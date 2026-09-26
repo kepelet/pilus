@@ -1,0 +1,18 @@
+[package]
+name = "l3s-protocol"
+description = "Wire protocol for the l3s desktop client of a luvus daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bincode.workspace = true
+crossterm.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+unicode-width.workspace = true

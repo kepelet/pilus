@@ -109,6 +109,76 @@ pub struct FeedUpdate {
     pub bar: Vec<BarWidget>,
     /// Current tabs of the active workspace.
     pub tabs: Vec<Tab>,
+    /// Current automation definitions.
+    pub automations: AutomationSummary,
+    /// Current tasks.
+    pub tasks: TaskSummary,
+}
+
+/// How many automation definitions exist, and how many are armed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AutomationSummary {
+    /// Definitions that will fire: everything not explicitly disabled.
+    pub enabled: u32,
+    /// Every definition, disabled or not.
+    pub total: u32,
+}
+
+impl AutomationSummary {
+    fn from_json(value: &Value) -> Self {
+        let items = value
+            .get("automations")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let total = items.len() as u32;
+        let enabled = items.iter().filter(|item| is_armed(item)).count() as u32;
+        Self { enabled, total }
+    }
+}
+
+/// A definition fires unless it says otherwise, under either flag spelling.
+fn is_armed(item: &Value) -> bool {
+    if let Some(disabled) = item.get("disabled").and_then(Value::as_bool) {
+        return !disabled;
+    }
+    if let Some(enabled) = item.get("enabled").and_then(Value::as_bool) {
+        return enabled;
+    }
+    true
+}
+
+/// How many tasks exist, and how many still need attention.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TaskSummary {
+    /// Tasks not in a terminal state.
+    pub open: u32,
+    /// Every task, open or not.
+    pub total: u32,
+}
+
+impl TaskSummary {
+    fn from_json(value: &Value) -> Self {
+        let items = value
+            .get("tasks")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let total = items.len() as u32;
+        let open = items.iter().filter(|item| is_open(item)).count() as u32;
+        Self { open, total }
+    }
+}
+
+/// A task needs attention unless its status reached a terminal state.
+fn is_open(item: &Value) -> bool {
+    match item.get("status").and_then(Value::as_str) {
+        Some(status) => !matches!(
+            status,
+            "done" | "completed" | "complete" | "merged" | "cancelled" | "canceled" | "archived"
+        ),
+        None => true,
+    }
 }
 
 /// One live agent session as reported by `agent.list`.
@@ -276,6 +346,18 @@ impl ControlClient {
             .map(Vec::as_slice)
             .unwrap_or_default();
         Ok(tabs.iter().filter_map(Tab::from_json).collect())
+    }
+
+    /// The automation definitions and their armed count.
+    pub fn automation_summary(&mut self) -> Result<AutomationSummary> {
+        let result = self.request("automation.list", json!({}))?;
+        Ok(AutomationSummary::from_json(&result))
+    }
+
+    /// The tasks and their open count.
+    pub fn task_summary(&mut self) -> Result<TaskSummary> {
+        let result = self.request("task.list", json!({}))?;
+        Ok(TaskSummary::from_json(&result))
     }
 
     /// Focus the tab at `index` (1-based).
@@ -505,15 +587,29 @@ fn refresh(
     let Some(active) = client.as_mut() else {
         return true;
     };
-    let snapshot = (active.agents(), active.bar_widgets(), active.tabs());
-    let (agents, bar, tabs) = match snapshot {
-        (Ok(agents), Ok(bar), Ok(tabs)) => (agents, bar, tabs),
+    let snapshot = (
+        active.agents(),
+        active.bar_widgets(),
+        active.tabs(),
+        active.automation_summary(),
+        active.task_summary(),
+    );
+    let (agents, bar, tabs, automations, tasks) = match snapshot {
+        (Ok(agents), Ok(bar), Ok(tabs), Ok(automations), Ok(tasks)) => {
+            (agents, bar, tabs, automations, tasks)
+        }
         _ => {
             *client = None;
             return true;
         }
     };
-    let update = FeedUpdate { agents, bar, tabs };
+    let update = FeedUpdate {
+        agents,
+        bar,
+        tabs,
+        automations,
+        tasks,
+    };
     let Ok(mut guard) = last.lock() else {
         return true;
     };
@@ -535,12 +631,15 @@ fn is_structural(name: &str) -> bool {
             || name.starts_with("pane.")
             || name.starts_with("tab.")
             || name.starts_with("workspace.")
+            || name.starts_with("automation.")
+            || name.starts_with("task.")
             || name.starts_with("terminal."))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_structural;
+    use super::{AutomationSummary, TaskSummary, is_structural};
+    use serde_json::json;
 
     #[test]
     fn structural_events_exclude_output_ready() {
@@ -549,8 +648,47 @@ mod tests {
         assert!(is_structural("terminal.metadata_changed"));
         assert!(is_structural("workspace.moved"));
         assert!(is_structural("agent.hook"));
+        assert!(is_structural("automation.run_started"));
+        assert!(is_structural("task.created"));
         assert!(!is_structural("terminal.output_ready"));
         assert!(!is_structural("events.resync_required"));
-        assert!(!is_structural("automation.run_started"));
+    }
+
+    #[test]
+    fn automation_summary_counts_armed() {
+        let value = json!({
+            "automations": [
+                {"name": "nightly"},
+                {"name": "paused", "disabled": true},
+                {"name": "legacy", "enabled": false},
+            ]
+        });
+        assert_eq!(
+            AutomationSummary::from_json(&value),
+            AutomationSummary {
+                enabled: 1,
+                total: 3
+            }
+        );
+        assert_eq!(
+            AutomationSummary::from_json(&json!({})),
+            AutomationSummary::default()
+        );
+    }
+
+    #[test]
+    fn task_summary_counts_open() {
+        let value = json!({
+            "tasks": [
+                {"title": "wip", "status": "working"},
+                {"title": "queued"},
+                {"title": "finished", "status": "done"},
+                {"title": "dropped", "status": "cancelled"},
+            ]
+        });
+        assert_eq!(
+            TaskSummary::from_json(&value),
+            TaskSummary { open: 2, total: 4 }
+        );
     }
 }

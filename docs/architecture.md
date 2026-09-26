@@ -38,6 +38,13 @@ and `--socket` override it. When the derived path is too long for `sun_path`,
 both the daemon and `l3s` relocate it to a hashed, owner-scoped alias under the
 temporary directory (`discovery::alias_for`).
 
+When nothing answers at the socket, the daemon isn't running, so `l3s` starts
+it with `luvus [--session NAME] server start` and waits for the socket
+(`autostart::ensure_server`, called from `connect`). The child gets
+`LUVUS_HOME` pinned to the target's state root, so it starts the same daemon
+`l3s` would have attached to. Liveness is checked by dialing, not by file
+existence, because a stopped server leaves its socket file behind.
+
 ## Handshake
 
 On connect, before any version agreement exists:

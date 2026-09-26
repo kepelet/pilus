@@ -8,21 +8,29 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 pub mod ansi;
+mod autostart;
 mod connection;
 mod control;
 mod discovery;
 mod error;
+mod machines;
 mod surface;
 mod transport;
 mod uhp;
+pub use autostart::{ensure_server, ensure_server_for};
 pub use connection::{ClientEvent, Connection, EndpointIdentity};
-pub use control::{Agent, AgentFeed, BarSegment, BarWidget, ControlClient, FeedUpdate, Tab};
+pub use control::{
+    Agent, AgentFeed, AutomationSummary, BarSegment, BarWidget, ControlClient, FeedUpdate, Tab,
+    TaskSummary,
+};
 pub use discovery::{
-    active_session, api_socket_path_for, client_socket_path_for, config_dir, describe,
-    list_sessions, session_dir_for, validate_session,
+    SessionInfo, active_session, api_socket_path_for, client_socket_path_for,
+    client_socket_path_under, config_dir, describe, generate_session_name, list_session_infos,
+    list_sessions, luvus_binary, session_dir_for, split_client_socket, validate_session,
 };
 pub use error::{Error, Result};
 pub use l3s_protocol as protocol;
+pub use machines::{MachineInfo, list_machines, refresh_machines};
 pub use surface::{Surface, SurfaceChange};
 pub use uhp::{Event, EventStream, Frame, Observer, Terminal, UhpClient};
 
@@ -92,6 +100,23 @@ impl ConnectTarget {
 }
 
 /// Attach to `target` with an initial `cols` by `rows` viewport.
+///
+/// When nothing listens at the target socket, the daemon isn't running, so
+/// it is started first ([`ensure_server`]) and the attach is retried until
+/// it stops initializing. Any other failure is returned as-is.
 pub fn connect(target: &ConnectTarget, cols: u16, rows: u16) -> Result<Connection> {
-    Connection::open(target, cols, rows)
+    match Connection::open(target, cols, rows) {
+        Err(Error::NotFound { .. }) => {}
+        other => return other,
+    }
+    ensure_server(target)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match Connection::open(target, cols, rows) {
+            Err(Error::NotFound { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            other => return other,
+        }
+    }
 }

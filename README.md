@@ -23,7 +23,7 @@ sidebar, without running another terminal emulator.
 
 Early. `l3s` today is a focused vertical slice:
 
-- discovers a running daemon's client socket (default or named session);
+- discovers the daemon's client socket (default or named session), starting the daemon itself when it isn't running;
 - completes the version-checked handshake and probes terminal colors;
 - streams the daemon's cell grid, applying full frames and sparse diffs;
 - claims the whole sidebar and hides the daemon's `« session Menu` chrome,
@@ -45,8 +45,9 @@ dashboard, agents dock) is still painted from the daemon's cells — see
 
 ## Build and run
 
-Requires Rust 1.96+, a running Luvus daemon, and — on macOS — either full Xcode
-or the Metal toolchain. The GUI links a stitched Metal shader and does not
+Requires Rust 1.96+, the `luvus` CLI on `PATH`, and — on macOS — either full
+Xcode or the Metal toolchain. `l3s` starts the Luvus daemon itself when it
+isn't already running. The GUI links a stitched Metal shader and does not
 invoke the `metal` compiler at build time, so the command-line tools alone are
 usually sufficient.
 

@@ -3,25 +3,37 @@
 //! The server packs a color into a `u32` with a tag in the high byte:
 //! `0` is "use the client default", `1` is an ANSI palette index, and `2` is a
 //! 24-bit sRGB value. [`resolve`] turns any of those into a paintable color.
+//!
+//! The chrome palette is deliberately near-black with a lighter sidebar,
+//! matching the product mock: the terminal grid stays pure black while panels,
+//! pills, and the breadcrumb float above it in dark greys.
 
 use gpui::{Rgba, rgb};
 
 /// The client's own chrome palette.
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
-    /// Window background.
+    /// Main window background behind the floating card.
+    pub window_bg: Rgba,
+    /// Terminal card background (also the terminal grid default).
     pub bg: Rgba,
+    /// Sidebar column background, a touch lighter than the main bg.
+    pub sidebar_bg: Rgba,
     /// Default cell foreground.
     pub fg: Rgba,
-    /// Header and footer background.
+    /// Selected pills, tab actives, and the breadcrumb bar.
     pub panel: Rgba,
+    /// Dimmed panel for inactive tabs.
+    pub panel_dim: Rgba,
     /// Borders and dividers.
     pub border: Rgba,
-    /// Accent for the connection indicator.
+    /// Accent for the connection indicator and links.
     pub accent: Rgba,
+    /// Branch names in the sidebar.
+    pub branch: Rgba,
     /// Muted text.
     pub muted: Rgba,
-    /// Text drawn on the header.
+    /// Text drawn on panels.
     pub panel_fg: Rgba,
     /// Background behind selected cells.
     pub selection_bg: Rgba,
@@ -36,13 +48,19 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            bg: rgb(0x101316),
+            window_bg: rgb(0x060608),
+            // Matches the daemon's own base surface: blank cells arrive with
+            // this exact color, so unpainted card interior is seamless.
+            bg: rgb(0x111116),
+            sidebar_bg: rgb(0x121215),
             fg: rgb(0xd8dde9),
-            panel: rgb(0x18181f),
-            border: rgb(0x2c2c38),
+            panel: rgb(0x1e1e24),
+            panel_dim: rgb(0x141419),
+            border: rgb(0x26262e),
             accent: rgb(0x7aa2f7),
-            muted: rgb(0x6b6b82),
-            panel_fg: rgb(0xc0c0d0),
+            branch: rgb(0xbb9af7),
+            muted: rgb(0x8e8e9e),
+            panel_fg: rgb(0xe8e8ec),
             selection_bg: rgb(0x2f4f7f),
             selection_fg: rgb(0xffffff),
             ok: rgb(0x7fd88f),

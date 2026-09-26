@@ -44,6 +44,10 @@ pub enum Error {
     #[error("invalid session name: {0}")]
     InvalidSession(String),
 
+    /// The daemon was not running and starting it failed.
+    #[error("could not start Luvus server: {0}")]
+    ServerStart(String),
+
     /// The JSON control API rejected the request or returned something
     /// unreadable.
     #[error("control API error: {0}")]

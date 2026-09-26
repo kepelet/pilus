@@ -141,6 +141,7 @@ fn print_help() {
 /// daemon does the VT emulation, so the frame arrives as finished rows and no
 /// terminal emulator is needed here.
 fn run_uhp(target: ConnectTarget, pane: Option<String>) -> Result<()> {
+    l3s_client::ensure_server(&target)?;
     let socket = target
         .socket
         .clone()
@@ -194,6 +195,7 @@ fn run_uhp(target: ConnectTarget, pane: Option<String>) -> Result<()> {
 /// pass. This drives the same `AgentFeed` headlessly so the event-driven
 /// refresh can be checked from a terminal.
 fn run_feed(target: ConnectTarget) -> Result<()> {
+    l3s_client::ensure_server(&target)?;
     let socket = target
         .socket
         .clone()
@@ -242,7 +244,7 @@ fn run_probe(target: ConnectTarget, workspaces: bool, open_menu: bool) -> Result
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     let socket = target.resolve();
-    let connection = l3s_client::connect(&target, 80, 24)?;
+    let connection = l3s_client::connect(&target, 159, 43)?; // TEMP wide probe
     if workspaces {
         connection.request_workspace_dock()?;
     }

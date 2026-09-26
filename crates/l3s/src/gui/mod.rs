@@ -10,25 +10,28 @@ mod keys;
 mod selection;
 mod theme;
 
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    KeyEventKind, MouseButton as TerminalMouseButton, MouseEvent, MouseEventKind,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
+    MouseEventKind,
 };
 use gpui::{
     App, Bounds, ClipboardItem, Context, Div, FocusHandle, FontWeight, Hsla, KeyDownEvent,
     Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, TextRun, Window, WindowBounds, WindowOptions, div, font,
-    prelude::*, px, size,
+    ScrollDelta, ScrollWheelEvent, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    div, font, point, prelude::*, px, size, svg,
 };
 use gpui_platform::application;
 use l3s_client::{
-    Agent, AgentFeed, BarWidget, ClientEvent, ConnectTarget, Connection, Surface, SurfaceChange,
-    Tab,
+    Agent, AgentFeed, AutomationSummary, BarWidget, ClientEvent, ConnectTarget, Connection,
+    MachineInfo, SessionInfo, Surface, SurfaceChange, Tab, TaskSummary, config_dir,
+    generate_session_name, list_machines, list_session_infos, refresh_machines,
+    split_client_socket,
 };
-use l3s_protocol::{
-    CellData, ClientMessage, FrameData, ShellDockRect, ShellSidebars, ShellWorkspace,
-};
+use l3s_protocol::{CellData, ClientMessage, FrameData, ShellSidebars, ShellWorkspace};
 use selection::{Cell, Selection};
 use theme::Theme;
 
@@ -36,15 +39,88 @@ use theme::Theme;
 const FONT_FAMILY: &str = "Menlo";
 /// Base font size in logical pixels.
 const FONT_SIZE: f32 = 13.0;
-/// Advance width of one cell as a fraction of the font size, used only until
-/// the real advance is measured from the font.
-const CELL_WIDTH_RATIO: f32 = 0.6;
 /// Line height as a fraction of the font size.
 const LINE_HEIGHT_RATIO: f32 = 1.3;
-/// Height of the native header strip in pixels.
-const HEADER_HEIGHT: f32 = 30.0;
-/// Height of a tab in the unified top chrome, independent of the text grid.
-const TAB_HEIGHT: f32 = 24.0;
+/// Height of our native tab strip; the grid starts below it.
+const TAB_STRIP_HEIGHT: f32 = 36.0;
+/// Grid offset from the window top: tab strip plus its top spacing.
+const HEADER_HEIGHT: f32 = 40.0;
+/// Daemon rows skipped at the top of the grid. The daemon draws its own tab
+/// strip plus a cwd breadcrumb there; the grid starts below them so only
+/// native chrome shows. (Our footer already carries the cwd.) Selection and
+/// click coordinates stay in daemon rows, so copy and gear clicks keep
+/// working.
+const SKIPPED_DAEMON_ROWS: u16 = 2;
+/// Daemon rows skipped at the grid bottom: its one-row status line, which our
+/// footer widgets already mirror.
+const SKIPPED_DAEMON_BOTTOM_ROWS: u16 = 1;
+/// Daemon rows skipped at the bottom: its status line, mirrored by our own
+/// footer widgets. Assumes a single-row status line.
+/// Height of the native footer bar.
+const FOOTER_HEIGHT: f32 = 28.0;
+/// Gap around the floating terminal card, on top/left/bottom.
+const CARD_GAP: f32 = 8.0;
+/// Breathing room below the last row is intentionally zero: the grid runs
+/// flush to the card's bottom border.
+/// Breathing room above the first row, mirroring the bottom.
+const TERMINAL_TOP_AIR: f32 = 6.0;
+/// Wider right margin on the card, for breathing room at the window edge.
+const CARD_GAP_RIGHT: f32 = 16.0;
+/// Height of a tab pill in the top chrome.
+const TAB_HEIGHT: f32 = 26.0;
+/// Chrome text size; the cell grid keeps its own monospace size.
+const CHROME_FONT: f32 = 13.0;
+/// Section label size (SESSIONS / PROJECTS).
+const SECTION_FONT: f32 = 11.0;
+
+/// Native sidebar destinations: live daemon data and bound views.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NavKind {
+    Automations,
+    Tasks,
+    Mission,
+    Orchestration,
+}
+
+impl NavKind {
+    /// All rows in sidebar order.
+    const ALL: [NavKind; 4] = [
+        NavKind::Automations,
+        NavKind::Tasks,
+        NavKind::Mission,
+        NavKind::Orchestration,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            NavKind::Automations => "Automations",
+            NavKind::Tasks => "Tasks",
+            NavKind::Mission => "Mission Control",
+            NavKind::Orchestration => "Orchestration",
+        }
+    }
+
+    /// Vendored lucide glyph; tinted by the caller's text color.
+    fn icon(self) -> &'static [u8] {
+        match self {
+            NavKind::Automations => include_bytes!("../../assets/icons/clock.svg"),
+            NavKind::Tasks => include_bytes!("../../assets/icons/list-checks.svg"),
+            NavKind::Mission => include_bytes!("../../assets/icons/layout-panel-left.svg"),
+            NavKind::Orchestration => include_bytes!("../../assets/icons/workflow.svg"),
+        }
+    }
+
+    /// The `<bind>` chord that opens this destination in the daemon.
+    ///
+    /// Automations surface in Mission Control and tasks on the task board,
+    /// so the data rows deep-link to the view that shows them.
+    fn chord(self) -> char {
+        match self {
+            NavKind::Automations | NavKind::Mission => 'm',
+            NavKind::Tasks | NavKind::Orchestration => 'o',
+        }
+    }
+}
 
 // Ratatui `Modifier` bits, as packed by the daemon.
 const M_BOLD: u16 = 1 << 0;
@@ -68,6 +144,11 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(640.0), px(400.0))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("l3s".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.0), px(11.0))),
+                }),
                 ..Default::default()
             },
             move |window, cx| cx.new(move |cx| L3sView::new(target, connection, window, cx)),
@@ -80,6 +161,23 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+/// Geometry of the inset terminal card: grid origin, visible cells, and the
+/// measurements behind them, so painting, pointer mapping, and the daemon
+/// viewport stay pixel-true to one another.
+struct CardLayout {
+    /// Card's left edge in window pixels (sidebar plus gap, or just gap).
+    card_x: f32,
+    /// First visible cell's top-left corner in window pixels.
+    origin_x: f32,
+    origin_y: f32,
+    /// Visible grid size in cells.
+    cols: u16,
+    rows: u16,
+    /// Measured cell size in pixels.
+    cell_w: f32,
+    cell_h: f32,
 }
 
 struct L3sView {
@@ -105,14 +203,45 @@ struct L3sView {
     press_anchor: Option<Cell>,
     /// Last cell a hover move was forwarded for, so the daemon isn't flooded.
     hover_cell: Option<Cell>,
-    /// Background poller for the daemon's live agent list.
+    /// Background poller for the current session's tabs and widgets.
     agent_feed: Option<AgentFeed>,
-    /// Latest agent snapshot.
-    agents: Vec<Agent>,
+    /// State root the SESSIONS section lists, derived from the launch target.
+    session_root: PathBuf,
+    /// Current session; `None` is the default session.
+    session_name: Option<String>,
+    /// Visible sessions under `session_root`.
+    sessions: Vec<SessionInfo>,
+    /// Last session-directory poll, so the disk isn't hit every frame.
+    last_session_poll: Instant,
+    /// Whether the footer session menu is open.
+    session_menu_open: bool,
+    /// Results from background session create/start operations.
+    session_rx: Receiver<SessionOpResult>,
+    /// Sender half, handed to each background session operation.
+    session_tx: Sender<SessionOpResult>,
     /// Latest status-bar widgets from `ui.bar.list`.
     bar_widgets: Vec<BarWidget>,
     /// Latest tabs of the active workspace.
     tabs: Vec<Tab>,
+    /// Latest live agent sessions for the AGENTS section.
+    agents: Vec<Agent>,
+    /// Latest automation/task counts for the nav badges.
+    automations: AutomationSummary,
+    tasks: TaskSummary,
+    /// Saved machine profiles under `session_root`.
+    machines: Vec<MachineInfo>,
+    /// Last machine-profile poll; the CLI is only re-read on a slow tick.
+    last_machine_poll: Instant,
+    /// A machine refresh is running off-thread; no overlapping spawns.
+    machine_refreshing: bool,
+    /// Fresh machine profiles from the background refresh.
+    machine_rx: Receiver<Vec<MachineInfo>>,
+    /// Sender half for the background machine refresh.
+    machine_tx: Sender<Vec<MachineInfo>>,
+    /// Optimistic nav pick: the row a click chose, before the daemon confirms.
+    nav_sel: Option<NavKind>,
+    /// When the optimistic pick was made, so stale picks age out.
+    nav_sel_at: Instant,
     /// The sidebar layout we superseded the daemon's with, once known.
     sidebar_layout: Option<l3s_protocol::SidebarsConfig>,
     /// Whether workspace paths are shown in that layout.
@@ -133,12 +262,21 @@ impl L3sView {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
-        // The agent list comes from UHP, which is addressed by session; an
-        // explicit client socket gives us no way to find it.
-        let agent_feed = target.socket.is_none().then(|| {
-            let socket = l3s_client::api_socket_path_for(target.session.as_deref());
-            AgentFeed::spawn(socket)
-        });
+        // Tabs and widgets come from UHP, which is addressed by session. Find
+        // the state root from the launch target, including explicit sockets,
+        // so `--socket` builds still list sessions and feed the right tabs.
+        let (session_root, session_name) = match &target.socket {
+            Some(path) => split_client_socket(path).unwrap_or_else(|| (config_dir(), None)),
+            None => (config_dir(), target.session.clone()),
+        };
+        let agent_feed = Some(AgentFeed::spawn(api_socket_for(
+            &session_root,
+            session_name.as_deref(),
+        )));
+        let sessions = list_session_infos(&session_root);
+        let machines = list_machines(&session_root);
+        let (machine_tx, machine_rx) = std::sync::mpsc::channel();
+        let (session_tx, session_rx) = std::sync::mpsc::channel();
 
         let view = Self {
             target,
@@ -157,9 +295,25 @@ impl L3sView {
             press_anchor: None,
             hover_cell: None,
             agent_feed,
-            agents: Vec::new(),
+            session_root,
+            session_name,
+            sessions,
+            last_session_poll: Instant::now(),
+            session_menu_open: false,
+            session_rx,
+            session_tx,
             bar_widgets: Vec::new(),
             tabs: Vec::new(),
+            agents: Vec::new(),
+            automations: AutomationSummary::default(),
+            tasks: TaskSummary::default(),
+            machines,
+            last_machine_poll: Instant::now() - Duration::from_secs(11),
+            machine_refreshing: false,
+            machine_rx,
+            machine_tx,
+            nav_sel: None,
+            nav_sel_at: Instant::now(),
             sidebar_layout: None,
             sidebar_workspace_paths: false,
             sidebar_revision: 0,
@@ -196,6 +350,17 @@ impl L3sView {
                     changed = true;
                 }
                 ClientEvent::Message(message) => {
+                    // Temporary: full-frame dimensions vs our viewport.
+                    if let l3s_client::protocol::ServerMessage::Frame(frame) = &message {
+                        eprintln!(
+                            "l3s-frame {}x{} want {}x{} skip {}",
+                            frame.width,
+                            frame.height,
+                            self.cols,
+                            self.rows,
+                            self.skipped_cols()
+                        );
+                    }
                     if self.surface.apply(&message) != SurfaceChange::None {
                         changed = true;
                     }
@@ -210,13 +375,20 @@ impl L3sView {
                 }
             }
         }
+        let mut tabs_changed = false;
         if let Some(feed) = self.agent_feed.as_ref() {
             while let Some(update) = feed.try_recv() {
-                self.agents = update.agents;
                 self.bar_widgets = update.bar;
                 self.tabs = update.tabs;
+                self.agents = update.agents;
+                self.automations = update.automations;
+                self.tasks = update.tasks;
+                tabs_changed = true;
                 changed = true;
             }
+        }
+        if tabs_changed {
+            self.reconcile_nav();
         }
         if self.sidebar_layout.is_none()
             && let Some(sidebars) = self.surface.shell_sidebars().cloned()
@@ -231,11 +403,55 @@ impl L3sView {
             self.sidebar_layout = Some(layout);
             self.push_sidebar_layout();
         }
+        while let Ok(op) = self.session_rx.try_recv() {
+            match op {
+                SessionOpResult::Started(name) => {
+                    self.sessions = list_session_infos(&self.session_root);
+                    self.switch_session(&name);
+                }
+                SessionOpResult::StartFailed(name, error) => {
+                    self.status = format!("couldn't start {name}: {error}");
+                }
+            }
+            changed = true;
+        }
+        // Sessions change rarely; re-read the state root on a slow tick so a
+        // created or stopped session appears without rescanning every frame.
+        if self.last_session_poll.elapsed() >= Duration::from_secs(2) {
+            self.last_session_poll = Instant::now();
+            let fresh = list_session_infos(&self.session_root);
+            if fresh != self.sessions {
+                self.sessions = fresh;
+                changed = true;
+            }
+        }
+        if !self.machine_refreshing && self.last_machine_poll.elapsed() >= Duration::from_secs(10) {
+            self.machine_refreshing = true;
+            self.last_machine_poll = Instant::now();
+            let root = self.session_root.clone();
+            let tx = self.machine_tx.clone();
+            std::thread::spawn(move || {
+                tx.send(refresh_machines(&root)).ok();
+            });
+        }
+        while let Ok(machines) = self.machine_rx.try_recv() {
+            self.machine_refreshing = false;
+            if machines != self.machines {
+                self.machines = machines;
+                changed = true;
+            }
+        }
         changed
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        // An open session menu owns Escape; the daemon never sees it.
+        if self.session_menu_open && keystroke.key == "escape" {
+            self.session_menu_open = false;
+            cx.notify();
+            return;
+        }
         // The platform clipboard chords are ours: the pane must see the copied
         // text (or a bracketed paste), never the chord itself.
         if keystroke.modifiers.platform {
@@ -268,6 +484,13 @@ impl L3sView {
         }
     }
 
+    /// Focus an agent's pane, switching workspace and tab as needed.
+    fn focus_agent(&self, pane: &str) {
+        if let Some(feed) = self.agent_feed.as_ref() {
+            feed.focus_pane(pane);
+        }
+    }
+
     /// Focus a workspace by id, switching the daemon's active workspace.
     fn focus_workspace(&mut self, workspace_id: &str) {
         let _ = self.connection.send(ClientMessage::ShellWorkspaceFocus {
@@ -275,11 +498,69 @@ impl L3sView {
         });
     }
 
-    /// Focus an agent's pane, switching workspace and tab as needed.
-    fn focus_agent(&self, pane: &str) {
-        if let Some(feed) = self.agent_feed.as_ref() {
-            feed.focus_pane(pane);
+    /// This client's session name: `default` when no session is named.
+    fn current_session_name(&self) -> &str {
+        self.session_name.as_deref().unwrap_or("default")
+    }
+
+    /// The control socket matching the current session under our state root.
+    fn api_socket(&self) -> PathBuf {
+        api_socket_for(&self.session_root, self.session_name.as_deref())
+    }
+
+    /// Attach to another session under the same state root.
+    ///
+    /// A failed attach keeps the old connection and reports why in the
+    /// status bar, so a stopped session can't strand the window.
+    fn switch_session(&mut self, name: &str) {
+        let session = (name != "default").then(|| name.to_string());
+        let dir = match &session {
+            Some(named) => self.session_root.join("sessions").join(named),
+            None => self.session_root.clone(),
+        };
+        self.session_name = session;
+        self.target = ConnectTarget::socket(dir.join("luvus-client.sock"));
+        match l3s_client::connect(&self.target, self.cols, self.rows) {
+            Ok(connection) => {
+                self.connection = connection;
+                let _ = self.connection.request_workspace_dock();
+                self.surface = Surface::new();
+                self.selection = None;
+                self.hover_cell = None;
+                self.press_anchor = None;
+                self.dragging = false;
+                self.sidebar_layout = None;
+                self.sidebar_workspace_paths = false;
+                self.sidebar_revision = 0;
+                self.bar_widgets = Vec::new();
+                self.tabs = Vec::new();
+                self.agents = Vec::new();
+                self.automations = AutomationSummary::default();
+                self.tasks = TaskSummary::default();
+                self.agent_feed = Some(AgentFeed::spawn(self.api_socket()));
+                self.sessions = list_session_infos(&self.session_root);
+                self.status = format!("connecting to {name}…");
+            }
+            Err(error) => {
+                self.status = format!("couldn't attach to {name}: {error}");
+            }
         }
+    }
+
+    /// Create a fresh session and attach to it once its socket appears.
+    ///
+    /// The name is generated docker-style; creation runs off the GUI thread
+    /// and reports back through the session channel the poll loop drains.
+    fn start_new_session(&mut self) {
+        let existing: Vec<String> = self.sessions.iter().map(|info| info.name.clone()).collect();
+        let name = generate_session_name(&existing);
+        self.status = format!("starting {name}…");
+        self.session_menu_open = false;
+        let root = self.session_root.clone();
+        let tx = self.session_tx.clone();
+        std::thread::spawn(move || {
+            tx.send(start_session_blocking(&root, &name)).ok();
+        });
     }
 
     /// Send our sidebar layout to the daemon with a fresh revision.
@@ -346,21 +627,71 @@ impl L3sView {
 
     /// Convert a window-space pointer position to a grid cell, if it lands on
     /// the grid rather than the native header.
-    fn cell_at(&self, position: Point<Pixels>) -> Option<Cell> {
-        let frame = self.surface.frame()?;
-        if frame.width == 0 || frame.height == 0 {
-            return None;
+    /// Whether a pointer position lands on native chrome instead of the grid.
+    ///
+    /// GPUI delivers mouse events to every listener under the cursor, so a
+    /// press on a sidebar button also reaches the grid beneath it. Without
+    /// this guard the grid forwards phantom clicks through our own panels:
+    /// opening the workspace picker and instantly dismissing it with the
+    /// release click, or toggling the daemon menu twice per gear press.
+    /// While the session menu is open the whole content area counts, since
+    /// the overlay sits above the grid.
+    fn hit_chrome(&mut self, window: &Window, position: Point<Pixels>) -> bool {
+        if self.session_menu_open {
+            return true;
         }
-        let cell_width = self.cell_width.unwrap_or(self.font_size * CELL_WIDTH_RATIO);
-        let cell_height = self.font_size * LINE_HEIGHT_RATIO;
-        let y = (f32::from(position.y) - HEADER_HEIGHT) / cell_height;
-        let x = f32::from(position.x) / cell_width;
+        let x = f32::from(position.x);
+        let y = f32::from(position.y);
+        if y < HEADER_HEIGHT {
+            return true;
+        }
+        if y >= f32::from(window.viewport_size().height) - FOOTER_HEIGHT {
+            return true;
+        }
+        if self.sidebar_visible
+            && let Some(dock) = self.surface.shell_dock()
+        {
+            let cell_width = self.cell_width(window);
+            let left = f32::from(dock.x) * cell_width;
+            let right = left + f32::from(dock.width) * cell_width;
+            let bottom = f32::from(window.viewport_size().height) - FOOTER_HEIGHT;
+            if x >= left && x < right && y < bottom {
+                return true;
+            }
+        }
+        // The gap ring around the floating card belongs to no pane.
+        let layout = self.card_layout(window);
+        let grid_right = layout.origin_x + f32::from(layout.cols) * layout.cell_w;
+        let grid_bottom = layout.origin_y + f32::from(layout.rows) * layout.cell_h;
+        if x < layout.origin_x || y < layout.origin_y || x >= grid_right || y >= grid_bottom {
+            return true;
+        }
+        false
+    }
+
+    fn cell_at(&mut self, window: &Window, position: Point<Pixels>) -> Option<Cell> {
+        let (width, height) = match self.surface.frame() {
+            Some(frame) if frame.width > 0 && frame.height > 0 => (frame.width, frame.height),
+            _ => return None,
+        };
+        let layout = self.card_layout(window);
+        let skip = u32::from(self.skipped_cols());
+        let paint_w = u32::from(layout.cols).min(u32::from(width).saturating_sub(skip));
+        let paint_h = u32::from(layout.rows).min(u32::from(height).saturating_sub(
+            u32::from(SKIPPED_DAEMON_ROWS) + u32::from(SKIPPED_DAEMON_BOTTOM_ROWS),
+        ));
+        let y = (f32::from(position.y) - layout.origin_y) / layout.cell_h;
+        let x = (f32::from(position.x) - layout.origin_x) / layout.cell_w;
         if y < 0.0 || x < 0.0 {
             return None;
         }
-        let column = (x as u32).min(u32::from(frame.width - 1)) as u16;
-        let row = (y as u32).min(u32::from(frame.height - 1)) as u16;
-        Some(Cell { column, row })
+        let column = skip.saturating_add((x as u32).min(paint_w.saturating_sub(1)));
+        let row = u32::from(SKIPPED_DAEMON_ROWS)
+            .saturating_add((y as u32).min(paint_h.saturating_sub(1)));
+        Some(Cell {
+            column: column as u16,
+            row: row as u16,
+        })
     }
 
     /// Send one mouse event to the daemon at `cell`.
@@ -373,8 +704,11 @@ impl L3sView {
         }));
     }
 
-    fn begin_selection(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        let Some(cell) = self.cell_at(event.position) else {
+    fn begin_selection(&mut self, event: &MouseDownEvent, window: &Window, cx: &mut Context<Self>) {
+        if self.hit_chrome(window, event.position) {
+            return;
+        }
+        let Some(cell) = self.cell_at(window, event.position) else {
             return;
         };
         // Record the press, but paint nothing yet: a plain click must not
@@ -387,9 +721,19 @@ impl L3sView {
         cx.notify();
     }
 
-    fn extend_selection(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+    fn extend_selection(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A drag started on the grid may roam anywhere; anything else over
+        // chrome belongs to the panels, not the daemon.
+        if !self.dragging && self.hit_chrome(window, event.position) {
+            return;
+        }
         if self.dragging && event.pressed_button == Some(MouseButton::Left) {
-            let Some(cell) = self.cell_at(event.position) else {
+            let Some(cell) = self.cell_at(window, event.position) else {
                 return;
             };
             let Some(anchor) = self.press_anchor else {
@@ -417,7 +761,7 @@ impl L3sView {
         }
         // Hover: only tell the daemon when the pointer crosses into a new cell,
         // so links and scrollbars react without a message per pixel.
-        let Some(cell) = self.cell_at(event.position) else {
+        let Some(cell) = self.cell_at(window, event.position) else {
             return;
         };
         if self.hover_cell != Some(cell) {
@@ -426,8 +770,17 @@ impl L3sView {
         }
     }
 
-    fn finish_selection(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+    fn finish_selection(&mut self, event: &MouseUpEvent, window: &Window, cx: &mut Context<Self>) {
         if !self.dragging {
+            return;
+        }
+        // A release over native chrome (letting go on a sidebar button after
+        // pressing it) ends the gesture without forwarding a click.
+        if self.hit_chrome(window, event.position) {
+            self.dragging = false;
+            self.press_anchor = None;
+            self.drag_moved = false;
+            cx.notify();
             return;
         }
         self.dragging = false;
@@ -447,7 +800,7 @@ impl L3sView {
         // whatever was clicked. Nothing was ever painted, so there is nothing
         // to clear.
         self.selection = None;
-        let Some(cell) = self.cell_at(event.position) else {
+        let Some(cell) = self.cell_at(window, event.position) else {
             cx.notify();
             return;
         };
@@ -464,20 +817,29 @@ impl L3sView {
         cx.notify();
     }
 
-    fn press(&self, event: &MouseDownEvent, button: TerminalMouseButton) {
-        if let Some(cell) = self.cell_at(event.position) {
+    fn press(&mut self, event: &MouseDownEvent, button: TerminalMouseButton, window: &Window) {
+        if self.hit_chrome(window, event.position) {
+            return;
+        }
+        if let Some(cell) = self.cell_at(window, event.position) {
             self.forward_mouse(MouseEventKind::Down(button), cell, event.modifiers);
         }
     }
 
-    fn release(&self, event: &MouseUpEvent, button: TerminalMouseButton) {
-        if let Some(cell) = self.cell_at(event.position) {
+    fn release(&mut self, event: &MouseUpEvent, button: TerminalMouseButton, window: &Window) {
+        if self.hit_chrome(window, event.position) {
+            return;
+        }
+        if let Some(cell) = self.cell_at(window, event.position) {
             self.forward_mouse(MouseEventKind::Up(button), cell, event.modifiers);
         }
     }
 
-    fn scroll(&self, event: &ScrollWheelEvent) {
-        let Some(cell) = self.cell_at(event.position) else {
+    fn scroll(&mut self, event: &ScrollWheelEvent, window: &Window) {
+        if self.hit_chrome(window, event.position) {
+            return;
+        }
+        let Some(cell) = self.cell_at(window, event.position) else {
             return;
         };
         let cell_height = self.font_size * LINE_HEIGHT_RATIO;
@@ -512,83 +874,82 @@ impl L3sView {
         }
     }
 
-    /// Build the native workspaces panel the daemon reserved for this client.
+    /// Build the native sidebar: nav, sessions, and projects.
     ///
     /// The daemon leaves the dock cells blank and reports their exact rectangle
     /// in `ShellDock`; this paints the same region from the `ShellWorkspaces`
     /// catalog, so the panel is native while staying column-aligned with the
     /// terminal grid behind it.
-    fn sidebar(&self, cx: &mut Context<Self>, cell_width: f32, cell_height: f32) -> Div {
+    fn sidebar(&self, cx: &mut Context<Self>, cell_width: f32, bottom: f32) -> Div {
         if !self.sidebar_visible {
             return div();
         }
         let Some(dock) = self.surface.shell_dock() else {
             return div();
         };
-        let stride = if dock.show_paths { 2.0 } else { 1.0 };
-        let row_height = stride * cell_height;
-        let font_size = self.font_size;
-
-        let add = div()
-            .id("l3s-add-workspace")
-            .cursor_pointer()
-            .text_color(self.theme.accent)
-            .child(" +")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| {
-                    let _ = this.connection.send(ClientMessage::OpenWorkspacePicker);
-                }),
-            );
+        let theme = self.theme;
 
         let mut list = div()
             .flex()
             .flex_col()
             .flex_1()
-            .pl(px(2.0 * cell_width))
-            .pr(px(cell_width))
+            .px_3()
+            .gap_1()
             .overflow_hidden()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .h(px(cell_height))
-                    .child(
-                        div()
-                            .text_size(px(font_size))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(self.theme.accent)
-                            .child("WORKSPACES"),
-                    )
-                    .child(add),
-            );
+            // Clearance for the floating traffic lights (transparent titlebar).
+            .child(div().h(px(40.0)));
 
-        for workspace in self.surface.workspaces() {
-            list = list.child(self.workspace_row(workspace, &dock, cx, cell_height, row_height));
+        for kind in NavKind::ALL {
+            list = list.child(self.nav_row(kind, cx));
         }
-        list = list.child(self.agents_section(cx, cell_height));
+
+        list = list.child(self.machines_section());
+        list = list.child(self.agents_section(cx));
+        list = list.child(self.projects_section(cx));
 
         // The panel starts on row 0, covering the daemon's `« session Menu`
-        // chrome so the sidebar shows only the two native sections.
+        // chrome so the sidebar shows only native sections. It runs full
+        // height down to the footer; the footer itself spans the full width
+        // beneath it, VS Code style.
         div()
             .absolute()
             .left(px(f32::from(dock.x) * cell_width))
             .top(px(0.0))
             .w(px(f32::from(dock.width) * cell_width))
-            .h(px((f32::from(dock.y) + f32::from(dock.height))
-                * cell_height
-                + HEADER_HEIGHT))
+            .h(px(bottom))
             .flex()
             .flex_col()
-            .bg(self.theme.bg)
+            .bg(theme.window_bg)
             .overflow_hidden()
             .child(list)
     }
 
-    /// The daemon's Menu-pill cell, for the header button to click.
+    /// The daemon's Menu-pill cell: scanned from the top rows, falling back
+    /// to the dock's trailing cells when the label isn't visible (yet).
+    ///
+    /// Scanning (instead of trusting the dock rect) keeps the click working
+    /// when hiding our sidebar reshuffles the daemon's chrome.
     fn menu_cell(&self) -> Option<Cell> {
+        const LABEL: [&str; 4] = ["M", "e", "n", "u"];
+        if let Some(frame) = self.surface.frame() {
+            let width = usize::from(frame.width);
+            for row in 0usize..3 {
+                for start in 0..width.saturating_sub(LABEL.len()) {
+                    let found = LABEL.iter().enumerate().all(|(offset, want)| {
+                        frame
+                            .cells
+                            .get(row * width + start + offset)
+                            .is_some_and(|cell| symbol(cell) == *want)
+                    });
+                    if found {
+                        return Some(Cell {
+                            column: start as u16 + 2,
+                            row: row as u16,
+                        });
+                    }
+                }
+            }
+        }
         let dock = self.surface.shell_dock()?;
         Some(Cell {
             column: dock.x + dock.width.saturating_sub(4),
@@ -617,14 +978,14 @@ impl L3sView {
         }
     }
 
-    /// The unified top chrome: app controls plus the tab strip, painted over
-    /// the daemon's tab row and the app header it replaces.
-    ///
-    /// It starts at the sidebar's right edge, so the sidebar keeps a full-height
-    /// column and the chrome never competes with it for the same pixels.
-    fn top_chrome(&self, cx: &mut Context<Self>, cell_width: f32, cell_height: f32) -> Div {
+    /// The native tab strip, full window width: toggle beside the traffic
+    /// lights, tabs, and settings at the far right.
+    fn top_chrome(&self, cx: &mut Context<Self>, cell_width: f32) -> Div {
         let theme = self.theme;
-        let left = f32::from(self.sidebar_cells());
+        // Beside the sidebar when it is open; full width (clear of the
+        // traffic lights) when it is hidden.
+        let left = f32::from(self.sidebar_cells()) * cell_width;
+        let pad = if self.sidebar_visible { 12.0 } else { 70.0 };
         let mut tabs = div()
             .flex()
             .flex_row()
@@ -633,131 +994,134 @@ impl L3sView {
             .flex_1()
             .overflow_hidden();
         for tab in &self.tabs {
-            tabs = tabs.child(self.tab_item(tab, cx, TAB_HEIGHT));
+            tabs = tabs.child(self.tab_item(tab, cx));
         }
         tabs = tabs.child(
             div()
                 .id("l3s-new-tab")
                 .flex()
                 .items_center()
+                .justify_center()
                 .h(px(TAB_HEIGHT))
-                .px_2()
+                .w(px(28.0))
+                .rounded_md()
                 .cursor_pointer()
+                .text_size(px(CHROME_FONT))
                 .text_color(theme.muted)
-                .hover(|style| style.text_color(theme.accent))
-                .child("+")
+                .hover(|style| style.text_color(theme.panel_fg).bg(theme.panel))
+                .child(icon(
+                    include_bytes!("../../assets/icons/plus.svg"),
+                    13.0,
+                    theme.muted,
+                ))
                 .on_click(cx.listener(|this, _, _, _| this.new_tab())),
         );
-        div()
-            .absolute()
-            .left(px(left * cell_width))
-            .right(px(0.0))
-            .top(px(0.0))
-            .h(px(HEADER_HEIGHT + cell_height))
+        let toggle = div()
+            .id("l3s-sidebar-toggle")
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(TAB_HEIGHT))
+            .w(px(28.0))
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.panel))
+            .child(icon(
+                include_bytes!("../../assets/icons/panel-left.svg"),
+                14.0,
+                theme.muted,
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_sidebar();
+                cx.notify();
+            }));
+        let tab_strip = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap_3()
-            .px_3()
-            .bg(theme.bg)
-            .border_b_1()
+            .gap_1()
+            .h(px(TAB_STRIP_HEIGHT))
+            .pl(px(pad))
+            .pr(px(8.0))
+            .child(toggle)
+            .child(tabs);
+        div()
+            .absolute()
+            .left(px(left))
+            .right(px(0.0))
+            .top(px(4.0))
+            .h(px(TAB_STRIP_HEIGHT))
+            .flex()
+            .flex_col()
+            .bg(theme.window_bg)
             .border_color(theme.border)
-            .text_size(px(self.font_size))
-            .child(
-                div()
-                    .id("l3s-sidebar-toggle")
-                    .cursor_pointer()
-                    .text_color(theme.muted)
-                    .hover(|style| style.text_color(theme.fg))
-                    .child(if self.sidebar_visible { "«" } else { "»" })
-                    .on_click(cx.listener(|this, _, _, _| this.toggle_sidebar())),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .flex_shrink_0()
-                    .text_color(theme.panel_fg)
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded_md().bg(theme.accent))
-                    .child(format!("l3s · {}", self.target.label())),
-            )
-            .child(tabs)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .flex_shrink_0()
-                    .child(
-                        div()
-                            .id("l3s-menu")
-                            .cursor_pointer()
-                            .text_color(theme.accent)
-                            .hover(|style| style.text_color(theme.panel_fg))
-                            .child("Menu")
-                            .on_click(cx.listener(|this, _, _, _| this.click_menu())),
-                    )
-                    .child(div().text_color(theme.muted).child(self.status.clone())),
-            )
+            .child(tab_strip)
     }
 
-    fn tab_item(&self, tab: &Tab, cx: &mut Context<Self>, tab_height: f32) -> impl IntoElement {
+    fn tab_item(&self, tab: &Tab, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let active = tab.active;
         let index = tab.index;
         let close_index = tab.index;
-        // The close button only brightens on hover: a resting tab bar reads as
-        // labels, and the target is one cell wide anyway.
+        let label = truncate_label(&tab.label(), 28);
+        let group = format!("l3s-tab-{index}");
         let close = div()
             .id(format!("l3s-tab-close-{index}"))
             .flex()
             .items_center()
             .cursor_pointer()
             .text_color(theme.muted)
-            .hover(|style| style.text_color(theme.accent))
-            .child("✕")
+            .opacity(0.0)
+            .group_hover(group.clone(), |style| style.opacity(1.0))
+            .hover(|style| style.text_color(theme.panel_fg))
+            .child(icon(
+                include_bytes!("../../assets/icons/x.svg"),
+                10.0,
+                theme.muted,
+            ))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 this.close_tab(close_index);
             }));
-        let (bg, fg) = if active {
-            (theme.panel, theme.panel_fg)
-        } else {
-            (theme.bg, theme.muted)
-        };
-        let mut item = div()
+        let fg = if active { theme.panel_fg } else { theme.muted };
+        div()
             .id(format!("l3s-tab-{index}"))
+            .group(group)
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
-            .gap_3()
-            .h(px(tab_height))
+            .gap_2()
+            .h(px(TAB_HEIGHT))
+            .min_w(px(100.0))
             .px_3()
-            .rounded_t_md()
+            .rounded_md()
             .cursor_pointer()
-            .text_size(px(self.font_size))
-            .bg(bg)
+            .text_size(px(CHROME_FONT))
+            .bg(if active { theme.panel } else { theme.panel_dim })
             .text_color(fg)
-            .child(div().child(tab.label()))
-            .child(close)
             .hover(|style| style.bg(theme.panel).text_color(theme.panel_fg))
-            .on_click(cx.listener(move |this, _, _, _| this.focus_tab(index)));
-        // The active tab carries an accent cap, so it stays legible when a
-        // second tab is under the pointer.
-        if active {
-            item = item.border_t_1().border_color(theme.accent);
-        }
-        item
+            .child(div().flex_1().child(label))
+            .child(close)
+            .on_click(cx.listener(move |this, _, _, _| this.focus_tab(index)))
     }
 
     /// Open the daemon's Settings menu by clicking its Menu pill.
     fn click_menu(&self) {
         if let Some(cell) = self.menu_cell() {
             self.forward_click(cell);
+        }
+    }
+
+    /// Daemon columns hidden beneath our sidebar: the dock the daemon blanks
+    /// for us. Zero when our sidebar is hidden (the daemon draws its own
+    /// there) or the dock sits elsewhere.
+    fn skipped_cols(&self) -> u16 {
+        if !self.sidebar_visible {
+            return 0;
+        }
+        match self.surface.shell_dock() {
+            Some(dock) if dock.x == 0 => dock.width,
+            _ => 0,
         }
     }
 
@@ -770,121 +1134,262 @@ impl L3sView {
         }
     }
 
-    /// The native bottom bar, covering the daemon's status line.
+    /// Pixels the bottom chrome insets past the sidebar, when it is visible.
+    /// The native bottom bar: session switcher on the left, widgets on right.
     ///
-    /// The right side mirrors the daemon's own status-bar widgets (fetched via
-    /// `ui.bar.list`); the left shows the connection and session.
-    fn status_bar(&self, cell_height: f32) -> Div {
+    /// The right side mirrors the daemon's own status-bar widgets (fetched
+    /// via `ui.bar.list`). The session pill opens the session menu; the bar
+    /// starts past the sidebar so it never hides beneath it.
+    fn status_bar(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let font_size = self.font_size;
-        let mut right = div().flex().flex_row().items_center().gap_2();
-        for widget in &self.bar_widgets {
-            if widget.region != "bottom-right" {
-                continue;
-            }
-            for segment in &widget.content {
-                if segment.separator {
-                    right = right.child(div().text_color(theme.muted).child("·"));
-                } else if !segment.text.is_empty() {
-                    right = right.child(
-                        div()
-                            .text_color(tone_color(&segment.tone, theme))
-                            .child(segment.text.clone()),
-                    );
-                }
-            }
-        }
+        let right = div().flex().flex_row().items_center().gap_2().child(
+            div()
+                .id("l3s-settings")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(28.0))
+                .w(px(28.0))
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.panel))
+                .child(icon(
+                    include_bytes!("../../assets/icons/settings.svg"),
+                    14.0,
+                    theme.muted,
+                ))
+                .on_click(cx.listener(|this, _, _, _| this.click_menu())),
+        );
         div()
             .absolute()
             .left(px(0.0))
-            .bottom(px(0.0))
+            .bottom(px(4.0))
             .w_full()
-            .h(px(cell_height))
+            .h(px(FOOTER_HEIGHT))
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
             .px_3()
-            .bg(theme.panel)
-            .text_size(px(font_size))
+            .text_size(px(12.0))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(div().text_color(theme.accent).child("●"))
-                    .child(div().text_color(theme.panel_fg).child(self.status.clone())),
+                    .child(
+                        div()
+                            .id("l3s-session-button")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .h(px(28.0))
+                            .px_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.panel))
+                            .child(
+                                div()
+                                    .text_color(theme.panel_fg)
+                                    .child(self.current_session_name().to_string()),
+                            )
+                            .child(icon(
+                                include_bytes!("../../assets/icons/chevron-down.svg"),
+                                12.0,
+                                theme.muted,
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.session_menu_open = !this.session_menu_open;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.muted)
+                            .child(truncate_label(&self.crumb_path(), 48)),
+                    )
+                    .child(session_status(
+                        self.status.clone(),
+                        self.current_session_name(),
+                        theme.muted,
+                    )),
             )
             .child(right)
     }
 
+    /// The footer session menu: switch sessions or start a fresh one.
+    ///
+    /// A transparent catcher covers the content area so a click anywhere
+    /// outside dismisses; the panel stops propagation so its own clicks land.
+    fn session_menu(&self, cx: &mut Context<Self>, card_x: f32) -> Div {
+        if !self.session_menu_open {
+            return div();
+        }
+        let theme = self.theme;
+        let mut items = div().flex().flex_col().gap_1();
+        for session in &self.sessions {
+            let name = session.name.clone();
+            let is_current = session.name == self.current_session_name();
+            let bg = if is_current {
+                theme.panel
+            } else {
+                theme.sidebar_bg
+            };
+            items = items.child(
+                div()
+                    .id(format!("l3s-menu-session-{}", session.name))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(28.0))
+                    .px_2()
+                    .rounded_md()
+                    .bg(bg)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.panel))
+                    .text_size(px(CHROME_FONT))
+                    .child(icon(
+                        if session.running {
+                            include_bytes!("../../assets/icons/cloud.svg")
+                        } else {
+                            include_bytes!("../../assets/icons/circle.svg")
+                        },
+                        14.0,
+                        theme.muted,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(if session.running {
+                                theme.panel_fg
+                            } else {
+                                theme.muted
+                            })
+                            .child(session.name.clone()),
+                    )
+                    .child(div().text_size(px(11.0)).text_color(theme.muted).child(
+                        if session.running {
+                            "running"
+                        } else {
+                            "stopped"
+                        },
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.session_menu_open = false;
+                        this.switch_session(&name);
+                        cx.notify();
+                    })),
+            );
+        }
+        items = items.child(
+            div()
+                .id("l3s-menu-new-session")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .h(px(28.0))
+                .px_2()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.panel))
+                .text_size(px(CHROME_FONT))
+                .text_color(theme.panel_fg)
+                .child(icon(
+                    include_bytes!("../../assets/icons/plus.svg"),
+                    14.0,
+                    theme.muted,
+                ))
+                .child("New session…")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.start_new_session();
+                    cx.notify();
+                })),
+        );
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(card_x + 12.0))
+                    .bottom(px(FOOTER_HEIGHT + 8.0))
+                    .w(px(264.0))
+                    .rounded_md()
+                    .bg(theme.sidebar_bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .p_2()
+                    .child(items)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    ),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.session_menu_open = false;
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// One project or nested workspace row; the active workspace gets the pill.
     fn workspace_row(
         &self,
         workspace: &ShellWorkspace,
-        dock: &ShellDockRect,
         cx: &mut Context<Self>,
-        cell_height: f32,
-        row_height: f32,
     ) -> impl IntoElement {
         let theme = self.theme;
         let active = workspace.active;
-        let background = if active {
-            theme::resolve(dock.active_bg, theme.panel)
-        } else {
-            theme.bg
-        };
-        let name_color = if active {
-            theme::resolve(dock.active_fg, theme.accent)
-        } else {
-            theme::resolve(dock.normal_fg, theme.fg)
-        };
-        let secondary = theme::resolve(dock.secondary_fg, theme.muted);
-        let branch_color = theme::resolve(dock.branch_fg, theme.accent);
-        let dot_color = theme::resolve(workspace.dot_color, theme.fg);
-
-        let mut first = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .h(px(cell_height))
-            .text_size(px(self.font_size))
-            .gap_2();
-        if workspace.nested {
-            first = first.child(div().text_color(secondary).child("└"));
-        }
-        first = first.child(div().text_color(dot_color).child(workspace.dot.clone()));
-        let mut name = div().text_color(name_color);
-        if active {
-            name = name.font_weight(FontWeight::BOLD);
-        }
-        first = first.child(name.child(workspace.name.clone()));
-        if let Some(branch) = workspace.branch.clone() {
-            first = first.child(
-                div()
-                    .text_color(if active { branch_color } else { secondary })
-                    .child(format!("  {branch}")),
-            );
-        }
-
+        let bg = if active { theme.panel } else { theme.window_bg };
         let mut row = div()
             .id(format!("l3s-workspace-{}", workspace.index))
             .flex()
-            .flex_col()
-            .h(px(row_height))
-            .bg(background)
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(if workspace.nested { 26.0 } else { 28.0 }))
+            .px_2()
+            .rounded_md()
+            .bg(bg)
             .cursor_pointer()
             .hover(|style| style.bg(theme.panel))
-            .child(first);
-        if dock.show_paths {
-            let indent = if workspace.nested { "    " } else { "  " };
-            row = row.child(
-                div()
-                    .h(px(cell_height))
-                    .text_size(px(self.font_size))
-                    .text_color(secondary)
-                    .child(format!("{indent}{}", workspace.cwd)),
-            );
+            .text_size(px(CHROME_FONT));
+        if workspace.nested {
+            row = row.pl(px(18.0));
+        }
+        let mut name = div().text_color(theme.panel_fg);
+        if active {
+            name = name.font_weight(FontWeight::BOLD);
+        }
+        row = row
+            .child(if workspace.nested {
+                icon(
+                    include_bytes!("../../assets/icons/circle.svg"),
+                    10.0,
+                    theme.muted,
+                )
+            } else {
+                icon(
+                    include_bytes!("../../assets/icons/folder.svg"),
+                    14.0,
+                    theme.panel_fg,
+                )
+            })
+            .child(name.child(workspace.name.clone()));
+        // The branch stays subtle here; the prompt line below carries the color.
+        if !workspace.nested
+            && let Some(branch) = workspace.branch.clone()
+        {
+            row = row.child(div().text_color(theme.branch).child(branch));
         }
         let id = workspace.id.clone();
         row.on_mouse_down(
@@ -893,121 +1398,363 @@ impl L3sView {
         )
     }
 
-    /// The native agents section: live agent sessions from the control API.
-    fn agents_section(&self, cx: &mut Context<Self>, cell_height: f32) -> Div {
-        let font_size = self.font_size;
-        let mut section = div().flex().flex_col().pt(px(cell_height * 0.75)).child(
+    /// Working directory for the footer: the active workspace's cwd.
+    fn crumb_path(&self) -> String {
+        if let Some(active) = self.surface.workspaces().iter().find(|w| w.active) {
+            return shorten_home(&active.cwd);
+        }
+        self.target.label()
+    }
+
+    /// The bound view holding focus, if any, from the daemon's tab kinds.
+    fn tab_view(&self) -> Option<NavKind> {
+        match self.tabs.iter().find(|tab| tab.active)?.kind.as_str() {
+            "mission" => Some(NavKind::Mission),
+            "orch" => Some(NavKind::Orchestration),
+            _ => None,
+        }
+    }
+
+    /// The view a nav row opens: data rows deep-link to their board.
+    fn nav_view(kind: NavKind) -> NavKind {
+        match kind {
+            NavKind::Automations | NavKind::Mission => NavKind::Mission,
+            NavKind::Tasks | NavKind::Orchestration => NavKind::Orchestration,
+        }
+    }
+
+    /// Whether a nav row reads active: the optimistic pick wins while fresh,
+    /// then yields to whatever the daemon actually focused. Exactly one row
+    /// ever lights, so a click never sprays the highlight across the menu.
+    fn nav_active(&self, kind: NavKind) -> bool {
+        if self.nav_sel != Some(kind) {
+            return false;
+        }
+        self.nav_sel_at.elapsed() < Duration::from_secs(3)
+            || self.tab_view() == Some(Self::nav_view(kind))
+    }
+
+    /// Follow the daemon when it navigates on its own (chords typed in a pane).
+    fn reconcile_nav(&mut self) {
+        if let Some(view) = self.tab_view()
+            && self.nav_sel.is_none_or(|sel| Self::nav_view(sel) != view)
+        {
+            self.nav_sel = Some(view);
+            self.nav_sel_at = Instant::now();
+        }
+    }
+
+    /// One sidebar destination: lucide glyph, label, live badge, chord click.
+    fn nav_row(&self, kind: NavKind, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let active = self.nav_active(kind);
+        let bg = if active { theme.panel } else { theme.window_bg };
+        let badge = match kind {
+            NavKind::Automations => Some(self.automations.enabled.to_string()),
+            NavKind::Tasks => Some(self.tasks.open.to_string()),
+            NavKind::Mission | NavKind::Orchestration => None,
+        };
+        let badge = match badge {
+            Some(text) => div()
+                .text_size(px(11.0))
+                .text_color(theme.muted)
+                .child(text),
+            None => div(),
+        };
+        let label = div().flex_1();
+        let chord = kind.chord();
+        div()
+            .id(format!("l3s-nav-{}", kind.label()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .h(px(28.0))
+            .px_2()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(CHROME_FONT))
+            .bg(bg)
+            .text_color(theme.panel_fg)
+            .hover(|style| style.bg(theme.panel))
+            .child(icon(kind.icon(), 15.0, theme.muted))
+            .child(label.child(kind.label().to_string()))
+            .child(badge)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.nav_sel = Some(kind);
+                this.nav_sel_at = Instant::now();
+                this.send_bind(chord);
+                cx.notify();
+            }))
+    }
+
+    /// Send `<bind> + key`: the daemon's prefix chord followed by `key`.
+    ///
+    /// The daemon's Keys tab confirms these: `m` opens Mission Control and
+    /// `o` opens the task board.
+    fn send_bind(&self, key: char) {
+        let press = |code: KeyCode, mods: KeyModifiers| {
+            ClientMessage::Key(KeyEvent::new_with_kind(code, mods, KeyEventKind::Press))
+        };
+        let _ = self
+            .connection
+            .send(press(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        let _ = self
+            .connection
+            .send(press(KeyCode::Char(key), KeyModifiers::NONE));
+    }
+
+    /// MACHINES: saved SSH profiles under our state root, display-only.
+    ///
+    /// The daemon exposes no control method for machines and opening one
+    /// needs an interactive terminal, so rows carry no action.
+    fn machines_section(&self) -> Div {
+        let theme = self.theme;
+        let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_between()
-                .h(px(cell_height))
+                .h(px(22.0))
+                .px_2()
                 .child(
                     div()
-                        .text_size(px(font_size))
+                        .text_size(px(SECTION_FONT))
                         .font_weight(FontWeight::BOLD)
-                        .text_color(self.theme.accent)
-                        .child("AGENTS"),
-                )
+                        .text_color(theme.muted)
+                        .child("MACHINES"),
+                ),
+        );
+        if self.machines.is_empty() {
+            return section.child(
+                div()
+                    .h(px(26.0))
+                    .px_2()
+                    .text_size(px(CHROME_FONT))
+                    .text_color(theme.muted)
+                    .child("No machines"),
+            );
+        }
+        for machine in &self.machines {
+            section = section.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(26.0))
+                    .px_2()
+                    .rounded_md()
+                    .text_size(px(CHROME_FONT))
+                    .child(icon(
+                        include_bytes!("../../assets/icons/server.svg"),
+                        14.0,
+                        theme.muted,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(if machine.enabled {
+                                theme.panel_fg
+                            } else {
+                                theme.muted
+                            })
+                            .child(machine.display().to_string()),
+                    )
+                    .child(machine_status(machine, theme)),
+            );
+        }
+        section
+    }
+
+    /// AGENTS: live agent sessions; clicking a row focuses its pane.
+    fn agents_section(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(22.0))
+                .px_2()
                 .child(
                     div()
-                        .text_size(px(font_size))
-                        .text_color(self.theme.muted)
-                        .child(self.agents.len().to_string()),
+                        .text_size(px(SECTION_FONT))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.muted)
+                        .child("AGENTS"),
                 ),
         );
         if self.agents.is_empty() {
             return section.child(
                 div()
-                    .h(px(cell_height))
-                    .text_size(px(font_size))
-                    .text_color(self.theme.muted)
-                    .child("no active agents"),
+                    .h(px(26.0))
+                    .px_2()
+                    .text_size(px(CHROME_FONT))
+                    .text_color(theme.muted)
+                    .child("No agents"),
             );
         }
         for agent in &self.agents {
-            section = section.child(self.agent_row(agent, cx, cell_height));
+            let pane = agent.pane.clone();
+            section = section.child(
+                div()
+                    .id(format!("l3s-agent-{}", agent.pane))
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.panel))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(CHROME_FONT))
+                            .child(icon(
+                                include_bytes!("../../assets/icons/circle.svg"),
+                                9.0,
+                                status_color(&agent.status, theme),
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_color(theme.panel_fg)
+                                    .child(agent.label().to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted)
+                                    .child(agent.agent.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .pl(px(17.0))
+                            .text_size(px(11.0))
+                            .text_color(theme.muted)
+                            .child(agent.workspace_name.clone())
+                            .child(match agent.branch.clone() {
+                                Some(branch) => div().text_color(theme.ok).child(branch),
+                                None => div(),
+                            }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, _| this.focus_agent(&pane)),
+                    ),
+            );
         }
         section
     }
 
-    fn agent_row(
-        &self,
-        agent: &Agent,
-        cx: &mut Context<Self>,
-        cell_height: f32,
-    ) -> impl IntoElement {
+    /// WORKSPACES: the catalog grouped by nesting, with a picker shortcut.
+    fn projects_section(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let dot = status_color(&agent.status, theme);
-        let background = if agent.focused {
-            theme::resolve(0, theme.panel)
-        } else {
-            theme.bg
-        };
-        let mut line = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .h(px(cell_height))
-            .text_size(px(self.font_size))
-            .gap_2()
-            .child(div().text_color(dot).child("●"))
-            .child(div().text_color(theme.accent).child(agent.agent.clone()));
-        line = line.child(
+        let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
             div()
-                .text_color(if agent.focused {
-                    theme.accent
-                } else {
-                    theme.fg
-                })
-                .child(agent.label().to_string()),
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .h(px(22.0))
+                .px_2()
+                .child(
+                    div()
+                        .text_size(px(SECTION_FONT))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.muted)
+                        .child("WORKSPACES"),
+                )
+                .child(
+                    div()
+                        .id("l3s-add-workspace")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(22.0))
+                        .w(px(22.0))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.panel))
+                        .child(icon(
+                            include_bytes!("../../assets/icons/plus.svg"),
+                            11.0,
+                            theme.muted,
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, _| {
+                                let _ = this.connection.send(ClientMessage::OpenWorkspacePicker);
+                            }),
+                        ),
+                ),
         );
-
-        let mut detail = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .h(px(cell_height))
-            .text_size(px(self.font_size))
-            .gap_2()
-            .text_color(theme.muted)
-            .child(agent.workspace_name.clone());
-        if let Some(branch) = agent.branch.clone() {
-            detail = detail.child(div().text_color(theme.ok).child(branch));
+        if self.surface.workspaces().is_empty() {
+            return section.child(
+                div()
+                    .h(px(26.0))
+                    .px_2()
+                    .text_size(px(CHROME_FONT))
+                    .text_color(theme.muted)
+                    .child("No projects yet"),
+            );
         }
+        for workspace in self.surface.workspaces() {
+            section = section.child(self.workspace_row(workspace, cx));
+        }
+        section
+    }
 
-        let pane = agent.pane.clone();
-        div()
-            .id(format!("l3s-agent-{}", agent.pane))
-            .flex()
-            .flex_col()
-            .h(px(cell_height * 2.0))
-            .bg(background)
-            .cursor_pointer()
-            .hover(|style| style.bg(theme.panel))
-            .overflow_hidden()
-            .child(line)
-            .child(detail)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, _| this.focus_agent(&pane)),
-            )
+    /// Measure the inset card and the grid that fits inside it.
+    ///
+    /// The card floats below the tab strip with a gap on top, right, and
+    /// bottom, starting past the sidebar; the footer floats separately
+    /// beneath it. The grid keeps a border on every side.
+    fn card_layout(&mut self, window: &Window) -> CardLayout {
+        let cell_w = self.cell_width(window);
+        let cell_h = self.font_size * LINE_HEIGHT_RATIO;
+        let viewport = window.viewport_size();
+        let card_x = f32::from(self.sidebar_cells()) * cell_w + CARD_GAP;
+        let grid_w = f32::from(viewport.width) - card_x - CARD_GAP_RIGHT - 2.0;
+        let grid_h =
+            f32::from(viewport.height) - HEADER_HEIGHT - FOOTER_HEIGHT - CARD_GAP - CARD_GAP - 2.0;
+        let cols = (grid_w / cell_w).clamp(20.0, 500.0) as u16;
+        let rows = ((grid_h - TERMINAL_TOP_AIR) / cell_h).clamp(5.0, 300.0) as u16;
+        CardLayout {
+            card_x,
+            origin_x: card_x + 1.0,
+            origin_y: HEADER_HEIGHT + CARD_GAP + 1.0 + TERMINAL_TOP_AIR,
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+        }
     }
 
     /// Recompute the cell grid size and tell the daemon when it changes.
     ///
-    /// Columns are planned with the same measured advance the grid paints
-    /// with: planning with the rough ratio while painting with the measured
-    /// width makes the daemon lay out more columns than fit, clipping the
-    /// right edge (modals, btop) off the window.
+    /// The viewport is whatever fits inside the floating card; planning with
+    /// anything else lays out columns the card clips off.
     fn sync_metrics(&mut self, window: &Window) {
-        let viewport = window.viewport_size();
-        let cell_width = self.cell_width(window);
-        let cell_height = self.font_size * LINE_HEIGHT_RATIO;
-        let cols = (viewport.width / px(cell_width)).clamp(20.0, 500.0) as u16;
-        let rows =
-            ((viewport.height - px(HEADER_HEIGHT)) / px(cell_height)).clamp(5.0, 300.0) as u16;
+        let layout = self.card_layout(window);
+        // The daemon lays out its whole chrome (docks included); we only show
+        // the pane area, so the skipped rows and columns ride along.
+        let cols = layout.cols.saturating_add(self.skipped_cols());
+        let rows = layout
+            .rows
+            .saturating_add(SKIPPED_DAEMON_ROWS)
+            .saturating_add(SKIPPED_DAEMON_BOTTOM_ROWS);
         if cols == self.cols && rows == self.rows {
             return;
         }
@@ -1016,8 +1763,8 @@ impl L3sView {
         let _ = self.connection.send(ClientMessage::Resize {
             cols,
             rows,
-            cell_width_px: cell_width.round().clamp(1.0, 65535.0) as u16,
-            cell_height_px: cell_height.round().clamp(1.0, 65535.0) as u16,
+            cell_width_px: layout.cell_w.round().clamp(1.0, 65535.0) as u16,
+            cell_height_px: layout.cell_h.round().clamp(1.0, 65535.0) as u16,
         });
     }
 }
@@ -1032,6 +1779,7 @@ impl Render for L3sView {
         let theme = self.theme;
         let cell_height = self.font_size * LINE_HEIGHT_RATIO;
         let cell_width = self.cell_width(window);
+        let layout = self.card_layout(window);
         let line_height = px(cell_height);
         let selection = self.selection;
         let grid = match self.surface.frame() {
@@ -1042,6 +1790,9 @@ impl Render for L3sView {
                 line_height,
                 selection,
                 cell_width,
+                self.skipped_cols(),
+                layout.cols,
+                layout.rows,
             ),
             None => div()
                 .flex()
@@ -1054,43 +1805,51 @@ impl Render for L3sView {
         let grid = grid
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _, cx| this.begin_selection(event, cx)),
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.begin_selection(event, window, cx);
+                }),
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(|this, event: &MouseDownEvent, _, _| {
-                    this.press(event, TerminalMouseButton::Right);
+                cx.listener(|this, event: &MouseDownEvent, window, _| {
+                    this.press(event, TerminalMouseButton::Right, window);
                 }),
             )
             .on_mouse_down(
                 MouseButton::Middle,
-                cx.listener(|this, event: &MouseDownEvent, _, _| {
-                    this.press(event, TerminalMouseButton::Middle);
+                cx.listener(|this, event: &MouseDownEvent, window, _| {
+                    this.press(event, TerminalMouseButton::Middle, window);
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, _, cx| this.finish_selection(event, cx)),
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.finish_selection(event, window, cx);
+                }),
             )
             .on_mouse_up(
                 MouseButton::Right,
-                cx.listener(|this, event: &MouseUpEvent, _, _| {
-                    this.release(event, TerminalMouseButton::Right);
+                cx.listener(|this, event: &MouseUpEvent, window, _| {
+                    this.release(event, TerminalMouseButton::Right, window);
                 }),
             )
             .on_mouse_up(
                 MouseButton::Middle,
-                cx.listener(|this, event: &MouseUpEvent, _, _| {
-                    this.release(event, TerminalMouseButton::Middle);
+                cx.listener(|this, event: &MouseUpEvent, window, _| {
+                    this.release(event, TerminalMouseButton::Middle, window);
                 }),
             )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                this.extend_selection(event, cx);
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                this.extend_selection(event, window, cx);
             }))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, _| {
-                this.scroll(event);
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, _| {
+                this.scroll(event, window);
             }));
-        let sidebar = self.sidebar(cx, cell_width, cell_height);
+        let sidebar = self.sidebar(
+            cx,
+            cell_width,
+            f32::from(window.viewport_size().height) - FOOTER_HEIGHT,
+        );
 
         // The unified top chrome paints over this row; the spacer only keeps
         // the grid and the pointer mapping anchored at HEADER_HEIGHT.
@@ -1102,29 +1861,55 @@ impl Render for L3sView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(theme.bg)
+            .bg(theme.window_bg)
             .text_color(theme.fg)
-            .font_family(FONT_FAMILY)
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.on_key_down(event, cx);
             }))
             .child(header)
             .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(grid)
-                    .child(self.status_bar(cell_height)),
+                div().relative().flex_1().child(
+                    div()
+                        .absolute()
+                        .left(px(layout.card_x))
+                        // Content already starts below the header spacer, so the
+                        // top is just the gap (counting HEADER_HEIGHT twice
+                        // pushes the whole grid down and clips its bottom).
+                        .top(px(CARD_GAP))
+                        .right(px(CARD_GAP_RIGHT))
+                        // Fixed bottom: any floor slack stays inside the card
+                        // on the grid's own background, invisible.
+                        .bottom(px(FOOTER_HEIGHT + CARD_GAP))
+                        .flex()
+                        .flex_col()
+                        .bg(theme.bg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .rounded_md()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .pt(px(TERMINAL_TOP_AIR))
+                                .child(grid),
+                        ),
+                ),
             )
-            // Both chrome layers live at the root so they can reach over the
-            // header row; the content column clips its own overflow.
+            // Chrome layers live at the root so they paint above the content
+            // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
-            .child(self.top_chrome(cx, cell_width, cell_height))
+            .child(self.top_chrome(cx, cell_width))
+            .child(self.session_menu(cx, layout.card_x))
+            .child(self.status_bar(cx))
     }
 }
 
+/// Paint the visible window of the grid, clamped to the layout: the daemon
+/// can lag a resize in either direction, and anything outside the card is
+/// clipped anyway, so pointer and paint must agree on the same bounds.
+#[allow(clippy::too_many_arguments)]
 fn render_grid(
     frame: &FrameData,
     theme: Theme,
@@ -1132,9 +1917,15 @@ fn render_grid(
     line_height: Pixels,
     selection: Option<Selection>,
     cell_width: f32,
+    skip_cols: u16,
+    max_cols: u16,
+    max_rows: u16,
 ) -> Div {
+    let end_row = SKIPPED_DAEMON_ROWS
+        .saturating_add(max_rows)
+        .min(frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS));
     let mut column = div().flex().flex_col().size_full();
-    for row in 0..frame.height {
+    for row in SKIPPED_DAEMON_ROWS..end_row.max(SKIPPED_DAEMON_ROWS) {
         column = column.child(render_row(
             frame,
             row,
@@ -1143,11 +1934,15 @@ fn render_grid(
             line_height,
             selection,
             cell_width,
+            skip_cols,
+            max_cols,
         ));
     }
     column
 }
 
+/// Paint one grid row, skipping the dock columns our sidebar covers.
+#[allow(clippy::too_many_arguments)]
 fn render_row(
     frame: &FrameData,
     row: u16,
@@ -1156,17 +1951,23 @@ fn render_row(
     line_height: Pixels,
     selection: Option<Selection>,
     cell_width: f32,
+    skip_cols: u16,
+    max_cols: u16,
 ) -> Div {
     let width = usize::from(frame.width);
-    let start = usize::from(row) * width;
-    let end = (start + width).min(frame.cells.len());
+    let skip = usize::from(skip_cols).min(width);
+    let paint_w = (width.saturating_sub(skip)).min(usize::from(max_cols));
+    let start = usize::from(row) * width + skip;
+    let end = (start + paint_w).min(frame.cells.len());
     let cells = frame.cells.get(start..end).unwrap_or(&[]);
 
     let mut element = div()
         .relative()
         .flex_shrink_0()
         .h(line_height)
-        .w(px(f32::from(frame.width) * cell_width));
+        .w(px(
+            f32::from(frame.width.saturating_sub(skip_cols)) * cell_width
+        ));
 
     // A double-width glyph covers two columns; the daemon blanks the trailing
     // continuation cell. Drop it here too so the run advances exactly one cell
@@ -1175,7 +1976,8 @@ fn render_row(
     let mut column = 0usize;
     while column < cells.len() {
         let cell = &cells[column];
-        rendered.push((column as u16, cell, cursor_at(frame, column as u16, row)));
+        let absolute = skip_cols.saturating_add(column as u16);
+        rendered.push((absolute, cell, cursor_at(frame, absolute, row)));
         column += if l3s_protocol::symbol_width(symbol(cell)) >= 2 {
             2
         } else {
@@ -1213,9 +2015,14 @@ fn render_row(
         };
         let run_cells = end_column.saturating_sub(start_column).max(1);
 
+        // Runs position relative to the painted slice: the container starts
+        // at the first visible column, so absolute daemon columns would
+        // shove every run right by the skipped width (and clip the edge).
         let mut span = div()
             .absolute()
-            .left(px(f32::from(start_column) * cell_width))
+            .left(px(
+                f32::from(start_column.saturating_sub(skip_cols)) * cell_width
+            ))
             .top(px(0.0))
             .w(px(f32::from(run_cells) * cell_width))
             .h(line_height)
@@ -1281,6 +2088,82 @@ fn symbol(cell: &CellData) -> &str {
     }
 }
 
+/// Reachability text for a machine row: latency, state, or still probing.
+fn machine_status(machine: &MachineInfo, theme: Theme) -> Div {
+    let (text, color) = match (machine.online, machine.latency_ms) {
+        (Some(true), Some(ms)) => (format!("{ms} ms"), theme.ok),
+        (Some(true), None) => ("online".to_string(), theme.ok),
+        (Some(false), _) => ("offline".to_string(), theme.alert),
+        (None, _) => ("…".to_string(), theme.muted),
+    };
+    div().text_size(px(11.0)).text_color(color).child(text)
+}
+
+/// The footer status text, hidden when it repeats the session pill.
+fn session_status(status: String, session: &str, muted: gpui::Rgba) -> Div {
+    if status == session {
+        return div();
+    }
+    div().text_color(muted).child(status)
+}
+
+/// A baked lucide glyph at `size` logical pixels, tinted `color`.
+///
+/// GPUI paints SVGs as an alpha mask tinted with the element's own text
+/// color, so every icon sets it explicitly instead of inheriting.
+fn icon(bytes: &'static [u8], size: f32, color: gpui::Rgba) -> impl IntoElement {
+    svg()
+        .data(bytes)
+        .w(px(size))
+        .h(px(size))
+        .flex_shrink_0()
+        .text_color(color)
+}
+
+/// Outcome of a background `luvus server start` for a fresh session.
+enum SessionOpResult {
+    Started(String),
+    StartFailed(String, String),
+}
+
+/// Start a named session's server and wait for its socket, off-thread.
+fn start_session_blocking(root: &Path, name: &str) -> SessionOpResult {
+    match l3s_client::ensure_server_for(root, Some(name)) {
+        Ok(()) => SessionOpResult::Started(name.to_string()),
+        Err(l3s_client::Error::NotFound { .. }) => {
+            SessionOpResult::StartFailed(name.to_string(), "luvus not found".to_string())
+        }
+        Err(error) => SessionOpResult::StartFailed(name.to_string(), error.to_string()),
+    }
+}
+
+/// The control socket for `session` (`None` is default) under `root`.
+fn api_socket_for(root: &Path, session: Option<&str>) -> PathBuf {
+    match session {
+        Some(name) => root.join("sessions").join(name).join("luvus.sock"),
+        None => root.join("luvus.sock"),
+    }
+}
+
+/// Shorten a workspace path with `~`, the way the mock's breadcrumb reads.
+fn shorten_home(path: &str) -> String {
+    if let Some(home) = std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
+        && let Some(rest) = path.strip_prefix(home.as_str())
+    {
+        return format!("~{rest}");
+    }
+    path.to_string()
+}
+
+/// Cap a tab label at `max` chars so one long name cannot crowd the strip.
+fn truncate_label(label: &str, max: usize) -> String {
+    if label.chars().count() <= max {
+        return label.to_string();
+    }
+    let kept: String = label.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
 /// A color for an agent status dot.
 fn status_color(status: &str, theme: Theme) -> gpui::Rgba {
     match status {
@@ -1288,17 +2171,6 @@ fn status_color(status: &str, theme: Theme) -> gpui::Rgba {
         "blocked" => theme.alert,
         "done" => theme.ok,
         _ => theme.muted,
-    }
-}
-
-/// A color for a status-bar segment tone.
-fn tone_color(tone: &str, theme: Theme) -> gpui::Rgba {
-    match tone {
-        "muted" => theme.muted,
-        "accent" => theme.accent,
-        "success" => theme.ok,
-        "error" => theme.alert,
-        _ => theme.panel_fg,
     }
 }
 

@@ -32,3 +32,6 @@ gpui_platform = { workspace = true, optional = true }
 objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
+
+[dev-dependencies]
+resvg = "=0.46.0"

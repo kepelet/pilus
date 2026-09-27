@@ -20,8 +20,8 @@ mod uhp;
 pub use autostart::{ensure_server, ensure_server_for};
 pub use connection::{ClientEvent, Connection, EndpointIdentity};
 pub use control::{
-    Agent, AgentFeed, AutomationSummary, BarSegment, BarWidget, ControlClient, FeedUpdate, Tab,
-    TaskSummary,
+    Agent, AgentFeed, Appearance, AutomationSummary, BarSegment, BarWidget, ControlClient,
+    FeedUpdate, Tab, TaskSummary, ThemeInfo,
 };
 pub use discovery::{
     SessionInfo, active_session, api_socket_path_for, client_socket_path_for,

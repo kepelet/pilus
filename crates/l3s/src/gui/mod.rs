@@ -5,12 +5,18 @@
 //! still owns layout, but this client claims the workspaces dock so it can draw
 //! that one panel natively, and selects text over the grid itself.
 
+mod about;
 mod app_icon;
+mod appearances;
 mod keys;
+mod scheme;
 mod selection;
+mod settings;
 mod theme;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -19,20 +25,21 @@ use crossterm::event::{
     MouseEventKind,
 };
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Div, FocusHandle, FontWeight, Hsla, KeyDownEvent,
-    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    div, font, point, prelude::*, px, size, svg,
+    App, Bounds, ClipboardItem, Context, Div, FocusHandle, FontWeight, Hsla, KeyBinding,
+    KeyDownEvent, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, TextRun, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, div, font, point, prelude::*, px, size, svg,
 };
 use gpui_platform::application;
 use l3s_client::{
-    Agent, AgentFeed, AutomationSummary, BarWidget, ClientEvent, ConnectTarget, Connection,
-    MachineInfo, SessionInfo, Surface, SurfaceChange, Tab, TaskSummary, config_dir,
-    generate_session_name, list_machines, list_session_infos, refresh_machines,
+    Agent, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent, ConnectTarget,
+    Connection, ControlClient, MachineInfo, SessionInfo, Surface, SurfaceChange, Tab, TaskSummary,
+    config_dir, generate_session_name, list_machines, list_session_infos, refresh_machines,
     split_client_socket,
 };
 use l3s_protocol::{CellData, ClientMessage, FrameData, ShellSidebars, ShellWorkspace};
 use selection::{Cell, Selection};
+use settings::Settings;
 use theme::Theme;
 
 /// Monospace family used for the cell grid.
@@ -60,6 +67,10 @@ const SKIPPED_DAEMON_BOTTOM_ROWS: u16 = 1;
 const FOOTER_HEIGHT: f32 = 28.0;
 /// Gap around the floating terminal card, on top/left/bottom.
 const CARD_GAP: f32 = 8.0;
+/// Slides the sidebar's first row down so it lines up with the top of the
+/// inset terminal card. The list's own `gap_1` already covers the rest of the
+/// `CARD_GAP` between the header and the card.
+const SIDEBAR_TOP_INSET: f32 = 4.0;
 /// Breathing room below the last row is intentionally zero: the grid runs
 /// flush to the card's bottom border.
 /// Breathing room above the first row, mirroring the bottom.
@@ -68,6 +79,9 @@ const TERMINAL_TOP_AIR: f32 = 6.0;
 const CARD_GAP_RIGHT: f32 = 16.0;
 /// Height of a tab pill in the top chrome.
 const TAB_HEIGHT: f32 = 26.0;
+/// Left inset for the collapsed tab strip: clears the floating traffic lights
+/// (the third light ends near 64px) with a comfortable gap before the toggle.
+const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
 /// Chrome text size; the cell grid keeps its own monospace size.
 const CHROME_FONT: f32 = 13.0;
 /// Section label size (SESSIONS / PROJECTS).
@@ -128,6 +142,67 @@ const M_ITALIC: u16 = 1 << 2;
 const M_UNDERLINED: u16 = 1 << 3;
 const M_REVERSED: u16 = 1 << 6;
 
+gpui::actions!([
+    /// Open the native Appearances window.
+    OpenAppearances,
+    /// Quit the application.
+    QuitApp,
+    /// Copy the current grid selection.
+    CopySelection,
+    /// Paste the system clipboard into the pane.
+    PasteClipboard,
+    /// Minimize the active window.
+    MinimizeWindow,
+    /// Zoom (maximize) the active window.
+    ZoomWindow,
+    /// Close the active window.
+    CloseWindow,
+    /// Select the whole visible grid.
+    SelectAllGrid,
+    /// Open another l3s window attached to the same daemon.
+    NewWindow,
+    /// Open a new daemon tab.
+    NewTab,
+    /// Split the focused pane side by side.
+    SplitVertical,
+    /// Split the focused pane stacked.
+    SplitHorizontal,
+    /// Close the active daemon tab.
+    CloseTab,
+    /// Close every open window.
+    CloseAllWindows,
+    /// Show the About window.
+    OpenAbout,
+    /// Check for updates (not wired up yet).
+    CheckForUpdates,
+    /// Grow the terminal font size.
+    IncreaseFontSize,
+    /// Shrink the terminal font size.
+    DecreaseFontSize,
+    /// Restore the default terminal font size.
+    ResetFontSize,
+    /// Show or hide the sidebar.
+    ToggleSidebar,
+    /// Focus tab 1.
+    FocusTab1,
+    /// Focus tab 2.
+    FocusTab2,
+    /// Focus tab 3.
+    FocusTab3,
+    /// Focus tab 4.
+    FocusTab4,
+    /// Focus tab 5.
+    FocusTab5,
+    /// Focus tab 6.
+    FocusTab6,
+    /// Focus tab 7.
+    FocusTab7,
+    /// Focus tab 8.
+    FocusTab8,
+    /// Focus tab 9.
+    FocusTab9
+]);
+
 /// Open the desktop window and attach to `target`.
 pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     // The real viewport is not known until a window exists; the first resize
@@ -136,9 +211,112 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     // Claim the workspaces dock before the window paints, so the daemon blanks
     // its own copy and starts projecting the catalog to us.
     connection.request_workspace_dock()?;
+    let appearances_socket = api_socket_for_target(&target);
+    let config_root = config_dir();
+    let new_window_target = target.clone();
+    let settings = Rc::new(RefCell::new(Settings::load(&config_root)));
 
     application().run(move |cx: &mut App| {
         app_icon::install();
+        cx.on_action({
+            let api = appearances_socket.clone();
+            let settings = settings.clone();
+            let config_root = config_root.clone();
+            move |_: &OpenAppearances, cx: &mut App| {
+                appearances::open(api.clone(), settings.clone(), config_root.clone(), cx)
+            }
+        });
+        cx.on_action(|_: &QuitApp, cx: &mut App| cx.quit());
+        // Enables the menu item; the update flow is not wired up yet.
+        cx.on_action(|_: &CheckForUpdates, _cx: &mut App| {});
+        cx.on_action(|_: &MinimizeWindow, cx: &mut App| {
+            if let Some(window) = cx.active_window() {
+                window
+                    .update(cx, |_, window, _| window.minimize_window())
+                    .ok();
+            }
+        });
+        cx.on_action(|_: &ZoomWindow, cx: &mut App| {
+            if let Some(window) = cx.active_window() {
+                window.update(cx, |_, window, _| window.zoom_window()).ok();
+            }
+        });
+        cx.on_action(|_: &CloseWindow, cx: &mut App| {
+            if let Some(window) = cx.active_window() {
+                window
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            }
+        });
+        cx.on_action({
+            let target = new_window_target.clone();
+            let settings = settings.clone();
+            move |_: &NewWindow, cx: &mut App| {
+                open_main_window(target.clone(), settings.clone(), cx)
+            }
+        });
+        cx.on_action(|_: &CloseAllWindows, cx: &mut App| {
+            for window in cx.windows() {
+                window
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            }
+        });
+        cx.on_action({
+            let settings = settings.clone();
+            let root = config_root.clone();
+            move |_: &IncreaseFontSize, cx: &mut App| bump_font(&settings, &root, 1.0, cx)
+        });
+        cx.on_action({
+            let settings = settings.clone();
+            let root = config_root.clone();
+            move |_: &DecreaseFontSize, cx: &mut App| bump_font(&settings, &root, -1.0, cx)
+        });
+        cx.on_action({
+            let settings = settings.clone();
+            let root = config_root.clone();
+            move |_: &ResetFontSize, cx: &mut App| bump_font(&settings, &root, 0.0, cx)
+        });
+        cx.bind_keys(app_key_bindings());
+        cx.set_menus([
+            Menu::new("l3s").items([
+                MenuItem::action("About l3s", OpenAbout),
+                MenuItem::action("Check for Updates…", CheckForUpdates),
+                MenuItem::separator(),
+                MenuItem::action("Appearances…", OpenAppearances),
+                MenuItem::separator(),
+                MenuItem::action("Quit l3s", QuitApp),
+            ]),
+            Menu::new("File").items([
+                MenuItem::action("New Window", NewWindow),
+                MenuItem::action("New Tab", NewTab),
+                MenuItem::separator(),
+                MenuItem::action("Split Vertical", SplitVertical),
+                MenuItem::action("Split Horizontal", SplitHorizontal),
+                MenuItem::separator(),
+                MenuItem::action("Close Tab", CloseTab),
+                MenuItem::action("Close Window", CloseWindow),
+                MenuItem::action("Close All Windows", CloseAllWindows),
+            ]),
+            Menu::new("Edit").items([
+                MenuItem::action("Copy", CopySelection),
+                MenuItem::action("Paste", PasteClipboard),
+                MenuItem::action("Select All", SelectAllGrid),
+            ]),
+            Menu::new("View").items([
+                MenuItem::action("Increase Font Size", IncreaseFontSize),
+                MenuItem::action("Decrease Font Size", DecreaseFontSize),
+                MenuItem::action("Reset Font Size", ResetFontSize),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Sidebar", ToggleSidebar),
+            ]),
+            Menu::new("Window").items([
+                MenuItem::action("Minimize", MinimizeWindow),
+                MenuItem::action("Zoom", ZoomWindow),
+                MenuItem::separator(),
+                MenuItem::action("Close Window", CloseWindow),
+            ]),
+        ]);
         let bounds = Bounds::centered(None, size(px(1240.0), px(780.0)), cx);
         let opened = cx.open_window(
             WindowOptions {
@@ -147,11 +325,16 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                 titlebar: Some(TitlebarOptions {
                     title: Some("l3s".into()),
                     appears_transparent: true,
-                    traffic_light_position: Some(point(px(12.0), px(11.0))),
+                    // Centred on the sidebar toggle icon box (22px from the
+                    // window top) and left-aligned with the sidebar nav glyphs
+                    // (12px panel padding + 8px row padding).
+                    traffic_light_position: Some(point(px(20.0), px(15.0))),
                 }),
                 ..Default::default()
             },
-            move |window, cx| cx.new(move |cx| L3sView::new(target, connection, window, cx)),
+            move |window, cx| {
+                cx.new(move |cx| L3sView::new(target, connection, settings.clone(), window, cx))
+            },
         );
         if let Err(error) = opened {
             eprintln!("l3s: could not open a window: {error}");
@@ -161,6 +344,93 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+/// Every application-level keybinding, in one place so a duplicate chord is a
+/// test failure rather than a shadowed shortcut.
+fn app_key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("cmd-,", OpenAppearances, None),
+        KeyBinding::new("cmd-q", QuitApp, None),
+        KeyBinding::new("cmd-c", CopySelection, None),
+        KeyBinding::new("cmd-v", PasteClipboard, None),
+        KeyBinding::new("cmd-a", SelectAllGrid, None),
+        KeyBinding::new("cmd-m", MinimizeWindow, None),
+        KeyBinding::new("cmd-n", NewWindow, None),
+        KeyBinding::new("cmd-t", NewTab, None),
+        KeyBinding::new("cmd-d", SplitVertical, None),
+        KeyBinding::new("cmd-shift-d", SplitHorizontal, None),
+        KeyBinding::new("cmd-w", CloseTab, None),
+        KeyBinding::new("cmd-shift-w", CloseWindow, None),
+        KeyBinding::new("cmd-alt-w", CloseAllWindows, None),
+        KeyBinding::new("cmd-=", IncreaseFontSize, None),
+        KeyBinding::new("cmd-+", IncreaseFontSize, None),
+        KeyBinding::new("cmd--", DecreaseFontSize, None),
+        KeyBinding::new("cmd-0", ResetFontSize, None),
+        KeyBinding::new("cmd-s", ToggleSidebar, None),
+        KeyBinding::new("cmd-1", FocusTab1, None),
+        KeyBinding::new("cmd-2", FocusTab2, None),
+        KeyBinding::new("cmd-3", FocusTab3, None),
+        KeyBinding::new("cmd-4", FocusTab4, None),
+        KeyBinding::new("cmd-5", FocusTab5, None),
+        KeyBinding::new("cmd-6", FocusTab6, None),
+        KeyBinding::new("cmd-7", FocusTab7, None),
+        KeyBinding::new("cmd-8", FocusTab8, None),
+        KeyBinding::new("cmd-9", FocusTab9, None),
+    ]
+}
+
+/// Open another l3s window on the same target.
+///
+/// Connection setup includes a handshake, so it briefly blocks; this only runs
+/// on an explicit File → New Window.
+fn open_main_window(target: ConnectTarget, settings: Rc<RefCell<Settings>>, cx: &mut App) {
+    let connection = match l3s_client::connect(&target, 120, 40) {
+        Ok(connection) => connection,
+        Err(error) => {
+            eprintln!("l3s: could not open another window: {error}");
+            return;
+        }
+    };
+    let _ = connection.request_workspace_dock();
+    let bounds = Bounds::centered(None, size(px(1240.0), px(780.0)), cx);
+    let opened = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(640.0), px(400.0))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("l3s".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(20.0), px(15.0))),
+            }),
+            ..Default::default()
+        },
+        move |window, cx| cx.new(move |cx| L3sView::new(target, connection, settings, window, cx)),
+    );
+    if let Err(error) = opened {
+        eprintln!("l3s: could not open another window: {error}");
+    }
+}
+
+/// Scale the UI and terminal fonts together and persist them. `delta == 0.0`
+/// restores the defaults.
+fn bump_font(settings: &Rc<RefCell<Settings>>, root: &Path, delta: f32, cx: &mut App) {
+    {
+        let mut settings = settings.borrow_mut();
+        let defaults = Settings::default();
+        let step = |value: f32, fallback: f32| {
+            if delta == 0.0 {
+                fallback
+            } else {
+                (value + delta).clamp(8.0, 32.0)
+            }
+        };
+        settings.ui_font_size = step(settings.ui_font_size, defaults.ui_font_size);
+        settings.terminal_font_size =
+            step(settings.terminal_font_size, defaults.terminal_font_size);
+        settings.save(root);
+    }
+    cx.refresh_windows();
 }
 
 /// Geometry of the inset terminal card: grid origin, visible cells, and the
@@ -186,12 +456,17 @@ struct L3sView {
     surface: Surface,
     theme: Theme,
     focus_handle: FocusHandle,
-    font_size: f32,
+    /// Font choices, shared with the Appearances window.
+    settings: Settings,
+    shared_settings: Rc<RefCell<Settings>>,
     cols: u16,
     rows: u16,
     status: String,
     /// Measured monospace advance width, resolved once from the font.
     cell_width: Option<f32>,
+    /// Last cell size pushed to the daemon, so a font change re-sends it even
+    /// when the row/column counts stay the same.
+    sent_cell: (u16, u16),
     /// Active native selection, if any.
     selection: Option<Selection>,
     /// Whether the left button is held and dragging across the grid.
@@ -238,6 +513,16 @@ struct L3sView {
     machine_rx: Receiver<Vec<MachineInfo>>,
     /// Sender half for the background machine refresh.
     machine_tx: Sender<Vec<MachineInfo>>,
+    /// Registered appearance themes and the selected id, from `theme.list`.
+    appearance: Appearance,
+    /// Last theme poll; the registry only changes on user action.
+    last_theme_poll: Instant,
+    /// A theme refresh is running off-thread; no overlapping spawns.
+    theme_refreshing: bool,
+    /// Fresh appearance snapshots from the background refresh.
+    theme_rx: Receiver<l3s_client::Result<Appearance>>,
+    /// Sender half for the background theme refresh.
+    theme_tx: Sender<l3s_client::Result<Appearance>>,
     /// Optimistic nav pick: the row a click chose, before the daemon confirms.
     nav_sel: Option<NavKind>,
     /// When the optimistic pick was made, so stale picks age out.
@@ -256,6 +541,7 @@ impl L3sView {
     fn new(
         target: ConnectTarget,
         connection: Connection,
+        shared_settings: Rc<RefCell<Settings>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -277,6 +563,8 @@ impl L3sView {
         let machines = list_machines(&session_root);
         let (machine_tx, machine_rx) = std::sync::mpsc::channel();
         let (session_tx, session_rx) = std::sync::mpsc::channel();
+        let (theme_tx, theme_rx) = std::sync::mpsc::channel();
+        let settings = shared_settings.borrow().clone();
 
         let view = Self {
             target,
@@ -284,11 +572,13 @@ impl L3sView {
             surface: Surface::new(),
             theme: Theme::default(),
             focus_handle,
-            font_size: FONT_SIZE,
+            settings,
+            shared_settings,
             cols: 120,
             rows: 40,
             status: "connecting…".to_string(),
             cell_width: None,
+            sent_cell: (0, 0),
             selection: None,
             dragging: false,
             drag_moved: false,
@@ -312,6 +602,11 @@ impl L3sView {
             machine_refreshing: false,
             machine_rx,
             machine_tx,
+            appearance: Appearance::default(),
+            last_theme_poll: Instant::now() - Duration::from_secs(11),
+            theme_refreshing: false,
+            theme_rx,
+            theme_tx,
             nav_sel: None,
             nav_sel_at: Instant::now(),
             sidebar_layout: None,
@@ -323,7 +618,8 @@ impl L3sView {
         cx.spawn(async move |this, cx| {
             loop {
                 let updated = this.update(cx, |view, cx| {
-                    if view.poll() {
+                    let changed = view.sync_settings();
+                    if view.poll() || changed {
                         cx.notify();
                     }
                 });
@@ -441,32 +737,98 @@ impl L3sView {
                 changed = true;
             }
         }
+        // The theme registry changes only when the user selects one, and the
+        // selection can also come from another window or the CLI, so a slow
+        // poll keeps every l3s window on the same appearance.
+        if !self.theme_refreshing && self.last_theme_poll.elapsed() >= Duration::from_secs(2) {
+            self.theme_refreshing = true;
+            self.last_theme_poll = Instant::now();
+            let api = api_socket_for(&self.session_root, self.session_name.as_deref());
+            let tx = self.theme_tx.clone();
+            std::thread::spawn(move || {
+                let result =
+                    ControlClient::connect(&api).and_then(|mut client| client.appearance());
+                tx.send(result).ok();
+            });
+        }
+        while let Ok(result) = self.theme_rx.try_recv() {
+            self.theme_refreshing = false;
+            if let Ok(appearance) = result
+                && appearance != self.appearance
+            {
+                self.appearance = appearance;
+                self.apply_appearance();
+                changed = true;
+            }
+        }
         changed
+    }
+
+    /// Rebuild the chrome palette from the selected appearance. A vendored
+    /// built-in resolves exactly; anything else falls back to the colors the
+    /// daemon projects in its shell-dock chrome.
+    fn apply_appearance(&mut self) {
+        let builtin = scheme::builtin(&self.appearance.active).map(Theme::from_palette);
+        let projected = self
+            .surface
+            .shell_dock()
+            .map(|dock| Theme::from_chrome(dock.chrome));
+        self.theme = builtin.or(projected).unwrap_or_default();
+    }
+
+    /// Pull the shared font settings the Appearances window may have changed.
+    fn sync_settings(&mut self) -> bool {
+        let latest = self.shared_settings.borrow().clone();
+        if latest == self.settings {
+            return false;
+        }
+        self.settings = latest;
+        // The cell advance depends on the terminal font, so re-measure and let
+        // `sync_metrics` push the new size to the daemon.
+        self.cell_width = None;
+        true
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        // Chords the native menu owns: consume them so they never reach the
+        // pane as input. The keymap dispatches the matching action.
+        if keystroke.modifiers.platform
+            && matches!(
+                keystroke.key.to_ascii_lowercase().as_str(),
+                "," | "comma"
+                    | "-"
+                    | "0"
+                    | "1"
+                    | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "="
+                    | "+"
+                    | "a"
+                    | "c"
+                    | "d"
+                    | "n"
+                    | "s"
+                    | "t"
+                    | "v"
+                    | "m"
+                    | "w"
+                    | "q"
+            )
+        {
+            return;
+        }
         // An open session menu owns Escape; the daemon never sees it.
         if self.session_menu_open && keystroke.key == "escape" {
             self.session_menu_open = false;
             cx.notify();
             return;
-        }
-        // The platform clipboard chords are ours: the pane must see the copied
-        // text (or a bracketed paste), never the chord itself.
-        if keystroke.modifiers.platform {
-            if keystroke.key.eq_ignore_ascii_case("c")
-                && self
-                    .selection
-                    .is_some_and(|selection| !selection.is_collapsed())
-            {
-                self.copy_selection(cx);
-                return;
-            }
-            if keystroke.key.eq_ignore_ascii_case("v") {
-                self.paste_clipboard(cx);
-                return;
-            }
         }
         if let Some(key) = keys::to_wire(keystroke, KeyEventKind::Press) {
             let _ = self.connection.send(ClientMessage::Key(key));
@@ -607,7 +969,7 @@ impl L3sView {
         if let Some(width) = self.cell_width {
             return width;
         }
-        let font = font(FONT_FAMILY);
+        let font = font(self.settings.terminal_font.as_str());
         let run = TextRun {
             len: 1,
             font,
@@ -618,11 +980,31 @@ impl L3sView {
         };
         let width = window
             .text_system()
-            .shape_line("M".into(), px(self.font_size), &[run], None)
+            .shape_line(
+                "M".into(),
+                px(self.settings.terminal_font_size),
+                &[run],
+                None,
+            )
             .width
             .into();
         self.cell_width = Some(width);
         width
+    }
+
+    /// The chrome/base text size, following the user's UI font size.
+    fn chrome_font(&self) -> f32 {
+        self.settings.ui_font_size
+    }
+
+    /// The section-label size, following the base like the mock.
+    fn section_font(&self) -> f32 {
+        (self.settings.ui_font_size - (CHROME_FONT - SECTION_FONT)).max(8.0)
+    }
+
+    /// Secondary chrome text (footer, rows, badges), one step below the base.
+    fn footer_font(&self) -> f32 {
+        (self.settings.ui_font_size - 1.0).max(8.0)
     }
 
     /// Convert a window-space pointer position to a grid cell, if it lands on
@@ -842,7 +1224,7 @@ impl L3sView {
         let Some(cell) = self.cell_at(window, event.position) else {
             return;
         };
-        let cell_height = self.font_size * LINE_HEIGHT_RATIO;
+        let cell_height = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
         let (delta, lines) = match event.delta {
             ScrollDelta::Lines(point) => (point.y, point.y.abs().round().max(1.0) as u16),
             ScrollDelta::Pixels(point) => {
@@ -874,6 +1256,25 @@ impl L3sView {
         }
     }
 
+    /// Select the whole visible grid, so Cmd+A followed by Cmd+C copies it.
+    fn select_all(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let layout = self.card_layout(window);
+        let skip = self.skipped_cols();
+        self.selection = Some(Selection {
+            anchor: Cell {
+                column: skip,
+                row: SKIPPED_DAEMON_ROWS,
+            },
+            cursor: Cell {
+                column: skip.saturating_add(layout.cols).saturating_sub(1),
+                row: SKIPPED_DAEMON_ROWS
+                    .saturating_add(layout.rows)
+                    .saturating_sub(1),
+            },
+        });
+        cx.notify();
+    }
+
     /// Build the native sidebar: nav, sessions, and projects.
     ///
     /// The daemon leaves the dock cells blank and reports their exact rectangle
@@ -894,6 +1295,7 @@ impl L3sView {
             .flex_col()
             .flex_1()
             .px_3()
+            .pt(px(SIDEBAR_TOP_INSET))
             .gap_1()
             .overflow_hidden()
             // Clearance for the floating traffic lights (transparent titlebar).
@@ -971,6 +1373,25 @@ impl L3sView {
         }
     }
 
+    /// Split the focused pane; `right` is side by side, `down` is stacked.
+    fn split(&self, direction: &str) {
+        if let Some(feed) = self.agent_feed.as_ref() {
+            feed.split(direction);
+        }
+    }
+
+    /// Close the active daemon tab, falling back to the last known one.
+    fn close_active_tab(&self) {
+        let tab = self
+            .tabs
+            .iter()
+            .find(|tab| tab.active)
+            .or_else(|| self.tabs.last());
+        if let Some(tab) = tab {
+            self.close_tab(tab.index);
+        }
+    }
+
     /// Close a workspace tab.
     fn close_tab(&self, index: u16) {
         if let Some(feed) = self.agent_feed.as_ref() {
@@ -985,7 +1406,11 @@ impl L3sView {
         // Beside the sidebar when it is open; full width (clear of the
         // traffic lights) when it is hidden.
         let left = f32::from(self.sidebar_cells()) * cell_width;
-        let pad = if self.sidebar_visible { 12.0 } else { 70.0 };
+        let pad = if self.sidebar_visible {
+            12.0
+        } else {
+            TRAFFIC_LIGHT_CLEARANCE
+        };
         let mut tabs = div()
             .flex()
             .flex_row()
@@ -1006,7 +1431,7 @@ impl L3sView {
                 .w(px(28.0))
                 .rounded_md()
                 .cursor_pointer()
-                .text_size(px(CHROME_FONT))
+                .text_size(px(self.chrome_font()))
                 .text_color(theme.muted)
                 .hover(|style| style.text_color(theme.panel_fg).bg(theme.panel))
                 .child(icon(
@@ -1084,7 +1509,7 @@ impl L3sView {
                 this.close_tab(close_index);
             }));
         let fg = if active { theme.panel_fg } else { theme.muted };
-        div()
+        let mut tab = div()
             .id(format!("l3s-tab-{index}"))
             .group(group)
             .flex()
@@ -1096,11 +1521,16 @@ impl L3sView {
             .px_3()
             .rounded_md()
             .cursor_pointer()
-            .text_size(px(CHROME_FONT))
-            .bg(if active { theme.panel } else { theme.panel_dim })
+            .text_size(px(self.chrome_font()))
+            .bg(if active { theme.panel } else { theme.window_bg })
             .text_color(fg)
-            .hover(|style| style.bg(theme.panel).text_color(theme.panel_fg))
-            .child(div().flex_1().child(label))
+            .hover(|style| style.bg(theme.panel).text_color(theme.panel_fg));
+        if active {
+            // Same low-contrast hairline as the terminal inset, so the active
+            // tab reads as raised without borrowing the scheme's border.
+            tab = tab.border_1().border_color(terminal_inset_border());
+        }
+        tab.child(div().flex_1().child(label))
             .child(close)
             .on_click(cx.listener(move |this, _, _, _| this.focus_tab(index)))
     }
@@ -1171,7 +1601,7 @@ impl L3sView {
             .items_center()
             .justify_between()
             .px_3()
-            .text_size(px(12.0))
+            .text_size(px(self.footer_font()))
             .child(
                 div()
                     .flex()
@@ -1250,7 +1680,7 @@ impl L3sView {
                     .bg(bg)
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.panel))
-                    .text_size(px(CHROME_FONT))
+                    .text_size(px(self.chrome_font()))
                     .child(icon(
                         if session.running {
                             include_bytes!("../../assets/icons/cloud.svg")
@@ -1270,13 +1700,16 @@ impl L3sView {
                             })
                             .child(session.name.clone()),
                     )
-                    .child(div().text_size(px(11.0)).text_color(theme.muted).child(
-                        if session.running {
-                            "running"
-                        } else {
-                            "stopped"
-                        },
-                    ))
+                    .child(
+                        div()
+                            .text_size(px(self.footer_font()))
+                            .text_color(theme.muted)
+                            .child(if session.running {
+                                "running"
+                            } else {
+                                "stopped"
+                            }),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.session_menu_open = false;
                         this.switch_session(&name);
@@ -1296,7 +1729,7 @@ impl L3sView {
                 .rounded_md()
                 .cursor_pointer()
                 .hover(|style| style.bg(theme.panel))
-                .text_size(px(CHROME_FONT))
+                .text_size(px(self.chrome_font()))
                 .text_color(theme.panel_fg)
                 .child(icon(
                     include_bytes!("../../assets/icons/plus.svg"),
@@ -1362,7 +1795,7 @@ impl L3sView {
             .bg(bg)
             .cursor_pointer()
             .hover(|style| style.bg(theme.panel))
-            .text_size(px(CHROME_FONT));
+            .text_size(px(self.chrome_font()));
         if workspace.nested {
             row = row.pl(px(18.0));
         }
@@ -1456,7 +1889,7 @@ impl L3sView {
         };
         let badge = match badge {
             Some(text) => div()
-                .text_size(px(11.0))
+                .text_size(px(self.section_font()))
                 .text_color(theme.muted)
                 .child(text),
             None => div(),
@@ -1473,7 +1906,7 @@ impl L3sView {
             .px_2()
             .rounded_md()
             .cursor_pointer()
-            .text_size(px(CHROME_FONT))
+            .text_size(px(self.chrome_font()))
             .bg(bg)
             .text_color(theme.panel_fg)
             .hover(|style| style.bg(theme.panel))
@@ -1519,7 +1952,7 @@ impl L3sView {
                 .px_2()
                 .child(
                     div()
-                        .text_size(px(SECTION_FONT))
+                        .text_size(px(self.section_font()))
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme.muted)
                         .child("MACHINES"),
@@ -1530,7 +1963,7 @@ impl L3sView {
                 div()
                     .h(px(26.0))
                     .px_2()
-                    .text_size(px(CHROME_FONT))
+                    .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
                     .child("No machines"),
             );
@@ -1545,7 +1978,7 @@ impl L3sView {
                     .h(px(26.0))
                     .px_2()
                     .rounded_md()
-                    .text_size(px(CHROME_FONT))
+                    .text_size(px(self.chrome_font()))
                     .child(icon(
                         include_bytes!("../../assets/icons/server.svg"),
                         14.0,
@@ -1561,7 +1994,7 @@ impl L3sView {
                             })
                             .child(machine.display().to_string()),
                     )
-                    .child(machine_status(machine, theme)),
+                    .child(machine_status(machine, theme, self.section_font())),
             );
         }
         section
@@ -1579,7 +2012,7 @@ impl L3sView {
                 .px_2()
                 .child(
                     div()
-                        .text_size(px(SECTION_FONT))
+                        .text_size(px(self.section_font()))
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme.muted)
                         .child("AGENTS"),
@@ -1590,7 +2023,7 @@ impl L3sView {
                 div()
                     .h(px(26.0))
                     .px_2()
-                    .text_size(px(CHROME_FONT))
+                    .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
                     .child("No agents"),
             );
@@ -1615,7 +2048,7 @@ impl L3sView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .text_size(px(CHROME_FONT))
+                            .text_size(px(self.chrome_font()))
                             .child(icon(
                                 include_bytes!("../../assets/icons/circle.svg"),
                                 9.0,
@@ -1629,7 +2062,7 @@ impl L3sView {
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(px(self.section_font()))
                                     .text_color(theme.muted)
                                     .child(agent.agent.clone()),
                             ),
@@ -1641,7 +2074,7 @@ impl L3sView {
                             .items_center()
                             .gap_2()
                             .pl(px(17.0))
-                            .text_size(px(11.0))
+                            .text_size(px(self.section_font()))
                             .text_color(theme.muted)
                             .child(agent.workspace_name.clone())
                             .child(match agent.branch.clone() {
@@ -1671,7 +2104,7 @@ impl L3sView {
                 .px_2()
                 .child(
                     div()
-                        .text_size(px(SECTION_FONT))
+                        .text_size(px(self.section_font()))
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme.muted)
                         .child("WORKSPACES"),
@@ -1705,7 +2138,7 @@ impl L3sView {
                 div()
                     .h(px(26.0))
                     .px_2()
-                    .text_size(px(CHROME_FONT))
+                    .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
                     .child("No projects yet"),
             );
@@ -1723,7 +2156,7 @@ impl L3sView {
     /// beneath it. The grid keeps a border on every side.
     fn card_layout(&mut self, window: &Window) -> CardLayout {
         let cell_w = self.cell_width(window);
-        let cell_h = self.font_size * LINE_HEIGHT_RATIO;
+        let cell_h = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
         let viewport = window.viewport_size();
         let card_x = f32::from(self.sidebar_cells()) * cell_w + CARD_GAP;
         let grid_w = f32::from(viewport.width) - card_x - CARD_GAP_RIGHT - 2.0;
@@ -1755,16 +2188,21 @@ impl L3sView {
             .rows
             .saturating_add(SKIPPED_DAEMON_ROWS)
             .saturating_add(SKIPPED_DAEMON_BOTTOM_ROWS);
-        if cols == self.cols && rows == self.rows {
+        let cell = (
+            layout.cell_w.round().clamp(1.0, 65535.0) as u16,
+            layout.cell_h.round().clamp(1.0, 65535.0) as u16,
+        );
+        if cols == self.cols && rows == self.rows && cell == self.sent_cell {
             return;
         }
         self.cols = cols;
         self.rows = rows;
+        self.sent_cell = cell;
         let _ = self.connection.send(ClientMessage::Resize {
             cols,
             rows,
-            cell_width_px: layout.cell_w.round().clamp(1.0, 65535.0) as u16,
-            cell_height_px: layout.cell_h.round().clamp(1.0, 65535.0) as u16,
+            cell_width_px: cell.0,
+            cell_height_px: cell.1,
         });
     }
 }
@@ -1777,16 +2215,40 @@ impl Render for L3sView {
         }
 
         let theme = self.theme;
-        let cell_height = self.font_size * LINE_HEIGHT_RATIO;
+        let cell_height = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
         let cell_width = self.cell_width(window);
         let layout = self.card_layout(window);
         let line_height = px(cell_height);
         let selection = self.selection;
+        // A vendored theme names the pane background directly, so the card's
+        // padding matches the grid by construction. Otherwise fall back to the
+        // dominant cell color the running app paints over the daemon base.
+        let terminal_bg = if scheme::builtin(&self.appearance.active).is_some() {
+            theme.bg
+        } else {
+            self.surface
+                .frame()
+                .map(|frame| {
+                    terminal_background(
+                        frame,
+                        self.skipped_cols(),
+                        layout.cols,
+                        layout.rows,
+                        theme.bg,
+                    )
+                })
+                .unwrap_or(theme.bg)
+        };
+        let grid_theme = Theme {
+            bg: terminal_bg,
+            ..theme
+        };
         let grid = match self.surface.frame() {
             Some(frame) => render_grid(
                 frame,
-                theme,
-                self.font_size,
+                grid_theme,
+                self.settings.terminal_font_size,
+                self.settings.terminal_font.as_str(),
                 line_height,
                 selection,
                 cell_width,
@@ -1855,7 +2317,7 @@ impl Render for L3sView {
         // the grid and the pointer mapping anchored at HEADER_HEIGHT.
         let header = div().h(px(HEADER_HEIGHT)).flex_shrink_0();
 
-        div()
+        let mut root = div()
             .id("l3s-root")
             .relative()
             .flex()
@@ -1867,7 +2329,44 @@ impl Render for L3sView {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.on_key_down(event, cx);
             }))
-            .child(header)
+            .on_action(cx.listener(|this, _: &CopySelection, _window, cx| this.copy_selection(cx)))
+            .on_action(cx.listener(|this, _: &PasteClipboard, _window, cx| {
+                this.paste_clipboard(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectAllGrid, window, cx| {
+                this.select_all(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewTab, _window, _cx| this.new_tab()))
+            .on_action(cx.listener(|this, _: &SplitVertical, _window, _cx| this.split("right")))
+            .on_action(cx.listener(|this, _: &SplitHorizontal, _window, _cx| this.split("down")))
+            .on_action(cx.listener(|this, _: &CloseTab, _window, _cx| this.close_active_tab()))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
+                this.toggle_sidebar();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OpenAbout, _window, cx| {
+                about::open(this.theme, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusTab1, _window, _cx| this.focus_tab(1)))
+            .on_action(cx.listener(|this, _: &FocusTab2, _window, _cx| this.focus_tab(2)))
+            .on_action(cx.listener(|this, _: &FocusTab3, _window, _cx| this.focus_tab(3)))
+            .on_action(cx.listener(|this, _: &FocusTab4, _window, _cx| this.focus_tab(4)))
+            .on_action(cx.listener(|this, _: &FocusTab5, _window, _cx| this.focus_tab(5)))
+            .on_action(cx.listener(|this, _: &FocusTab6, _window, _cx| this.focus_tab(6)))
+            .on_action(cx.listener(|this, _: &FocusTab7, _window, _cx| this.focus_tab(7)))
+            .on_action(cx.listener(|this, _: &FocusTab8, _window, _cx| this.focus_tab(8)))
+            .on_action(cx.listener(|this, _: &FocusTab9, _window, _cx| {
+                if let Some(tab) = this.tabs.last() {
+                    this.focus_tab(tab.index);
+                }
+            }));
+
+        // The chrome inherits the chosen UI family; the grid overrides it.
+        if let Some(font) = self.settings.ui_font.as_ref() {
+            root = root.font_family(font.clone());
+        }
+
+        root.child(header)
             .child(
                 div().relative().flex_1().child(
                     div()
@@ -1883,9 +2382,9 @@ impl Render for L3sView {
                         .bottom(px(FOOTER_HEIGHT + CARD_GAP))
                         .flex()
                         .flex_col()
-                        .bg(theme.bg)
+                        .bg(terminal_bg)
                         .border_1()
-                        .border_color(theme.border)
+                        .border_color(terminal_inset_border())
                         .rounded_md()
                         .overflow_hidden()
                         .child(
@@ -1914,6 +2413,7 @@ fn render_grid(
     frame: &FrameData,
     theme: Theme,
     font_size: f32,
+    font_family: &str,
     line_height: Pixels,
     selection: Option<Selection>,
     cell_width: f32,
@@ -1931,6 +2431,7 @@ fn render_grid(
             row,
             theme,
             font_size,
+            font_family,
             line_height,
             selection,
             cell_width,
@@ -1948,6 +2449,7 @@ fn render_row(
     row: u16,
     theme: Theme,
     font_size: f32,
+    font_family: &str,
     line_height: Pixels,
     selection: Option<Selection>,
     cell_width: f32,
@@ -2029,7 +2531,7 @@ fn render_row(
             .flex()
             .items_center()
             .overflow_hidden()
-            .font_family(FONT_FAMILY)
+            .font_family(font_family)
             .text_size(px(font_size))
             .line_height(line_height)
             .bg(bg)
@@ -2059,16 +2561,19 @@ fn style_of(
     let mut fg = theme::resolve(cell.fg, theme.fg);
     let mut bg = theme::resolve(cell.bg, theme.bg);
     let mut mods = cell.mods;
-    if mods & M_REVERSED != 0 {
-        std::mem::swap(&mut fg, &mut bg);
-        mods &= !M_REVERSED;
-    }
     if cursor {
+        // A caret block is the cell's declared foreground painted as the
+        // background. Apps that draw their own caret (a REVERSED cell) already
+        // encode it here, so also applying REVERSED would invert twice and
+        // erase the caret.
         std::mem::swap(&mut fg, &mut bg);
         if fg == bg {
             fg = theme.accent;
         }
+    } else if mods & M_REVERSED != 0 {
+        std::mem::swap(&mut fg, &mut bg);
     }
+    mods &= !M_REVERSED;
     if selected {
         fg = theme.selection_fg;
         bg = theme.selection_bg;
@@ -2080,6 +2585,12 @@ fn cursor_at(frame: &FrameData, column: u16, row: u16) -> bool {
     frame.cursor_visible && frame.cursor == Some((column, row))
 }
 
+/// The terminal card's frame, independent of the color scheme: a low-contrast
+/// hairline so the inset reads subtly against any theme.
+fn terminal_inset_border() -> gpui::Rgba {
+    gpui::rgb(0x24242c)
+}
+
 fn symbol(cell: &CellData) -> &str {
     if cell.symbol.is_empty() {
         " "
@@ -2088,15 +2599,82 @@ fn symbol(cell: &CellData) -> &str {
     }
 }
 
+/// The terminal's own background: the most common resolved cell color over
+/// the visible pane. The card's padding uses it so the blank frame blends with
+/// the running app's surface instead of the daemon's base color.
+fn terminal_background(
+    frame: &FrameData,
+    skip_cols: u16,
+    max_cols: u16,
+    max_rows: u16,
+    fallback: gpui::Rgba,
+) -> gpui::Rgba {
+    use std::collections::HashMap;
+    // TUI screens use a handful of backgrounds, so count the first few with a
+    // cheap linear scan and only fall back to a map for truecolor-heavy ones.
+    const DISTINCT_LIMIT: usize = 32;
+    let width = usize::from(frame.width);
+    let skip = usize::from(skip_cols).min(width);
+    let first_row = usize::from(SKIPPED_DAEMON_ROWS);
+    let last_row = first_row
+        .saturating_add(usize::from(max_rows))
+        .min(usize::from(frame.height).saturating_sub(usize::from(SKIPPED_DAEMON_BOTTOM_ROWS)));
+
+    // Vote on *resolved* colors, not packed wire values: the same visible
+    // color arrives as a palette index in one cell and an sRGB triple in
+    // another, and splitting those votes is what lets the gap pick a wrong
+    // winner when the surface is black.
+    let mut small: Vec<(u32, usize, gpui::Rgba)> = Vec::new();
+    let mut wide: Option<HashMap<u32, (usize, gpui::Rgba)>> = None;
+    for row in first_row..last_row {
+        let start = row * width + skip;
+        let end = (start + usize::from(max_cols)).min((row + 1) * width);
+        for cell in frame.cells.get(start..end).unwrap_or(&[]) {
+            let color = theme::resolve(cell.bg, fallback);
+            let key = color_key(color);
+            if let Some(map) = wide.as_mut() {
+                map.entry(key).or_insert((0, color)).0 += 1;
+            } else if let Some(entry) = small.iter_mut().find(|(k, _, _)| *k == key) {
+                entry.1 += 1;
+            } else if small.len() < DISTINCT_LIMIT {
+                small.push((key, 1, color));
+            } else {
+                let mut map: HashMap<u32, (usize, gpui::Rgba)> = small
+                    .drain(..)
+                    .map(|(k, count, color)| (k, (count, color)))
+                    .collect();
+                map.entry(key).or_insert((0, color)).0 += 1;
+                wide = Some(map);
+            }
+        }
+    }
+
+    let winner = match wide {
+        Some(map) => map.into_values().max_by_key(|(count, _)| *count),
+        None => small
+            .into_iter()
+            .map(|(_, count, color)| (count, color))
+            .max_by_key(|(count, _)| *count),
+    };
+    winner.map(|(_, color)| color).unwrap_or(fallback)
+}
+
+/// Canonical sRGB key for a resolved color, so equal colors that arrive under
+/// different wire encodings (palette index, sRGB, reset) vote as one.
+fn color_key(color: gpui::Rgba) -> u32 {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b)
+}
+
 /// Reachability text for a machine row: latency, state, or still probing.
-fn machine_status(machine: &MachineInfo, theme: Theme) -> Div {
+fn machine_status(machine: &MachineInfo, theme: Theme, size: f32) -> Div {
     let (text, color) = match (machine.online, machine.latency_ms) {
         (Some(true), Some(ms)) => (format!("{ms} ms"), theme.ok),
         (Some(true), None) => ("online".to_string(), theme.ok),
         (Some(false), _) => ("offline".to_string(), theme.alert),
         (None, _) => ("…".to_string(), theme.muted),
     };
-    div().text_size(px(11.0)).text_color(color).child(text)
+    div().text_size(px(size)).text_color(color).child(text)
 }
 
 /// The footer status text, hidden when it repeats the session pill.
@@ -2145,6 +2723,16 @@ fn api_socket_for(root: &Path, session: Option<&str>) -> PathBuf {
     }
 }
 
+/// The control socket for a launch target, matching `L3sView`'s derivation so
+/// the Appearances window talks to the same daemon session.
+fn api_socket_for_target(target: &ConnectTarget) -> PathBuf {
+    let (root, session) = match &target.socket {
+        Some(path) => split_client_socket(path).unwrap_or_else(|| (config_dir(), None)),
+        None => (config_dir(), target.session.clone()),
+    };
+    api_socket_for(&root, session.as_deref())
+}
+
 /// Shorten a workspace path with `~`, the way the mock's breadcrumb reads.
 fn shorten_home(path: &str) -> String {
     if let Some(home) = std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
@@ -2180,6 +2768,95 @@ fn remove_dock(side: &mut l3s_protocol::SideConfig, name: &str) {
         side.docks.remove(index);
         if index < side.dock_weights.len() {
             side.dock_weights.remove(index);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A blank cell carrying only attribute bits.
+    fn cell(mods: u16) -> CellData {
+        CellData {
+            mods,
+            ..CellData::default()
+        }
+    }
+
+    #[test]
+    fn caret_over_an_app_drawn_reverse_cell_stays_visible() {
+        let theme = Theme::default();
+        // Apps like pi paint their own caret as a REVERSED cell. The caret
+        // highlight must not invert it again, which would cancel the block.
+        let block = (theme.bg, theme.fg, 0);
+        assert_eq!(style_of(&cell(0), theme, true, false), block);
+        assert_eq!(style_of(&cell(M_REVERSED), theme, true, false), block);
+    }
+
+    #[test]
+    fn reversed_cell_without_the_caret_still_inverts() {
+        let theme = Theme::default();
+        assert_eq!(
+            style_of(&cell(M_REVERSED), theme, false, false),
+            (theme.bg, theme.fg, 0)
+        );
+    }
+
+    #[test]
+    fn terminal_background_takes_the_dominant_cell_color() {
+        let theme = Theme::default();
+        let mut frame = FrameData::blank(4, 4, 0, 0);
+        for cell in &mut frame.cells {
+            cell.bg = 0x0218_1825;
+        }
+        frame.cells[0].bg = 0;
+        assert_eq!(
+            terminal_background(&frame, 0, 4, 2, theme.bg),
+            theme::resolve(0x0218_1825, theme.bg)
+        );
+    }
+
+    #[test]
+    fn terminal_background_merges_equivalent_encodings() {
+        let theme = Theme::default();
+        let mut frame = FrameData::blank(4, 4, 0, 0);
+        for cell in &mut frame.cells {
+            cell.bg = 0x021e_1e2e;
+        }
+        // On the visible row, black arrives under three different encodings.
+        // Each bucket is a minority on its own, so only a resolved vote lets
+        // black beat the surface color.
+        frame.cells[2 * 4].bg = 0x0100_0000; // palette 0
+        frame.cells[2 * 4 + 1].bg = 0x0100_0010; // palette 16
+        frame.cells[2 * 4 + 2].bg = 0x0200_0000; // sRGB black
+        assert_eq!(
+            terminal_background(&frame, 0, 4, 2, theme.bg),
+            theme::resolve(0x0200_0000, theme.bg)
+        );
+    }
+
+    #[test]
+    fn builtin_theme_supplies_the_pane_background() {
+        // Catppuccin Mocha's pane/terminal background is its `mantle` role.
+        let theme = Theme::from_palette(scheme::builtin("catppuccin-mocha").expect("vendored"));
+        assert_eq!(theme.bg, gpui::rgb(0x181825));
+        // Luvus aliases resolve to the same palette.
+        assert_eq!(
+            scheme::builtin("mocha").map(|palette| palette.mantle),
+            Some(gpui::rgb(0x181825))
+        );
+        assert!(scheme::builtin("no-such-theme").is_none());
+    }
+
+    #[test]
+    fn app_key_bindings_are_unique() {
+        // `app_key_bindings` parses every chord as it is built; a duplicate
+        // would shadow an earlier shortcut, so catch that here too.
+        let mut seen = std::collections::HashSet::new();
+        for binding in app_key_bindings() {
+            let chord = format!("{:?}", binding.keystrokes());
+            assert!(seen.insert(chord.clone()), "duplicate shortcut: {chord}");
         }
     }
 }

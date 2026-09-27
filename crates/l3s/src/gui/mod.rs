@@ -9,6 +9,7 @@ mod about;
 mod app_icon;
 mod appearances;
 mod keys;
+mod palette;
 mod scheme;
 mod selection;
 mod settings;
@@ -25,10 +26,11 @@ use crossterm::event::{
     MouseEventKind,
 };
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Div, FocusHandle, FontWeight, Hsla, KeyBinding,
+    Action, App, Bounds, ClipboardItem, Context, Div, FocusHandle, FontWeight, Hsla, KeyBinding,
     KeyDownEvent, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, TextRun, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, div, font, point, prelude::*, px, size, svg,
+    MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, TextRun,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, div, font, point, prelude::*, px, size,
+    svg,
 };
 use gpui_platform::application;
 use l3s_client::{
@@ -38,6 +40,7 @@ use l3s_client::{
     split_client_socket,
 };
 use l3s_protocol::{CellData, ClientMessage, FrameData, ShellSidebars, ShellWorkspace};
+use palette::{Command, Entry, Palette};
 use selection::{Cell, Selection};
 use settings::Settings;
 use theme::Theme;
@@ -183,6 +186,8 @@ gpui::actions!([
     ResetFontSize,
     /// Show or hide the sidebar.
     ToggleSidebar,
+    /// Open the command palette.
+    OpenCommandPalette,
     /// Focus tab 1.
     FocusTab1,
     /// Focus tab 2.
@@ -304,6 +309,8 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                 MenuItem::action("Select All", SelectAllGrid),
             ]),
             Menu::new("View").items([
+                MenuItem::action("Command Palette…", OpenCommandPalette),
+                MenuItem::separator(),
                 MenuItem::action("Increase Font Size", IncreaseFontSize),
                 MenuItem::action("Decrease Font Size", DecreaseFontSize),
                 MenuItem::action("Reset Font Size", ResetFontSize),
@@ -368,6 +375,7 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd--", DecreaseFontSize, None),
         KeyBinding::new("cmd-0", ResetFontSize, None),
         KeyBinding::new("cmd-s", ToggleSidebar, None),
+        KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
         KeyBinding::new("cmd-1", FocusTab1, None),
         KeyBinding::new("cmd-2", FocusTab2, None),
         KeyBinding::new("cmd-3", FocusTab3, None),
@@ -490,6 +498,10 @@ struct L3sView {
     last_session_poll: Instant,
     /// Whether the footer session menu is open.
     session_menu_open: bool,
+    /// The ⌘⇧P command palette's query and selection.
+    palette: Palette,
+    /// Keeps the highlighted palette row scrolled into view.
+    palette_scroll: ScrollHandle,
     /// Results from background session create/start operations.
     session_rx: Receiver<SessionOpResult>,
     /// Sender half, handed to each background session operation.
@@ -590,6 +602,8 @@ impl L3sView {
             sessions,
             last_session_poll: Instant::now(),
             session_menu_open: false,
+            palette: Palette::default(),
+            palette_scroll: ScrollHandle::new(),
             session_rx,
             session_tx,
             bar_widgets: Vec::new(),
@@ -789,7 +803,12 @@ impl L3sView {
         true
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // An open palette owns every keystroke: type, navigate, run, dismiss.
+        if self.palette.is_open() {
+            self.palette_key(event, window, cx);
+            return;
+        }
         let keystroke = &event.keystroke;
         // Chords the native menu owns: consume them so they never reach the
         // pane as input. The keymap dispatches the matching action.
@@ -814,6 +833,7 @@ impl L3sView {
                     | "c"
                     | "d"
                     | "n"
+                    | "p"
                     | "s"
                     | "t"
                     | "v"
@@ -835,6 +855,226 @@ impl L3sView {
         }
     }
 
+    /// Route a keystroke to the open palette.
+    fn palette_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "escape" | "esc" => self.palette.close(),
+            "enter" => {
+                if let Some(command) = self.highlighted_command() {
+                    self.palette.close();
+                    self.run_command(command, window, cx);
+                }
+            }
+            "up" => {
+                let len = self.palette.matches(&self.palette_entries()).len();
+                self.palette.move_selection(-1, len);
+                self.palette_scroll
+                    .scroll_to_item(self.palette.selected().min(len.saturating_sub(1)));
+            }
+            "down" | "tab" => {
+                let len = self.palette.matches(&self.palette_entries()).len();
+                self.palette.move_selection(1, len);
+                self.palette_scroll
+                    .scroll_to_item(self.palette.selected().min(len.saturating_sub(1)));
+            }
+            "left" => self.palette.move_cursor(-1),
+            "right" => self.palette.move_cursor(1),
+            "home" => self.palette.cursor_home(),
+            "end" => self.palette.cursor_end(),
+            "delete" | "del" => {
+                // ⌘Delete clears the whole query, matching the field convention.
+                if keystroke.modifiers.platform {
+                    self.palette.clear();
+                } else {
+                    self.palette.delete();
+                }
+                self.palette_scroll.scroll_to_item(0);
+            }
+            "backspace" => {
+                if keystroke.modifiers.platform {
+                    self.palette.clear();
+                } else {
+                    self.palette.backspace();
+                }
+                self.palette_scroll.scroll_to_item(0);
+            }
+            "space" => {
+                self.palette.insert(" ");
+                self.palette_scroll.scroll_to_item(0);
+            }
+            _ => {
+                // Only unmodified text edits the query; chords stay inert.
+                if keystroke.modifiers.platform || keystroke.modifiers.control {
+                    return;
+                }
+                if let Some(text) = keystroke.key_char.as_deref().filter(|text| !text.is_empty()) {
+                    self.palette.insert(text);
+                    self.palette_scroll.scroll_to_item(0);
+                } else if keystroke.key.chars().count() == 1 {
+                    // Some layouts deliver a bare character without `key_char`.
+                    self.palette.insert(&keystroke.key);
+                    self.palette_scroll.scroll_to_item(0);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// The live command list, rebuilt from current view state.
+    fn palette_entries(&self) -> Vec<Entry> {
+        let entry = |command: Command, title: &str, group: &'static str, shortcut| Entry {
+            command,
+            title: title.to_string(),
+            group,
+            shortcut,
+        };
+        let mut entries = vec![
+            entry(Command::NewTab, "New Tab", "Session", Some("⌘T")),
+            entry(Command::CloseTab, "Close Tab", "Session", Some("⌘W")),
+            entry(
+                Command::SplitVertical,
+                "Split Vertical",
+                "Session",
+                Some("⌘D"),
+            ),
+            entry(
+                Command::SplitHorizontal,
+                "Split Horizontal",
+                "Session",
+                Some("⌘⇧D"),
+            ),
+            entry(Command::NewSession, "New Session…", "Session", None),
+            entry(Command::NewWindow, "New Window", "Application", Some("⌘N")),
+            entry(
+                Command::OpenAppearances,
+                "Open Appearances…",
+                "Application",
+                Some("⌘,"),
+            ),
+            entry(Command::OpenAbout, "About l3s", "Application", None),
+            entry(Command::Quit, "Quit l3s", "Application", Some("⌘Q")),
+            entry(
+                Command::ToggleSidebar,
+                "Toggle Sidebar",
+                "View",
+                Some("⌘S"),
+            ),
+            entry(
+                Command::IncreaseFontSize,
+                "Increase Font Size",
+                "View",
+                Some("⌘+"),
+            ),
+            entry(
+                Command::DecreaseFontSize,
+                "Decrease Font Size",
+                "View",
+                Some("⌘−"),
+            ),
+            entry(
+                Command::ResetFontSize,
+                "Reset Font Size",
+                "View",
+                Some("⌘0"),
+            ),
+            entry(Command::CopySelection, "Copy", "Edit", Some("⌘C")),
+            entry(Command::PasteClipboard, "Paste", "Edit", Some("⌘V")),
+            entry(Command::SelectAllGrid, "Select All", "Edit", Some("⌘A")),
+            entry(
+                Command::CloseWindow,
+                "Close Window",
+                "Window",
+                Some("⌘⇧W"),
+            ),
+            entry(
+                Command::CloseAllWindows,
+                "Close All Windows",
+                "Window",
+                Some("⌘⌥W"),
+            ),
+            entry(
+                Command::OpenWorkspacePicker,
+                "Open Workspace…",
+                "Workspace",
+                None,
+            ),
+        ];
+        for tab in &self.tabs {
+            entries.push(entry(
+                Command::FocusTab(tab.index),
+                &format!("Go to Tab {}", tab.label()),
+                "Navigate",
+                None,
+            ));
+        }
+        for session in &self.sessions {
+            entries.push(entry(
+                Command::SwitchSession(session.name.clone()),
+                &format!("Switch to Session {}", session.name),
+                "Navigate",
+                None,
+            ));
+        }
+        for workspace in self.surface.workspaces() {
+            entries.push(entry(
+                Command::FocusWorkspace(workspace.id.clone()),
+                &format!("Open Workspace {}", workspace.name),
+                "Workspace",
+                None,
+            ));
+        }
+        for agent in &self.agents {
+            entries.push(entry(
+                Command::FocusAgent(agent.pane.clone()),
+                &format!("Focus Agent {}", agent.label()),
+                "Navigate",
+                None,
+            ));
+        }
+        entries
+    }
+
+    /// The command under the palette's highlight.
+    fn highlighted_command(&self) -> Option<Command> {
+        let entries = self.palette_entries();
+        let matches = self.palette.matches(&entries);
+        self.palette
+            .highlighted(&matches)
+            .map(|entry| entry.command.clone())
+    }
+
+    /// Execute a command chosen in the palette.
+    fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            Command::NewWindow => window.dispatch_action(NewWindow.boxed_clone(), cx),
+            Command::NewTab => window.dispatch_action(NewTab.boxed_clone(), cx),
+            Command::SplitVertical => window.dispatch_action(SplitVertical.boxed_clone(), cx),
+            Command::SplitHorizontal => window.dispatch_action(SplitHorizontal.boxed_clone(), cx),
+            Command::CloseTab => window.dispatch_action(CloseTab.boxed_clone(), cx),
+            Command::CloseWindow => window.dispatch_action(CloseWindow.boxed_clone(), cx),
+            Command::CloseAllWindows => window.dispatch_action(CloseAllWindows.boxed_clone(), cx),
+            Command::ToggleSidebar => window.dispatch_action(ToggleSidebar.boxed_clone(), cx),
+            Command::IncreaseFontSize => window.dispatch_action(IncreaseFontSize.boxed_clone(), cx),
+            Command::DecreaseFontSize => window.dispatch_action(DecreaseFontSize.boxed_clone(), cx),
+            Command::ResetFontSize => window.dispatch_action(ResetFontSize.boxed_clone(), cx),
+            Command::OpenAppearances => window.dispatch_action(OpenAppearances.boxed_clone(), cx),
+            Command::OpenAbout => window.dispatch_action(OpenAbout.boxed_clone(), cx),
+            Command::CopySelection => window.dispatch_action(CopySelection.boxed_clone(), cx),
+            Command::PasteClipboard => window.dispatch_action(PasteClipboard.boxed_clone(), cx),
+            Command::SelectAllGrid => window.dispatch_action(SelectAllGrid.boxed_clone(), cx),
+            Command::Quit => window.dispatch_action(QuitApp.boxed_clone(), cx),
+            Command::OpenWorkspacePicker => {
+                let _ = self.connection.send(ClientMessage::OpenWorkspacePicker);
+            }
+            Command::FocusTab(index) => self.focus_tab(index),
+            Command::SwitchSession(name) => self.switch_session(&name),
+            Command::NewSession => self.start_new_session(),
+            Command::FocusWorkspace(id) => self.focus_workspace(&id),
+            Command::FocusAgent(pane) => self.focus_agent(&pane),
+        }
+    }
+
     /// Send the system clipboard to the daemon, which applies the pane's own
     /// bracketed-paste rules.
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
@@ -844,6 +1084,29 @@ impl L3sView {
         if !text.is_empty() {
             let _ = self.connection.send(ClientMessage::Paste(text));
         }
+    }
+
+    /// Copy the palette query, mirroring [`Self::copy_selection`] for the grid.
+    fn copy_query(&self, cx: &mut Context<Self>) {
+        let query = self.palette.query();
+        if !query.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(query.to_string()));
+        }
+    }
+
+    /// Paste the system clipboard into the palette query, folding newlines so a
+    /// pasted block stays a single search line.
+    fn paste_into_palette(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let text = text.replace(['\n', '\r'], " ");
+        self.palette.insert(&text);
+        self.palette_scroll.scroll_to_item(0);
+        cx.notify();
     }
 
     /// Focus an agent's pane, switching workspace and tab as needed.
@@ -1019,7 +1282,7 @@ impl L3sView {
     /// While the session menu is open the whole content area counts, since
     /// the overlay sits above the grid.
     fn hit_chrome(&mut self, window: &Window, position: Point<Pixels>) -> bool {
-        if self.session_menu_open {
+        if self.session_menu_open || self.palette.is_open() {
             return true;
         }
         let x = f32::from(position.x);
@@ -1774,6 +2037,169 @@ impl L3sView {
             )
     }
 
+    /// The ⌘⇧P overlay: a query field above a filtered command list.
+    ///
+    /// A transparent catcher covers the window so a click outside the panel
+    /// dismisses it; the panel stops propagation so its own clicks land.
+    fn palette_overlay(&self, cx: &mut Context<Self>) -> Div {
+        if !self.palette.is_open() {
+            return div();
+        }
+        let theme = self.theme;
+        let entries = self.palette_entries();
+        let matches = self.palette.matches(&entries);
+        let selected = self.palette.selected().min(matches.len().saturating_sub(1));
+        let query = self.palette.query().to_string();
+        let cursor = self.palette.cursor();
+        let select_all = self.palette.is_select_all();
+
+        let mut rows = div()
+            .id("l3s-palette-list")
+            .flex()
+            .flex_col()
+            .p_1()
+            .max_h(px(360.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.palette_scroll);
+        if matches.is_empty() {
+            rows = rows.child(
+                div()
+                    .px_3()
+                    .py_4()
+                    .text_size(px(self.chrome_font()))
+                    .text_color(theme.muted)
+                    .child("No matching commands"),
+            );
+        }
+        for (index, entry) in matches.iter().enumerate() {
+            let active = index == selected;
+            let command = entry.command.clone();
+            // The highlight borrows the active theme's selection colors, so the
+            // palette reads as part of the scheme rather than a fixed panel.
+            let (bg, fg, dim) = if active {
+                (
+                    theme.selection_bg,
+                    theme.selection_fg,
+                    theme.selection_fg.opacity(0.75),
+                )
+            } else {
+                (theme.sidebar_bg, theme.panel_fg, theme.muted)
+            };
+            rows = rows.child(
+                div()
+                    .id(format!("l3s-palette-{index}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .h(px(30.0))
+                    .px_3()
+                    .rounded_md()
+                    .bg(bg)
+                    .cursor_pointer()
+                    .text_size(px(self.chrome_font()))
+                    .text_color(fg)
+                    .hover(move |style| {
+                        style.bg(if active { theme.selection_bg } else { theme.panel })
+                    })
+                    .child(div().flex_1().child(entry.title.clone()))
+                    .child(
+                        div()
+                            .text_size(px(self.section_font()))
+                            .text_color(dim)
+                            .child(entry.group),
+                    )
+                    .child(match entry.shortcut {
+                        Some(shortcut) => div()
+                            .text_size(px(self.footer_font()))
+                            .text_color(dim)
+                            .child(shortcut.to_string()),
+                        None => div(),
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.palette.close();
+                        this.run_command(command.clone(), window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let caret = div().w(px(1.5)).h(px(16.0)).bg(theme.accent);
+        let mut line = div().flex().flex_row().items_center().flex_1();
+        if query.is_empty() {
+            // Caret first, so the hint reads as a placeholder rather than text.
+            line = line.child(caret).child(
+                div()
+                    .pl(px(2.0))
+                    .text_color(theme.muted)
+                    .child("Type a command…"),
+            );
+        } else if select_all {
+            line = line.child(
+                div()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(theme.selection_bg)
+                    .text_color(theme.selection_fg)
+                    .child(query.clone()),
+            );
+        } else {
+            let before: String = query.chars().take(cursor).collect();
+            let after: String = query.chars().skip(cursor).collect();
+            line = line
+                .child(div().text_color(theme.fg).child(before))
+                .child(caret)
+                .child(div().text_color(theme.fg).child(after));
+        }
+        let field = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(44.0))
+            .px_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .text_size(px(self.chrome_font()))
+            .child(line);
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .occlude()
+            .bg(theme.window_bg.opacity(0.55))
+            .flex()
+            .justify_center()
+            .pt(px(HEADER_HEIGHT + 12.0))
+            .child(
+                div()
+                    .w(px(560.0))
+                    .max_h(px(420.0))
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .bg(theme.sidebar_bg)
+                    .border_1()
+                    .border_color(theme.accent)
+                    .overflow_hidden()
+                    .child(field)
+                    .child(rows)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    ),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.palette.close();
+                    cx.notify();
+                }),
+            )
+    }
+
     /// One project or nested workspace row; the active workspace gets the pill.
     fn workspace_row(
         &self,
@@ -2326,15 +2752,31 @@ impl Render for L3sView {
             .bg(theme.window_bg)
             .text_color(theme.fg)
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                this.on_key_down(event, cx);
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.on_key_down(event, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &CopySelection, _window, cx| this.copy_selection(cx)))
+            .on_action(cx.listener(|this, _: &CopySelection, _window, cx| {
+                if this.palette.is_open() {
+                    this.copy_query(cx);
+                } else {
+                    this.copy_selection(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &PasteClipboard, _window, cx| {
-                this.paste_clipboard(cx);
+                if this.palette.is_open() {
+                    this.paste_into_palette(cx);
+                } else {
+                    this.paste_clipboard(cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &SelectAllGrid, window, cx| {
-                this.select_all(window, cx);
+                // With the palette open, ⌘A selects the query, not the grid.
+                if this.palette.is_open() {
+                    this.palette.select_all();
+                    cx.notify();
+                } else {
+                    this.select_all(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &NewTab, _window, _cx| this.new_tab()))
             .on_action(cx.listener(|this, _: &SplitVertical, _window, _cx| this.split("right")))
@@ -2342,6 +2784,15 @@ impl Render for L3sView {
             .on_action(cx.listener(|this, _: &CloseTab, _window, _cx| this.close_active_tab()))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
                 this.toggle_sidebar();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
+                // The chord toggles, so pressing it again dismisses.
+                if this.palette.is_open() {
+                    this.palette.close();
+                } else {
+                    this.palette.open();
+                }
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenAbout, _window, cx| {
@@ -2402,6 +2853,7 @@ impl Render for L3sView {
             .child(self.top_chrome(cx, cell_width))
             .child(self.session_menu(cx, layout.card_x))
             .child(self.status_bar(cx))
+            .child(self.palette_overlay(cx))
     }
 }
 

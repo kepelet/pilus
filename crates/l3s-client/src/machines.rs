@@ -8,13 +8,17 @@
 use serde_json::Value;
 use std::path::Path;
 
+use crate::connection::Connection;
+use crate::error::{Error, Result};
+use crate::transport::{SshTarget, Stream};
+
 /// One saved machine profile plus its live reachability.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MachineInfo {
     /// Stable profile id.
     pub id: String,
     /// Human label; may be empty.
-    pub label: String,
+    pub display: String,
     /// SSH destination, e.g. `user@host`.
     pub destination: String,
     /// Whether the profile is enabled.
@@ -23,22 +27,52 @@ pub struct MachineInfo {
     pub online: Option<bool>,
     /// Probe round-trip in milliseconds, when measured.
     pub latency_ms: Option<u64>,
+    /// Verified absolute path to the remote `luvus` binary.
+    pub remote_binary: String,
+    /// Preferred remote named session; `None` is the remote default.
+    pub preferred_session: Option<String>,
+    /// Whether Luvus manages (and may replace) the remote binary.
+    pub automatic_provisioning: bool,
 }
 
 impl MachineInfo {
     /// The name to draw: the label, else the id.
     pub fn display(&self) -> &str {
-        if self.label.is_empty() {
+        if self.display.is_empty() {
             &self.id
         } else {
-            &self.label
+            &self.display
         }
+    }
+
+    /// The remote named session to attach to, if the profile pins one.
+    ///
+    /// A missing or `default` value means the remote default session.
+    pub fn remote_session(&self) -> Option<String> {
+        self.preferred_session
+            .clone()
+            .filter(|name| name != "default" && crate::discovery::validate_session(name).is_ok())
+    }
+
+    /// The SSH destination and remote command for this profile.
+    ///
+    /// `None` when the profile has not been provisioned with a verified
+    /// remote binary; the caller should surface that as "run machine enable".
+    pub fn ssh_target(&self) -> Option<SshTarget> {
+        if self.destination.is_empty() || self.remote_binary.is_empty() {
+            return None;
+        }
+        Some(SshTarget {
+            destination: self.destination.clone(),
+            binary: self.remote_binary.clone(),
+            session: self.remote_session(),
+        })
     }
 
     fn from_json(value: &Value) -> Option<Self> {
         Some(Self {
             id: value.get("id")?.as_str()?.to_string(),
-            label: value
+            display: value
                 .get("label")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
@@ -54,8 +88,41 @@ impl MachineInfo {
                 .unwrap_or(false),
             online: None,
             latency_ms: None,
+            remote_binary: value
+                .get("remote_binary")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            preferred_session: value
+                .get("preferred_session")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string),
+            automatic_provisioning: value
+                .get("automatic_provisioning")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
+}
+
+/// Attach to a saved machine over its SSH bridge.
+///
+/// This mirrors the reference client: one `ssh -T` process per enabled
+/// machine, carrying the ordinary binary render protocol. The bridge starts
+/// the selected remote session when it is absent and never installs software.
+pub fn connect_machine(machine: &MachineInfo, cols: u16, rows: u16) -> Result<Connection> {
+    let target = machine.ssh_target().ok_or_else(|| {
+        Error::Machine(format!(
+            "machine `{}` has no verified remote binary; run `luvus machine enable {}`",
+            machine.id, machine.id
+        ))
+    })?;
+    let mut command = target.command(&["remote-client-bridge"]);
+    let stream = Stream::spawn(&mut command).map_err(|error| {
+        Error::Machine(format!("could not launch ssh for {}: {error}", machine.id))
+    })?;
+    Connection::open_stream(stream, machine.display().to_string(), cols, rows)
 }
 
 /// List profiles under `root` and probe each one's reachability.
@@ -105,11 +172,14 @@ pub fn refresh_machines(root: &Path) -> Vec<MachineInfo> {
 fn local_machine() -> MachineInfo {
     MachineInfo {
         id: "local".to_string(),
-        label: "Local".to_string(),
+        display: "Local".to_string(),
         destination: local_hostname(),
         enabled: true,
         online: None,
         latency_ms: None,
+        remote_binary: String::new(),
+        preferred_session: None,
+        automatic_provisioning: false,
     }
 }
 

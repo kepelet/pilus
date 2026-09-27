@@ -21,17 +21,18 @@ pub use autostart::{ensure_server, ensure_server_for};
 pub use connection::{ClientEvent, Connection, EndpointIdentity};
 pub use control::{
     Agent, AgentFeed, Appearance, AutomationSummary, BarSegment, BarWidget, ControlClient,
-    FeedUpdate, Tab, TaskSummary, ThemeInfo,
+    FeedScope, FeedUpdate, Tab, TaskSummary, ThemeInfo,
 };
 pub use discovery::{
-    SessionInfo, active_session, api_socket_path_for, client_socket_path_for,
+    HOME_ENV, SessionInfo, active_session, api_socket_path_for, client_socket_path_for,
     client_socket_path_under, config_dir, describe, generate_session_name, list_session_infos,
     list_sessions, luvus_binary, session_dir_for, split_client_socket, validate_session,
 };
 pub use error::{Error, Result};
 pub use l3s_protocol as protocol;
-pub use machines::{MachineInfo, list_machines, refresh_machines};
+pub use machines::{MachineInfo, connect_machine, list_machines, refresh_machines};
 pub use surface::{Surface, SurfaceChange};
+pub use transport::SshTarget;
 pub use uhp::{Event, EventStream, Frame, Observer, Terminal, UhpClient};
 
 use std::path::PathBuf;

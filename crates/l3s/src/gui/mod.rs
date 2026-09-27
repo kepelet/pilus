@@ -9,14 +9,19 @@ mod about;
 mod app_icon;
 mod appearances;
 mod keys;
+mod machines;
 mod palette;
+mod picker;
 mod scheme;
 mod selection;
 mod settings;
+mod text_field;
 mod theme;
+mod update_window;
 mod updater;
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -39,11 +44,14 @@ use gpui_updater_core::UpdateStatus;
 use l3s_client::{
     Agent, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent, ConnectTarget,
     Connection, ControlClient, MachineInfo, SessionInfo, Surface, SurfaceChange, Tab, TaskSummary,
-    config_dir, generate_session_name, list_machines, list_session_infos, refresh_machines,
-    split_client_socket,
+    config_dir, connect_machine, generate_session_name, list_machines, list_session_infos,
+    refresh_machines, split_client_socket,
 };
-use l3s_protocol::{CellData, ClientMessage, FrameData, ShellSidebars, ShellWorkspace};
+use l3s_protocol::{
+    CellData, ClientMessage, FrameData, ShellSidebars, ShellWorkspace, SurfaceInterest,
+};
 use palette::{Command, Entry, Palette};
+use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use selection::{Cell, Selection};
 use settings::Settings;
 use theme::Theme;
@@ -152,6 +160,8 @@ const M_REVERSED: u16 = 1 << 6;
 gpui::actions!([
     /// Open the native Appearances window.
     OpenAppearances,
+    /// Open the native remote-machine manager window.
+    OpenMachineManager,
     /// Quit the application.
     QuitApp,
     /// Copy the current grid selection.
@@ -190,6 +200,10 @@ gpui::actions!([
     ResetFontSize,
     /// Show or hide the sidebar.
     ToggleSidebar,
+    /// Open the native Open Workspace picker.
+    OpenWorkspacePicker,
+    /// Open the footer session switcher.
+    OpenSessionMenu,
     /// Open the command palette.
     OpenCommandPalette,
     /// Focus tab 1.
@@ -212,6 +226,13 @@ gpui::actions!([
     FocusTab9
 ]);
 
+/// A shared counter the machine manager bumps so every main window reloads the
+/// owner-local machine catalog after a mutation.
+#[derive(Default)]
+pub(crate) struct MachineSignal {
+    pub(crate) revision: u64,
+}
+
 /// Open the desktop window and attach to `target`.
 pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     // The real viewport is not known until a window exists; the first resize
@@ -224,6 +245,8 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     let config_root = config_dir();
     let new_window_target = target.clone();
     let settings = Rc::new(RefCell::new(Settings::load(&config_root)));
+    let machine_signal = Rc::new(RefCell::new(MachineSignal::default()));
+    let shared_theme = Rc::new(RefCell::new(Theme::default()));
 
     application().run(move |cx: &mut App| {
         app_icon::install();
@@ -233,6 +256,14 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             let config_root = config_root.clone();
             move |_: &OpenAppearances, cx: &mut App| {
                 appearances::open(api.clone(), settings.clone(), config_root.clone(), cx)
+            }
+        });
+        cx.on_action({
+            let root = config_root.clone();
+            let signal = machine_signal.clone();
+            let theme = shared_theme.clone();
+            move |_: &OpenMachineManager, cx: &mut App| {
+                machines::open(root.clone(), signal.clone(), theme.clone(), cx);
             }
         });
         cx.on_action(|_: &QuitApp, cx: &mut App| cx.quit());
@@ -258,8 +289,16 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
         cx.on_action({
             let target = new_window_target.clone();
             let settings = settings.clone();
+            let signal = machine_signal.clone();
+            let theme = shared_theme.clone();
             move |_: &NewWindow, cx: &mut App| {
-                open_main_window(target.clone(), settings.clone(), cx)
+                open_main_window(
+                    target.clone(),
+                    settings.clone(),
+                    signal.clone(),
+                    theme.clone(),
+                    cx,
+                )
             }
         });
         cx.on_action(|_: &CloseAllWindows, cx: &mut App| {
@@ -288,15 +327,16 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
         cx.set_menus([
             Menu::new("l3s").items([
                 MenuItem::action("About l3s", OpenAbout),
-                MenuItem::action("Check for Updates…", CheckForUpdates),
+                MenuItem::action("Check for Updates", CheckForUpdates),
                 MenuItem::separator(),
-                MenuItem::action("Appearances…", OpenAppearances),
+                MenuItem::action("Appearances", OpenAppearances),
                 MenuItem::separator(),
                 MenuItem::action("Quit l3s", QuitApp),
             ]),
             Menu::new("File").items([
                 MenuItem::action("New Window", NewWindow),
                 MenuItem::action("New Tab", NewTab),
+                MenuItem::action("Open Workspace", OpenWorkspacePicker),
                 MenuItem::separator(),
                 MenuItem::action("Split Vertical", SplitVertical),
                 MenuItem::action("Split Horizontal", SplitHorizontal),
@@ -311,7 +351,7 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                 MenuItem::action("Select All", SelectAllGrid),
             ]),
             Menu::new("View").items([
-                MenuItem::action("Command Palette…", OpenCommandPalette),
+                MenuItem::action("Command Palette", OpenCommandPalette),
                 MenuItem::separator(),
                 MenuItem::action("Increase Font Size", IncreaseFontSize),
                 MenuItem::action("Decrease Font Size", DecreaseFontSize),
@@ -342,7 +382,19 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                 ..Default::default()
             },
             move |window, cx| {
-                cx.new(move |cx| L3sView::new(target, connection, settings.clone(), window, cx))
+                let signal = machine_signal.clone();
+                let theme = shared_theme.clone();
+                cx.new(move |cx| {
+                    L3sView::new(
+                        target,
+                        connection,
+                        settings.clone(),
+                        signal,
+                        theme,
+                        window,
+                        cx,
+                    )
+                })
             },
         );
         if let Err(error) = opened {
@@ -378,6 +430,8 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-0", ResetFontSize, None),
         KeyBinding::new("cmd-s", ToggleSidebar, None),
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
+        KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, None),
+        KeyBinding::new("cmd-shift-s", OpenSessionMenu, None),
         KeyBinding::new("cmd-1", FocusTab1, None),
         KeyBinding::new("cmd-2", FocusTab2, None),
         KeyBinding::new("cmd-3", FocusTab3, None),
@@ -394,7 +448,13 @@ fn app_key_bindings() -> Vec<KeyBinding> {
 ///
 /// Connection setup includes a handshake, so it briefly blocks; this only runs
 /// on an explicit File → New Window.
-fn open_main_window(target: ConnectTarget, settings: Rc<RefCell<Settings>>, cx: &mut App) {
+fn open_main_window(
+    target: ConnectTarget,
+    settings: Rc<RefCell<Settings>>,
+    machine_signal: Rc<RefCell<MachineSignal>>,
+    shared_theme: Rc<RefCell<Theme>>,
+    cx: &mut App,
+) {
     let connection = match l3s_client::connect(&target, 120, 40) {
         Ok(connection) => connection,
         Err(error) => {
@@ -415,7 +475,11 @@ fn open_main_window(target: ConnectTarget, settings: Rc<RefCell<Settings>>, cx: 
             }),
             ..Default::default()
         },
-        move |window, cx| cx.new(move |cx| L3sView::new(target, connection, settings, window, cx)),
+        move |window, cx| {
+            let signal = machine_signal.clone();
+            let theme = shared_theme.clone();
+            cx.new(move |cx| L3sView::new(target, connection, settings, signal, theme, window, cx))
+        },
     );
     if let Err(error) = opened {
         eprintln!("l3s: could not open another window: {error}");
@@ -460,11 +524,111 @@ struct CardLayout {
     cell_h: f32,
 }
 
+/// A stable endpoint identity: the local session or one saved machine.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+enum EndpointId {
+    /// The owner-local daemon this window launched against.
+    Local,
+    /// A saved machine profile, by its stable id.
+    Machine(String),
+}
+
+impl EndpointId {
+    /// A short key for element ids and collapse state.
+    fn key(&self) -> String {
+        match self {
+            Self::Local => "local".to_string(),
+            Self::Machine(id) => id.clone(),
+        }
+    }
+
+    /// The machine profile this endpoint refers to, if any.
+    fn machine_id(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Machine(id) => Some(id.as_str()),
+        }
+    }
+}
+
+/// One connected endpoint while another endpoint owns the visible surface.
+///
+/// The active endpoint's state lives in [`L3sView`]'s own fields so drawing
+/// code never changes; this is the mirror image for everything else. Inactive
+/// endpoints stay suspended: their catalogs still arrive, so their workspace
+/// rows render, but they stream no frames and own no input.
+struct Endpoint {
+    machine: Option<MachineInfo>,
+    connection: Connection,
+    surface: Surface,
+    status: String,
+    tabs: Vec<Tab>,
+    agents: Vec<Agent>,
+    bar_widgets: Vec<BarWidget>,
+    automations: AutomationSummary,
+    tasks: TaskSummary,
+    /// Agents-only feed, so a hidden endpoint still lists its agents.
+    feed: AgentFeed,
+}
+
+/// A requested endpoint handoff waiting for its prepared frame.
+struct PendingSwitch {
+    target: EndpointId,
+    /// Workspace to focus after the handoff commits.
+    focus: Option<String>,
+    /// Pane to focus after the handoff commits.
+    pane: Option<String>,
+    ticket: u64,
+    /// Whether a prepared frame has been requested for `ticket`.
+    prepared: bool,
+    /// When the handoff started, for the stall timeout.
+    started: Instant,
+}
+
+/// The endpoint a click asked for, before its connection exists.
+#[derive(Clone)]
+struct EndpointRequest {
+    id: EndpointId,
+    /// Workspace to focus once the endpoint is active.
+    focus: Option<String>,
+    /// Pane to focus once the endpoint is active.
+    pane: Option<String>,
+}
+
+/// A background machine connection's outcome.
+enum MachineConnect {
+    Connected {
+        machine: MachineInfo,
+        connection: Connection,
+    },
+    Failed {
+        id: String,
+        error: String,
+    },
+}
+
+/// Automatic reconnect state for one machine, with bounded backoff.
+struct Reconnect {
+    /// Consecutive failed connection attempts since the last healthy link.
+    failures: u32,
+    /// Earliest instant for the next automatic attempt.
+    next_at: Instant,
+}
+
+/// First automatic reconnect delay.
+const RECONNECT_BASE: Duration = Duration::from_secs(1);
+/// Ceiling for the exponential backoff.
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// Consecutive failures before automatic attempts pause for a manual retry.
+const RECONNECT_ATTEMPTS: u32 = 3;
+
 struct L3sView {
     target: ConnectTarget,
     connection: Connection,
     surface: Surface,
     theme: Theme,
+    /// The app's live palette, shared with the Remote Machines window.
+    shared_theme: Rc<RefCell<Theme>>,
     focus_handle: FocusHandle,
     /// Font choices, shared with the Appearances window.
     settings: Settings,
@@ -504,6 +668,14 @@ struct L3sView {
     palette: Palette,
     /// Keeps the highlighted palette row scrolled into view.
     palette_scroll: ScrollHandle,
+    /// The native Open Workspace folder picker.
+    picker: WorkspacePicker,
+    /// Keeps the highlighted picker row scrolled into view.
+    picker_scroll: ScrollHandle,
+    /// Results from background picker listings and opens.
+    picker_rx: Receiver<PickerEvent>,
+    /// Sender half for picker tasks.
+    picker_tx: Sender<PickerEvent>,
     /// Results from background session create/start operations.
     session_rx: Receiver<SessionOpResult>,
     /// Sender half, handed to each background session operation.
@@ -541,6 +713,14 @@ struct L3sView {
     nav_sel: Option<NavKind>,
     /// When the optimistic pick was made, so stale picks age out.
     nav_sel_at: Instant,
+    /// Optimistic tab pick from a click, until `tab.list` confirms it.
+    tab_sel: Option<u16>,
+    /// When the optimistic tab pick was made, so stale picks age out.
+    tab_sel_at: Instant,
+    /// Optimistic focused agent (endpoint, pane), until `agent.list` confirms.
+    agent_sel: Option<(EndpointId, String)>,
+    /// When the optimistic agent pick was made, so stale picks age out.
+    agent_sel_at: Instant,
     /// The sidebar layout we superseded the daemon's with, once known.
     sidebar_layout: Option<l3s_protocol::SidebarsConfig>,
     /// Whether workspace paths are shown in that layout.
@@ -549,9 +729,40 @@ struct L3sView {
     sidebar_revision: u64,
     /// Whether the native sidebar is expanded.
     sidebar_visible: bool,
+    /// The endpoint currently loaded into the active fields above.
+    active: EndpointId,
+    /// The active machine's profile, when a machine owns the surface.
+    active_machine: Option<MachineInfo>,
+    /// Connected endpoints that are not currently active.
+    endpoints: HashMap<EndpointId, Endpoint>,
+    /// Endpoint ids with a background connection in flight.
+    connecting: HashSet<EndpointId>,
+    /// The most recent endpoint a click asked for, awaiting its connection.
+    wanted: Option<EndpointRequest>,
+    /// A handoff waiting for the target's prepared frame.
+    pending_switch: Option<PendingSwitch>,
+    /// Monotonic ticket source for prepared frames.
+    switch_ticket: u64,
+    /// Background machine connections.
+    machine_connect_rx: Receiver<MachineConnect>,
+    machine_connect_tx: Sender<MachineConnect>,
+    /// Enabled machines auto-connected once this lifetime, so a slow catalog
+    /// poll never restarts a bridge or retries a host that already failed.
+    auto_connected: HashSet<String>,
+    /// Automatic reconnect state per machine id, with bounded backoff.
+    reconnects: HashMap<String, Reconnect>,
+    /// Whether the active connection is still alive; a dropped machine
+    /// endpoint is replaced in place when its reconnect succeeds.
+    active_live: bool,
+    /// A `MachineCatalogChanged` arrived; refresh profiles on the next tick.
+    catalog_dirty: bool,
     /// OTA updater entity and the last status the view painted.
     updater: Entity<Updater>,
     last_update_status: UpdateStatus,
+    /// Machine-manager revision signal, shared with the manager window.
+    machine_signal: Rc<RefCell<MachineSignal>>,
+    /// Last revision this window applied, so a manager mutation reloads once.
+    seen_machine_revision: u64,
 }
 
 impl L3sView {
@@ -559,6 +770,8 @@ impl L3sView {
         target: ConnectTarget,
         connection: Connection,
         shared_settings: Rc<RefCell<Settings>>,
+        machine_signal: Rc<RefCell<MachineSignal>>,
+        shared_theme: Rc<RefCell<Theme>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -580,6 +793,8 @@ impl L3sView {
         let machines = list_machines(&session_root);
         let (machine_tx, machine_rx) = std::sync::mpsc::channel();
         let (session_tx, session_rx) = std::sync::mpsc::channel();
+        let (machine_connect_tx, machine_connect_rx) = std::sync::mpsc::channel();
+        let (picker_tx, picker_rx) = std::sync::mpsc::channel();
         let (theme_tx, theme_rx) = std::sync::mpsc::channel();
         let settings = shared_settings.borrow().clone();
         let update_request = UpdateRequest::from_settings(
@@ -589,11 +804,12 @@ impl L3sView {
         let updater = cx.new(|cx| Updater::from_request(&update_request, cx));
         let auto_check = settings.auto_check_updates;
 
-        let view = Self {
+        let mut view = Self {
             target,
             connection,
             surface: Surface::new(),
             theme: Theme::default(),
+            shared_theme,
             focus_handle,
             settings,
             shared_settings,
@@ -615,6 +831,10 @@ impl L3sView {
             session_menu_open: false,
             palette: Palette::default(),
             palette_scroll: ScrollHandle::new(),
+            picker: WorkspacePicker::default(),
+            picker_scroll: ScrollHandle::new(),
+            picker_rx,
+            picker_tx,
             session_rx,
             session_tx,
             bar_widgets: Vec::new(),
@@ -634,17 +854,39 @@ impl L3sView {
             theme_tx,
             nav_sel: None,
             nav_sel_at: Instant::now(),
+            tab_sel: None,
+            tab_sel_at: Instant::now(),
+            agent_sel: None,
+            agent_sel_at: Instant::now(),
             sidebar_layout: None,
             sidebar_workspace_paths: false,
             sidebar_revision: 0,
             sidebar_visible: true,
+            active: EndpointId::Local,
+            active_machine: None,
+            endpoints: HashMap::new(),
+            connecting: HashSet::new(),
+            wanted: None,
+            pending_switch: None,
+            switch_ticket: 0,
+            machine_connect_rx,
+            machine_connect_tx,
+            auto_connected: HashSet::new(),
+            reconnects: HashMap::new(),
+            active_live: true,
+            catalog_dirty: false,
             updater: updater.clone(),
             last_update_status: UpdateStatus::Idle,
+            machine_signal,
+            seen_machine_revision: 0,
         };
 
         if auto_check {
             updater.update(cx, |updater, cx| updater.check(cx));
         }
+
+        // Bridge every enabled machine up front so their workspaces are ready.
+        view.auto_connect_machines();
 
         cx.spawn(async move |this, cx| {
             loop {
@@ -674,41 +916,32 @@ impl L3sView {
         // transitions to the window so the footer badge stays live.
         let update_status = self.updater.read(cx).status().clone();
         if update_status != self.last_update_status {
-            self.last_update_status = update_status;
+            let was_error = matches!(self.last_update_status, UpdateStatus::Errored(_));
+            self.last_update_status = update_status.clone();
             changed = true;
-        }
-        while let Some(event) = self.connection.try_recv() {
-            match event {
-                ClientEvent::Ready { .. } => {
-                    self.status = self.connection.identity().session.clone();
-                    changed = true;
-                }
-                ClientEvent::Message(message) => {
-                    // Temporary: full-frame dimensions vs our viewport.
-                    if let l3s_client::protocol::ServerMessage::Frame(frame) = &message {
-                        eprintln!(
-                            "l3s-frame {}x{} want {}x{} skip {}",
-                            frame.width,
-                            frame.height,
-                            self.cols,
-                            self.rows,
-                            self.skipped_cols()
-                        );
-                    }
-                    if self.surface.apply(&message) != SurfaceChange::None {
-                        changed = true;
-                    }
-                    if let Some(text) = self.surface.take_notify() {
-                        self.status = text;
-                        changed = true;
-                    }
-                }
-                ClientEvent::Disconnected { reason } => {
-                    self.status = format!("disconnected · {reason}");
-                    changed = true;
-                }
+            // A failure surfaces in a window with a retry button instead of a
+            // footer pill.
+            if matches!(update_status, UpdateStatus::Errored(_))
+                && !was_error
+                && !update_window::is_open(cx)
+            {
+                update_window::open(self.updater.clone(), self.theme, cx);
             }
         }
+        // The machine manager bumps this on every successful mutation; reload
+        // the catalog so added, removed, or re-enabled hosts appear at once.
+        let machine_revision = self.machine_signal.borrow().revision;
+        if machine_revision != self.seen_machine_revision {
+            self.seen_machine_revision = machine_revision;
+            self.catalog_dirty = true;
+            changed = true;
+        }
+        changed |= self.poll_active();
+        changed |= self.poll_endpoints();
+        changed |= self.poll_machine_connects();
+        self.pump_reconnects();
+        self.drive_pending_switch();
+        self.expire_pending_switch();
         let mut tabs_changed = false;
         if let Some(feed) = self.agent_feed.as_ref() {
             while let Some(update) = feed.try_recv() {
@@ -723,6 +956,27 @@ impl L3sView {
         }
         if tabs_changed {
             self.reconcile_nav();
+        }
+        // Drop the optimistic tab pick once `tab.list` agrees or it goes stale.
+        if let Some(selected) = self.tab_sel {
+            let confirmed = self
+                .tabs
+                .iter()
+                .any(|tab| tab.active && tab.index == selected);
+            if confirmed || self.tab_sel_at.elapsed() > Duration::from_secs(2) {
+                self.tab_sel = None;
+            }
+        }
+        // Same for the optimistic focused agent, confirmed by `agent.list`.
+        if let Some((endpoint, pane)) = self.agent_sel.clone() {
+            let confirmed = endpoint == self.active
+                && self
+                    .agents
+                    .iter()
+                    .any(|agent| agent.pane == pane && agent.focused);
+            if confirmed || self.agent_sel_at.elapsed() > Duration::from_secs(2) {
+                self.agent_sel = None;
+            }
         }
         if self.sidebar_layout.is_none()
             && let Some(sidebars) = self.surface.shell_sidebars().cloned()
@@ -759,7 +1013,17 @@ impl L3sView {
                 changed = true;
             }
         }
-        if !self.machine_refreshing && self.last_machine_poll.elapsed() >= Duration::from_secs(10) {
+        let needs_probe = self.machines.iter().any(|machine| {
+            machine.id != "local"
+                && machine.enabled
+                && !self.reconnects.contains_key(&machine.id)
+                && !self.machine_connected(&machine.id)
+        });
+        if (self.catalog_dirty
+            || (needs_probe && self.last_machine_poll.elapsed() >= Duration::from_secs(10)))
+            && !self.machine_refreshing
+        {
+            self.catalog_dirty = false;
             self.machine_refreshing = true;
             self.last_machine_poll = Instant::now();
             let root = self.session_root.clone();
@@ -772,6 +1036,28 @@ impl L3sView {
             self.machine_refreshing = false;
             if machines != self.machines {
                 self.machines = machines;
+                // A machine removed from the catalog keeps its connection only
+                // while it is the one on screen; every other bridge closes now.
+                let known: Vec<String> = self.machines.iter().map(|m| m.id.clone()).collect();
+                let active = self.active_machine.as_ref().map(|m| m.id.clone());
+                self.endpoints.retain(|id, _| match id {
+                    EndpointId::Local => true,
+                    EndpointId::Machine(machine) => {
+                        known.iter().any(|known| known == machine)
+                            || active.as_deref() == Some(machine.as_str())
+                    }
+                });
+                // Forget attempts for hosts that are gone or disabled, so
+                // re-enabling one auto-connects again without retrying the rest.
+                let enabled: HashSet<String> = self
+                    .machines
+                    .iter()
+                    .filter(|machine| machine.enabled)
+                    .map(|machine| machine.id.clone())
+                    .collect();
+                self.auto_connected.retain(|id| enabled.contains(id));
+                self.reconnects.retain(|id, _| enabled.contains(id));
+                self.auto_connect_machines();
                 changed = true;
             }
         }
@@ -799,7 +1085,678 @@ impl L3sView {
                 changed = true;
             }
         }
+        while let Ok(event) = self.picker_rx.try_recv() {
+            match event {
+                PickerEvent::Listed { path, result } => {
+                    self.picker.apply_listing(&path, result);
+                    changed = true;
+                }
+                PickerEvent::Opened(result) => {
+                    match result {
+                        Ok(()) => self.status = "opened the workspace".to_string(),
+                        Err(error) => self.status = format!("couldn't open workspace: {error}"),
+                    }
+                    changed = true;
+                }
+                PickerEvent::WorktreeOpened(result) => {
+                    match result {
+                        Ok(()) => self.status = "created a new worktree".to_string(),
+                        Err(error) => self.status = format!("couldn't create worktree: {error}"),
+                    }
+                    changed = true;
+                }
+            }
+        }
         changed
+    }
+
+    /// Drain the active endpoint's connection.
+    fn poll_active(&mut self) -> bool {
+        let mut changed = false;
+        let mut catalog = false;
+        while let Some(event) = self.connection.try_recv() {
+            match event {
+                ClientEvent::Ready { identity, .. } => {
+                    self.status = identity.session;
+                    self.active_live = true;
+                    changed = true;
+                }
+                ClientEvent::Message(message) => {
+                    if let l3s_protocol::ServerMessage::MachineCatalogChanged { .. } = &message {
+                        catalog = true;
+                    }
+                    if self.surface.apply(&message) != SurfaceChange::None {
+                        changed = true;
+                    }
+                    if let Some(text) = self.surface.take_notify() {
+                        self.status = text;
+                        changed = true;
+                    }
+                }
+                ClientEvent::Disconnected { reason } => {
+                    self.status = format!("disconnected · {reason}");
+                    self.active_live = false;
+                    // The remote feed is its own SSH bridge; stop it while the
+                    // render bridge is down, and queue a backoff reconnect.
+                    self.agent_feed = None;
+                    if let Some(machine) = self.active_machine.clone() {
+                        self.schedule_reconnect(machine);
+                    }
+                    changed = true;
+                }
+            }
+        }
+        self.catalog_dirty |= catalog;
+        changed
+    }
+
+    /// The active endpoint as a picker/control source.
+    fn active_dir_source(&self) -> DirSource {
+        match &self.active_machine {
+            Some(machine) => match machine.ssh_target() {
+                Some(target) => DirSource::Remote(target),
+                None => DirSource::Local,
+            },
+            None => DirSource::Local,
+        }
+    }
+
+    /// Drain suspended endpoints and complete a prepared handoff.
+    fn poll_endpoints(&mut self) -> bool {
+        let mut changed = false;
+        let mut catalog = false;
+        let mut prepared: Option<EndpointId> = None;
+        let mut dropped: Vec<EndpointId> = Vec::new();
+        let pending = self
+            .pending_switch
+            .as_ref()
+            .map(|pending| (pending.target.clone(), pending.ticket));
+        let ids: Vec<EndpointId> = self.endpoints.keys().cloned().collect();
+        for id in ids {
+            let Some(endpoint) = self.endpoints.get_mut(&id) else {
+                continue;
+            };
+            let mut disconnected = None;
+            while let Some(event) = endpoint.connection.try_recv() {
+                match event {
+                    ClientEvent::Ready { identity, .. } => {
+                        endpoint.status = identity.session;
+                        changed = true;
+                    }
+                    ClientEvent::Message(message) => {
+                        if let l3s_protocol::ServerMessage::MachineCatalogChanged { .. } = &message
+                        {
+                            catalog = true;
+                        }
+                        if let l3s_protocol::ServerMessage::PreparedFrame { ticket, .. } = &message
+                            && pending.as_ref() == Some(&(id.clone(), *ticket))
+                        {
+                            prepared = Some(id.clone());
+                        }
+                        if endpoint.surface.apply(&message) != SurfaceChange::None {
+                            changed = true;
+                        }
+                    }
+                    ClientEvent::Disconnected { reason } => disconnected = Some(reason),
+                }
+            }
+            // A hidden endpoint keeps its agent list fresh through its own
+            // agents-only feed; the rest of its chrome waits for activation.
+            while let Some(update) = endpoint.feed.try_recv() {
+                if update.agents != endpoint.agents {
+                    endpoint.agents = update.agents;
+                    changed = true;
+                }
+            }
+            if disconnected.is_some() {
+                dropped.push(id.clone());
+                changed = true;
+            }
+        }
+        // A dropped suspended machine is torn down and reconnected from
+        // scratch; its surface closes with its SSH bridge.
+        for id in dropped {
+            if let EndpointId::Machine(machine_id) = &id {
+                self.endpoints.remove(&id);
+                if self
+                    .pending_switch
+                    .as_ref()
+                    .is_some_and(|pending| pending.target == id)
+                {
+                    self.pending_switch = None;
+                }
+                if let Some(machine) = self
+                    .machines
+                    .iter()
+                    .find(|machine| &machine.id == machine_id)
+                    .cloned()
+                {
+                    self.schedule_reconnect(machine);
+                }
+            }
+        }
+        self.catalog_dirty |= catalog;
+        if prepared.is_some() {
+            self.finish_switch();
+            changed = true;
+        }
+        changed
+    }
+
+    /// Turn finished background connections into endpoints and honor the
+    /// endpoint a click requested while the connection was in flight.
+    fn poll_machine_connects(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.machine_connect_rx.try_recv() {
+            match result {
+                MachineConnect::Connected {
+                    machine,
+                    connection,
+                } => {
+                    let id = EndpointId::Machine(machine.id.clone());
+                    self.connecting.remove(&id);
+                    self.reconnects.remove(&machine.id);
+                    // A reconnect of the machine already on screen swaps its
+                    // connection in place; the stale surface stays until the
+                    // new bridge sends a frame. Otherwise this is a fresh
+                    // suspended endpoint.
+                    if self
+                        .active_machine
+                        .as_ref()
+                        .is_some_and(|active| active.id == machine.id)
+                    {
+                        if !self.active_live {
+                            self.replace_active_connection(machine, connection);
+                            changed = true;
+                        }
+                        continue;
+                    }
+                    let _ = connection.request_workspace_dock();
+                    let _ = connection.set_interest(SurfaceInterest::Suspended);
+                    let _ = connection.send(ClientMessage::Resize {
+                        cols: self.cols,
+                        rows: self.rows,
+                        cell_width_px: self.sent_cell.0,
+                        cell_height_px: self.sent_cell.1,
+                    });
+                    let feed = self.agents_feed_for(&machine);
+                    self.endpoints.insert(
+                        id,
+                        Endpoint {
+                            machine: Some(machine),
+                            connection,
+                            surface: Surface::new(),
+                            status: "connecting…".to_string(),
+                            tabs: Vec::new(),
+                            agents: Vec::new(),
+                            bar_widgets: Vec::new(),
+                            automations: AutomationSummary::default(),
+                            tasks: TaskSummary::default(),
+                            feed,
+                        },
+                    );
+                    changed = true;
+                }
+                MachineConnect::Failed { id, error } => {
+                    self.connecting.remove(&EndpointId::Machine(id.clone()));
+                    // Count the failure and arm the next backoff attempt; a
+                    // healthy link resets the budget on success.
+                    let entry = self.reconnects.entry(id.clone()).or_insert(Reconnect {
+                        failures: 0,
+                        next_at: Instant::now(),
+                    });
+                    entry.failures = entry.failures.saturating_add(1);
+                    entry.next_at = Instant::now() + reconnect_delay(entry.failures);
+                    self.status = if entry.failures >= RECONNECT_ATTEMPTS {
+                        format!("{id}: {error} (automatic retries paused)")
+                    } else {
+                        format!("{id}: {error}")
+                    };
+                    changed = true;
+                }
+            }
+        }
+        if let Some(request) = self.wanted.clone()
+            && self.endpoints.contains_key(&request.id)
+        {
+            self.wanted = None;
+            self.begin_switch(request.id, request.focus, request.pane);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Send the pending handoff's prepare request once its endpoint is known.
+    fn drive_pending_switch(&mut self) {
+        let Some(pending) = self.pending_switch.as_ref() else {
+            return;
+        };
+        if pending.prepared {
+            return;
+        }
+        let target = pending.target.clone();
+        let ticket = pending.ticket;
+        let (cols, rows) = (self.cols, self.rows);
+        if let Some(endpoint) = self.endpoints.get(&target) {
+            let _ = endpoint.connection.set_interest(SurfaceInterest::Prepared);
+            let _ = endpoint.connection.prepare_surface(ticket, cols, rows);
+            if let Some(pending) = self.pending_switch.as_mut() {
+                pending.prepared = true;
+            }
+        }
+    }
+
+    /// Start the two-phase handoff to an already-connected endpoint.
+    fn begin_switch(&mut self, target: EndpointId, focus: Option<String>, pane: Option<String>) {
+        if target == self.active {
+            self.cancel_pending_switch();
+            if let Some(workspace) = focus {
+                self.focus_workspace(&workspace);
+            }
+            if let Some(pane) = pane {
+                self.focus_agent(&pane);
+            }
+            return;
+        }
+        // Abandon an earlier handoff so its endpoint stops preparing frames.
+        if self
+            .pending_switch
+            .as_ref()
+            .is_some_and(|pending| pending.target != target)
+        {
+            self.cancel_pending_switch();
+        }
+        self.switch_ticket = self.switch_ticket.wrapping_add(1);
+        let ticket = self.switch_ticket;
+        self.pending_switch = Some(PendingSwitch {
+            target,
+            focus,
+            pane,
+            ticket,
+            prepared: false,
+            started: Instant::now(),
+        });
+    }
+
+    /// Drop a pending handoff, returning its endpoint to a suspended state.
+    fn cancel_pending_switch(&mut self) {
+        let Some(pending) = self.pending_switch.take() else {
+            return;
+        };
+        if let Some(endpoint) = self.endpoints.get(&pending.target) {
+            let _ = endpoint.connection.set_interest(SurfaceInterest::Suspended);
+        }
+    }
+
+    /// Give up on a handoff whose target never produced a frame.
+    fn expire_pending_switch(&mut self) {
+        const SWITCH_TIMEOUT: Duration = Duration::from_secs(8);
+        let expired = self
+            .pending_switch
+            .as_ref()
+            .is_some_and(|pending| pending.started.elapsed() >= SWITCH_TIMEOUT);
+        if !expired {
+            return;
+        }
+        // A prepared-but-uncommitted frame still lets the handoff succeed; a
+        // target that never prepared is reported and cancelled.
+        if self
+            .pending_switch
+            .as_ref()
+            .is_some_and(|pending| pending.prepared)
+        {
+            self.finish_switch();
+            return;
+        }
+        let label = self
+            .pending_switch
+            .as_ref()
+            .map(|pending| self.endpoint_label(&pending.target))
+            .unwrap_or_default();
+        self.cancel_pending_switch();
+        self.status = format!("timed out switching to {label}");
+    }
+
+    /// Commit a prepared handoff: the target's candidate frame has arrived, so
+    /// the surfaces trade places without ever blanking the window.
+    fn finish_switch(&mut self) {
+        let Some(pending) = self.pending_switch.take() else {
+            return;
+        };
+        let target = pending.target;
+        if target == self.active {
+            return;
+        }
+        // The outgoing endpoint stops streaming but keeps its panes and size.
+        let _ = self.connection.set_interest(SurfaceInterest::Suspended);
+        // Give the outgoing endpoint an agents-only feed so its agents stay in
+        // the list while it is hidden.
+        let outgoing_feed = self.spawn_agents_feed(self.active_machine.as_ref());
+
+        let Some(endpoint) = self.endpoints.remove(&target) else {
+            return;
+        };
+        let Endpoint {
+            machine,
+            connection,
+            surface,
+            status,
+            tabs,
+            agents,
+            bar_widgets,
+            automations,
+            tasks,
+            // The incoming agents-only feed is superseded by the full feed
+            // spawned below; the agent snapshot it already produced is moved
+            // into the active slots, so the list never flickers.
+            feed: _incoming_feed,
+        } = endpoint;
+        let outgoing_id = std::mem::replace(&mut self.active, target.clone());
+        let outgoing = Endpoint {
+            machine: self.active_machine.take(),
+            connection: std::mem::replace(&mut self.connection, connection),
+            surface: std::mem::replace(&mut self.surface, surface),
+            status: std::mem::replace(&mut self.status, status),
+            tabs: std::mem::replace(&mut self.tabs, tabs),
+            agents: std::mem::replace(&mut self.agents, agents),
+            bar_widgets: std::mem::replace(&mut self.bar_widgets, bar_widgets),
+            automations: std::mem::replace(&mut self.automations, automations),
+            tasks: std::mem::replace(&mut self.tasks, tasks),
+            feed: outgoing_feed,
+        };
+        self.endpoints.insert(outgoing_id, outgoing);
+        self.active_machine = machine;
+
+        let _ = self.connection.set_interest(SurfaceInterest::Active);
+        let _ = self.connection.send(ClientMessage::Resize {
+            cols: self.cols,
+            rows: self.rows,
+            cell_width_px: self.sent_cell.0,
+            cell_height_px: self.sent_cell.1,
+        });
+        // Sidebar preferences belong to this window, not the endpoint: make the
+        // newly active server blank the same docks the previous one did.
+        self.push_sidebar_layout();
+        self.agent_feed = Some(self.spawn_feed_for_active());
+        self.selection = None;
+        self.hover_cell = None;
+        self.press_anchor = None;
+        self.dragging = false;
+        self.nav_sel = None;
+        self.tab_sel = None;
+        self.picker.close();
+        self.active_live = true;
+        self.status = self.connection.identity().session.clone();
+        if let Some(workspace) = pending.focus {
+            self.focus_workspace(&workspace);
+        }
+        if let Some(pane) = pending.pane {
+            self.focus_agent(&pane);
+        }
+    }
+
+    /// Select an endpoint, connecting it first when necessary.
+    ///
+    /// `focus` and `pane` name a workspace and pane to focus once the endpoint
+    /// owns the surface; both are deferred through the handoff.
+    fn activate_endpoint(
+        &mut self,
+        id: EndpointId,
+        focus: Option<String>,
+        pane: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if id == self.active {
+            // Re-selecting the visible endpoint abandons any pending handoff.
+            self.cancel_pending_switch();
+            // A dropped active machine reconnects on demand; a healthy one
+            // just focuses the requested workspace or pane.
+            if !self.active_live {
+                if let Some(machine) = self.active_machine.clone() {
+                    self.reconnects.remove(&machine.id);
+                    self.spawn_machine_connect(machine);
+                }
+                cx.notify();
+                return;
+            }
+            if let Some(workspace) = focus {
+                self.focus_workspace(&workspace);
+            }
+            if let Some(pane) = pane {
+                self.focus_agent(&pane);
+            }
+            cx.notify();
+            return;
+        }
+        if self.endpoints.contains_key(&id) {
+            self.begin_switch(id, focus, pane);
+            cx.notify();
+            return;
+        }
+        let Some(machine_id) = id.machine_id().map(str::to_string) else {
+            return;
+        };
+        self.wanted = Some(EndpointRequest {
+            id: id.clone(),
+            focus,
+            pane,
+        });
+        let Some(machine) = self
+            .machines
+            .iter()
+            .find(|machine| machine.id == machine_id)
+            .cloned()
+        else {
+            self.status = format!("unknown machine `{machine_id}`");
+            return;
+        };
+        // A manual click always retries and resets the backoff budget, even
+        // after automatic attempts paused.
+        self.reconnects.remove(&machine.id);
+        self.auto_connected.insert(machine.id.clone());
+        self.spawn_machine_connect(machine);
+        cx.notify();
+    }
+
+    /// Start a background SSH bridge for `machine`.
+    ///
+    /// Each bridge runs on its own thread, so connecting the whole catalog is
+    /// parallel rather than one handshake at a time.
+    fn spawn_machine_connect(&mut self, machine: MachineInfo) {
+        let id = EndpointId::Machine(machine.id.clone());
+        if !self.connecting.insert(id) {
+            return;
+        }
+        let (cols, rows) = (self.cols, self.rows);
+        let tx = self.machine_connect_tx.clone();
+        std::thread::spawn(move || {
+            let result = match connect_machine(&machine, cols, rows) {
+                Ok(connection) => MachineConnect::Connected {
+                    machine,
+                    connection,
+                },
+                Err(error) => MachineConnect::Failed {
+                    id: machine.id.clone(),
+                    error: error.to_string(),
+                },
+            };
+            tx.send(result).ok();
+        });
+    }
+
+    /// Whether `machine_id` already has a bridge, is connecting, or is active.
+    fn machine_connected(&self, machine_id: &str) -> bool {
+        self.active_machine
+            .as_ref()
+            .is_some_and(|active| active.id == machine_id)
+            || self
+                .endpoints
+                .contains_key(&EndpointId::Machine(machine_id.to_string()))
+            || self
+                .connecting
+                .contains(&EndpointId::Machine(machine_id.to_string()))
+    }
+
+    /// Bridge every enabled machine that has not been attempted yet.
+    ///
+    /// Connecting all saved hosts up front means their workspace rows are
+    /// populated and a click switches immediately instead of waiting on a
+    /// handshake. Attempts are parallel and recorded, so a slow catalog poll
+    /// neither reconnects a healthy host nor retries one that already failed.
+    fn auto_connect_machines(&mut self) {
+        let machines: Vec<MachineInfo> = self
+            .machines
+            .iter()
+            .filter(|machine| machine.id != "local" && machine.enabled)
+            .cloned()
+            .collect();
+        for machine in machines {
+            if self.machine_connected(&machine.id)
+                || !self.auto_connected.insert(machine.id.clone())
+            {
+                continue;
+            }
+            self.spawn_machine_connect(machine);
+        }
+    }
+
+    /// Arm bounded-backoff reconnect after a bridge drops.
+    fn schedule_reconnect(&mut self, machine: MachineInfo) {
+        let entry = self
+            .reconnects
+            .entry(machine.id.clone())
+            .or_insert(Reconnect {
+                failures: 0,
+                next_at: Instant::now(),
+            });
+        if entry.failures >= RECONNECT_ATTEMPTS {
+            return;
+        }
+        entry.next_at = Instant::now() + reconnect_delay(entry.failures);
+    }
+
+    /// Start the automatic attempts whose backoff has elapsed.
+    ///
+    /// Bounded and parallel like the first connection: one attempt per due
+    /// machine, no busy loop, and attempts stop after [`RECONNECT_ATTEMPTS`]
+    /// until a manual click resets the budget.
+    fn pump_reconnects(&mut self) {
+        if self.reconnects.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let in_flight: HashSet<String> = self
+            .connecting
+            .iter()
+            .filter_map(|id| id.machine_id().map(str::to_string))
+            .collect();
+        let due: Vec<String> = self
+            .reconnects
+            .iter()
+            .filter(|(id, entry)| {
+                entry.failures < RECONNECT_ATTEMPTS
+                    && now >= entry.next_at
+                    && !in_flight.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            let Some(machine) = self
+                .machines
+                .iter()
+                .find(|machine| machine.id == id && machine.enabled)
+                .cloned()
+            else {
+                self.reconnects.remove(&id);
+                continue;
+            };
+            // Move the deadline forward now so a slow handshake is not
+            // restarted on the next tick; the result handler rebases it.
+            if let Some(entry) = self.reconnects.get_mut(&id) {
+                entry.next_at = now + reconnect_delay(entry.failures);
+            }
+            self.spawn_machine_connect(machine);
+        }
+    }
+
+    /// Swap a reconnected bridge into the active slots without a handoff.
+    fn replace_active_connection(&mut self, machine: MachineInfo, connection: Connection) {
+        let machine_id = machine.id.clone();
+        self.connection = connection;
+        self.active_live = true;
+        self.active_machine = Some(machine);
+        self.endpoints
+            .remove(&EndpointId::Machine(machine_id.clone()));
+        let _ = self.connection.request_workspace_dock();
+        let _ = self.connection.set_interest(SurfaceInterest::Active);
+        let _ = self.connection.send(ClientMessage::Resize {
+            cols: self.cols,
+            rows: self.rows,
+            cell_width_px: self.sent_cell.0,
+            cell_height_px: self.sent_cell.1,
+        });
+        self.push_sidebar_layout();
+        self.agent_feed = Some(self.spawn_feed_for_active());
+        self.status = "reconnected".to_string();
+    }
+
+    /// The workspace catalog of an endpoint, active or stashed.
+    fn endpoint_workspaces(&self, id: &EndpointId) -> &[ShellWorkspace] {
+        if *id == self.active {
+            return self.surface.workspaces();
+        }
+        self.endpoints
+            .get(id)
+            .map(|endpoint| endpoint.surface.workspaces())
+            .unwrap_or(&[])
+    }
+
+    /// The agent list of an endpoint, active or stashed.
+    fn endpoint_agents(&self, id: &EndpointId) -> &[Agent] {
+        if *id == self.active {
+            return &self.agents;
+        }
+        self.endpoints
+            .get(id)
+            .map(|endpoint| endpoint.agents.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The endpoints with a live bridge: Local, then every connected machine.
+    fn connected_endpoints(&self) -> Vec<EndpointId> {
+        let mut ids = vec![EndpointId::Local];
+        for machine in self.machines.iter().filter(|machine| machine.id != "local") {
+            let id = EndpointId::Machine(machine.id.clone());
+            if id == self.active || self.endpoints.contains_key(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// A feed for the active endpoint: local socket or, for a machine, its
+    /// remote UHP surface over the same SSH bridge family.
+    fn spawn_feed_for_active(&self) -> AgentFeed {
+        match &self.active_machine {
+            Some(machine) => match machine.ssh_target() {
+                Some(target) => AgentFeed::spawn_ssh(target),
+                None => AgentFeed::spawn(self.api_socket()),
+            },
+            None => AgentFeed::spawn(self.api_socket()),
+        }
+    }
+
+    /// An agents-only feed for a hidden endpoint, so its agents still list.
+    fn spawn_agents_feed(&self, machine: Option<&MachineInfo>) -> AgentFeed {
+        match machine.and_then(MachineInfo::ssh_target) {
+            Some(target) => AgentFeed::spawn_ssh_agents(target),
+            None => AgentFeed::spawn_agents(self.api_socket()),
+        }
+    }
+
+    /// The agents-only feed for one machine.
+    fn agents_feed_for(&self, machine: &MachineInfo) -> AgentFeed {
+        self.spawn_agents_feed(Some(machine))
     }
 
     /// Rebuild the chrome palette from the selected appearance. A vendored
@@ -812,6 +1769,7 @@ impl L3sView {
             .shell_dock()
             .map(|dock| Theme::from_chrome(dock.chrome));
         self.theme = builtin.or(projected).unwrap_or_default();
+        *self.shared_theme.borrow_mut() = self.theme;
     }
 
     /// Pull the shared font settings the Appearances window may have changed.
@@ -828,6 +1786,11 @@ impl L3sView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The Open Workspace picker owns every keystroke while it is open.
+        if self.picker.is_open() {
+            self.picker_key(event, cx);
+            return;
+        }
         // An open palette owns every keystroke: type, navigate, run, dismiss.
         if self.palette.is_open() {
             self.palette_key(event, window, cx);
@@ -972,11 +1935,11 @@ impl L3sView {
                 "Session",
                 Some("⌘⇧D"),
             ),
-            entry(Command::NewSession, "New Session…", "Session", None),
+            entry(Command::NewSession, "New Session", "Session", None),
             entry(Command::NewWindow, "New Window", "Application", Some("⌘N")),
             entry(
                 Command::OpenAppearances,
-                "Open Appearances…",
+                "Open Appearances",
                 "Application",
                 Some("⌘,"),
             ),
@@ -1013,9 +1976,9 @@ impl L3sView {
             ),
             entry(
                 Command::OpenWorkspacePicker,
-                "Open Workspace…",
+                "Open Workspace",
                 "Workspace",
-                None,
+                Some("⌘⇧O"),
             ),
         ];
         for tab in &self.tabs {
@@ -1082,10 +2045,8 @@ impl L3sView {
             Command::PasteClipboard => window.dispatch_action(PasteClipboard.boxed_clone(), cx),
             Command::SelectAllGrid => window.dispatch_action(SelectAllGrid.boxed_clone(), cx),
             Command::Quit => window.dispatch_action(QuitApp.boxed_clone(), cx),
-            Command::OpenWorkspacePicker => {
-                let _ = self.connection.send(ClientMessage::OpenWorkspacePicker);
-            }
-            Command::FocusTab(index) => self.focus_tab(index),
+            Command::OpenWorkspacePicker => self.open_picker(cx),
+            Command::FocusTab(index) => self.focus_tab(index, cx),
             Command::SwitchSession(name) => self.switch_session(&name),
             Command::NewSession => self.start_new_session(),
             Command::FocusWorkspace(id) => self.focus_workspace(&id),
@@ -1128,10 +2089,25 @@ impl L3sView {
     }
 
     /// Focus an agent's pane, switching workspace and tab as needed.
-    fn focus_agent(&self, pane: &str) {
+    ///
+    /// The AGENTS row highlights immediately from the optimistic pick; the
+    /// feed's next `agent.list` confirms it once the daemon has focused it.
+    fn focus_agent(&mut self, pane: &str) {
+        self.agent_sel = Some((self.active.clone(), pane.to_string()));
+        self.agent_sel_at = Instant::now();
         if let Some(feed) = self.agent_feed.as_ref() {
             feed.focus_pane(pane);
         }
+    }
+
+    /// Whether an agent row draws as the focused pane.
+    fn agent_focused(&self, endpoint: &EndpointId, agent: &Agent) -> bool {
+        if let Some((selected, pane)) = &self.agent_sel
+            && self.agent_sel_at.elapsed() < Duration::from_secs(2)
+        {
+            return selected == endpoint && *pane == agent.pane;
+        }
+        *endpoint == self.active && agent.focused
     }
 
     /// Focus a workspace by id, switching the daemon's active workspace.
@@ -1139,6 +2115,621 @@ impl L3sView {
         let _ = self.connection.send(ClientMessage::ShellWorkspaceFocus {
             workspace_id: workspace_id.to_string(),
         });
+    }
+
+    /// A control client for an endpoint's control surface.
+    fn control_client_for(&self, source: &DirSource) -> Option<ControlClient> {
+        match source {
+            DirSource::Local => ControlClient::connect(&self.api_socket()).ok(),
+            DirSource::Remote(target) => ControlClient::connect_ssh(target.clone()).ok(),
+        }
+    }
+
+    /// Open the native Open Workspace picker on the active endpoint.
+    fn open_picker(&mut self, cx: &mut Context<Self>) {
+        let source = self.active_dir_source();
+        let start = self.picker_start_dir();
+        self.picker.open(source, start);
+        self.list_picker(cx);
+        cx.notify();
+    }
+
+    /// Where the picker starts: the active workspace's folder, else the home.
+    fn picker_start_dir(&self) -> String {
+        if let Some(active) = self.surface.workspaces().iter().find(|w| w.active)
+            && !active.cwd.is_empty()
+        {
+            return active.cwd.clone();
+        }
+        match &self.active_machine {
+            Some(_) => "~".to_string(),
+            None => std::env::var("HOME").unwrap_or_else(|_| "/".to_string()),
+        }
+    }
+
+    /// Start a background listing of the picker's current directory.
+    fn list_picker(&mut self, _cx: &mut Context<Self>) {
+        picker::spawn_list(
+            self.picker_tx.clone(),
+            self.picker.source().clone(),
+            self.picker.cwd().to_string(),
+        );
+    }
+
+    /// Open `path` as a workspace on the picker's endpoint, then close it.
+    fn open_workspace_path(&mut self, path: String, cx: &mut Context<Self>) {
+        let source = self.picker.source().clone();
+        let Some(mut client) = self.control_client_for(&source) else {
+            self.status = "no control connection for the selected endpoint".to_string();
+            return;
+        };
+        self.picker.close();
+        self.status = format!("opening {path}…");
+        let tx = self.picker_tx.clone();
+        std::thread::spawn(move || {
+            let result = client
+                .open_workspace(&path)
+                .map_err(|error| error.to_string());
+            tx.send(PickerEvent::Opened(result)).ok();
+        });
+        cx.notify();
+    }
+
+    /// Create a worktree of the endpoint's active repo with a generated branch.
+    fn open_new_worktree(&mut self, cx: &mut Context<Self>) {
+        let source = self.picker.source().clone();
+        let Some(mut client) = self.control_client_for(&source) else {
+            self.status = "no control connection for the selected endpoint".to_string();
+            return;
+        };
+        let branch = generate_session_name(&[]);
+        self.picker.close();
+        self.status = format!("creating worktree {branch}…");
+        let tx = self.picker_tx.clone();
+        std::thread::spawn(move || {
+            let result = client
+                .create_worktree(&branch)
+                .map_err(|error| error.to_string());
+            tx.send(PickerEvent::WorktreeOpened(result)).ok();
+        });
+        cx.notify();
+    }
+
+    /// Route a keystroke to the open picker.
+    fn picker_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        // The host dropdown is its own modal layer.
+        if self.picker.menu_open() {
+            match key {
+                "escape" => self.picker.close_menu(),
+                "up" => self.picker.menu_move(-1),
+                "down" => self.picker.menu_move(1),
+                "enter" => {
+                    if let Some(source) = self.picker.take_menu_source() {
+                        self.picker.rebase(source, "~".to_string());
+                        self.list_picker(cx);
+                        self.picker_scroll.scroll_to_item(0);
+                    }
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
+        if key == "escape" {
+            if self.picker.editing() {
+                self.picker.end_edit();
+            } else {
+                self.picker.close();
+            }
+            cx.notify();
+            return;
+        }
+        if self.picker.editing() {
+            match key {
+                "enter" => {
+                    if self.picker.jump().is_some() {
+                        self.list_picker(cx);
+                        self.picker_scroll.scroll_to_item(0);
+                    }
+                }
+                "backspace" => self.picker.path_mut().backspace(),
+                "delete" | "del" => self.picker.path_mut().delete(),
+                "left" => self.picker.path_mut().left(),
+                "right" => self.picker.path_mut().right(),
+                "home" => self.picker.path_mut().home(),
+                "end" => self.picker.path_mut().end(),
+                _ => {
+                    if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
+                        return;
+                    }
+                    if let Some(text) = event
+                        .keystroke
+                        .key_char
+                        .as_deref()
+                        .filter(|t| !t.is_empty())
+                    {
+                        self.picker.path_mut().insert(text);
+                    } else if event.keystroke.key.chars().count() == 1 {
+                        self.picker.path_mut().insert(&event.keystroke.key);
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        // Shift+`.` toggles hidden entries; GPUI may report `.`, `>`, or a
+        // `key_char` of `>` depending on layout.
+        if key == ">"
+            || event.keystroke.key_char.as_deref() == Some(">")
+            || (event.keystroke.modifiers.shift && key == ".")
+        {
+            self.picker.toggle_hidden();
+            cx.notify();
+            return;
+        }
+        match key {
+            "up" => self.picker.move_selection(-1),
+            "down" => self.picker.move_selection(1),
+            "left" => {
+                if self.picker.go_up().is_some() {
+                    self.list_picker(cx);
+                }
+            }
+            "right" => {
+                if self.picker.go_back().is_some() {
+                    self.list_picker(cx);
+                }
+            }
+            "enter" => {
+                if self.picker.enter().is_some() {
+                    self.list_picker(cx);
+                }
+            }
+            "backspace" => {
+                if self.picker.go_up().is_some() {
+                    self.list_picker(cx);
+                }
+            }
+            "tab" => self.picker.begin_edit(),
+            _ => {}
+        }
+        self.picker_scroll.scroll_to_item(self.picker.selected());
+        cx.notify();
+    }
+
+    /// The endpoint choices shown in the picker's host dropdown.
+    fn picker_menu_choices(&self) -> Vec<MenuChoice> {
+        let current = self.picker.source().clone();
+        let mut choices = vec![MenuChoice {
+            label: "Local".to_string(),
+            source: DirSource::Local,
+            current: current == DirSource::Local,
+            online: Some(true),
+        }];
+        for machine in self
+            .machines
+            .iter()
+            .filter(|machine| machine.id != "local" && machine.enabled)
+        {
+            if let Some(target) = machine.ssh_target() {
+                let source = DirSource::Remote(target);
+                choices.push(MenuChoice {
+                    label: machine.display().to_string(),
+                    current: source == current,
+                    online: machine.online,
+                    source,
+                });
+            }
+        }
+        choices
+    }
+
+    /// The label for the picker's current endpoint.
+    fn picker_source_label(&self) -> String {
+        match self.picker.source() {
+            DirSource::Local => "Local".to_string(),
+            DirSource::Remote(target) => self
+                .machines
+                .iter()
+                .find(|machine| machine.ssh_target().as_ref() == Some(target))
+                .map(|machine| machine.display().to_string())
+                .unwrap_or_else(|| target.destination.clone()),
+        }
+    }
+
+    /// The Open Workspace picker overlay.
+    fn picker_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        if !self.picker.is_open() {
+            return div();
+        }
+        // Fit the panel inside the window so a short or narrow window never
+        // clips the footer buttons.
+        let viewport = window.viewport_size();
+        let panel_w = (f32::from(viewport.width) - 32.0).clamp(320.0, 760.0);
+        // Fill the window below the header so the footer buttons sit at the
+        // bottom; clamp so a tiny window still shows a usable panel.
+        let panel_h = (f32::from(viewport.height) - HEADER_HEIGHT - 36.0).clamp(220.0, 900.0);
+        let theme = self.theme;
+        let cwd = self.picker.cwd().to_string();
+        let editing = self.picker.editing();
+        let path = self.picker.path();
+        let mut line = div().flex().flex_row().items_center().flex_1();
+        if editing {
+            let text = path.value.clone();
+            let cursor = path.cursor;
+            let before: String = text.chars().take(cursor).collect();
+            let after: String = text.chars().skip(cursor).collect();
+            line = line
+                .child(div().text_color(theme.fg).child(before))
+                .child(div().w(px(1.5)).h(px(16.0)).bg(theme.accent))
+                .child(div().text_color(theme.fg).child(after));
+        } else {
+            line = line.child(div().text_color(theme.fg).child(cwd.clone()));
+        }
+        let path_field = div()
+            .id("l3s-picker-path")
+            .flex()
+            .items_center()
+            .h(px(38.0))
+            .px_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .cursor_pointer()
+            .text_size(px(self.chrome_font()))
+            .child(line)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.picker.begin_edit();
+                cx.notify();
+            }));
+
+        let source_label = self.picker_source_label();
+        let menu_button = div()
+            .id("l3s-picker-endpoint")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(26.0))
+            .px_2()
+            .rounded_md()
+            .bg(theme.panel)
+            .text_size(px(self.footer_font()))
+            .text_color(theme.fg)
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.border))
+            .child(icon(
+                include_bytes!("../../assets/icons/monitor.svg"),
+                13.0,
+                theme.muted,
+            ))
+            .child(source_label)
+            .child(icon(
+                include_bytes!("../../assets/icons/chevron-down.svg"),
+                11.0,
+                theme.muted,
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let choices = this.picker_menu_choices();
+                this.picker.toggle_menu(choices);
+                cx.notify();
+            }));
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(42.0))
+            .px_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.fg)
+                    .child("Open Workspace"),
+            )
+            .child(menu_button);
+        let menu = if self.picker.menu_open() {
+            let choices = self.picker.menu_choices();
+            let highlighted = self.picker.menu_selected();
+            let mut list = div().flex().flex_col().gap_1().p_1();
+            for (index, choice) in choices.iter().enumerate() {
+                let active = index == highlighted;
+                let (status_text, status_color) = match choice.online {
+                    Some(true) => ("online", theme.ok),
+                    Some(false) => ("offline", theme.alert),
+                    None => ("…", theme.muted),
+                };
+                list = list.child(
+                    div()
+                        .id(format!("l3s-picker-endpoint-{index}"))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .h(px(28.0))
+                        .px_2()
+                        .rounded_md()
+                        .text_size(px(self.chrome_font()))
+                        .bg(if active {
+                            theme.selection_bg
+                        } else {
+                            theme.sidebar_bg
+                        })
+                        .text_color(if active {
+                            theme.selection_fg
+                        } else {
+                            theme.panel_fg
+                        })
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.panel))
+                        .child(icon(
+                            include_bytes!("../../assets/icons/circle.svg"),
+                            8.0,
+                            status_color,
+                        ))
+                        .child(choice.label.clone())
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(self.section_font()))
+                                .text_color(if active {
+                                    theme.selection_fg.opacity(0.75)
+                                } else {
+                                    theme.muted
+                                })
+                                .child(status_text),
+                        )
+                        .child(if choice.current {
+                            div()
+                                .text_size(px(self.section_font()))
+                                .text_color(theme.muted)
+                                .child("current")
+                        } else {
+                            div()
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(source) = this.picker.choose_menu(index) {
+                                this.picker.rebase(source, "~".to_string());
+                                this.list_picker(cx);
+                                this.picker_scroll.scroll_to_item(0);
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            div()
+                .absolute()
+                .occlude()
+                .top(px(44.0))
+                .right(px(8.0))
+                .w(px(240.0))
+                .rounded_md()
+                .bg(theme.sidebar_bg)
+                .border_1()
+                .border_color(theme.border)
+                .child(list)
+        } else {
+            div()
+        };
+
+        let entries = self.picker.entries();
+        let selected = self.picker.selected();
+        let mut rows = div()
+            .id("l3s-picker-list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_1()
+            .p_1()
+            .overflow_y_scroll()
+            .track_scroll(&self.picker_scroll);
+        if let Some(error) = self.picker.error() {
+            rows = rows.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(self.footer_font()))
+                    .text_color(theme.alert)
+                    .child(error.to_string()),
+            );
+        }
+        if entries.is_empty() && self.picker.loading() {
+            rows = rows.child(
+                div()
+                    .px_3()
+                    .py_4()
+                    .text_size(px(self.chrome_font()))
+                    .text_color(theme.muted)
+                    .child("Loading…"),
+            );
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            let active = index == selected;
+            let name = entry.name.clone();
+            let row_icon: &[u8] = if entry.is_home {
+                include_bytes!("../../assets/icons/house.svg")
+            } else if entry.is_parent {
+                include_bytes!("../../assets/icons/arrow-up.svg")
+            } else {
+                include_bytes!("../../assets/icons/folder.svg")
+            };
+            let (bg, fg) = if active {
+                (theme.selection_bg, theme.selection_fg)
+            } else {
+                (theme.sidebar_bg, theme.panel_fg)
+            };
+            rows = rows.child(
+                div()
+                    .id(format!("l3s-picker-entry-{index}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(28.0))
+                    .px_2()
+                    .rounded_md()
+                    .bg(bg)
+                    .text_color(fg)
+                    .cursor_pointer()
+                    .text_size(px(self.chrome_font()))
+                    .hover(|style| style.bg(theme.panel))
+                    .child(icon(
+                        row_icon,
+                        14.0,
+                        if active {
+                            theme.selection_fg
+                        } else {
+                            theme.muted
+                        },
+                    ))
+                    .child(name)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.picker.select(index);
+                        if this.picker.enter().is_some() {
+                            this.list_picker(cx);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let hidden = self.picker.show_hidden();
+        let check = div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(13.0))
+            .h(px(13.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(if hidden { theme.accent } else { theme.muted })
+            .bg(if hidden {
+                theme.accent
+            } else {
+                theme.panel_dim
+            })
+            .child(if hidden {
+                div().w(px(5.0)).h(px(5.0)).rounded_sm().bg(theme.window_bg)
+            } else {
+                div()
+            });
+        let hidden_toggle = div()
+            .id("l3s-picker-hidden")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .cursor_pointer()
+            .text_size(px(self.footer_font()))
+            .text_color(theme.fg)
+            .child(check)
+            .child("Hidden")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.picker.toggle_hidden();
+                cx.notify();
+            }));
+        let open = div()
+            .id("l3s-picker-open")
+            .flex()
+            .items_center()
+            .h(px(26.0))
+            .px_3()
+            .flex_shrink_0()
+            .rounded_md()
+            .bg(theme.accent)
+            .text_color(theme.window_bg)
+            .text_size(px(self.footer_font()))
+            .font_weight(FontWeight::BOLD)
+            .cursor_pointer()
+            .child("Open this folder")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_workspace_path(cwd.clone(), cx);
+            }));
+        let worktree = div()
+            .id("l3s-picker-worktree")
+            .flex()
+            .items_center()
+            .h(px(26.0))
+            .px_3()
+            .flex_shrink_0()
+            .rounded_md()
+            .bg(theme.panel)
+            .text_color(theme.fg)
+            .text_size(px(self.footer_font()))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.border))
+            .child("Open with new worktree")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.open_new_worktree(cx);
+            }));
+        let footer = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .h(px(42.0))
+            .px_3()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(hidden_toggle)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .text_size(px(self.section_font()))
+                    .text_color(theme.muted)
+                    .child("↑↓ · ↵ open · ← up · → back · ⇧. hidden"),
+            )
+            .child(worktree)
+            .child(open);
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .occlude()
+            .bg(theme.window_bg.opacity(0.55))
+            .flex()
+            .justify_center()
+            .pt(px(HEADER_HEIGHT + 12.0))
+            .child(
+                div()
+                    .w(px(panel_w))
+                    .h(px(panel_h))
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .bg(theme.sidebar_bg)
+                    .border_1()
+                    .border_color(theme.accent)
+                    .overflow_hidden()
+                    .child(header)
+                    .child(path_field)
+                    .child(rows)
+                    .child(footer)
+                    .child(menu)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    ),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.picker.close();
+                    cx.notify();
+                }),
+            )
     }
 
     /// This client's session name: `default` when no session is named.
@@ -1167,6 +2758,14 @@ impl L3sView {
             Ok(connection) => {
                 self.connection = connection;
                 let _ = self.connection.request_workspace_dock();
+                // Machine profiles are owner-local to a named session, so a
+                // session switch drops every remote endpoint and its SSH link.
+                self.endpoints.clear();
+                self.connecting.clear();
+                self.wanted = None;
+                self.pending_switch = None;
+                self.active = EndpointId::Local;
+                self.active_machine = None;
                 self.surface = Surface::new();
                 self.selection = None;
                 self.hover_cell = None;
@@ -1177,11 +2776,20 @@ impl L3sView {
                 self.sidebar_revision = 0;
                 self.bar_widgets = Vec::new();
                 self.tabs = Vec::new();
+                self.tab_sel = None;
+                self.agent_sel = None;
+                self.picker.close();
                 self.agents = Vec::new();
                 self.automations = AutomationSummary::default();
                 self.tasks = TaskSummary::default();
                 self.agent_feed = Some(AgentFeed::spawn(self.api_socket()));
                 self.sessions = list_session_infos(&self.session_root);
+                self.machines = list_machines(&self.session_root);
+                self.auto_connected.clear();
+                self.reconnects.clear();
+                self.active_live = true;
+                self.catalog_dirty = true;
+                self.auto_connect_machines();
                 self.status = format!("connecting to {name}…");
             }
             Err(error) => {
@@ -1255,7 +2863,8 @@ impl L3sView {
             }
             UpdateStatus::Installing => Some(("Installing update…".to_string(), false)),
             UpdateStatus::Staged(version) => Some((format!("Restart to install {version}"), true)),
-            UpdateStatus::Errored(_) => Some(("Update failed — retry".to_string(), true)),
+            // Failures open the Update window with a retry button instead.
+            UpdateStatus::Errored(_) => None,
         }
     }
 
@@ -1353,7 +2962,7 @@ impl L3sView {
     /// While the session menu is open the whole content area counts, since
     /// the overlay sits above the grid.
     fn hit_chrome(&mut self, window: &Window, position: Point<Pixels>) -> bool {
-        if self.session_menu_open || self.palette.is_open() {
+        if self.session_menu_open || self.palette.is_open() || self.picker.is_open() {
             return true;
         }
         let x = f32::from(position.x);
@@ -1639,9 +3248,8 @@ impl L3sView {
             list = list.child(self.nav_row(kind, cx));
         }
 
-        list = list.child(self.machines_section());
+        list = list.child(self.workspaces_section(cx));
         list = list.child(self.agents_section(cx));
-        list = list.child(self.projects_section(cx));
 
         // The panel starts on row 0, covering the daemon's `« session Menu`
         // chrome so the sidebar shows only native sections. It runs full
@@ -1694,9 +3302,26 @@ impl L3sView {
     }
 
     /// Focus a workspace tab.
-    fn focus_tab(&self, index: u16) {
+    ///
+    /// The pill updates immediately from the optimistic pick; `tab.list`
+    /// confirms it a moment later, after the daemon has actually switched.
+    fn focus_tab(&mut self, index: u16, cx: &mut Context<Self>) {
+        self.tab_sel = Some(index);
+        self.tab_sel_at = Instant::now();
         if let Some(feed) = self.agent_feed.as_ref() {
             feed.focus_tab(index);
+        }
+        cx.notify();
+    }
+
+    /// Whether a tab draws as active: an optimistic click wins briefly, then
+    /// the daemon's own active flag.
+    fn tab_active(&self, tab: &Tab) -> bool {
+        match self.tab_sel {
+            Some(selected) if self.tab_sel_at.elapsed() < Duration::from_secs(2) => {
+                tab.index == selected
+            }
+            _ => tab.active,
         }
     }
 
@@ -1715,19 +3340,27 @@ impl L3sView {
     }
 
     /// Close the active daemon tab, falling back to the last known one.
-    fn close_active_tab(&self) {
-        let tab = self
+    fn close_active_tab(&mut self) {
+        let index = self
             .tabs
             .iter()
             .find(|tab| tab.active)
-            .or_else(|| self.tabs.last());
-        if let Some(tab) = tab {
-            self.close_tab(tab.index);
+            .or_else(|| self.tabs.last())
+            .map(|tab| tab.index);
+        if let Some(index) = index {
+            self.close_tab(index);
         }
     }
 
     /// Close a workspace tab.
-    fn close_tab(&self, index: u16) {
+    ///
+    /// The daemon closes the whole workspace when its final tab closes, so the
+    /// last tab is held back until explicit workspace close/delete exists.
+    fn close_tab(&mut self, index: u16) {
+        if self.tabs.len() <= 1 {
+            self.status = "Can't close the last tab".to_string();
+            return;
+        }
         if let Some(feed) = self.agent_feed.as_ref() {
             feed.close_tab(index);
         }
@@ -1819,7 +3452,7 @@ impl L3sView {
 
     fn tab_item(&self, tab: &Tab, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let active = tab.active;
+        let active = self.tab_active(tab);
         let index = tab.index;
         let close_index = tab.index;
         let label = truncate_label(&tab.label(), 28);
@@ -1841,6 +3474,7 @@ impl L3sView {
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 this.close_tab(close_index);
+                cx.notify();
             }));
         let fg = if active { theme.panel_fg } else { theme.muted };
         let mut tab = div()
@@ -1866,7 +3500,7 @@ impl L3sView {
         }
         tab.child(div().flex_1().child(label))
             .child(close)
-            .on_click(cx.listener(move |this, _, _, _| this.focus_tab(index)))
+            .on_click(cx.listener(move |this, _, _, cx| this.focus_tab(index, cx)))
     }
 
     /// Open the daemon's Settings menu by clicking its Menu pill.
@@ -1936,6 +3570,27 @@ impl L3sView {
                 pill.child(label)
             });
         }
+        // Remote-machine manager, beside the settings gear.
+        right = right.child(
+            div()
+                .id("l3s-machines")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(28.0))
+                .w(px(28.0))
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.panel))
+                .child(icon(
+                    include_bytes!("../../assets/icons/monitor.svg"),
+                    14.0,
+                    theme.muted,
+                ))
+                .on_click(cx.listener(|_, _, window, cx| {
+                    window.dispatch_action(OpenMachineManager.boxed_clone(), cx);
+                })),
+        );
         right = right.child(
             div()
                 .id("l3s-settings")
@@ -2017,7 +3672,7 @@ impl L3sView {
     ///
     /// A transparent catcher covers the content area so a click anywhere
     /// outside dismisses; the panel stops propagation so its own clicks land.
-    fn session_menu(&self, cx: &mut Context<Self>, card_x: f32) -> Div {
+    fn session_menu(&self, cx: &mut Context<Self>) -> Div {
         if !self.session_menu_open {
             return div();
         }
@@ -2100,7 +3755,7 @@ impl L3sView {
                     14.0,
                     theme.muted,
                 ))
-                .child("New session…")
+                .child("New session")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.start_new_session();
                     cx.notify();
@@ -2115,7 +3770,7 @@ impl L3sView {
             .child(
                 div()
                     .absolute()
-                    .left(px(card_x + 12.0))
+                    .left(px(8.0))
                     .bottom(px(FOOTER_HEIGHT + 8.0))
                     .w(px(264.0))
                     .rounded_md()
@@ -2306,16 +3961,26 @@ impl L3sView {
     }
 
     /// One project or nested workspace row; the active workspace gets the pill.
+    ///
+    /// `host` is the machine name for a remote row, shown muted so a flat list
+    /// still says where the project lives.
     fn workspace_row(
         &self,
+        endpoint: &EndpointId,
         workspace: &ShellWorkspace,
+        host: Option<&str>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
-        let active = workspace.active;
+        let active = *endpoint == self.active && workspace.active;
+        let remote = endpoint.machine_id().is_some();
         let bg = if active { theme.panel } else { theme.window_bg };
         let mut row = div()
-            .id(format!("l3s-workspace-{}", workspace.index))
+            .id(format!(
+                "l3s-workspace-{}-{}",
+                endpoint.key(),
+                workspace.index
+            ))
             .flex()
             .flex_row()
             .items_center()
@@ -2341,6 +4006,12 @@ impl L3sView {
                     10.0,
                     theme.muted,
                 )
+            } else if remote {
+                icon(
+                    include_bytes!("../../assets/icons/server.svg"),
+                    14.0,
+                    theme.muted,
+                )
             } else {
                 icon(
                     include_bytes!("../../assets/icons/folder.svg"),
@@ -2355,10 +4026,21 @@ impl L3sView {
         {
             row = row.child(div().text_color(theme.branch).child(branch));
         }
-        let id = workspace.id.clone();
+        if let Some(host) = host {
+            row = row.child(
+                div()
+                    .text_size(px(self.section_font()))
+                    .text_color(theme.muted)
+                    .child(host.to_string()),
+            );
+        }
+        let workspace_id = workspace.id.clone();
+        let endpoint = endpoint.clone();
         row.on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _, _, _| this.focus_workspace(&id)),
+            cx.listener(move |this, _, _, cx| {
+                this.activate_endpoint(endpoint.clone(), Some(workspace_id.clone()), None, cx);
+            }),
         )
     }
 
@@ -2367,7 +4049,7 @@ impl L3sView {
         if let Some(active) = self.surface.workspaces().iter().find(|w| w.active) {
             return shorten_home(&active.cwd);
         }
-        self.target.label()
+        self.connection.identity().session.clone()
     }
 
     /// The bound view holding focus, if any, from the daemon's tab kinds.
@@ -2434,7 +4116,9 @@ impl L3sView {
             .items_center()
             .gap_3()
             .h(px(28.0))
-            .px_2()
+            .pl_2()
+            // Match the workspace add button: let the badge reach the panel edge.
+            .mr(px(-12.0))
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
@@ -2468,162 +4152,10 @@ impl L3sView {
             .send(press(KeyCode::Char(key), KeyModifiers::NONE));
     }
 
-    /// MACHINES: saved SSH profiles under our state root, display-only.
-    ///
-    /// The daemon exposes no control method for machines and opening one
-    /// needs an interactive terminal, so rows carry no action.
-    fn machines_section(&self) -> Div {
-        let theme = self.theme;
-        let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .h(px(22.0))
-                .px_2()
-                .child(
-                    div()
-                        .text_size(px(self.section_font()))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.muted)
-                        .child("MACHINES"),
-                ),
-        );
-        if self.machines.is_empty() {
-            return section.child(
-                div()
-                    .h(px(26.0))
-                    .px_2()
-                    .text_size(px(self.chrome_font()))
-                    .text_color(theme.muted)
-                    .child("No machines"),
-            );
-        }
-        for machine in &self.machines {
-            section = section.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .h(px(26.0))
-                    .px_2()
-                    .rounded_md()
-                    .text_size(px(self.chrome_font()))
-                    .child(icon(
-                        include_bytes!("../../assets/icons/server.svg"),
-                        14.0,
-                        theme.muted,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_color(if machine.enabled {
-                                theme.panel_fg
-                            } else {
-                                theme.muted
-                            })
-                            .child(machine.display().to_string()),
-                    )
-                    .child(machine_status(machine, theme, self.section_font())),
-            );
-        }
-        section
-    }
-
-    /// AGENTS: live agent sessions; clicking a row focuses its pane.
-    fn agents_section(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .h(px(22.0))
-                .px_2()
-                .child(
-                    div()
-                        .text_size(px(self.section_font()))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.muted)
-                        .child("AGENTS"),
-                ),
-        );
-        if self.agents.is_empty() {
-            return section.child(
-                div()
-                    .h(px(26.0))
-                    .px_2()
-                    .text_size(px(self.chrome_font()))
-                    .text_color(theme.muted)
-                    .child("No agents"),
-            );
-        }
-        for agent in &self.agents {
-            let pane = agent.pane.clone();
-            section = section.child(
-                div()
-                    .id(format!("l3s-agent-{}", agent.pane))
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme.panel))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .text_size(px(self.chrome_font()))
-                            .child(icon(
-                                include_bytes!("../../assets/icons/circle.svg"),
-                                9.0,
-                                status_color(&agent.status, theme),
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_color(theme.panel_fg)
-                                    .child(agent.label().to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(self.section_font()))
-                                    .text_color(theme.muted)
-                                    .child(agent.agent.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .pl(px(17.0))
-                            .text_size(px(self.section_font()))
-                            .text_color(theme.muted)
-                            .child(agent.workspace_name.clone())
-                            .child(match agent.branch.clone() {
-                                Some(branch) => div().text_color(theme.ok).child(branch),
-                                None => div(),
-                            }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, _| this.focus_agent(&pane)),
-                    ),
-            );
-        }
-        section
-    }
-
-    /// WORKSPACES: the catalog grouped by nesting, with a picker shortcut.
-    fn projects_section(&self, cx: &mut Context<Self>) -> Div {
+    /// WORKSPACES: every open project across Local and the connected machines,
+    /// as one flat list. Remote rows carry the machine name so the host stays
+    /// clear without a group header.
+    fn workspaces_section(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
             div()
@@ -2632,7 +4164,10 @@ impl L3sView {
                 .items_center()
                 .justify_between()
                 .h(px(22.0))
-                .px_2()
+                .pl_2()
+                // Cancel the sidebar list's right inset so the add button sits
+                // flush on the panel edge.
+                .mr(px(-12.0))
                 .child(
                     div()
                         .text_size(px(self.section_font()))
@@ -2656,15 +4191,21 @@ impl L3sView {
                             11.0,
                             theme.muted,
                         ))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, _| {
-                                let _ = this.connection.send(ClientMessage::OpenWorkspacePicker);
-                            }),
-                        ),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_picker(cx);
+                        })),
                 ),
         );
-        if self.surface.workspaces().is_empty() {
+        let mut any = false;
+        for id in self.connected_endpoints() {
+            let host = id.machine_id().map(|_| self.endpoint_label(&id));
+            let workspaces = self.endpoint_workspaces(&id);
+            for workspace in workspaces {
+                any = true;
+                section = section.child(self.workspace_row(&id, workspace, host.as_deref(), cx));
+            }
+        }
+        if !any {
             return section.child(
                 div()
                     .h(px(26.0))
@@ -2674,10 +4215,172 @@ impl L3sView {
                     .child("No projects yet"),
             );
         }
-        for workspace in self.surface.workspaces() {
-            section = section.child(self.workspace_row(workspace, cx));
-        }
         section
+    }
+
+    /// The display label for an endpoint.
+    fn endpoint_label(&self, id: &EndpointId) -> String {
+        match id {
+            EndpointId::Local => "Local".to_string(),
+            EndpointId::Machine(machine_id) => self
+                .machines
+                .iter()
+                .find(|machine| &machine.id == machine_id)
+                .map(|machine| machine.display().to_string())
+                .unwrap_or_else(|| machine_id.clone()),
+        }
+    }
+
+    /// AGENTS: live agent sessions grouped by endpoint; clicking a row focuses
+    /// its pane, activating the owning endpoint first when it is hidden.
+    fn agents_section(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(22.0))
+                .px_2()
+                .child(
+                    div()
+                        .text_size(px(self.section_font()))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.muted)
+                        .child("AGENTS"),
+                ),
+        );
+        let mut any = false;
+        for id in self.connected_endpoints() {
+            let agents = self.endpoint_agents(&id);
+            if agents.is_empty() {
+                continue;
+            }
+            any = true;
+            section = section.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(22.0))
+                    .px_2()
+                    .pt(px(2.0))
+                    .text_size(px(self.section_font()))
+                    .text_color(theme.muted)
+                    .child(self.endpoint_label(&id)),
+            );
+            for agent in agents {
+                section = section.child(self.agent_row(&id, agent, cx));
+            }
+        }
+        if any {
+            return section;
+        }
+        section.child(
+            div()
+                .h(px(26.0))
+                .px_2()
+                .text_size(px(self.chrome_font()))
+                .text_color(theme.muted)
+                .child("No agents"),
+        )
+    }
+
+    /// One agent row; clicking focuses its pane on its owning endpoint.
+    fn agent_row(
+        &self,
+        endpoint: &EndpointId,
+        agent: &Agent,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let focused = self.agent_focused(endpoint, agent);
+        let bg = if focused {
+            theme.selection_bg
+        } else {
+            theme.window_bg
+        };
+        let fg = if focused {
+            theme.selection_fg
+        } else {
+            theme.panel_fg
+        };
+        let dim = if focused {
+            theme.selection_fg.opacity(0.75)
+        } else {
+            theme.muted
+        };
+        let pane = agent.pane.clone();
+        let endpoint = endpoint.clone();
+        div()
+            .id(format!("l3s-agent-{}-{}", endpoint.key(), agent.pane))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(bg)
+            .cursor_pointer()
+            .hover(move |style| {
+                if focused {
+                    style
+                } else {
+                    style.bg(theme.panel)
+                }
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(self.chrome_font()))
+                    .child(icon(
+                        include_bytes!("../../assets/icons/circle.svg"),
+                        9.0,
+                        status_color(&agent.status, theme),
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(fg)
+                            .font_weight(if focused {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .child(agent.label().to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(self.section_font()))
+                            .text_color(dim)
+                            .child(agent.agent.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .pl(px(17.0))
+                    .text_size(px(self.section_font()))
+                    .text_color(dim)
+                    .child(agent.workspace_name.clone())
+                    .child(match agent.branch.clone() {
+                        Some(branch) => div().text_color(theme.ok).child(branch),
+                        None => div(),
+                    }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.activate_endpoint(endpoint.clone(), None, Some(pane.clone()), cx);
+                }),
+            )
     }
 
     /// Measure the inset card and the grid that fits inside it.
@@ -2886,7 +4589,10 @@ impl Render for L3sView {
             .on_action(cx.listener(|this, _: &NewTab, _window, _cx| this.new_tab()))
             .on_action(cx.listener(|this, _: &SplitVertical, _window, _cx| this.split("right")))
             .on_action(cx.listener(|this, _: &SplitHorizontal, _window, _cx| this.split("down")))
-            .on_action(cx.listener(|this, _: &CloseTab, _window, _cx| this.close_active_tab()))
+            .on_action(cx.listener(|this, _: &CloseTab, _window, cx| {
+                this.close_active_tab();
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
                 this.toggle_sidebar();
                 cx.notify();
@@ -2900,6 +4606,13 @@ impl Render for L3sView {
                 }
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &OpenWorkspacePicker, _window, cx| {
+                this.open_picker(cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenSessionMenu, _window, cx| {
+                this.session_menu_open = true;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &OpenAbout, _window, cx| {
                 about::open(this.theme, cx);
             }))
@@ -2907,17 +4620,17 @@ impl Render for L3sView {
                 this.check_for_updates(cx);
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &FocusTab1, _window, _cx| this.focus_tab(1)))
-            .on_action(cx.listener(|this, _: &FocusTab2, _window, _cx| this.focus_tab(2)))
-            .on_action(cx.listener(|this, _: &FocusTab3, _window, _cx| this.focus_tab(3)))
-            .on_action(cx.listener(|this, _: &FocusTab4, _window, _cx| this.focus_tab(4)))
-            .on_action(cx.listener(|this, _: &FocusTab5, _window, _cx| this.focus_tab(5)))
-            .on_action(cx.listener(|this, _: &FocusTab6, _window, _cx| this.focus_tab(6)))
-            .on_action(cx.listener(|this, _: &FocusTab7, _window, _cx| this.focus_tab(7)))
-            .on_action(cx.listener(|this, _: &FocusTab8, _window, _cx| this.focus_tab(8)))
-            .on_action(cx.listener(|this, _: &FocusTab9, _window, _cx| {
+            .on_action(cx.listener(|this, _: &FocusTab1, _window, cx| this.focus_tab(1, cx)))
+            .on_action(cx.listener(|this, _: &FocusTab2, _window, cx| this.focus_tab(2, cx)))
+            .on_action(cx.listener(|this, _: &FocusTab3, _window, cx| this.focus_tab(3, cx)))
+            .on_action(cx.listener(|this, _: &FocusTab4, _window, cx| this.focus_tab(4, cx)))
+            .on_action(cx.listener(|this, _: &FocusTab5, _window, cx| this.focus_tab(5, cx)))
+            .on_action(cx.listener(|this, _: &FocusTab6, _window, cx| this.focus_tab(6, cx)))
+            .on_action(cx.listener(|this, _: &FocusTab7, _window, cx| this.focus_tab(7, cx)))
+            .on_action(cx.listener(|this, _: &FocusTab8, _window, cx| this.focus_tab(8, cx)))
+            .on_action(cx.listener(|this, _: &FocusTab9, _window, cx| {
                 if let Some(tab) = this.tabs.last() {
-                    this.focus_tab(tab.index);
+                    this.focus_tab(tab.index, cx);
                 }
             }));
 
@@ -2960,9 +4673,10 @@ impl Render for L3sView {
             // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
             .child(self.top_chrome(cx, cell_width))
-            .child(self.session_menu(cx, layout.card_x))
+            .child(self.session_menu(cx))
             .child(self.status_bar(cx))
             .child(self.palette_overlay(cx))
+            .child(self.picker_overlay(window, cx))
     }
 }
 
@@ -3227,15 +4941,20 @@ fn color_key(color: gpui::Rgba) -> u32 {
     (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b)
 }
 
-/// Reachability text for a machine row: latency, state, or still probing.
-fn machine_status(machine: &MachineInfo, theme: Theme, size: f32) -> Div {
-    let (text, color) = match (machine.online, machine.latency_ms) {
-        (Some(true), Some(ms)) => (format!("{ms} ms"), theme.ok),
-        (Some(true), None) => ("online".to_string(), theme.ok),
-        (Some(false), _) => ("offline".to_string(), theme.alert),
-        (None, _) => ("…".to_string(), theme.muted),
-    };
-    div().text_size(px(size)).text_color(color).child(text)
+/// Bounded exponential backoff with jitter for a machine reconnect.
+///
+/// `failures` is the count of consecutive failed attempts; the delay doubles
+/// up to [`RECONNECT_MAX`] and lands in 75–125% of the nominal value so many
+/// machines dropping together do not retry in lockstep.
+fn reconnect_delay(failures: u32) -> Duration {
+    let exponent = failures.min(5);
+    let base = (RECONNECT_BASE.as_millis() * (1u128 << exponent)).min(RECONNECT_MAX.as_millis());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u128::from(elapsed.subsec_nanos()))
+        .unwrap_or(0);
+    let millis = (base * (75 + nanos % 51) / 100) as u64;
+    Duration::from_millis(millis.max(1))
 }
 
 /// Compact byte count for the download badge (`12.4 MB`).
@@ -3430,10 +5149,29 @@ mod tests {
     fn app_key_bindings_are_unique() {
         // `app_key_bindings` parses every chord as it is built; a duplicate
         // would shadow an earlier shortcut, so catch that here too.
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for binding in app_key_bindings() {
             let chord = format!("{:?}", binding.keystrokes());
             assert!(seen.insert(chord.clone()), "duplicate shortcut: {chord}");
         }
+    }
+
+    #[test]
+    fn reconnect_delay_grows_and_stays_bounded() {
+        let nominal = |failures: u32| {
+            let exponent = failures.min(5);
+            (RECONNECT_BASE.as_millis() * (1u128 << exponent)).min(RECONNECT_MAX.as_millis())
+        };
+        // Jitter makes an exact value unpredictable; check the 75-125% envelope
+        // and that the ceiling holds for arbitrarily many failures.
+        for failures in 0..10u32 {
+            let delay = reconnect_delay(failures).as_millis();
+            let base = nominal(failures);
+            assert!(
+                delay >= base * 75 / 100 && delay <= base * 125 / 100,
+                "attempt {failures}: {delay} outside envelope of {base}"
+            );
+        }
+        assert!(reconnect_delay(40).as_millis() <= RECONNECT_MAX.as_millis() * 125 / 100);
     }
 }

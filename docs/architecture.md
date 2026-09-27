@@ -141,6 +141,10 @@ because one tab open emits several structural events. `--probe-feed` drives the
 same feed headlessly. Clicking an agent row focuses its pane; clicking a
 workspace row sends `ShellWorkspaceFocus`.
 
+**Last tab.** The daemon closes a workspace when its final tab closes, so the
+client holds back its own last-tab close (⌘W / the tab ×) with a status hint.
+Exiting the shell itself still closes the workspace; that is daemon behavior.
+
 **Top chrome and Menu.** The daemon's `« session Menu` strip is hidden by
 `owns_session_chrome`, and the sidebar covers its column. One native layer owns
 the whole top of the window: a bar of `HEADER_HEIGHT + one cell` that starts at
@@ -194,6 +198,81 @@ rows stay reserved.
 
 The daemon remains authoritative about dock geometry and theme; the client only
 decides how to draw the rows.
+
+## Machines
+
+Saved SSH profiles turn one window into several endpoints. A profile is
+owner-local to the local named session (`machines.json` under the state root)
+and is read with `luvus machine list --json`; the CLI remains the authority for
+provisioning and reachability, so `l3s` never installs or replaces a remote
+binary itself.
+
+Each enabled machine becomes one endpoint:
+
+- **Transport.** `l3s-client` spawns `ssh -T -o BatchMode=yes …
+  <destination> <remote_binary> [--session NAME] remote-client-bridge` and
+  treats the child's stdin/stdout as the same `Stream` a local socket uses
+  (`transport::SshTarget`, `machines::connect_machine`). Stderr is drained on a
+  helper thread and folded into handshake errors, and the last `Connection`
+  clone kills the SSH child so a reader parked in `read` unblocks.
+- **Auto-connect.** Every enabled profile is bridged at startup and whenever
+  the catalog gains or re-enables one. Each bridge is its own thread, so the
+  whole catalog comes up in parallel; an attempt is recorded, so the slow
+  catalog poll never restarts a healthy host, retries a failed one, or probes
+  over SSH while every enabled machine is already connected.
+- **Reconnect.** A dropped bridge is retried with bounded exponential backoff
+  and jitter (1 s doubling to a 30 s ceiling), one attempt per machine, and at
+  most three consecutive failures before the row shows `attention` and
+  automatic attempts pause. Clicking the machine resumes immediately and
+  resets the budget; the active machine's replacement bridge is swapped in
+  place, so its surface is never blanked.
+- **Sidebar and manager.** Workspaces across Local and every connected machine
+  render as one flat list (a remote row carries a small server glyph and the
+  machine name) rather than grouped headers; agents stay grouped by endpoint
+  below it. A monitor button beside the settings gear opens a native Remote
+  Machines window that lists profiles with reachability and shells out to
+  `luvus machine add/enable/disable/remove`, bumping a shared revision so every
+  open window reloads the catalog at once.
+- **Open Workspace.** `⌘⇧O`, the File menu, and the `+` all open a native
+  folder picker instead of the daemon's own. A host dropdown at the top with an
+  online/offline dot switches which endpoint is browsed (Local or any enabled
+  machine) without changing the visible surface. Local reads the filesystem
+  directly; a machine lists directories over the same SSH client (`cd`, `$PWD`,
+  and `find -print0`, NUL-separated). A leading `~` is expanded on the browsed
+  host, so a workspace path the daemon shortens to `~` still resolves. The list
+  leads with Home and `..`; `←` goes up, `→` steps back through visited
+  directories, and `⇧.` toggles hidden entries. Opening the chosen folder is one
+  `workspace.open` control request to that endpoint, while **Open with new
+  worktree** generates a branch name and issues `worktree.create`, so the daemon
+  still owns workspace and worktree creation.
+- **Agents.** Every connected endpoint also runs an agents-only feed (one
+  `agent.list` per reconciliation, no full chrome refresh), so the AGENTS dock
+  lists live agents from Local and each hidden machine, grouped by endpoint.
+  The row whose pane currently holds focus is highlighted (optimistically on
+  click, then confirmed by `agent.list`). Clicking one focuses its pane,
+  activating the owning endpoint first when it is hidden.
+- **Surface.** The remote server hands back `Welcome`/`Ready`/`EndpointIdentity`
+  exactly like the local one, so the handshake, frame loop, and workspace
+  projection are unchanged.
+- **Interest.** Inactive endpoints are sent `SurfaceInterest::Suspended`: their
+  workspace catalog (`ShellWorkspaces`) still arrives, so their rows render,
+  but they stream no frames and own no input, cursor, or PTY size.
+- **Switch.** Selecting an endpoint sends `SurfaceInterest::Prepared` and a
+  ticket-tagged `PrepareSurface`; the matching `PreparedFrame` is committed by
+  swapping the endpoints' surfaces, then `SurfaceInterest::Active` and a
+  `Resize` go to the new one. A stalled handoff falls back after a bounded
+  timeout, and re-selecting the visible endpoint cancels it. (The events exist
+  in `ServerMessage`/`ClientMessage`: `PreparedFrame`, `SurfaceInterest`,
+  `PrepareSurface`.)
+- **Chrome.** The active endpoint's tabs, agents, and bar widgets come from its
+  own control surface. Local uses the Unix control socket; a machine reaches
+  `luvus uhp proxy` through the same SSH options, one request per invocation.
+  Because `uhp proxy` forwards a single request, a remote feed reconciles on a
+  short timer instead of holding an `events.subscribe` stream.
+
+There is no daemon-side machine method: the window owns every SSH process, and
+two clients attached to the same local session load the same profiles without
+sharing a bridge.
 
 ## The UHP path
 
@@ -264,4 +343,6 @@ Selection lives in `gui/selection.rs`: it normalizes a reversed drag, answers
   so they are visible but not client-native.
 - Double-click to select a word, and triple-click to select a line.
 - Named-pipe transport on Windows.
-- SSH/remote endpoints and the federated machine catalog.
+- Remote install/repair from the window: `l3s` connects with an already
+  provisioned remote binary and tells you to run `luvus machine enable` when
+  one is missing; the machine-create form is not drawn natively yet.

@@ -37,6 +37,11 @@ Early. `l3s` today is a focused vertical slice:
   close) driven by the `tab.*` control API;
 - covers the daemon's bottom status line with a native bar whose right side
   mirrors the daemon's own `ui.bar.list` widgets (mode, pane count, tab);
+- shows local and remote projects in one flat workspace list, bridges every
+  enabled SSH machine over `ssh -T` in parallel at startup, switches the
+  visible surface between endpoints with a two-phase prepared frame, offers a
+  native Open Workspace folder picker and a Remote Machines manager, and lists
+  live agents from every connected endpoint in the AGENTS dock;
 - paints the grid in a GPUI window with the ANSI palette resolved natively.
 
 Client-native chrome that the daemon does not project (file tree, Git
@@ -64,6 +69,9 @@ cargo run -p l3s --no-default-features -- --probe
 
 # Same, but claim the workspaces dock and print its projection.
 cargo run -p l3s --no-default-features -- --probe-workspaces
+
+# Attach to one saved machine over SSH and print its workspace catalog.
+cargo run -p l3s --no-default-features -- --probe-machine mac-mini
 ```
 
 ### macOS app bundle

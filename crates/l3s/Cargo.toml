@@ -24,8 +24,11 @@ anyhow.workspace = true
 crossterm.workspace = true
 l3s-client.workspace = true
 l3s-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 gpui = { workspace = true, optional = true }
+image.workspace = true
 gpui_platform = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

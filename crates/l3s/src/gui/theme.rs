@@ -69,6 +69,57 @@ impl Default for Theme {
     }
 }
 
+impl Theme {
+    /// The chrome palette for a built-in Luvus theme: the same semantic roles
+    /// the daemon renders with, so client chrome and the grid agree.
+    pub fn from_palette(p: super::scheme::Palette) -> Self {
+        Self {
+            // `crust` is the deepest chrome; the terminal pane sits on
+            // `mantle`, which is also what the card's padding paints.
+            window_bg: p.crust,
+            bg: p.mantle,
+            sidebar_bg: p.base,
+            fg: p.text,
+            panel: p.surface0,
+            panel_dim: p.base,
+            border: p.border,
+            accent: p.accent,
+            branch: p.green,
+            muted: p.subtext0,
+            panel_fg: p.text,
+            selection_bg: p.sel_bg,
+            selection_fg: p.text,
+            ok: p.green,
+            alert: p.coral,
+        }
+    }
+
+    /// The chrome palette the daemon projects for a thin client, used when the
+    /// active theme is not one we have vendored. Roles the projection omits
+    /// keep the built-in default.
+    pub fn from_chrome(chrome: l3s_protocol::MachineFormTheme) -> Self {
+        let base = Self::default();
+        let c = |packed, fallback| resolve(packed, fallback);
+        Self {
+            window_bg: c(chrome.accent_text, base.window_bg), // crust
+            bg: base.bg,
+            sidebar_bg: c(chrome.rule, base.sidebar_bg), // surface1
+            fg: c(chrome.text, base.fg),
+            panel: c(chrome.surface, base.panel), // surface0
+            panel_dim: c(chrome.rule, base.panel_dim),
+            border: c(chrome.border, base.border), // border_focus
+            accent: c(chrome.accent, base.accent),
+            branch: base.branch,
+            muted: c(chrome.subtext0, base.muted),
+            panel_fg: c(chrome.text, base.panel_fg),
+            selection_bg: base.selection_bg,
+            selection_fg: base.selection_fg,
+            ok: base.ok,
+            alert: c(chrome.error, base.alert), // coral
+        }
+    }
+}
+
 /// Resolve a wire-packed color, falling back to `default` for `Reset`.
 pub fn resolve(packed: u32, default: Rgba) -> Rgba {
     match packed >> 24 {

@@ -100,6 +100,71 @@ impl Tab {
     }
 }
 
+/// One appearance theme from `theme.list`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ThemeInfo {
+    /// Stable theme id, as accepted by `theme.use`.
+    pub id: String,
+    /// Human display name.
+    pub display_name: String,
+    /// One-line description.
+    pub description: String,
+    /// Author, empty for the Luvus team defaults.
+    pub author: String,
+    /// `dark`, `light`, or `terminal`.
+    pub appearance: String,
+    /// `built_in`, `installed`, or `virtual`.
+    pub source: String,
+    /// Whether this is the selected theme.
+    pub active: bool,
+}
+
+impl ThemeInfo {
+    fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            id: value.get("id")?.as_str()?.to_string(),
+            display_name: value
+                .get("display_name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            description: value
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            author: value
+                .get("author")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            appearance: value
+                .get("appearance")
+                .and_then(Value::as_str)
+                .unwrap_or("dark")
+                .to_string(),
+            source: value
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            active: value
+                .get("active")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+}
+
+/// The theme registry: every registered theme plus the active id.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Appearance {
+    /// All registered themes, in the daemon's display order.
+    pub themes: Vec<ThemeInfo>,
+    /// The selected theme's id.
+    pub active: String,
+}
+
 /// One poll of the live agent list and the status-bar widgets.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FeedUpdate {
@@ -377,6 +442,35 @@ impl ControlClient {
         self.request("tab.close", json!({ "tab": index.to_string() }))?;
         Ok(())
     }
+
+    /// Split the focused pane; `direction` is `right`, `down`, or `auto`.
+    pub fn split_pane(&mut self, direction: &str) -> Result<()> {
+        self.request("pane.split", json!({ "direction": direction }))?;
+        Ok(())
+    }
+
+    /// The theme registry and the selected theme.
+    pub fn appearance(&mut self) -> Result<Appearance> {
+        let result = self.request("theme.list", json!({}))?;
+        let themes = result
+            .get("themes")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let themes: Vec<ThemeInfo> = themes.iter().filter_map(ThemeInfo::from_json).collect();
+        let active = themes
+            .iter()
+            .find(|theme| theme.active)
+            .map(|theme| theme.id.clone())
+            .unwrap_or_default();
+        Ok(Appearance { themes, active })
+    }
+
+    /// Select and persist a theme by id.
+    pub fn select_theme(&mut self, id: &str) -> Result<()> {
+        self.request("theme.use", json!({ "id": id }))?;
+        Ok(())
+    }
 }
 
 /// Read one newline-terminated line without reading past it.
@@ -446,6 +540,7 @@ enum Command {
     FocusTab(u16),
     NewTab,
     CloseTab(u16),
+    Split(String),
 }
 
 /// A background feed that keeps a fresh snapshot and forwards commands.
@@ -509,6 +604,11 @@ impl AgentFeed {
     pub fn close_tab(&self, index: u16) {
         let _ = self.commands.send(Command::CloseTab(index));
     }
+
+    /// Ask the daemon to split the focused pane (`right`/`down`/`auto`).
+    pub fn split(&self, direction: &str) {
+        let _ = self.commands.send(Command::Split(direction.to_string()));
+    }
 }
 
 /// Service one command, then reconcile because a command is a state change.
@@ -531,6 +631,7 @@ fn run_commands(
                         Command::FocusTab(index) => active.focus_tab(index),
                         Command::NewTab => active.new_tab(),
                         Command::CloseTab(index) => active.close_tab(index),
+                        Command::Split(direction) => active.split_pane(&direction),
                     };
                     if outcome.is_err() {
                         client = None;

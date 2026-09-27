@@ -8,12 +8,13 @@
 //! 4. if `Ready::probe_terminal` is set, the client replies with
 //!    [`ClientMessage::TerminalColors`] before the server will stream frames.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use l3s_protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, ShellDockLayout};
+use l3s_protocol::{
+    ClientMessage, PROTOCOL_VERSION, ServerMessage, ShellDockLayout, SurfaceInterest,
+};
 
 use crate::ConnectTarget;
 use crate::error::{Error, Result};
@@ -51,17 +52,45 @@ pub enum ClientEvent {
 pub struct Connection {
     outbound: Sender<ClientMessage>,
     inbound: Receiver<ClientEvent>,
-    socket: PathBuf,
+    /// Kept so dropping the connection can terminate a spawned SSH bridge.
+    stream: Arc<Stream>,
+    label: String,
     identity: EndpointIdentity,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // A remote reader may be parked in `read`; killing the child closes
+        // its stdout and lets that thread exit. Local sockets are a no-op.
+        self.stream.terminate();
+    }
 }
 
 impl Connection {
     /// Attach to `target`, announcing an initial `cols` by `rows` viewport.
     pub fn open(target: &ConnectTarget, cols: u16, rows: u16) -> Result<Self> {
         let socket = target.resolve();
-        let stream = Arc::new(Stream::connect(&socket)?);
+        let stream = Stream::connect(&socket)?;
+        Self::open_stream(stream, socket.display().to_string(), cols, rows)
+    }
 
-        let (probe_terminal, identity) = handshake(&stream, cols, rows)?;
+    /// Attach over an already-connected stream.
+    ///
+    /// `label` is a human-readable endpoint name used in errors and status
+    /// text. A remote SSH bridge hands its child pipes in here; the handshake
+    /// and frame loop are identical to the local socket path.
+    pub fn open_stream(
+        stream: Stream,
+        label: impl Into<String>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self> {
+        let stream = Arc::new(stream);
+        let (probe_terminal, identity) =
+            handshake(&stream, cols, rows).map_err(|error| match stream.stderr_tail() {
+                Some(tail) => Error::Machine(format!("{error}: {tail}")),
+                None => error,
+            })?;
 
         let (outbound_tx, outbound_rx) = unbounded::<ClientMessage>();
         let (inbound_tx, inbound_rx) = unbounded::<ClientEvent>();
@@ -79,14 +108,15 @@ impl Connection {
         Ok(Self {
             outbound: outbound_tx,
             inbound: inbound_rx,
-            socket,
+            stream,
+            label: label.into(),
             identity,
         })
     }
 
-    /// The socket this connection is attached to.
-    pub fn socket_path(&self) -> &Path {
-        &self.socket
+    /// The endpoint label this connection was opened with.
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// The server's identity, learned during the handshake.
@@ -134,6 +164,29 @@ impl Connection {
             owns_session_chrome: true,
             ..ShellDockLayout::default()
         }))
+    }
+
+    /// Tell the server how much of this endpoint's surface we want.
+    ///
+    /// Inactive endpoints are suspended: they keep owning their panes and PTY
+    /// sizes but stop streaming frames, so a saved machine costs one SSH
+    /// process and a small reader rather than a second render loop.
+    pub fn set_interest(&self, interest: SurfaceInterest) -> Result<()> {
+        self.send(ClientMessage::SurfaceInterest(interest))
+    }
+
+    /// Ask for a fresh candidate frame tagged with `ticket`.
+    ///
+    /// The two-phase handoff: the current surface stays interactive until the
+    /// matching `PreparedFrame` arrives, so a slow or failed destination never
+    /// blanks a usable window.
+    pub fn prepare_surface(&self, ticket: u64, cols: u16, rows: u16) -> Result<()> {
+        self.send(ClientMessage::PrepareSurface { ticket, cols, rows })
+    }
+
+    /// Send a lightweight liveness check; the reply echoes `nonce`.
+    pub fn health_check(&self, nonce: u64) -> Result<()> {
+        self.send(ClientMessage::HealthCheck { nonce })
     }
 }
 
@@ -225,4 +278,25 @@ fn spawn_reader(stream: Arc<Stream>, inbound: Sender<ClientEvent>) {
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// A scripted peer on a child process's stdio, proving a remote bridge is
+    /// handshaken exactly like a local socket. Raw bincode frames are written
+    /// with `printf` so the test needs no helper binary.
+    #[test]
+    fn handshakes_over_a_spawned_child_stream() {
+        let script = r"head -c 8 >/dev/null; printf '\003\000\000\000\000\022\000'; printf '\002\000\000\000\013\000'; printf '\012\000\000\000\022\001\007default'; sleep 1";
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        let stream = Stream::spawn(&mut command).expect("spawn the scripted peer");
+        let connection = Connection::open_stream(stream, "scripted", 120, 40).expect("handshake");
+        assert_eq!(connection.identity().session, "default");
+        assert_eq!(connection.identity().boot_id, 1);
+    }
 }

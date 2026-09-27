@@ -38,7 +38,7 @@ impl Default for Settings {
             terminal_font: FONT_FAMILY.to_string(),
             terminal_font_size: FONT_SIZE,
             update_channel: "stable".to_string(),
-            auto_check_updates: true,
+            auto_check_updates: false,
             update_feed_url: None,
         }
     }

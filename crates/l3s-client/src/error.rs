@@ -52,4 +52,9 @@ pub enum Error {
     /// unreadable.
     #[error("control API error: {0}")]
     Control(String),
+
+    /// A saved remote machine could not be bridged: missing binary, failed
+    /// SSH launch, or a remote command that exited before the handshake.
+    #[error("{0}")]
+    Machine(String),
 }

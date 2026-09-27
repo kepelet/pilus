@@ -11,7 +11,7 @@
 use gpui::{Rgba, rgb};
 
 /// The client's own chrome palette.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
     /// Main window background behind the floating card.
     pub window_bg: Rgba,

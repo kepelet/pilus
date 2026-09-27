@@ -1,5 +1,7 @@
 //! Command-line entry point and launch modes.
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Result, bail};
 use l3s_client::ConnectTarget;
 
@@ -33,6 +35,11 @@ pub enum Launch {
     },
     /// Check the OTA release source and print the result.
     CheckUpdates,
+    /// Attach to one saved machine over SSH and print its workspace catalog.
+    ProbeMachine {
+        /// Stable machine profile id.
+        id: String,
+    },
 }
 
 /// Parse arguments and run the requested mode.
@@ -48,6 +55,7 @@ pub fn run() -> Result<()> {
         Launch::Uhp { target, pane } => run_uhp(target, pane),
         Launch::Feed { target } => run_feed(target),
         Launch::CheckUpdates => run_check_updates(),
+        Launch::ProbeMachine { id } => run_probe_machine(id),
     }
 }
 
@@ -60,6 +68,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
     let mut uhp = false;
     let mut feed = false;
     let mut check_updates = false;
+    let mut machine_id = None;
     let mut pane_id = None;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -88,6 +97,12 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
             }
             "--probe-uhp" => uhp = true,
             "--probe-feed" => feed = true,
+            "--probe-machine" => {
+                machine_id = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--probe-machine needs an id"))?,
+                );
+            }
             "--check-updates" => check_updates = true,
             "--pane" => {
                 pane_id = Some(
@@ -104,6 +119,9 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
     }
     if check_updates {
         return Ok(Launch::CheckUpdates);
+    }
+    if let Some(id) = machine_id {
+        return Ok(Launch::ProbeMachine { id });
     }
     if uhp {
         return Ok(Launch::Uhp {
@@ -137,10 +155,58 @@ fn print_help() {
          \x20   --probe-menu     Probe, then open the daemon's Menu by click\n\
          \x20   --probe-uhp      Stream one pane via UHP and print the screen\n\
          \x20   --probe-feed     Run the event-driven feed briefly and print it\n\
+         \x20   --probe-machine ID  Attach to a saved machine over SSH and print it\n\
          \x20   --check-updates  Check the OTA release source and print it\n\
          \x20   --pane ID        Pane to observe with --probe-uhp\n\
          \x20   -h, --help       Print this help"
     );
+}
+
+/// Attach to a saved machine over SSH and print its identity and workspaces.
+///
+/// The headless proof of the remote path: locate the profile, launch the same
+/// `remote-client-bridge` the window uses, claim the workspaces dock, and fold
+/// the catalog the remote server projects.
+fn run_probe_machine(id: String) -> Result<()> {
+    let root = l3s_client::config_dir();
+    let machine = l3s_client::list_machines(&root)
+        .into_iter()
+        .find(|machine| machine.id == id)
+        .ok_or_else(|| anyhow::anyhow!("no saved machine `{id}`"))?;
+    println!(
+        "machine {} → {} (binary {})",
+        machine.id, machine.destination, machine.remote_binary
+    );
+    let connection = l3s_client::connect_machine(&machine, 120, 40)?;
+    connection.request_workspace_dock()?;
+    let identity = connection.identity();
+    println!(
+        "attached: boot {} session {}",
+        identity.boot_id, identity.session
+    );
+
+    let mut surface = l3s_client::Surface::new();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline && surface.workspaces().is_empty() {
+        match connection.recv_timeout(Duration::from_millis(200)) {
+            Some(l3s_client::ClientEvent::Message(message)) => {
+                surface.apply(&message);
+            }
+            Some(l3s_client::ClientEvent::Disconnected { reason }) => {
+                bail!("disconnected: {reason}");
+            }
+            _ => {}
+        }
+    }
+    let workspaces = surface.workspaces();
+    println!("{} workspace(s):", workspaces.len());
+    for workspace in workspaces {
+        println!(
+            "  {:<4} {:<28} {}",
+            workspace.index, workspace.name, workspace.cwd
+        );
+    }
+    Ok(())
 }
 
 /// Stream one pane through UHP and print the parsed screen.
@@ -211,9 +277,9 @@ fn run_feed(target: ConnectTarget) -> Result<()> {
         .unwrap_or_else(|| l3s_client::api_socket_path_for(target.session.as_deref()));
     let feed = l3s_client::AgentFeed::spawn(socket.clone());
     println!("feed: watching {}", socket.display());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(3);
     let mut updates = 0;
-    while std::time::Instant::now() < deadline {
+    while Instant::now() < deadline {
         if let Some(update) = feed.try_recv() {
             updates += 1;
             let agents: Vec<String> = update
@@ -233,7 +299,7 @@ fn run_feed(target: ConnectTarget) -> Result<()> {
                 tabs.join(", ")
             );
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
     }
     println!("{updates} update(s) in 3s");
     Ok(())
@@ -345,10 +411,9 @@ fn run_probe(target: ConnectTarget, workspaces: bool, open_menu: bool) -> Result
 
     let mut surface = l3s_client::Surface::new();
     let mut took_sidebars = false;
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(if workspaces { 3 } else { 5 });
-    while std::time::Instant::now() < deadline {
-        match connection.recv_timeout(std::time::Duration::from_millis(200)) {
+    let deadline = Instant::now() + Duration::from_secs(if workspaces { 3 } else { 5 });
+    while Instant::now() < deadline {
+        match connection.recv_timeout(Duration::from_millis(200)) {
             Some(l3s_client::ClientEvent::Message(message)) => {
                 match &message {
                     l3s_protocol::ServerMessage::ShellWorkspaces(list) => {

@@ -21,7 +21,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
-use crate::transport::Stream;
+use crate::transport::{SshTarget, Stream};
 
 /// One segment of a status-bar widget.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -322,20 +322,62 @@ impl Agent {
     }
 }
 
+/// Where a control request is sent.
+///
+/// The local API socket answers many connections on one process. A remote
+/// machine is reached through `luvus uhp proxy`, which forwards exactly one
+/// request per SSH invocation, so each call opens its own SSH child.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlTransport {
+    /// The owner-local control socket.
+    Socket(PathBuf),
+    /// A remote host over the local OpenSSH client.
+    Ssh(SshTarget),
+}
+
+impl ControlTransport {
+    /// Open one fresh stream for a single request.
+    pub(crate) fn stream(&self) -> Result<Stream> {
+        match self {
+            Self::Socket(path) => Stream::connect(path),
+            Self::Ssh(target) => {
+                let mut command = target.command(&["uhp", "proxy"]);
+                Stream::spawn(&mut command)
+            }
+        }
+    }
+}
+
 /// A synchronous request/response connection to the control socket.
 ///
 /// The daemon's control socket answers exactly one request per connection, so
 /// each call opens a fresh connection rather than reusing one.
 pub struct ControlClient {
-    socket: PathBuf,
+    transport: ControlTransport,
     next_id: u64,
 }
 
 impl ControlClient {
+    /// Wrap an already-resolved transport.
+    pub fn from_transport(transport: ControlTransport) -> Self {
+        Self {
+            transport,
+            next_id: 0,
+        }
+    }
+
     /// Connect to the control socket at `path`.
     pub fn connect(path: &Path) -> Result<Self> {
         Ok(Self {
-            socket: path.to_path_buf(),
+            transport: ControlTransport::Socket(path.to_path_buf()),
+            next_id: 0,
+        })
+    }
+
+    /// Connect to a remote machine's control surface over SSH.
+    pub fn connect_ssh(target: SshTarget) -> Result<Self> {
+        Ok(Self {
+            transport: ControlTransport::Ssh(target),
             next_id: 0,
         })
     }
@@ -349,7 +391,7 @@ impl ControlClient {
             "params": params,
         })
         .to_string();
-        let stream = Stream::connect(&self.socket)?;
+        let stream = self.transport.stream()?;
         {
             let mut writer = &stream;
             writer.write_all(line.as_bytes())?;
@@ -357,7 +399,10 @@ impl ControlClient {
             writer.flush()?;
         }
 
-        let response = read_line(&stream)?;
+        let response = read_line(&stream).map_err(|error| match stream.stderr_tail() {
+            Some(tail) => Error::Control(format!("{method}: {tail}")),
+            None => error,
+        })?;
         if response.is_empty() {
             return Err(Error::Control("control socket closed".to_string()));
         }
@@ -388,6 +433,18 @@ impl ControlClient {
     /// Focus the pane an agent runs in, jumping to its workspace and tab.
     pub fn focus_pane(&mut self, pane: &str) -> Result<()> {
         self.request("pane.focus", json!({ "pane": pane }))?;
+        Ok(())
+    }
+
+    /// Open `path` as a workspace, or focus it when it is already open.
+    pub fn open_workspace(&mut self, path: &str) -> Result<()> {
+        self.request("workspace.open", json!({ "path": path }))?;
+        Ok(())
+    }
+
+    /// Create a worktree (and its workspace) for `branch` in the active repo.
+    pub fn create_worktree(&mut self, branch: &str) -> Result<()> {
+        self.request("worktree.create", json!({ "branch": branch }))?;
         Ok(())
     }
 
@@ -549,11 +606,28 @@ pub struct AgentFeed {
     updates: Receiver<FeedUpdate>,
 }
 
+/// How much chrome a feed refreshes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedScope {
+    /// Agents, bar, tabs, automations, and tasks: the visible surface.
+    Full,
+    /// Agents only: a connected endpoint that is not on screen, so its
+    /// workspace rows and agent list stay fresh without the full refresh.
+    Agents,
+}
+
 /// How long the feed waits for a command before reconciling on its own.
 ///
 /// Events drive normal updates; this only covers state a structural event does
 /// not describe (the status bar's mode, for one) and any missed event.
 const RECONCILE: Duration = Duration::from_secs(10);
+
+/// Reconciliation cadence for a remote feed, which has no event stream and so
+/// cannot wait ten seconds for a change to surface.
+const RECONCILE_REMOTE: Duration = Duration::from_secs(5);
+
+/// Reconciliation cadence for an agents-only feed behind a hidden endpoint.
+const RECONCILE_AGENTS: Duration = Duration::from_secs(3);
 
 /// How long to wait before resubscribing after the event stream ends.
 const RESUBSCRIBE: Duration = Duration::from_millis(500);
@@ -561,6 +635,29 @@ const RESUBSCRIBE: Duration = Duration::from_millis(500);
 impl AgentFeed {
     /// Start the feed for `socket`, reconnecting after failures.
     pub fn spawn(socket: PathBuf) -> Self {
+        Self::spawn_transport(ControlTransport::Socket(socket), false, FeedScope::Full)
+    }
+
+    /// Start a snapshot-only feed for a remote machine.
+    ///
+    /// `luvus uhp proxy` carries one request per SSH invocation, so an event
+    /// subscription cannot be held; the feed reconciles on a short timer
+    /// instead of reacting to structural events.
+    pub fn spawn_ssh(target: SshTarget) -> Self {
+        Self::spawn_transport(ControlTransport::Ssh(target), true, FeedScope::Full)
+    }
+
+    /// Start an agents-only feed for a hidden endpoint.
+    pub fn spawn_agents(socket: PathBuf) -> Self {
+        Self::spawn_transport(ControlTransport::Socket(socket), true, FeedScope::Agents)
+    }
+
+    /// Start an agents-only feed for a hidden remote machine.
+    pub fn spawn_ssh_agents(target: SshTarget) -> Self {
+        Self::spawn_transport(ControlTransport::Ssh(target), true, FeedScope::Agents)
+    }
+
+    fn spawn_transport(transport: ControlTransport, poll_only: bool, scope: FeedScope) -> Self {
         let (commands, command_rx) = unbounded();
         let (update_tx, updates) = unbounded();
         // Shared so a burst of structural events (one tab open emits several)
@@ -568,15 +665,35 @@ impl AgentFeed {
         let last: Arc<Mutex<Option<FeedUpdate>>> = Arc::new(Mutex::new(None));
         let command_updates = update_tx.clone();
         let command_last = Arc::clone(&last);
-        let command_socket = socket.clone();
+        let command_transport = transport.clone();
+        let interval = match scope {
+            FeedScope::Agents => RECONCILE_AGENTS,
+            FeedScope::Full if poll_only => RECONCILE_REMOTE,
+            FeedScope::Full => RECONCILE,
+        };
         thread::Builder::new()
             .name("l3s-commands".to_string())
-            .spawn(move || run_commands(command_socket, command_rx, command_updates, command_last))
+            .spawn(move || {
+                run_commands(
+                    command_transport,
+                    interval,
+                    scope,
+                    command_rx,
+                    command_updates,
+                    command_last,
+                )
+            })
             .ok();
-        thread::Builder::new()
-            .name("l3s-events".to_string())
-            .spawn(move || run_events(socket, update_tx, last))
-            .ok();
+        // Only the full local feed holds an event subscription; an agents-only
+        // feed reconciles on its timer instead.
+        if scope == FeedScope::Full
+            && let ControlTransport::Socket(socket) = transport
+        {
+            thread::Builder::new()
+                .name("l3s-events".to_string())
+                .spawn(move || run_events(socket, update_tx, last))
+                .ok();
+        }
         Self { commands, updates }
     }
 
@@ -613,17 +730,24 @@ impl AgentFeed {
 
 /// Service one command, then reconcile because a command is a state change.
 fn run_commands(
-    socket: PathBuf,
+    transport: ControlTransport,
+    interval: Duration,
+    scope: FeedScope,
     commands: Receiver<Command>,
     updates: Sender<FeedUpdate>,
     last: Arc<Mutex<Option<FeedUpdate>>>,
 ) {
+    // Publish one snapshot immediately; remote feeds have no event stream to
+    // trigger the first refresh.
+    if !refresh(&transport, scope, &updates, &last) {
+        return;
+    }
     let mut client: Option<ControlClient> = None;
     loop {
-        match commands.recv_timeout(RECONCILE) {
+        match commands.recv_timeout(interval) {
             Ok(command) => {
                 if client.is_none() {
-                    client = ControlClient::connect(&socket).ok();
+                    client = Some(ControlClient::from_transport(transport.clone()));
                 }
                 if let Some(active) = client.as_mut() {
                     let outcome = match command {
@@ -641,7 +765,7 @@ fn run_commands(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        if !refresh(&socket, &mut client, &updates, &last) {
+        if !refresh(&transport, scope, &updates, &last) {
             break;
         }
     }
@@ -649,20 +773,29 @@ fn run_commands(
 
 /// Hold an event subscription, refreshing the snapshot on structural changes.
 fn run_events(socket: PathBuf, updates: Sender<FeedUpdate>, last: Arc<Mutex<Option<FeedUpdate>>>) {
-    let mut client: Option<ControlClient> = None;
     loop {
         let mut uhp = crate::uhp::UhpClient::connect(&socket);
         let Ok(mut stream) = uhp.subscribe() else {
             thread::sleep(RESUBSCRIBE);
             continue;
         };
-        if !refresh(&socket, &mut client, &updates, &last) {
+        if !refresh(
+            &ControlTransport::Socket(socket.clone()),
+            FeedScope::Full,
+            &updates,
+            &last,
+        ) {
             break;
         }
         loop {
             match stream.next_event() {
                 Ok(Some(event)) if is_structural(&event.name) => {
-                    if !refresh(&socket, &mut client, &updates, &last) {
+                    if !refresh(
+                        &ControlTransport::Socket(socket.clone()),
+                        FeedScope::Full,
+                        &updates,
+                        &last,
+                    ) {
                         return;
                     }
                 }
@@ -675,41 +808,20 @@ fn run_events(socket: PathBuf, updates: Sender<FeedUpdate>, last: Arc<Mutex<Opti
     }
 }
 
-/// Re-read the three snapshots and forward them. `false` means the UI is gone.
+/// Re-read every snapshot concurrently and forward the combined result.
+///
+/// The full scope's reads are independent one-request connections; issuing
+/// them in parallel turns the chrome-refresh latency from the sum of five
+/// round trips into the slowest one, which is what keeps the tab strip in step
+/// with a tab switch. `false` means the UI is gone.
 fn refresh(
-    socket: &Path,
-    client: &mut Option<ControlClient>,
+    transport: &ControlTransport,
+    scope: FeedScope,
     updates: &Sender<FeedUpdate>,
     last: &Mutex<Option<FeedUpdate>>,
 ) -> bool {
-    if client.is_none() {
-        *client = ControlClient::connect(socket).ok();
-    }
-    let Some(active) = client.as_mut() else {
+    let Some(update) = fetch_update(transport, scope) else {
         return true;
-    };
-    let snapshot = (
-        active.agents(),
-        active.bar_widgets(),
-        active.tabs(),
-        active.automation_summary(),
-        active.task_summary(),
-    );
-    let (agents, bar, tabs, automations, tasks) = match snapshot {
-        (Ok(agents), Ok(bar), Ok(tabs), Ok(automations), Ok(tasks)) => {
-            (agents, bar, tabs, automations, tasks)
-        }
-        _ => {
-            *client = None;
-            return true;
-        }
-    };
-    let update = FeedUpdate {
-        agents,
-        bar,
-        tabs,
-        automations,
-        tasks,
     };
     let Ok(mut guard) = last.lock() else {
         return true;
@@ -720,6 +832,38 @@ fn refresh(
     *guard = Some(update.clone());
     drop(guard);
     updates.send(update).is_ok()
+}
+
+/// Read the requested snapshots in parallel.
+///
+/// `None` means at least one read failed; the caller keeps the last good
+/// snapshot and retries on the next event or reconciliation tick.
+fn fetch_update(transport: &ControlTransport, scope: FeedScope) -> Option<FeedUpdate> {
+    if scope == FeedScope::Agents {
+        let agents = ControlClient::from_transport(transport.clone())
+            .agents()
+            .ok()?;
+        return Some(FeedUpdate {
+            agents,
+            ..FeedUpdate::default()
+        });
+    }
+    thread::scope(|threads| -> Option<FeedUpdate> {
+        let agents = threads.spawn(|| ControlClient::from_transport(transport.clone()).agents());
+        let bar = threads.spawn(|| ControlClient::from_transport(transport.clone()).bar_widgets());
+        let tabs = threads.spawn(|| ControlClient::from_transport(transport.clone()).tabs());
+        let automations =
+            threads.spawn(|| ControlClient::from_transport(transport.clone()).automation_summary());
+        let tasks =
+            threads.spawn(|| ControlClient::from_transport(transport.clone()).task_summary());
+        Some(FeedUpdate {
+            agents: agents.join().ok()?.ok()?,
+            bar: bar.join().ok()?.ok()?,
+            tabs: tabs.join().ok()?.ok()?,
+            automations: automations.join().ok()?.ok()?,
+            tasks: tasks.join().ok()?.ok()?,
+        })
+    })
 }
 
 /// Whether an event can change what the native chrome shows.

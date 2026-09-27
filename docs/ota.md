@@ -6,7 +6,8 @@
 | --- | --- |
 | Release source + policy | `crates/l3s/src/update.rs` |
 | GPUI entity (check → download → stage) | `crates/l3s/src/gui/updater.rs` |
-| Footer badge + `l3s → Check for Updates…` | `crates/l3s/src/gui/mod.rs` |
+| Footer badge + `l3s → Check for Updates` | `crates/l3s/src/gui/mod.rs` |
+| Update window (live status + Retry) | `crates/l3s/src/gui/update_window.rs` |
 | Update prefs (channel, auto-check, feed override) | `crates/l3s/src/gui/settings.rs` |
 | DMG packaging | `scripts/package-macos-dmg.sh` |
 | Release automation | `.github/workflows/release.yml` |
@@ -15,7 +16,10 @@ The engine is `gpui-updater-core`: a blocking check → download → verify →
 install pipeline. The `Updater` entity runs it on GPUI's background executor
 and reports progress through `UpdateStatus`, so the GUI thread never blocks —
 the same threading rule as the daemon connection. A staged update sets the
-app's restart path to the new `.app` bundle; `Restart` relaunches into it.
+app's restart path to the new `.app` bundle; `Restart` relaunches into it. A
+failed check or download opens the native Update window (with a Retry button)
+instead of a footer pill; the window observes the entity, so retries and
+progress repaint live.
 
 `gpui-updater-pre` was evaluated and rejected: it needs Rust 1.98 while this
 workspace pins 1.96. The local `Updater` mirrors its shape and can be swapped

@@ -6,12 +6,13 @@
 //! `--probe-uhp` uses to print one PTY's rendered screen.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Value, json};
 
+use crate::control::ControlTransport;
 use crate::error::{Error, Result};
-use crate::transport::Stream;
+use crate::transport::{SshTarget, Stream};
 
 /// One live PTY as reported by `terminal.backend.inventory`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -47,7 +48,7 @@ pub struct Frame {
 /// -connection contract; the observe stream keeps its connection until dropped.
 #[derive(Clone, Debug)]
 pub struct UhpClient {
-    socket: PathBuf,
+    transport: ControlTransport,
     next_id: u64,
 }
 
@@ -55,7 +56,19 @@ impl UhpClient {
     /// Bind to the UHP socket at `path`.
     pub fn connect(path: &Path) -> Self {
         Self {
-            socket: path.to_path_buf(),
+            transport: ControlTransport::Socket(path.to_path_buf()),
+            next_id: 0,
+        }
+    }
+
+    /// Bind to a remote machine's UHP surface over SSH.
+    ///
+    /// `luvus uhp proxy` forwards one request per invocation, so streaming
+    /// methods (`events.subscribe`, `terminal.backend.observe`) are not
+    /// reachable this way; ordinary request/response methods are.
+    pub fn connect_ssh(target: SshTarget) -> Self {
+        Self {
+            transport: ControlTransport::Ssh(target),
             next_id: 0,
         }
     }
@@ -69,7 +82,7 @@ impl UhpClient {
             "params": params,
         })
         .to_string();
-        let stream = Stream::connect(&self.socket)?;
+        let stream = self.transport.stream()?;
         {
             let mut writer = &stream;
             writer.write_all(line.as_bytes())?;
@@ -121,7 +134,7 @@ impl UhpClient {
             "params": {},
         })
         .to_string();
-        let stream = Stream::connect(&self.socket)?;
+        let stream = self.transport.stream()?;
         {
             let mut writer = &stream;
             writer.write_all(line.as_bytes())?;
@@ -155,7 +168,7 @@ impl UhpClient {
             "params": params,
         })
         .to_string();
-        let stream = Stream::connect(&self.socket)?;
+        let stream = self.transport.stream()?;
         {
             let mut writer = &stream;
             writer.write_all(line.as_bytes())?;

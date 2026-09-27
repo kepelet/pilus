@@ -31,6 +31,8 @@ pub enum Launch {
         /// Which daemon to attach to.
         target: ConnectTarget,
     },
+    /// Check the OTA release source and print the result.
+    CheckUpdates,
 }
 
 /// Parse arguments and run the requested mode.
@@ -45,6 +47,7 @@ pub fn run() -> Result<()> {
         } => run_probe(target, workspaces, open_menu),
         Launch::Uhp { target, pane } => run_uhp(target, pane),
         Launch::Feed { target } => run_feed(target),
+        Launch::CheckUpdates => run_check_updates(),
     }
 }
 
@@ -56,6 +59,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
     let mut open_menu = false;
     let mut uhp = false;
     let mut feed = false;
+    let mut check_updates = false;
     let mut pane_id = None;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -84,6 +88,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
             }
             "--probe-uhp" => uhp = true,
             "--probe-feed" => feed = true,
+            "--check-updates" => check_updates = true,
             "--pane" => {
                 pane_id = Some(
                     args.next()
@@ -96,6 +101,9 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
             }
             other => bail!("unrecognized argument: {other}"),
         }
+    }
+    if check_updates {
+        return Ok(Launch::CheckUpdates);
     }
     if uhp {
         return Ok(Launch::Uhp {
@@ -129,6 +137,7 @@ fn print_help() {
          \x20   --probe-menu     Probe, then open the daemon's Menu by click\n\
          \x20   --probe-uhp      Stream one pane via UHP and print the screen\n\
          \x20   --probe-feed     Run the event-driven feed briefly and print it\n\
+         \x20   --check-updates  Check the OTA release source and print it\n\
          \x20   --pane ID        Pane to observe with --probe-uhp\n\
          \x20   -h, --help       Print this help"
     );
@@ -227,6 +236,41 @@ fn run_feed(target: ConnectTarget) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     println!("{updates} update(s) in 3s");
+    Ok(())
+}
+
+/// Check the OTA release source without touching the GUI.
+///
+/// Uses the same engine the window drives, so a failing nightly feed or a
+/// mismatched asset name shows up here first. Honors `L3S_UPDATE_FEED_URL`.
+fn run_check_updates() -> Result<()> {
+    let request = crate::update::UpdateRequest::from_settings("stable", None);
+    if request.uses_manifest() {
+        let url = request.feed_url.as_deref().unwrap_or("(unset)");
+        println!("source: manifest {url}");
+    } else {
+        println!(
+            "source: GitHub {}/{} (releases/latest)",
+            crate::update::GITHUB_OWNER,
+            crate::update::GITHUB_REPO
+        );
+    }
+    let engine = crate::update::engine(&request);
+    match engine.check() {
+        Ok(Some(release)) => {
+            println!(
+                "update available: {} ({})",
+                release.version, release.asset.name
+            );
+            if let Some(notes) = release.notes.filter(|notes| !notes.trim().is_empty()) {
+                let first = notes.lines().next().unwrap_or("");
+                println!("notes: {first}");
+            }
+            println!("{}", crate::update::PROTOCOL_NOTE);
+        }
+        Ok(None) => println!("up to date ({})", env!("CARGO_PKG_VERSION")),
+        Err(error) => bail!("update check failed: {error}"),
+    }
     Ok(())
 }
 

@@ -31,3 +31,11 @@ build:
 # Assemble a macOS .app bundle with the icon and Info.plist.
 bundle:
     ./scripts/bundle-macos.sh
+
+# Package a signed macOS DMG for OTA distribution (see docs/ota.md).
+package-dmg:
+    ./scripts/package-macos-dmg.sh
+
+# Check the OTA release source without opening a window.
+check-updates:
+    cargo run -p l3s --no-default-features -- --check-updates

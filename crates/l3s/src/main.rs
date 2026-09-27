@@ -5,6 +5,7 @@
 mod cli;
 #[cfg(feature = "gui")]
 mod gui;
+mod update;
 
 fn main() -> std::process::ExitCode {
     match cli::run() {

@@ -22,6 +22,12 @@ pub struct Settings {
     pub terminal_font: String,
     /// Terminal cell text size in logical pixels.
     pub terminal_font_size: f32,
+    /// Update channel: `stable` or `beta`.
+    pub update_channel: String,
+    /// Check for updates automatically on launch.
+    pub auto_check_updates: bool,
+    /// Override the release feed with a static manifest URL.
+    pub update_feed_url: Option<String>,
 }
 
 impl Default for Settings {
@@ -31,6 +37,9 @@ impl Default for Settings {
             ui_font_size: CHROME_FONT,
             terminal_font: FONT_FAMILY.to_string(),
             terminal_font_size: FONT_SIZE,
+            update_channel: "stable".to_string(),
+            auto_check_updates: true,
+            update_feed_url: None,
         }
     }
 }
@@ -77,6 +86,9 @@ mod tests {
             ui_font_size: 15.0,
             terminal_font: "JetBrains Mono".to_string(),
             terminal_font_size: 14.0,
+            update_channel: "beta".to_string(),
+            auto_check_updates: false,
+            update_feed_url: Some("https://dl.example.com/beta/latest.json".to_string()),
         };
         let text = serde_json::to_string(&settings).expect("serialize");
         let back: Settings = serde_json::from_str(&text).expect("deserialize");

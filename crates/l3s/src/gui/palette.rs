@@ -350,9 +350,15 @@ mod tests {
         let mut palette = Palette::default();
         palette.insert("q");
         let matches = palette.matches(&entries);
-        assert_eq!(palette.highlighted(&matches).map(|e| e.title.as_str()), Some("Quit"));
+        assert_eq!(
+            palette.highlighted(&matches).map(|e| e.title.as_str()),
+            Some("Quit")
+        );
         palette.move_selection(9, matches.len());
-        assert_eq!(palette.highlighted(&matches).map(|e| e.title.as_str()), Some("Quit"));
+        assert_eq!(
+            palette.highlighted(&matches).map(|e| e.title.as_str()),
+            Some("Quit")
+        );
     }
 
     #[test]

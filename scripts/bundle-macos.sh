@@ -6,7 +6,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/l3s/Cargo.toml | head -1)"
+version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 app="target/release/l3s.app"
 
 cargo build --release -p l3s
@@ -35,7 +35,16 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc sign so Gatekeeper allows a locally built bundle to run.
-codesign --force --sign - "$app" >/dev/null 2>&1 || true
+# Ad-hoc sign so Gatekeeper allows a locally built bundle to run. Set
+# APPLE_DEVELOPER_IDENTITY to a Developer ID for distributable builds: OTA
+# updates only survive Gatekeeper when the bundle carries that identity with
+# the hardened runtime. A requested identity must succeed — silently shipping
+# ad-hoc would produce an update Gatekeeper rejects, so that path fails loudly.
+identity="${APPLE_DEVELOPER_IDENTITY:--}"
+if [ -n "$identity" ]; then
+    codesign --force --options runtime --sign "$identity" "$app"
+else
+    codesign --force --sign - "$app" >/dev/null 2>&1 || true
+fi
 
 echo "built $app"

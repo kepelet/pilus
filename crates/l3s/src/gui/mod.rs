@@ -14,6 +14,7 @@ mod scheme;
 mod selection;
 mod settings;
 mod theme;
+mod updater;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -21,18 +22,20 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use crate::update::UpdateRequest;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
     MouseEventKind,
 };
 use gpui::{
-    Action, App, Bounds, ClipboardItem, Context, Div, FocusHandle, FontWeight, Hsla, KeyBinding,
-    KeyDownEvent, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, TextRun,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, font, point, prelude::*, px, size,
-    svg,
+    Action, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
+    KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions, div, font,
+    point, prelude::*, px, size, svg,
 };
 use gpui_platform::application;
+use gpui_updater_core::UpdateStatus;
 use l3s_client::{
     Agent, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent, ConnectTarget,
     Connection, ControlClient, MachineInfo, SessionInfo, Surface, SurfaceChange, Tab, TaskSummary,
@@ -44,6 +47,7 @@ use palette::{Command, Entry, Palette};
 use selection::{Cell, Selection};
 use settings::Settings;
 use theme::Theme;
+use updater::Updater;
 
 /// Monospace family used for the cell grid.
 const FONT_FAMILY: &str = "Menlo";
@@ -232,8 +236,6 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             }
         });
         cx.on_action(|_: &QuitApp, cx: &mut App| cx.quit());
-        // Enables the menu item; the update flow is not wired up yet.
-        cx.on_action(|_: &CheckForUpdates, _cx: &mut App| {});
         cx.on_action(|_: &MinimizeWindow, cx: &mut App| {
             if let Some(window) = cx.active_window() {
                 window
@@ -547,6 +549,9 @@ struct L3sView {
     sidebar_revision: u64,
     /// Whether the native sidebar is expanded.
     sidebar_visible: bool,
+    /// OTA updater entity and the last status the view painted.
+    updater: Entity<Updater>,
+    last_update_status: UpdateStatus,
 }
 
 impl L3sView {
@@ -577,6 +582,12 @@ impl L3sView {
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let (theme_tx, theme_rx) = std::sync::mpsc::channel();
         let settings = shared_settings.borrow().clone();
+        let update_request = UpdateRequest::from_settings(
+            &settings.update_channel,
+            settings.update_feed_url.clone(),
+        );
+        let updater = cx.new(|cx| Updater::from_request(&update_request, cx));
+        let auto_check = settings.auto_check_updates;
 
         let view = Self {
             target,
@@ -627,13 +638,19 @@ impl L3sView {
             sidebar_workspace_paths: false,
             sidebar_revision: 0,
             sidebar_visible: true,
+            updater: updater.clone(),
+            last_update_status: UpdateStatus::Idle,
         };
+
+        if auto_check {
+            updater.update(cx, |updater, cx| updater.check(cx));
+        }
 
         cx.spawn(async move |this, cx| {
             loop {
                 let updated = this.update(cx, |view, cx| {
                     let changed = view.sync_settings();
-                    if view.poll() || changed {
+                    if view.poll(cx) || changed {
                         cx.notify();
                     }
                 });
@@ -651,8 +668,15 @@ impl L3sView {
     }
 
     /// Drain pending connection events. Returns whether a repaint is needed.
-    fn poll(&mut self) -> bool {
+    fn poll(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
+        // The updater notifies its own entity; this 16 ms loop forwards its
+        // transitions to the window so the footer badge stays live.
+        let update_status = self.updater.read(cx).status().clone();
+        if update_status != self.last_update_status {
+            self.last_update_status = update_status;
+            changed = true;
+        }
         while let Some(event) = self.connection.try_recv() {
             match event {
                 ClientEvent::Ready { .. } => {
@@ -908,7 +932,11 @@ impl L3sView {
                 if keystroke.modifiers.platform || keystroke.modifiers.control {
                     return;
                 }
-                if let Some(text) = keystroke.key_char.as_deref().filter(|text| !text.is_empty()) {
+                if let Some(text) = keystroke
+                    .key_char
+                    .as_deref()
+                    .filter(|text| !text.is_empty())
+                {
                     self.palette.insert(text);
                     self.palette_scroll.scroll_to_item(0);
                 } else if keystroke.key.chars().count() == 1 {
@@ -954,12 +982,7 @@ impl L3sView {
             ),
             entry(Command::OpenAbout, "About l3s", "Application", None),
             entry(Command::Quit, "Quit l3s", "Application", Some("⌘Q")),
-            entry(
-                Command::ToggleSidebar,
-                "Toggle Sidebar",
-                "View",
-                Some("⌘S"),
-            ),
+            entry(Command::ToggleSidebar, "Toggle Sidebar", "View", Some("⌘S")),
             entry(
                 Command::IncreaseFontSize,
                 "Increase Font Size",
@@ -981,12 +1004,7 @@ impl L3sView {
             entry(Command::CopySelection, "Copy", "Edit", Some("⌘C")),
             entry(Command::PasteClipboard, "Paste", "Edit", Some("⌘V")),
             entry(Command::SelectAllGrid, "Select All", "Edit", Some("⌘A")),
-            entry(
-                Command::CloseWindow,
-                "Close Window",
-                "Window",
-                Some("⌘⇧W"),
-            ),
+            entry(Command::CloseWindow, "Close Window", "Window", Some("⌘⇧W")),
             entry(
                 Command::CloseAllWindows,
                 "Close All Windows",
@@ -1186,6 +1204,59 @@ impl L3sView {
         std::thread::spawn(move || {
             tx.send(start_session_blocking(&root, &name)).ok();
         });
+    }
+
+    /// Manual check from the menu bar (`l3s → Check for Updates…`).
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        self.updater.update(cx, |updater, cx| updater.check(cx));
+    }
+
+    /// The badge's next step: download an available update, restart into a
+    /// staged one, or re-check after an error.
+    fn advance_update(&mut self, cx: &mut Context<Self>) {
+        self.updater
+            .update(cx, |updater, cx| match updater.status() {
+                UpdateStatus::Staged(_) => updater.restart(cx),
+                UpdateStatus::Available(_)
+                | UpdateStatus::Errored(_)
+                | UpdateStatus::UpToDate
+                | UpdateStatus::Idle => {
+                    // A known release downloads; otherwise (re)check. The engine
+                    // itself no-ops a download with nothing staged.
+                    if updater.available().is_some() {
+                        updater.download_and_install(cx);
+                    } else {
+                        updater.check(cx);
+                    }
+                }
+                UpdateStatus::Checking
+                | UpdateStatus::Downloading { .. }
+                | UpdateStatus::Installing => {}
+            });
+    }
+
+    /// Short footer badge text for the update state, plus whether clicking
+    /// it advances the flow. `None` keeps the footer clean.
+    fn update_badge(&self) -> Option<(String, bool)> {
+        match &self.last_update_status {
+            UpdateStatus::Idle | UpdateStatus::UpToDate => None,
+            UpdateStatus::Checking => Some(("Checking for updates…".to_string(), false)),
+            UpdateStatus::Available(version) => Some((format!("Update to {version}"), true)),
+            UpdateStatus::Downloading { downloaded, total } => {
+                let label = match total {
+                    Some(total) => format!(
+                        "Downloading {} / {}",
+                        human_bytes(*downloaded),
+                        human_bytes(*total)
+                    ),
+                    None => format!("Downloading {}", human_bytes(*downloaded)),
+                };
+                Some((label, false))
+            }
+            UpdateStatus::Installing => Some(("Installing update…".to_string(), false)),
+            UpdateStatus::Staged(version) => Some((format!("Restart to install {version}"), true)),
+            UpdateStatus::Errored(_) => Some(("Update failed — retry".to_string(), true)),
+        }
     }
 
     /// Send our sidebar layout to the daemon with a fresh revision.
@@ -1835,7 +1906,37 @@ impl L3sView {
     /// starts past the sidebar so it never hides beneath it.
     fn status_bar(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let right = div().flex().flex_row().items_center().gap_2().child(
+        let mut right = div().flex().flex_row().items_center().gap_2();
+        // OTA state lives next to the settings gear: quiet when idle, a
+        // progress label while busy, and a clickable pill when the user can
+        // advance the flow (download, restart, or retry).
+        if let Some((label, actionable)) = self.update_badge() {
+            let pill = div()
+                .id("l3s-update")
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(28.0))
+                .px_2()
+                .rounded_md()
+                .text_color(if actionable {
+                    theme.accent
+                } else {
+                    theme.muted
+                });
+            right = right.child(if actionable {
+                pill.cursor_pointer()
+                    .hover(|style| style.bg(theme.panel))
+                    .child(label)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.advance_update(cx);
+                        cx.notify();
+                    }))
+            } else {
+                pill.child(label)
+            });
+        }
+        right = right.child(
             div()
                 .id("l3s-settings")
                 .flex()
@@ -2100,7 +2201,11 @@ impl L3sView {
                     .text_size(px(self.chrome_font()))
                     .text_color(fg)
                     .hover(move |style| {
-                        style.bg(if active { theme.selection_bg } else { theme.panel })
+                        style.bg(if active {
+                            theme.selection_bg
+                        } else {
+                            theme.panel
+                        })
                     })
                     .child(div().flex_1().child(entry.title.clone()))
                     .child(
@@ -2798,6 +2903,10 @@ impl Render for L3sView {
             .on_action(cx.listener(|this, _: &OpenAbout, _window, cx| {
                 about::open(this.theme, cx);
             }))
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| {
+                this.check_for_updates(cx);
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &FocusTab1, _window, _cx| this.focus_tab(1)))
             .on_action(cx.listener(|this, _: &FocusTab2, _window, _cx| this.focus_tab(2)))
             .on_action(cx.listener(|this, _: &FocusTab3, _window, _cx| this.focus_tab(3)))
@@ -3127,6 +3236,22 @@ fn machine_status(machine: &MachineInfo, theme: Theme, size: f32) -> Div {
         (None, _) => ("…".to_string(), theme.muted),
     };
     div().text_size(px(size)).text_color(color).child(text)
+}
+
+/// Compact byte count for the download badge (`12.4 MB`).
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// The footer status text, hidden when it repeats the session pill.

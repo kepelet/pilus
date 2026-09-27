@@ -83,6 +83,17 @@ The bundle's icon comes from `crates/l3s/assets/l3s.icns`, generated from
 sips -z 1024 1024 art.png --out crates/l3s/assets/l3s-icon-1024.png
 ```
 
+## Updates
+
+`l3s` updates itself from GitHub Releases: `l3s → Check for Updates…` checks
+on demand, and a footer badge tracks download and restart-into-update. See
+[`docs/ota.md`](docs/ota.md) for the release process, signing, and channels.
+
+```sh
+just package-dmg    # signed Apple Silicon .dmg + SHA256SUMS
+just check-updates  # exercise the feed without opening a window
+```
+
 ## Layout
 
 | Crate | Responsibility |

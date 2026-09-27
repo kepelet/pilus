@@ -1,0 +1,114 @@
+# Release `l3s` to GitHub Releases for the OTA updater.
+#
+# Tag `vX.Y.Z` (matching `Cargo.toml`) to ship stable, `vX.Y.Z-beta.N` for the
+# beta channel. The client reads `releases/latest` (stable) or includes
+# pre-releases (beta), matching assets on the `macos` / `arm64` / `.dmg`
+# substrings, so asset names must stay `l3s-v<version>-macos-arm64.dmg`.
+#
+# Required secrets: none for unsigned checksums-only releases.
+# Recommended: `MINISIGN_SECRET_KEY` (the minisign secret key contents) plus
+# the matching public key in `crates/l3s/src/update.rs`, and Apple signing:
+# `APPLE_DEVELOPER_IDENTITY` (e.g. `Developer ID Application: Name (TEAMID)`),
+# `APPLE_CERTIFICATE` (base64 of the matching .p12) and `APPLE_CERT_PASSWORD`
+# for signing, `APPLE_ID`, `APPLE_APP_PASSWORD` (an app-specific password),
+# and `APPLE_TEAM_ID` for notarization.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.96"
+
+      - name: Import signing certificate
+        if: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        env:
+          CERT_P12: ${{ secrets.APPLE_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          echo "$CERT_P12" | base64 --decode > /tmp/signing.p12
+          security create-keychain -p actions l3s-signing.keychain
+          security set-keychain-settings -t 3600 -u l3s-signing.keychain
+          security unlock-keychain -p actions l3s-signing.keychain
+          security import /tmp/signing.p12 -k l3s-signing.keychain \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -s l3s-signing.keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k actions l3s-signing.keychain
+          rm -f /tmp/signing.p12
+
+      - name: Install minisign
+        if: ${{ secrets.MINISIGN_SECRET_KEY != '' }}
+        run: brew install minisign
+
+      - name: Set up notarization credentials
+        if: ${{ secrets.APPLE_ID != '' }}
+        run: |
+          xcrun notarytool store-credentials l3s-notary \
+            --apple-id "${{ secrets.APPLE_ID }}" \
+            --password "${{ secrets.APPLE_APP_PASSWORD }}" \
+            --team-id "${{ secrets.APPLE_TEAM_ID }}"
+
+      - name: Package DMG
+        env:
+          APPLE_DEVELOPER_IDENTITY: ${{ secrets.APPLE_DEVELOPER_IDENTITY }}
+          # Empty unless notarization credentials were stored above; the
+          # packaging script skips notarization when this is unset.
+          NOTARY_PROFILE: ${{ secrets.APPLE_ID != '' && 'l3s-notary' || '' }}
+          MINISIGN_SECRET_KEY: minisign.key
+        run: |
+          if [ -n "${{ secrets.MINISIGN_SECRET_KEY }}" ]; then
+            printf '%s' "${{ secrets.MINISIGN_SECRET_KEY }}" > minisign.key
+            chmod 600 minisign.key
+          else
+            unset MINISIGN_SECRET_KEY
+          fi
+          ./scripts/package-macos-dmg.sh
+          rm -f minisign.key
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: |
+            target/release/*.dmg
+            target/release/*.minisig
+            target/release/SHA256SUMS
+
+  publish:
+    needs: package-macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Merge checksums
+        run: |
+          cat dist/*/SHA256SUMS | sort -u > dist/SHA256SUMS
+          cat dist/SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/**/*.dmg
+            dist/**/*.minisig
+            dist/SHA256SUMS
+          prerelease: ${{ contains(github.ref_name, 'beta') }}
+          generate_release_notes: true

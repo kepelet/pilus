@@ -22,6 +22,7 @@ gui = ["dep:gpui", "dep:gpui_platform"]
 [dependencies]
 anyhow.workspace = true
 crossterm.workspace = true
+gpui-updater-core.workspace = true
 l3s-client.workspace = true
 l3s-protocol.workspace = true
 serde.workspace = true

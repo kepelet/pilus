@@ -6852,36 +6852,9 @@ fn render_row(
         };
     }
 
-    let selected = |column: u16| selection.is_some_and(|s| s.contains(column, row));
-    let mut index = 0usize;
-    while index < rendered.len() {
-        let start_column = rendered[index].0;
-        let (fg, bg, mods) = style_of(
-            rendered[index].1,
-            theme,
-            rendered[index].2,
-            selected(start_column),
-        );
-        let mut text = String::new();
-        let mut next = index;
-        while next < rendered.len() {
-            let (column, cell, cursor) = rendered[next];
-            if style_of(cell, theme, cursor, selected(column)) != (fg, bg, mods) {
-                break;
-            }
-            text.push_str(symbol(cell));
-            next += 1;
-        }
-        // Pin the run to its first cell: flowing runs let a trailing space
-        // trimmed by text layout shift every later column, which unaligns
-        // box borders and can push the right edge off the window.
-        let end_column = if next < rendered.len() {
-            rendered[next].0
-        } else {
-            frame.width
-        };
-        let run_cells = end_column.saturating_sub(start_column).max(1);
-
+    for (start_column, run_cells, text, (fg, bg, mods)) in
+        collect_runs(frame.width, &rendered, theme, row, selection)
+    {
         // Runs position relative to the painted slice: the container starts
         // at the first visible column, so absolute daemon columns would
         // shove every run right by the skipped width (and clip the edge).
@@ -6912,9 +6885,77 @@ fn render_row(
             span = span.underline();
         }
         element = element.child(span);
-        index = next;
     }
     element
+}
+
+/// Whether `symbol` can safely flow inside a multi-cell shaped run.
+///
+/// The grid is measured from the monospace base font's `M` advance, so an
+/// ASCII run shapes to exactly `cells * cell_width`. Nerd-Font private-use
+/// glyphs and emoji fall back to other fonts whose advances differ; shaping
+/// them together with their neighbors shifts every later glyph in the run
+/// and clips the tail (a starship prompt loses its branch's last letter and
+/// the version's last digit). Isolate those cells in their own fixed-width
+/// spans so the error cannot accumulate past one glyph.
+fn is_flowable(symbol: &str) -> bool {
+    symbol.is_ascii() && l3s_protocol::symbol_width(symbol) <= 1
+}
+
+/// Group one row's cells into pinned runs sharing one style.
+///
+/// Runs split on style (so one background div paints them) and additionally
+/// on [`is_flowable`], so ASCII flows while each fallback glyph gets its own
+/// fixed-width span anchored to its daemon column. `frame_width` closes the
+/// last run; `rendered` holds `(absolute column, cell, cursor)` with wide
+/// continuations already dropped.
+type PinnedRun = (u16, u16, String, (gpui::Rgba, gpui::Rgba, u16));
+
+fn collect_runs(
+    frame_width: u16,
+    rendered: &[(u16, &CellData, bool)],
+    theme: Theme,
+    row: u16,
+    selection: Option<Selection>,
+) -> Vec<PinnedRun> {
+    let selected = |column: u16| selection.is_some_and(|s| s.contains(column, row));
+    let mut runs = Vec::new();
+    let mut index = 0usize;
+    while index < rendered.len() {
+        let start_column = rendered[index].0;
+        let style = style_of(
+            rendered[index].1,
+            theme,
+            rendered[index].2,
+            selected(start_column),
+        );
+        let start_flowable = is_flowable(symbol(rendered[index].1));
+        let mut text = String::new();
+        let mut next = index;
+        while next < rendered.len() {
+            let (column, cell, cursor) = rendered[next];
+            if style_of(cell, theme, cursor, selected(column)) != style {
+                break;
+            }
+            if next > index && (!start_flowable || !is_flowable(symbol(cell))) {
+                break;
+            }
+            text.push_str(symbol(cell));
+            next += 1;
+        }
+        // Pin the run to its first cell: flowing runs let a trailing space
+        // trimmed by text layout shift every later column, which unaligns
+        // box borders and can push the right edge off the window.
+        let end_column = if next < rendered.len() {
+            rendered[next].0
+        } else {
+            frame_width
+        };
+        let run_cells = end_column.saturating_sub(start_column).max(1);
+        runs.push((start_column, run_cells, text, style));
+        index = next;
+    }
+    runs
 }
 
 fn style_of(
@@ -7411,6 +7452,73 @@ mod tests {
             let chord = format!("{:?}", binding.keystrokes());
             assert!(seen.insert(chord.clone()), "duplicate shortcut: {chord}");
         }
+    }
+
+    #[test]
+    fn fallback_glyphs_do_not_flow_with_neighbors() {
+        assert!(is_flowable("a"));
+        assert!(is_flowable(" "));
+        // Nerd-Font branch glyph and emoji fall back past Menlo, so their
+        // advances differ from the measured cell width.
+        assert!(!is_flowable("\u{e0a0}"));
+        assert!(!is_flowable("\u{1f4e6}"));
+    }
+
+    #[test]
+    fn starship_prompt_isolates_fallback_glyphs() {
+        let theme = Theme::default();
+        let text = "a \u{e0a0} b \u{1f4e6} c";
+        // The emoji occupies two daemon columns with a blank continuation.
+        let width: u16 = 10;
+        let mut cells = Vec::new();
+        let mut columns: Vec<u16> = Vec::new();
+        let mut column: u16 = 0;
+        for grapheme in [
+            "a",
+            " ",
+            "\u{e0a0}",
+            " ",
+            "b",
+            " ",
+            "\u{1f4e6}",
+            "",
+            " ",
+            "c",
+        ] {
+            if grapheme.is_empty() {
+                column += 1;
+                continue;
+            }
+            cells.push(CellData {
+                symbol: grapheme.to_string(),
+                fg: 0,
+                bg: 0,
+                mods: 0,
+            });
+            columns.push(column);
+            column += if l3s_protocol::symbol_width(grapheme) >= 2 {
+                2
+            } else {
+                1
+            };
+        }
+        assert_eq!(text, "a \u{e0a0} b \u{1f4e6} c");
+        let rendered: Vec<(u16, &CellData, bool)> = columns
+            .iter()
+            .zip(cells.iter())
+            .map(|(c, cell)| (*c, cell, false))
+            .collect();
+        let runs = collect_runs(width, &rendered, theme, 0, None);
+        let texts: Vec<&str> = runs.iter().map(|(_, _, text, _)| text.as_str()).collect();
+        assert_eq!(texts, vec!["a ", "\u{e0a0}", " b ", "\u{1f4e6}", " c"]);
+        // Every run stays pinned: widths cover the daemon columns exactly,
+        // so later ASCII never shifts into the clipped tail.
+        let mut covered = 0u16;
+        for (start, cells, _, _) in &runs {
+            assert_eq!(*start, covered);
+            covered = covered.saturating_add(*cells);
+        }
+        assert_eq!(covered, width);
     }
 
     #[test]

@@ -729,6 +729,12 @@ struct L3sView {
     sidebar_revision: u64,
     /// Whether the native sidebar is expanded.
     sidebar_visible: bool,
+    /// Whether the WORKSPACES section is collapsed to its header.
+    workspaces_collapsed: bool,
+    /// Whether the AGENTS section is collapsed to its header.
+    agents_collapsed: bool,
+    /// Keeps the sidebar's sections scrolled under the fixed top clearance.
+    sidebar_scroll: ScrollHandle,
     /// The endpoint currently loaded into the active fields above.
     active: EndpointId,
     /// The active machine's profile, when a machine owns the surface.
@@ -862,6 +868,9 @@ impl L3sView {
             sidebar_workspace_paths: false,
             sidebar_revision: 0,
             sidebar_visible: true,
+            workspaces_collapsed: false,
+            agents_collapsed: false,
+            sidebar_scroll: ScrollHandle::new(),
             active: EndpointId::Local,
             active_machine: None,
             endpoints: HashMap::new(),
@@ -3233,23 +3242,33 @@ impl L3sView {
         };
         let theme = self.theme;
 
-        let mut list = div()
+        // The scroll container stays a plain block. Making it a flex column
+        // lets its children shrink to fit, which squeezes the nav rows; the
+        // inner content carries the flex layout so it overflows and scrolls.
+        let mut content = div()
             .flex()
             .flex_col()
-            .flex_1()
+            .gap_1()
             .px_3()
             .pt(px(SIDEBAR_TOP_INSET))
-            .gap_1()
-            .overflow_hidden()
-            // Clearance for the floating traffic lights (transparent titlebar).
-            .child(div().h(px(40.0)));
+            .pb_3();
 
         for kind in NavKind::ALL {
-            list = list.child(self.nav_row(kind, cx));
+            content = content.child(self.nav_row(kind, cx));
         }
 
-        list = list.child(self.workspaces_section(cx));
-        list = list.child(self.agents_section(cx));
+        content = content.child(self.workspaces_section(cx));
+        content = content.child(self.agents_section(cx));
+
+        let list = div()
+            .id("l3s-sidebar-scroll")
+            .flex_1()
+            // Let the scroll area shrink below its content, so it scrolls
+            // instead of pushing the panel taller than the window.
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll)
+            .child(content);
 
         // The panel starts on row 0, covering the daemon's `« session Menu`
         // chrome so the sidebar shows only native sections. It runs full
@@ -3265,6 +3284,9 @@ impl L3sView {
             .flex_col()
             .bg(theme.window_bg)
             .overflow_hidden()
+            // Fixed clearance for the floating traffic lights; the sections
+            // scroll under it instead of disappearing beneath the titlebar.
+            .child(div().h(px(40.0)).flex_shrink_0())
             .child(list)
     }
 
@@ -3960,7 +3982,8 @@ impl L3sView {
             )
     }
 
-    /// One project or nested workspace row; the active workspace gets the pill.
+    /// One project or nested workspace row: the name on the first line, the
+    /// working directory on the second. The active workspace gets the pill.
     ///
     /// `host` is the machine name for a remote row, shown muted so a flat list
     /// still says where the project lives.
@@ -3975,31 +3998,23 @@ impl L3sView {
         let active = *endpoint == self.active && workspace.active;
         let remote = endpoint.machine_id().is_some();
         let bg = if active { theme.panel } else { theme.window_bg };
-        let mut row = div()
-            .id(format!(
-                "l3s-workspace-{}-{}",
-                endpoint.key(),
-                workspace.index
-            ))
+        let cwd = shorten_home(&workspace.cwd);
+        let mut lines = vec![(format!("Directory: {cwd}"), theme.muted)];
+        if let Some(branch) = workspace.branch.clone() {
+            lines.push((format!("Branch: {branch}"), theme.branch));
+        }
+        if let Some(host) = host {
+            lines.push((format!("Host: {host}"), theme.muted));
+        }
+        let tip = row_tooltip(workspace.name.clone(), theme.panel_fg, lines, theme);
+
+        let mut head = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .h(px(if workspace.nested { 26.0 } else { 28.0 }))
-            .px_2()
-            .rounded_md()
-            .bg(bg)
-            .cursor_pointer()
-            .hover(|style| style.bg(theme.panel))
-            .text_size(px(self.chrome_font()));
-        if workspace.nested {
-            row = row.pl(px(18.0));
-        }
-        let mut name = div().text_color(theme.panel_fg);
-        if active {
-            name = name.font_weight(FontWeight::BOLD);
-        }
-        row = row
+            .min_w_0()
+            .text_size(px(self.chrome_font()))
             .child(if workspace.nested {
                 icon(
                     include_bytes!("../../assets/icons/circle.svg"),
@@ -4018,21 +4033,66 @@ impl L3sView {
                     14.0,
                     theme.panel_fg,
                 )
-            })
-            .child(name.child(workspace.name.clone()));
+            });
+        let mut name = div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_color(theme.panel_fg);
+        if active {
+            name = name.font_weight(FontWeight::BOLD);
+        }
+        head = head.child(name.child(workspace.name.clone()));
         // The branch stays subtle here; the prompt line below carries the color.
         if !workspace.nested
             && let Some(branch) = workspace.branch.clone()
         {
-            row = row.child(div().text_color(theme.branch).child(branch));
+            head = head.child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(self.section_font()))
+                    .text_color(theme.branch)
+                    .child(branch),
+            );
         }
         if let Some(host) = host {
-            row = row.child(
+            head = head.child(
                 div()
+                    .flex_shrink_0()
                     .text_size(px(self.section_font()))
                     .text_color(theme.muted)
                     .child(host.to_string()),
             );
+        }
+
+        let mut row = div()
+            .id(format!(
+                "l3s-workspace-{}-{}",
+                endpoint.key(),
+                workspace.index
+            ))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(bg)
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.panel))
+            .tooltip(tip)
+            .child(head)
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(self.section_font()))
+                    .text_color(theme.muted)
+                    .child(cwd),
+            );
+        if workspace.nested {
+            row = row.pl(px(18.0));
         }
         let workspace_id = workspace.id.clone();
         let endpoint = endpoint.clone();
@@ -4170,10 +4230,31 @@ impl L3sView {
                 .mr(px(-12.0))
                 .child(
                     div()
+                        .id("l3s-workspaces-toggle")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .flex_1()
+                        .cursor_pointer()
                         .text_size(px(self.section_font()))
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme.muted)
-                        .child("WORKSPACES"),
+                        .hover(|style| style.text_color(theme.panel_fg))
+                        .child(icon(
+                            if self.workspaces_collapsed {
+                                include_bytes!("../../assets/icons/chevron-right.svg")
+                            } else {
+                                include_bytes!("../../assets/icons/chevron-down.svg")
+                            },
+                            12.0,
+                            theme.muted,
+                        ))
+                        .child("WORKSPACES")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.workspaces_collapsed = !this.workspaces_collapsed;
+                            cx.notify();
+                        })),
                 )
                 .child(
                     div()
@@ -4192,10 +4273,14 @@ impl L3sView {
                             theme.muted,
                         ))
                         .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
                             this.open_picker(cx);
                         })),
                 ),
         );
+        if self.workspaces_collapsed {
+            return section;
+        }
         let mut any = false;
         for id in self.connected_endpoints() {
             let host = id.machine_id().map(|_| self.endpoint_label(&id));
@@ -4244,12 +4329,35 @@ impl L3sView {
                 .px_2()
                 .child(
                     div()
+                        .id("l3s-agents-toggle")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .cursor_pointer()
                         .text_size(px(self.section_font()))
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme.muted)
-                        .child("AGENTS"),
+                        .hover(|style| style.text_color(theme.panel_fg))
+                        .child(icon(
+                            if self.agents_collapsed {
+                                include_bytes!("../../assets/icons/chevron-right.svg")
+                            } else {
+                                include_bytes!("../../assets/icons/chevron-down.svg")
+                            },
+                            12.0,
+                            theme.muted,
+                        ))
+                        .child("AGENTS")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.agents_collapsed = !this.agents_collapsed;
+                            cx.notify();
+                        })),
                 ),
         );
+        if self.agents_collapsed {
+            return section;
+        }
         let mut any = false;
         for id in self.connected_endpoints() {
             let agents = self.endpoint_agents(&id);
@@ -4286,7 +4394,9 @@ impl L3sView {
         )
     }
 
-    /// One agent row; clicking focuses its pane on its owning endpoint.
+    /// One agent row: the agent and its label on the first line, the workspace
+    /// and working directory on the second. The brand mark is tinted by status.
+    /// Clicking focuses its pane on its owning endpoint.
     fn agent_row(
         &self,
         endpoint: &EndpointId,
@@ -4310,6 +4420,23 @@ impl L3sView {
         } else {
             theme.muted
         };
+        let status = status_color(&agent.status, theme);
+        let branch = agent.branch.clone();
+        let cwd = shorten_home(&agent.cwd);
+        let label = agent.label().to_string();
+        let mut lines = vec![
+            (format!("Agent: {}", agent.agent), dim),
+            (format!("Status: {}", status_label(&agent.status)), status),
+        ];
+        if !agent.workspace_name.is_empty() {
+            lines.push((format!("Workspace: {}", agent.workspace_name), dim));
+        }
+        lines.push((format!("Directory: {cwd}"), dim));
+        if let Some(branch) = branch.clone() {
+            lines.push((format!("Branch: {branch}"), theme.ok));
+        }
+        let tip = row_tooltip(label.clone(), fg, lines, theme);
+
         let pane = agent.pane.clone();
         let endpoint = endpoint.clone();
         div()
@@ -4330,34 +4457,36 @@ impl L3sView {
                     style.bg(theme.panel)
                 }
             })
+            .tooltip(tip)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .min_w_0()
                     .text_size(px(self.chrome_font()))
-                    .child(icon(
-                        include_bytes!("../../assets/icons/circle.svg"),
-                        9.0,
-                        status_color(&agent.status, theme),
-                    ))
+                    .child(icon(agent_icon(&agent.agent), 12.0, fg))
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_color(fg)
                             .font_weight(if focused {
                                 FontWeight::BOLD
                             } else {
                                 FontWeight::NORMAL
                             })
-                            .child(agent.label().to_string()),
+                            .child(label),
                     )
                     .child(
                         div()
-                            .text_size(px(self.section_font()))
-                            .text_color(dim)
-                            .child(agent.agent.clone()),
+                            .flex_shrink_0()
+                            .w(px(8.0))
+                            .h(px(8.0))
+                            .rounded_full()
+                            .bg(status),
                     ),
             )
             .child(
@@ -4366,12 +4495,20 @@ impl L3sView {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .pl(px(17.0))
+                    .min_w_0()
+                    .pl(px(20.0))
                     .text_size(px(self.section_font()))
                     .text_color(dim)
-                    .child(agent.workspace_name.clone())
-                    .child(match agent.branch.clone() {
-                        Some(branch) => div().text_color(theme.ok).child(branch),
+                    .child(
+                        div()
+                            .flex_shrink_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(agent.workspace_name.clone()),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(cwd))
+                    .child(match branch {
+                        Some(branch) => div().flex_shrink_0().text_color(theme.ok).child(branch),
                         None => div(),
                     }),
             )
@@ -4994,6 +5131,127 @@ fn icon(bytes: &'static [u8], size: f32, color: gpui::Rgba) -> impl IntoElement 
         .text_color(color)
 }
 
+/// Vendored brand mark for the daemon's agent kind.
+///
+/// The daemon's canonical ids are lowercase and stable, but aliases and
+/// user-defined manifests reach us too, so each brand is probed by substring.
+/// Unknown kinds fall back to a generic bot glyph so every row keeps a leading
+/// icon. Probes are ordered so a longer name wins over one inside it: `copilot`
+/// must beat `pi`.
+fn agent_icon(kind: &str) -> &'static [u8] {
+    let kind = kind.trim().to_ascii_lowercase();
+    let probes: &[(&str, &'static [u8])] = &[
+        (
+            "claude",
+            include_bytes!("../../assets/icons/agents/claude-code.svg"),
+        ),
+        (
+            "copilot",
+            include_bytes!("../../assets/icons/agents/github-copilot.svg"),
+        ),
+        (
+            "codex",
+            include_bytes!("../../assets/icons/agents/codex.svg"),
+        ),
+        (
+            "openai",
+            include_bytes!("../../assets/icons/agents/codex.svg"),
+        ),
+        (
+            "antigravity",
+            include_bytes!("../../assets/icons/agents/antigravity.svg"),
+        ),
+        (
+            "opencode",
+            include_bytes!("../../assets/icons/agents/opencode.svg"),
+        ),
+        ("kimi", include_bytes!("../../assets/icons/agents/kimi.svg")),
+        ("grok", include_bytes!("../../assets/icons/agents/grok.svg")),
+        (
+            "hermes",
+            include_bytes!("../../assets/icons/agents/hermes.svg"),
+        ),
+        (
+            "cursor",
+            include_bytes!("../../assets/icons/agents/cursor.svg"),
+        ),
+        (
+            "kilo",
+            include_bytes!("../../assets/icons/agents/kilo-code.svg"),
+        ),
+        (
+            "gemini",
+            include_bytes!("../../assets/icons/agents/gemini.svg"),
+        ),
+        ("qwen", include_bytes!("../../assets/icons/agents/qwen.svg")),
+        ("amp", include_bytes!("../../assets/icons/agents/amp.svg")),
+        ("arc", include_bytes!("../../assets/icons/agents/arc.svg")),
+        ("omp", include_bytes!("../../assets/icons/agents/pi.svg")),
+        ("pi", include_bytes!("../../assets/icons/agents/pi.svg")),
+    ];
+    for (needle, bytes) in probes {
+        if kind.contains(needle) {
+            return bytes;
+        }
+    }
+    include_bytes!("../../assets/icons/agents/bot.svg")
+}
+
+/// A hover card that reveals a sidebar row's full, untruncated text.
+struct SidebarTip {
+    title: String,
+    title_color: gpui::Rgba,
+    lines: Vec<(String, gpui::Rgba)>,
+    theme: Theme,
+}
+
+impl Render for SidebarTip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            // Paths wrap at `/`, so a deep cwd stays inside the card.
+            .max_w(px(420.0))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.panel)
+            .text_size(px(SECTION_FONT))
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(self.title_color)
+                    .child(self.title.clone()),
+            );
+        for (text, color) in &self.lines {
+            card = card.child(div().text_color(*color).child(text.clone()));
+        }
+        card
+    }
+}
+
+/// The tooltip builder for a sidebar row, which truncates its text.
+fn row_tooltip(
+    title: String,
+    title_color: gpui::Rgba,
+    lines: Vec<(String, gpui::Rgba)>,
+    theme: Theme,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    move |_, cx| {
+        cx.new(|_| SidebarTip {
+            title: title.clone(),
+            title_color,
+            lines: lines.clone(),
+            theme,
+        })
+        .into()
+    }
+}
+
 /// Outcome of a background `luvus server start` for a fresh session.
 enum SessionOpResult {
     Started(String),
@@ -5055,6 +5313,15 @@ fn status_color(status: &str, theme: Theme) -> gpui::Rgba {
         "blocked" => theme.alert,
         "done" => theme.ok,
         _ => theme.muted,
+    }
+}
+
+/// Title-case the daemon's lowercase status (`working` -> `Working`).
+fn status_label(status: &str) -> String {
+    let mut chars = status.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
     }
 }
 

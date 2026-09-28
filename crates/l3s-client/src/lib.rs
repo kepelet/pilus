@@ -14,6 +14,7 @@ mod control;
 mod discovery;
 mod error;
 mod machines;
+mod projects;
 mod surface;
 mod transport;
 mod uhp;
@@ -31,6 +32,12 @@ pub use discovery::{
 pub use error::{Error, Result};
 pub use l3s_protocol as protocol;
 pub use machines::{MachineInfo, connect_machine, list_machines, refresh_machines};
+pub use projects::{
+    Project, RemoteRepos, common_git_dir, common_git_dirs_remote, current_branch,
+    current_branches_remote, expand_local as expand_project_local,
+    expand_remote as expand_project_remote, id_for_name as project_id_for_name, load_projects,
+    projects_file, save_projects, validate as validate_project,
+};
 pub use surface::{Surface, SurfaceChange};
 pub use transport::SshTarget;
 pub use uhp::{Event, EventStream, Frame, Observer, Terminal, UhpClient};

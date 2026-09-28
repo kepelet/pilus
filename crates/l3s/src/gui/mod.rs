@@ -12,6 +12,7 @@ mod keys;
 mod machines;
 mod palette;
 mod picker;
+mod projects;
 mod scheme;
 mod selection;
 mod settings;
@@ -43,8 +44,10 @@ use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
 use l3s_client::{
     Agent, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent, ConnectTarget,
-    Connection, ControlClient, MachineInfo, SessionInfo, Surface, SurfaceChange, Tab, TaskSummary,
-    config_dir, connect_machine, generate_session_name, list_machines, list_session_infos,
+    Connection, ControlClient, HOME_ENV, MachineInfo, Project, SessionInfo, SshTarget, Surface,
+    SurfaceChange, Tab, TaskSummary, common_git_dir, common_git_dirs_remote, config_dir,
+    connect_machine, current_branch, current_branches_remote, expand_project_local,
+    expand_project_remote, generate_session_name, list_machines, list_session_infos, luvus_binary,
     refresh_machines, split_client_socket,
 };
 use l3s_protocol::{
@@ -52,6 +55,7 @@ use l3s_protocol::{
 };
 use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
+use projects::{ProjectField, ProjectsPanel};
 use selection::{Cell, Selection};
 use settings::Settings;
 use theme::Theme;
@@ -206,6 +210,8 @@ gpui::actions!([
     OpenSessionMenu,
     /// Open the command palette.
     OpenCommandPalette,
+    /// Open the Settings page.
+    OpenSettings,
     /// Focus tab 1.
     FocusTab1,
     /// Focus tab 2.
@@ -330,6 +336,7 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                 MenuItem::action("Check for Updates", CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action("Appearances", OpenAppearances),
+                MenuItem::action("Settings", OpenSettings),
                 MenuItem::separator(),
                 MenuItem::action("Quit l3s", QuitApp),
             ]),
@@ -432,6 +439,7 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
         KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, None),
         KeyBinding::new("cmd-shift-s", OpenSessionMenu, None),
+        KeyBinding::new("cmd-shift-.", OpenSettings, None),
         KeyBinding::new("cmd-1", FocusTab1, None),
         KeyBinding::new("cmd-2", FocusTab2, None),
         KeyBinding::new("cmd-3", FocusTab3, None),
@@ -522,6 +530,28 @@ struct CardLayout {
     /// Measured cell size in pixels.
     cell_w: f32,
     cell_h: f32,
+}
+
+/// What the folder picker is being used for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerPurpose {
+    /// Open a folder as a workspace (or start a worktree there).
+    OpenWorkspace,
+    /// Choose the base directory for the project form's location field.
+    PickProjectDir,
+}
+
+/// One background repo-resolution answer: git common dirs by workspace.
+type RepoFacts = Vec<((String, String), Option<String>)>;
+
+/// One background repo-resolution answer, plus the remote homes seen.
+struct RepoResolve {
+    /// Git common dirs by `(endpoint key, raw workspace cwd)`.
+    facts: RepoFacts,
+    /// Remote `$HOME` by endpoint key, for expanding `~` cwds.
+    homes: Vec<(String, String)>,
+    /// Current branches by `(endpoint key, project location)`.
+    branches: Vec<((String, String), Option<String>)>,
 }
 
 /// A stable endpoint identity: the local session or one saved machine.
@@ -670,6 +700,8 @@ struct L3sView {
     palette_scroll: ScrollHandle,
     /// The native Open Workspace folder picker.
     picker: WorkspacePicker,
+    /// What the picker is currently being used for.
+    picker_purpose: PickerPurpose,
     /// Keeps the highlighted picker row scrolled into view.
     picker_scroll: ScrollHandle,
     /// Results from background picker listings and opens.
@@ -699,6 +731,14 @@ struct L3sView {
     machine_rx: Receiver<Vec<MachineInfo>>,
     /// Sender half for the background machine refresh.
     machine_tx: Sender<Vec<MachineInfo>>,
+    /// Status lines from background machine mutations (enable/disable/remove).
+    machine_op_rx: Receiver<String>,
+    /// Sender half for background machine mutation outcomes.
+    machine_op_tx: Sender<String>,
+    /// The machine id whose CLI mutation is running, if any.
+    machine_busy: Option<String>,
+    /// A machine remove awaiting its second click, if any.
+    machine_pending_remove: Option<String>,
     /// Registered appearance themes and the selected id, from `theme.list`.
     appearance: Appearance,
     /// Last theme poll; the registry only changes on user action.
@@ -731,6 +771,10 @@ struct L3sView {
     sidebar_visible: bool,
     /// Whether the WORKSPACES section is collapsed to its header.
     workspaces_collapsed: bool,
+    /// Whether the PROJECTS section is collapsed to its header.
+    projects_collapsed: bool,
+    /// Project ids whose workspace group is collapsed in the sidebar.
+    project_collapsed: HashSet<String>,
     /// Whether the AGENTS section is collapsed to its header.
     agents_collapsed: bool,
     /// Keeps the sidebar's sections scrolled under the fixed top clearance.
@@ -769,6 +813,26 @@ struct L3sView {
     machine_signal: Rc<RefCell<MachineSignal>>,
     /// Last revision this window applied, so a manager mutation reloads once.
     seen_machine_revision: u64,
+    /// Persistent projects and the in-window manager panel.
+    projects: ProjectsPanel,
+    /// Git common dirs by `(endpoint key, cwd)`, resolving which repository
+    /// a workspace belongs to no matter where its worktree lives.
+    project_repo: HashMap<(String, String), Option<String>>,
+    /// Fresh repo facts from the background resolver.
+    project_repo_rx: Receiver<RepoResolve>,
+    /// Sender half for the background repo resolver.
+    project_repo_tx: Sender<RepoResolve>,
+    /// Remote `$HOME` by endpoint key, for expanding `~` workspace dirs.
+    remote_home: HashMap<String, String>,
+    /// The project whose directory was last opened, with an optimistic
+    /// highlight until the daemon confirms the focus (mirrors tab/agent).
+    project_sel: Option<String>,
+    /// When the optimistic project pick was made.
+    project_sel_at: Instant,
+    /// Current branches by `(endpoint key, project location)`.
+    project_branch: HashMap<(String, String), Option<String>>,
+    /// A repo resolution is running off-thread; no overlapping spawns.
+    project_repo_pending: bool,
 }
 
 impl L3sView {
@@ -798,6 +862,8 @@ impl L3sView {
         let sessions = list_session_infos(&session_root);
         let machines = list_machines(&session_root);
         let (machine_tx, machine_rx) = std::sync::mpsc::channel();
+        let (machine_op_tx, machine_op_rx) = std::sync::mpsc::channel();
+        let (project_repo_tx, project_repo_rx) = std::sync::mpsc::channel();
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let (machine_connect_tx, machine_connect_rx) = std::sync::mpsc::channel();
         let (picker_tx, picker_rx) = std::sync::mpsc::channel();
@@ -838,6 +904,7 @@ impl L3sView {
             palette: Palette::default(),
             palette_scroll: ScrollHandle::new(),
             picker: WorkspacePicker::default(),
+            picker_purpose: PickerPurpose::OpenWorkspace,
             picker_scroll: ScrollHandle::new(),
             picker_rx,
             picker_tx,
@@ -852,7 +919,11 @@ impl L3sView {
             last_machine_poll: Instant::now() - Duration::from_secs(11),
             machine_refreshing: false,
             machine_rx,
+            machine_op_rx,
             machine_tx,
+            machine_op_tx,
+            machine_busy: None,
+            machine_pending_remove: None,
             appearance: Appearance::default(),
             last_theme_poll: Instant::now() - Duration::from_secs(11),
             theme_refreshing: false,
@@ -869,6 +940,8 @@ impl L3sView {
             sidebar_revision: 0,
             sidebar_visible: true,
             workspaces_collapsed: false,
+            projects_collapsed: false,
+            project_collapsed: HashSet::new(),
             agents_collapsed: false,
             sidebar_scroll: ScrollHandle::new(),
             active: EndpointId::Local,
@@ -888,7 +961,17 @@ impl L3sView {
             last_update_status: UpdateStatus::Idle,
             machine_signal,
             seen_machine_revision: 0,
+            projects: ProjectsPanel::default(),
+            project_repo: HashMap::new(),
+            project_repo_rx,
+            project_repo_tx,
+            project_repo_pending: false,
+            remote_home: HashMap::new(),
+            project_branch: HashMap::new(),
+            project_sel: None,
+            project_sel_at: Instant::now(),
         };
+        view.projects.reload(&view.session_root);
 
         if auto_check {
             updater.update(cx, |updater, cx| updater.check(cx));
@@ -1029,17 +1112,15 @@ impl L3sView {
                 && !self.machine_connected(&machine.id)
         });
         if (self.catalog_dirty
-            || (needs_probe && self.last_machine_poll.elapsed() >= Duration::from_secs(10)))
+            || (needs_probe && self.last_machine_poll.elapsed() >= Duration::from_secs(10))
+            // Reachability drifts, and a connected or disabled machine never
+            // sets `needs_probe`, so a slow fallback keeps every status
+            // honest instead of stuck on `probing…`.
+            || self.last_machine_poll.elapsed() >= Duration::from_secs(30))
             && !self.machine_refreshing
         {
             self.catalog_dirty = false;
-            self.machine_refreshing = true;
-            self.last_machine_poll = Instant::now();
-            let root = self.session_root.clone();
-            let tx = self.machine_tx.clone();
-            std::thread::spawn(move || {
-                tx.send(refresh_machines(&root)).ok();
-            });
+            self.probe_machines();
         }
         while let Ok(machines) = self.machine_rx.try_recv() {
             self.machine_refreshing = false;
@@ -1070,6 +1151,38 @@ impl L3sView {
                 changed = true;
             }
         }
+        while let Ok(message) = self.machine_op_rx.try_recv() {
+            self.machine_busy = None;
+            // Tell every open main window and the manager to reload.
+            self.machine_signal.borrow_mut().revision += 1;
+            if self.projects.is_open() {
+                self.projects.set_status(message);
+            } else {
+                self.status = message;
+            }
+            changed = true;
+        }
+        while let Ok(resolved) = self.project_repo_rx.try_recv() {
+            self.project_repo_pending = false;
+            for (endpoint_key, home) in resolved.homes {
+                self.remote_home.insert(endpoint_key, home);
+            }
+            for (key, common) in resolved.facts {
+                if self.project_repo.get(&key) != Some(&common) {
+                    self.project_repo.insert(key, common);
+                    changed = true;
+                }
+            }
+            for (key, branch) in resolved.branches {
+                if self.project_branch.get(&key) != Some(&branch) {
+                    self.project_branch.insert(key, branch);
+                    changed = true;
+                }
+            }
+        }
+        // The workspace set outgrows the repo cache as work opens; resolve
+        // the newcomers so grouping follows without a rescan of the known.
+        self.resolve_project_repos();
         // The theme registry changes only when the user selects one, and the
         // selection can also come from another window or the CLI, so a slow
         // poll keeps every l3s window on the same appearance.
@@ -1111,6 +1224,30 @@ impl L3sView {
                     match result {
                         Ok(()) => self.status = "created a new worktree".to_string(),
                         Err(error) => self.status = format!("couldn't create worktree: {error}"),
+                    }
+                    changed = true;
+                }
+                PickerEvent::ProjectOpened { machine, result } => {
+                    match result {
+                        Ok(()) => {
+                            self.status = "opened the workspace".to_string();
+                            self.activate_project_endpoint(machine, cx);
+                        }
+                        Err(error) => {
+                            self.status = format!("couldn't open workspace: {error}");
+                        }
+                    }
+                    changed = true;
+                }
+                PickerEvent::ProjectWorktreeOpened { machine, result } => {
+                    match result {
+                        Ok(()) => {
+                            self.status = "created a new worktree".to_string();
+                            self.activate_project_endpoint(machine, cx);
+                        }
+                        Err(error) => {
+                            self.status = format!("couldn't create worktree: {error}");
+                        }
                     }
                     changed = true;
                 }
@@ -1159,6 +1296,19 @@ impl L3sView {
         changed
     }
 
+    /// Re-probe machine reachability off-thread, unless one already runs.
+    fn probe_machines(&mut self) {
+        if self.machine_refreshing {
+            return;
+        }
+        self.machine_refreshing = true;
+        self.last_machine_poll = Instant::now();
+        let root = self.session_root.clone();
+        let tx = self.machine_tx.clone();
+        std::thread::spawn(move || {
+            tx.send(refresh_machines(&root)).ok();
+        });
+    }
     /// The active endpoint as a picker/control source.
     fn active_dir_source(&self) -> DirSource {
         match &self.active_machine {
@@ -1493,7 +1643,7 @@ impl L3sView {
         self.dragging = false;
         self.nav_sel = None;
         self.tab_sel = None;
-        self.picker.close();
+        self.close_picker();
         self.active_live = true;
         self.status = self.connection.identity().session.clone();
         if let Some(workspace) = pending.focus {
@@ -1800,6 +1950,11 @@ impl L3sView {
             self.picker_key(event, cx);
             return;
         }
+        // The Settings page owns every keystroke while it is open.
+        if self.projects.is_open() {
+            self.settings_key(event, cx);
+            return;
+        }
         // An open palette owns every keystroke: type, navigate, run, dismiss.
         if self.palette.is_open() {
             self.palette_key(event, window, cx);
@@ -1812,6 +1967,7 @@ impl L3sView {
             && matches!(
                 keystroke.key.to_ascii_lowercase().as_str(),
                 "," | "comma"
+                    | "."
                     | "-"
                     | "0"
                     | "1"
@@ -1989,7 +2145,27 @@ impl L3sView {
                 "Workspace",
                 Some("⌘⇧O"),
             ),
+            entry(
+                Command::OpenSettings,
+                "Settings",
+                "Application",
+                Some("⌘⇧."),
+            ),
         ];
+        for project in self.projects.projects().iter().cloned() {
+            entries.push(entry(
+                Command::OpenProject(project.id.clone()),
+                &format!("Open Project {}", project.name),
+                "Projects",
+                None,
+            ));
+            entries.push(entry(
+                Command::NewProjectWorktree(project.id.clone()),
+                &format!("New Worktree in {}", project.name),
+                "Projects",
+                None,
+            ));
+        }
         for tab in &self.tabs {
             entries.push(entry(
                 Command::FocusTab(tab.index),
@@ -2055,6 +2231,31 @@ impl L3sView {
             Command::SelectAllGrid => window.dispatch_action(SelectAllGrid.boxed_clone(), cx),
             Command::Quit => window.dispatch_action(QuitApp.boxed_clone(), cx),
             Command::OpenWorkspacePicker => self.open_picker(cx),
+            Command::OpenSettings => self.open_settings(cx),
+            Command::OpenProject(id) => {
+                if let Some(project) = self
+                    .projects
+                    .projects()
+                    .iter()
+                    .find(|project| project.id == id)
+                    .cloned()
+                {
+                    self.open_project_location(project, cx);
+                }
+            }
+            Command::NewProjectWorktree(id) => {
+                self.projects.open(&self.session_root);
+                if let Some(index) = self
+                    .projects
+                    .projects()
+                    .iter()
+                    .position(|project| project.id == id)
+                {
+                    self.projects.select(index);
+                    self.projects.start_worktree();
+                }
+                cx.notify();
+            }
             Command::FocusTab(index) => self.focus_tab(index, cx),
             Command::SwitchSession(name) => self.switch_session(&name),
             Command::NewSession => self.start_new_session(),
@@ -2126,6 +2327,12 @@ impl L3sView {
         });
     }
 
+    /// Leave the Settings page: sidebar actions address the terminal
+    /// surface the page covers, so acting on one dismisses the other.
+    fn leave_settings_page(&mut self) {
+        self.projects.close();
+    }
+
     /// A control client for an endpoint's control surface.
     fn control_client_for(&self, source: &DirSource) -> Option<ControlClient> {
         match source {
@@ -2138,9 +2345,16 @@ impl L3sView {
     fn open_picker(&mut self, cx: &mut Context<Self>) {
         let source = self.active_dir_source();
         let start = self.picker_start_dir();
+        self.picker_purpose = PickerPurpose::OpenWorkspace;
         self.picker.open(source, start);
         self.list_picker(cx);
         cx.notify();
+    }
+
+    /// Close the folder picker, whatever it was being used for.
+    fn close_picker(&mut self) {
+        self.picker.close();
+        self.picker_purpose = PickerPurpose::OpenWorkspace;
     }
 
     /// Where the picker starts: the active workspace's folder, else the home.
@@ -2172,7 +2386,7 @@ impl L3sView {
             self.status = "no control connection for the selected endpoint".to_string();
             return;
         };
-        self.picker.close();
+        self.close_picker();
         self.status = format!("opening {path}…");
         let tx = self.picker_tx.clone();
         std::thread::spawn(move || {
@@ -2184,6 +2398,60 @@ impl L3sView {
         cx.notify();
     }
 
+    /// Browse for the project form's base directory on the form's machine.
+    ///
+    /// This reuses the Open Workspace folder picker in directory-pick mode:
+    /// it lists the same filesystem the project will live on, and confirming
+    /// writes the folder back into the location field instead of opening it.
+    fn browse_project_dir(&mut self, cx: &mut Context<Self>) {
+        let ids = self.project_machine_ids();
+        let machine = ids.get(self.projects.machine_cursor()).cloned().flatten();
+        let source = match &machine {
+            None => DirSource::Local,
+            Some(id) => match self
+                .machines
+                .iter()
+                .find(|candidate| &candidate.id == id)
+                .and_then(|candidate| candidate.ssh_target())
+            {
+                Some(target) => DirSource::Remote(target),
+                None => {
+                    self.projects.set_status(format!(
+                        "machine `{id}` has no verified remote binary; run `luvus machine enable {id}`"
+                    ));
+                    cx.notify();
+                    return;
+                }
+            },
+        };
+        let current = self
+            .projects
+            .field(ProjectField::Location)
+            .value
+            .trim()
+            .to_string();
+        let start = if current.is_empty() {
+            match &source {
+                DirSource::Local => std::env::var("HOME").unwrap_or_else(|_| "/".to_string()),
+                DirSource::Remote(_) => "~".to_string(),
+            }
+        } else {
+            current
+        };
+        self.picker_purpose = PickerPurpose::PickProjectDir;
+        self.picker.open(source, start);
+        self.list_picker(cx);
+        cx.notify();
+    }
+
+    /// Confirm the picker's current folder as the project location.
+    fn use_picked_dir(&mut self, cx: &mut Context<Self>) {
+        let dir = self.picker.cwd().to_string();
+        self.close_picker();
+        self.projects.set_location(dir);
+        cx.notify();
+    }
+
     /// Create a worktree of the endpoint's active repo with a generated branch.
     fn open_new_worktree(&mut self, cx: &mut Context<Self>) {
         let source = self.picker.source().clone();
@@ -2192,7 +2460,7 @@ impl L3sView {
             return;
         };
         let branch = generate_session_name(&[]);
-        self.picker.close();
+        self.close_picker();
         self.status = format!("creating worktree {branch}…");
         let tx = self.picker_tx.clone();
         std::thread::spawn(move || {
@@ -2225,11 +2493,20 @@ impl L3sView {
             cx.notify();
             return;
         }
+        // In directory-pick mode ⇧↵ confirms the current folder for the
+        // project form; plain ↵ keeps browsing.
+        if self.picker_purpose == PickerPurpose::PickProjectDir
+            && key == "enter"
+            && event.keystroke.modifiers.shift
+        {
+            self.use_picked_dir(cx);
+            return;
+        }
         if key == "escape" {
             if self.picker.editing() {
                 self.picker.end_edit();
             } else {
-                self.picker.close();
+                self.close_picker();
             }
             cx.notify();
             return;
@@ -2334,6 +2611,34 @@ impl L3sView {
         choices
     }
 
+    /// The display label for the project form's selected machine.
+    fn project_form_machine_label(&self) -> String {
+        let ids = self.project_machine_ids();
+        match ids.get(self.projects.machine_cursor()).cloned().flatten() {
+            None => "Local".to_string(),
+            Some(id) => self
+                .machines
+                .iter()
+                .find(|machine| machine.id == id)
+                .map(|machine| machine.display().to_string())
+                .unwrap_or_else(|| id.clone()),
+        }
+    }
+
+    /// The card's content: the Settings page while it is open, else the
+    /// terminal grid. Sharing the card keeps the page inset exactly like
+    /// the terminal, with the sidebar still showing beside it.
+    fn card_content(&self, cx: &mut Context<Self>, grid: Div) -> Div {
+        if self.projects.is_open() {
+            return self.settings_page(cx);
+        }
+        div()
+            .flex_1()
+            .overflow_hidden()
+            .pt(px(TERMINAL_TOP_AIR))
+            .child(grid)
+    }
+
     /// The label for the picker's current endpoint.
     fn picker_source_label(&self) -> String {
         match self.picker.source() {
@@ -2345,6 +2650,1120 @@ impl L3sView {
                 .map(|machine| machine.display().to_string())
                 .unwrap_or_else(|| target.destination.clone()),
         }
+    }
+
+    /// Show the Settings page, reloading the project store first.
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.projects.open(&self.session_root);
+        self.probe_machines();
+        cx.notify();
+    }
+
+    /// Machine choice rows for the project form: Local, then saved machines.
+    fn project_machine_ids(&self) -> Vec<Option<String>> {
+        ProjectsPanel::machine_ids(&self.machines)
+    }
+
+    /// The display label for a project's machine.
+    fn project_host_label(&self, project: &Project) -> String {
+        match &project.machine {
+            None => "Local".to_string(),
+            Some(id) => self
+                .machines
+                .iter()
+                .find(|machine| &machine.id == id)
+                .map(|machine| machine.display().to_string())
+                .unwrap_or_else(|| id.clone()),
+        }
+    }
+
+    /// A control client for the endpoint a project lives on.
+    fn control_client_for_project(&self, project: &Project) -> Option<ControlClient> {
+        match &project.machine {
+            None => ControlClient::connect(&self.api_socket()).ok(),
+            Some(id) => {
+                let target = self
+                    .machines
+                    .iter()
+                    .find(|machine| &machine.id == id)?
+                    .ssh_target()?;
+                ControlClient::connect_ssh(target).ok()
+            }
+        }
+    }
+
+    /// Open a project's base directory as a workspace on its own endpoint.
+    fn open_project_location(&mut self, project: Project, cx: &mut Context<Self>) {
+        let Some(mut client) = self.control_client_for_project(&project) else {
+            self.status = format!(
+                "no control connection for `{}`: check the machine profile",
+                project.name
+            );
+            return;
+        };
+        let location = project.location.clone();
+        let machine = project.machine.clone();
+        self.project_sel = Some(project.id.clone());
+        self.project_sel_at = Instant::now();
+        self.projects.close();
+        self.status = format!("opening {}…", location);
+        let tx = self.picker_tx.clone();
+        std::thread::spawn(move || {
+            let result = client
+                .open_workspace(&location)
+                .map_err(|error| error.to_string());
+            tx.send(PickerEvent::ProjectOpened { machine, result }).ok();
+        });
+        cx.notify();
+    }
+
+    /// Create a worktree for `branch` inside a project's repo.
+    ///
+    /// `worktree.create` targets the daemon's active repo, so the project's
+    /// base directory is opened first; both requests share one background
+    /// thread and report through the picker channel.
+    fn create_project_worktree(
+        &mut self,
+        project: Project,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut client) = self.control_client_for_project(&project) else {
+            self.status = format!(
+                "no control connection for `{}`: check the machine profile",
+                project.name
+            );
+            return;
+        };
+        let location = project.location.clone();
+        let machine = project.machine.clone();
+        self.project_sel = Some(project.id.clone());
+        self.project_sel_at = Instant::now();
+        self.projects.close();
+        self.status = format!("creating worktree {branch}…");
+        let tx = self.picker_tx.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = client.open_workspace(&location) {
+                tx.send(PickerEvent::ProjectWorktreeOpened {
+                    machine,
+                    result: Err(error.to_string()),
+                })
+                .ok();
+                return;
+            }
+            let result = client
+                .create_worktree(&branch)
+                .map_err(|error| error.to_string());
+            tx.send(PickerEvent::ProjectWorktreeOpened { machine, result })
+                .ok();
+        });
+        cx.notify();
+    }
+
+    /// Whether the project reads as active: an optimistic pick still
+    /// confirming, or its base directory active on the visible surface. A
+    /// nested worktree lights only its own row, never the project too.
+    fn project_active(&self, project: &Project) -> bool {
+        if self
+            .project_sel
+            .as_deref()
+            .is_some_and(|id| id == project.id)
+            && self.project_sel_at.elapsed() < Duration::from_secs(2)
+        {
+            return true;
+        }
+        let base = project.location.trim_end_matches('/');
+        for id in self.connected_endpoints() {
+            if id != self.active {
+                continue;
+            }
+            for workspace in self.endpoint_workspaces(&id) {
+                if !workspace.active {
+                    continue;
+                }
+                let cwd = self.expand_cwd(&id.key(), &workspace.cwd);
+                if cwd.trim_end_matches('/') == base {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Show the endpoint a project was just opened on.
+    ///
+    /// Opening happens on the project's own daemon, which may not own the
+    /// visible surface; without the handoff the click looks like a no-op
+    /// until the user manually switches to that machine.
+    fn activate_project_endpoint(&mut self, machine: Option<String>, cx: &mut Context<Self>) {
+        let target = match machine {
+            None => EndpointId::Local,
+            Some(id) => EndpointId::Machine(id),
+        };
+        if target != self.active {
+            self.activate_endpoint(target, None, None, cx);
+        }
+    }
+
+    /// Route a keystroke to the open Settings page.
+    fn settings_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            if self.projects.worktree_target().is_some() {
+                self.projects.cancel_worktree();
+            } else if self.projects.in_form() {
+                self.projects.cancel_form();
+            } else if self.projects.pending_delete().is_some() {
+                self.projects.cancel_delete();
+            } else {
+                self.projects.close();
+            }
+            cx.notify();
+            return;
+        }
+        if self.projects.pending_delete().is_some() && key != "shift" {
+            self.projects.cancel_delete();
+        }
+        if self.machine_pending_remove.is_some() && key != "shift" {
+            self.machine_pending_remove = None;
+        }
+        // The inline new-worktree input owns the keyboard while open.
+        if self.projects.worktree_target().is_some() {
+            match key {
+                "enter" => {
+                    if let Some((project, branch)) = self.projects.take_worktree() {
+                        self.create_project_worktree(project, branch, cx);
+                    }
+                }
+                "backspace" => self.projects.worktree_name_mut().backspace(),
+                "delete" | "del" => self.projects.worktree_name_mut().delete(),
+                "left" => self.projects.worktree_name_mut().left(),
+                "right" => self.projects.worktree_name_mut().right(),
+                "home" => self.projects.worktree_name_mut().home(),
+                "end" => self.projects.worktree_name_mut().end(),
+                _ => {
+                    if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
+                        return;
+                    }
+                    self.insert_into_worktree_name(event);
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if self.projects.in_form() {
+            self.projects_form_key(event, cx);
+            return;
+        }
+        match key {
+            "up" => self.projects.move_selection(-1),
+            "down" => self.projects.move_selection(1),
+            "enter" => {
+                if let Some(project) = self.projects.highlighted().cloned() {
+                    self.open_project_location(project, cx);
+                    return;
+                }
+            }
+            "n" => self.projects.start_new(),
+            "e" => {
+                let ids = self.project_machine_ids();
+                self.projects.start_edit(&ids);
+            }
+            "d" => {
+                let root = self.session_root.clone();
+                let _ = self.projects.request_delete(&root);
+            }
+            "w" => self.projects.start_worktree(),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Insert typed text into the inline worktree name field.
+    fn insert_into_worktree_name(&mut self, event: &KeyDownEvent) {
+        if let Some(text) = event
+            .keystroke
+            .key_char
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
+            self.projects.worktree_name_mut().insert(text);
+        } else if event.keystroke.key.chars().count() == 1 {
+            let key = event.keystroke.key.clone();
+            self.projects.worktree_name_mut().insert(&key);
+        }
+    }
+
+    /// Route a keystroke to the project create/edit form.
+    fn projects_form_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        match key {
+            "tab" => {
+                self.projects.cycle_focus(event.keystroke.modifiers.shift);
+            }
+            "up" => {
+                let choices = self.project_machine_ids().len();
+                self.projects.move_machine(-1, choices);
+            }
+            "down" => {
+                let choices = self.project_machine_ids().len();
+                self.projects.move_machine(1, choices);
+            }
+            "enter" => {
+                let root = self.session_root.clone();
+                let ids = self.project_machine_ids();
+                let _ = self.projects.submit(&root, &ids);
+            }
+            "backspace" | "delete" | "del" | "left" | "right" | "home" | "end" => {
+                let Some(field) = self.projects.focus() else {
+                    return;
+                };
+                let slot = self.projects.field_mut(field);
+                match key {
+                    "backspace" => slot.backspace(),
+                    "delete" | "del" => slot.delete(),
+                    "left" => slot.left(),
+                    "right" => slot.right(),
+                    "home" => slot.home(),
+                    _ => slot.end(),
+                }
+            }
+            _ => {
+                if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
+                    return;
+                }
+                let Some(field) = self.projects.focus() else {
+                    return;
+                };
+                if let Some(text) = event
+                    .keystroke
+                    .key_char
+                    .as_deref()
+                    .filter(|text| !text.is_empty())
+                {
+                    self.projects.field_mut(field).insert(text);
+                } else if event.keystroke.key.chars().count() == 1 {
+                    let key = event.keystroke.key.clone();
+                    self.projects.field_mut(field).insert(&key);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// The Settings page, drawn in place of the terminal card.
+    ///
+    /// It fills the same inset card the grid lives in — same gaps, border,
+    /// and rounding — so it reads as a native surface with the sidebar still
+    /// showing. A Back button at the top left walks form → list → closed;
+    /// there is no close button by design.
+    fn settings_page(&self, cx: &mut Context<Self>) -> Div {
+        if !self.projects.is_open() {
+            return div();
+        }
+        let theme = self.theme;
+        let in_form = self.projects.in_form();
+        let body = if in_form {
+            self.projects_form(cx)
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap_6()
+                .child(self.projects_section_block(cx))
+                .child(self.machines_section_block(cx))
+        };
+        let status = self.projects.status().to_string();
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .child(
+                div().flex().flex_row().flex_shrink_0().px_4().pt_3().child(
+                    div()
+                        .id("l3s-projects-back")
+                        .px_4()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.border)
+                        .cursor_pointer()
+                        .text_size(px(12.0))
+                        .text_color(theme.muted)
+                        .hover(|style| style.bg(theme.panel))
+                        .child("‹ Back")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.projects.in_form() {
+                                this.projects.cancel_form();
+                            } else {
+                                this.projects.close();
+                            }
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(
+                div()
+                    .id("l3s-projects-page")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(div().flex().flex_col().py_3().child(body)),
+            )
+            .child(if status.is_empty() {
+                div()
+            } else {
+                div()
+                    .px_4()
+                    .py_2()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child(status)
+            })
+    }
+
+    /// The PROJECTS section of the page: header, rows, empty state, and the
+    /// New Project CTA. Future page sections will stack below this one.
+    fn projects_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let new_button = div()
+            .id("l3s-projects-new")
+            .flex()
+            .items_center()
+            .h(px(24.0))
+            .px_2()
+            .rounded_md()
+            .bg(theme.accent)
+            .text_color(theme.window_bg)
+            .text_size(px(12.0))
+            .font_weight(FontWeight::BOLD)
+            .cursor_pointer()
+            .child("New Project")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.projects.start_new();
+                cx.notify();
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .child(
+                        div()
+                            .text_size(px(self.section_font()))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme.muted)
+                            .child("PROJECTS"),
+                    )
+                    .child(new_button),
+            )
+            .child(self.projects_list(cx))
+    }
+
+    /// The REMOTE MACHINES section of the page: every saved machine profile
+    /// with the same status and enable/remove actions as the manager window.
+    /// Adding and provisioning stay in the full manager window.
+    fn machines_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let mut section = div().flex().flex_col().gap_2().child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .child(
+                    div()
+                        .text_size(px(self.section_font()))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.muted)
+                        .child("REMOTE MACHINES"),
+                )
+                .child(
+                    div()
+                        .id("l3s-machines-manage")
+                        .flex()
+                        .items_center()
+                        .h(px(24.0))
+                        .px_2()
+                        .rounded_md()
+                        .bg(theme.accent)
+                        .text_color(theme.window_bg)
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::BOLD)
+                        .cursor_pointer()
+                        .child("Manage Machines")
+                        .on_click(cx.listener(|_, _, window, cx| {
+                            window.dispatch_action(OpenMachineManager.boxed_clone(), cx);
+                        })),
+                ),
+        );
+        let mut any = false;
+        for machine in self.machines.iter().filter(|machine| machine.id != "local") {
+            any = true;
+            section = section.child(self.machine_page_row(machine, cx));
+        }
+        if !any {
+            section = section.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(12.0))
+                    .text_color(theme.muted)
+                    .child("No remote machines yet. Add one to work on other hosts."),
+            );
+        }
+        section
+    }
+
+    /// One saved machine row: name, destination, status, and its actions.
+    fn machine_page_row(&self, machine: &MachineInfo, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let id = machine.id.clone();
+        let busy = self.machine_busy.as_deref() == Some(machine.id.as_str());
+        let confirming = self.machine_pending_remove.as_deref() == Some(machine.id.as_str());
+        let (status, status_color) = machine_status_text(machine, theme);
+        let toggle_id = id.clone();
+        let toggle_label = if machine.enabled { "Disable" } else { "Enable" };
+        let remove_id = id.clone();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .mx_3()
+            .px_2()
+            .py_2()
+            .rounded_md()
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .text_color(theme.fg)
+                                    .child(machine.display().to_string()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted)
+                                    .child(machine.id.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted)
+                            .child(machine.destination.clone())
+                            .child(div().text_color(status_color).child(status)),
+                    ),
+            )
+            .child(
+                div()
+                    .id(format!("l3s-machine-page-toggle-{id}"))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(if busy { theme.muted } else { theme.fg })
+                    .hover(|style| style.bg(theme.panel_dim))
+                    .child(if busy { "…" } else { toggle_label })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_machine_page(toggle_id.clone());
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id(format!("l3s-machine-page-remove-{id}"))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(if confirming { theme.alert } else { theme.muted })
+                    .hover(|style| style.bg(theme.panel_dim))
+                    .child(if confirming { "Confirm" } else { "Remove" })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_machine_page(remove_id.clone());
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// Enable a disabled machine, or disable an enabled one, off-thread.
+    fn toggle_machine_page(&mut self, id: String) {
+        if self.machine_busy.is_some() {
+            return;
+        }
+        let Some(machine) = self
+            .machines
+            .iter()
+            .find(|machine| machine.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        self.machine_pending_remove = None;
+        if machine.enabled {
+            self.run_machine_page_op(
+                &id,
+                vec!["disable".to_string()],
+                format!("Disabled `{id}`."),
+            );
+        } else {
+            self.run_machine_page_op(&id, vec!["enable".to_string()], format!("Enabled `{id}`."));
+        }
+    }
+
+    /// Remove a machine after a second confirming click.
+    fn remove_machine_page(&mut self, id: String) {
+        if self.machine_busy.is_some() {
+            return;
+        }
+        if self.machine_pending_remove.as_deref() != Some(id.as_str()) {
+            self.machine_pending_remove = Some(id.clone());
+            self.projects.set_status(format!(
+                "Remove `{id}`? Click Confirm to delete the profile."
+            ));
+            return;
+        }
+        self.machine_pending_remove = None;
+        self.run_machine_page_op(&id, vec!["remove".to_string()], format!("Removed `{id}`."));
+    }
+
+    /// Run one `luvus machine …` mutation off-thread, then report back.
+    ///
+    /// The outcome and a fresh catalog travel through the existing channels,
+    /// so the window reloads the section and tells other windows, exactly
+    /// like the manager window's own mutations do.
+    fn run_machine_page_op(&mut self, id: &str, args: Vec<String>, success: String) {
+        self.machine_busy = Some(id.to_string());
+        self.projects.set_status("Running…".to_string());
+        let root = self.session_root.clone();
+        let op_tx = self.machine_op_tx.clone();
+        let machine_tx = self.machine_tx.clone();
+        std::thread::spawn(move || {
+            let message = match run_machine_cli(&root, args) {
+                Ok(()) => success,
+                Err(error) => error,
+            };
+            op_tx.send(message).ok();
+            machine_tx.send(list_machines(&root)).ok();
+        });
+    }
+
+    /// The project list with its row actions and inline worktree input.
+    fn projects_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let mut list = div().flex().flex_col().gap_1().px_3().py_1();
+        if self.projects.projects().is_empty() {
+            list = list.child(
+                div()
+                    .py_4()
+                    .text_size(px(12.0))
+                    .text_color(theme.muted)
+                    .child("No projects yet. Create one to group worktrees that live together."),
+            );
+        }
+        for (index, project) in self.projects.projects().iter().cloned().enumerate() {
+            list = list.child(self.projects_row(&project, index, cx));
+        }
+        if let Some(target) = self.projects.worktree_target().map(str::to_string) {
+            let name = self
+                .projects
+                .projects()
+                .iter()
+                .find(|project| project.id == target)
+                .map(|project| project.name.clone())
+                .unwrap_or_default();
+            let branch = self
+                .projects
+                .projects()
+                .iter()
+                .find(|project| project.id == target)
+                .map(|project| project.branch_for(&self.projects.worktree_name().value))
+                .unwrap_or_default();
+            let field = self.projects.worktree_name();
+            let before: String = field.value.chars().take(field.cursor).collect();
+            let after: String = field.value.chars().skip(field.cursor).collect();
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_2()
+                    .py_2()
+                    .rounded_md()
+                    .bg(theme.panel_dim)
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.fg)
+                            .child(format!("New worktree in {name} → {branch}")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .h(px(28.0))
+                            .px_2()
+                            .rounded_md()
+                            .bg(theme.window_bg)
+                            .border_1()
+                            .border_color(theme.accent)
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .text_size(px(12.0))
+                                    .child(div().text_color(theme.fg).child(before))
+                                    .child(div().w(px(1.5)).h(px(14.0)).bg(theme.accent))
+                                    .child(div().text_color(theme.fg).child(after)),
+                            ),
+                    ),
+            );
+        }
+        list
+    }
+
+    /// One project row with Open / Worktree / Edit / Delete actions.
+    fn projects_row(
+        &self,
+        project: &Project,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        // The highlight follows the keyboard cursor only; mouse users get
+        // no selection affordance, like the machine rows.
+        let selected = self.projects.cursor_visible() && self.projects.selected() == index;
+        let host = self.project_host_label(project);
+        let confirming = self.projects.pending_delete() == Some(project.id.as_str());
+        let open_project = project.clone();
+        // Live workspaces owned by this project, so the card shows what is
+        // open on it — the same grouping the sidebar nests.
+        let action = |id: &str, label: &str| {
+            div()
+                .id(format!("l3s-projects-{id}-{}", project.id))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(11.0))
+                .hover(|style| style.bg(theme.panel_dim))
+                .child(label.to_string())
+        };
+        div()
+            .id(format!("l3s-projects-row-{}", project.id))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_2()
+            .rounded_md()
+            .bg(if selected {
+                theme.panel_dim
+            } else {
+                theme.panel
+            })
+            .border_1()
+            .border_color(if selected { theme.accent } else { theme.border })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.0))
+                            .text_color(theme.fg)
+                            .child(project.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted)
+                            .child(host),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child(shorten_home(&project.location)),
+            )
+            .child(self.project_members(project, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_color(theme.muted)
+                    .child(
+                        action("open", "Open")
+                            .text_color(theme.fg)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_project_location(open_project.clone(), cx);
+                            })),
+                    )
+                    .child(
+                        action("worktree", "New worktree")
+                            .text_color(theme.fg)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.projects.select(index);
+                                this.projects.start_worktree();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        action("edit", "Edit").on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.projects.select(index);
+                            let ids = this.project_machine_ids();
+                            this.projects.start_edit(&ids);
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        action("delete", if confirming { "Confirm" } else { "Delete" })
+                            .text_color(if confirming { theme.alert } else { theme.muted })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.projects.select(index);
+                                let root = this.session_root.clone();
+                                let _ = this.projects.request_delete(&root);
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
+    /// The open workspaces owned by `project`, drawn on its card.
+    ///
+    /// Clicking one leaves the page and hands the surface to the owning
+    /// endpoint, focused on that workspace — the same jump as the sidebar.
+    fn project_members(&self, project: &Project, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let members: Vec<(EndpointId, String, String, Option<String>)> = self
+            .project_workspaces(project)
+            .into_iter()
+            .map(|(endpoint, workspace)| {
+                (
+                    endpoint.clone(),
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.branch.clone(),
+                )
+            })
+            .collect();
+        let mut list = div().flex().flex_col().gap_1();
+        if members.is_empty() {
+            return list.child(
+                div()
+                    .px_2()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child("No open worktrees"),
+            );
+        }
+        for (endpoint, workspace_id, name, branch) in members {
+            let label = div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(12.0))
+                .text_color(theme.fg)
+                .child(name);
+            let branch = match branch {
+                Some(branch) => div()
+                    .flex_shrink_0()
+                    .text_size(px(11.0))
+                    .text_color(theme.branch)
+                    .child(branch),
+                None => div(),
+            };
+            list = list.child(
+                div()
+                    .id(format!("l3s-projects-member-{}-{workspace_id}", project.id))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.panel_dim))
+                    .child(icon(
+                        include_bytes!("../../assets/icons/folder.svg"),
+                        12.0,
+                        theme.muted,
+                    ))
+                    .child(label)
+                    .child(branch)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.leave_settings_page();
+                        this.activate_endpoint(
+                            endpoint.clone(),
+                            Some(workspace_id.clone()),
+                            None,
+                            cx,
+                        );
+                    })),
+            );
+        }
+        list
+    }
+
+    /// The create/edit form.
+    fn projects_form(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let ids = self.project_machine_ids();
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .child(self.project_field_box(ProjectField::Name, "Name", cx))
+            .child(self.project_field_box(ProjectField::Repository, "Repository URL", cx))
+            .child(self.project_field_box(
+                ProjectField::BranchPrefix,
+                "Branch prefix (optional)",
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_end()
+                    .gap_2()
+                    .child(div().flex_1().min_w(px(0.0)).child(self.project_field_box(
+                        ProjectField::Location,
+                        "Base directory",
+                        cx,
+                    )))
+                    .child(
+                        div()
+                            .id("l3s-projects-browse")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.0))
+                            .px_3()
+                            .flex_shrink_0()
+                            .rounded_md()
+                            .bg(theme.panel_dim)
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_size(px(12.0))
+                            .text_color(theme.fg)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.border))
+                            .child("Browse…")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.browse_project_dir(cx);
+                            })),
+                    ),
+            );
+        let mut machine_list = div().flex().flex_col().gap_1();
+        machine_list = machine_list.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.muted)
+                .child("Machine"),
+        );
+        for (index, id) in ids.iter().enumerate() {
+            let label = match id {
+                None => "Local".to_string(),
+                Some(machine_id) => self
+                    .machines
+                    .iter()
+                    .find(|machine| &machine.id == machine_id)
+                    .map(|machine| format!("{} ({})", machine.display(), machine_id))
+                    .unwrap_or_else(|| machine_id.clone()),
+            };
+            let picked = self.projects.machine_cursor() == index;
+            machine_list = machine_list.child(
+                div()
+                    .id(format!("l3s-projects-machine-{index}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if picked { theme.panel_dim } else { theme.panel })
+                    .border_1()
+                    .border_color(if picked { theme.accent } else { theme.border })
+                    .text_size(px(12.0))
+                    .text_color(theme.fg)
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let choices = this.project_machine_ids().len();
+                        let current = this.projects.machine_cursor();
+                        let delta = index as isize - current as isize;
+                        this.projects.move_machine(delta, choices);
+                        cx.notify();
+                    })),
+            );
+        }
+        body = body.child(machine_list);
+        let save = div()
+            .id("l3s-projects-save")
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(28.0))
+            .px_3()
+            .rounded_md()
+            .bg(theme.accent)
+            .text_color(theme.window_bg)
+            .text_size(px(12.0))
+            .font_weight(FontWeight::BOLD)
+            .cursor_pointer()
+            .child("Save")
+            .on_click(cx.listener(|this, _, _, cx| {
+                let root = this.session_root.clone();
+                let ids = this.project_machine_ids();
+                let _ = this.projects.submit(&root, &ids);
+                cx.notify();
+            }));
+        let cancel = div()
+            .id("l3s-projects-cancel")
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(28.0))
+            .px_3()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(theme.muted)
+            .hover(|style| style.bg(theme.panel_dim))
+            .child("Cancel")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.projects.cancel_form();
+                cx.notify();
+            }));
+        div().flex().flex_col().child(body).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .px_3()
+                .pb_2()
+                .child(cancel)
+                .child(save),
+        )
+    }
+
+    /// One labelled single-line field in the project form.
+    fn project_field_box(
+        &self,
+        field: ProjectField,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let focused = self.projects.focus() == Some(field);
+        let text = self.projects.field(field).value.clone();
+        let cursor = self.projects.field(field).cursor;
+        let mut line = div().flex().flex_row().items_center().min_h(px(18.0));
+        if text.is_empty() && !focused {
+            line = line.child(div().text_color(theme.muted).child(label.to_string()));
+        } else {
+            let before: String = text.chars().take(cursor).collect();
+            let after: String = text.chars().skip(cursor).collect();
+            line = line.child(div().text_color(theme.fg).child(before));
+            if focused {
+                line = line.child(div().w(px(1.5)).h(px(14.0)).bg(theme.accent));
+            }
+            line = line.child(div().text_color(theme.fg).child(after));
+        }
+        div()
+            .id(format!("l3s-project-field-{label}"))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child(label.to_string()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(28.0))
+                    .px_2()
+                    .rounded_md()
+                    .bg(theme.panel_dim)
+                    .border_1()
+                    .border_color(if focused { theme.accent } else { theme.border })
+                    .cursor_pointer()
+                    .child(line),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    // Focus the field; Tab cycles from here.
+                    this.projects.cancel_delete();
+                    while this.projects.focus() != Some(field) {
+                        this.projects.cycle_focus(false);
+                    }
+                    this.projects.field_mut(field).end();
+                    cx.notify();
+                }),
+            )
     }
 
     /// The Open Workspace picker overlay.
@@ -2392,6 +3811,7 @@ impl L3sView {
                 cx.notify();
             }));
 
+        let picking_dir = self.picker_purpose == PickerPurpose::PickProjectDir;
         let source_label = self.picker_source_label();
         let menu_button = div()
             .id("l3s-picker-endpoint")
@@ -2437,9 +3857,36 @@ impl L3sView {
                     .text_size(px(14.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(theme.fg)
-                    .child("Open Workspace"),
+                    .child(if picking_dir {
+                        "Choose Directory"
+                    } else {
+                        "Open Workspace"
+                    }),
             )
-            .child(menu_button);
+            // Directory-pick mode browses the project form's machine, so the
+            // endpoint switcher is replaced by a static label.
+            .child(if picking_dir {
+                div()
+                    .id("l3s-picker-endpoint-label")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(26.0))
+                    .px_2()
+                    .rounded_md()
+                    .bg(theme.panel)
+                    .text_size(px(self.footer_font()))
+                    .text_color(theme.muted)
+                    .child(icon(
+                        include_bytes!("../../assets/icons/monitor.svg"),
+                        13.0,
+                        theme.muted,
+                    ))
+                    .child(self.project_form_machine_label())
+            } else {
+                menu_button
+            });
         let menu = if self.picker.menu_open() {
             let choices = self.picker.menu_choices();
             let highlighted = self.picker.menu_selected();
@@ -2676,7 +4123,24 @@ impl L3sView {
             .on_click(cx.listener(|this, _, _, cx| {
                 this.open_new_worktree(cx);
             }));
-        let footer = div()
+        let use_dir = div()
+            .id("l3s-picker-use-dir")
+            .flex()
+            .items_center()
+            .h(px(26.0))
+            .px_3()
+            .flex_shrink_0()
+            .rounded_md()
+            .bg(theme.accent)
+            .text_color(theme.window_bg)
+            .text_size(px(self.footer_font()))
+            .font_weight(FontWeight::BOLD)
+            .cursor_pointer()
+            .child("Use this folder")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.use_picked_dir(cx);
+            }));
+        let mut footer = div()
             .flex()
             .flex_row()
             .items_center()
@@ -2694,10 +4158,17 @@ impl L3sView {
                     .overflow_hidden()
                     .text_size(px(self.section_font()))
                     .text_color(theme.muted)
-                    .child("↑↓ · ↵ open · ← up · → back · ⇧. hidden"),
-            )
-            .child(worktree)
-            .child(open);
+                    .child(if picking_dir {
+                        "↑↓ · ↵ browse · ⇧↵ use this folder · esc cancels"
+                    } else {
+                        "↑↓ · ↵ open · ← up · → back · ⇧. hidden"
+                    }),
+            );
+        if picking_dir {
+            footer = footer.child(use_dir);
+        } else {
+            footer = footer.child(worktree).child(open);
+        }
 
         div()
             .absolute()
@@ -2735,7 +4206,7 @@ impl L3sView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.picker.close();
+                    this.close_picker();
                     cx.notify();
                 }),
             )
@@ -2787,7 +4258,7 @@ impl L3sView {
                 self.tabs = Vec::new();
                 self.tab_sel = None;
                 self.agent_sel = None;
-                self.picker.close();
+                self.close_picker();
                 self.agents = Vec::new();
                 self.automations = AutomationSummary::default();
                 self.tasks = TaskSummary::default();
@@ -3257,6 +4728,7 @@ impl L3sView {
             content = content.child(self.nav_row(kind, cx));
         }
 
+        content = content.child(self.projects_section(cx));
         content = content.child(self.workspaces_section(cx));
         content = content.child(self.agents_section(cx));
 
@@ -3449,7 +4921,7 @@ impl L3sView {
                 this.toggle_sidebar();
                 cx.notify();
             }));
-        let tab_strip = div()
+        let mut tab_strip = div()
             .flex()
             .flex_row()
             .items_center()
@@ -3457,8 +4929,12 @@ impl L3sView {
             .h(px(TAB_STRIP_HEIGHT))
             .pl(px(pad))
             .pr(px(8.0))
-            .child(toggle)
-            .child(tabs);
+            .child(toggle);
+        // Tabs belong to the terminal surface, so they hide with it while a
+        // page owns the card.
+        if !self.projects.is_open() {
+            tab_strip = tab_strip.child(tabs);
+        }
         div()
             .absolute()
             .left(px(left))
@@ -3986,12 +5462,14 @@ impl L3sView {
     /// working directory on the second. The active workspace gets the pill.
     ///
     /// `host` is the machine name for a remote row, shown muted so a flat list
-    /// still says where the project lives.
+    /// still says where the project lives. `compact` drops the leading icon
+    /// for rows nested under a project header, which already carries one.
     fn workspace_row(
         &self,
         endpoint: &EndpointId,
         workspace: &ShellWorkspace,
         host: Option<&str>,
+        compact: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
@@ -4014,8 +5492,9 @@ impl L3sView {
             .items_center()
             .gap_2()
             .min_w_0()
-            .text_size(px(self.chrome_font()))
-            .child(if workspace.nested {
+            .text_size(px(self.chrome_font()));
+        if !compact {
+            head = head.child(if workspace.nested {
                 icon(
                     include_bytes!("../../assets/icons/circle.svg"),
                     10.0,
@@ -4034,6 +5513,7 @@ impl L3sView {
                     theme.panel_fg,
                 )
             });
+        }
         let mut name = div()
             .flex_1()
             .min_w_0()
@@ -4043,8 +5523,11 @@ impl L3sView {
             name = name.font_weight(FontWeight::BOLD);
         }
         head = head.child(name.child(workspace.name.clone()));
-        // The branch stays subtle here; the prompt line below carries the color.
-        if !workspace.nested
+        // The branch stays subtle here; the prompt line below carries the
+        // color. Compact (nested) rows skip the badge: the tooltip still
+        // names the branch.
+        if !compact
+            && !workspace.nested
             && let Some(branch) = workspace.branch.clone()
         {
             head = head.child(
@@ -4099,6 +5582,7 @@ impl L3sView {
         row.on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
+                this.leave_settings_page();
                 this.activate_endpoint(endpoint.clone(), Some(workspace_id.clone()), None, cx);
             }),
         )
@@ -4189,6 +5673,7 @@ impl L3sView {
             .child(label.child(kind.label().to_string()))
             .child(badge)
             .on_click(cx.listener(move |this, _, _, cx| {
+                this.leave_settings_page();
                 this.nav_sel = Some(kind);
                 this.nav_sel_at = Instant::now();
                 this.send_bind(chord);
@@ -4212,9 +5697,443 @@ impl L3sView {
             .send(press(KeyCode::Char(key), KeyModifiers::NONE));
     }
 
-    /// WORKSPACES: every open project across Local and the connected machines,
-    /// as one flat list. Remote rows carry the machine name so the host stays
-    /// clear without a group header.
+    /// PROJECTS: persistent project records with their live workspaces
+    /// grouped beneath them. A workspace whose directory falls under a
+    /// project's base directory on the same endpoint renders nested here
+    /// instead of in WORKSPACES, so one project reads as one unit of work.
+    fn projects_section(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .h(px(22.0))
+                .pl_2()
+                .mr(px(-12.0))
+                .child(
+                    div()
+                        .id("l3s-projects-toggle")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .flex_1()
+                        .cursor_pointer()
+                        .text_size(px(self.section_font()))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.muted)
+                        .hover(|style| style.text_color(theme.panel_fg))
+                        .child(icon(
+                            if self.projects_collapsed {
+                                include_bytes!("../../assets/icons/chevron-right.svg")
+                            } else {
+                                include_bytes!("../../assets/icons/chevron-down.svg")
+                            },
+                            12.0,
+                            theme.muted,
+                        ))
+                        .child("PROJECTS")
+                        .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.projects_collapsed = !this.projects_collapsed;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("l3s-manage-projects")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(22.0))
+                        .w(px(22.0))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.panel))
+                        .child(icon(
+                            include_bytes!("../../assets/icons/plus.svg"),
+                            11.0,
+                            theme.muted,
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_settings(cx);
+                        })),
+                ),
+        );
+        if self.projects_collapsed {
+            return section;
+        }
+        if self.projects.projects().is_empty() {
+            section = section.child(
+                div()
+                    .h(px(26.0))
+                    .px_2()
+                    .text_size(px(self.chrome_font()))
+                    .text_color(theme.muted)
+                    .child("No projects yet"),
+            );
+        }
+        for project in self.projects.projects() {
+            section = section.child(self.project_row(project, cx));
+        }
+        section
+    }
+
+    /// One project row with its grouped workspaces nested beneath it.
+    fn project_row(&self, project: &Project, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let collapsed = self.project_collapsed.contains(&project.id);
+        let active = self.project_active(project);
+        let host = self.project_host_label(project);
+        let location = shorten_home(&project.location);
+        let grouped = self.project_workspaces(project);
+        let project_id = project.id.clone();
+        let project_for_open = project.clone();
+        let group = format!("l3s-projectg-{}", project.id);
+        let mut row = div().flex().flex_col().gap_1();
+        let mut tip_lines = vec![
+            (format!("Directory: {location}"), theme.muted),
+            (format!("Host: {host}"), theme.muted),
+        ];
+        // The base directory's own live branch, resolved with the repo
+        // facts; absent outside a git repository.
+        if let Some(Some(branch)) = self
+            .project_branch
+            .get(&(project.endpoint_key().to_string(), project.location.clone()))
+        {
+            tip_lines.push((format!("Branch: {branch}"), theme.branch));
+        }
+        let tip = row_tooltip(project.name.clone(), theme.panel_fg, tip_lines, theme);
+        let header = div()
+            .id(format!("l3s-project-{}", project.id))
+            .group(group.clone())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(if active { theme.panel } else { theme.window_bg })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.panel))
+            // A plain square marks the project; hovering the row swaps in
+            // the collapse chevron, so the affordance appears on demand.
+            .child(
+                div()
+                    .relative()
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .flex_shrink_0()
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .child(icon(
+                                include_bytes!("../../assets/icons/folder-git.svg"),
+                                12.0,
+                                theme.muted,
+                            ))
+                            .opacity(1.0)
+                            .group_hover(group.clone(), |style| style.opacity(0.0)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .child(icon(
+                                if collapsed {
+                                    include_bytes!("../../assets/icons/chevron-right.svg")
+                                } else {
+                                    include_bytes!("../../assets/icons/chevron-down.svg")
+                                },
+                                12.0,
+                                theme.muted,
+                            ))
+                            .opacity(0.0)
+                            .group_hover(group.clone(), |style| style.opacity(1.0)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(self.chrome_font()))
+                    .text_color(theme.panel_fg)
+                    .font_weight(if active {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .child(project.name.clone()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(self.section_font()))
+                    .text_color(theme.muted)
+                    .child(host),
+            )
+            .tooltip(tip)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.project_collapsed.contains(&project_id) {
+                    this.project_collapsed.remove(&project_id);
+                } else {
+                    this.project_collapsed.insert(project_id.clone());
+                }
+                cx.notify();
+            }));
+        // The directory sub-line carries the open affordance: a hover fill
+        // marks it clickable. The project tip lives on the header above.
+        let sub = div()
+            .id(format!("l3s-project-open-{}", project.id))
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.panel))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .pl(px(8.0))
+                    .py(px(2.0))
+                    .text_size(px(self.section_font()))
+                    .text_color(theme.muted)
+                    .child(location),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.open_project_location(project_for_open.clone(), cx);
+            }));
+        // A collapsed project is one header row; the directory and the
+        // workspaces show only expanded.
+        row = row.child(header);
+        if !collapsed {
+            row = row.child(sub);
+            for (endpoint, workspace) in grouped {
+                // Nested rows drop the host badge (the header names the
+                // machine), the daemon's circle, and the wide indent: a
+                // tight corner marks the child instead.
+                let child = ShellWorkspace {
+                    nested: false,
+                    ..workspace.clone()
+                };
+                row = row.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .pl(px(8.0))
+                        .child(div().w(px(14.0)).flex_shrink_0().pt(px(7.0)).child(icon(
+                            include_bytes!("../../assets/icons/corner-down-right.svg"),
+                            12.0,
+                            theme.muted,
+                        )))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .child(self.workspace_row(&endpoint, &child, None, true, cx)),
+                        ),
+                );
+            }
+        }
+        row
+    }
+
+    /// Every live workspace owned by `project`, across endpoints.
+    ///
+    /// The base directory itself is the project header, so only worktrees
+    /// nest — a workspace sitting exactly on the location stays hidden.
+    fn project_workspaces(&self, project: &Project) -> Vec<(EndpointId, &ShellWorkspace)> {
+        let mut grouped = Vec::new();
+        let base = project.location.trim_end_matches('/');
+        for id in self.connected_endpoints() {
+            for workspace in self.endpoint_workspaces(&id) {
+                let cwd = self.expand_cwd(&id.key(), &workspace.cwd);
+                let common = self.workspace_common(&id.key(), &workspace.cwd);
+                if !project.owns_workspace_repo(&id.key(), &cwd, common) {
+                    continue;
+                }
+                if cwd.trim_end_matches('/') == base {
+                    continue;
+                }
+                grouped.push((id.clone(), workspace));
+            }
+        }
+        grouped
+    }
+
+    /// The project owning `cwd` on `endpoint_key`, if any.
+    fn project_for_workspace(&self, endpoint_key: &str, cwd: &str) -> Option<&Project> {
+        let expanded = self.expand_cwd(endpoint_key, cwd);
+        let common = self.workspace_common(endpoint_key, cwd);
+        self.projects
+            .projects()
+            .iter()
+            .find(|project| project.owns_workspace_repo(endpoint_key, &expanded, common))
+    }
+
+    /// Expand the daemon's `~`-shorthand dirs against the owning machine.
+    fn expand_cwd(&self, endpoint_key: &str, cwd: &str) -> String {
+        if endpoint_key == "local" {
+            return expand_project_local(cwd);
+        }
+        match self.remote_home.get(endpoint_key) {
+            Some(home) => expand_project_remote(cwd, home),
+            None => cwd.to_string(),
+        }
+    }
+
+    /// The cached git common dir for a workspace, if it was resolved.
+    fn workspace_common(&self, endpoint_key: &str, cwd: &str) -> Option<&str> {
+        self.project_repo
+            .get(&(endpoint_key.to_string(), cwd.to_string()))
+            .and_then(|common| common.as_deref())
+    }
+
+    /// Resolve the repositories of ungrouped workspaces off-thread.
+    ///
+    /// Directory-owned workspaces need no help, so only the rest go through
+    /// `git rev-parse`: locals one by one, remotes one SSH batch per
+    /// machine. Facts arrive on `project_repo_rx` and regroup the sidebar.
+    fn resolve_project_repos(&mut self) {
+        if self.project_repo_pending {
+            return;
+        }
+        let rows: Vec<(EndpointId, String)> = self
+            .connected_endpoints()
+            .into_iter()
+            .flat_map(|id| {
+                self.endpoint_workspaces(&id)
+                    .iter()
+                    .map(|workspace| (id.clone(), workspace.cwd.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut live = HashSet::new();
+        let mut missing: Vec<(String, Option<SshTarget>, String)> = Vec::new();
+        for (id, cwd) in &rows {
+            if cwd.is_empty() {
+                continue;
+            }
+            let key = (id.key(), cwd.clone());
+            live.insert(key.clone());
+            if self.project_repo.contains_key(&key) {
+                continue;
+            }
+            if self
+                .projects
+                .projects()
+                .iter()
+                .any(|project| project.owns_workspace(&key.0, &self.expand_cwd(&key.0, &key.1)))
+            {
+                self.project_repo.insert(key, None);
+                continue;
+            }
+            let target = match id {
+                EndpointId::Local => None,
+                EndpointId::Machine(machine_id) => self
+                    .machines
+                    .iter()
+                    .find(|machine| &machine.id == machine_id)
+                    .and_then(|machine| machine.ssh_target()),
+            };
+            // Without a bridge there is nothing to ask; retry later.
+            if id.machine_id().is_some() && target.is_none() {
+                continue;
+            }
+            missing.push((key.0, target, key.1));
+        }
+        self.project_repo.retain(|key, _| live.contains(key));
+        // Project base branches resolve on the same tick, keyed by raw
+        // location so the tip can show the live branch.
+        let mut live_bases = HashSet::new();
+        let mut bases: Vec<(String, Option<SshTarget>, String)> = Vec::new();
+        for project in self.projects.projects() {
+            if project.location.trim().is_empty() {
+                continue;
+            }
+            let key = (project.endpoint_key().to_string(), project.location.clone());
+            live_bases.insert(key.clone());
+            if self.project_branch.contains_key(&key) {
+                continue;
+            }
+            let target = match &project.machine {
+                None => None,
+                Some(id) => self
+                    .machines
+                    .iter()
+                    .find(|machine| &machine.id == id)
+                    .and_then(|machine| machine.ssh_target()),
+            };
+            if key.0 != "local" && target.is_none() {
+                continue;
+            }
+            bases.push((key.0, target, key.1));
+        }
+        self.project_branch
+            .retain(|key, _| live_bases.contains(key));
+        if missing.is_empty() && bases.is_empty() {
+            return;
+        }
+        self.project_repo_pending = true;
+        let tx = self.project_repo_tx.clone();
+        std::thread::spawn(move || {
+            let mut facts = Vec::with_capacity(missing.len());
+            let mut homes = Vec::new();
+            let mut remotes: HashMap<String, (SshTarget, Vec<String>)> = HashMap::new();
+            for (endpoint_key, target, cwd) in missing {
+                match target {
+                    None => facts.push(((endpoint_key, cwd.clone()), common_git_dir(&cwd))),
+                    Some(target) => remotes
+                        .entry(endpoint_key)
+                        .or_insert_with(|| (target, Vec::new()))
+                        .1
+                        .push(cwd),
+                }
+            }
+            for (endpoint_key, (target, cwds)) in remotes {
+                let probed = common_git_dirs_remote(&target, &cwds);
+                if !probed.home.is_empty() {
+                    homes.push((endpoint_key.clone(), probed.home));
+                }
+                for (cwd, common) in probed.facts {
+                    facts.push(((endpoint_key.clone(), cwd), common));
+                }
+            }
+            let mut branches = Vec::with_capacity(bases.len());
+            let mut branch_remotes: HashMap<String, (SshTarget, Vec<String>)> = HashMap::new();
+            for (endpoint_key, target, location) in bases {
+                match target {
+                    None => {
+                        branches.push(((endpoint_key, location.clone()), current_branch(&location)))
+                    }
+                    Some(target) => branch_remotes
+                        .entry(endpoint_key)
+                        .or_insert_with(|| (target, Vec::new()))
+                        .1
+                        .push(location),
+                }
+            }
+            for (endpoint_key, (target, locations)) in branch_remotes {
+                for (location, branch) in current_branches_remote(&target, &locations) {
+                    branches.push(((endpoint_key.clone(), location), branch));
+                }
+            }
+            tx.send(RepoResolve {
+                facts,
+                homes,
+                branches,
+            })
+            .ok();
+        });
+    }
+
+    /// WORKSPACES: every open workspace not grouped under a project.
     fn workspaces_section(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
@@ -4251,6 +6170,7 @@ impl L3sView {
                             theme.muted,
                         ))
                         .child("WORKSPACES")
+                        .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border()))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.workspaces_collapsed = !this.workspaces_collapsed;
                             cx.notify();
@@ -4274,6 +6194,7 @@ impl L3sView {
                         ))
                         .on_click(cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
+                            this.leave_settings_page();
                             this.open_picker(cx);
                         })),
                 ),
@@ -4286,8 +6207,16 @@ impl L3sView {
             let host = id.machine_id().map(|_| self.endpoint_label(&id));
             let workspaces = self.endpoint_workspaces(&id);
             for workspace in workspaces {
+                // Project-grouped workspaces render nested under PROJECTS.
+                if self
+                    .project_for_workspace(&id.key(), &workspace.cwd)
+                    .is_some()
+                {
+                    continue;
+                }
                 any = true;
-                section = section.child(self.workspace_row(&id, workspace, host.as_deref(), cx));
+                section =
+                    section.child(self.workspace_row(&id, workspace, host.as_deref(), false, cx));
             }
         }
         if !any {
@@ -4297,7 +6226,7 @@ impl L3sView {
                     .px_2()
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
-                    .child("No projects yet"),
+                    .child("No workspaces yet"),
             );
         }
         section
@@ -4325,8 +6254,10 @@ impl L3sView {
                 .flex()
                 .flex_row()
                 .items_center()
+                .justify_between()
                 .h(px(22.0))
-                .px_2()
+                .pl_2()
+                .mr(px(-12.0))
                 .child(
                     div()
                         .id("l3s-agents-toggle")
@@ -4334,6 +6265,7 @@ impl L3sView {
                         .flex_row()
                         .items_center()
                         .gap_1()
+                        .flex_1()
                         .cursor_pointer()
                         .text_size(px(self.section_font()))
                         .font_weight(FontWeight::BOLD)
@@ -4349,8 +6281,31 @@ impl L3sView {
                             theme.muted,
                         ))
                         .child("AGENTS")
+                        .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border()))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.agents_collapsed = !this.agents_collapsed;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("l3s-add-agent")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(22.0))
+                        .w(px(22.0))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.panel))
+                        .child(icon(
+                            include_bytes!("../../assets/icons/plus.svg"),
+                            11.0,
+                            theme.muted,
+                        ))
+                        // Noop for now; a future section will start agents here.
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.stop_propagation();
                             cx.notify();
                         })),
                 ),
@@ -4496,7 +6451,6 @@ impl L3sView {
                     .items_center()
                     .gap_2()
                     .min_w_0()
-                    .pl(px(20.0))
                     .text_size(px(self.section_font()))
                     .text_color(dim)
                     .child(
@@ -4515,6 +6469,7 @@ impl L3sView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
+                    this.leave_settings_page();
                     this.activate_endpoint(endpoint.clone(), None, Some(pane.clone()), cx);
                 }),
             )
@@ -4744,7 +6699,11 @@ impl Render for L3sView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenWorkspacePicker, _window, cx| {
+                this.leave_settings_page();
                 this.open_picker(cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, _window, cx| {
+                this.open_settings(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSessionMenu, _window, cx| {
                 this.session_menu_open = true;
@@ -4797,13 +6756,7 @@ impl Render for L3sView {
                         .border_color(terminal_inset_border())
                         .rounded_md()
                         .overflow_hidden()
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .pt(px(TERMINAL_TOP_AIR))
-                                .child(grid),
-                        ),
+                        .child(self.card_content(cx, grid)),
                 ),
             )
             // Chrome layers live at the root so they paint above the content
@@ -5285,6 +7238,43 @@ fn api_socket_for_target(target: &ConnectTarget) -> PathBuf {
         None => (config_dir(), target.session.clone()),
     };
     api_socket_for(&root, session.as_deref())
+}
+
+/// The status label and color for a saved machine, mirroring the manager.
+fn machine_status_text(machine: &MachineInfo, theme: Theme) -> (String, gpui::Rgba) {
+    if !machine.enabled {
+        return ("disabled".to_string(), theme.muted);
+    }
+    match (machine.online, machine.latency_ms) {
+        (Some(true), Some(ms)) => (format!("online · {ms} ms"), theme.ok),
+        (Some(true), None) => ("online".to_string(), theme.ok),
+        (Some(false), _) => ("offline".to_string(), theme.alert),
+        (None, _) => ("probing…".to_string(), theme.muted),
+    }
+}
+
+/// Run one `luvus machine …` mutation, returning the error to show.
+fn run_machine_cli(root: &Path, args: Vec<String>) -> Result<(), String> {
+    let Some(binary) = luvus_binary() else {
+        return Err("luvus binary not found on PATH".to_string());
+    };
+    match std::process::Command::new(binary)
+        .arg("machine")
+        .args(&args)
+        .env(HOME_ENV, root)
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                "The command failed.".to_string()
+            } else {
+                stderr
+            })
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Shorten a workspace path with `~`, the way the mock's breadcrumb reads.

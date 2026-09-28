@@ -68,6 +68,21 @@ pub enum PickerEvent {
     Opened(Result<(), String>),
     /// A `worktree.create` request finished.
     WorktreeOpened(Result<(), String>),
+    /// A project's `workspace.open` finished; `machine` owns the project
+    /// (`None` is local), so the surface can hand off to its endpoint.
+    ProjectOpened {
+        /// The project's machine profile id, or `None` for local.
+        machine: Option<String>,
+        /// The open outcome.
+        result: Result<(), String>,
+    },
+    /// A project's worktree finished; `machine` owns the project.
+    ProjectWorktreeOpened {
+        /// The project's machine profile id, or `None` for local.
+        machine: Option<String>,
+        /// The create outcome.
+        result: Result<(), String>,
+    },
 }
 
 /// The Open Workspace picker's state.

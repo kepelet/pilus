@@ -57,4 +57,8 @@ pub enum Error {
     /// SSH launch, or a remote command that exited before the handshake.
     #[error("{0}")]
     Machine(String),
+
+    /// A project definition could not be saved or read.
+    #[error("projects error: {0}")]
+    Projects(String),
 }

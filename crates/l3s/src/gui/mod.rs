@@ -6503,6 +6503,7 @@ impl L3sView {
             .pt(px(SIDEBAR_TOP_INSET))
             .pb_3();
 
+        content = content.child(self.new_workspace_row(cx));
         for kind in NavKind::ALL {
             content = content.child(self.nav_row(kind, cx));
         }
@@ -7400,6 +7401,53 @@ impl L3sView {
             self.nav_sel = Some(view);
             self.nav_sel_at = Instant::now();
         }
+    }
+
+    /// A "New Workspace" action above the nav rows.
+    ///
+    /// The Home composer is where a new workspace and its first agent are
+    /// chosen, so this row toggles the same composer as the Cmd+Shift+N chord.
+    fn new_workspace_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let bg = if self.home.is_open() {
+            theme.panel
+        } else {
+            theme.window_bg
+        };
+        div()
+            .id("l3s-new-workspace")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .h(px(28.0))
+            .pl_2()
+            // Match the nav rows: let the label reach the panel edge.
+            .mr(px(-12.0))
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(self.chrome_font()))
+            .bg(bg)
+            .text_color(theme.panel_fg)
+            .hover(|style| style.bg(theme.panel))
+            .child(icon(
+                include_bytes!("../../assets/icons/plus.svg"),
+                15.0,
+                theme.muted,
+            ))
+            .child(div().flex_1().child("New Workspace"))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_home(cx)))
+    }
+
+    /// Toggle the Home composer, shared by the Cmd+Shift+N chord and the
+    /// sidebar's New Workspace row.
+    fn toggle_home(&mut self, cx: &mut Context<Self>) {
+        if self.home.is_open() {
+            self.home.close();
+        } else {
+            self.open_home(cx);
+        }
+        cx.notify();
     }
 
     /// One sidebar destination: lucide glyph, label, live badge, chord click.
@@ -8459,13 +8507,7 @@ impl Render for L3sView {
                 this.open_settings(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenHome, _window, cx| {
-                // The chord toggles, so pressing it again dismisses the composer.
-                if this.home.is_open() {
-                    this.home.close();
-                    cx.notify();
-                } else {
-                    this.open_home(cx);
-                }
+                this.toggle_home(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSessionMenu, _window, cx| {
                 this.session_menu_open = true;

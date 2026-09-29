@@ -16,6 +16,7 @@ mod picker;
 mod projects;
 mod scheme;
 mod selection;
+mod sound;
 mod text_field;
 mod theme;
 mod ui_playground;
@@ -1118,7 +1119,7 @@ impl L3sView {
             self.catalog_dirty = true;
             changed = true;
         }
-        changed |= self.poll_active();
+        changed |= self.poll_active(cx);
         changed |= self.poll_endpoints();
         changed |= self.poll_machine_connects();
         self.pump_reconnects();
@@ -1374,7 +1375,7 @@ impl L3sView {
     }
 
     /// Drain the active endpoint's connection.
-    fn poll_active(&mut self) -> bool {
+    fn poll_active(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         let mut catalog = false;
         while let Some(event) = self.connection.try_recv() {
@@ -1394,6 +1395,18 @@ impl L3sView {
                     if let Some(text) = self.surface.take_notify() {
                         self.status = text;
                         changed = true;
+                    }
+                    // The daemon copies through us when it cannot reach the
+                    // host clipboard itself (remote sessions, OSC 52): it
+                    // ships the text and expects the window to install it.
+                    if let Some(text) = self.surface.take_clipboard() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                    if let Some(url) = self.surface.take_open_url() {
+                        cx.open_url(&url);
+                    }
+                    for cue in self.surface.take_sounds() {
+                        sound::play(cue);
                     }
                 }
                 ClientEvent::Disconnected { reason } => {

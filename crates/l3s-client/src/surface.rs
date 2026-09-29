@@ -187,6 +187,20 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_is_queued_for_the_window_to_install() {
+        // The daemon copies through the client when it cannot reach the host
+        // clipboard, so the text must survive one take for the window to write
+        // it and then be cleared.
+        let mut surface = Surface::new();
+        assert_eq!(
+            surface.apply(&ServerMessage::Clipboard("hi".into())),
+            SurfaceChange::None
+        );
+        assert_eq!(surface.take_clipboard().as_deref(), Some("hi"));
+        assert!(surface.take_clipboard().is_none());
+    }
+
+    #[test]
     fn diff_without_a_frame_requests_resync() {
         let mut surface = Surface::new();
         let diff = ServerMessage::FrameDiff(FrameDiff {

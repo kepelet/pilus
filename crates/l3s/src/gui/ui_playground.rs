@@ -6,11 +6,17 @@
 //! switches react. It runs against the active theme, so a palette change shows
 //! up everywhere at once without touching live daemon data.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gpui::{
     App, Bounds, Context, Div, FocusHandle, FontWeight, KeyDownEvent, Render, Window, WindowBounds,
     WindowOptions, div, prelude::*, px, size,
 };
 
+use crate::settings::Settings;
+
+use super::style::{self, ButtonKind};
 use super::text_field::TextField;
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, icon, terminal_inset_border};
@@ -90,19 +96,6 @@ const ICONS: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// The button treatments the app uses.
-#[derive(Clone, Copy)]
-enum ButtonKind {
-    /// Accent fill, the primary action.
-    Primary,
-    /// Panel fill with a border.
-    Secondary,
-    /// Text-only, fills on hover.
-    Ghost,
-    /// Panel fill with alert text.
-    Danger,
-}
-
 /// Which demo input owns the keyboard.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputId {
@@ -120,6 +113,8 @@ struct Picker {
 /// The playground window root view.
 pub struct UiPlaygroundView {
     theme: Theme,
+    /// Shared client settings, so the Interface font reaches this window.
+    settings: Rc<RefCell<Settings>>,
     focus_handle: FocusHandle,
     single: TextField,
     multi: TextField,
@@ -136,11 +131,17 @@ pub struct UiPlaygroundView {
 }
 
 impl UiPlaygroundView {
-    fn new(theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(
+        theme: Theme,
+        settings: Rc<RefCell<Settings>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         Self {
             theme,
+            settings,
             focus_handle,
             single: TextField::with_value("click and type".to_string()),
             multi: TextField::with_value("A multi-line\ntextarea.".to_string()),
@@ -172,6 +173,11 @@ impl UiPlaygroundView {
     fn note(&mut self, text: String, cx: &mut Context<Self>) {
         self.status = text;
         cx.notify();
+    }
+
+    /// The window's type scale, resolved from the shared settings.
+    fn fonts(&self) -> style::Fonts {
+        style::Fonts::resolve(&self.settings)
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -239,13 +245,7 @@ impl UiPlaygroundView {
             .flex()
             .flex_col()
             .gap_3()
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.muted)
-                    .child(title),
-            )
+            .child(style::section_label(theme, title, self.fonts().label))
             .child(body)
     }
 
@@ -275,55 +275,23 @@ impl UiPlaygroundView {
         kind: ButtonKind,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = self.theme;
-        let (bg, fg, border) = match kind {
-            ButtonKind::Primary => (theme.accent, theme.window_bg, theme.accent),
-            ButtonKind::Secondary => (theme.panel_dim, theme.fg, theme.border),
-            ButtonKind::Ghost => (theme.panel.opacity(0.0), theme.muted, theme.panel.opacity(0.0)),
-            ButtonKind::Danger => (theme.panel_dim, theme.alert, theme.border),
-        };
-        let hover_bg = match kind {
-            ButtonKind::Ghost => theme.panel_dim,
-            _ => theme.panel,
-        };
-        let hover_fg = match kind {
-            ButtonKind::Danger => theme.alert,
-            _ => theme.panel_fg,
-        };
-        div()
-            .id(id)
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .h(px(28.0))
-            .px_3()
-            .rounded_md()
-            .bg(bg)
-            .text_color(fg)
-            .border_1()
-            .border_color(border)
-            .text_size(px(12.0))
-            .font_weight(match kind {
-                ButtonKind::Primary => FontWeight::BOLD,
-                _ => FontWeight::NORMAL,
-            })
-            .cursor_pointer()
-            .hover(move |style| style.bg(hover_bg).text_color(hover_fg))
-            .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| match kind {
+        style::button(id, label, kind, self.theme, self.fonts().secondary).on_click(cx.listener(
+            move |this, _, _, cx| match kind {
                 ButtonKind::Primary => {
                     this.clicks = this.clicks.saturating_add(1);
                     this.note(format!("Primary clicked {} times", this.clicks), cx);
                 }
                 ButtonKind::Secondary => {
                     this.toggle = !this.toggle;
-                    this.note(format!("Toggle is now {}", if this.toggle { "on" } else { "off" }), cx);
+                    this.note(
+                        format!("Toggle is now {}", if this.toggle { "on" } else { "off" }),
+                        cx,
+                    );
                 }
                 ButtonKind::Ghost => this.note("Ghost clicked".to_string(), cx),
                 ButtonKind::Danger => this.note("Danger clicked".to_string(), cx),
-            }))
+            },
+        ))
     }
 
     /// The circular icon-only send button.
@@ -358,47 +326,31 @@ impl UiPlaygroundView {
             InputId::Multi => &self.multi,
         };
         let lines = self.field_body(field, focused);
-        div()
-            .id(match id {
+        style::field(
+            match id {
                 InputId::Single => "pg-input-single",
                 InputId::Multi => "pg-input-multi",
-            })
-            .flex()
-            .flex_col()
-            .gap_1()
-            .w(px(240.0))
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(theme.muted)
-                    .child(label),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .min_h(px(if multiline { 84.0 } else { 30.0 }))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(theme.panel_dim)
-                    .border_1()
-                    .border_color(if focused { theme.accent } else { theme.border })
-                    .text_size(px(13.0))
-                    .cursor_pointer()
-                    .child(lines),
-            )
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.input = id;
-                    match id {
-                        InputId::Single => this.single.end(),
-                        InputId::Multi => this.multi.end(),
-                    }
-                    cx.notify();
-                }),
-            )
+            },
+            label,
+            focused,
+            theme,
+            if multiline { 84.0 } else { 30.0 },
+            self.fonts().label,
+            lines,
+        )
+        .w(px(240.0))
+        .text_size(px(self.fonts().body))
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.input = id;
+                match id {
+                    InputId::Single => this.single.end(),
+                    InputId::Multi => this.multi.end(),
+                }
+                cx.notify();
+            }),
+        )
     }
 
     /// Render an input's text, placing the caret on the cursor's line.
@@ -480,7 +432,7 @@ impl UiPlaygroundView {
         }
         chip.child(
             div()
-                .text_size(px(12.0))
+                .text_size(px(self.fonts().secondary))
                 .text_color(theme.muted)
                 .child(prefix),
         )
@@ -488,7 +440,7 @@ impl UiPlaygroundView {
             div()
                 .max_w(px(180.0))
                 .truncate()
-                .text_size(px(13.0))
+                .text_size(px(self.fonts().body))
                 .text_color(fg)
                 .child(value),
         )
@@ -516,7 +468,7 @@ impl UiPlaygroundView {
             .rounded_lg()
             .bg(theme.bg)
             .border_1()
-            .border_color(theme.border);
+            .border_color(terminal_inset_border());
         for (option_index, option) in options.into_iter().enumerate() {
             let active = option_index == selected;
             list = list.child(
@@ -530,7 +482,7 @@ impl UiPlaygroundView {
                     .rounded_md()
                     .bg(if active { theme.panel } else { theme.bg })
                     .text_color(theme.panel_fg)
-                    .text_size(px(13.0))
+                    .text_size(px(self.fonts().body))
                     .font_weight(if active {
                         FontWeight::BOLD
                     } else {
@@ -554,7 +506,7 @@ impl UiPlaygroundView {
         let theme = self.theme;
         let active = self.tab == index;
         let fg = if active { theme.panel_fg } else { theme.muted };
-        let mut tab = div()
+        div()
             .id(format!("pg-tab-{index}"))
             .flex()
             .flex_row()
@@ -565,18 +517,14 @@ impl UiPlaygroundView {
             .rounded_md()
             .bg(if active { theme.panel } else { theme.window_bg })
             .text_color(fg)
-            .text_size(px(13.0))
+            .text_size(px(self.fonts().body))
             .cursor_pointer()
             .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.tab = index;
                 this.note(format!("{label} tab selected"), cx);
             }))
-            .child(label);
-        if active {
-            tab = tab.border_1().border_color(terminal_inset_border());
-        }
-        tab
+            .child(label)
     }
 
     /// A working on/off switch.
@@ -643,7 +591,7 @@ impl UiPlaygroundView {
             )
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(px(self.fonts().body))
                     .text_color(theme.fg)
                     .child("Checkbox"),
             )
@@ -689,7 +637,7 @@ impl UiPlaygroundView {
                     )
                     .child(
                         div()
-                            .text_size(px(10.0))
+                            .text_size(px(style::scaled(&self.settings, 10.0)))
                             .text_color(theme.muted)
                             .child(name),
                     ),
@@ -722,7 +670,7 @@ impl UiPlaygroundView {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(px(self.fonts().body))
                             .text_color(theme.fg)
                             .child("mac-mini"),
                     )
@@ -732,7 +680,7 @@ impl UiPlaygroundView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .text_size(px(11.0))
+                            .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
                             .child("rizaldy@mac-mini")
                             .child(div().text_color(theme.ok).child("online")),
@@ -740,13 +688,13 @@ impl UiPlaygroundView {
             )
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(self.fonts().label))
                     .text_color(theme.fg)
                     .child("Disable"),
             )
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(self.fonts().label))
                     .text_color(theme.muted)
                     .child("Remove"),
             )
@@ -769,7 +717,7 @@ impl UiPlaygroundView {
             } else {
                 theme.window_bg.opacity(0.0)
             })
-            .text_size(px(13.0))
+            .text_size(px(self.fonts().body))
             .text_color(if active { theme.panel_fg } else { theme.muted })
             .child(icon(
                 include_bytes!("../../assets/icons/layout-panel-left.svg"),
@@ -790,7 +738,7 @@ impl UiPlaygroundView {
             .h(px(20.0))
             .rounded_sm()
             .bg(theme.border)
-            .text_size(px(11.0))
+            .text_size(px(self.fonts().label))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.fg)
             .child("L");
@@ -803,7 +751,7 @@ impl UiPlaygroundView {
             .px_1()
             .rounded_full()
             .bg(theme.accent)
-            .text_size(px(10.0))
+            .text_size(px(style::scaled(&self.settings, 10.0)))
             .text_color(theme.window_bg)
             .child("3");
         let dot = |color: gpui::Rgba, label: &'static str, theme: Theme| {
@@ -819,7 +767,7 @@ impl UiPlaygroundView {
                 ))
                 .child(
                     div()
-                        .text_size(px(11.0))
+                        .text_size(px(self.fonts().label))
                         .text_color(theme.muted)
                         .child(label),
                 )
@@ -851,7 +799,7 @@ impl UiPlaygroundView {
                     .child(icon(bytes, 18.0, theme.muted))
                     .child(
                         div()
-                            .text_size(px(9.0))
+                            .text_size(px(style::scaled(&self.settings, 9.0)))
                             .text_color(theme.muted)
                             .child(*name),
                     ),
@@ -877,7 +825,7 @@ impl UiPlaygroundView {
                     .w(px(210.0))
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
                             .child("Inset terminal card"),
                     )
@@ -899,7 +847,7 @@ impl UiPlaygroundView {
                     .w(px(210.0))
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
                             .child("Composer card + footer"),
                     )
@@ -914,7 +862,7 @@ impl UiPlaygroundView {
                                     .items_center()
                                     .h(px(40.0))
                                     .px_3()
-                                    .rounded_t_xl()
+                                    .rounded_t_lg()
                                     .bg(theme.panel.opacity(0.0))
                                     .border_t_1()
                                     .border_l_1()
@@ -922,7 +870,7 @@ impl UiPlaygroundView {
                                     .border_color(terminal_inset_border())
                                     .child(
                                         div()
-                                            .text_size(px(11.0))
+                                            .text_size(px(self.fonts().label))
                                             .text_color(theme.muted)
                                             .child("composer"),
                                     ),
@@ -939,10 +887,10 @@ impl UiPlaygroundView {
                                     .border_r_1()
                                     .border_b_1()
                                     .border_color(terminal_inset_border())
-                                    .rounded_b_3xl()
+                                    .rounded_b_lg()
                                     .child(
                                         div()
-                                            .text_size(px(11.0))
+                                            .text_size(px(self.fonts().label))
                                             .text_color(theme.muted)
                                             .child("footer"),
                                     ),
@@ -957,7 +905,7 @@ impl UiPlaygroundView {
                     .w(px(210.0))
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
                             .child("Panel box"),
                     )
@@ -987,7 +935,7 @@ impl UiPlaygroundView {
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .text_size(px(11.0))
+                    .text_size(px(self.fonts().label))
                     .font_weight(FontWeight::BOLD)
                     .text_color(theme.muted)
                     .child("SECTION")
@@ -1018,7 +966,7 @@ impl UiPlaygroundView {
                     .gap_1()
                     .flex_1()
                     .cursor_pointer()
-                    .text_size(px(11.0))
+                    .text_size(px(self.fonts().label))
                     .font_weight(FontWeight::BOLD)
                     .text_color(theme.muted)
                     .hover(move |style| style.text_color(theme.panel_fg))
@@ -1086,7 +1034,7 @@ impl UiPlaygroundView {
                 div()
                     .flex_1()
                     .truncate()
-                    .text_size(px(13.0))
+                    .text_size(px(self.fonts().body))
                     .text_color(theme.panel_fg)
                     .font_weight(if active {
                         FontWeight::BOLD
@@ -1129,7 +1077,7 @@ impl UiPlaygroundView {
                         div()
                             .flex_1()
                             .truncate()
-                            .text_size(px(13.0))
+                            .text_size(px(self.fonts().body))
                             .text_color(theme.panel_fg)
                             .font_weight(if active {
                                 FontWeight::BOLD
@@ -1141,14 +1089,14 @@ impl UiPlaygroundView {
                     .child(
                         div()
                             .flex_shrink_0()
-                            .text_size(px(11.0))
+                            .text_size(px(self.fonts().label))
                             .text_color(theme.branch)
                             .child("main"),
                     ),
             )
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(self.fonts().label))
                     .text_color(theme.muted)
                     .child("~/Developer/l3s"),
             )
@@ -1175,13 +1123,13 @@ impl UiPlaygroundView {
                 div()
                     .flex_1()
                     .truncate()
-                    .text_size(px(13.0))
+                    .text_size(px(self.fonts().body))
                     .text_color(theme.panel_fg)
                     .child("quiet-comet"),
             )
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(self.fonts().label))
                     .text_color(theme.ok)
                     .child("working"),
             )
@@ -1213,9 +1161,9 @@ impl UiPlaygroundView {
                 .px_3()
                 .rounded_md()
                 .bg(bg)
-                .child(div().flex_1().text_size(px(13.0)).text_color(fg).child(title))
-                .child(div().text_size(px(11.0)).text_color(dim).child(group))
-                .child(div().text_size(px(11.0)).text_color(dim).child(shortcut))
+                .child(div().flex_1().text_size(px(self.fonts().body)).text_color(fg).child(title))
+                .child(div().text_size(px(self.fonts().label)).text_color(dim).child(group))
+                .child(div().text_size(px(self.fonts().label)).text_color(dim).child(shortcut))
         };
         div()
             .flex()
@@ -1224,7 +1172,7 @@ impl UiPlaygroundView {
             .rounded_lg()
             .bg(theme.sidebar_bg)
             .border_1()
-            .border_color(theme.border)
+            .border_color(terminal_inset_border())
             .overflow_hidden()
             .child(
                 div()
@@ -1234,8 +1182,8 @@ impl UiPlaygroundView {
                     .h(px(40.0))
                     .px_3()
                     .border_b_1()
-                    .border_color(theme.border)
-                    .text_size(px(13.0))
+                    .border_color(terminal_inset_border())
+                    .text_size(px(self.fonts().body))
                     .child(div().w(px(1.5)).h(px(16.0)).bg(theme.accent))
                     .child(
                         div()
@@ -1273,7 +1221,7 @@ impl UiPlaygroundView {
                 .px_2()
                 .rounded_md()
                 .bg(bg)
-                .text_size(px(13.0))
+                .text_size(px(self.fonts().body))
                 .text_color(fg)
                 .child(icon(bytes, 14.0, theme.muted))
                 .child(name)
@@ -1285,7 +1233,7 @@ impl UiPlaygroundView {
             .rounded_lg()
             .bg(theme.bg)
             .border_1()
-            .border_color(theme.border)
+            .border_color(terminal_inset_border())
             .overflow_hidden()
             .child(
                 div()
@@ -1294,8 +1242,8 @@ impl UiPlaygroundView {
                     .h(px(38.0))
                     .px_3()
                     .border_b_1()
-                    .border_color(theme.border)
-                    .text_size(px(13.0))
+                    .border_color(terminal_inset_border())
+                    .text_size(px(self.fonts().body))
                     .text_color(theme.fg)
                     .child("~/Developer"),
             )
@@ -1328,10 +1276,10 @@ impl UiPlaygroundView {
                     .px_3()
                     .py_2()
                     .border_t_1()
-                    .border_color(theme.border)
+                    .border_color(terminal_inset_border())
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(self.fonts().secondary))
                             .text_color(theme.muted)
                             .child("Cancel"),
                     )
@@ -1345,7 +1293,7 @@ impl UiPlaygroundView {
                             .rounded_md()
                             .bg(theme.accent)
                             .text_color(theme.window_bg)
-                            .text_size(px(12.0))
+                            .text_size(px(self.fonts().secondary))
                             .font_weight(FontWeight::BOLD)
                             .child("Open"),
                     ),
@@ -1374,7 +1322,7 @@ impl UiPlaygroundView {
             .w_full()
             .h(px(28.0))
             .px_3()
-            .text_size(px(11.0))
+            .text_size(px(self.fonts().label))
             .child(
                 div()
                     .flex()
@@ -1440,23 +1388,23 @@ impl UiPlaygroundView {
             .rounded_md()
             .bg(theme.sidebar_bg)
             .border_1()
-            .border_color(theme.border)
+            .border_color(terminal_inset_border())
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(self.fonts().secondary))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.panel_fg)
                     .child("quiet-comet"),
             )
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(self.fonts().label))
                     .text_color(theme.muted)
                     .child("Directory: ~/Developer/l3s"),
             )
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(self.fonts().label))
                     .text_color(theme.branch)
                     .child("Branch: quiet-comet"),
             )
@@ -1473,19 +1421,19 @@ impl UiPlaygroundView {
             .gap_4()
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(self.fonts().secondary))
                     .text_color(theme.muted)
                     .child("No projects yet."),
             )
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(self.fonts().secondary))
                     .text_color(theme.alert)
                     .child("couldn't open workspace"),
             )
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(self.fonts().secondary))
                     .text_color(theme.muted)
                     .child("Loading…"),
             )
@@ -1500,7 +1448,7 @@ impl UiPlaygroundView {
                     .bg(theme.panel_dim)
                     .border_1()
                     .border_color(theme.border)
-                    .text_size(px(11.0))
+                    .text_size(px(self.fonts().label))
                     .text_color(theme.muted)
                     .child("⌘⇧P"),
             )
@@ -1510,25 +1458,20 @@ impl UiPlaygroundView {
     fn small_buttons(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let confirm = self.confirm;
+        let fonts = self.fonts();
         div()
             .flex()
             .flex_row()
             .flex_wrap()
             .items_center()
             .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .h(px(24.0))
-                    .px_2()
-                    .rounded_md()
-                    .bg(theme.accent)
-                    .text_color(theme.window_bg)
-                    .text_size(px(12.0))
-                    .font_weight(FontWeight::BOLD)
-                    .child("New Project"),
-            )
+            .child(style::small_button(
+                "pg-small-primary",
+                "New Project",
+                ButtonKind::Primary,
+                theme,
+                fonts.secondary,
+            ))
             .child(
                 div()
                     .flex()
@@ -1547,30 +1490,26 @@ impl UiPlaygroundView {
                     )),
             )
             .child(
-                div()
-                    .id("pg-confirm")
-                    .flex()
-                    .items_center()
-                    .h(px(24.0))
-                    .px_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_size(px(11.0))
-                    .text_color(if confirm { theme.alert } else { theme.muted })
-                    .hover(move |style| style.bg(theme.panel_dim))
-                    .child(if confirm { "Confirm" } else { "Remove" })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.confirm = !this.confirm;
-                        let armed = this.confirm;
-                        this.note(
-                            if armed {
-                                "Remove armed".to_string()
-                            } else {
-                                "Remove cancelled".to_string()
-                            },
-                            cx,
-                        );
-                    })),
+                style::small_button(
+                    "pg-confirm",
+                    if confirm { "Confirm" } else { "Remove" },
+                    ButtonKind::Ghost,
+                    theme,
+                    fonts.label,
+                )
+                .text_color(if confirm { theme.alert } else { theme.muted })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.confirm = !this.confirm;
+                    let armed = this.confirm;
+                    this.note(
+                        if armed {
+                            "Remove armed".to_string()
+                        } else {
+                            "Remove cancelled".to_string()
+                        },
+                        cx,
+                    );
+                })),
             )
             .child(
                 div()
@@ -1579,7 +1518,7 @@ impl UiPlaygroundView {
                     .h(px(24.0))
                     .px_2()
                     .rounded_md()
-                    .text_size(px(11.0))
+                    .text_size(px(fonts.label))
                     .text_color(theme.fg)
                     .child("Disable"),
             )
@@ -1619,7 +1558,7 @@ impl Render for UiPlaygroundView {
                         .child(self.circle_button(cx))
                         .child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(px(self.fonts().label))
                                 .text_color(theme.muted)
                                 .child(format!("primary clicks: {clicks}")),
                         ),
@@ -1727,33 +1666,33 @@ impl Render for UiPlaygroundView {
                         .gap_1()
                         .child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(px(self.fonts().label))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(theme.muted)
                                 .child("SECTION LABEL"),
                         )
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(px(self.fonts().body))
                                 .text_color(theme.panel_fg)
                                 .child("Body panel text"),
                         )
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(px(self.fonts().secondary))
                                 .text_color(theme.muted)
                                 .child("Muted secondary text"),
                         )
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(px(self.fonts().secondary))
                                 .text_color(theme.branch)
                                 .child("branch-name"),
                         )
                         .child(
                             div()
                                 .font_family("Menlo")
-                                .text_size(px(13.0))
+                                .text_size(px(self.settings.borrow().terminal_font_size))
                                 .text_color(theme.fg)
                                 .child("monospace 0123456789"),
                         ),
@@ -1761,7 +1700,7 @@ impl Render for UiPlaygroundView {
             ))
             .child(self.section("ICONS", self.tray(self.icon_grid())));
 
-        div()
+        let root = div()
             .id("l3s-ui-playground")
             .track_focus(&self.focus_handle)
             .flex()
@@ -1789,15 +1728,16 @@ impl Render for UiPlaygroundView {
                     .py_2()
                     .border_t_1()
                     .border_color(theme.border)
-                    .text_size(px(11.0))
+                    .text_size(px(self.fonts().label))
                     .text_color(theme.muted)
                     .child(self.status.clone()),
-            )
+            );
+        super::apply_chrome_font(root, &self.settings)
     }
 }
 
 /// Open the UI Playground window.
-pub fn open(theme: Theme, cx: &mut App) {
+pub fn open(theme: Theme, settings: Rc<RefCell<Settings>>, cx: &mut App) {
     let bounds = Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
     let opened = cx.open_window(
         WindowOptions {
@@ -1809,7 +1749,7 @@ pub fn open(theme: Theme, cx: &mut App) {
             }),
             ..Default::default()
         },
-        move |window, cx| cx.new(move |cx| UiPlaygroundView::new(theme, window, cx)),
+        move |window, cx| cx.new(move |cx| UiPlaygroundView::new(theme, settings, window, cx)),
     );
     if let Err(error) = opened {
         eprintln!("l3s: could not open the UI playground: {error}");

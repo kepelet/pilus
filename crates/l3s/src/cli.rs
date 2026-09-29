@@ -48,6 +48,12 @@ pub enum Launch {
     /// Play every notification cue once, so the audio path can be heard
     /// without waiting for an agent to block.
     TestSound,
+    /// Capture headless screenshots of every native surface (development aid).
+    #[cfg(feature = "visual-test")]
+    UiShots {
+        /// Also capture the main window against the local daemon.
+        main: bool,
+    },
 }
 
 /// Parse arguments and run the requested mode.
@@ -65,6 +71,8 @@ pub fn run() -> Result<()> {
         Launch::CheckUpdates { channel, feed_url } => run_check_updates(channel, feed_url),
         Launch::ProbeMachine { id } => run_probe_machine(id),
         Launch::TestSound => run_test_sound(),
+        #[cfg(feature = "visual-test")]
+        Launch::UiShots { main } => run_ui_shots(main),
     }
 }
 
@@ -77,6 +85,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
     let mut uhp = false;
     let mut feed = false;
     let mut check_updates = false;
+    #[cfg(feature = "visual-test")]
+    let (mut ui_shots, mut ui_shots_main) = (false, false);
     let mut machine_id = None;
     let mut pane_id = None;
     let mut channel = None;
@@ -116,6 +126,13 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
             }
             "--check-updates" => check_updates = true,
             "--test-sound" => return Ok(Launch::TestSound),
+            #[cfg(feature = "visual-test")]
+            "--ui-shots" => ui_shots = true,
+            #[cfg(feature = "visual-test")]
+            "--ui-shots-main" => {
+                ui_shots = true;
+                ui_shots_main = true;
+            }
             "--channel" => {
                 channel = Some(
                     args.next()
@@ -143,6 +160,12 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
     }
     if check_updates {
         return Ok(Launch::CheckUpdates { channel, feed_url });
+    }
+    #[cfg(feature = "visual-test")]
+    if ui_shots {
+        return Ok(Launch::UiShots {
+            main: ui_shots_main,
+        });
     }
     if channel.is_some() || feed_url.is_some() {
         bail!(
@@ -217,6 +240,16 @@ fn run_test_sound() -> Result<()> {
 #[cfg(not(feature = "gui"))]
 fn run_test_sound() -> Result<()> {
     bail!("--test-sound needs the gui feature")
+}
+
+/// Capture headless UI screenshots; a development aid behind `visual-test`.
+#[cfg(feature = "visual-test")]
+fn run_ui_shots(main: bool) -> Result<()> {
+    if main {
+        crate::gui::shots::run_main()
+    } else {
+        crate::gui::shots::run()
+    }
 }
 
 /// Attach to a saved machine over SSH and print its identity and workspaces.

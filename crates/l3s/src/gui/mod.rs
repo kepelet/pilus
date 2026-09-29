@@ -16,7 +16,10 @@ mod picker;
 mod projects;
 mod scheme;
 mod selection;
+#[cfg(feature = "visual-test")]
+pub(crate) mod shots;
 pub(crate) mod sound;
+mod style;
 mod text_field;
 mod theme;
 mod ui_playground;
@@ -282,8 +285,15 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             let root = config_root.clone();
             let signal = machine_signal.clone();
             let theme = shared_theme.clone();
+            let settings = settings.clone();
             move |_: &OpenMachineManager, cx: &mut App| {
-                machines::open(root.clone(), signal.clone(), theme.clone(), cx);
+                machines::open(
+                    root.clone(),
+                    signal.clone(),
+                    theme.clone(),
+                    settings.clone(),
+                    cx,
+                );
             }
         });
         cx.on_action(|_: &QuitApp, cx: &mut App| cx.quit());
@@ -1221,7 +1231,12 @@ impl L3sView {
                 && !was_error
                 && !update_window::is_open(cx)
             {
-                update_window::open(self.updater.clone(), self.theme, cx);
+                update_window::open(
+                    self.updater.clone(),
+                    self.theme,
+                    self.shared_settings.clone(),
+                    cx,
+                );
             }
         }
         // The machine manager bumps this on every successful mutation; reload
@@ -2535,7 +2550,9 @@ impl L3sView {
             Command::OpenWorkspacePicker => self.open_picker(cx),
             Command::OpenSettings => self.open_settings(cx),
             Command::OpenHome => self.open_home(cx),
-            Command::OpenUiPlayground => ui_playground::open(self.theme, cx),
+            Command::OpenUiPlayground => {
+                ui_playground::open(self.theme, self.shared_settings.clone(), cx);
+            }
             Command::OpenProject(id) => {
                 if let Some(project) = self
                     .projects
@@ -3509,7 +3526,7 @@ impl L3sView {
             .child(self.home_mark())
             .child(
                 div()
-                    .text_size(px(18.0))
+                    .text_size(px(style::scaled(&self.shared_settings, 18.0)))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.fg)
                     .child("Ready when you are"),
@@ -3520,7 +3537,7 @@ impl L3sView {
                 div()
                     .w_full()
                     .px_2()
-                    .text_size(px(12.0))
+                    .text_size(px(self.footer_font()))
                     .text_color(theme.muted)
                     .child(status),
             );
@@ -3546,7 +3563,7 @@ impl L3sView {
         match about::app_icon() {
             Some(icon) => img(icon).w(px(52.0)).h(px(52.0)).into_any_element(),
             None => div()
-                .text_size(px(30.0))
+                .text_size(px(style::scaled(&self.shared_settings, 30.0)))
                 .text_color(theme.accent)
                 .child("l3s")
                 .into_any_element(),
@@ -3605,7 +3622,7 @@ impl L3sView {
             .px_5()
             .pt_5()
             .pb_3()
-            .text_size(px(15.0))
+            .text_size(px(style::scaled(&self.shared_settings, 15.0)))
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
@@ -3627,7 +3644,7 @@ impl L3sView {
             .flex()
             .flex_col()
             .w_full()
-            .rounded_t_xl()
+            .rounded_t_lg()
             .bg(theme.panel.opacity(0.0))
             .border_t_1()
             .border_l_1()
@@ -3702,7 +3719,7 @@ impl L3sView {
         } else {
             chip = chip.child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(self.footer_font()))
                     .text_color(theme.muted)
                     .child(format!("{}:", field.label())),
             );
@@ -3762,7 +3779,7 @@ impl L3sView {
             .border_r_1()
             .border_b_1()
             .border_color(terminal_inset_border())
-            .rounded_b_3xl()
+            .rounded_b_lg()
             .child(self.home_meta_picker(HomeField::Machine, cx))
             .child(self.home_meta_picker(HomeField::Project, cx));
         // Branch and worktree only apply to a git project; a personal
@@ -3812,7 +3829,7 @@ impl L3sView {
                     .h(px(18.0))
                     .rounded_sm()
                     .bg(theme.border)
-                    .text_size(px(11.0))
+                    .text_size(px(self.section_font()))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.fg)
                     .child(letter)
@@ -3906,13 +3923,13 @@ impl L3sView {
             .rounded_lg()
             .bg(theme.bg)
             .border_1()
-            .border_color(theme.border);
+            .border_color(terminal_inset_border());
         if !filter.is_empty() {
             list = list.child(
                 div()
                     .px_3()
                     .pt_1()
-                    .text_size(px(11.0))
+                    .text_size(px(self.section_font()))
                     .text_color(theme.muted)
                     .child(format!("Filter: {filter}")),
             );
@@ -3962,7 +3979,7 @@ impl L3sView {
                 div()
                     .px_3()
                     .py_1()
-                    .text_size(px(11.0))
+                    .text_size(px(self.section_font()))
                     .text_color(theme.muted)
                     .child(format!("…{} more · type to filter", total - MAX_ROWS)),
             );
@@ -4325,26 +4342,22 @@ impl L3sView {
             .min_h(px(0.0))
             .child(
                 div().flex().flex_row().flex_shrink_0().px_4().pt_3().child(
-                    div()
-                        .id("l3s-projects-back")
-                        .px_4()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme.border)
-                        .cursor_pointer()
-                        .text_size(px(12.0))
-                        .text_color(theme.muted)
-                        .hover(|style| style.bg(theme.panel))
-                        .child("‹ Back")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if this.projects.in_form() {
-                                this.projects.cancel_form();
-                            } else {
-                                this.projects.close();
-                            }
-                            cx.notify();
-                        })),
+                    style::small_button(
+                        "l3s-projects-back",
+                        "‹ Back",
+                        style::ButtonKind::Secondary,
+                        theme,
+                        self.footer_font(),
+                    )
+                    .text_color(theme.muted)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.projects.in_form() {
+                            this.projects.cancel_form();
+                        } else {
+                            this.projects.close();
+                        }
+                        cx.notify();
+                    })),
                 ),
             )
             .child(
@@ -4364,7 +4377,7 @@ impl L3sView {
                     .flex_shrink_0()
                     .border_t_1()
                     .border_color(theme.border)
-                    .text_size(px(11.0))
+                    .text_size(px(self.section_font()))
                     .text_color(theme.muted)
                     .child(status)
             })
@@ -4374,23 +4387,17 @@ impl L3sView {
     /// New Project CTA. Future page sections will stack below this one.
     fn projects_section_block(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let new_button = div()
-            .id("l3s-projects-new")
-            .flex()
-            .items_center()
-            .h(px(24.0))
-            .px_2()
-            .rounded_md()
-            .bg(theme.accent)
-            .text_color(theme.window_bg)
-            .text_size(px(12.0))
-            .font_weight(FontWeight::BOLD)
-            .cursor_pointer()
-            .child("New Project")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.projects.start_new();
-                cx.notify();
-            }));
+        let new_button = style::small_button(
+            "l3s-projects-new",
+            "New Project",
+            style::ButtonKind::Primary,
+            theme,
+            self.footer_font(),
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.projects.start_new();
+            cx.notify();
+        }));
         div()
             .flex()
             .flex_col()
@@ -4403,11 +4410,7 @@ impl L3sView {
                     .justify_between()
                     .px_3()
                     .child(
-                        div()
-                            .text_size(px(self.section_font()))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.muted)
-                            .child("PROJECTS"),
+                        style::section_label(theme, "PROJECTS", self.section_font()),
                     )
                     .child(new_button),
             )
@@ -4428,34 +4431,22 @@ impl L3sView {
                 .justify_between()
                 .px_3()
                 .child(
-                    div()
-                        .text_size(px(self.section_font()))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.muted)
-                        .child("AGENT CONFIG"),
+                    style::section_label(theme, "AGENT CONFIG", self.section_font()),
                 )
                 .child(
-                    div()
-                        .id("l3s-agents-refresh")
-                        .flex()
-                        .items_center()
-                        .h(px(24.0))
-                        .px_2()
-                        .rounded_md()
-                        .bg(theme.panel_dim)
-                        .border_1()
-                        .border_color(theme.border)
-                        .text_size(px(11.0))
-                        .text_color(theme.fg)
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme.border))
-                        .child("Refresh")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.agent_config_cache.remove("local");
-                            this.agent_config_pending.remove("local");
-                            this.ensure_agent_configs_for("local");
-                            cx.notify();
-                        })),
+                    style::small_button(
+                        "l3s-agents-refresh",
+                        "Refresh",
+                        style::ButtonKind::Secondary,
+                        theme,
+                        self.section_font(),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.agent_config_cache.remove("local");
+                        this.agent_config_pending.remove("local");
+                        this.ensure_agent_configs_for("local");
+                        cx.notify();
+                    })),
                 ),
         );
         match configs {
@@ -4465,12 +4456,13 @@ impl L3sView {
                 }
             }
             Some(_) | None if loading => {
-                section = section.child(agent_config_empty(theme, "Detecting agents…"));
+                section = section.child(agent_config_empty(theme, "Detecting agents…", self.footer_font()));
             }
             Some(_) | None => {
                 section = section.child(agent_config_empty(
                     theme,
                     "No coding agents found. Install one, then Refresh.",
+                    self.footer_font(),
                 ));
             }
         }
@@ -4518,14 +4510,14 @@ impl L3sView {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_size(px(13.0))
+                                    .text_size(px(self.chrome_font()))
                                     .text_color(theme.fg)
                                     .child(config.label.clone()),
                             )
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .text_size(px(11.0))
+                                    .text_size(px(self.section_font()))
                                     .text_color(theme.muted)
                                     .child(config.kind.clone()),
                             ),
@@ -4536,7 +4528,7 @@ impl L3sView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .text_size(px(11.0))
+                            .text_size(px(self.section_font()))
                             .text_color(theme.muted)
                             .child(config.source.clone())
                             .child(format!("· default: {default}")),
@@ -4545,7 +4537,7 @@ impl L3sView {
             .child(
                 div()
                     .flex_shrink_0()
-                    .text_size(px(11.0))
+                    .text_size(px(self.section_font()))
                     .text_color(theme.muted)
                     .child(catalog),
             )
@@ -4564,29 +4556,19 @@ impl L3sView {
                 .justify_between()
                 .px_3()
                 .child(
-                    div()
-                        .text_size(px(self.section_font()))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.muted)
-                        .child("REMOTE MACHINES"),
+                    style::section_label(theme, "REMOTE MACHINES", self.section_font()),
                 )
                 .child(
-                    div()
-                        .id("l3s-machines-manage")
-                        .flex()
-                        .items_center()
-                        .h(px(24.0))
-                        .px_2()
-                        .rounded_md()
-                        .bg(theme.accent)
-                        .text_color(theme.window_bg)
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::BOLD)
-                        .cursor_pointer()
-                        .child("Manage Machines")
-                        .on_click(cx.listener(|_, _, window, cx| {
-                            window.dispatch_action(OpenMachineManager.boxed_clone(), cx);
-                        })),
+                    style::small_button(
+                        "l3s-machines-manage",
+                        "Manage Machines",
+                        style::ButtonKind::Primary,
+                        theme,
+                        self.footer_font(),
+                    )
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        window.dispatch_action(OpenMachineManager.boxed_clone(), cx);
+                    })),
                 ),
         );
         let mut any = false;
@@ -4599,7 +4581,7 @@ impl L3sView {
                 div()
                     .px_3()
                     .py_2()
-                    .text_size(px(12.0))
+                    .text_size(px(self.footer_font()))
                     .text_color(theme.muted)
                     .child("No remote machines yet. Add one to work on other hosts."),
             );
@@ -4646,14 +4628,14 @@ impl L3sView {
                                 div()
                                     .min_w(px(0.0))
                                     .truncate()
-                                    .text_size(px(13.0))
+                                    .text_size(px(self.chrome_font()))
                                     .text_color(theme.fg)
                                     .child(machine.display().to_string()),
                             )
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .text_size(px(11.0))
+                                    .text_size(px(self.section_font()))
                                     .text_color(theme.muted)
                                     .child(machine.id.clone()),
                             ),
@@ -4664,43 +4646,39 @@ impl L3sView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .text_size(px(11.0))
+                            .text_size(px(self.section_font()))
                             .text_color(theme.muted)
                             .child(machine.destination.clone())
                             .child(div().text_color(status_color).child(status)),
                     ),
             )
             .child(
-                div()
-                    .id(format!("l3s-machine-page-toggle-{id}"))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_size(px(11.0))
-                    .text_color(if busy { theme.muted } else { theme.fg })
-                    .hover(|style| style.bg(theme.panel_dim))
-                    .child(if busy { "…" } else { toggle_label })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_machine_page(toggle_id.clone());
-                        cx.notify();
-                    })),
+                style::small_button(
+                    format!("l3s-machine-page-toggle-{id}"),
+                    if busy { "…" } else { toggle_label },
+                    style::ButtonKind::Ghost,
+                    theme,
+                    self.section_font(),
+                )
+                .text_color(if busy { theme.muted } else { theme.fg })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_machine_page(toggle_id.clone());
+                    cx.notify();
+                })),
             )
             .child(
-                div()
-                    .id(format!("l3s-machine-page-remove-{id}"))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_size(px(11.0))
-                    .text_color(if confirming { theme.alert } else { theme.muted })
-                    .hover(|style| style.bg(theme.panel_dim))
-                    .child(if confirming { "Confirm" } else { "Remove" })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.remove_machine_page(remove_id.clone());
-                        cx.notify();
-                    })),
+                style::small_button(
+                    format!("l3s-machine-page-remove-{id}"),
+                    if confirming { "Confirm" } else { "Remove" },
+                    style::ButtonKind::Ghost,
+                    theme,
+                    self.section_font(),
+                )
+                .text_color(if confirming { theme.alert } else { theme.muted })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.remove_machine_page(remove_id.clone());
+                    cx.notify();
+                })),
             )
     }
 
@@ -4774,7 +4752,7 @@ impl L3sView {
             list = list.child(
                 div()
                     .py_4()
-                    .text_size(px(12.0))
+                    .text_size(px(self.footer_font()))
                     .text_color(theme.muted)
                     .child("No projects yet. Create one to group worktrees that live together."),
             );
@@ -4811,7 +4789,7 @@ impl L3sView {
                     .bg(theme.panel_dim)
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(self.footer_font()))
                             .text_color(theme.fg)
                             .child(format!("New worktree in {name} → {branch}")),
                     )
@@ -4831,7 +4809,7 @@ impl L3sView {
                                     .flex()
                                     .flex_row()
                                     .items_center()
-                                    .text_size(px(12.0))
+                                    .text_size(px(self.footer_font()))
                                     .child(div().text_color(theme.fg).child(before))
                                     .child(div().w(px(1.5)).h(px(14.0)).bg(theme.accent))
                                     .child(div().text_color(theme.fg).child(after)),
@@ -4859,15 +4837,13 @@ impl L3sView {
         // Live workspaces owned by this project, so the card shows what is
         // open on it — the same grouping the sidebar nests.
         let action = |id: &str, label: &str| {
-            div()
-                .id(format!("l3s-projects-{id}-{}", project.id))
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(px(11.0))
-                .hover(|style| style.bg(theme.panel_dim))
-                .child(label.to_string())
+            style::small_button(
+                format!("l3s-projects-{id}-{}", project.id),
+                label.to_string(),
+                style::ButtonKind::Ghost,
+                theme,
+                self.section_font(),
+            )
         };
         div()
             .id(format!("l3s-projects-row-{}", project.id))
@@ -4895,21 +4871,21 @@ impl L3sView {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(13.0))
+                            .text_size(px(self.chrome_font()))
                             .text_color(theme.fg)
                             .child(project.name.clone()),
                     )
                     .child(
                         div()
                             .flex_shrink_0()
-                            .text_size(px(11.0))
+                            .text_size(px(self.section_font()))
                             .text_color(theme.muted)
                             .child(host),
                     ),
             )
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(self.section_font()))
                     .text_color(theme.muted)
                     .child(shorten_home(&project.location)),
             )
@@ -4985,7 +4961,7 @@ impl L3sView {
             return list.child(
                 div()
                     .px_2()
-                    .text_size(px(11.0))
+                    .text_size(px(self.section_font()))
                     .text_color(theme.muted)
                     .child("No open worktrees"),
             );
@@ -4995,13 +4971,13 @@ impl L3sView {
                 .flex_1()
                 .min_w(px(0.0))
                 .truncate()
-                .text_size(px(12.0))
+                .text_size(px(self.footer_font()))
                 .text_color(theme.fg)
                 .child(name);
             let branch = match branch {
                 Some(branch) => div()
                     .flex_shrink_0()
-                    .text_size(px(11.0))
+                    .text_size(px(self.section_font()))
                     .text_color(theme.branch)
                     .child(branch),
                 None => div(),
@@ -5068,32 +5044,23 @@ impl L3sView {
                         cx,
                     )))
                     .child(
-                        div()
-                            .id("l3s-projects-browse")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.0))
-                            .px_3()
-                            .flex_shrink_0()
-                            .rounded_md()
-                            .bg(theme.panel_dim)
-                            .border_1()
-                            .border_color(theme.border)
-                            .text_size(px(12.0))
-                            .text_color(theme.fg)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme.border))
-                            .child("Browse…")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.browse_project_dir(cx);
-                            })),
+                        style::button(
+                            "l3s-projects-browse",
+                            "Browse…",
+                            style::ButtonKind::Secondary,
+                            theme,
+                            self.footer_font(),
+                        )
+                        .flex_shrink_0()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.browse_project_dir(cx);
+                        })),
                     ),
             );
         let mut machine_list = div().flex().flex_col().gap_1();
         machine_list = machine_list.child(
             div()
-                .text_size(px(11.0))
+                .text_size(px(self.section_font()))
                 .text_color(theme.muted)
                 .child("Machine"),
         );
@@ -5122,7 +5089,7 @@ impl L3sView {
                     .bg(if picked { theme.panel_dim } else { theme.panel })
                     .border_1()
                     .border_color(if picked { theme.accent } else { theme.border })
-                    .text_size(px(12.0))
+                    .text_size(px(self.footer_font()))
                     .text_color(theme.fg)
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -5135,43 +5102,30 @@ impl L3sView {
             );
         }
         body = body.child(machine_list);
-        let save = div()
-            .id("l3s-projects-save")
-            .flex()
-            .items_center()
-            .justify_center()
-            .h(px(28.0))
-            .px_3()
-            .rounded_md()
-            .bg(theme.accent)
-            .text_color(theme.window_bg)
-            .text_size(px(12.0))
-            .font_weight(FontWeight::BOLD)
-            .cursor_pointer()
-            .child("Save")
-            .on_click(cx.listener(|this, _, _, cx| {
-                let root = this.l3s_root.clone();
-                let ids = this.project_machine_ids();
-                let _ = this.projects.submit(&root, &ids);
-                cx.notify();
-            }));
-        let cancel = div()
-            .id("l3s-projects-cancel")
-            .flex()
-            .items_center()
-            .justify_center()
-            .h(px(28.0))
-            .px_3()
-            .rounded_md()
-            .cursor_pointer()
-            .text_size(px(12.0))
-            .text_color(theme.muted)
-            .hover(|style| style.bg(theme.panel_dim))
-            .child("Cancel")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.projects.cancel_form();
-                cx.notify();
-            }));
+        let save = style::button(
+            "l3s-projects-save",
+            "Save",
+            style::ButtonKind::Primary,
+            theme,
+            self.footer_font(),
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            let root = this.l3s_root.clone();
+            let ids = this.project_machine_ids();
+            let _ = this.projects.submit(&root, &ids);
+            cx.notify();
+        }));
+        let cancel = style::button(
+            "l3s-projects-cancel",
+            "Cancel",
+            style::ButtonKind::Ghost,
+            theme,
+            self.footer_font(),
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.projects.cancel_form();
+            cx.notify();
+        }));
         div().flex().flex_col().child(body).child(
             div()
                 .flex()
@@ -5209,31 +5163,16 @@ impl L3sView {
             }
             line = line.child(div().text_color(theme.fg).child(after));
         }
-        div()
-            .id(format!("l3s-project-field-{label}"))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(theme.muted)
-                    .child(label.to_string()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .h(px(28.0))
-                    .px_2()
-                    .rounded_md()
-                    .bg(theme.panel_dim)
-                    .border_1()
-                    .border_color(if focused { theme.accent } else { theme.border })
-                    .cursor_pointer()
-                    .child(line),
-            )
-            .on_mouse_down(
+        style::field(
+            format!("l3s-project-field-{label}"),
+            label,
+            focused,
+            theme,
+            28.0,
+            self.section_font(),
+            line,
+        )
+        .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     // Focus the field; Tab cycles from here.
@@ -5305,43 +5244,27 @@ impl L3sView {
 
         let feed_action = if editing {
             div().child(
-                div()
-                    .id("l3s-update-feed-save")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(28.0))
-                    .px_3()
-                    .flex_shrink_0()
-                    .rounded_md()
-                    .bg(theme.accent)
-                    .text_color(theme.window_bg)
-                    .text_size(px(11.0))
-                    .font_weight(FontWeight::BOLD)
-                    .cursor_pointer()
-                    .child("Save")
-                    .on_click(cx.listener(|this, _, _, cx| this.commit_update_feed(cx))),
+                style::button(
+                    "l3s-update-feed-save",
+                    "Save",
+                    style::ButtonKind::Primary,
+                    theme,
+                    self.section_font(),
+                )
+                .flex_shrink_0()
+                .on_click(cx.listener(|this, _, _, cx| this.commit_update_feed(cx))),
             )
         } else if explicit.is_some() {
             div().child(
-                div()
-                    .id("l3s-update-feed-reset")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(28.0))
-                    .px_3()
-                    .flex_shrink_0()
-                    .rounded_md()
-                    .bg(theme.panel_dim)
-                    .border_1()
-                    .border_color(theme.border)
-                    .text_size(px(11.0))
-                    .text_color(theme.fg)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme.border))
-                    .child("Use Default")
-                    .on_click(cx.listener(|this, _, _, cx| this.reset_update_feed(cx))),
+                style::button(
+                    "l3s-update-feed-reset",
+                    "Use Default",
+                    style::ButtonKind::Secondary,
+                    theme,
+                    self.section_font(),
+                )
+                .flex_shrink_0()
+                .on_click(cx.listener(|this, _, _, cx| this.reset_update_feed(cx))),
             )
         } else {
             div()
@@ -5374,13 +5297,13 @@ impl L3sView {
                     } else {
                         theme.panel_dim
                     })
-                    .text_size(px(10.0))
+                    .text_size(px(style::scaled(&self.shared_settings, 10.0)))
                     .text_color(theme.window_bg)
                     .child(if auto_check { "✓" } else { "" }),
             )
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(self.footer_font()))
                     .text_color(theme.fg)
                     .child("Check for updates on launch"),
             )
@@ -5391,12 +5314,7 @@ impl L3sView {
             .flex_col()
             .gap_3()
             .child(
-                div()
-                    .px_3()
-                    .text_size(px(self.section_font()))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.muted)
-                    .child("UPDATES"),
+                style::section_label(theme, "UPDATES", self.section_font()).px_3(),
             )
             .child(
                 div()
@@ -5418,7 +5336,7 @@ impl L3sView {
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(px(self.section_font()))
                                     .text_color(theme.muted)
                                     .child("Channel"),
                             )
@@ -5439,7 +5357,7 @@ impl L3sView {
                             .gap_1()
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(px(self.section_font()))
                                     .text_color(theme.muted)
                                     .child("Feed URL override"),
                             )
@@ -5456,29 +5374,25 @@ impl L3sView {
                     .child(checkbox)
                     .child(
                         div().flex().flex_row().items_center().justify_end().child(
-                            div()
-                                .id("l3s-update-check-now")
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .h(px(24.0))
-                                .px_2()
-                                .flex_shrink_0()
-                                .rounded_md()
-                                .bg(theme.panel_dim)
-                                .border_1()
-                                .border_color(theme.border)
-                                .text_size(px(11.0))
-                                .text_color(theme.fg)
-                                .cursor_pointer()
-                                .hover(|style| style.bg(theme.border))
-                                .child("Check Now")
-                                .on_click(cx.listener(|this, _, _, cx| {
+                            style::small_button(
+                                "l3s-update-check-now",
+                                "Check Now",
+                                style::ButtonKind::Secondary,
+                                theme,
+                                self.section_font(),
+                            )
+                            .flex_shrink_0()
+                            .on_click(cx.listener(|this, _, _, cx| {
                                     this.check_for_updates(cx);
                                     // Surface the result live (progress, up-to-date,
                                     // or retry) instead of only the footer badge.
                                     if !update_window::is_open(cx) {
-                                        update_window::open(this.updater.clone(), this.theme, cx);
+                                        update_window::open(
+                                            this.updater.clone(),
+                                            this.theme,
+                                            this.shared_settings.clone(),
+                                            cx,
+                                        );
                                     }
                                 })),
                         ),
@@ -5507,7 +5421,7 @@ impl L3sView {
                     theme.panel_dim
                 })
                 .text_color(if active { theme.window_bg } else { theme.fg })
-                .text_size(px(11.0))
+                .text_size(px(self.section_font()))
                 .font_weight(if active {
                     FontWeight::BOLD
                 } else {
@@ -5558,7 +5472,7 @@ impl L3sView {
             .h(px(38.0))
             .px_3()
             .border_b_1()
-            .border_color(theme.border)
+            .border_color(terminal_inset_border())
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .child(line)
@@ -5607,10 +5521,10 @@ impl L3sView {
             .h(px(42.0))
             .px_3()
             .border_b_1()
-            .border_color(theme.border)
+            .border_color(terminal_inset_border())
             .child(
                 div()
-                    .text_size(px(14.0))
+                    .text_size(px(style::scaled(&self.shared_settings, 14.0)))
                     .font_weight(FontWeight::BOLD)
                     .text_color(theme.fg)
                     .child(if picking_dir {
@@ -5721,7 +5635,7 @@ impl L3sView {
                 .rounded_md()
                 .bg(theme.sidebar_bg)
                 .border_1()
-                .border_color(theme.border)
+                .border_color(terminal_inset_border())
                 .child(list)
         } else {
             div()
@@ -5845,57 +5759,39 @@ impl L3sView {
                 this.picker.toggle_hidden();
                 cx.notify();
             }));
-        let open = div()
-            .id("l3s-picker-open")
-            .flex()
-            .items_center()
-            .h(px(26.0))
-            .px_3()
-            .flex_shrink_0()
-            .rounded_md()
-            .bg(theme.accent)
-            .text_color(theme.window_bg)
-            .text_size(px(self.footer_font()))
-            .font_weight(FontWeight::BOLD)
-            .cursor_pointer()
-            .child("Open this folder")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_workspace_path(cwd.clone(), cx);
-            }));
-        let worktree = div()
-            .id("l3s-picker-worktree")
-            .flex()
-            .items_center()
-            .h(px(26.0))
-            .px_3()
-            .flex_shrink_0()
-            .rounded_md()
-            .bg(theme.panel)
-            .text_color(theme.fg)
-            .text_size(px(self.footer_font()))
-            .cursor_pointer()
-            .hover(|style| style.bg(theme.border))
-            .child("Open with new worktree")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.open_new_worktree(cx);
-            }));
-        let use_dir = div()
-            .id("l3s-picker-use-dir")
-            .flex()
-            .items_center()
-            .h(px(26.0))
-            .px_3()
-            .flex_shrink_0()
-            .rounded_md()
-            .bg(theme.accent)
-            .text_color(theme.window_bg)
-            .text_size(px(self.footer_font()))
-            .font_weight(FontWeight::BOLD)
-            .cursor_pointer()
-            .child("Use this folder")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.use_picked_dir(cx);
-            }));
+        let open = style::button(
+            "l3s-picker-open",
+            "Open this folder",
+            style::ButtonKind::Primary,
+            theme,
+            self.footer_font(),
+        )
+        .flex_shrink_0()
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.open_workspace_path(cwd.clone(), cx);
+        }));
+        let worktree = style::button(
+            "l3s-picker-worktree",
+            "Open with new worktree",
+            style::ButtonKind::Secondary,
+            theme,
+            self.footer_font(),
+        )
+        .flex_shrink_0()
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.open_new_worktree(cx);
+        }));
+        let use_dir = style::button(
+            "l3s-picker-use-dir",
+            "Use this folder",
+            style::ButtonKind::Primary,
+            theme,
+            self.footer_font(),
+        )
+        .flex_shrink_0()
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.use_picked_dir(cx);
+        }));
         let mut footer = div()
             .flex()
             .flex_row()
@@ -5905,7 +5801,7 @@ impl L3sView {
             .px_3()
             .flex_shrink_0()
             .border_t_1()
-            .border_color(theme.border)
+            .border_color(terminal_inset_border())
             .child(hidden_toggle)
             .child(
                 div()
@@ -5947,7 +5843,7 @@ impl L3sView {
                     .rounded_lg()
                     .bg(theme.sidebar_bg)
                     .border_1()
-                    .border_color(theme.accent)
+                    .border_color(terminal_inset_border())
                     .overflow_hidden()
                     .child(header)
                     .child(path_field)
@@ -6878,7 +6774,7 @@ impl L3sView {
                 cx.notify();
             }));
         let fg = if active { theme.panel_fg } else { theme.muted };
-        let mut tab = div()
+        let tab = div()
             .id(format!("l3s-tab-{index}"))
             .group(group)
             .flex()
@@ -6894,11 +6790,6 @@ impl L3sView {
             .bg(if active { theme.panel } else { theme.window_bg })
             .text_color(fg)
             .hover(|style| style.bg(theme.panel).text_color(theme.panel_fg));
-        if active {
-            // Same low-contrast hairline as the terminal inset, so the active
-            // tab reads as raised without borrowing the scheme's border.
-            tab = tab.border_1().border_color(terminal_inset_border());
-        }
         tab.child(div().flex_1().child(label))
             .child(close)
             .on_click(cx.listener(move |this, _, _, cx| this.focus_tab(index, cx)))
@@ -7188,7 +7079,7 @@ impl L3sView {
                     .rounded_md()
                     .bg(theme.sidebar_bg)
                     .border_1()
-                    .border_color(theme.border)
+                    .border_color(terminal_inset_border())
                     .p_2()
                     .child(items)
                     .on_mouse_down(
@@ -7330,7 +7221,7 @@ impl L3sView {
             .h(px(44.0))
             .px_3()
             .border_b_1()
-            .border_color(theme.border)
+            .border_color(terminal_inset_border())
             .text_size(px(self.chrome_font()))
             .child(line);
 
@@ -7354,7 +7245,7 @@ impl L3sView {
                     .rounded_lg()
                     .bg(theme.sidebar_bg)
                     .border_1()
-                    .border_color(theme.accent)
+                    .border_color(terminal_inset_border())
                     .overflow_hidden()
                     .child(field)
                     .child(rows)
@@ -8274,21 +8165,11 @@ impl L3sView {
     ) -> impl IntoElement {
         let theme = self.theme;
         let focused = self.agent_focused(endpoint, agent);
-        let bg = if focused {
-            theme.selection_bg
-        } else {
-            theme.window_bg
-        };
-        let fg = if focused {
-            theme.selection_fg
-        } else {
-            theme.panel_fg
-        };
-        let dim = if focused {
-            theme.selection_fg.opacity(0.75)
-        } else {
-            theme.muted
-        };
+        // The focused row borrows the workspace/worktree pill, so a selected
+        // agent reads like a selected workspace instead of a text selection.
+        let bg = if focused { theme.panel } else { theme.window_bg };
+        let fg = theme.panel_fg;
+        let dim = theme.muted;
         let status = status_color(&agent.status, theme);
         let branch = agent.branch.clone();
         let cwd = shorten_home(&agent.cwd);
@@ -8319,13 +8200,7 @@ impl L3sView {
             .rounded_md()
             .bg(bg)
             .cursor_pointer()
-            .hover(move |style| {
-                if focused {
-                    style
-                } else {
-                    style.bg(theme.panel)
-                }
-            })
+            .hover(|style| style.bg(theme.panel))
             .tooltip(tip)
             .child(
                 div()
@@ -8650,7 +8525,7 @@ impl Render for L3sView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenAbout, _window, cx| {
-                about::open(this.theme, cx);
+                about::open(this.theme, this.shared_settings.clone(), cx);
             }))
             .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| {
                 this.check_for_updates(cx);
@@ -8670,10 +8545,9 @@ impl Render for L3sView {
                 }
             }));
 
-        // The chrome inherits the chosen UI family; the grid overrides it.
-        if let Some(font) = self.settings.ui_font.as_ref() {
-            root = root.font_family(font.clone());
-        }
+        // The chrome inherits the chosen UI family and size; the grid overrides
+        // both.
+        root = apply_chrome_font(root, &self.shared_settings);
 
         root.child(header)
             .child(
@@ -8942,6 +8816,17 @@ fn terminal_inset_border() -> gpui::Rgba {
     gpui::rgb(0x24242c)
 }
 
+/// Apply the user's Interface font family and base size to a window root, so
+/// every native surface starts from the same chrome type.
+fn apply_chrome_font<T: Styled>(root: T, settings: &Rc<RefCell<Settings>>) -> T {
+    let settings = settings.borrow();
+    let root = root.text_size(px(settings.ui_font_size));
+    match settings.ui_font.as_ref() {
+        Some(font) => root.font_family(font.clone()),
+        None => root,
+    }
+}
+
 fn symbol(cell: &CellData) -> &str {
     if cell.symbol.is_empty() {
         " "
@@ -9157,7 +9042,7 @@ impl Render for SidebarTip {
             .py_2()
             .rounded_md()
             .border_1()
-            .border_color(theme.border)
+            .border_color(terminal_inset_border())
             .bg(theme.panel)
             .text_size(px(SECTION_FONT))
             .child(
@@ -9293,7 +9178,7 @@ fn status_color(status: &str, theme: Theme) -> gpui::Rgba {
 }
 
 /// A muted placeholder row for the AGENT CONFIG section.
-fn agent_config_empty(theme: Theme, message: &str) -> Div {
+fn agent_config_empty(theme: Theme, message: &str, text_size: f32) -> Div {
     div()
         .mx_3()
         .px_3()
@@ -9301,7 +9186,7 @@ fn agent_config_empty(theme: Theme, message: &str) -> Div {
         .rounded_md()
         .border_1()
         .border_color(theme.border)
-        .text_size(px(12.0))
+        .text_size(px(text_size))
         .text_color(theme.muted)
         .child(message.to_string())
 }

@@ -18,6 +18,9 @@ workspace = true
 [features]
 default = ["gui"]
 gui = ["dep:gpui", "dep:gpui_platform"]
+# Headless Metal rendering used by `gui::shots` to capture each surface to a
+# PNG for visual consistency review. Not part of a normal build.
+visual-test = ["gui", "gpui/test-support", "gpui_platform/test-support"]
 
 [dependencies]
 anyhow.workspace = true

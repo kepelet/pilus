@@ -4,12 +4,18 @@
 //! status. It observes the shared [`Updater`] entity, so retries and progress
 //! repaint without reopening.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gpui::{
     App, Context, Entity, FocusHandle, KeyDownEvent, Render, Window, WindowBounds, WindowOptions,
     div, prelude::*, px, size,
 };
 use gpui_updater_core::UpdateStatus;
 
+use crate::settings::Settings;
+
+use super::style::{self, ButtonKind};
 use super::theme::Theme;
 use super::updater::Updater;
 use super::{CloseTab, CloseWindow, human_bytes};
@@ -34,13 +40,16 @@ enum Action {
 pub struct UpdateWindow {
     updater: Entity<Updater>,
     theme: Theme,
+    /// Shared client settings, so the Interface font reaches this window.
+    settings: Rc<RefCell<Settings>>,
     focus_handle: FocusHandle,
 }
 
 impl UpdateWindow {
-    fn new(
+    pub(super) fn new(
         updater: Entity<Updater>,
         theme: Theme,
+        settings: Rc<RefCell<Settings>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -51,8 +60,14 @@ impl UpdateWindow {
         Self {
             updater,
             theme,
+            settings,
             focus_handle,
         }
+    }
+
+    /// The window's type scale, resolved from the shared settings.
+    fn fonts(&self) -> style::Fonts {
+        style::Fonts::resolve(&self.settings)
     }
 }
 
@@ -107,39 +122,33 @@ impl Render for UpdateWindow {
                 ),
             };
 
+        let fonts = self.fonts();
         let button = action.map(|(action, label)| {
-            div()
-                .id("l3s-update-action")
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(30.0))
-                .px_4()
-                .rounded_md()
-                .bg(theme.accent)
-                .text_color(theme.window_bg)
-                .text_size(px(13.0))
-                .font_weight(gpui::FontWeight::BOLD)
-                .cursor_pointer()
-                .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    match action {
-                        Action::Check | Action::Retry => {
-                            this.updater.update(cx, |updater, cx| updater.check(cx));
-                        }
-                        Action::Download => {
-                            this.updater
-                                .update(cx, |updater, cx| updater.download_and_install(cx));
-                        }
-                        Action::Restart => {
-                            this.updater.update(cx, |updater, cx| updater.restart(cx));
-                        }
+            style::button(
+                "l3s-update-action",
+                label,
+                ButtonKind::Primary,
+                theme,
+                fonts.secondary,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                match action {
+                    Action::Check | Action::Retry => {
+                        this.updater.update(cx, |updater, cx| updater.check(cx));
                     }
-                    cx.notify();
-                }))
+                    Action::Download => {
+                        this.updater
+                            .update(cx, |updater, cx| updater.download_and_install(cx));
+                    }
+                    Action::Restart => {
+                        this.updater.update(cx, |updater, cx| updater.restart(cx));
+                    }
+                }
+                cx.notify();
+            }))
         });
 
-        div()
+        let root = div()
             .id("l3s-update-window")
             .track_focus(&self.focus_handle)
             .flex()
@@ -164,13 +173,13 @@ impl Render for UpdateWindow {
                     .pt_6()
                     .child(
                         div()
-                            .text_size(px(16.0))
+                            .text_size(px(style::scaled(&self.settings, 15.0)))
                             .font_weight(gpui::FontWeight::BOLD)
                             .child(heading),
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(self.fonts().secondary))
                             .text_color(theme.muted)
                             .child(detail),
                     ),
@@ -185,7 +194,8 @@ impl Render for UpdateWindow {
                     .px_6()
                     .pb_6()
                     .children(button),
-            )
+            );
+        super::apply_chrome_font(root, &self.settings)
     }
 }
 
@@ -197,7 +207,7 @@ pub fn is_open(cx: &App) -> bool {
 }
 
 /// Open the Update window for a shared updater entity.
-pub fn open(updater: Entity<Updater>, theme: Theme, cx: &mut App) {
+pub fn open(updater: Entity<Updater>, theme: Theme, settings: Rc<RefCell<Settings>>, cx: &mut App) {
     let bounds = gpui::Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
     let opened = cx.open_window(
         WindowOptions {
@@ -209,7 +219,7 @@ pub fn open(updater: Entity<Updater>, theme: Theme, cx: &mut App) {
             }),
             ..Default::default()
         },
-        move |window, cx| cx.new(move |cx| UpdateWindow::new(updater, theme, window, cx)),
+        move |window, cx| cx.new(move |cx| UpdateWindow::new(updater, theme, settings, window, cx)),
     );
     if let Err(error) = opened {
         eprintln!("l3s: could not open the update window: {error}");

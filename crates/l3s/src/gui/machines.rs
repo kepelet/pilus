@@ -18,6 +18,9 @@ use gpui::{
 };
 use l3s_client::{HOME_ENV, MachineInfo, luvus_binary, refresh_machines};
 
+use crate::settings::Settings;
+
+use super::style::{self, ButtonKind};
 use super::text_field::TextField;
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, MachineSignal};
@@ -131,6 +134,8 @@ pub struct MachineManagerView {
     signal: Rc<RefCell<MachineSignal>>,
     /// The app's live chrome palette, so this window matches the scheme.
     shared_theme: Rc<RefCell<Theme>>,
+    /// Shared client settings, so the Interface font reaches this window.
+    shared_settings: Rc<RefCell<Settings>>,
     machines: Vec<MachineInfo>,
     theme: Theme,
     form: Form,
@@ -150,10 +155,11 @@ pub struct MachineManagerView {
 }
 
 impl MachineManagerView {
-    fn new(
+    pub(super) fn new(
         root: PathBuf,
         signal: Rc<RefCell<MachineSignal>>,
         shared_theme: Rc<RefCell<Theme>>,
+        shared_settings: Rc<RefCell<Settings>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -168,6 +174,7 @@ impl MachineManagerView {
             signal,
             theme,
             shared_theme,
+            shared_settings,
             machines: Vec::new(),
             form: Form::default(),
             focus: None,
@@ -370,6 +377,11 @@ impl MachineManagerView {
         cx.notify();
     }
 
+    /// The window's type scale, resolved from the shared settings.
+    fn fonts(&self) -> style::Fonts {
+        style::Fonts::resolve(&self.shared_settings)
+    }
+
     /// A labelled single-line text field.
     fn field_box(&self, field: Field, label: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -388,40 +400,25 @@ impl MachineManagerView {
             }
             line = line.child(div().text_color(theme.fg).child(after));
         }
-        div()
-            .id(format!("l3s-machine-field-{label}"))
-            .flex_1()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(theme.muted)
-                    .child(label.to_string()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .h(px(28.0))
-                    .px_2()
-                    .rounded_md()
-                    .bg(theme.panel_dim)
-                    .border_1()
-                    .border_color(if focused { theme.accent } else { theme.border })
-                    .cursor_pointer()
-                    .child(line),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.focus = Some(field);
-                    this.form.field_mut(field).end();
-                    this.pending_remove = None;
-                    cx.notify();
-                }),
-            )
+        style::field(
+            format!("l3s-machine-field-{label}"),
+            label,
+            focused,
+            theme,
+            28.0,
+            self.fonts().label,
+            line,
+        )
+        .flex_1()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.focus = Some(field);
+                this.form.field_mut(field).end();
+                this.pending_remove = None;
+                cx.notify();
+            }),
+        )
     }
 
     /// The add-machine form.
@@ -458,7 +455,7 @@ impl MachineManagerView {
             .items_center()
             .gap_2()
             .cursor_pointer()
-            .text_size(px(12.0))
+            .text_size(px(self.fonts().secondary))
             .text_color(theme.fg)
             .child(check)
             .child("Install luvus if needed")
@@ -467,36 +464,24 @@ impl MachineManagerView {
                 this.pending_remove = None;
                 cx.notify();
             }));
-        let add = div()
-            .id("l3s-machine-add")
-            .flex()
-            .items_center()
-            .justify_center()
-            .h(px(28.0))
-            .px_3()
-            .rounded_md()
-            .bg(if installing {
-                theme.panel_dim
-            } else {
-                theme.accent
-            })
-            .text_color(if installing {
-                theme.muted
-            } else {
-                theme.window_bg
-            })
-            .text_size(px(12.0))
-            .font_weight(gpui::FontWeight::BOLD)
-            .cursor_pointer()
-            .child(if installing {
+        let mut add = style::button(
+            "l3s-machine-add",
+            if installing {
                 "Adding…"
             } else {
                 "Add machine"
-            })
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.submit();
-                cx.notify();
-            }));
+            },
+            ButtonKind::Primary,
+            theme,
+            self.fonts().secondary,
+        );
+        if installing {
+            add = add.bg(theme.panel_dim).text_color(theme.muted);
+        }
+        let add = add.on_click(cx.listener(|this, _, _, cx| {
+            this.submit();
+            cx.notify();
+        }));
         div()
             .flex()
             .flex_col()
@@ -505,7 +490,7 @@ impl MachineManagerView {
             .pt_3()
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(px(self.fonts().body))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(theme.fg)
                     .child("Add a machine"),
@@ -553,80 +538,74 @@ impl MachineManagerView {
             (true, "Enable")
         };
         let toggle_id = id.clone();
-        let toggle_button = div()
-            .id(format!("l3s-machine-toggle-{id}"))
-            .flex()
-            .items_center()
-            .h(px(24.0))
-            .px_2()
-            .rounded_md()
-            .bg(theme.panel)
-            .text_size(px(12.0))
-            .text_color(if busy { theme.muted } else { theme.fg })
-            .cursor_pointer()
-            .hover(|style| style.bg(theme.border))
-            .child(toggle.1)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.busy.is_some() {
-                    return;
+        let mut toggle_button = style::small_button(
+            format!("l3s-machine-toggle-{id}"),
+            toggle.1,
+            ButtonKind::Ghost,
+            theme,
+            self.fonts().label,
+        );
+        if busy {
+            toggle_button = toggle_button.text_color(theme.muted);
+        }
+        let toggle_button = toggle_button.on_click(cx.listener(move |this, _, _, cx| {
+            if this.busy.is_some() {
+                return;
+            }
+            this.pending_remove = None;
+            let op = if toggle.0 {
+                MachineOp::Enable {
+                    id: toggle_id.clone(),
+                    install: installing,
                 }
-                this.pending_remove = None;
-                let op = if toggle.0 {
-                    MachineOp::Enable {
-                        id: toggle_id.clone(),
-                        install: installing,
-                    }
-                } else {
-                    MachineOp::Disable {
-                        id: toggle_id.clone(),
-                    }
-                };
-                this.start_op(op, &toggle_id);
-                cx.notify();
-            }));
+            } else {
+                MachineOp::Disable {
+                    id: toggle_id.clone(),
+                }
+            };
+            this.start_op(op, &toggle_id);
+            cx.notify();
+        }));
 
         let remove_id = id.clone();
-        let remove_button = div()
-            .id(format!("l3s-machine-remove-{id}"))
-            .flex()
-            .items_center()
-            .h(px(24.0))
-            .px_2()
-            .rounded_md()
-            .text_size(px(12.0))
-            .text_color(if confirming { theme.alert } else { theme.muted })
-            .cursor_pointer()
-            .hover(|style| style.bg(theme.panel))
-            .child(if confirming { "Confirm" } else { "Remove" })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.busy.is_some() {
-                    return;
-                }
-                if this.pending_remove.as_deref() == Some(remove_id.as_str()) {
-                    this.pending_remove = None;
-                    this.start_op(
-                        MachineOp::Remove {
-                            id: remove_id.clone(),
-                        },
-                        &remove_id,
-                    );
-                } else {
-                    this.pending_remove = Some(remove_id.clone());
-                    this.status =
-                        format!("Remove `{remove_id}`? Click Confirm to delete the profile.");
-                }
-                cx.notify();
-            }));
+        let remove_button = style::small_button(
+            format!("l3s-machine-remove-{id}"),
+            if confirming { "Confirm" } else { "Remove" },
+            ButtonKind::Ghost,
+            theme,
+            self.fonts().label,
+        )
+        .text_color(if confirming { theme.alert } else { theme.muted })
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if this.busy.is_some() {
+                return;
+            }
+            if this.pending_remove.as_deref() == Some(remove_id.as_str()) {
+                this.pending_remove = None;
+                this.start_op(
+                    MachineOp::Remove {
+                        id: remove_id.clone(),
+                    },
+                    &remove_id,
+                );
+            } else {
+                this.pending_remove = Some(remove_id.clone());
+                this.status = format!("Remove `{remove_id}`? Click Confirm to delete the profile.");
+            }
+            cx.notify();
+        }));
 
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap_3()
-            .px_3()
+            .px_2()
             .py_2()
             .rounded_md()
-            .hover(|style| style.bg(theme.panel_dim))
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.border)
             .child(
                 div()
                     .flex_1()
@@ -641,13 +620,13 @@ impl MachineManagerView {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_size(px(13.0))
+                                    .text_size(px(self.fonts().body))
                                     .text_color(theme.fg)
                                     .child(machine.display().to_string()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(px(self.fonts().label))
                                     .text_color(theme.muted)
                                     .child(machine.id.clone()),
                             ),
@@ -658,7 +637,7 @@ impl MachineManagerView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .text_size(px(11.0))
+                            .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
                             .child(machine.destination.clone())
                             .child(div().text_color(status_color).child(status)),
@@ -683,16 +662,16 @@ impl MachineManagerView {
             .overflow_y_scroll();
         list = list.child(
             div()
-                .text_size(px(13.0))
+                .text_size(px(self.fonts().label))
                 .font_weight(gpui::FontWeight::BOLD)
-                .text_color(theme.fg)
+                .text_color(theme.muted)
                 .pb_1()
-                .child("Saved machines"),
+                .child("SAVED MACHINES"),
         );
         if self.machines.is_empty() {
             return list.child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(self.fonts().secondary))
                     .text_color(theme.muted)
                     .child("No machines yet. Add one above."),
             );
@@ -710,34 +689,30 @@ impl MachineManagerView {
 impl Render for MachineManagerView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let refresh = div()
-            .id("l3s-machine-refresh")
-            .flex()
-            .items_center()
-            .h(px(24.0))
-            .px_2()
-            .rounded_md()
-            .text_size(px(12.0))
-            .text_color(if self.refreshing {
-                theme.muted
-            } else {
-                theme.fg
-            })
-            .cursor_pointer()
-            .hover(|style| style.bg(theme.panel))
-            .child(if self.refreshing {
+        let refresh = style::small_button(
+            "l3s-machine-refresh",
+            if self.refreshing {
                 "Refreshing…"
             } else {
                 "Refresh"
-            })
-            .on_click(cx.listener(|this, _, _, cx| {
-                if !this.refreshing {
-                    this.probe();
-                }
-                cx.notify();
-            }));
+            },
+            ButtonKind::Secondary,
+            theme,
+            self.fonts().label,
+        )
+        .text_color(if self.refreshing {
+            theme.muted
+        } else {
+            theme.fg
+        })
+        .on_click(cx.listener(|this, _, _, cx| {
+            if !this.refreshing {
+                this.probe();
+            }
+            cx.notify();
+        }));
 
-        div()
+        let root = div()
             .id("l3s-machines-window")
             .relative()
             .track_focus(&self.focus_handle)
@@ -761,7 +736,7 @@ impl Render for MachineManagerView {
                     .pt_3()
                     .child(
                         div()
-                            .text_size(px(15.0))
+                            .text_size(px(style::scaled(&self.shared_settings, 15.0)))
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("Remote Machines"),
                     )
@@ -775,10 +750,11 @@ impl Render for MachineManagerView {
                     .py_2()
                     .border_t_1()
                     .border_color(theme.border)
-                    .text_size(px(11.0))
+                    .text_size(px(self.fonts().label))
                     .text_color(theme.muted)
                     .child(self.status.clone()),
-            )
+            );
+        super::apply_chrome_font(root, &self.shared_settings)
     }
 }
 
@@ -871,6 +847,7 @@ pub fn open(
     root: PathBuf,
     signal: Rc<RefCell<MachineSignal>>,
     shared_theme: Rc<RefCell<Theme>>,
+    shared_settings: Rc<RefCell<Settings>>,
     cx: &mut App,
 ) {
     let bounds = Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
@@ -885,7 +862,9 @@ pub fn open(
             ..Default::default()
         },
         move |window, cx| {
-            cx.new(move |cx| MachineManagerView::new(root, signal, shared_theme, window, cx))
+            cx.new(move |cx| {
+                MachineManagerView::new(root, signal, shared_theme, shared_settings, window, cx)
+            })
         },
     );
     if let Err(error) = opened {

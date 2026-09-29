@@ -1,5 +1,7 @@
 //! The native About window: the app name, version, and credits.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use gpui::{
@@ -7,6 +9,7 @@ use gpui::{
     WindowOptions, div, img, prelude::*, px, size,
 };
 
+use super::style;
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow};
 
@@ -41,6 +44,8 @@ const CREDITS: &[Credit] = &[
 /// The About window root view.
 pub struct AboutView {
     theme: Theme,
+    /// Shared client settings; only the Interface font is read here.
+    settings: Rc<RefCell<crate::settings::Settings>>,
     /// Version to show: the preview stamp when this build carries one, else
     /// the Cargo version.
     version: String,
@@ -48,7 +53,12 @@ pub struct AboutView {
 }
 
 impl AboutView {
-    fn new(theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(
+        theme: Theme,
+        settings: Rc<RefCell<crate::settings::Settings>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         // `preview-feed.sh` stamps the feed's synthetic version into the
@@ -56,9 +66,15 @@ impl AboutView {
         let version = crate::update::current_version().to_string();
         Self {
             theme,
+            settings,
             version,
             focus_handle,
         }
+    }
+
+    /// The window's type scale, resolved from the shared settings.
+    fn fonts(&self) -> style::Fonts {
+        style::Fonts::resolve(&self.settings)
     }
 }
 
@@ -90,20 +106,20 @@ impl Render for AboutView {
                     .flex_col()
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(px(self.fonts().body))
                             .text_color(theme.fg)
                             .child(credit.name),
                     )
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
                             .child(credit.detail),
                     ),
             );
         }
 
-        div()
+        let root = div()
             .id("l3s-about")
             .track_focus(&self.focus_handle)
             .flex()
@@ -139,7 +155,7 @@ impl Render for AboutView {
                                     .child(div().pb_2().child(app_icon().map_or_else(
                                         || {
                                             div()
-                                                .text_size(px(28.0))
+                                                .text_size(px(style::scaled(&self.settings, 28.0)))
                                                 .text_color(theme.accent)
                                                 .child("l3s")
                                                 .into_any_element()
@@ -148,19 +164,20 @@ impl Render for AboutView {
                                     )))
                                     .child(
                                         div()
-                                            .text_size(px(12.0))
+                                            .text_size(px(self.fonts().secondary))
                                             .text_color(theme.muted)
                                             .child(version),
                                     ),
                             )
                             .child(div().px_6().pt_2().pb_6().child(credits)),
                     ),
-            )
+            );
+        super::apply_chrome_font(root, &self.settings)
     }
 }
 
 /// Open the About window.
-pub fn open(theme: Theme, cx: &mut App) {
+pub fn open(theme: Theme, settings: Rc<RefCell<crate::settings::Settings>>, cx: &mut App) {
     let bounds = gpui::Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
     let opened = cx.open_window(
         WindowOptions {
@@ -172,7 +189,7 @@ pub fn open(theme: Theme, cx: &mut App) {
             }),
             ..Default::default()
         },
-        move |window, cx| cx.new(move |cx| AboutView::new(theme, window, cx)),
+        move |window, cx| cx.new(move |cx| AboutView::new(theme, settings, window, cx)),
     );
     if let Err(error) = opened {
         eprintln!("l3s: could not open about: {error}");

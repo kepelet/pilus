@@ -54,7 +54,8 @@ use l3s_client::{
     Surface, SurfaceChange, Tab, TaskSummary, common_git_dir, common_git_dirs_remote, config_dir,
     connect_machine, current_branch, current_branches_remote, expand_project_local,
     expand_project_remote, generate_session_name, l3s_config_dir, l3s_workspaces_dir,
-    list_branches, list_machines, list_session_infos, luvus_binary, refresh_machines,
+    list_branches, list_branches_remote, list_machines, list_session_infos, luvus_binary,
+    refresh_machines,
     split_client_socket,
 };
 use l3s_protocol::{
@@ -73,6 +74,8 @@ use updater::Updater;
 const LINE_HEIGHT_RATIO: f32 = 1.3;
 /// Height of our native tab strip; the grid starts below it.
 const TAB_STRIP_HEIGHT: f32 = 36.0;
+/// Height of a compact composer picker, above or inside the footer.
+const HOME_PICKER_HEIGHT: f32 = 24.0;
 /// Grid offset from the window top: tab strip plus its top spacing.
 const HEADER_HEIGHT: f32 = 40.0;
 /// Daemon rows skipped at the top of the grid. The daemon draws its own tab
@@ -1032,7 +1035,7 @@ struct L3sView {
     home_branch_rx: Receiver<(String, Vec<String>)>,
     /// Sender half for the background branch reader.
     home_branch_tx: Sender<(String, Vec<String>)>,
-    /// Agent availability and models for the Home composer's machine.
+    /// Agent availability and models for the Home composer's project.
     agent_configs: Vec<AgentConfig>,
     /// Agent configs by machine key (`local` or a machine id), so switching
     /// back to a machine is instant.
@@ -3051,10 +3054,6 @@ impl L3sView {
         self.leave_settings_page();
         self.picker.close();
         self.projects.reload(&self.l3s_root);
-        if self.home.new_branch().is_empty() {
-            self.home
-                .set_new_branch(generate_session_name(&self.session_names()));
-        }
         self.home.open();
         self.home_sync_key.clear();
         self.probe_machines();
@@ -3072,27 +3071,9 @@ impl L3sView {
             .collect()
     }
 
-    /// The enabled machine the Home composer's machine chip selects, if any.
-    fn home_machine_id(&self) -> Option<String> {
-        let cursor = self.home.choice(HomeField::Machine).cursor();
-        if cursor == 0 {
-            return None;
-        }
-        self.machines
-            .iter()
-            .filter(|machine| machine.id != "local" && machine.enabled)
-            .nth(cursor - 1)
-            .map(|machine| machine.id.clone())
-    }
-
-    /// The projects the Home composer offers, scoped to the machine chip.
+    /// The projects the Home composer offers.
     fn home_projects(&self) -> Vec<&Project> {
-        let machine = self.home_machine_id();
-        self.projects
-            .projects()
-            .iter()
-            .filter(|project| project.machine == machine)
-            .collect()
+        self.projects.projects().iter().collect()
     }
 
     /// The project the Home composer currently has highlighted.
@@ -3102,37 +3083,12 @@ impl L3sView {
             .and_then(|index| self.home_projects().get(index).copied())
     }
 
-    /// Whether the Home composer's selected project is a git repository with a
-    /// resolvable branch, so the branch and worktree pickers apply.
-    ///
-    /// Git facts resolve in the background; before the first answer the pickers
-    /// stay visible so a git project never flashes them off.
-    fn home_project_git(&self) -> bool {
-        let Some(project) = self.home_project() else {
-            return false;
-        };
-        let key = (project.endpoint_key().to_string(), project.location.clone());
-        match self.project_branch.get(&key) {
-            Some(None) => false,
-            Some(Some(_)) | None => true,
-        }
-    }
-
-    /// Move Home focus by one visible field, skipping the git pickers when the
-    /// selected project is not a repository.
+    /// Move Home focus by one field.
     fn home_move_focus(&mut self, backward: bool) {
-        for _ in 0..HomeField::ALL.len() + 2 {
-            if backward {
-                self.home.focus_prev();
-            } else {
-                self.home.focus_next();
-            }
-            match self.home.focus() {
-                HomeFocus::Prompt => return,
-                HomeFocus::Picker(HomeField::Base | HomeField::Branch)
-                    if !self.home_project_git() => {}
-                HomeFocus::Picker(_) => return,
-            }
+        if backward {
+            self.home.focus_prev();
+        } else {
+            self.home.focus_next();
         }
     }
 
@@ -3144,9 +3100,11 @@ impl L3sView {
             .find(|config| config.label == label)
     }
 
-    /// The machine key the Home composer's machine chip selects.
+    /// The machine key backing the selected project, `local` when none.
     fn home_machine_key(&self) -> String {
-        self.home_machine_id().unwrap_or_else(|| "local".to_string())
+        self.home_project()
+            .and_then(|project| project.machine.clone())
+            .unwrap_or_else(|| "local".to_string())
     }
 
     /// The SSH target for a machine key, or `None` for the local machine.
@@ -3201,8 +3159,7 @@ impl L3sView {
             return;
         }
         let signature = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            self.home.choice(HomeField::Machine).cursor(),
+            "{}|{}|{}|{}|{}|{}|{}",
             self.home
                 .choice(HomeField::Agent)
                 .selected()
@@ -3213,7 +3170,6 @@ impl L3sView {
                 .unwrap_or_default(),
             self.home.choice(HomeField::Project).cursor(),
             self.home_branches.len(),
-            self.machines.len(),
             self.projects.projects().len(),
             self.agent_configs.len(),
             self.agent_config_key.as_deref().unwrap_or_default(),
@@ -3222,15 +3178,6 @@ impl L3sView {
             return;
         }
         self.home_sync_key = signature;
-
-        let mut machines = vec!["Local".to_string()];
-        machines.extend(
-            self.machines
-                .iter()
-                .filter(|machine| machine.id != "local" && machine.enabled)
-                .map(|machine| machine.display().to_string()),
-        );
-        self.home.choice_mut(HomeField::Machine).set(machines);
 
         let mut agents: Vec<String> = self
             .agent_configs
@@ -3299,11 +3246,7 @@ impl L3sView {
             }
         }
 
-        let mut branches = vec![self.home.new_branch().to_string()];
-        branches.extend(self.home_branches.iter().cloned());
-        self.home.choice_mut(HomeField::Branch).set(branches);
-
-        let mut projects = vec!["No project".to_string()];
+        let mut projects = vec!["a personal workspace".to_string()];
         projects.extend(
             self.home_projects()
                 .iter()
@@ -3311,22 +3254,16 @@ impl L3sView {
         );
         self.home.choice_mut(HomeField::Project).set(projects);
 
-        // A hidden picker must not hold focus when the project changes.
-        if !self.home_project_git()
-            && matches!(
-                self.home.focus(),
-                HomeFocus::Picker(HomeField::Base | HomeField::Branch)
-            )
-        {
-            self.home.set_focus(HomeFocus::Picker(HomeField::Project));
-        }
+        self.home
+            .choice_mut(HomeField::Branch)
+            .set(self.home_branches.clone());
     }
 
     /// Load the selected project's local branches when the pick changes.
     ///
     /// Branch listing shells out to git, so it runs off-thread and reports
-    /// through a channel; remote projects keep only the generated name until
-    /// remote listing lands.
+    /// through a channel; remote projects keep the last listing until remote
+    /// listing lands.
     fn load_home_branches(&mut self) -> bool {
         let mut changed = false;
         while let Ok((id, branches)) = self.home_branch_rx.try_recv() {
@@ -3353,14 +3290,20 @@ impl L3sView {
         }) else {
             return changed;
         };
-        if project.machine.is_some() {
-            return changed;
-        }
+        let target = project
+            .machine
+            .as_deref()
+            .and_then(|id| self.machines.iter().find(|machine| machine.id == id))
+            .and_then(MachineInfo::ssh_target);
         let tx = self.home_branch_tx.clone();
         let id = project.id;
         let location = project.location;
         std::thread::spawn(move || {
-            tx.send((id, list_branches(&location))).ok();
+            let branches = match target {
+                Some(target) => list_branches_remote(&target, &location),
+                None => list_branches(&location),
+            };
+            tx.send((id, branches)).ok();
         });
         changed
     }
@@ -3493,13 +3436,6 @@ impl L3sView {
         prompt: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(machine) = self.home_machine_id() {
-            self.home.set_status(format!(
-                "Personal workspaces are local; `{machine}` was selected."
-            ));
-            cx.notify();
-            return;
-        }
         let Ok(mut client) = ControlClient::connect(&self.api_socket()) else {
             self.home
                 .set_status("No control connection for this machine.".to_string());
@@ -3515,15 +3451,7 @@ impl L3sView {
                 .map_err(|error| format!("couldn't create {}: {error}", dir.display()))
                 .and_then(|()| {
                     let location = dir.to_string_lossy().into_owned();
-                    launch_home_agent(
-                        &mut client,
-                        &location,
-                        BaseMode::Local,
-                        "",
-                        &name,
-                        &agent,
-                        &prompt,
-                    )
+                    launch_home_agent(&mut client, &location, BaseMode::Checkout, "", &name, &agent, &prompt)
                 });
             tx.send(PickerEvent::HomeLaunched { machine: None, result })
                 .ok();
@@ -3624,12 +3552,6 @@ impl L3sView {
     fn home_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let status = self.home.status().to_string();
-        let card = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .child(self.home_composer(cx))
-            .child(self.home_meta_row(cx));
         let mut column = div()
             .flex()
             .flex_col()
@@ -3638,14 +3560,15 @@ impl L3sView {
             .w_full()
             .max_w(px(720.0))
             .child(self.home_mark())
+            .child(self.home_headline(cx))
             .child(
                 div()
-                    .text_size(px(style::scaled(&self.shared_settings, 18.0)))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.fg)
-                    .child("Ready when you are"),
-            )
-            .child(card);
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(self.home_composer(cx))
+                    .child(self.home_footer(cx)),
+            );
         if !status.is_empty() {
             column = column.child(
                 div()
@@ -3668,6 +3591,107 @@ impl L3sView {
             .px_6()
             .py_8()
             .child(column)
+    }
+
+    /// The headline above the composer, naming the launch target inline.
+    fn home_headline(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .text_size(px(style::scaled(&self.shared_settings, 18.0)))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.fg)
+            .child("What should we build next in")
+            .child(self.home_headline_project(cx))
+    }
+
+    /// The project picker embedded in the headline.
+    ///
+    /// A secondary button, so it reads as the one clickable target in the
+    /// sentence.
+    fn home_headline_project(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let open = self.home.dropdown() == Some(HomeField::Project);
+        let value = self
+            .home
+            .choice(HomeField::Project)
+            .selected()
+            .unwrap_or_default()
+            .to_string();
+        let mut picker = style::small_button(
+            "l3s-home-headline-project",
+            div().max_w(px(320.0)).truncate().child(value),
+            style::ButtonKind::Secondary,
+            theme,
+            self.footer_font(),
+        )
+        .relative()
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(HomeField::Project, cx)))
+        .child(icon(
+            include_bytes!("../../assets/icons/chevron-down.svg"),
+            14.0,
+            theme.muted,
+        ));
+        if open {
+            picker = picker.child(self.home_dropdown_anchor(HomeField::Project, cx));
+        }
+        picker
+    }
+
+    /// The compact footer: the base picker on the left, the branch on the
+    /// right. In new-worktree mode the branch reads as `origin/<branch>`.
+    fn home_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .w_full()
+            .px_3()
+            .py(px(2.0))
+            .bg(theme.composer_footer)
+            .border_l_1()
+            .border_r_1()
+            .border_b_1()
+            .border_color(terminal_inset_border())
+            .rounded_b_lg()
+            .child(self.home_base_picker(cx))
+            .child(self.home_branch_picker(cx));
+        div().w_full().px_4().child(row)
+    }
+
+    /// The base-mode picker on the footer's left.
+    fn home_base_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let value = self
+            .home
+            .choice(HomeField::Base)
+            .selected()
+            .unwrap_or_default()
+            .to_string();
+        let leading = self.home_picker_leading(HomeField::Base, &value);
+        self.home_picker_face(HomeField::Base, leading, value, cx)
+    }
+
+    /// The branch picker in the footer. Under New worktree it names the
+    /// upstream it will branch from, so it reads `origin/<branch>`.
+    fn home_branch_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.home.choice(HomeField::Branch).selected();
+        let value = match selected {
+            Some(branch) if self.home.base_mode() == BaseMode::NewWorktree => {
+                format!("From: origin/{branch}")
+            }
+            Some(branch) => branch.to_string(),
+            None => "No branch".to_string(),
+        };
+        let leading = self.home_picker_leading(HomeField::Branch, &value);
+        self.home_picker_face(HomeField::Branch, leading, value, cx)
     }
 
     /// The app icon above the headline, falling back to the wordmark.
@@ -3695,9 +3719,9 @@ impl L3sView {
             .flex()
             .flex_col()
             .min_h(px(112.0))
-            .px_5()
-            .pt_5()
-            .pb_3()
+            .px_4()
+            .pt_4()
+            .pb(px(0.0))
             .text_size(px(style::scaled(&self.shared_settings, 15.0)))
             .cursor_pointer()
             .on_mouse_down(
@@ -3713,14 +3737,14 @@ impl L3sView {
 
     /// The composer card: the prompt above a row of pickers and the send button.
     ///
-    /// Only the top corners round; the meta footer continues the same card.
+    /// The card rounds on every corner and floats above the meta footer.
     fn home_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         div()
             .flex()
             .flex_col()
             .w_full()
-            .rounded_t_lg()
+            .rounded_lg()
             .bg(theme.panel.opacity(0.0))
             .border_t_1()
             .border_l_1()
@@ -3737,8 +3761,8 @@ impl L3sView {
                     .justify_between()
                     .gap_3()
                     .px_4()
-                    .pt_1()
-                    .pb_4()
+                    .pt_2()
+                    .pb_2()
                     .child(
                         div()
                             .flex()
@@ -3753,153 +3777,78 @@ impl L3sView {
             )
     }
 
-    /// One picker chip inside the composer, styled like a tab.
+    /// One picker chip inside the composer, drawn like the footer pickers.
     fn home_chip(&self, field: HomeField, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let active = self.home.focus() == HomeFocus::Picker(field)
-            || self.home.dropdown() == Some(field);
         let value = self
             .home
             .choice(field)
             .selected()
             .unwrap_or_default()
             .to_string();
-        let fg = if active { theme.panel_fg } else { theme.muted };
-        let mut chip = div()
-            .id(format!("l3s-home-chip-{}", field.label()))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .h(px(TAB_HEIGHT))
-            .px_3()
-            .rounded_md()
-            .bg(if active { theme.panel } else { theme.window_bg })
-            .text_color(fg)
-            .cursor_pointer()
-            .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(field, cx)));
-        if active {
-            chip = chip.border_1().border_color(terminal_inset_border());
-        }
-        if field == HomeField::Agent {
-            chip = chip.child(icon(agent_icon(&value), 14.0, fg));
-        } else {
-            chip = chip.child(
-                div()
-                    .text_size(px(self.footer_font()))
-                    .text_color(theme.muted)
-                    .child(format!("{}:", field.label())),
-            );
-        }
-        let mut chip = chip
-            .child(
-                div()
-                    .max_w(px(200.0))
-                    .truncate()
-                    .text_size(px(self.chrome_font()))
-                    .text_color(fg)
-                    .child(value),
-            )
-            .child(icon(
-                include_bytes!("../../assets/icons/chevron-down.svg"),
-                13.0,
-                theme.muted,
-            ));
-        if self.home.dropdown() == Some(field) {
-            chip = chip.relative().child(self.home_dropdown_anchor(field, cx));
-        }
-        chip
+        let leading = self.home_picker_leading(field, &value);
+        self.home_picker_face(field, leading, value, cx)
     }
 
     /// The icon-only circular send button.
     fn home_send_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         div()
-            .id("l3s-home-send")
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(30.0))
-            .h(px(30.0))
-            .rounded_full()
-            .bg(theme.panel)
-            .cursor_pointer()
-            .hover(move |style| style.bg(theme.border))
-            .on_click(cx.listener(|this, _, _, cx| this.home_send(cx)))
-            .child(icon(
-                include_bytes!("../../assets/icons/arrow-up.svg"),
-                15.0,
-                theme.fg,
-            ))
+            .pt_2()
+            .pb_2()
+            .child(
+                div()
+                    .id("l3s-home-send")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(30.0))
+                    .h(px(30.0))
+                    .rounded_full()
+                    .bg(theme.panel)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.border))
+                    .on_click(cx.listener(|this, _, _, cx| this.home_send(cx)))
+                    .child(icon(
+                        include_bytes!("../../assets/icons/arrow-up.svg"),
+                        15.0,
+                        theme.fg,
+                    )),
+            )
     }
 
-    /// The machine, project, and git pickers below the composer.
-    fn home_meta_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let mut row = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .justify_center()
-            .gap_5()
-            .w_full()
-            .px_3()
-            .py_2()
-            .bg(theme.window_bg)
-            .border_l_1()
-            .border_r_1()
-            .border_b_1()
-            .border_color(terminal_inset_border())
-            .rounded_b_lg()
-            .child(self.home_meta_picker(HomeField::Machine, cx))
-            .child(self.home_meta_picker(HomeField::Project, cx));
-        // Branch and worktree only apply to a git project; a personal
-        // workspace has neither.
-        if self.home_project_git() {
-            row = row
-                .child(self.home_meta_picker(HomeField::Base, cx))
-                .child(self.home_meta_picker(HomeField::Branch, cx));
-        }
-        div().w_full().px_4().child(row)
-    }
-
-    /// One picker in the meta footer, styled like a tab.
-    fn home_meta_picker(&self, field: HomeField, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+    /// The fill color of a picker's leading glyph, brighter when active.
+    fn home_picker_fg(&self, field: HomeField) -> gpui::Rgba {
         let active = self.home.focus() == HomeFocus::Picker(field)
             || self.home.dropdown() == Some(field);
-        let fg = if active { theme.panel_fg } else { theme.muted };
-        let selected = match field {
-            HomeField::Base => self.home.base_mode().label().to_string(),
-            _ => self
-                .home
-                .choice(field)
-                .selected()
-                .unwrap_or_default()
-                .to_string(),
-        };
-        let leading: AnyElement = match field {
-            HomeField::Machine => icon(
-                include_bytes!("../../assets/icons/monitor.svg"),
-                15.0,
-                fg,
-            )
-            .into_any_element(),
-            HomeField::Project => match self.home_project().and_then(|project| {
-                project
-                    .name
-                    .chars()
-                    .next()
-                    .map(|ch| ch.to_uppercase().to_string())
-            }) {
+        if active {
+            self.theme.panel_fg
+        } else {
+            self.theme.muted
+        }
+    }
+
+    /// The leading glyph shared by a composer chip and a footer picker.
+    fn home_picker_leading(&self, field: HomeField, value: &str) -> AnyElement {
+        let fg = self.home_picker_fg(field);
+        let theme = self.theme;
+        let glyph = |bytes: &'static [u8]| icon(bytes, 14.0, fg).into_any_element();
+        match field {
+            HomeField::Agent => glyph(agent_icon(value)),
+            HomeField::Model => glyph(include_bytes!("../../assets/icons/cpu.svg")),
+            HomeField::Effort => glyph(include_bytes!("../../assets/icons/gauge.svg")),
+            HomeField::Base => glyph(include_bytes!("../../assets/icons/git-fork.svg")),
+            HomeField::Branch => glyph(include_bytes!("../../assets/icons/git-branch.svg")),
+            HomeField::Project => match self
+                .home_project()
+                .and_then(|project| project.name.chars().next())
+                .map(|ch| ch.to_uppercase().to_string())
+            {
                 Some(letter) => div()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .w(px(18.0))
-                    .h(px(18.0))
+                    .w(px(16.0))
+                    .h(px(16.0))
                     .rounded_sm()
                     .bg(theme.border)
                     .text_size(px(self.section_font()))
@@ -3907,31 +3856,34 @@ impl L3sView {
                     .text_color(theme.fg)
                     .child(letter)
                     .into_any_element(),
-                None => icon(include_bytes!("../../assets/icons/folder.svg"), 15.0, fg)
-                    .into_any_element(),
+                None => glyph(include_bytes!("../../assets/icons/folder.svg")),
             },
-            HomeField::Base => icon(
-                include_bytes!("../../assets/icons/git-fork.svg"),
-                15.0,
-                fg,
-            )
-            .into_any_element(),
-            HomeField::Branch => icon(
-                include_bytes!("../../assets/icons/git-branch.svg"),
-                15.0,
-                fg,
-            )
-            .into_any_element(),
-            _ => div().into_any_element(),
-        };
-        let mut item = div()
-            .id(format!("l3s-home-meta-{}", field.label()))
+        }
+    }
+
+    /// The compact face shared by every composer picker.
+    ///
+    /// Agent, model, and effort all draw through this, so the chips read as
+    /// one control with one interaction.
+    fn home_picker_face(
+        &self,
+        field: HomeField,
+        leading: AnyElement,
+        value: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let active = self.home.focus() == HomeFocus::Picker(field)
+            || self.home.dropdown() == Some(field);
+        let fg = if active { theme.panel_fg } else { theme.muted };
+        let mut face = div()
+            .id(format!("l3s-home-picker-{}", field.label()))
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .h(px(TAB_HEIGHT))
-            .px_3()
+            .h(px(HOME_PICKER_HEIGHT))
+            .px_2()
             .rounded_md()
             .bg(if active {
                 theme.panel
@@ -3943,27 +3895,27 @@ impl L3sView {
             .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(field, cx)));
         if active {
-            item = item.border_1().border_color(terminal_inset_border());
+            face = face.border_1().border_color(terminal_inset_border());
         }
-        let mut item = item
+        let mut face = face
             .child(leading)
             .child(
                 div()
                     .max_w(px(180.0))
                     .truncate()
-                    .text_size(px(self.chrome_font()))
+                    .text_size(px(self.footer_font()))
                     .text_color(fg)
-                    .child(selected),
+                    .child(value),
             )
             .child(icon(
                 include_bytes!("../../assets/icons/chevron-down.svg"),
-                13.0,
+                12.0,
                 theme.muted,
             ));
         if self.home.dropdown() == Some(field) {
-            item = item.relative().child(self.home_dropdown_anchor(field, cx));
+            face = face.relative().child(self.home_dropdown_anchor(field, cx));
         }
-        item
+        face.into_any_element()
     }
 
     /// Toggle `field`'s dropdown from its chip.
@@ -4091,7 +4043,7 @@ impl L3sView {
         deferred(
             anchored()
                 .anchor(Anchor::TopLeft)
-                .offset(point(px(0.0), px(TAB_HEIGHT + 4.0)))
+                .offset(point(px(0.0), px(HOME_PICKER_HEIGHT + 4.0)))
                 .snap_to_window_with_margin(px(8.0))
                 .child(list),
         )

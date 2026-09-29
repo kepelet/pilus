@@ -39,6 +39,7 @@ pub use projects::{
     Project, RemoteRepos, common_git_dir, common_git_dirs_remote, current_branch,
     current_branches_remote, expand_local as expand_project_local,
     expand_remote as expand_project_remote, id_for_name as project_id_for_name, list_branches,
+    list_branches_remote,
     load_projects, projects_file, save_projects, validate as validate_project,
 };
 pub use surface::{Surface, SurfaceChange};

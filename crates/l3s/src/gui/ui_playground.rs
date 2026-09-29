@@ -43,11 +43,13 @@ const ICONS: &[(&str, &[u8])] = &[
         "corner-down-right",
         include_bytes!("../../assets/icons/corner-down-right.svg"),
     ),
+    ("cpu", include_bytes!("../../assets/icons/cpu.svg")),
     ("folder", include_bytes!("../../assets/icons/folder.svg")),
     (
         "folder-git",
         include_bytes!("../../assets/icons/folder-git.svg"),
     ),
+    ("gauge", include_bytes!("../../assets/icons/gauge.svg")),
     ("house", include_bytes!("../../assets/icons/house.svg")),
     (
         "layout-panel-left",
@@ -106,7 +108,7 @@ enum InputId {
 
 /// One working dropdown in the gallery.
 struct Picker {
-    prefix: &'static str,
+    icon: &'static [u8],
     options: Vec<&'static str>,
     selected: usize,
 }
@@ -176,12 +178,12 @@ impl UiPlaygroundView {
             multi,
             pickers: vec![
                 Picker {
-                    prefix: "Model:",
+                    icon: include_bytes!("../../assets/icons/cpu.svg"),
                     options: vec!["Default", "DeepSeek V4.1 Flash", "Muse Spark 1.3"],
                     selected: 1,
                 },
                 Picker {
-                    prefix: "Effort:",
+                    icon: include_bytes!("../../assets/icons/gauge.svg"),
                     options: vec!["Default", "Low", "Medium", "High"],
                     selected: 3,
                 },
@@ -353,7 +355,7 @@ impl UiPlaygroundView {
             .get(picker.selected)
             .copied()
             .unwrap_or_default();
-        let prefix = picker.prefix;
+        let glyph = picker.icon;
         let active = self.open_picker == Some(index);
         let fg = if active { theme.panel_fg } else { theme.muted };
         let mut chip = div()
@@ -362,10 +364,14 @@ impl UiPlaygroundView {
             .flex_row()
             .items_center()
             .gap_2()
-            .h(px(26.0))
-            .px_3()
+            .h(px(24.0))
+            .px_2()
             .rounded_md()
-            .bg(if active { theme.panel } else { theme.window_bg })
+            .bg(if active {
+                theme.panel
+            } else {
+                theme.panel.opacity(0.0)
+            })
             .text_color(fg)
             .cursor_pointer()
             .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
@@ -380,25 +386,20 @@ impl UiPlaygroundView {
         if active {
             chip = chip.border_1().border_color(terminal_inset_border());
         }
-        chip.child(
-            div()
-                .text_size(px(self.fonts().secondary))
-                .text_color(theme.muted)
-                .child(prefix),
-        )
-        .child(
-            div()
-                .max_w(px(180.0))
-                .truncate()
-                .text_size(px(self.fonts().body))
-                .text_color(fg)
-                .child(value),
-        )
-        .child(icon(
-            include_bytes!("../../assets/icons/chevron-down.svg"),
-            13.0,
-            theme.muted,
-        ))
+        chip.child(icon(glyph, 14.0, fg))
+            .child(
+                div()
+                    .max_w(px(180.0))
+                    .truncate()
+                    .text_size(px(self.fonts().secondary))
+                    .text_color(fg)
+                    .child(value),
+            )
+            .child(icon(
+                include_bytes!("../../assets/icons/chevron-down.svg"),
+                12.0,
+                theme.muted,
+            ))
     }
 
     /// The open picker's option list, shown under the chip row.
@@ -1560,7 +1561,7 @@ impl Render for UiPlaygroundView {
                                         deferred(
                                             anchored()
                                                 .anchor(Anchor::TopLeft)
-                                                .offset(point(px(0.0), px(30.0)))
+                                                .offset(point(px(0.0), px(28.0)))
                                                 .snap_to_window_with_margin(px(8.0))
                                                 .child(self.picker_options(cx)),
                                         )

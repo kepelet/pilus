@@ -5,7 +5,7 @@
 //! resolves the picker options from live daemon data, paints them, and routes
 //! keys, so the model stays unit-testable without GPUI or a daemon.
 
-use super::text_field::TextField;
+use super::text_input::TextField;
 
 /// The pickers in the composer, in the order they read across it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -247,11 +247,6 @@ impl HomePanel {
     /// The prompt buffer.
     pub fn prompt(&self) -> &TextField {
         &self.prompt
-    }
-
-    /// The prompt buffer, mutably.
-    pub fn prompt_mut(&mut self) -> &mut TextField {
-        &mut self.prompt
     }
 
     /// The generated branch offered first for a new worktree.

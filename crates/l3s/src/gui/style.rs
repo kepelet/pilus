@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui::{Div, ElementId, FontWeight, IntoElement, Stateful, div, prelude::*, px};
+use gpui::{Div, ElementId, Font, FontWeight, IntoElement, Stateful, div, font, prelude::*, px};
 
 use crate::settings::{CHROME_FONT, Settings};
 
@@ -49,6 +49,17 @@ impl Fonts {
             secondary: scaled(settings, TEXT_SECONDARY),
             label: scaled(settings, TEXT_LABEL),
         }
+    }
+}
+
+/// The chrome font family, or the platform default when the setting is unset.
+///
+/// Text drawn through GPUI's shaper needs the family explicitly; a window's
+/// `font_family` style does not reach [`gpui::ShapedLine`].
+pub(super) fn chrome_font(settings: &Rc<RefCell<Settings>>) -> Font {
+    match settings.borrow().ui_font.as_ref() {
+        Some(family) => font(family.clone()),
+        None => Font::default(),
     }
 }
 

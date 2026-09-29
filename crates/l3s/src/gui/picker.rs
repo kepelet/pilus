@@ -10,7 +10,7 @@ use std::sync::mpsc::Sender;
 
 use l3s_client::SshTarget;
 
-use super::text_field::TextField;
+use super::text_input::TextField;
 
 /// Where the picker reads directories from.
 #[derive(Clone, PartialEq)]
@@ -172,11 +172,6 @@ impl WorkspacePicker {
         &self.path
     }
 
-    /// The editable path buffer for key handling.
-    pub fn path_mut(&mut self) -> &mut TextField {
-        &mut self.path
-    }
-
     /// Whether hidden directories are shown.
     pub fn show_hidden(&self) -> bool {
         self.show_hidden
@@ -252,7 +247,7 @@ impl WorkspacePicker {
                 // directory and `..` keeps working.
                 if listed.root != self.cwd {
                     self.cwd = listed.root.clone();
-                    self.path = TextField::with_value(self.cwd.clone());
+                    self.path.set_value(self.cwd.clone());
                 }
                 self.all = listed.entries;
             }
@@ -313,7 +308,7 @@ impl WorkspacePicker {
     /// Start editing the path field.
     pub fn begin_edit(&mut self) {
         self.editing = true;
-        self.path = TextField::with_value(self.cwd.clone());
+        self.path.set_value(self.cwd.clone());
     }
 
     /// Stop editing without changing the directory.
@@ -323,7 +318,7 @@ impl WorkspacePicker {
 
     /// Jump to the edited path, returning it to list.
     pub fn jump(&mut self) -> Option<String> {
-        let target = self.path.value.trim().to_string();
+        let target = self.path.value().trim().to_string();
         self.editing = false;
         if target.is_empty() || target == self.cwd {
             return None;
@@ -390,7 +385,7 @@ impl WorkspacePicker {
         self.loading = true;
         self.error = None;
         self.editing = false;
-        self.path = TextField::with_value(self.cwd.clone());
+        self.path.set_value(self.cwd.clone());
     }
 
     /// Recompute the drawn rows from the full listing.

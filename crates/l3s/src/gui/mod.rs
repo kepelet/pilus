@@ -20,7 +20,7 @@ mod selection;
 pub(crate) mod shots;
 pub(crate) mod sound;
 mod style;
-mod text_field;
+mod text_input;
 mod theme;
 mod ui_playground;
 mod update_window;
@@ -42,7 +42,7 @@ use crossterm::event::{
 use gpui::{
     Action, AnyElement, App, Bounds, ClipboardItem, Context, DisplayId, Div, Entity, FocusHandle,
     FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
+    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
     ScrollHandle, ScrollWheelEvent, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions,
     div, font, img, point, prelude::*, px, size, svg,
 };
@@ -65,7 +65,7 @@ use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use projects::{ProjectField, ProjectsPanel};
 use selection::{Cell, Selection};
-use text_field::TextField;
+use text_input::{TextField, TextInput};
 use theme::Theme;
 use updater::Updater;
 
@@ -446,9 +446,9 @@ fn app_key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("cmd-,", OpenAppearances, None),
         KeyBinding::new("cmd-q", QuitApp, None),
-        KeyBinding::new("cmd-c", CopySelection, None),
-        KeyBinding::new("cmd-v", PasteClipboard, None),
-        KeyBinding::new("cmd-a", SelectAllGrid, None),
+        KeyBinding::new("cmd-c", CopySelection, Some("!Input")),
+        KeyBinding::new("cmd-v", PasteClipboard, Some("!Input")),
+        KeyBinding::new("cmd-a", SelectAllGrid, Some("!Input")),
         KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("cmd-n", NewWindow, None),
         KeyBinding::new("cmd-shift-n", OpenHome, None),
@@ -831,10 +831,14 @@ struct L3sView {
     session_menu_open: bool,
     /// The ⌘⇧P command palette's query and selection.
     palette: Palette,
+    /// The palette's query field, an IME-capable field over `palette`'s buffer.
+    palette_input: Entity<TextInput>,
     /// Keeps the highlighted palette row scrolled into view.
     palette_scroll: ScrollHandle,
     /// The native Open Workspace folder picker.
     picker: WorkspacePicker,
+    /// The picker's path field, an IME-capable field over `picker`'s buffer.
+    picker_path: Entity<TextInput>,
     /// What the picker is currently being used for.
     picker_purpose: PickerPurpose,
     /// Keeps the highlighted picker row scrolled into view.
@@ -948,6 +952,8 @@ struct L3sView {
     app_version: String,
     /// Update feed URL while the Settings page is editing it.
     update_feed: TextField,
+    /// The feed-URL input, an IME-capable field over `update_feed`.
+    update_feed_input: Entity<TextInput>,
     /// Whether the update feed URL field owns the keyboard.
     update_url_editing: bool,
     /// Machine-manager revision signal, shared with the manager window.
@@ -956,6 +962,10 @@ struct L3sView {
     seen_machine_revision: u64,
     /// Persistent projects and the in-window manager panel.
     projects: ProjectsPanel,
+    /// The project form's four inputs, entities over the panel's buffers.
+    project_inputs: [Entity<TextInput>; 4],
+    /// The inline new-worktree name input.
+    worktree_input: Entity<TextInput>,
     /// Git common dirs by `(endpoint key, cwd)`, resolving which repository
     /// a workspace belongs to no matter where its worktree lives.
     project_repo: HashMap<(String, String), Option<String>>,
@@ -976,6 +986,8 @@ struct L3sView {
     project_repo_pending: bool,
     /// The Home composer's state.
     home: HomePanel,
+    /// The composer's prompt, an IME-capable field over `home`'s buffer.
+    home_prompt: Entity<TextInput>,
     /// Local branches of the Home composer's selected project.
     home_branches: Vec<String>,
     /// The project a branch listing belongs to, so a change reloads once.
@@ -1063,6 +1075,83 @@ impl L3sView {
         );
         let updater = cx.new(|cx| Updater::from_request(&update_request, cx));
         let auto_check = settings.auto_check_updates;
+        let initial_theme = *shared_theme.borrow();
+        let initial_fonts = style::Fonts::resolve(&shared_settings);
+        let home = HomePanel::default();
+        let home_prompt = cx.new(|cx| {
+            TextInput::from_shared(
+                home.prompt().shared(),
+                "Describe the work…",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                true,
+                initial_theme,
+                cx,
+            )
+            .submit_on_enter()
+        });
+        let picker = WorkspacePicker::default();
+        let picker_path = cx.new(|cx| {
+            TextInput::from_shared(
+                picker.path().shared(),
+                "Path",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+
+        let projects = ProjectsPanel::default();
+        let update_feed = TextField::default();
+        let update_feed_input = cx.new(|cx| {
+            TextInput::from_shared(
+                update_feed.shared(),
+                "Feed URL",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+        let project_inputs = [
+            Self::build_project_input(cx, &projects, ProjectField::Name, "Name", &shared_settings, initial_theme, initial_fonts.body),
+            Self::build_project_input(cx, &projects, ProjectField::Repository, "Repository", &shared_settings, initial_theme, initial_fonts.body),
+            Self::build_project_input(cx, &projects, ProjectField::BranchPrefix, "Branch prefix", &shared_settings, initial_theme, initial_fonts.body),
+            Self::build_project_input(cx, &projects, ProjectField::Location, "Location", &shared_settings, initial_theme, initial_fonts.body),
+        ];
+        let worktree_input = cx.new(|cx| {
+            TextInput::from_shared(
+                projects.worktree_name().shared(),
+                "Worktree name",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+
+        let palette = Palette::default();
+        let palette_input = cx.new(|cx| {
+            TextInput::from_shared(
+                palette.input().shared(),
+                "Type a command…",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+        // Every edit re-points the highlight at the best match.
+        cx.observe(&palette_input, |this, _, cx| {
+            this.palette.reset_selection();
+            cx.notify();
+        })
+        .detach();
 
         let mut view = Self {
             target,
@@ -1094,9 +1183,11 @@ impl L3sView {
             sessions,
             last_session_poll: Instant::now(),
             session_menu_open: false,
-            palette: Palette::default(),
+            palette,
+            palette_input,
             palette_scroll: ScrollHandle::new(),
             picker: WorkspacePicker::default(),
+            picker_path,
             picker_purpose: PickerPurpose::OpenWorkspace,
             picker_scroll: ScrollHandle::new(),
             picker_rx,
@@ -1153,11 +1244,14 @@ impl L3sView {
             updater: updater.clone(),
             last_update_status: UpdateStatus::Idle,
             app_version: crate::update::current_version().to_string(),
-            update_feed: TextField::default(),
+            update_feed,
+            update_feed_input,
             update_url_editing: false,
             machine_signal,
             seen_machine_revision: 0,
-            projects: ProjectsPanel::default(),
+            projects,
+            project_inputs,
+            worktree_input,
             project_repo: HashMap::new(),
             project_repo_rx,
             project_repo_tx,
@@ -1166,7 +1260,8 @@ impl L3sView {
             project_branch: HashMap::new(),
             project_sel: None,
             project_sel_at: Instant::now(),
-            home: HomePanel::default(),
+            home,
+            home_prompt,
             home_branches: Vec::new(),
             home_branch_project: None,
             home_branch_rx,
@@ -2335,49 +2430,9 @@ impl L3sView {
                 self.palette_scroll
                     .scroll_to_item(self.palette.selected().min(len.saturating_sub(1)));
             }
-            "left" => self.palette.move_cursor(-1),
-            "right" => self.palette.move_cursor(1),
-            "home" => self.palette.cursor_home(),
-            "end" => self.palette.cursor_end(),
-            "delete" | "del" => {
-                // ⌘Delete clears the whole query, matching the field convention.
-                if keystroke.modifiers.platform {
-                    self.palette.clear();
-                } else {
-                    self.palette.delete();
-                }
-                self.palette_scroll.scroll_to_item(0);
-            }
-            "backspace" => {
-                if keystroke.modifiers.platform {
-                    self.palette.clear();
-                } else {
-                    self.palette.backspace();
-                }
-                self.palette_scroll.scroll_to_item(0);
-            }
-            "space" => {
-                self.palette.insert(" ");
-                self.palette_scroll.scroll_to_item(0);
-            }
-            _ => {
-                // Only unmodified text edits the query; chords stay inert.
-                if keystroke.modifiers.platform || keystroke.modifiers.control {
-                    return;
-                }
-                if let Some(text) = keystroke
-                    .key_char
-                    .as_deref()
-                    .filter(|text| !text.is_empty())
-                {
-                    self.palette.insert(text);
-                    self.palette_scroll.scroll_to_item(0);
-                } else if keystroke.key.chars().count() == 1 {
-                    // Some layouts deliver a bare character without `key_char`.
-                    self.palette.insert(&keystroke.key);
-                    self.palette_scroll.scroll_to_item(0);
-                }
-            }
+            // Everything else belongs to the query field: the entity handles
+            // editing and stops propagation, so only these keys reach here.
+            _ => {}
         }
         cx.notify();
     }
@@ -2596,29 +2651,6 @@ impl L3sView {
         }
     }
 
-    /// Copy the palette query, mirroring [`Self::copy_selection`] for the grid.
-    fn copy_query(&self, cx: &mut Context<Self>) {
-        let query = self.palette.query();
-        if !query.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(query.to_string()));
-        }
-    }
-
-    /// Paste the system clipboard into the palette query, folding newlines so a
-    /// pasted block stays a single search line.
-    fn paste_into_palette(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            return;
-        };
-        if text.is_empty() {
-            return;
-        }
-        let text = text.replace(['\n', '\r'], " ");
-        self.palette.insert(&text);
-        self.palette_scroll.scroll_to_item(0);
-        cx.notify();
-    }
-
     /// Focus an agent's pane, switching workspace and tab as needed.
     ///
     /// The AGENTS row highlights immediately from the optimistic pick; the
@@ -2750,7 +2782,7 @@ impl L3sView {
         let current = self
             .projects
             .field(ProjectField::Location)
-            .value
+            .value()
             .trim()
             .to_string();
         let start = if current.is_empty() {
@@ -2835,34 +2867,11 @@ impl L3sView {
             return;
         }
         if self.picker.editing() {
-            match key {
-                "enter" => {
-                    if self.picker.jump().is_some() {
-                        self.list_picker(cx);
-                        self.picker_scroll.scroll_to_item(0);
-                    }
-                }
-                "backspace" => self.picker.path_mut().backspace(),
-                "delete" | "del" => self.picker.path_mut().delete(),
-                "left" => self.picker.path_mut().left(),
-                "right" => self.picker.path_mut().right(),
-                "home" => self.picker.path_mut().home(),
-                "end" => self.picker.path_mut().end(),
-                _ => {
-                    if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
-                        return;
-                    }
-                    if let Some(text) = event
-                        .keystroke
-                        .key_char
-                        .as_deref()
-                        .filter(|t| !t.is_empty())
-                    {
-                        self.picker.path_mut().insert(text);
-                    } else if event.keystroke.key.chars().count() == 1 {
-                        self.picker.path_mut().insert(&event.keystroke.key);
-                    }
-                }
+            // The path entity handles editing; a bare Enter is all that
+            // reaches here.
+            if key == "enter" && self.picker.jump().is_some() {
+                self.list_picker(cx);
+                self.picker_scroll.scroll_to_item(0);
             }
             cx.notify();
             return;
@@ -3359,38 +3368,12 @@ impl L3sView {
         }
 
         if self.home.focus() == HomeFocus::Prompt {
+            // The prompt entity handles editing and stops propagation; only
+            // the keys it declines (Tab, a bare Enter) reach here.
             match key {
-                "enter" => {
-                    if mods.shift {
-                        self.home.prompt_mut().newline();
-                    } else {
-                        self.home_send(cx);
-                        return;
-                    }
-                }
+                "enter" => self.home_send(cx),
                 "tab" => self.home_move_focus(mods.shift),
-                "backspace" => self.home.prompt_mut().backspace(),
-                "delete" | "del" => self.home.prompt_mut().delete(),
-                "left" => self.home.prompt_mut().left(),
-                "right" => self.home.prompt_mut().right(),
-                "home" => self.home.prompt_mut().home(),
-                "end" => self.home.prompt_mut().end(),
-                _ => {
-                    if mods.platform || mods.control {
-                        return;
-                    }
-                    if let Some(text) = event
-                        .keystroke
-                        .key_char
-                        .as_deref()
-                        .filter(|text| !text.is_empty())
-                    {
-                        self.home.prompt_mut().insert_multiline(text);
-                    } else if event.keystroke.key.chars().count() == 1 {
-                        let text = event.keystroke.key.clone();
-                        self.home.prompt_mut().insert_multiline(&text);
-                    }
-                }
+                _ => {}
             }
             cx.notify();
             return;
@@ -3417,7 +3400,7 @@ impl L3sView {
     /// Workspace setup and the agent start share one background thread and
     /// report through the picker channel, like the project worktree action.
     fn home_send(&mut self, cx: &mut Context<Self>) {
-        let prompt = self.home.prompt().value.trim().to_string();
+        let prompt = self.home.prompt().value().trim().to_string();
         if prompt.is_empty() {
             self.home.set_status("Write a prompt to send.".to_string());
             cx.notify();
@@ -3506,6 +3489,79 @@ impl L3sView {
         cx.notify();
     }
 
+    /// Keep the keyboard where the Home composer says it is.
+    ///
+    /// The prompt is its own entity, so the window root cannot simply claim
+    /// focus each frame; when the composer is on a picker (or closed) the root
+    /// takes it back so chip navigation still works.
+    /// The form input entity for `field`.
+    fn project_input(&self, field: ProjectField) -> Entity<TextInput> {
+        self.project_inputs[match field {
+            ProjectField::Name => 0,
+            ProjectField::Repository => 1,
+            ProjectField::BranchPrefix => 2,
+            ProjectField::Location => 3,
+        }]
+        .clone()
+    }
+
+    /// Build a form input over the panel's shared buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn build_project_input(
+        cx: &mut Context<Self>,
+        projects: &ProjectsPanel,
+        field: ProjectField,
+        placeholder: &'static str,
+        settings: &Rc<RefCell<Settings>>,
+        theme: Theme,
+        font_size: f32,
+    ) -> Entity<TextInput> {
+        cx.new(|cx| {
+            TextInput::from_shared(
+                projects.field(field).shared(),
+                placeholder,
+                style::chrome_font(settings),
+                px(font_size),
+                false,
+                theme,
+                cx,
+            )
+        })
+    }
+
+    fn sync_focus(&self, window: &mut Window, cx: &mut App) {
+        let target = if self.picker.is_open() && self.picker.editing() {
+            Some(self.picker_path.focus_handle(cx))
+        } else if self.home.is_open() && self.home.focus() == HomeFocus::Prompt {
+            Some(self.home_prompt.focus_handle(cx))
+        } else if self.update_url_editing {
+            Some(self.update_feed_input.focus_handle(cx))
+        } else if self.projects.worktree_target().is_some() {
+            Some(self.worktree_input.focus_handle(cx))
+        } else if self.projects.in_form() {
+            self.projects
+                .focus()
+                .map(|field| self.project_input(field).focus_handle(cx))
+        } else if self.palette.is_open() {
+            Some(self.palette_input.focus_handle(cx))
+        } else {
+            None
+        };
+        match target {
+            Some(handle) => {
+                if !handle.is_focused(window) {
+                    window.focus(&handle, cx);
+                }
+            }
+            None => {
+                let root = self.focus_handle.clone();
+                if !root.is_focused(window) {
+                    window.focus(&root, cx);
+                }
+            }
+        }
+    }
+
     /// The Home screen: the launch composer that fills the inset card.
     fn home_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -3572,48 +3628,11 @@ impl L3sView {
 
     /// The prompt edit area, with a caret on the cursor's line.
     fn home_prompt_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let text = self.home.prompt().value.clone();
-        let cursor = self.home.prompt().cursor;
-        let focused = self.home.focus() == HomeFocus::Prompt;
-        let lines: Vec<&str> = text.split('\n').collect();
-        // Locate the caret's line and column in characters.
-        let mut caret_line = 0usize;
-        let mut caret_col = cursor;
-        let mut consumed = 0usize;
-        for (index, line) in lines.iter().enumerate() {
-            let len = line.chars().count();
-            if cursor <= consumed + len {
-                caret_line = index;
-                caret_col = cursor - consumed;
-                break;
-            }
-            consumed += len + 1;
-            caret_line = index;
-            caret_col = len;
-        }
-        let mut rows = div().flex().flex_col().gap_1();
-        if text.is_empty() && !focused {
-            rows = rows.child(div().text_color(theme.muted).child("Describe the work…"));
-        } else {
-            for (index, line) in lines.iter().enumerate() {
-                if index == caret_line && focused {
-                    let before: String = line.chars().take(caret_col).collect();
-                    let after: String = line.chars().skip(caret_col).collect();
-                    rows = rows.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .child(div().text_color(theme.fg).child(before))
-                            .child(div().w(px(1.5)).h(px(18.0)).bg(theme.accent))
-                            .child(div().text_color(theme.fg).child(after)),
-                    );
-                } else {
-                    rows = rows.child(div().text_color(theme.fg).child((*line).to_string()));
-                }
-            }
-        }
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let entity = self.home_prompt.clone();
+        entity.update(cx, |input, _| {
+            input.set_style(self.theme, style::chrome_font(&self.shared_settings), px(fonts.body));
+        });
         div()
             .id("l3s-home-prompt")
             .flex()
@@ -3628,11 +3647,10 @@ impl L3sView {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.home.set_focus(HomeFocus::Prompt);
-                    this.home.prompt_mut().end();
                     cx.notify();
                 }),
             )
-            .child(rows)
+            .child(entity)
     }
 
     /// The composer card: the prompt above a row of pickers and the send button.
@@ -4136,33 +4154,13 @@ impl L3sView {
     /// Route a keystroke to the open Settings page.
     fn settings_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
-        // The feed-URL input owns the keyboard while it is being edited.
+        // The feed-URL input owns the keyboard while it is being edited; only
+        // the keys it declines reach here.
         if self.update_url_editing {
             match key {
                 "escape" => self.update_url_editing = false,
                 "enter" => self.commit_update_feed(cx),
-                "backspace" => self.update_feed.backspace(),
-                "delete" | "del" => self.update_feed.delete(),
-                "left" => self.update_feed.left(),
-                "right" => self.update_feed.right(),
-                "home" => self.update_feed.home(),
-                "end" => self.update_feed.end(),
-                _ => {
-                    if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
-                        return;
-                    }
-                    if let Some(text) = event
-                        .keystroke
-                        .key_char
-                        .as_deref()
-                        .filter(|text| !text.is_empty())
-                    {
-                        self.update_feed.insert(text);
-                    } else if event.keystroke.key.chars().count() == 1 {
-                        let text = event.keystroke.key.clone();
-                        self.update_feed.insert(&text);
-                    }
-                }
+                _ => {}
             }
             cx.notify();
             return;
@@ -4186,26 +4184,13 @@ impl L3sView {
         if self.machine_pending_remove.is_some() && key != "shift" {
             self.machine_pending_remove = None;
         }
-        // The inline new-worktree input owns the keyboard while open.
+        // The inline new-worktree input owns the keyboard while open; only a
+        // bare Enter (submit) reaches here.
         if self.projects.worktree_target().is_some() {
-            match key {
-                "enter" => {
-                    if let Some((project, branch)) = self.projects.take_worktree() {
-                        self.create_project_worktree(project, branch, cx);
-                    }
-                }
-                "backspace" => self.projects.worktree_name_mut().backspace(),
-                "delete" | "del" => self.projects.worktree_name_mut().delete(),
-                "left" => self.projects.worktree_name_mut().left(),
-                "right" => self.projects.worktree_name_mut().right(),
-                "home" => self.projects.worktree_name_mut().home(),
-                "end" => self.projects.worktree_name_mut().end(),
-                _ => {
-                    if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
-                        return;
-                    }
-                    self.insert_into_worktree_name(event);
-                }
+            if key == "enter"
+                && let Some((project, branch)) = self.projects.take_worktree()
+            {
+                self.create_project_worktree(project, branch, cx);
             }
             cx.notify();
             return;
@@ -4238,22 +4223,10 @@ impl L3sView {
         cx.notify();
     }
 
-    /// Insert typed text into the inline worktree name field.
-    fn insert_into_worktree_name(&mut self, event: &KeyDownEvent) {
-        if let Some(text) = event
-            .keystroke
-            .key_char
-            .as_deref()
-            .filter(|text| !text.is_empty())
-        {
-            self.projects.worktree_name_mut().insert(text);
-        } else if event.keystroke.key.chars().count() == 1 {
-            let key = event.keystroke.key.clone();
-            self.projects.worktree_name_mut().insert(&key);
-        }
-    }
-
     /// Route a keystroke to the project create/edit form.
+    ///
+    /// The focused field entity handles editing; Tab, the machine chooser,
+    /// and submit are the only keys that reach here.
     fn projects_form_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         match key {
@@ -4273,39 +4246,7 @@ impl L3sView {
                 let ids = self.project_machine_ids();
                 let _ = self.projects.submit(&root, &ids);
             }
-            "backspace" | "delete" | "del" | "left" | "right" | "home" | "end" => {
-                let Some(field) = self.projects.focus() else {
-                    return;
-                };
-                let slot = self.projects.field_mut(field);
-                match key {
-                    "backspace" => slot.backspace(),
-                    "delete" | "del" => slot.delete(),
-                    "left" => slot.left(),
-                    "right" => slot.right(),
-                    "home" => slot.home(),
-                    _ => slot.end(),
-                }
-            }
-            _ => {
-                if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
-                    return;
-                }
-                let Some(field) = self.projects.focus() else {
-                    return;
-                };
-                if let Some(text) = event
-                    .keystroke
-                    .key_char
-                    .as_deref()
-                    .filter(|text| !text.is_empty())
-                {
-                    self.projects.field_mut(field).insert(text);
-                } else if event.keystroke.key.chars().count() == 1 {
-                    let key = event.keystroke.key.clone();
-                    self.projects.field_mut(field).insert(&key);
-                }
-            }
+            _ => {}
         }
         cx.notify();
     }
@@ -4773,11 +4714,16 @@ impl L3sView {
                 .projects()
                 .iter()
                 .find(|project| project.id == target)
-                .map(|project| project.branch_for(&self.projects.worktree_name().value))
+                .map(|project| project.branch_for(&self.projects.worktree_name().value()))
                 .unwrap_or_default();
-            let field = self.projects.worktree_name();
-            let before: String = field.value.chars().take(field.cursor).collect();
-            let after: String = field.value.chars().skip(field.cursor).collect();
+            let worktree_input = self.worktree_input.clone();
+            worktree_input.update(cx, |input, _| {
+                input.set_style(
+                    theme,
+                    style::chrome_font(&self.shared_settings),
+                    px(self.footer_font()),
+                );
+            });
             list = list.child(
                 div()
                     .flex()
@@ -4804,16 +4750,7 @@ impl L3sView {
                             .border_1()
                             .border_color(theme.accent)
                             .cursor_pointer()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .text_size(px(self.footer_font()))
-                                    .child(div().text_color(theme.fg).child(before))
-                                    .child(div().w(px(1.5)).h(px(14.0)).bg(theme.accent))
-                                    .child(div().text_color(theme.fg).child(after)),
-                            ),
+                            .child(worktree_input),
                     ),
             );
         }
@@ -5149,20 +5086,14 @@ impl L3sView {
     ) -> impl IntoElement {
         let theme = self.theme;
         let focused = self.projects.focus() == Some(field);
-        let text = self.projects.field(field).value.clone();
-        let cursor = self.projects.field(field).cursor;
-        let mut line = div().flex().flex_row().items_center().min_h(px(18.0));
-        if text.is_empty() && !focused {
-            line = line.child(div().text_color(theme.muted).child(label.to_string()));
-        } else {
-            let before: String = text.chars().take(cursor).collect();
-            let after: String = text.chars().skip(cursor).collect();
-            line = line.child(div().text_color(theme.fg).child(before));
-            if focused {
-                line = line.child(div().w(px(1.5)).h(px(14.0)).bg(theme.accent));
-            }
-            line = line.child(div().text_color(theme.fg).child(after));
-        }
+        let entity = self.project_input(field);
+        entity.update(cx, |input, _| {
+            input.set_style(
+                theme,
+                style::chrome_font(&self.shared_settings),
+                px(self.section_font()),
+            );
+        });
         style::field(
             format!("l3s-project-field-{label}"),
             label,
@@ -5170,20 +5101,19 @@ impl L3sView {
             theme,
             28.0,
             self.section_font(),
-            line,
+            entity,
         )
         .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    // Focus the field; Tab cycles from here.
-                    this.projects.cancel_delete();
-                    while this.projects.focus() != Some(field) {
-                        this.projects.cycle_focus(false);
-                    }
-                    this.projects.field_mut(field).end();
-                    cx.notify();
-                }),
-            )
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                // Focus the field; Tab cycles from here.
+                this.projects.cancel_delete();
+                while this.projects.focus() != Some(field) {
+                    this.projects.cycle_focus(false);
+                }
+                cx.notify();
+            }),
+        )
     }
 
     /// The UPDATES section of the page: channel, feed override, auto-check,
@@ -5204,14 +5134,15 @@ impl L3sView {
 
         let mut line = div().flex().flex_row().items_center().min_h(px(18.0));
         if editing {
-            let text = self.update_feed.value.clone();
-            let cursor = self.update_feed.cursor;
-            let before: String = text.chars().take(cursor).collect();
-            let after: String = text.chars().skip(cursor).collect();
-            line = line
-                .child(div().text_color(theme.fg).child(before))
-                .child(div().w(px(1.5)).h(px(14.0)).bg(theme.accent))
-                .child(div().text_color(theme.fg).child(after));
+            let input = self.update_feed_input.clone();
+            input.update(cx, |input, _| {
+                input.set_style(
+                    theme,
+                    style::chrome_font(&self.shared_settings),
+                    px(self.section_font()),
+                );
+            });
+            line = line.child(input);
         } else if let Some(url) = &explicit {
             line = line.child(div().truncate().text_color(theme.fg).child(url.clone()));
         } else {
@@ -5451,20 +5382,16 @@ impl L3sView {
         let theme = self.theme;
         let cwd = self.picker.cwd().to_string();
         let editing = self.picker.editing();
-        let path = self.picker.path();
-        let mut line = div().flex().flex_row().items_center().flex_1();
-        if editing {
-            let text = path.value.clone();
-            let cursor = path.cursor;
-            let before: String = text.chars().take(cursor).collect();
-            let after: String = text.chars().skip(cursor).collect();
-            line = line
-                .child(div().text_color(theme.fg).child(before))
-                .child(div().w(px(1.5)).h(px(16.0)).bg(theme.accent))
-                .child(div().text_color(theme.fg).child(after));
+        let picker_path = self.picker_path.clone();
+        picker_path.update(cx, |input, _| {
+            let fonts = style::Fonts::resolve(&self.shared_settings);
+            input.set_style(self.theme, style::chrome_font(&self.shared_settings), px(fonts.body));
+        });
+        let line = div().flex().flex_row().items_center().flex_1().child(if editing {
+            picker_path.into_any_element()
         } else {
-            line = line.child(div().text_color(theme.fg).child(cwd.clone()));
-        }
+            div().text_color(theme.fg).child(cwd.clone()).into_any_element()
+        });
         let path_field = div()
             .id("l3s-picker-path")
             .flex()
@@ -5978,15 +5905,15 @@ impl L3sView {
 
     /// Seed the feed-URL input and give it the keyboard.
     fn edit_update_feed(&mut self, cx: &mut Context<Self>) {
-        self.update_feed =
-            TextField::with_value(self.settings.update_feed_url.clone().unwrap_or_default());
+        self.update_feed
+            .set_value(self.settings.update_feed_url.clone().unwrap_or_default());
         self.update_url_editing = true;
         cx.notify();
     }
 
     /// Commit the feed-URL input; blank falls back to the channel default.
     fn commit_update_feed(&mut self, cx: &mut Context<Self>) {
-        let value = self.update_feed.value.trim().to_string();
+        let value = self.update_feed.value().trim().to_string();
         self.settings.update_feed_url = (!value.is_empty()).then_some(value);
         self.update_url_editing = false;
         self.save_update_settings(cx);
@@ -7108,9 +7035,6 @@ impl L3sView {
         let entries = self.palette_entries();
         let matches = self.palette.matches(&entries);
         let selected = self.palette.selected().min(matches.len().saturating_sub(1));
-        let query = self.palette.query().to_string();
-        let cursor = self.palette.cursor();
-        let select_all = self.palette.is_select_all();
 
         let mut rows = div()
             .id("l3s-palette-list")
@@ -7187,33 +7111,14 @@ impl L3sView {
             );
         }
 
-        let caret = div().w(px(1.5)).h(px(16.0)).bg(theme.accent);
-        let mut line = div().flex().flex_row().items_center().flex_1();
-        if query.is_empty() {
-            // Caret first, so the hint reads as a placeholder rather than text.
-            line = line.child(caret).child(
-                div()
-                    .pl(px(2.0))
-                    .text_color(theme.muted)
-                    .child("Type a command…"),
+        let palette_input = self.palette_input.clone();
+        palette_input.update(cx, |input, _| {
+            input.set_style(
+                theme,
+                style::chrome_font(&self.shared_settings),
+                px(self.chrome_font()),
             );
-        } else if select_all {
-            line = line.child(
-                div()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(theme.selection_bg)
-                    .text_color(theme.selection_fg)
-                    .child(query.clone()),
-            );
-        } else {
-            let before: String = query.chars().take(cursor).collect();
-            let after: String = query.chars().skip(cursor).collect();
-            line = line
-                .child(div().text_color(theme.fg).child(before))
-                .child(caret)
-                .child(div().text_color(theme.fg).child(after));
-        }
+        });
         let field = div()
             .flex()
             .flex_row()
@@ -7223,7 +7128,7 @@ impl L3sView {
             .border_b_1()
             .border_color(terminal_inset_border())
             .text_size(px(self.chrome_font()))
-            .child(line);
+            .child(palette_input);
 
         div()
             .absolute()
@@ -8333,9 +8238,7 @@ impl Render for L3sView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_metrics(window);
         self.sync_home();
-        if !self.focus_handle.is_focused(window) {
-            window.focus(&self.focus_handle, cx);
-        }
+        self.sync_focus(window, cx);
 
         let theme = self.theme;
         let cell_height = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
@@ -8462,27 +8365,13 @@ impl Render for L3sView {
                 this.control_held = event.modifiers.control;
             }))
             .on_action(cx.listener(|this, _: &CopySelection, _window, cx| {
-                if this.palette.is_open() {
-                    this.copy_query(cx);
-                } else {
-                    this.copy_selection(cx);
-                }
+                this.copy_selection(cx);
             }))
             .on_action(cx.listener(|this, _: &PasteClipboard, _window, cx| {
-                if this.palette.is_open() {
-                    this.paste_into_palette(cx);
-                } else {
-                    this.paste_clipboard(cx);
-                }
+                this.paste_clipboard(cx);
             }))
             .on_action(cx.listener(|this, _: &SelectAllGrid, window, cx| {
-                // With the palette open, ⌘A selects the query, not the grid.
-                if this.palette.is_open() {
-                    this.palette.select_all();
-                    cx.notify();
-                } else {
-                    this.select_all(window, cx);
-                }
+                this.select_all(window, cx);
             }))
             .on_action(cx.listener(|this, _: &NewTab, _window, _cx| this.new_tab()))
             .on_action(cx.listener(|this, _: &SplitVertical, _window, _cx| this.split("right")))

@@ -16,7 +16,7 @@ mod picker;
 mod projects;
 mod scheme;
 mod selection;
-mod sound;
+pub(crate) mod sound;
 mod text_field;
 mod theme;
 mod ui_playground;

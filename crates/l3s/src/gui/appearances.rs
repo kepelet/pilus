@@ -16,9 +16,9 @@ use gpui::{
 };
 use l3s_client::{Appearance, ControlClient, ThemeInfo};
 
-use super::settings::Settings;
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, scheme};
+use crate::settings::Settings;
 
 /// Width and height of the appearances window.
 const WINDOW_SIZE: (f32, f32) = (640.0, 600.0);

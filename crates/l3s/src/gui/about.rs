@@ -41,6 +41,9 @@ const CREDITS: &[Credit] = &[
 /// The About window root view.
 pub struct AboutView {
     theme: Theme,
+    /// Version to show: the preview stamp when this build carries one, else
+    /// the Cargo version.
+    version: String,
     focus_handle: FocusHandle,
 }
 
@@ -48,8 +51,12 @@ impl AboutView {
     fn new(theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+        // `preview-feed.sh` stamps the feed's synthetic version into the
+        // build, so an installed preview names itself here.
+        let version = crate::update::current_version().to_string();
         Self {
             theme,
+            version,
             focus_handle,
         }
     }
@@ -74,6 +81,7 @@ pub(super) fn app_icon() -> Option<Arc<RenderImage>> {
 impl Render for AboutView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let version = format!("version {}", self.version);
         let mut credits = div().flex().flex_col().gap_3();
         for credit in CREDITS {
             credits = credits.child(
@@ -128,26 +136,21 @@ impl Render for AboutView {
                                     .px_6()
                                     .pt_8()
                                     .pb_6()
-                                    .child(app_icon().map_or_else(
+                                    .child(div().pb_2().child(app_icon().map_or_else(
                                         || {
                                             div()
-                                                .text_size(px(34.0))
+                                                .text_size(px(28.0))
                                                 .text_color(theme.accent)
                                                 .child("l3s")
                                                 .into_any_element()
                                         },
-                                        |icon| img(icon).w(px(96.0)).h(px(96.0)).into_any_element(),
-                                    ))
-                                    .child(
-                                        div().text_size(px(12.0)).text_color(theme.muted).child(
-                                            format!("version {}", env!("CARGO_PKG_VERSION")),
-                                        ),
-                                    )
+                                        |icon| img(icon).w(px(64.0)).h(px(64.0)).into_any_element(),
+                                    )))
                                     .child(
                                         div()
                                             .text_size(px(12.0))
                                             .text_color(theme.muted)
-                                            .child("Native desktop client for Luvus."),
+                                            .child(version),
                                     ),
                             )
                             .child(div().px_6().pt_2().pb_6().child(credits)),

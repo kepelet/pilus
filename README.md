@@ -93,13 +93,18 @@ sips -z 1024 1024 art.png --out crates/l3s/assets/l3s-icon-1024.png
 
 ## Updates
 
-`l3s` updates itself from GitHub Releases: `l3s → Check for Updates…` checks
-on demand, and a footer badge tracks download and restart-into-update. See
+`l3s` updates itself from a release feed: `l3s → Check for Updates…` checks
+on demand, a footer badge tracks download and restart-into-update, and
+**Settings → UPDATES** picks the channel and feed URL. Stable builds read
+`https://releases.kepelet.com/l3s/stable.json`; preview/nightly builds read
+`https://releases.kepelet.com/l3s/preview.json`. See
 [`docs/ota.md`](docs/ota.md) for the release process, signing, and channels.
 
 ```sh
 just package-dmg    # signed Apple Silicon .dmg + SHA256SUMS
 just check-updates  # exercise the feed without opening a window
+just preview-feed   # DMG + latest.json the preview channel reads locally
+just serve-preview  # serve that payload on 127.0.0.1:8000
 ```
 
 ## Layout

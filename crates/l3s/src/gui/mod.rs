@@ -16,7 +16,6 @@ mod picker;
 mod projects;
 mod scheme;
 mod selection;
-mod settings;
 mod text_field;
 mod theme;
 mod ui_playground;
@@ -30,7 +29,8 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use crate::update::UpdateRequest;
+use crate::settings::{CHROME_FONT, Settings};
+use crate::update::{UpdateChannel, UpdateRequest, describe_source};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
     MouseEventKind,
@@ -61,14 +61,10 @@ use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use projects::{ProjectField, ProjectsPanel};
 use selection::{Cell, Selection};
-use settings::Settings;
+use text_field::TextField;
 use theme::Theme;
 use updater::Updater;
 
-/// Monospace family used for the cell grid.
-const FONT_FAMILY: &str = "Menlo";
-/// Base font size in logical pixels.
-const FONT_SIZE: f32 = 13.0;
 /// Line height as a fraction of the font size.
 const LINE_HEIGHT_RATIO: f32 = 1.3;
 /// Height of our native tab strip; the grid starts below it.
@@ -105,8 +101,6 @@ const TAB_HEIGHT: f32 = 26.0;
 /// Left inset for the collapsed tab strip: clears the floating traffic lights
 /// (the third light ends near 64px) with a comfortable gap before the toggle.
 const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
-/// Chrome text size; the cell grid keeps its own monospace size.
-const CHROME_FONT: f32 = 13.0;
 /// Section label size (SESSIONS / PROJECTS).
 const SECTION_FONT: f32 = 11.0;
 
@@ -846,6 +840,12 @@ struct L3sView {
     /// OTA updater entity and the last status the view painted.
     updater: Entity<Updater>,
     last_update_status: UpdateStatus,
+    /// The running build's version (stamped for previews), shown in the footer.
+    app_version: String,
+    /// Update feed URL while the Settings page is editing it.
+    update_feed: TextField,
+    /// Whether the update feed URL field owns the keyboard.
+    update_url_editing: bool,
     /// Machine-manager revision signal, shared with the manager window.
     machine_signal: Rc<RefCell<MachineSignal>>,
     /// Last revision this window applied, so a manager mutation reloads once.
@@ -1032,6 +1032,9 @@ impl L3sView {
             catalog_dirty: false,
             updater: updater.clone(),
             last_update_status: UpdateStatus::Idle,
+            app_version: crate::update::current_version().to_string(),
+            update_feed: TextField::default(),
+            update_url_editing: false,
             machine_signal,
             seen_machine_revision: 0,
             projects: ProjectsPanel::default(),
@@ -1070,7 +1073,7 @@ impl L3sView {
         cx.spawn(async move |this, cx| {
             loop {
                 let updated = this.update(cx, |view, cx| {
-                    let changed = view.sync_settings();
+                    let changed = view.sync_settings(cx);
                     if view.poll(cx) || changed {
                         cx.notify();
                     }
@@ -2045,16 +2048,33 @@ impl L3sView {
         *self.shared_theme.borrow_mut() = self.theme;
     }
 
-    /// Pull the shared font settings the Appearances window may have changed.
-    fn sync_settings(&mut self) -> bool {
+    /// Pull shared settings the Appearances window or Settings page changed.
+    ///
+    /// A change to the update channel or feed URL rebuilds the updater engine
+    /// in place; turning auto-check on checks right away, like a launch would.
+    fn sync_settings(&mut self, cx: &mut Context<Self>) -> bool {
         let latest = self.shared_settings.borrow().clone();
         if latest == self.settings {
             return false;
         }
+        let update_changed = latest.update_channel != self.settings.update_channel
+            || latest.update_feed_url != self.settings.update_feed_url;
+        let auto_check_turned_on = latest.auto_check_updates && !self.settings.auto_check_updates;
         self.settings = latest;
         // The cell advance depends on the terminal font, so re-measure and let
         // `sync_metrics` push the new size to the daemon.
         self.cell_width = None;
+        if update_changed {
+            let request = UpdateRequest::from_settings(
+                &self.settings.update_channel,
+                self.settings.update_feed_url.clone(),
+            );
+            self.updater
+                .update(cx, |updater, cx| updater.reconfigure(&request, cx));
+        }
+        if auto_check_turned_on {
+            self.updater.update(cx, |updater, cx| updater.check(cx));
+        }
         true
     }
 
@@ -2465,6 +2485,7 @@ impl L3sView {
     fn leave_settings_page(&mut self) {
         self.projects.close();
         self.home.close();
+        self.update_url_editing = false;
     }
 
     /// A control client for an endpoint's control surface.
@@ -3947,6 +3968,37 @@ impl L3sView {
     /// Route a keystroke to the open Settings page.
     fn settings_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        // The feed-URL input owns the keyboard while it is being edited.
+        if self.update_url_editing {
+            match key {
+                "escape" => self.update_url_editing = false,
+                "enter" => self.commit_update_feed(cx),
+                "backspace" => self.update_feed.backspace(),
+                "delete" | "del" => self.update_feed.delete(),
+                "left" => self.update_feed.left(),
+                "right" => self.update_feed.right(),
+                "home" => self.update_feed.home(),
+                "end" => self.update_feed.end(),
+                _ => {
+                    if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
+                        return;
+                    }
+                    if let Some(text) = event
+                        .keystroke
+                        .key_char
+                        .as_deref()
+                        .filter(|text| !text.is_empty())
+                    {
+                        self.update_feed.insert(text);
+                    } else if event.keystroke.key.chars().count() == 1 {
+                        let text = event.keystroke.key.clone();
+                        self.update_feed.insert(&text);
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
         if key == "escape" {
             if self.projects.worktree_target().is_some() {
                 self.projects.cancel_worktree();
@@ -4112,6 +4164,7 @@ impl L3sView {
                 .child(self.projects_section_block(cx))
                 .child(self.machines_section_block(cx))
                 .child(self.agent_config_section_block(cx))
+                .child(self.updates_section_block(cx))
         };
         let status = self.projects.status().to_string();
         div()
@@ -5043,6 +5096,281 @@ impl L3sView {
             )
     }
 
+    /// The UPDATES section of the page: channel, feed override, auto-check,
+    /// and a manual check. Committing a change rebuilds the updater engine.
+    fn updates_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let request = UpdateRequest::from_settings(
+            &self.settings.update_channel,
+            self.settings.update_feed_url.clone(),
+        );
+        let source = describe_source(&request);
+        let editing = self.update_url_editing;
+        let explicit = self
+            .settings
+            .update_feed_url
+            .clone()
+            .filter(|url| !url.trim().is_empty());
+
+        let mut line = div().flex().flex_row().items_center().min_h(px(18.0));
+        if editing {
+            let text = self.update_feed.value.clone();
+            let cursor = self.update_feed.cursor;
+            let before: String = text.chars().take(cursor).collect();
+            let after: String = text.chars().skip(cursor).collect();
+            line = line
+                .child(div().text_color(theme.fg).child(before))
+                .child(div().w(px(1.5)).h(px(14.0)).bg(theme.accent))
+                .child(div().text_color(theme.fg).child(after));
+        } else if let Some(url) = &explicit {
+            line = line.child(div().truncate().text_color(theme.fg).child(url.clone()));
+        } else {
+            line = line.child(
+                div()
+                    .truncate()
+                    .text_color(theme.muted)
+                    .child(format!("Default · {source}")),
+            );
+        }
+
+        let field = div()
+            .id("l3s-update-feed")
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .h(px(28.0))
+            .px_2()
+            .rounded_md()
+            .bg(theme.panel_dim)
+            .border_1()
+            .border_color(if editing { theme.accent } else { theme.border })
+            .cursor_pointer()
+            .child(line)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.edit_update_feed(cx)),
+            );
+
+        let feed_action = if editing {
+            div().child(
+                div()
+                    .id("l3s-update-feed-save")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(28.0))
+                    .px_3()
+                    .flex_shrink_0()
+                    .rounded_md()
+                    .bg(theme.accent)
+                    .text_color(theme.window_bg)
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::BOLD)
+                    .cursor_pointer()
+                    .child("Save")
+                    .on_click(cx.listener(|this, _, _, cx| this.commit_update_feed(cx))),
+            )
+        } else if explicit.is_some() {
+            div().child(
+                div()
+                    .id("l3s-update-feed-reset")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(28.0))
+                    .px_3()
+                    .flex_shrink_0()
+                    .rounded_md()
+                    .bg(theme.panel_dim)
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(px(11.0))
+                    .text_color(theme.fg)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.border))
+                    .child("Use Default")
+                    .on_click(cx.listener(|this, _, _, cx| this.reset_update_feed(cx))),
+            )
+        } else {
+            div()
+        };
+
+        let auto_check = self.settings.auto_check_updates;
+        let checkbox = div()
+            .id("l3s-update-auto-check")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(if auto_check {
+                        theme.accent
+                    } else {
+                        theme.border
+                    })
+                    .bg(if auto_check {
+                        theme.accent
+                    } else {
+                        theme.panel_dim
+                    })
+                    .text_size(px(10.0))
+                    .text_color(theme.window_bg)
+                    .child(if auto_check { "✓" } else { "" }),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.fg)
+                    .child("Check for updates on launch"),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_check(cx)));
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .px_3()
+                    .text_size(px(self.section_font()))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.muted)
+                    .child("UPDATES"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .mx_3()
+                    .px_3()
+                    .py_3()
+                    .rounded_md()
+                    .bg(theme.panel)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted)
+                                    .child("Channel"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(self.update_channel_pill(UpdateChannel::Stable, cx))
+                                    .child(self.update_channel_pill(UpdateChannel::Preview, cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted)
+                                    .child("Feed URL override"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(field)
+                                    .child(feed_action),
+                            ),
+                    )
+                    .child(checkbox)
+                    .child(
+                        div().flex().flex_row().items_center().justify_end().child(
+                            div()
+                                .id("l3s-update-check-now")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(px(24.0))
+                                .px_2()
+                                .flex_shrink_0()
+                                .rounded_md()
+                                .bg(theme.panel_dim)
+                                .border_1()
+                                .border_color(theme.border)
+                                .text_size(px(11.0))
+                                .text_color(theme.fg)
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme.border))
+                                .child("Check Now")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.check_for_updates(cx);
+                                    // Surface the result live (progress, up-to-date,
+                                    // or retry) instead of only the footer badge.
+                                    if !update_window::is_open(cx) {
+                                        update_window::open(this.updater.clone(), this.theme, cx);
+                                    }
+                                })),
+                        ),
+                    ),
+            )
+    }
+
+    /// One channel pill; the active one uses the accent color.
+    fn update_channel_pill(&self, value: UpdateChannel, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let active = UpdateChannel::parse(&self.settings.update_channel) == value;
+        div().child(
+            div()
+                .id(format!("l3s-update-channel-{}", value.label()))
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(22.0))
+                .px_3()
+                .rounded_md()
+                .border_1()
+                .border_color(if active { theme.accent } else { theme.border })
+                .bg(if active {
+                    theme.accent
+                } else {
+                    theme.panel_dim
+                })
+                .text_color(if active { theme.window_bg } else { theme.fg })
+                .text_size(px(11.0))
+                .font_weight(if active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.border))
+                .child(value.label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_update_channel(value, cx);
+                })),
+        )
+    }
+
     /// The Open Workspace picker overlay.
     fn picker_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         if !self.picker.is_open() {
@@ -5574,6 +5902,54 @@ impl L3sView {
     /// Manual check from the menu bar (`l3s → Check for Updates…`).
     fn check_for_updates(&mut self, cx: &mut Context<Self>) {
         self.updater.update(cx, |updater, cx| updater.check(cx));
+    }
+
+    /// Persist update preferences and rebuild the updater engine in place.
+    fn save_update_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings.save(&self.l3s_root);
+        *self.shared_settings.borrow_mut() = self.settings.clone();
+        let request = UpdateRequest::from_settings(
+            &self.settings.update_channel,
+            self.settings.update_feed_url.clone(),
+        );
+        self.updater
+            .update(cx, |updater, cx| updater.reconfigure(&request, cx));
+        cx.notify();
+    }
+
+    /// Switch the update channel from the Settings page.
+    fn set_update_channel(&mut self, channel: UpdateChannel, cx: &mut Context<Self>) {
+        self.settings.update_channel = channel.label().to_string();
+        self.save_update_settings(cx);
+    }
+
+    /// Toggle the launch-time auto-check from the Settings page.
+    fn toggle_auto_check(&mut self, cx: &mut Context<Self>) {
+        self.settings.auto_check_updates = !self.settings.auto_check_updates;
+        self.save_update_settings(cx);
+    }
+
+    /// Seed the feed-URL input and give it the keyboard.
+    fn edit_update_feed(&mut self, cx: &mut Context<Self>) {
+        self.update_feed =
+            TextField::with_value(self.settings.update_feed_url.clone().unwrap_or_default());
+        self.update_url_editing = true;
+        cx.notify();
+    }
+
+    /// Commit the feed-URL input; blank falls back to the channel default.
+    fn commit_update_feed(&mut self, cx: &mut Context<Self>) {
+        let value = self.update_feed.value.trim().to_string();
+        self.settings.update_feed_url = (!value.is_empty()).then_some(value);
+        self.update_url_editing = false;
+        self.save_update_settings(cx);
+    }
+
+    /// Drop the explicit feed URL so the channel default applies again.
+    fn reset_update_feed(&mut self, cx: &mut Context<Self>) {
+        self.update_url_editing = false;
+        self.settings.update_feed_url = None;
+        self.save_update_settings(cx);
     }
 
     /// The badge's next step: download an available update, restart into a
@@ -6316,6 +6692,17 @@ impl L3sView {
     fn status_bar(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let mut right = div().flex().flex_row().items_center().gap_2();
+        // The running build's version, beside the update state so a preview
+        // stamp is identifiable without opening About.
+        right = right.child(
+            div()
+                .flex()
+                .items_center()
+                .h(px(28.0))
+                .px_1()
+                .text_color(theme.muted)
+                .child(format!("v{}", self.app_version)),
+        );
         // OTA state lives next to the settings gear: quiet when idle, a
         // progress label while busy, and a clickable pill when the user can
         // advance the flow (download, restart, or retry).

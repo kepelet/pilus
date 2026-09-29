@@ -10,14 +10,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, Context, Div, FocusHandle, FontWeight, KeyDownEvent, Render, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, size,
+    App, Bounds, Context, Div, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, Render,
+    Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 
 use crate::settings::Settings;
 
 use super::style::{self, ButtonKind};
-use super::text_field::TextField;
+use super::text_input::TextInput;
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, icon, terminal_inset_border};
 
@@ -116,9 +116,8 @@ pub struct UiPlaygroundView {
     /// Shared client settings, so the Interface font reaches this window.
     settings: Rc<RefCell<Settings>>,
     focus_handle: FocusHandle,
-    single: TextField,
-    multi: TextField,
-    input: InputId,
+    single: Entity<TextInput>,
+    multi: Entity<TextInput>,
     pickers: Vec<Picker>,
     open_picker: Option<usize>,
     tab: usize,
@@ -139,13 +138,38 @@ impl UiPlaygroundView {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+        let fonts = style::Fonts::resolve(&settings);
+        let font = style::chrome_font(&settings);
+        let single = cx.new(|cx| {
+            TextInput::new(
+                "click and type".to_string(),
+                "Type…",
+                font.clone(),
+                px(fonts.body),
+                false,
+                theme,
+                cx,
+            )
+        });
+        let multi = cx.new(|cx| {
+            TextInput::new(
+                "A multi-line\ntextarea.".to_string(),
+                "Type…",
+                font.clone(),
+                px(fonts.body),
+                true,
+                theme,
+                cx,
+            )
+        });
+        let input_handle = single.focus_handle(cx);
+        window.focus(&input_handle, cx);
         Self {
             theme,
             settings,
             focus_handle,
-            single: TextField::with_value("click and type".to_string()),
-            multi: TextField::with_value("A multi-line\ntextarea.".to_string()),
-            input: InputId::Single,
+            single,
+            multi,
             pickers: vec![
                 Picker {
                     prefix: "Model:",
@@ -187,55 +211,19 @@ impl UiPlaygroundView {
             return;
         }
         // Tab walks between the two inputs, so both are reachable by keyboard.
+        // Everything else is the focused field's own business, which consumes
+        // what it handles before it reaches here.
         if key == "tab" {
-            self.input = match self.input {
-                InputId::Single => InputId::Multi,
-                InputId::Multi => InputId::Single,
+            let single_focused = self.single.read(cx).is_focused(window);
+            let next = if single_focused {
+                self.multi.clone()
+            } else {
+                self.single.clone()
             };
+            let handle = next.focus_handle(cx);
+            window.focus(&handle, cx);
             cx.notify();
-            return;
         }
-        let multiline = self.input == InputId::Multi;
-        let field = if multiline {
-            &mut self.multi
-        } else {
-            &mut self.single
-        };
-        match key {
-            "backspace" => field.backspace(),
-            "delete" | "del" => field.delete(),
-            "left" => field.left(),
-            "right" => field.right(),
-            "home" => field.home(),
-            "end" => field.end(),
-            "enter" if multiline => field.newline(),
-            "enter" => {}
-            _ => {
-                if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
-                    return;
-                }
-                if let Some(text) = event
-                    .keystroke
-                    .key_char
-                    .as_deref()
-                    .filter(|text| !text.is_empty())
-                {
-                    if multiline {
-                        field.insert_multiline(text);
-                    } else {
-                        field.insert(text);
-                    }
-                } else if event.keystroke.key.chars().count() == 1 {
-                    let typed = event.keystroke.key.clone();
-                    if multiline {
-                        field.insert_multiline(&typed);
-                    } else {
-                        field.insert(&typed);
-                    }
-                }
-            }
-        }
-        cx.notify();
     }
 
     /// One titled group in the catalogue.
@@ -317,15 +305,24 @@ impl UiPlaygroundView {
     }
 
     /// A labelled input box, editable while it owns the keyboard.
-    fn input_box(&self, id: InputId, label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn input_box(
+        &self,
+        id: InputId,
+        label: &'static str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = self.theme;
-        let focused = self.input == id;
-        let multiline = id == InputId::Multi;
-        let field = match id {
-            InputId::Single => &self.single,
-            InputId::Multi => &self.multi,
+        let fonts = self.fonts();
+        let entity = match id {
+            InputId::Single => self.single.clone(),
+            InputId::Multi => self.multi.clone(),
         };
-        let lines = self.field_body(field, focused);
+        entity.update(cx, |input, _| {
+            input.set_style(theme, style::chrome_font(&self.settings), px(fonts.body));
+        });
+        let focused = entity.read(cx).is_focused(window);
+        let multiline = id == InputId::Multi;
         style::field(
             match id {
                 InputId::Single => "pg-input-single",
@@ -335,67 +332,11 @@ impl UiPlaygroundView {
             focused,
             theme,
             if multiline { 84.0 } else { 30.0 },
-            self.fonts().label,
-            lines,
+            fonts.label,
+            entity,
         )
         .w(px(240.0))
-        .text_size(px(self.fonts().body))
-        .on_mouse_down(
-            gpui::MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                this.input = id;
-                match id {
-                    InputId::Single => this.single.end(),
-                    InputId::Multi => this.multi.end(),
-                }
-                cx.notify();
-            }),
-        )
-    }
-
-    /// Render an input's text, placing the caret on the cursor's line.
-    fn field_body(&self, field: &TextField, focused: bool) -> Div {
-        let theme = self.theme;
-        let text = field.value.clone();
-        let cursor = field.cursor;
-        let lines: Vec<&str> = text.split('\n').collect();
-        let mut caret_line = 0usize;
-        let mut caret_col = cursor;
-        let mut consumed = 0usize;
-        for (index, line) in lines.iter().enumerate() {
-            let len = line.chars().count();
-            if cursor <= consumed + len {
-                caret_line = index;
-                caret_col = cursor - consumed;
-                break;
-            }
-            consumed += len + 1;
-            caret_line = index;
-            caret_col = len;
-        }
-        let mut rows = div().flex().flex_col().gap_1();
-        if text.is_empty() && !focused {
-            rows = rows.child(div().text_color(theme.muted).child("Type…"));
-            return rows;
-        }
-        for (index, line) in lines.iter().enumerate() {
-            if index == caret_line && focused {
-                let before: String = line.chars().take(caret_col).collect();
-                let after: String = line.chars().skip(caret_col).collect();
-                rows = rows.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .child(div().text_color(theme.fg).child(before))
-                        .child(div().w(px(1.5)).h(px(16.0)).bg(theme.accent))
-                        .child(div().text_color(theme.fg).child(after)),
-                );
-            } else {
-                rows = rows.child(div().text_color(theme.fg).child((*line).to_string()));
-            }
-        }
-        rows
+        .text_size(px(fonts.body))
     }
 
     /// One chip in the interactive dropdown row.
@@ -1526,7 +1467,7 @@ impl UiPlaygroundView {
 }
 
 impl Render for UiPlaygroundView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let clicks = self.clicks;
         let body = div()
@@ -1573,8 +1514,8 @@ impl Render for UiPlaygroundView {
                         .flex_wrap()
                         .items_start()
                         .gap_4()
-                        .child(self.input_box(InputId::Single, "Single line", cx))
-                        .child(self.input_box(InputId::Multi, "Multi line", cx)),
+                        .child(self.input_box(InputId::Single, "Single line", window, cx))
+                        .child(self.input_box(InputId::Multi, "Multi line", window, cx)),
                 ),
             ))
             .child(self.section(

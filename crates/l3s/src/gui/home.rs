@@ -167,6 +167,9 @@ pub struct HomePanel {
     new_branch: String,
     /// Which picker's dropdown is showing, if any.
     dropdown: Option<HomeField>,
+    /// The picker an outside press just dismissed, so the chip's own click can
+    /// tell a toggle-off from a fresh open.
+    dismissed: Option<HomeField>,
     /// The open dropdown's type-to-filter query.
     filter: String,
     status: String,
@@ -187,6 +190,7 @@ impl Default for HomePanel {
             project: Choice::default(),
             new_branch: String::new(),
             dropdown: None,
+            dismissed: None,
             filter: String::new(),
             status: String::new(),
         }
@@ -203,6 +207,7 @@ impl HomePanel {
     pub fn open(&mut self) {
         self.open = true;
         self.dropdown = None;
+        self.dismissed = None;
         self.filter.clear();
         self.focus = HomeFocus::Prompt;
         self.status.clear();
@@ -212,6 +217,7 @@ impl HomePanel {
     pub fn close(&mut self) {
         self.open = false;
         self.dropdown = None;
+        self.dismissed = None;
         self.filter.clear();
         self.status.clear();
     }
@@ -319,7 +325,28 @@ impl HomePanel {
     /// Hide the dropdown without changing the selection.
     pub fn close_dropdown(&mut self) {
         self.dropdown = None;
+        self.dismissed = None;
         self.filter.clear();
+    }
+
+    /// Close the dropdown because a press landed outside it.
+    ///
+    /// The chip's own click arrives on mouse-up, after this capture-phase
+    /// handler, so the dismissed picker is remembered for that click to read.
+    /// A press that lands while nothing is open just clears the memory.
+    pub fn dismiss_dropdown(&mut self) {
+        if self.dropdown.is_some() {
+            self.dismissed = self.dropdown;
+            self.dropdown = None;
+            self.filter.clear();
+        } else {
+            self.dismissed = None;
+        }
+    }
+
+    /// The picker an outside press dismissed, consuming the memory.
+    pub fn take_dismissed(&mut self) -> Option<HomeField> {
+        self.dismissed.take()
     }
 
     /// The open dropdown's filter query.
@@ -417,6 +444,19 @@ mod tests {
         assert_eq!(choice.selected(), Some("b"));
         choice.set(vec!["x".into(), "y".into()]);
         assert_eq!(choice.selected(), Some("x"));
+    }
+
+    #[test]
+    fn outside_press_dismisses_and_the_chip_click_sees_it() {
+        let mut home = HomePanel::default();
+        home.open_dropdown(HomeField::Model);
+        home.dismiss_dropdown();
+        assert_eq!(home.dropdown(), None);
+        // The chip's click arrives after the press and reads the dismissal.
+        assert_eq!(home.take_dismissed(), Some(HomeField::Model));
+        // A press with nothing open forgets the previous dismissal.
+        home.dismiss_dropdown();
+        assert_eq!(home.take_dismissed(), None);
     }
 
     #[test]

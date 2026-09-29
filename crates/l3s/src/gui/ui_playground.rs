@@ -11,7 +11,8 @@ use std::rc::Rc;
 
 use gpui::{
     App, Bounds, Context, Div, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, Render,
-    Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    Window, WindowBounds, WindowOptions, anchored, deferred, div, point, prelude::*, px, size,
+    Anchor,
 };
 
 use crate::settings::Settings;
@@ -120,6 +121,9 @@ pub struct UiPlaygroundView {
     multi: Entity<TextInput>,
     pickers: Vec<Picker>,
     open_picker: Option<usize>,
+    /// The picker an outside press just dismissed, so the chip's own click can
+    /// tell a toggle-off from a fresh open.
+    dismissed_picker: Option<usize>,
     tab: usize,
     toggle: bool,
     checked: bool,
@@ -183,6 +187,7 @@ impl UiPlaygroundView {
                 },
             ],
             open_picker: None,
+            dismissed_picker: None,
             tab: 0,
             toggle: true,
             checked: false,
@@ -365,7 +370,11 @@ impl UiPlaygroundView {
             .cursor_pointer()
             .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_picker = (this.open_picker != Some(index)).then_some(index);
+                if this.dismissed_picker.take() == Some(index) {
+                    // An outside press already closed this chip; stay closed.
+                } else {
+                    this.open_picker = (this.open_picker != Some(index)).then_some(index);
+                }
                 cx.notify();
             }));
         if active {
@@ -406,6 +415,16 @@ impl UiPlaygroundView {
             .gap_1()
             .p_1()
             .w(px(220.0))
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if this.open_picker.is_some() {
+                    this.dismissed_picker = this.open_picker;
+                    this.open_picker = None;
+                } else {
+                    this.dismissed_picker = None;
+                }
+                cx.notify();
+            }))
             .rounded_lg()
             .bg(theme.bg)
             .border_1()
@@ -435,6 +454,7 @@ impl UiPlaygroundView {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.pickers[index].selected = option_index;
                         this.open_picker = None;
+                        this.dismissed_picker = None;
                         this.note(format!("Selected {option}"), cx);
                     })),
             );
@@ -1522,20 +1542,32 @@ impl Render for UiPlaygroundView {
                 "DROPDOWNS",
                 self.tray(
                     div()
+                        .relative()
                         .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .flex_wrap()
-                                .items_center()
-                                .gap_3()
-                                .child(self.picker_chip(0, cx))
-                                .child(self.picker_chip(1, cx)),
-                        )
-                        .child(self.picker_options(cx)),
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_3()
+                        .child(self.picker_chip(0, cx))
+                        .child(self.picker_chip(1, cx))
+                        .when(self.open_picker.is_some(), |row| {
+                            row.child(
+                                div()
+                                    .absolute()
+                                    .top(px(0.0))
+                                    .left(px(0.0))
+                                    .child(
+                                        deferred(
+                                            anchored()
+                                                .anchor(Anchor::TopLeft)
+                                                .offset(point(px(0.0), px(30.0)))
+                                                .snap_to_window_with_margin(px(8.0))
+                                                .child(self.picker_options(cx)),
+                                        )
+                                        .with_priority(1),
+                                    ),
+                            )
+                        }),
                 ),
             ))
             .child(self.section(

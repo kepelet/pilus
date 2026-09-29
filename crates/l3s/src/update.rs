@@ -1,27 +1,35 @@
 //! OTA release source and policy for `l3s`.
 //!
-//! The GUI never talks to GitHub or a feed directly. It drives
-//! [`gui::updater::Updater`], which owns an [`UpdateEngine`] built here, so
-//! the source selection (GitHub Releases vs. a static manifest) and the
-//! protocol-compatibility policy stay in one testable place.
+//! The GUI never talks to the release host directly. It drives
+//! [`gui::updater::Updater`], which owns an [`UpdateEngine`] built here, so the
+//! source selection (channel manifest vs. explicit feed URL) and the
+//! protocol-compatibility policy stay in one testable place. The headless
+//! `l3s --check-updates` path builds the same engine, so a broken feed fails
+//! there before it fails in a window.
 //!
 //! Data flow: `update::engine()` → `Updater` entity (background executor) →
 //! `L3sView` status badge → `cx.restart()` into the staged bundle.
 
 use gpui_updater_core::{
-    EngineConfig, GitHubSource, StaticManifestSource, UpdateEngine, UpdateSource, Verification,
-    Version,
+    EngineConfig, StaticManifestSource, UpdateEngine, UpdateSource, Verification, Version,
 };
 
-/// GitHub repo that publishes the `.dmg` releases.
-pub const GITHUB_OWNER: &str = "RizRiyz";
-/// GitHub repo that publishes the `.dmg` releases.
-pub const GITHUB_REPO: &str = "l3s";
+/// Manifest the stable channel reads.
+pub const STABLE_FEED_URL: &str = "https://releases.kepelet.com/l3s/stable.json";
+
+/// Manifest the preview/nightly channels read.
+pub const PREVIEW_FEED_URL: &str = "https://releases.kepelet.com/l3s/preview.json";
+
+/// Name of the env var that overrides the update channel.
+///
+/// Lets a dev session run `nightly` without editing `settings.json`, e.g.
+/// `L3S_UPDATE_CHANNEL=preview cargo run -p l3s`.
+pub const CHANNEL_ENV: &str = "L3S_UPDATE_CHANNEL";
 
 /// Name of the env var that overrides the feed with a static manifest URL.
 ///
-/// Useful for staging (`https://dl.example.com/channels/beta/latest.json`)
-/// and for local testing (`python3 -m http.server` + a hand-written manifest).
+/// Useful for staging and for local testing
+/// (`python3 -m http.server 8000 --directory /tmp/feed`).
 pub const FEED_URL_ENV: &str = "L3S_UPDATE_FEED_URL";
 
 /// Minisign public key that verifies release artifacts.
@@ -31,106 +39,132 @@ pub const FEED_URL_ENV: &str = "L3S_UPDATE_FEED_URL";
 /// not). Once set, switch the default policy to [`Verification::Signature`].
 pub const MINISIGN_PUBLIC_KEY: Option<&str> = None;
 
-/// Supported update channel. The channel selects the manifest path; the
-/// GitHub path ignores it and always reads `releases/latest`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Supported update channel.
+///
+/// Each channel reads a manifest on the release host; `beta`, `nightly`,
+/// `canary`, and `preview` all map to the preview manifest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UpdateChannel {
-    /// Production releases.
+    /// Production releases from [`STABLE_FEED_URL`].
     #[default]
     Stable,
-    /// Pre-release builds.
-    Beta,
+    /// Pre-release builds from [`PREVIEW_FEED_URL`].
+    Preview,
 }
 
 impl UpdateChannel {
-    /// Parse `stable`/`beta`, falling back to stable.
+    /// Parse a channel name, falling back to stable.
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "beta" | "pre" | "prerelease" | "pre-release" => Self::Beta,
+            "preview" | "nightly" | "beta" | "canary" | "dev" | "pre" | "prerelease"
+            | "pre-release" => Self::Preview,
             _ => Self::Stable,
+        }
+    }
+
+    /// Canonical name written to settings and shown in the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Preview => "preview",
+        }
+    }
+
+    /// Manifest used when no explicit URL is configured.
+    pub fn default_feed_url(self) -> &'static str {
+        match self {
+            Self::Stable => STABLE_FEED_URL,
+            Self::Preview => PREVIEW_FEED_URL,
         }
     }
 }
 
 /// What to check, and how strictly to verify it.
 pub struct UpdateRequest {
-    /// Release channel (matters for static-manifest feeds).
+    /// Release channel; selects the default source.
     pub channel: UpdateChannel,
-    /// Explicit manifest URL; overrides the GitHub source when set.
+    /// Explicit manifest URL; `None` uses the channel default.
     pub feed_url: Option<String>,
     /// Minisign public key; defaults to [`MINISIGN_PUBLIC_KEY`].
     pub minisign_key: Option<String>,
 }
 
 impl UpdateRequest {
-    /// Build from settings: explicit feed URL wins, else GitHub.
+    /// Build from persisted settings, then apply the env overrides.
+    ///
+    /// For each knob the env var wins: `L3S_UPDATE_CHANNEL` over
+    /// `update_channel`, `L3S_UPDATE_FEED_URL` over `update_feed_url`. A blank
+    /// value is ignored.
     pub fn from_settings(channel: &str, feed_url: Option<String>) -> Self {
-        let from_env = std::env::var(FEED_URL_ENV)
+        let channel = std::env::var(CHANNEL_ENV)
             .ok()
-            .filter(|url| !url.trim().is_empty());
+            .filter(|raw| !raw.trim().is_empty())
+            .map_or_else(
+                || UpdateChannel::parse(channel),
+                |raw| UpdateChannel::parse(&raw),
+            );
+        let feed_url = std::env::var(FEED_URL_ENV)
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .or_else(|| feed_url.filter(|url| !url.trim().is_empty()));
         Self {
-            channel: UpdateChannel::parse(channel),
-            feed_url: feed_url.filter(|url| !url.trim().is_empty()).or(from_env),
+            channel,
+            feed_url,
             minisign_key: MINISIGN_PUBLIC_KEY.map(str::to_string),
         }
     }
 
-    /// Whether this check reads a static manifest instead of GitHub.
-    pub fn uses_manifest(&self) -> bool {
+    /// The URL the next check reads: explicit override, else the channel
+    /// default.
+    pub fn resolved_feed_url(&self) -> String {
         self.feed_url
-            .as_ref()
-            .is_some_and(|url| !url.trim().is_empty())
+            .clone()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| self.channel.default_feed_url().to_string())
     }
 }
 
-/// The running app version, parsed from `Cargo.toml`.
+/// The running app version.
+///
+/// `scripts/preview-feed.sh` stamps the synthetic preview version into the
+/// binary through `build.rs`, so an installed preview reports exactly what its
+/// feed manifest advertises and a re-check of the same feed settles as up to
+/// date. Stable builds embed nothing and fall back to the Cargo version.
 pub fn current_version() -> Version {
-    // Cargo guarantees a valid semver version string.
-    Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or(Version::new(0, 0, 0))
+    let raw = build_version().unwrap_or(env!("CARGO_PKG_VERSION"));
+    // Cargo guarantees a valid semver version; a bad stamp should not panic a
+    // release build.
+    Version::parse(raw).unwrap_or(Version::new(0, 0, 0))
 }
 
-/// Arch substring the release asset name must contain.
+/// The build-time preview stamp, when one was set while packaging.
+fn build_version() -> Option<&'static str> {
+    let raw = include_str!(concat!(env!("OUT_DIR"), "/preview_version")).trim();
+    (!raw.is_empty()).then_some(raw)
+}
+
+/// One-line description of where a request reads releases from.
 ///
-/// Releases ship Apple Silicon only, so this is always `arm64`. An Intel Mac
-/// matches nothing and gets a readable "no release asset" error instead of
-/// a wrong binary.
-pub fn arch_pattern() -> &'static str {
-    "arm64"
+/// Printed by `--check-updates`, so a misconfigured channel is visible before
+/// a check runs.
+pub fn describe_source(request: &UpdateRequest) -> String {
+    format!("manifest {}", request.resolved_feed_url())
 }
 
 /// Build the update source for a request.
 ///
-/// GitHub needs no extra infrastructure: the workflow publishes
-/// `l3s-*-macos-*.dmg` + `SHA256SUMS` (+ `.minisig` once signing lands) and
-/// the client reads `releases/latest`. A feed URL switches to a static
-/// manifest (R2/S3/any HTTPS host) with per-asset `os`/`arch`/`format` fields.
+/// Each channel reads its manifest on the release host, or the explicit feed
+/// URL when one is configured, with per-asset `os`/`arch`/`format` fields.
+/// Releases ship Apple Silicon only, so `arch` is always `arm64`: an Intel Mac
+/// matches nothing and gets a readable "no release asset" error instead of a
+/// wrong binary.
 pub fn build_source(request: &UpdateRequest) -> Box<dyn UpdateSource> {
-    if let Some(url) = request.feed_url.clone() {
-        Box::new(
-            StaticManifestSource::new(url)
-                .os("macos")
-                .arch(arch_normalized())
-                .format("dmg"),
-        )
-    } else {
-        let mut source = GitHubSource::new(GITHUB_OWNER, GITHUB_REPO)
-            .asset_contains("macos")
-            .asset_contains(arch_pattern())
-            .asset_contains(".dmg")
-            .with_checksums("SHA256SUMS");
-        if request.channel == UpdateChannel::Beta {
-            source = source.include_prereleases(true);
-        }
-        if request.minisign_key.is_some() {
-            source = source.with_minisig();
-        }
-        Box::new(source)
-    }
-}
-
-/// Arch value for manifest `arch` fields: Apple Silicon only (see above).
-fn arch_normalized() -> &'static str {
-    "arm64"
+    Box::new(
+        StaticManifestSource::new(request.resolved_feed_url())
+            .os("macos")
+            .arch("arm64")
+            .format("dmg"),
+    )
 }
 
 /// Verification policy for a request.
@@ -166,26 +200,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_version_matches_cargo() {
-        let version = current_version();
-        assert_eq!(version.to_string(), env!("CARGO_PKG_VERSION"));
+    fn current_version_uses_the_build_stamp_when_present() {
+        let expected = build_version().unwrap_or(env!("CARGO_PKG_VERSION"));
+        assert_eq!(current_version().to_string(), expected);
     }
 
     #[test]
-    fn channel_parses_leniently() {
+    fn channel_parses_aliases_leniently() {
+        for preview in ["preview", "BETA", "nightly", "canary", "pre-release"] {
+            assert_eq!(
+                UpdateChannel::parse(preview),
+                UpdateChannel::Preview,
+                "{preview}"
+            );
+        }
         assert_eq!(UpdateChannel::parse("stable"), UpdateChannel::Stable);
-        assert_eq!(UpdateChannel::parse("BETA"), UpdateChannel::Beta);
-        assert_eq!(UpdateChannel::parse("pre-release"), UpdateChannel::Beta);
         assert_eq!(UpdateChannel::parse("nonsense"), UpdateChannel::Stable);
+        assert_eq!(UpdateChannel::parse("  "), UpdateChannel::Stable);
     }
 
     #[test]
-    fn explicit_feed_url_wins() {
-        let request = UpdateRequest::from_settings(
-            "stable",
-            Some("https://dl.example.com/stable/latest.json".to_string()),
+    fn stable_defaults_to_the_stable_manifest() {
+        let request = UpdateRequest {
+            channel: UpdateChannel::Stable,
+            feed_url: None,
+            minisign_key: None,
+        };
+        assert_eq!(request.resolved_feed_url(), STABLE_FEED_URL);
+        assert_eq!(
+            describe_source(&request),
+            format!("manifest {STABLE_FEED_URL}")
         );
-        assert!(request.uses_manifest());
+    }
+
+    #[test]
+    fn preview_defaults_to_the_preview_manifest() {
+        let request = UpdateRequest {
+            channel: UpdateChannel::Preview,
+            feed_url: None,
+            minisign_key: None,
+        };
+        assert_eq!(request.resolved_feed_url(), PREVIEW_FEED_URL);
+    }
+
+    #[test]
+    fn explicit_feed_url_wins_over_the_channel_default() {
+        let request = UpdateRequest {
+            channel: UpdateChannel::Preview,
+            feed_url: Some("https://dl.example.com/preview/latest.json".to_string()),
+            minisign_key: None,
+        };
+        assert_eq!(
+            request.resolved_feed_url(),
+            "https://dl.example.com/preview/latest.json"
+        );
+    }
+
+    #[test]
+    fn blank_settings_feed_falls_back_to_the_channel_default() {
+        let request = UpdateRequest::from_settings("preview", Some("   ".to_string()));
+        assert_eq!(request.resolved_feed_url(), PREVIEW_FEED_URL);
     }
 
     #[test]

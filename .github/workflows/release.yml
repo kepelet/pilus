@@ -1,9 +1,10 @@
-# Release `l3s` to GitHub Releases for the OTA updater.
+# Release `l3s` artifacts; the client's channel manifests point at them.
 #
-# Tag `vX.Y.Z` (matching `Cargo.toml`) to ship stable, `vX.Y.Z-beta.N` for the
-# beta channel. The client reads `releases/latest` (stable) or includes
-# pre-releases (beta), matching assets on the `macos` / `arm64` / `.dmg`
-# substrings, so asset names must stay `l3s-v<version>-macos-arm64.dmg`.
+# Tag `vX.Y.Z` (matching `Cargo.toml`) to ship stable. The workflow packages
+# `l3s-v<version>-macos-arm64.dmg` and attaches it to the GitHub release. The
+# client reads channel manifests on `releases.kepelet.com` (`stable.json` /
+# `preview.json`), so point those at the uploaded asset (the manifest's
+# `macos` / `arm64` / `.dmg` fields select it).
 #
 # Required secrets: none for unsigned checksums-only releases.
 # Recommended: `MINISIGN_SECRET_KEY` (the minisign secret key contents) plus

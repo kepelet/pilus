@@ -34,7 +34,12 @@ pub enum Launch {
         target: ConnectTarget,
     },
     /// Check the OTA release source and print the result.
-    CheckUpdates,
+    CheckUpdates {
+        /// Channel override (`stable`/`preview`); `None` uses settings/env.
+        channel: Option<String>,
+        /// Feed URL override; `None` uses settings/env or the channel default.
+        feed_url: Option<String>,
+    },
     /// Attach to one saved machine over SSH and print its workspace catalog.
     ProbeMachine {
         /// Stable machine profile id.
@@ -54,7 +59,7 @@ pub fn run() -> Result<()> {
         } => run_probe(target, workspaces, open_menu),
         Launch::Uhp { target, pane } => run_uhp(target, pane),
         Launch::Feed { target } => run_feed(target),
-        Launch::CheckUpdates => run_check_updates(),
+        Launch::CheckUpdates { channel, feed_url } => run_check_updates(channel, feed_url),
         Launch::ProbeMachine { id } => run_probe_machine(id),
     }
 }
@@ -70,6 +75,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
     let mut check_updates = false;
     let mut machine_id = None;
     let mut pane_id = None;
+    let mut channel = None;
+    let mut feed_url = None;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -104,6 +111,18 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
                 );
             }
             "--check-updates" => check_updates = true,
+            "--channel" => {
+                channel = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--channel needs a name"))?,
+                );
+            }
+            "--feed-url" => {
+                feed_url = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--feed-url needs a URL"))?,
+                );
+            }
             "--pane" => {
                 pane_id = Some(
                     args.next()
@@ -118,7 +137,13 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
         }
     }
     if check_updates {
-        return Ok(Launch::CheckUpdates);
+        return Ok(Launch::CheckUpdates { channel, feed_url });
+    }
+    if channel.is_some() || feed_url.is_some() {
+        bail!(
+            "--channel and --feed-url apply to --check-updates; for the window, \
+             set L3S_UPDATE_CHANNEL / L3S_UPDATE_FEED_URL instead"
+        );
     }
     if let Some(id) = machine_id {
         return Ok(Launch::ProbeMachine { id });
@@ -157,6 +182,8 @@ fn print_help() {
          \x20   --probe-feed     Run the event-driven feed briefly and print it\n\
          \x20   --probe-machine ID  Attach to a saved machine over SSH and print it\n\
          \x20   --check-updates  Check the OTA release source and print it\n\
+         \x20   --channel NAME   Channel for --check-updates (stable or preview)\n\
+         \x20   --feed-url URL   Static release manifest for --check-updates\n\
          \x20   --pane ID        Pane to observe with --probe-uhp\n\
          \x20   -h, --help       Print this help"
     );
@@ -307,20 +334,24 @@ fn run_feed(target: ConnectTarget) -> Result<()> {
 
 /// Check the OTA release source without touching the GUI.
 ///
-/// Uses the same engine the window drives, so a failing nightly feed or a
-/// mismatched asset name shows up here first. Honors `L3S_UPDATE_FEED_URL`.
-fn run_check_updates() -> Result<()> {
-    let request = crate::update::UpdateRequest::from_settings("stable", None);
-    if request.uses_manifest() {
-        let url = request.feed_url.as_deref().unwrap_or("(unset)");
-        println!("source: manifest {url}");
-    } else {
-        println!(
-            "source: GitHub {}/{} (releases/latest)",
-            crate::update::GITHUB_OWNER,
-            crate::update::GITHUB_REPO
-        );
+/// Reads the same `settings.json` the window does, then layers `--channel` /
+/// `--feed-url` on top; `L3S_UPDATE_CHANNEL` / `L3S_UPDATE_FEED_URL` sit
+/// between the two. Uses the same engine the window drives, so a failing
+/// preview feed or a mismatched asset name shows up here first.
+fn run_check_updates(channel: Option<String>, feed_url: Option<String>) -> Result<()> {
+    let settings = crate::settings::Settings::load(&l3s_client::l3s_config_dir());
+    let mut request = crate::update::UpdateRequest::from_settings(
+        &settings.update_channel,
+        settings.update_feed_url.clone(),
+    );
+    if let Some(channel) = channel {
+        request.channel = crate::update::UpdateChannel::parse(&channel);
     }
+    if let Some(url) = feed_url {
+        request.feed_url = Some(url);
+    }
+    println!("channel: {}", request.channel.label());
+    println!("source: {}", crate::update::describe_source(&request));
     let engine = crate::update::engine(&request);
     match engine.check() {
         Ok(Some(release)) => {
@@ -334,7 +365,7 @@ fn run_check_updates() -> Result<()> {
             }
             println!("{}", crate::update::PROTOCOL_NOTE);
         }
-        Ok(None) => println!("up to date ({})", env!("CARGO_PKG_VERSION")),
+        Ok(None) => println!("up to date ({})", crate::update::current_version()),
         Err(error) => bail!("update check failed: {error}"),
     }
     Ok(())
@@ -526,5 +557,54 @@ fn print_frame(frame: &l3s_protocol::FrameData) {
             })
             .collect();
         println!("{}", line.trim_end());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_args(args: &[&str]) -> Result<Launch> {
+        parse(args.iter().map(ToString::to_string))
+    }
+
+    #[test]
+    fn check_updates_takes_channel_and_feed_overrides() {
+        let launch = parse_args(&[
+            "--check-updates",
+            "--channel",
+            "nightly",
+            "--feed-url",
+            "http://127.0.0.1:8000/latest.json",
+        ])
+        .expect("parse");
+        match launch {
+            Launch::CheckUpdates { channel, feed_url } => {
+                assert_eq!(channel.as_deref(), Some("nightly"));
+                assert_eq!(
+                    feed_url.as_deref(),
+                    Some("http://127.0.0.1:8000/latest.json")
+                );
+            }
+            _ => panic!("expected CheckUpdates"),
+        }
+    }
+
+    #[test]
+    fn channel_overrides_require_check_updates() {
+        assert!(parse_args(&["--channel", "preview"]).is_err());
+        assert!(parse_args(&["--feed-url", "http://127.0.0.1:8000/latest.json"]).is_err());
+    }
+
+    #[test]
+    fn a_bare_check_updates_uses_settings() {
+        let launch = parse_args(&["--check-updates"]).expect("parse");
+        match launch {
+            Launch::CheckUpdates { channel, feed_url } => {
+                assert!(channel.is_none());
+                assert!(feed_url.is_none());
+            }
+            _ => panic!("expected CheckUpdates"),
+        }
     }
 }

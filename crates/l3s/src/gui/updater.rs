@@ -35,17 +35,23 @@ pub struct Updater {
 impl Updater {
     /// Build from an [`UpdateRequest`]; the engine is fixed for the entity.
     pub fn from_request(request: &UpdateRequest, _cx: &mut Context<Self>) -> Self {
-        Self::with_engine(crate::update::engine(request))
-    }
-
-    /// Build from a ready engine (tests).
-    pub fn with_engine(engine: BoxedEngine) -> Self {
         Self {
             status: UpdateStatus::Idle,
             available: None,
-            engine: Arc::new(engine),
+            engine: Arc::new(crate::update::engine(request)),
             task: None,
         }
+    }
+
+    /// Swap the engine after the channel or feed URL changed.
+    ///
+    /// Cancels any in-flight foreground task, so a check that raced the
+    /// settings change cannot land an answer for the old source.
+    pub fn reconfigure(&mut self, request: &UpdateRequest, cx: &mut Context<Self>) {
+        self.task = None;
+        self.engine = Arc::new(crate::update::engine(request));
+        self.available = None;
+        self.set_status(UpdateStatus::Idle, cx);
     }
 
     /// Current status; read this in `render`.

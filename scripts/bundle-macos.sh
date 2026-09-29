@@ -7,6 +7,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+# `preview-feed.sh` overrides this with its synthetic preview version so the
+# bundle's Info.plist matches the version the binary reports.
+app_version="${L3S_BUILD_VERSION:-$version}"
 app="target/release/l3s.app"
 
 cargo build --release -p l3s
@@ -27,8 +30,8 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>CFBundleExecutable</key><string>l3s</string>
     <key>CFBundleIconFile</key><string>l3s.icns</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>${version}</string>
-    <key>CFBundleVersion</key><string>${version}</string>
+    <key>CFBundleShortVersionString</key><string>${app_version}</string>
+    <key>CFBundleVersion</key><string>${app_version}</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict>

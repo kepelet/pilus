@@ -38,8 +38,8 @@ use crossterm::event::{
 };
 use gpui::{
     Action, AnyElement, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, FontWeight,
-    Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle,
+    Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle,
     ScrollWheelEvent, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions, div, font,
     img, point, prelude::*, px, size, svg,
 };
@@ -710,6 +710,11 @@ struct L3sView {
     press_anchor: Option<Cell>,
     /// Last cell a hover move was forwarded for, so the daemon isn't flooded.
     hover_cell: Option<Cell>,
+    /// Whether `Ctrl` is held, tracked from modifier changes. macOS turns a
+    /// `Ctrl`+left-click into a right-click before the window sees it, so the
+    /// flag is what lets a secondary click still reach the daemon as the
+    /// `Ctrl`+left-click that opens a link.
+    control_held: bool,
     /// Background poller for the current session's tabs and widgets.
     agent_feed: Option<AgentFeed>,
     /// State root the SESSIONS section lists, derived from the launch target.
@@ -967,6 +972,7 @@ impl L3sView {
             drag_moved: false,
             press_anchor: None,
             hover_cell: None,
+            control_held: false,
             agent_feed,
             session_root,
             l3s_root,
@@ -6167,11 +6173,16 @@ impl L3sView {
 
     /// Send one mouse event to the daemon at `cell`.
     fn forward_mouse(&self, kind: MouseEventKind, cell: Cell, modifiers: Modifiers) {
+        self.forward_mouse_with(kind, cell, keys::mouse_modifiers(modifiers));
+    }
+
+    /// Send one mouse event with wire modifiers already resolved.
+    fn forward_mouse_with(&self, kind: MouseEventKind, cell: Cell, modifiers: KeyModifiers) {
         let _ = self.connection.send(ClientMessage::Mouse(MouseEvent {
             kind,
             column: cell.column,
             row: cell.row,
-            modifiers: keys::modifiers(modifiers),
+            modifiers,
         }));
     }
 
@@ -6235,6 +6246,10 @@ impl L3sView {
         let Some(cell) = self.cell_at(window, event.position) else {
             return;
         };
+        // A move carries the live modifier state (macOS only clears `Ctrl` on
+        // the down/up it rewrites), so it repairs a stale flag after `Ctrl` was
+        // released while the pointer was outside the window.
+        self.control_held = event.modifiers.control;
         if self.hover_cell != Some(cell) {
             self.hover_cell = Some(cell);
             self.forward_mouse(MouseEventKind::Moved, cell, event.modifiers);
@@ -6292,18 +6307,46 @@ impl L3sView {
         if self.hit_chrome(window, event.position) {
             return;
         }
-        if let Some(cell) = self.cell_at(window, event.position) {
-            self.forward_mouse(MouseEventKind::Down(button), cell, event.modifiers);
-        }
+        let Some(cell) = self.cell_at(window, event.position) else {
+            return;
+        };
+        self.forward_button(MouseEventKind::Down(button), button, cell, event.modifiers);
     }
 
     fn release(&mut self, event: &MouseUpEvent, button: TerminalMouseButton, window: &Window) {
         if self.hit_chrome(window, event.position) {
             return;
         }
-        if let Some(cell) = self.cell_at(window, event.position) {
-            self.forward_mouse(MouseEventKind::Up(button), cell, event.modifiers);
+        let Some(cell) = self.cell_at(window, event.position) else {
+            return;
+        };
+        self.forward_button(MouseEventKind::Up(button), button, cell, event.modifiers);
+    }
+
+    /// Forward a button event, reinterpreting a `Ctrl`-held secondary click as
+    /// the `Ctrl`+left-click the daemon uses to open a link.
+    ///
+    /// macOS rewrites `Ctrl`+left-click to a right-click in `gpui`, so the
+    /// original chord is unrecoverable from the event alone; `control_held`
+    /// supplies the missing half.
+    fn forward_button(
+        &self,
+        kind: MouseEventKind,
+        button: TerminalMouseButton,
+        cell: Cell,
+        modifiers: Modifiers,
+    ) {
+        if button == TerminalMouseButton::Right && self.control_held {
+            let kind = match kind {
+                MouseEventKind::Down(_) => MouseEventKind::Down(TerminalMouseButton::Left),
+                MouseEventKind::Up(_) => MouseEventKind::Up(TerminalMouseButton::Left),
+                other => other,
+            };
+            let modifiers = keys::mouse_modifiers(modifiers) | KeyModifiers::CONTROL;
+            self.forward_mouse_with(kind, cell, modifiers);
+            return;
         }
+        self.forward_mouse_with(kind, cell, keys::mouse_modifiers(modifiers));
     }
 
     fn scroll(&mut self, event: &ScrollWheelEvent, window: &Window) {
@@ -8332,6 +8375,9 @@ impl Render for L3sView {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx);
+            }))
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _window, _cx| {
+                this.control_held = event.modifiers.control;
             }))
             .on_action(cx.listener(|this, _: &CopySelection, _window, cx| {
                 if this.palette.is_open() {

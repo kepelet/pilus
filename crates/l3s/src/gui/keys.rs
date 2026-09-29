@@ -61,6 +61,19 @@ fn key_code(keystroke: &Keystroke) -> Option<KeyCode> {
     Some(code)
 }
 
+/// Translate pointer modifiers into the daemon's vocabulary.
+///
+/// The daemon opens a pane link on `Ctrl`+click. macOS terminals use `Cmd`
+/// for the same gesture, so alias `Cmd` onto `Ctrl` here and let the daemon
+/// see the chord it already understands.
+pub(super) fn mouse_modifiers(modifiers: Modifiers) -> KeyModifiers {
+    let mut out = self::modifiers(modifiers);
+    if modifiers.platform {
+        out |= KeyModifiers::CONTROL;
+    }
+    out
+}
+
 pub(super) fn modifiers(modifiers: Modifiers) -> KeyModifiers {
     let mut out = KeyModifiers::NONE;
     if modifiers.control {
@@ -115,5 +128,16 @@ mod tests {
     #[test]
     fn modifier_only_is_dropped() {
         assert!(to_wire(&stroke("shift", None), KeyEventKind::Press).is_none());
+    }
+
+    #[test]
+    fn command_aliases_onto_control_for_the_mouse() {
+        // The daemon opens links on Ctrl+click; macOS users reach for Cmd.
+        let command = mouse_modifiers(Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        });
+        assert!(command.contains(KeyModifiers::CONTROL));
+        assert!(mouse_modifiers(Modifiers::default()).is_empty());
     }
 }

@@ -42,6 +42,8 @@ Early. `l3s` today is a focused vertical slice:
   visible surface between endpoints with a two-phase prepared frame, offers a
   native Open Workspace folder picker and a Remote Machines manager, and lists
   live agents from every connected endpoint in the AGENTS dock;
+- remembers the main window's size, position, and display across launches,
+  falling back to a centered window when the display is gone;
 - paints the grid in a GPUI window with the ANSI palette resolved natively.
 
 Client-native chrome that the daemon does not project (file tree, Git

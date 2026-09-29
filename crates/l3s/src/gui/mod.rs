@@ -30,18 +30,18 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use crate::settings::{CHROME_FONT, Settings};
+use crate::settings::{CHROME_FONT, Settings, WindowGeometry};
 use crate::update::{UpdateChannel, UpdateRequest, describe_source};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
     MouseEventKind,
 };
 use gpui::{
-    Action, AnyElement, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, FontWeight,
-    Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions, div, font,
-    img, point, prelude::*, px, size, svg,
+    Action, AnyElement, App, Bounds, ClipboardItem, Context, DisplayId, Div, Entity, FocusHandle,
+    FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    div, font, img, point, prelude::*, px, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
@@ -104,6 +104,17 @@ const TAB_HEIGHT: f32 = 26.0;
 const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
 /// Section label size (SESSIONS / PROJECTS).
 const SECTION_FONT: f32 = 11.0;
+/// Opening size of the main window when nothing is remembered.
+const WINDOW_SIZE: (f32, f32) = (1240.0, 780.0);
+/// Smallest main window the user can resize to, and the floor for a
+/// remembered frame.
+const WINDOW_MIN_SIZE: (f32, f32) = (640.0, 400.0);
+/// How long a moved frame must sit still before it is written to settings, so
+/// a live resize does not write the file on every tick.
+const WINDOW_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Least amount of a restored frame that must land on a display for the frame
+/// to be usable: enough of the titlebar to grab and drag.
+const WINDOW_MIN_VISIBLE: (f32, f32) = (120.0, 40.0);
 
 /// Native sidebar destinations: live daemon data and bound views.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -377,11 +388,12 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                 MenuItem::action("Close Window", CloseWindow),
             ]),
         ]);
-        let bounds = Bounds::centered(None, size(px(1240.0), px(780.0)), cx);
+        let (bounds, display_id) = remembered_frame(&settings.borrow(), cx);
         let opened = cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(640.0), px(400.0))),
+                window_bounds: Some(bounds),
+                display_id,
+                window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("l3s".into()),
                     appears_transparent: true,
@@ -457,6 +469,78 @@ fn app_key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
+/// The frame and display for the first window: the remembered one when it
+/// still lands on the display it was recorded on, otherwise a centered
+/// default. New windows stay centered; only the first is restored.
+fn remembered_frame(settings: &Settings, cx: &App) -> (WindowBounds, Option<DisplayId>) {
+    let default = || {
+        (
+            WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)),
+                cx,
+            )),
+            None,
+        )
+    };
+    let Some(saved) = settings.window.as_ref() else {
+        return default();
+    };
+    // Runtime display ids do not survive a reboot; the UUID does.
+    let display = match saved.display.as_deref() {
+        Some(uuid) => cx
+            .displays()
+            .into_iter()
+            .find(|display| display.uuid().is_ok_and(|id| id.to_string() == uuid)),
+        // Geometry from a platform without stable ids still helps when it
+        // lands on the primary display.
+        None => cx.primary_display(),
+    };
+    let Some(display) = display else {
+        return default();
+    };
+    let bounds = Bounds::new(
+        point(px(saved.x), px(saved.y)),
+        size(
+            px(saved.width.max(WINDOW_MIN_SIZE.0)),
+            px(saved.height.max(WINDOW_MIN_SIZE.1)),
+        ),
+    );
+    if !frame_reachable(&bounds, display.visible_bounds()) {
+        return default();
+    }
+    let bounds = if saved.maximized {
+        WindowBounds::Maximized(bounds)
+    } else {
+        WindowBounds::Windowed(bounds)
+    };
+    (bounds, Some(display.id()))
+}
+
+/// Snapshot the window frame in the form the settings file keeps.
+fn window_geometry(window: &Window, cx: &App) -> WindowGeometry {
+    let bounds = window.window_bounds().get_bounds();
+    WindowGeometry {
+        x: f32::from(bounds.origin.x),
+        y: f32::from(bounds.origin.y),
+        width: f32::from(bounds.size.width),
+        height: f32::from(bounds.size.height),
+        maximized: window.is_maximized(),
+        display: window
+            .display(cx)
+            .and_then(|display| display.uuid().ok())
+            .map(|uuid| uuid.to_string()),
+    }
+}
+
+/// A restored frame must keep enough of itself on its display to be grabbed;
+/// otherwise it opens out of sight after the display was unplugged.
+fn frame_reachable(bounds: &Bounds<Pixels>, visible: Bounds<Pixels>) -> bool {
+    let overlap = bounds.intersect(&visible);
+    f32::from(overlap.size.width) >= WINDOW_MIN_VISIBLE.0
+        && f32::from(overlap.size.height) >= WINDOW_MIN_VISIBLE.1
+}
+
 /// Open another l3s window on the same target.
 ///
 /// Connection setup includes a handshake, so it briefly blocks; this only runs
@@ -476,11 +560,11 @@ fn open_main_window(
         }
     };
     let _ = connection.request_workspace_dock();
-    let bounds = Bounds::centered(None, size(px(1240.0), px(780.0)), cx);
+    let bounds = WindowBounds::centered(size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
     let opened = cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(640.0), px(400.0))),
+            window_bounds: Some(bounds),
+            window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
             titlebar: Some(TitlebarOptions {
                 title: Some("l3s".into()),
                 appears_transparent: true,
@@ -691,6 +775,10 @@ struct L3sView {
     /// Font choices, shared with the Appearances window.
     settings: Settings,
     shared_settings: Rc<RefCell<Settings>>,
+    /// Whether the remembered frame changed since the last settings write.
+    window_dirty: bool,
+    /// When the frame last changed, so a drag settles before the write.
+    window_moved_at: Instant,
     cols: u16,
     rows: u16,
     status: String,
@@ -921,6 +1009,19 @@ impl L3sView {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
+        // Remember the main window's frame across launches; the observer
+        // reports moves and resizes alike.
+        cx.observe_window_bounds(window, |view, window, cx| {
+            view.remember_window_bounds(window, cx);
+        })
+        .detach();
+        // A quit flushes the frame without waiting for the debounce.
+        cx.on_app_quit(|view, _cx| {
+            view.settings.save(&view.l3s_root);
+            async {}
+        })
+        .detach();
+
         // Tabs and widgets come from UHP, which is addressed by session. Find
         // the state root from the launch target, including explicit sockets,
         // so `--socket` builds still list sessions and feed the right tabs.
@@ -962,6 +1063,8 @@ impl L3sView {
             focus_handle,
             settings,
             shared_settings,
+            window_dirty: false,
+            window_moved_at: Instant::now(),
             cols: 120,
             rows: 40,
             status: "connecting…".to_string(),
@@ -1068,6 +1171,9 @@ impl L3sView {
             home_defaults_for: None,
             home_efforts_for: None,
         };
+        // Seed the remembered frame from the one the window actually opened
+        // with; moves and resizes update it from here on.
+        view.remember_window_bounds(window, cx);
         view.projects.reload(&view.l3s_root);
 
         if auto_check {
@@ -1080,6 +1186,7 @@ impl L3sView {
         cx.spawn(async move |this, cx| {
             loop {
                 let updated = this.update(cx, |view, cx| {
+                    view.persist_window_bounds();
                     let changed = view.sync_settings(cx);
                     if view.poll(cx) || changed {
                         cx.notify();
@@ -2065,6 +2172,31 @@ impl L3sView {
             .map(|dock| Theme::from_chrome(dock.chrome));
         self.theme = builtin.or(projected).unwrap_or_default();
         *self.shared_theme.borrow_mut() = self.theme;
+    }
+
+    /// Record the window's frame in settings. The tick loop flushes it once
+    /// the frame stops changing.
+    fn remember_window_bounds(&mut self, window: &Window, cx: &App) {
+        let geometry = window_geometry(window, cx);
+        if self.settings.window.as_ref() == Some(&geometry) {
+            return;
+        }
+        self.settings.window = Some(geometry);
+        // The Settings page and other windows read the shared copy, so the
+        // frame must land there too or `sync_settings` would restore the old
+        // one on the next tick.
+        *self.shared_settings.borrow_mut() = self.settings.clone();
+        self.window_dirty = true;
+        self.window_moved_at = Instant::now();
+    }
+
+    /// Write a settled frame to the settings file.
+    fn persist_window_bounds(&mut self) {
+        if !self.window_dirty || self.window_moved_at.elapsed() < WINDOW_SAVE_DEBOUNCE {
+            return;
+        }
+        self.window_dirty = false;
+        self.settings.save(&self.l3s_root);
     }
 
     /// Pull shared settings the Appearances window or Settings page changed.
@@ -9229,6 +9361,17 @@ mod tests {
             mods,
             ..CellData::default()
         }
+    }
+
+    #[test]
+    fn restored_frames_must_stay_reachable() {
+        let display = Bounds::new(point(px(0.), px(0.)), size(px(1920.), px(1080.)));
+        let frame = |x: f32, y: f32| Bounds::new(point(px(x), px(y)), size(px(800.), px(600.)));
+        // Inside, edge-clipped, or mostly off-screen but still grabbable.
+        assert!(frame_reachable(&frame(100., 100.), display));
+        assert!(frame_reachable(&frame(-650., -450.), display));
+        // Gone with the display it was recorded on.
+        assert!(!frame_reachable(&frame(2400., 0.), display));
     }
 
     #[test]

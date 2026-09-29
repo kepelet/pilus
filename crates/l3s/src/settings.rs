@@ -16,6 +16,27 @@ pub const FONT_SIZE: f32 = 13.0;
 /// Default chrome text size in logical pixels.
 pub const CHROME_FONT: f32 = 13.0;
 
+/// The main window's frame when it was last seen, so the next launch reopens
+/// it where the user left it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    /// Left edge in the display's own coordinates, like the window reports it.
+    pub x: f32,
+    /// Top edge in the display's own coordinates.
+    pub y: f32,
+    /// Frame width in logical pixels.
+    pub width: f32,
+    /// Frame height in logical pixels.
+    pub height: f32,
+    /// Whether the window was zoomed (maximized) when it was recorded.
+    #[serde(default)]
+    pub maximized: bool,
+    /// Stable UUID of the display it sat on, so the frame is restored there
+    /// even after the runtime display id changes.
+    #[serde(default)]
+    pub display: Option<String>,
+}
+
 /// The font choices and update preferences a user can change.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -35,6 +56,8 @@ pub struct Settings {
     /// Override the release feed with a static manifest URL; empty uses the
     /// channel default (`releases.kepelet.com/l3s/<channel>.json`).
     pub update_feed_url: Option<String>,
+    /// Frame of the main window, restored on the next launch.
+    pub window: Option<WindowGeometry>,
 }
 
 impl Default for Settings {
@@ -47,6 +70,7 @@ impl Default for Settings {
             update_channel: "stable".to_string(),
             auto_check_updates: false,
             update_feed_url: None,
+            window: None,
         }
     }
 }
@@ -91,6 +115,15 @@ mod tests {
         assert!(settings.ui_font.is_none());
         assert_eq!(settings.update_channel, "stable");
         assert!(settings.update_feed_url.is_none());
+        assert!(settings.window.is_none());
+    }
+
+    #[test]
+    fn missing_window_is_none() {
+        // Settings written before the frame was remembered must still load.
+        let back: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert!(back.window.is_none());
     }
 
     #[test]
@@ -103,6 +136,14 @@ mod tests {
             update_channel: "preview".to_string(),
             auto_check_updates: false,
             update_feed_url: Some("https://dl.example.com/preview/latest.json".to_string()),
+            window: Some(WindowGeometry {
+                x: 120.0,
+                y: 64.0,
+                width: 1280.0,
+                height: 800.0,
+                maximized: true,
+                display: Some("6d0f9a4c-30b2-4f25-9a2e-4a8f9c3b7d10".to_string()),
+            }),
         };
         let text = serde_json::to_string(&settings).expect("serialize");
         let back: Settings = serde_json::from_str(&text).expect("deserialize");

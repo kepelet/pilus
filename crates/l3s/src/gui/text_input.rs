@@ -18,6 +18,7 @@
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
@@ -35,6 +36,8 @@ use super::theme::Theme;
 const LINE_LEADING: f32 = 1.45;
 /// Caret width, in logical pixels.
 const CARET_WIDTH: f32 = 1.5;
+/// Half of the on/off caret blink cycle, in milliseconds.
+const CARET_BLINK: Duration = Duration::from_millis(530);
 
 /// The last shaped frame, kept so pointer hit-testing can map a window point to
 /// a byte offset without re-shaping on every mouse move.
@@ -466,6 +469,13 @@ pub(super) struct TextInput {
     /// Whether a bare Enter should be left to the window (to send) instead of
     /// inserting a newline. Shift+Enter always inserts one.
     enter_submits: bool,
+    /// Whether the caret is in its visible blink phase.
+    caret_on: bool,
+    /// Whether the field held focus at the last paint. The blink task idles
+    /// while this is false.
+    focused: bool,
+    /// Whether the blink task has been started for this field.
+    blink_started: bool,
     last: Rc<RefCell<Option<LastLayout>>>,
 }
 
@@ -519,6 +529,9 @@ impl TextInput {
             theme,
             dragging: false,
             enter_submits: false,
+            caret_on: true,
+            focused: false,
+            blink_started: false,
             last: Rc::new(RefCell::new(None)),
         }
     }
@@ -957,6 +970,31 @@ impl TextInput {
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
+        if focused != self.focused {
+            // Start each focus span with a visible caret.
+            self.focused = focused;
+            self.caret_on = true;
+        }
+        // Blink the caret on a slow timer, repainting only while focused so an
+        // idle field costs nothing. The task dies with the entity.
+        if !self.blink_started {
+            self.blink_started = true;
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(CARET_BLINK).await;
+                    let alive = this.update(cx, |input, cx| {
+                        if input.focused {
+                            input.caret_on = !input.caret_on;
+                            cx.notify();
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         let theme = self.theme;
         let font_size = self.font_size;
         let line_height = self.line_height;
@@ -1013,7 +1051,7 @@ impl Render for TextInput {
 
         let offsets = line_offsets(&text);
         let marked = self.marked.clone();
-        let caret_visible = focused;
+        let caret_visible = focused && self.caret_on;
         let row_count = layouts.len();
         let height = self.height(row_count);
 

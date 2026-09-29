@@ -10,36 +10,33 @@ use super::text_input::TextField;
 /// The pickers in the composer, in the order they read across it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HomeField {
-    Machine,
     Agent,
     Model,
     Effort,
-    Branch,
     Base,
+    Branch,
     Project,
 }
 
 impl HomeField {
     /// Every picker, left to right.
-    pub const ALL: [HomeField; 7] = [
-        HomeField::Machine,
+    pub const ALL: [HomeField; 6] = [
         HomeField::Agent,
         HomeField::Model,
         HomeField::Effort,
-        HomeField::Branch,
         HomeField::Base,
+        HomeField::Branch,
         HomeField::Project,
     ];
 
     /// The chip label.
     pub fn label(self) -> &'static str {
         match self {
-            HomeField::Machine => "Machine",
             HomeField::Agent => "Agent",
             HomeField::Model => "Model",
             HomeField::Effort => "Effort",
+            HomeField::Base => "Base",
             HomeField::Branch => "Branch",
-            HomeField::Base => "Base branch",
             HomeField::Project => "Project",
         }
     }
@@ -86,20 +83,23 @@ impl HomeFocus {
     }
 }
 
-/// What a launch starts from: the project checkout or a fresh worktree.
+/// What a launch starts from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BaseMode {
     /// Run in the project's existing checkout.
-    Local,
-    /// Create a worktree for the branch first.
+    Checkout,
+    /// Create a worktree from the base branch first.
     NewWorktree,
 }
 
 impl BaseMode {
-    /// The chip value.
+    /// Both modes, in toggle order.
+    pub const ALL: [BaseMode; 2] = [BaseMode::Checkout, BaseMode::NewWorktree];
+
+    /// The segment label.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Local => "Local",
+            Self::Checkout => "Current checkout",
             Self::NewWorktree => "New worktree",
         }
     }
@@ -113,11 +113,6 @@ pub struct Choice {
 }
 
 impl Choice {
-    /// A choice seeded with `options`, highlighting the first.
-    pub fn with_options(options: Vec<String>) -> Self {
-        Self { options, cursor: 0 }
-    }
-
     /// Every option.
     pub fn options(&self) -> &[String] {
         &self.options
@@ -156,15 +151,12 @@ pub struct HomePanel {
     open: bool,
     prompt: TextField,
     focus: HomeFocus,
-    machine: Choice,
     agent: Choice,
     model: Choice,
     effort: Choice,
-    branch: Choice,
     base: Choice,
+    branch: Choice,
     project: Choice,
-    /// A generated branch name offered first for a new worktree.
-    new_branch: String,
     /// Which picker's dropdown is showing, if any.
     dropdown: Option<HomeField>,
     /// The picker an outside press just dismissed, so the chip's own click can
@@ -177,18 +169,18 @@ pub struct HomePanel {
 
 impl Default for HomePanel {
     fn default() -> Self {
+        let mut base = Choice::default();
+        base.set(BaseMode::ALL.iter().map(|mode| mode.label().to_string()).collect());
         Self {
             open: false,
             prompt: TextField::default(),
             focus: HomeFocus::Prompt,
-            machine: Choice::default(),
             agent: Choice::default(),
             model: Choice::default(),
             effort: Choice::default(),
+            base,
             branch: Choice::default(),
-            base: Choice::with_options(vec!["Local".to_string(), "New worktree".to_string()]),
             project: Choice::default(),
-            new_branch: String::new(),
             dropdown: None,
             dismissed: None,
             filter: String::new(),
@@ -255,25 +247,14 @@ impl HomePanel {
         &self.prompt
     }
 
-    /// The generated branch offered first for a new worktree.
-    pub fn new_branch(&self) -> &str {
-        &self.new_branch
-    }
-
-    /// Replace the generated branch name.
-    pub fn set_new_branch(&mut self, branch: String) {
-        self.new_branch = branch;
-    }
-
-    /// The picker options for `field`; `Base` and `Branch` included.
+    /// The picker options for `field`.
     pub fn choice(&self, field: HomeField) -> &Choice {
         match field {
-            HomeField::Machine => &self.machine,
             HomeField::Agent => &self.agent,
             HomeField::Model => &self.model,
             HomeField::Effort => &self.effort,
-            HomeField::Branch => &self.branch,
             HomeField::Base => &self.base,
+            HomeField::Branch => &self.branch,
             HomeField::Project => &self.project,
         }
     }
@@ -281,24 +262,13 @@ impl HomePanel {
     /// The picker options for `field`, mutably.
     pub fn choice_mut(&mut self, field: HomeField) -> &mut Choice {
         match field {
-            HomeField::Machine => &mut self.machine,
             HomeField::Agent => &mut self.agent,
             HomeField::Model => &mut self.model,
             HomeField::Effort => &mut self.effort,
-            HomeField::Branch => &mut self.branch,
             HomeField::Base => &mut self.base,
+            HomeField::Branch => &mut self.branch,
             HomeField::Project => &mut self.project,
         }
-    }
-
-    /// Whether the selected project is the "No project" row.
-    pub fn project_is_none(&self) -> bool {
-        self.project.cursor() == 0
-    }
-
-    /// The selected project's index in the caller's project list.
-    pub fn project_index(&self) -> Option<usize> {
-        (!self.project_is_none()).then(|| self.project.cursor() - 1)
     }
 
     /// What a launch starts from.
@@ -306,8 +276,18 @@ impl HomePanel {
         if self.base.cursor() == 1 {
             BaseMode::NewWorktree
         } else {
-            BaseMode::Local
+            BaseMode::Checkout
         }
+    }
+
+    /// Whether the selected project is the personal-workspace row.
+    pub fn project_is_none(&self) -> bool {
+        self.project.cursor() == 0
+    }
+
+    /// The selected project's index in the caller's project list.
+    pub fn project_index(&self) -> Option<usize> {
+        (!self.project_is_none()).then(|| self.project.cursor() - 1)
     }
 
     /// Which picker's dropdown is showing, if any.
@@ -438,7 +418,8 @@ mod tests {
 
     #[test]
     fn choice_set_keeps_value_when_it_survives() {
-        let mut choice = Choice::with_options(vec!["a".into(), "b".into(), "c".into()]);
+        let mut choice = Choice::default();
+        choice.set(vec!["a".into(), "b".into(), "c".into()]);
         choice.choose(1);
         choice.set(vec!["c".into(), "b".into()]);
         assert_eq!(choice.selected(), Some("b"));
@@ -468,7 +449,7 @@ mod tests {
         home.focus_next();
         assert_eq!(home.focus(), HomeFocus::Prompt);
         home.focus_next();
-        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Machine));
+        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Agent));
     }
 
     #[test]
@@ -499,9 +480,9 @@ mod tests {
     }
 
     #[test]
-    fn base_mode_reads_the_cursor() {
+    fn base_mode_reads_the_picker() {
         let mut home = HomePanel::default();
-        assert_eq!(home.base_mode(), BaseMode::Local);
+        assert_eq!(home.base_mode(), BaseMode::Checkout);
         home.choice_mut(HomeField::Base).choose(1);
         assert_eq!(home.base_mode(), BaseMode::NewWorktree);
     }

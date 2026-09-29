@@ -6697,7 +6697,12 @@ impl L3sView {
     ///
     /// The pill updates immediately from the optimistic pick; `tab.list`
     /// confirms it a moment later, after the daemon has actually switched.
+    /// A shortcut for a tab that does not exist (e.g. `Cmd+4` with three
+    /// tabs) is ignored rather than selecting nothing.
     fn focus_tab(&mut self, index: u16, cx: &mut Context<Self>) {
+        if !tab_exists(&self.tabs, index) {
+            return;
+        }
         self.tab_sel = Some(index);
         self.tab_sel_at = Instant::now();
         if let Some(feed) = self.agent_feed.as_ref() {
@@ -8442,6 +8447,13 @@ impl L3sView {
     }
 }
 
+/// Whether `tabs` contains the 1-based position `index`.
+///
+/// Guards `Cmd+N` shortcuts: a tab that does not exist must not be selected.
+fn tab_exists(tabs: &[Tab], index: u16) -> bool {
+    tabs.iter().any(|tab| tab.index == index)
+}
+
 impl Render for L3sView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_metrics(window);
@@ -9448,6 +9460,20 @@ mod tests {
             let chord = format!("{:?}", binding.keystrokes());
             assert!(seen.insert(chord.clone()), "duplicate shortcut: {chord}");
         }
+    }
+
+    #[test]
+    fn focus_shortcut_ignores_a_missing_tab() {
+        let tabs: Vec<Tab> = (1..=3)
+            .map(|index| Tab {
+                index,
+                ..Tab::default()
+            })
+            .collect();
+        assert!(tab_exists(&tabs, 3));
+        // `Cmd+4` with three tabs must not select anything.
+        assert!(!tab_exists(&tabs, 4));
+        assert!(!tab_exists(&[], 1));
     }
 
     #[test]

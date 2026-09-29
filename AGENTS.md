@@ -34,6 +34,37 @@ with only the command-line tools can build the app.
 - The GUI thread never blocks on socket IO. Reads happen on a background reader
   thread; writes go through an unbounded channel to a writer thread.
 
+## UI
+
+`crates/l3s/src/gui/ui_playground.rs` is the visual contract: a working
+catalogue of every native element the app draws. `crates/l3s/src/gui/style.rs`
+is the only implementation of it. Draw controls through `style::button`,
+`style::small_button`, `style::field`, and `style::section_label`; do not
+hand-roll a button, field, or section label in another window. When an element
+is missing, add it to `style.rs` and to the playground first, then use it.
+
+- **Type scale**: 13 body, 12 secondary, 11 label. Section labels are bold,
+  muted, and uppercase. Resolve sizes with `style::Fonts::resolve` or
+  `style::scaled` so every surface follows the Interface size setting; a fixed
+  `text_size(px(...))` for chrome text is a bug even when the default happens
+  to match.
+- **Geometry**: 28px regular controls, 24px compact ones, `px_3`/`px_2`
+  padding, `rounded_md` for controls, cards, and overlays, `rounded_lg` for
+  large floating panels. The Home composer's `rounded_t_lg`/`rounded_b_lg`
+  follows that rule rather than excepting it.
+- **Color** comes from `Theme` roles; literals belong in `theme.rs` and
+  `scheme.rs` only. Chrome and floating-panel frames use
+  `terminal_inset_border()`, the terminal card's low-contrast hairline;
+  interactive content (fields, rows, buttons, badges) outlines with
+  `theme.border`. The selected tab is raised by its panel fill alone; it takes
+  no border. Accent means progress or focus, not a panel edge.
+- **Selection** in the sidebar (workspace, worktree, agent) is the `theme.panel`
+  pill with `panel_fg`/`muted` text and a bold name. `selection_bg`/`selection_fg`
+  belong to text selection and list highlighting, not sidebar rows.
+- Every window root goes through `apply_chrome_font`, so the Interface family
+  and size reach the whole tree. A new window opts in by taking the shared
+  `Settings` and calling it in `render`.
+
 ## Commands
 
 ```sh
@@ -41,6 +72,17 @@ cargo test                    # unit + handshake integration tests
 cargo run -p l3s              # the window (needs a running daemon)
 cargo run -p l3s -- --probe   # headless: print the first frame
 ```
+
+Before shipping a UI change, render it. The `visual-test` feature (not part of
+a normal build) captures every surface to `/tmp/l3s-shots`:
+
+```sh
+cargo run -p l3s --features visual-test -- --ui-shots       # standalone windows
+cargo run -p l3s --features visual-test -- --ui-shots-main  # main window + overlays
+```
+
+`L3S_SHOT_FONT_SIZE` overrides the Interface size for those captures, which is
+the quickest way to catch chrome that ignores the setting.
 
 ## Style
 

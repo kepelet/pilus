@@ -16,6 +16,7 @@ use gpui::{
 };
 use l3s_client::{Appearance, ControlClient, ThemeInfo};
 
+use super::style;
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, scheme};
 use crate::settings::Settings;
@@ -189,7 +190,7 @@ impl AppearancesView {
         cx.notify();
     }
 
-    fn fonts(&self, field: FontField) -> &[String] {
+    fn families(&self, field: FontField) -> &[String] {
         match field {
             FontField::Ui => &self.ui_fonts,
             FontField::Terminal => &self.terminal_fonts,
@@ -223,6 +224,11 @@ impl AppearancesView {
         self.publish(cx);
     }
 
+    /// The window's type scale, resolved from the shared settings.
+    fn fonts(&self) -> style::Fonts {
+        style::Fonts::resolve(&self.shared_settings)
+    }
+
     fn theme_row(&self, info: &ThemeInfo, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let active = info.active;
@@ -250,7 +256,7 @@ impl AppearancesView {
             .py(px(1.0))
             .rounded_sm()
             .bg(theme.panel_dim)
-            .text_size(px(10.0))
+            .text_size(px(style::scaled(&self.shared_settings, 10.0)))
             .text_color(theme.muted)
             .child(info.appearance.clone());
 
@@ -279,13 +285,13 @@ impl AppearancesView {
                     .gap_0p5()
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(px(self.fonts().body))
                             .text_color(theme.fg)
                             .child(info.display_name.clone()),
                     )
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
                             .child(info.description.clone()),
                     ),
@@ -295,7 +301,7 @@ impl AppearancesView {
         if active {
             row = row.child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(self.fonts().secondary))
                     .text_color(theme.accent)
                     .child("✓"),
             );
@@ -318,7 +324,7 @@ impl AppearancesView {
             .justify_center()
             .w(px(24.0))
             .h(px(22.0))
-            .rounded_sm()
+            .rounded_md()
             .bg(theme.panel_dim)
             .cursor_pointer()
             .text_color(theme.fg)
@@ -346,7 +352,7 @@ impl AppearancesView {
             .flex_1()
             .h(px(24.0))
             .px_2()
-            .rounded_sm()
+            .rounded_md()
             .bg(if open { theme.panel } else { theme.panel_dim })
             .cursor_pointer()
             .hover(|style| style.bg(theme.panel))
@@ -384,7 +390,7 @@ impl AppearancesView {
             .gap_2()
             .px_3()
             .py_1()
-            .text_size(px(12.0))
+            .text_size(px(self.fonts().secondary))
             .text_color(theme.fg)
             .child(
                 div()
@@ -416,14 +422,11 @@ impl AppearancesView {
 
     /// A section title, matching the weight of the list headings below.
     fn section_heading(&self, label: &str) -> Div {
-        div()
+        style::section_label(self.theme, label.to_string(), self.fonts().label)
             .px_3()
             .pt_3()
             .pb_1()
-            .text_size(px(13.0))
             .whitespace_nowrap()
-            .text_color(self.theme.muted)
-            .child(label.to_string())
     }
 
     /// A dropdown list of every available family for one field.
@@ -431,7 +434,7 @@ impl AppearancesView {
         let theme = self.theme;
         let current = self.family(field);
         let mut list = div().flex().flex_col().p_1();
-        for name in self.fonts(field).iter().cloned() {
+        for name in self.families(field).iter().cloned() {
             let selected = name == current;
             let id = name.clone();
             list = list.child(
@@ -441,7 +444,7 @@ impl AppearancesView {
                     .py_1()
                     .rounded_sm()
                     .cursor_pointer()
-                    .text_size(px(12.0))
+                    .text_size(px(self.fonts().secondary))
                     .text_color(if selected { theme.accent } else { theme.fg })
                     .hover(|style| style.bg(theme.panel))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -554,12 +557,12 @@ impl Render for AppearancesView {
             .flex_1()
             .overflow_y_scroll();
 
-        list = list.child(self.section_heading("Color Scheme"));
+        list = list.child(self.section_heading("COLOR SCHEME"));
         if self.appearance.themes.is_empty() {
             list = list.child(
                 div()
                     .p_3()
-                    .text_size(px(12.0))
+                    .text_size(px(self.fonts().secondary))
                     .text_color(theme.muted)
                     .child("No themes registered."),
             );
@@ -569,11 +572,11 @@ impl Render for AppearancesView {
         }
 
         list = list
-            .child(self.section_heading("Fonts"))
+            .child(self.section_heading("FONTS"))
             .child(self.font_row(FontField::Ui, "Interface", cx))
             .child(self.font_row(FontField::Terminal, "Terminal", cx));
 
-        let mut root = div()
+        let root = div()
             .id("l3s-appearances")
             .relative()
             .track_focus(&self.focus_handle)
@@ -587,10 +590,7 @@ impl Render for AppearancesView {
             }))
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
             .on_action(cx.listener(|_, _: &CloseTab, window, _| window.remove_window()));
-        if let Some(font) = self.settings.ui_font.as_ref() {
-            root = root.font_family(font.clone());
-        }
-        let mut root = root.child(list);
+        let mut root = super::apply_chrome_font(root, &self.shared_settings).child(list);
         if let Some(field) = self.open_picker {
             root = root.child(self.picker_overlay(field, window, cx));
         }

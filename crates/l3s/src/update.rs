@@ -151,6 +151,16 @@ pub fn describe_source(request: &UpdateRequest) -> String {
     format!("manifest {}", request.resolved_feed_url())
 }
 
+/// Attach the feed URL to an engine error message.
+///
+/// `gpui-updater-core`'s transport errors carry no URL, so a bare
+/// "connection refused" cannot distinguish a broken channel default from an
+/// explicit `update_feed_url` override pointed at a stopped local feed server.
+/// Naming the source makes the misconfiguration readable in the Update window.
+pub fn error_with_source(source: &str, error: impl std::fmt::Display) -> String {
+    format!("{error} (source: {source})")
+}
+
 /// Build the update source for a request.
 ///
 /// Each channel reads its manifest on the release host, or the explicit feed
@@ -260,6 +270,18 @@ mod tests {
     fn blank_settings_feed_falls_back_to_the_channel_default() {
         let request = UpdateRequest::from_settings("preview", Some("   ".to_string()));
         assert_eq!(request.resolved_feed_url(), PREVIEW_FEED_URL);
+    }
+
+    #[test]
+    fn engine_errors_name_the_feed_they_came_from() {
+        let message = error_with_source(
+            "http://127.0.0.1:8000/latest.json",
+            "http error: io: connection refused (os error 61)",
+        );
+        assert_eq!(
+            message,
+            "http error: io: connection refused (os error 61) (source: http://127.0.0.1:8000/latest.json)"
+        );
     }
 
     #[test]

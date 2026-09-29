@@ -40,11 +40,11 @@ use crossterm::event::{
     MouseEventKind,
 };
 use gpui::{
-    Action, AnyElement, App, Bounds, ClipboardItem, Context, DisplayId, Div, Entity, FocusHandle,
+    Action, Anchor, AnyElement, App, Bounds, ClipboardItem, Context, DisplayId, Div, Entity, FocusHandle,
     FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
     ScrollHandle, ScrollWheelEvent, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    div, font, img, point, prelude::*, px, size, svg,
+    anchored, deferred, div, font, img, point, prelude::*, px, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
@@ -3656,7 +3656,6 @@ impl L3sView {
                     .child(status),
             );
         }
-        column = column.child(self.home_dropdown(cx));
         div()
             .id("l3s-home-scroll")
             .flex()
@@ -3705,6 +3704,7 @@ impl L3sView {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.home.set_focus(HomeFocus::Prompt);
+                    this.home.close_dropdown();
                     cx.notify();
                 }),
             )
@@ -3778,15 +3778,7 @@ impl L3sView {
             .text_color(fg)
             .cursor_pointer()
             .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.home.set_focus(HomeFocus::Picker(field));
-                if this.home.dropdown() == Some(field) {
-                    this.home.close_dropdown();
-                } else {
-                    this.home.open_dropdown(field);
-                }
-                cx.notify();
-            }));
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(field, cx)));
         if active {
             chip = chip.border_1().border_color(terminal_inset_border());
         }
@@ -3800,19 +3792,24 @@ impl L3sView {
                     .child(format!("{}:", field.label())),
             );
         }
-        chip.child(
-            div()
-                .max_w(px(200.0))
-                .truncate()
-                .text_size(px(self.chrome_font()))
-                .text_color(fg)
-                .child(value),
-        )
-        .child(icon(
-            include_bytes!("../../assets/icons/chevron-down.svg"),
-            13.0,
-            theme.muted,
-        ))
+        let mut chip = chip
+            .child(
+                div()
+                    .max_w(px(200.0))
+                    .truncate()
+                    .text_size(px(self.chrome_font()))
+                    .text_color(fg)
+                    .child(value),
+            )
+            .child(icon(
+                include_bytes!("../../assets/icons/chevron-down.svg"),
+                13.0,
+                theme.muted,
+            ));
+        if self.home.dropdown() == Some(field) {
+            chip = chip.relative().child(self.home_dropdown_anchor(field, cx));
+        }
+        chip
     }
 
     /// The icon-only circular send button.
@@ -3944,19 +3941,12 @@ impl L3sView {
             .text_color(fg)
             .cursor_pointer()
             .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.home.set_focus(HomeFocus::Picker(field));
-                if this.home.dropdown() == Some(field) {
-                    this.home.close_dropdown();
-                } else {
-                    this.home.open_dropdown(field);
-                }
-                cx.notify();
-            }));
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(field, cx)));
         if active {
             item = item.border_1().border_color(terminal_inset_border());
         }
-        item.child(leading)
+        let mut item = item
+            .child(leading)
             .child(
                 div()
                     .max_w(px(180.0))
@@ -3969,18 +3959,51 @@ impl L3sView {
                 include_bytes!("../../assets/icons/chevron-down.svg"),
                 13.0,
                 theme.muted,
-            ))
+            ));
+        if self.home.dropdown() == Some(field) {
+            item = item.relative().child(self.home_dropdown_anchor(field, cx));
+        }
+        item
     }
 
-    /// The open picker's option list, shown under the composer.
+    /// Toggle `field`'s dropdown from its chip.
     ///
+    /// A press outside the dropdown already closed it in the capture phase;
+    /// in that case this click is a toggle-off and must not reopen the picker.
+    fn toggle_home_dropdown(&mut self, field: HomeField, cx: &mut Context<Self>) {
+        self.home.set_focus(HomeFocus::Picker(field));
+        if self.home.take_dismissed() == Some(field) {
+            // Already closed by the outside press; stay closed.
+        } else if self.home.dropdown() == Some(field) {
+            self.home.close_dropdown();
+        } else {
+            self.home.open_dropdown(field);
+        }
+        cx.notify();
+    }
+
+    /// A zero-size anchor at the chip's top-left corner.
+    ///
+    /// The chip centers its real children, so an anchored child would inherit
+    /// that centering; pinning this wrapper to the top-left gives the dropdown
+    /// a stable origin without adding a flex item (and its gap) to the chip.
+    fn home_dropdown_anchor(&self, field: HomeField, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .child(self.home_dropdown(field, cx))
+            .into_any_element()
+    }
+
+    /// The open picker's option list, floated under the chip that owns it.
+    ///
+    /// Rendering it through `deferred`/`anchored` keeps it out of the centered
+    /// composer's flow, so opening a picker no longer shifts the layout.
     /// Large catalogs (Pi can list hundreds of models) are filtered and
     /// capped, so opening the dropdown never builds an unbounded element tree.
-    fn home_dropdown(&self, cx: &mut Context<Self>) -> Div {
+    fn home_dropdown(&self, field: HomeField, cx: &mut Context<Self>) -> AnyElement {
         const MAX_ROWS: usize = 100;
-        let Some(field) = self.home.dropdown() else {
-            return div();
-        };
         let theme = self.theme;
         let cursor = self.home.choice(field).cursor();
         let options = self.home.choice(field).options();
@@ -3993,9 +4016,14 @@ impl L3sView {
             .flex_col()
             .gap_1()
             .p_1()
-            .w_full()
+            .w(px(260.0))
             .max_h(px(240.0))
             .overflow_y_scroll()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.home.dismiss_dropdown();
+                cx.notify();
+            }))
             .rounded_lg()
             .bg(theme.bg)
             .border_1()
@@ -4060,7 +4088,15 @@ impl L3sView {
                     .child(format!("…{} more · type to filter", total - MAX_ROWS)),
             );
         }
-        div().w_full().child(list)
+        deferred(
+            anchored()
+                .anchor(Anchor::TopLeft)
+                .offset(point(px(0.0), px(TAB_HEIGHT + 4.0)))
+                .snap_to_window_with_margin(px(8.0))
+                .child(list),
+        )
+        .with_priority(1)
+        .into_any_element()
     }
 
     /// Machine choice rows for the project form: Local, then saved machines.

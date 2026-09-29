@@ -45,6 +45,9 @@ pub enum Launch {
         /// Stable machine profile id.
         id: String,
     },
+    /// Play every notification cue once, so the audio path can be heard
+    /// without waiting for an agent to block.
+    TestSound,
 }
 
 /// Parse arguments and run the requested mode.
@@ -61,6 +64,7 @@ pub fn run() -> Result<()> {
         Launch::Feed { target } => run_feed(target),
         Launch::CheckUpdates { channel, feed_url } => run_check_updates(channel, feed_url),
         Launch::ProbeMachine { id } => run_probe_machine(id),
+        Launch::TestSound => run_test_sound(),
     }
 }
 
@@ -111,6 +115,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
                 );
             }
             "--check-updates" => check_updates = true,
+            "--test-sound" => return Ok(Launch::TestSound),
             "--channel" => {
                 channel = Some(
                     args.next()
@@ -185,8 +190,33 @@ fn print_help() {
          \x20   --channel NAME   Channel for --check-updates (stable or preview)\n\
          \x20   --feed-url URL   Static release manifest for --check-updates\n\
          \x20   --pane ID        Pane to observe with --probe-uhp\n\
+         \x20   --test-sound     Play every notification cue and exit\n\
          \x20   -h, --help       Print this help"
     );
+}
+
+/// Play every notification cue once, then exit.
+///
+/// The daemon only sends a cue when an agent blocks or finishes, which makes
+/// the audio hard to exercise on demand. This drives the same client player
+/// directly so a missing cue can be diagnosed without a live agent.
+#[cfg(feature = "gui")]
+fn run_test_sound() -> Result<()> {
+    use l3s_protocol::{SoundCue, SoundSignal, SoundStyle};
+    for style in [SoundStyle::Soft, SoundStyle::Retro, SoundStyle::Pulse] {
+        for cue in [SoundCue::Done, SoundCue::Blocked] {
+            println!("{style:?} · {cue:?}");
+            crate::gui::sound::play(SoundSignal { cue, style });
+            std::thread::sleep(Duration::from_millis(700));
+        }
+    }
+    Ok(())
+}
+
+/// `--test-sound` needs the window player, which the gui feature provides.
+#[cfg(not(feature = "gui"))]
+fn run_test_sound() -> Result<()> {
+    bail!("--test-sound needs the gui feature")
 }
 
 /// Attach to a saved machine over SSH and print its identity and workspaces.

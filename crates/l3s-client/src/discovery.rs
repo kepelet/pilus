@@ -27,6 +27,9 @@ pub const DEFAULT_SESSION: &str = "default";
 /// Longest accepted session name, in bytes.
 const MAX_SESSION_NAME_LEN: usize = 64;
 
+/// Environment override for l3s's own state directory.
+pub const L3S_HOME_ENV: &str = "L3S_HOME";
+
 /// The state root for this process.
 pub fn config_dir() -> PathBuf {
     if let Some(value) = std::env::var_os(HOME_ENV)
@@ -40,6 +43,24 @@ pub fn config_dir() -> PathBuf {
         ".luvus"
     };
     home_dir().join(name)
+}
+
+/// The directory l3s owns for its stores, independent of the Luvus state root.
+///
+/// Projects, client settings, and personal workspaces live here so they
+/// survive Luvus session changes and never mix with the daemon's own files.
+pub fn l3s_config_dir() -> PathBuf {
+    if let Some(value) = std::env::var_os(L3S_HOME_ENV)
+        && !value.is_empty()
+    {
+        return PathBuf::from(value);
+    }
+    home_dir().join(".l3s")
+}
+
+/// The directory holding personal (project-less) workspaces.
+pub fn l3s_workspaces_dir() -> PathBuf {
+    l3s_config_dir().join("workspaces")
 }
 
 /// The runtime directory for a session (`None` is the default session).

@@ -8,7 +8,7 @@
 //! group them, so this file is a plain JSON store under the state root:
 //!
 //! ```text
-//! $LUVUS_HOME/l3s/projects.json
+//! $L3S_HOME/projects.json
 //! ```
 //!
 //! Failures yield an empty list: projects are sidebar chrome, and a corrupt
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-/// File name of the project store inside `<root>/l3s/`.
+/// File name of the project store inside the l3s state directory.
 const FILE_NAME: &str = "projects.json";
 
 /// One persistent project.
@@ -89,9 +89,9 @@ impl Project {
     }
 }
 
-/// The store file for `root`.
+/// The store file for the l3s state directory `root`.
 pub fn projects_file(root: &Path) -> PathBuf {
-    root.join("l3s").join(FILE_NAME)
+    root.join(FILE_NAME)
 }
 
 /// Load every project under `root`; corrupt or missing files read as empty.
@@ -103,13 +103,12 @@ pub fn load_projects(root: &Path) -> Vec<Project> {
     parse_projects(&bytes)
 }
 
-/// Persist `projects` under `root`, creating `<root>/l3s` as needed.
+/// Persist `projects` under `root`, creating the directory as needed.
 pub fn save_projects(root: &Path, projects: &[Project]) -> Result<()> {
-    let dir = root.join("l3s");
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(root)?;
     let payload = serde_json::to_string_pretty(&serde_json::json!({ "projects": projects }))
         .map_err(|error| Error::Projects(error.to_string()))?;
-    std::fs::write(dir.join(FILE_NAME), payload)?;
+    std::fs::write(root.join(FILE_NAME), payload)?;
     Ok(())
 }
 
@@ -193,6 +192,36 @@ pub fn current_branch(cwd: &str) -> Option<String> {
     }
     let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!branch.is_empty()).then_some(branch)
+}
+
+/// List `cwd`'s local branch names on this machine, most recent first.
+///
+/// Returns an empty list outside a git repository. The first entry is not
+/// necessarily the checked-out branch; callers that need that use
+/// [`current_branch`].
+#[must_use]
+pub fn list_branches(cwd: &str) -> Vec<String> {
+    let cwd = expand_local(cwd);
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&cwd)
+        .arg("for-each-ref")
+        .arg("--sort=-committerdate")
+        .arg("--format=%(refname:short)")
+        .arg("refs/heads")
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Resolve many `cwds` to their current branch names on a remote machine.

@@ -1,7 +1,7 @@
 //! The in-window Projects panel state.
 //!
 //! Projects are persistent records (name, machine, repository URL, optional
-//! branch prefix, base directory) stored under `<root>/l3s/projects.json`.
+//! branch prefix, base directory) stored under `<root>/projects.json`.
 //! This module holds the panel's list/form/worktree state; the window in
 //! `mod.rs` owns rendering and key routing so the panel never becomes another
 //! OS window. Nothing here touches GPUI or the daemon, so it is unit-testable

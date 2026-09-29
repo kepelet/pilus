@@ -122,6 +122,17 @@ L3S_UPDATE_FEED_URL=http://127.0.0.1:8000/latest.json just run
 Without the override, `--channel preview` and `L3S_UPDATE_CHANNEL=preview`
 read the hosted `preview.json`.
 
+The base URL passed to `just preview-feed` is baked into each asset's `url`,
+so it must be a host clients can dial. `0.0.0.0` is only a bind address: on
+another machine it resolves to that machine's own loopback, so the check
+succeeds (it reads `update_feed_url`) while the download fails with
+`connection refused`. Use `127.0.0.1` for the local machine, or the
+Tailscale/LAN host for another one:
+
+```sh
+just preview-feed http://<tailnet-host>:8000
+```
+
 Set `L3S_PREVIEW_VERSION` only when you want the feed to advertise a real
 version (for example when publishing a hosted preview for others).
 

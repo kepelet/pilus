@@ -52,6 +52,19 @@ manifest_version="${L3S_PREVIEW_VERSION:-${major}.${minor}.$((patch + 1))-previe
 base_url="${L3S_PREVIEW_BASE_URL:-http://127.0.0.1:8000}"
 base_url="${base_url%/}"
 
+# `0.0.0.0` is what a server binds to, never a host a client can dial: on
+# another machine it resolves to that machine's own loopback, so the check
+# (which reads the feed URL) succeeds but the download (which reads this
+# baked-in asset URL) fails with "connection refused".
+case "$base_url" in
+    *//0.0.0.0 | *//0.0.0.0[:/]*)
+        echo "preview-feed: base URL '$base_url' uses 0.0.0.0, a bind address" >&2
+        echo "              pass a reachable host, e.g. http://127.0.0.1:8000" >&2
+        echo "              or http://<tailnet-host>:8000 for another machine" >&2
+        exit 1
+        ;;
+esac
+
 if [ "${SKIP_PACKAGE:-}" != "1" ]; then
     # Stamp the synthetic version into the build so the bundled app reports it.
     L3S_BUILD_VERSION="$manifest_version" ./scripts/package-macos-dmg.sh

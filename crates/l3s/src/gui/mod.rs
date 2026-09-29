@@ -6171,6 +6171,54 @@ impl L3sView {
         })
     }
 
+    /// Whether the pointer is over something the daemon opens as a link.
+    ///
+    /// Protocol 18 carries no hyperlink targets in the frame, so the markers
+    /// are the underline the daemon paints on a link and an obvious URL token
+    /// (which most agents underline anyway). Drives the pointer cursor.
+    fn hovered_link(&self) -> bool {
+        let Some(hover) = self.hover_cell else {
+            return false;
+        };
+        let Some(frame) = self.surface.frame() else {
+            return false;
+        };
+        if hover.row >= frame.height || hover.column >= frame.width {
+            return false;
+        }
+        let width = usize::from(frame.width);
+        let row_start = usize::from(hover.row) * width;
+        let Some(row) = frame.cells.get(row_start..row_start + width) else {
+            return false;
+        };
+        if row
+            .get(usize::from(hover.column))
+            .is_some_and(|cell| cell.mods & M_UNDERLINED != 0)
+        {
+            return true;
+        }
+        // Walk out to the whitespace-delimited token under the pointer.
+        let mut text = String::new();
+        let mut at = 0;
+        for (column, cell) in row.iter().enumerate() {
+            if column == usize::from(hover.column) {
+                at = text.len();
+            }
+            text.push_str(&cell.symbol);
+        }
+        let start = text[..at]
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map_or(0, |(index, ch)| index + ch.len_utf8());
+        let end = text[at..]
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map_or(text.len(), |(index, _)| at + index);
+        let token = text[start..end].to_ascii_lowercase();
+        token.starts_with("http://") || token.starts_with("https://") || token.starts_with("www.")
+    }
+
     /// Send one mouse event to the daemon at `cell`.
     fn forward_mouse(&self, kind: MouseEventKind, cell: Cell, modifiers: Modifiers) {
         self.forward_mouse_with(kind, cell, keys::mouse_modifiers(modifiers));
@@ -6212,6 +6260,9 @@ impl L3sView {
         // A drag started on the grid may roam anywhere; anything else over
         // chrome belongs to the panels, not the daemon.
         if !self.dragging && self.hit_chrome(window, event.position) {
+            if self.hover_cell.take().is_some() {
+                cx.notify();
+            }
             return;
         }
         if self.dragging && event.pressed_button == Some(MouseButton::Left) {
@@ -6244,6 +6295,9 @@ impl L3sView {
         // Hover: only tell the daemon when the pointer crosses into a new cell,
         // so links and scrollbars react without a message per pixel.
         let Some(cell) = self.cell_at(window, event.position) else {
+            if self.hover_cell.take().is_some() {
+                cx.notify();
+            }
             return;
         };
         // A move carries the live modifier state (macOS only clears `Ctrl` on
@@ -6253,6 +6307,9 @@ impl L3sView {
         if self.hover_cell != Some(cell) {
             self.hover_cell = Some(cell);
             self.forward_mouse(MouseEventKind::Moved, cell, event.modifiers);
+            // The pointer cursor follows the link under the cursor, so the
+            // frame must repaint as the hovered cell changes.
+            cx.notify();
         }
     }
 
@@ -8310,6 +8367,12 @@ impl Render for L3sView {
                 .size_full()
                 .text_color(theme.muted)
                 .child("Waiting for the daemon's first frame…"),
+        };
+        // A link under the pointer reads as clickable.
+        let grid = if self.hovered_link() {
+            grid.cursor_pointer()
+        } else {
+            grid
         };
         let grid = grid
             .on_mouse_down(

@@ -8,6 +8,7 @@
 mod about;
 mod app_icon;
 mod appearances;
+mod home;
 mod keys;
 mod machines;
 mod palette;
@@ -18,6 +19,7 @@ mod selection;
 mod settings;
 mod text_field;
 mod theme;
+mod ui_playground;
 mod update_window;
 mod updater;
 
@@ -34,25 +36,27 @@ use crossterm::event::{
     MouseEventKind,
 };
 use gpui::{
-    Action, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
-    KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent,
+    Action, AnyElement, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, FontWeight,
+    Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle,
     ScrollWheelEvent, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions, div, font,
-    point, prelude::*, px, size, svg,
+    img, point, prelude::*, px, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
 use l3s_client::{
-    Agent, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent, ConnectTarget,
-    Connection, ControlClient, HOME_ENV, MachineInfo, Project, SessionInfo, SshTarget, Surface,
-    SurfaceChange, Tab, TaskSummary, common_git_dir, common_git_dirs_remote, config_dir,
+    Agent, AgentConfig, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent,
+    ConnectTarget, Connection, ControlClient, HOME_ENV, MachineInfo, Project, SessionInfo, SshTarget,
+    Surface, SurfaceChange, Tab, TaskSummary, common_git_dir, common_git_dirs_remote, config_dir,
     connect_machine, current_branch, current_branches_remote, expand_project_local,
-    expand_project_remote, generate_session_name, list_machines, list_session_infos, luvus_binary,
-    refresh_machines, split_client_socket,
+    expand_project_remote, generate_session_name, l3s_config_dir, l3s_workspaces_dir,
+    list_branches, list_machines, list_session_infos, luvus_binary, refresh_machines,
+    split_client_socket,
 };
 use l3s_protocol::{
     CellData, ClientMessage, FrameData, ShellSidebars, ShellWorkspace, SurfaceInterest,
 };
+use home::{BaseMode, HomeField, HomeFocus, HomePanel};
 use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use projects::{ProjectField, ProjectsPanel};
@@ -212,6 +216,8 @@ gpui::actions!([
     OpenCommandPalette,
     /// Open the Settings page.
     OpenSettings,
+    /// Open the Home composer for a new agent.
+    OpenHome,
     /// Focus tab 1.
     FocusTab1,
     /// Focus tab 2.
@@ -249,8 +255,10 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     connection.request_workspace_dock()?;
     let appearances_socket = api_socket_for_target(&target);
     let config_root = config_dir();
+    let l3s_root = l3s_config_dir();
+    migrate_legacy_stores(&config_root, &l3s_root);
     let new_window_target = target.clone();
-    let settings = Rc::new(RefCell::new(Settings::load(&config_root)));
+    let settings = Rc::new(RefCell::new(Settings::load(&l3s_root)));
     let machine_signal = Rc::new(RefCell::new(MachineSignal::default()));
     let shared_theme = Rc::new(RefCell::new(Theme::default()));
 
@@ -259,9 +267,9 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
         cx.on_action({
             let api = appearances_socket.clone();
             let settings = settings.clone();
-            let config_root = config_root.clone();
+            let root = l3s_root.clone();
             move |_: &OpenAppearances, cx: &mut App| {
-                appearances::open(api.clone(), settings.clone(), config_root.clone(), cx)
+                appearances::open(api.clone(), settings.clone(), root.clone(), cx)
             }
         });
         cx.on_action({
@@ -316,17 +324,17 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
         });
         cx.on_action({
             let settings = settings.clone();
-            let root = config_root.clone();
+            let root = l3s_root.clone();
             move |_: &IncreaseFontSize, cx: &mut App| bump_font(&settings, &root, 1.0, cx)
         });
         cx.on_action({
             let settings = settings.clone();
-            let root = config_root.clone();
+            let root = l3s_root.clone();
             move |_: &DecreaseFontSize, cx: &mut App| bump_font(&settings, &root, -1.0, cx)
         });
         cx.on_action({
             let settings = settings.clone();
-            let root = config_root.clone();
+            let root = l3s_root.clone();
             move |_: &ResetFontSize, cx: &mut App| bump_font(&settings, &root, 0.0, cx)
         });
         cx.bind_keys(app_key_bindings());
@@ -343,6 +351,7 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             Menu::new("File").items([
                 MenuItem::action("New Window", NewWindow),
                 MenuItem::action("New Tab", NewTab),
+                MenuItem::action("New Agent…", OpenHome),
                 MenuItem::action("Open Workspace", OpenWorkspacePicker),
                 MenuItem::separator(),
                 MenuItem::action("Split Vertical", SplitVertical),
@@ -425,6 +434,7 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-a", SelectAllGrid, None),
         KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("cmd-n", NewWindow, None),
+        KeyBinding::new("cmd-shift-n", OpenHome, None),
         KeyBinding::new("cmd-t", NewTab, None),
         KeyBinding::new("cmd-d", SplitVertical, None),
         KeyBinding::new("cmd-shift-d", SplitHorizontal, None),
@@ -513,6 +523,29 @@ fn bump_font(settings: &Rc<RefCell<Settings>>, root: &Path, delta: f32, cx: &mut
         settings.save(root);
     }
     cx.refresh_windows();
+}
+
+/// Move l3s's own stores out of the Luvus state root the first time the
+/// `~/.l3s` layout is used, so existing projects and settings are not lost.
+fn migrate_legacy_stores(luvus_root: &Path, l3s_root: &Path) {
+    if std::fs::create_dir_all(l3s_root).is_err() {
+        return;
+    }
+    let pairs = [
+        (
+            luvus_root.join("l3s").join("projects.json"),
+            l3s_root.join("projects.json"),
+        ),
+        (
+            luvus_root.join("l3s-client.json"),
+            l3s_root.join("settings.json"),
+        ),
+    ];
+    for (old, new) in pairs {
+        if !new.exists() && old.exists() {
+            let _ = std::fs::copy(&old, &new);
+        }
+    }
 }
 
 /// Geometry of the inset terminal card: grid origin, visible cells, and the
@@ -686,6 +719,10 @@ struct L3sView {
     agent_feed: Option<AgentFeed>,
     /// State root the SESSIONS section lists, derived from the launch target.
     session_root: PathBuf,
+    /// l3s's own state directory: projects, settings, and personal workspaces.
+    l3s_root: PathBuf,
+    /// The directory holding personal (project-less) workspaces.
+    workspaces_root: PathBuf,
     /// Current session; `None` is the default session.
     session_name: Option<String>,
     /// Visible sessions under `session_root`.
@@ -833,6 +870,36 @@ struct L3sView {
     project_branch: HashMap<(String, String), Option<String>>,
     /// A repo resolution is running off-thread; no overlapping spawns.
     project_repo_pending: bool,
+    /// The Home composer's state.
+    home: HomePanel,
+    /// Local branches of the Home composer's selected project.
+    home_branches: Vec<String>,
+    /// The project a branch listing belongs to, so a change reloads once.
+    home_branch_project: Option<String>,
+    /// Fresh branch listings from the background reader.
+    home_branch_rx: Receiver<(String, Vec<String>)>,
+    /// Sender half for the background branch reader.
+    home_branch_tx: Sender<(String, Vec<String>)>,
+    /// Agent availability and models for the Home composer's machine.
+    agent_configs: Vec<AgentConfig>,
+    /// Agent configs by machine key (`local` or a machine id), so switching
+    /// back to a machine is instant.
+    agent_config_cache: HashMap<String, Vec<AgentConfig>>,
+    /// Machine keys with an agent-config fetch in flight.
+    agent_config_pending: HashSet<String>,
+    /// The machine key `agent_configs` belongs to.
+    agent_config_key: Option<String>,
+    /// Fresh agent configs from the background fetcher.
+    agent_config_rx: Receiver<(String, Vec<AgentConfig>)>,
+    /// Sender half for the background agent-config fetcher.
+    agent_config_tx: Sender<(String, Vec<AgentConfig>)>,
+    /// Signature of the last Home option build, so a large model list is not
+    /// cloned every frame.
+    home_sync_key: String,
+    /// The agent whose defaults were last applied to model and effort.
+    home_defaults_for: Option<String>,
+    /// The model whose reasoning levels are currently in the effort picker.
+    home_efforts_for: Option<String>,
 }
 
 impl L3sView {
@@ -855,6 +922,8 @@ impl L3sView {
             Some(path) => split_client_socket(path).unwrap_or_else(|| (config_dir(), None)),
             None => (config_dir(), target.session.clone()),
         };
+        let l3s_root = l3s_config_dir();
+        let workspaces_root = l3s_workspaces_dir();
         let agent_feed = Some(AgentFeed::spawn(api_socket_for(
             &session_root,
             session_name.as_deref(),
@@ -864,6 +933,8 @@ impl L3sView {
         let (machine_tx, machine_rx) = std::sync::mpsc::channel();
         let (machine_op_tx, machine_op_rx) = std::sync::mpsc::channel();
         let (project_repo_tx, project_repo_rx) = std::sync::mpsc::channel();
+        let (home_branch_tx, home_branch_rx) = std::sync::mpsc::channel();
+        let (agent_config_tx, agent_config_rx) = std::sync::mpsc::channel();
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let (machine_connect_tx, machine_connect_rx) = std::sync::mpsc::channel();
         let (picker_tx, picker_rx) = std::sync::mpsc::channel();
@@ -897,6 +968,8 @@ impl L3sView {
             hover_cell: None,
             agent_feed,
             session_root,
+            l3s_root,
+            workspaces_root,
             session_name,
             sessions,
             last_session_poll: Instant::now(),
@@ -970,8 +1043,22 @@ impl L3sView {
             project_branch: HashMap::new(),
             project_sel: None,
             project_sel_at: Instant::now(),
+            home: HomePanel::default(),
+            home_branches: Vec::new(),
+            home_branch_project: None,
+            home_branch_rx,
+            home_branch_tx,
+            agent_configs: Vec::new(),
+            agent_config_cache: HashMap::new(),
+            agent_config_pending: HashSet::new(),
+            agent_config_key: None,
+            agent_config_rx,
+            agent_config_tx,
+            home_sync_key: String::new(),
+            home_defaults_for: None,
+            home_efforts_for: None,
         };
-        view.projects.reload(&view.session_root);
+        view.projects.reload(&view.l3s_root);
 
         if auto_check {
             updater.update(cx, |updater, cx| updater.check(cx));
@@ -1251,7 +1338,34 @@ impl L3sView {
                     }
                     changed = true;
                 }
+                PickerEvent::HomeLaunched { machine, result } => {
+                    match result {
+                        Ok(message) => {
+                            self.status = message;
+                            self.activate_project_endpoint(machine, cx);
+                        }
+                        Err(error) => self.status = format!("couldn't start the agent: {error}"),
+                    }
+                    changed = true;
+                }
             }
+        }
+        while let Ok((key, configs)) = self.agent_config_rx.try_recv() {
+            self.agent_config_pending.remove(&key);
+            self.agent_config_cache.insert(key.clone(), configs.clone());
+            if self.agent_config_key.as_deref() == Some(key.as_str()) {
+                self.agent_configs = configs;
+                changed = true;
+            }
+        }
+        if self.home.is_open() {
+            self.ensure_home_agent_configs();
+        }
+        if self.projects.is_open() {
+            self.ensure_agent_configs_for("local");
+        }
+        if self.load_home_branches() {
+            changed = true;
         }
         changed
     }
@@ -1950,6 +2064,11 @@ impl L3sView {
             self.picker_key(event, cx);
             return;
         }
+        // The Home composer owns every keystroke while it is open.
+        if self.home.is_open() {
+            self.home_key(event, cx);
+            return;
+        }
         // The Settings page owns every keystroke while it is open.
         if self.projects.is_open() {
             self.settings_key(event, cx);
@@ -2146,10 +2265,22 @@ impl L3sView {
                 Some("⌘⇧O"),
             ),
             entry(
+                Command::OpenHome,
+                "New Agent",
+                "Application",
+                Some("⌘⇧N"),
+            ),
+            entry(
                 Command::OpenSettings,
                 "Settings",
                 "Application",
                 Some("⌘⇧."),
+            ),
+            entry(
+                Command::OpenUiPlayground,
+                "Open UI Playground",
+                "Application",
+                None,
             ),
         ];
         for project in self.projects.projects().iter().cloned() {
@@ -2232,6 +2363,8 @@ impl L3sView {
             Command::Quit => window.dispatch_action(QuitApp.boxed_clone(), cx),
             Command::OpenWorkspacePicker => self.open_picker(cx),
             Command::OpenSettings => self.open_settings(cx),
+            Command::OpenHome => self.open_home(cx),
+            Command::OpenUiPlayground => ui_playground::open(self.theme, cx),
             Command::OpenProject(id) => {
                 if let Some(project) = self
                     .projects
@@ -2244,7 +2377,7 @@ impl L3sView {
                 }
             }
             Command::NewProjectWorktree(id) => {
-                self.projects.open(&self.session_root);
+                self.projects.open(&self.l3s_root);
                 if let Some(index) = self
                     .projects
                     .projects()
@@ -2327,10 +2460,11 @@ impl L3sView {
         });
     }
 
-    /// Leave the Settings page: sidebar actions address the terminal
-    /// surface the page covers, so acting on one dismisses the other.
+    /// Leave the full-card pages (Home and Settings): sidebar actions address
+    /// the terminal surface they cover, so acting on one dismisses the other.
     fn leave_settings_page(&mut self) {
         self.projects.close();
+        self.home.close();
     }
 
     /// A control client for an endpoint's control surface.
@@ -2629,6 +2763,13 @@ impl L3sView {
     /// terminal grid. Sharing the card keeps the page inset exactly like
     /// the terminal, with the sidebar still showing beside it.
     fn card_content(&self, cx: &mut Context<Self>, grid: Div) -> Div {
+        if self.home.is_open() {
+            return div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.home_page(cx));
+        }
         if self.projects.is_open() {
             return self.settings_page(cx);
         }
@@ -2654,9 +2795,1007 @@ impl L3sView {
 
     /// Show the Settings page, reloading the project store first.
     fn open_settings(&mut self, cx: &mut Context<Self>) {
-        self.projects.open(&self.session_root);
+        self.home.close();
+        self.projects.open(&self.l3s_root);
         self.probe_machines();
+        self.ensure_agent_configs_for("local");
         cx.notify();
+    }
+
+    /// Show the Home composer, reloading the project store first.
+    ///
+    /// The composer picks the project, machine, agent, and base for a launch,
+    /// so it reads the same stores the Settings page does and reuses the
+    /// project panel's loaded list.
+    fn open_home(&mut self, cx: &mut Context<Self>) {
+        self.leave_settings_page();
+        self.picker.close();
+        self.projects.reload(&self.l3s_root);
+        if self.home.new_branch().is_empty() {
+            self.home
+                .set_new_branch(generate_session_name(&self.session_names()));
+        }
+        self.home.open();
+        self.home_sync_key.clear();
+        self.probe_machines();
+        self.ensure_home_agent_configs();
+        self.sync_home();
+        cx.notify();
+    }
+
+    /// The live agent aliases, so a generated branch avoids a collision.
+    fn session_names(&self) -> Vec<String> {
+        self.agents
+            .iter()
+            .map(|agent| agent.name.clone())
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    /// The enabled machine the Home composer's machine chip selects, if any.
+    fn home_machine_id(&self) -> Option<String> {
+        let cursor = self.home.choice(HomeField::Machine).cursor();
+        if cursor == 0 {
+            return None;
+        }
+        self.machines
+            .iter()
+            .filter(|machine| machine.id != "local" && machine.enabled)
+            .nth(cursor - 1)
+            .map(|machine| machine.id.clone())
+    }
+
+    /// The projects the Home composer offers, scoped to the machine chip.
+    fn home_projects(&self) -> Vec<&Project> {
+        let machine = self.home_machine_id();
+        self.projects
+            .projects()
+            .iter()
+            .filter(|project| project.machine == machine)
+            .collect()
+    }
+
+    /// The project the Home composer currently has highlighted.
+    fn home_project(&self) -> Option<&Project> {
+        self.home
+            .project_index()
+            .and_then(|index| self.home_projects().get(index).copied())
+    }
+
+    /// Whether the Home composer's selected project is a git repository with a
+    /// resolvable branch, so the branch and worktree pickers apply.
+    ///
+    /// Git facts resolve in the background; before the first answer the pickers
+    /// stay visible so a git project never flashes them off.
+    fn home_project_git(&self) -> bool {
+        let Some(project) = self.home_project() else {
+            return false;
+        };
+        let key = (project.endpoint_key().to_string(), project.location.clone());
+        match self.project_branch.get(&key) {
+            Some(None) => false,
+            Some(Some(_)) | None => true,
+        }
+    }
+
+    /// Move Home focus by one visible field, skipping the git pickers when the
+    /// selected project is not a repository.
+    fn home_move_focus(&mut self, backward: bool) {
+        for _ in 0..HomeField::ALL.len() + 2 {
+            if backward {
+                self.home.focus_prev();
+            } else {
+                self.home.focus_next();
+            }
+            match self.home.focus() {
+                HomeFocus::Prompt => return,
+                HomeFocus::Picker(HomeField::Base | HomeField::Branch)
+                    if !self.home_project_git() => {}
+                HomeFocus::Picker(_) => return,
+            }
+        }
+    }
+
+    /// The installed agent the Home composer currently has highlighted.
+    fn home_agent(&self) -> Option<&AgentConfig> {
+        let label = self.home.choice(HomeField::Agent).selected()?;
+        self.agent_configs
+            .iter()
+            .find(|config| config.label == label)
+    }
+
+    /// The machine key the Home composer's machine chip selects.
+    fn home_machine_key(&self) -> String {
+        self.home_machine_id().unwrap_or_else(|| "local".to_string())
+    }
+
+    /// The SSH target for a machine key, or `None` for the local machine.
+    fn machine_target_by_key(&self, key: &str) -> Option<SshTarget> {
+        if key == "local" {
+            return None;
+        }
+        self.machines
+            .iter()
+            .find(|machine| machine.id == key)
+            .and_then(MachineInfo::ssh_target)
+    }
+
+    /// Fetch `key`'s agent configs when they are neither cached nor in flight.
+    fn ensure_agent_configs_for(&mut self, key: &str) {
+        if self.agent_config_cache.contains_key(key) || self.agent_config_pending.contains(key) {
+            return;
+        }
+        self.agent_config_pending.insert(key.to_string());
+        let target = self.machine_target_by_key(key);
+        let tx = self.agent_config_tx.clone();
+        let key = key.to_string();
+        std::thread::spawn(move || {
+            let configs = match target {
+                Some(target) => l3s_client::agents::remote(&target),
+                None => l3s_client::agents::local(),
+            };
+            tx.send((key, configs)).ok();
+        });
+    }
+
+    /// Point `agent_configs` at the Home composer's machine, fetching if needed.
+    fn ensure_home_agent_configs(&mut self) {
+        let key = self.home_machine_key();
+        if self.agent_config_key.as_deref() != Some(key.as_str()) {
+            self.agent_configs = self
+                .agent_config_cache
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            self.agent_config_key = Some(key.clone());
+        }
+        self.ensure_agent_configs_for(&key);
+    }
+
+    /// Rebuild the Home picker options from live state.
+    ///
+    /// A signature guard skips the work when nothing relevant changed, so a
+    /// large model catalog is not rebuilt on every frame.
+    fn sync_home(&mut self) {
+        if !self.home.is_open() {
+            return;
+        }
+        let signature = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.home.choice(HomeField::Machine).cursor(),
+            self.home
+                .choice(HomeField::Agent)
+                .selected()
+                .unwrap_or_default(),
+            self.home
+                .choice(HomeField::Model)
+                .selected()
+                .unwrap_or_default(),
+            self.home.choice(HomeField::Project).cursor(),
+            self.home_branches.len(),
+            self.machines.len(),
+            self.projects.projects().len(),
+            self.agent_configs.len(),
+            self.agent_config_key.as_deref().unwrap_or_default(),
+        );
+        if signature == self.home_sync_key {
+            return;
+        }
+        self.home_sync_key = signature;
+
+        let mut machines = vec!["Local".to_string()];
+        machines.extend(
+            self.machines
+                .iter()
+                .filter(|machine| machine.id != "local" && machine.enabled)
+                .map(|machine| machine.display().to_string()),
+        );
+        self.home.choice_mut(HomeField::Machine).set(machines);
+
+        let mut agents: Vec<String> = self
+            .agent_configs
+            .iter()
+            .map(|config| config.label.clone())
+            .collect();
+        if agents.is_empty() {
+            agents.push(
+                if self.agent_config_pending.contains(&self.home_machine_key()) {
+                    "Loading…".to_string()
+                } else {
+                    "No agent found".to_string()
+                },
+            );
+        }
+        self.home.choice_mut(HomeField::Agent).set(agents);
+
+        let models = self
+            .home_agent()
+            .map(AgentConfig::choices)
+            .unwrap_or_else(|| vec!["Default".to_string()]);
+        self.home.choice_mut(HomeField::Model).set(models);
+
+        // Apply the agent's default model once per agent switch, so a later
+        // pick by the user is not overwritten on the next frame.
+        let kind = self.home_agent().map(|config| config.kind.clone());
+        if kind != self.home_defaults_for {
+            self.home_defaults_for = kind;
+            if let Some(default) = self.home_agent().and_then(|config| config.default_model.clone())
+                && let Some(index) = self
+                    .home
+                    .choice(HomeField::Model)
+                    .options()
+                    .iter()
+                    .position(|model| *model == default)
+            {
+                self.home.choice_mut(HomeField::Model).choose(index);
+            }
+        }
+
+        // The effort picker follows the selected model's own reasoning levels.
+        let model = self
+            .home
+            .choice(HomeField::Model)
+            .selected()
+            .unwrap_or("Default")
+            .to_string();
+        let efforts = self
+            .home_agent()
+            .map(|config| config.efforts_for(&model))
+            .unwrap_or_else(|| vec!["Default".to_string()]);
+        self.home.choice_mut(HomeField::Effort).set(efforts);
+        if self.home_efforts_for.as_deref() != Some(model.as_str()) {
+            self.home_efforts_for = Some(model.clone());
+            if let Some(default) = self
+                .home_agent()
+                .and_then(|config| config.default_effort_for(&model))
+                && let Some(index) = self
+                    .home
+                    .choice(HomeField::Effort)
+                    .options()
+                    .iter()
+                    .position(|level| *level == default)
+            {
+                self.home.choice_mut(HomeField::Effort).choose(index);
+            }
+        }
+
+        let mut branches = vec![self.home.new_branch().to_string()];
+        branches.extend(self.home_branches.iter().cloned());
+        self.home.choice_mut(HomeField::Branch).set(branches);
+
+        let mut projects = vec!["No project".to_string()];
+        projects.extend(
+            self.home_projects()
+                .iter()
+                .map(|project| project.name.clone()),
+        );
+        self.home.choice_mut(HomeField::Project).set(projects);
+
+        // A hidden picker must not hold focus when the project changes.
+        if !self.home_project_git()
+            && matches!(
+                self.home.focus(),
+                HomeFocus::Picker(HomeField::Base | HomeField::Branch)
+            )
+        {
+            self.home.set_focus(HomeFocus::Picker(HomeField::Project));
+        }
+    }
+
+    /// Load the selected project's local branches when the pick changes.
+    ///
+    /// Branch listing shells out to git, so it runs off-thread and reports
+    /// through a channel; remote projects keep only the generated name until
+    /// remote listing lands.
+    fn load_home_branches(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok((id, branches)) = self.home_branch_rx.try_recv() {
+            if self.home_branch_project.as_deref() == Some(id.as_str()) {
+                self.home_branches = branches;
+                changed = true;
+            }
+        }
+        if !self.home.is_open() {
+            return changed;
+        }
+        let selected = self.home_project().map(|project| project.id.clone());
+        if selected == self.home_branch_project {
+            return changed;
+        }
+        self.home_branch_project = selected.clone();
+        self.home_branches.clear();
+        let Some(project) = selected.and_then(|id| {
+            self.projects
+                .projects()
+                .iter()
+                .find(|project| project.id == id)
+                .cloned()
+        }) else {
+            return changed;
+        };
+        if project.machine.is_some() {
+            return changed;
+        }
+        let tx = self.home_branch_tx.clone();
+        let id = project.id;
+        let location = project.location;
+        std::thread::spawn(move || {
+            tx.send((id, list_branches(&location))).ok();
+        });
+        changed
+    }
+
+    /// Route a keystroke to the Home composer.
+    fn home_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let mods = event.keystroke.modifiers;
+
+        // An open dropdown owns the keyboard: arrows move, Enter commits.
+        if self.home.dropdown().is_some() {
+            match key {
+                "escape" => self.home.close_dropdown(),
+                "up" => self.home.move_dropdown(-1),
+                "down" => self.home.move_dropdown(1),
+                "enter" | "tab" => self.home.close_dropdown(),
+                "backspace" | "delete" | "del" => self.home.filter_backspace(),
+                _ => {
+                    if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
+                        return;
+                    }
+                    if let Some(text) = event
+                        .keystroke
+                        .key_char
+                        .as_deref()
+                        .filter(|text| !text.is_empty())
+                    {
+                        self.home.filter_insert(text);
+                    } else if event.keystroke.key.chars().count() == 1 {
+                        let text = event.keystroke.key.clone();
+                        self.home.filter_insert(&text);
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        if key == "escape" {
+            self.home.close();
+            cx.notify();
+            return;
+        }
+        if mods.platform && key == "enter" {
+            self.home_send(cx);
+            return;
+        }
+
+        if self.home.focus() == HomeFocus::Prompt {
+            match key {
+                "enter" => {
+                    if mods.shift {
+                        self.home.prompt_mut().newline();
+                    } else {
+                        self.home_send(cx);
+                        return;
+                    }
+                }
+                "tab" => self.home_move_focus(mods.shift),
+                "backspace" => self.home.prompt_mut().backspace(),
+                "delete" | "del" => self.home.prompt_mut().delete(),
+                "left" => self.home.prompt_mut().left(),
+                "right" => self.home.prompt_mut().right(),
+                "home" => self.home.prompt_mut().home(),
+                "end" => self.home.prompt_mut().end(),
+                _ => {
+                    if mods.platform || mods.control {
+                        return;
+                    }
+                    if let Some(text) = event
+                        .keystroke
+                        .key_char
+                        .as_deref()
+                        .filter(|text| !text.is_empty())
+                    {
+                        self.home.prompt_mut().insert_multiline(text);
+                    } else if event.keystroke.key.chars().count() == 1 {
+                        let text = event.keystroke.key.clone();
+                        self.home.prompt_mut().insert_multiline(&text);
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        // Picker focus: arrows and Tab move between chips, Enter opens one.
+        match key {
+            "tab" => self.home_move_focus(mods.shift),
+            "left" | "up" => self.home_move_focus(true),
+            "right" | "down" => self.home_move_focus(false),
+            "enter" | "space" => {
+                if let Some(field) = self.home.focused_picker() {
+                    self.home.open_dropdown(field);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Launch the composer's agent on the selected project, or in a personal
+    /// workspace under l3s's own directory when no project is chosen.
+    ///
+    /// Workspace setup and the agent start share one background thread and
+    /// report through the picker channel, like the project worktree action.
+    fn home_send(&mut self, cx: &mut Context<Self>) {
+        let prompt = self.home.prompt().value.trim().to_string();
+        if prompt.is_empty() {
+            self.home.set_status("Write a prompt to send.".to_string());
+            cx.notify();
+            return;
+        }
+        let Some(agent) = self.home_agent().map(|config| config.kind.clone()) else {
+            self.home.set_status("Pick an installed agent.".to_string());
+            cx.notify();
+            return;
+        };
+        let base = self.home.base_mode();
+        let branch = self
+            .home
+            .choice(HomeField::Branch)
+            .selected()
+            .unwrap_or_default()
+            .to_string();
+        let name = generate_session_name(&self.session_names());
+        match self.home_project().cloned() {
+            Some(project) => {
+                let Some(mut client) = self.control_client_for_project(&project) else {
+                    self.home
+                        .set_status(format!("No control connection for `{}`.", project.name));
+                    cx.notify();
+                    return;
+                };
+                let location = project.location.clone();
+                let machine = project.machine.clone();
+                self.home.close();
+                self.status = format!("starting {agent}…");
+                let tx = self.picker_tx.clone();
+                std::thread::spawn(move || {
+                    let result =
+                        launch_home_agent(&mut client, &location, base, &branch, &name, &agent, &prompt);
+                    tx.send(PickerEvent::HomeLaunched { machine, result }).ok();
+                });
+            }
+            None => self.launch_personal_workspace(name, agent, prompt, cx),
+        }
+        cx.notify();
+    }
+
+    /// Open l3s's personal `workspaces` directory as the agent's workspace.
+    fn launch_personal_workspace(
+        &mut self,
+        name: String,
+        agent: String,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(machine) = self.home_machine_id() {
+            self.home.set_status(format!(
+                "Personal workspaces are local; `{machine}` was selected."
+            ));
+            cx.notify();
+            return;
+        }
+        let Ok(mut client) = ControlClient::connect(&self.api_socket()) else {
+            self.home
+                .set_status("No control connection for this machine.".to_string());
+            cx.notify();
+            return;
+        };
+        let dir = self.workspaces_root.clone();
+        self.home.close();
+        self.status = format!("starting {agent}…");
+        let tx = self.picker_tx.clone();
+        std::thread::spawn(move || {
+            let result = std::fs::create_dir_all(&dir)
+                .map_err(|error| format!("couldn't create {}: {error}", dir.display()))
+                .and_then(|()| {
+                    let location = dir.to_string_lossy().into_owned();
+                    launch_home_agent(
+                        &mut client,
+                        &location,
+                        BaseMode::Local,
+                        "",
+                        &name,
+                        &agent,
+                        &prompt,
+                    )
+                });
+            tx.send(PickerEvent::HomeLaunched { machine: None, result })
+                .ok();
+        });
+        cx.notify();
+    }
+
+    /// The Home screen: the launch composer that fills the inset card.
+    fn home_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let status = self.home.status().to_string();
+        let card = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .child(self.home_composer(cx))
+            .child(self.home_meta_row(cx));
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_4()
+            .w_full()
+            .max_w(px(720.0))
+            .child(self.home_mark())
+            .child(
+                div()
+                    .text_size(px(18.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.fg)
+                    .child("Ready when you are"),
+            )
+            .child(card);
+        if !status.is_empty() {
+            column = column.child(
+                div()
+                    .w_full()
+                    .px_2()
+                    .text_size(px(12.0))
+                    .text_color(theme.muted)
+                    .child(status),
+            );
+        }
+        column = column.child(self.home_dropdown(cx));
+        div()
+            .id("l3s-home-scroll")
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .size_full()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .px_6()
+            .py_8()
+            .child(column)
+    }
+
+    /// The app icon above the headline, falling back to the wordmark.
+    fn home_mark(&self) -> AnyElement {
+        let theme = self.theme;
+        match about::app_icon() {
+            Some(icon) => img(icon).w(px(52.0)).h(px(52.0)).into_any_element(),
+            None => div()
+                .text_size(px(30.0))
+                .text_color(theme.accent)
+                .child("l3s")
+                .into_any_element(),
+        }
+    }
+
+    /// The prompt edit area, with a caret on the cursor's line.
+    fn home_prompt_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let text = self.home.prompt().value.clone();
+        let cursor = self.home.prompt().cursor;
+        let focused = self.home.focus() == HomeFocus::Prompt;
+        let lines: Vec<&str> = text.split('\n').collect();
+        // Locate the caret's line and column in characters.
+        let mut caret_line = 0usize;
+        let mut caret_col = cursor;
+        let mut consumed = 0usize;
+        for (index, line) in lines.iter().enumerate() {
+            let len = line.chars().count();
+            if cursor <= consumed + len {
+                caret_line = index;
+                caret_col = cursor - consumed;
+                break;
+            }
+            consumed += len + 1;
+            caret_line = index;
+            caret_col = len;
+        }
+        let mut rows = div().flex().flex_col().gap_1();
+        if text.is_empty() && !focused {
+            rows = rows.child(div().text_color(theme.muted).child("Describe the work…"));
+        } else {
+            for (index, line) in lines.iter().enumerate() {
+                if index == caret_line && focused {
+                    let before: String = line.chars().take(caret_col).collect();
+                    let after: String = line.chars().skip(caret_col).collect();
+                    rows = rows.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .child(div().text_color(theme.fg).child(before))
+                            .child(div().w(px(1.5)).h(px(18.0)).bg(theme.accent))
+                            .child(div().text_color(theme.fg).child(after)),
+                    );
+                } else {
+                    rows = rows.child(div().text_color(theme.fg).child((*line).to_string()));
+                }
+            }
+        }
+        div()
+            .id("l3s-home-prompt")
+            .flex()
+            .flex_col()
+            .min_h(px(112.0))
+            .px_5()
+            .pt_5()
+            .pb_3()
+            .text_size(px(15.0))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.home.set_focus(HomeFocus::Prompt);
+                    this.home.prompt_mut().end();
+                    cx.notify();
+                }),
+            )
+            .child(rows)
+    }
+
+    /// The composer card: the prompt above a row of pickers and the send button.
+    ///
+    /// Only the top corners round; the meta footer continues the same card.
+    fn home_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .rounded_t_xl()
+            .bg(theme.panel.opacity(0.0))
+            .border_t_1()
+            .border_l_1()
+            .border_r_1()
+            .border_b_1()
+            .border_color(terminal_inset_border())
+            .overflow_hidden()
+            .child(self.home_prompt_area(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .px_4()
+                    .pt_1()
+                    .pb_4()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(self.home_chip(HomeField::Agent, cx))
+                            .child(self.home_chip(HomeField::Model, cx))
+                            .child(self.home_chip(HomeField::Effort, cx)),
+                    )
+                    .child(self.home_send_button(cx)),
+            )
+    }
+
+    /// One picker chip inside the composer, styled like a tab.
+    fn home_chip(&self, field: HomeField, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let active = self.home.focus() == HomeFocus::Picker(field)
+            || self.home.dropdown() == Some(field);
+        let value = self
+            .home
+            .choice(field)
+            .selected()
+            .unwrap_or_default()
+            .to_string();
+        let fg = if active { theme.panel_fg } else { theme.muted };
+        let mut chip = div()
+            .id(format!("l3s-home-chip-{}", field.label()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(TAB_HEIGHT))
+            .px_3()
+            .rounded_md()
+            .bg(if active { theme.panel } else { theme.window_bg })
+            .text_color(fg)
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.home.set_focus(HomeFocus::Picker(field));
+                if this.home.dropdown() == Some(field) {
+                    this.home.close_dropdown();
+                } else {
+                    this.home.open_dropdown(field);
+                }
+                cx.notify();
+            }));
+        if active {
+            chip = chip.border_1().border_color(terminal_inset_border());
+        }
+        if field == HomeField::Agent {
+            chip = chip.child(icon(agent_icon(&value), 14.0, fg));
+        } else {
+            chip = chip.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.muted)
+                    .child(format!("{}:", field.label())),
+            );
+        }
+        chip.child(
+            div()
+                .max_w(px(200.0))
+                .truncate()
+                .text_size(px(self.chrome_font()))
+                .text_color(fg)
+                .child(value),
+        )
+        .child(icon(
+            include_bytes!("../../assets/icons/chevron-down.svg"),
+            13.0,
+            theme.muted,
+        ))
+    }
+
+    /// The icon-only circular send button.
+    fn home_send_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .id("l3s-home-send")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(30.0))
+            .h(px(30.0))
+            .rounded_full()
+            .bg(theme.panel)
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.border))
+            .on_click(cx.listener(|this, _, _, cx| this.home_send(cx)))
+            .child(icon(
+                include_bytes!("../../assets/icons/arrow-up.svg"),
+                15.0,
+                theme.fg,
+            ))
+    }
+
+    /// The machine, project, and git pickers below the composer.
+    fn home_meta_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .justify_center()
+            .gap_5()
+            .w_full()
+            .px_3()
+            .py_2()
+            .bg(theme.window_bg)
+            .border_l_1()
+            .border_r_1()
+            .border_b_1()
+            .border_color(terminal_inset_border())
+            .rounded_b_3xl()
+            .child(self.home_meta_picker(HomeField::Machine, cx))
+            .child(self.home_meta_picker(HomeField::Project, cx));
+        // Branch and worktree only apply to a git project; a personal
+        // workspace has neither.
+        if self.home_project_git() {
+            row = row
+                .child(self.home_meta_picker(HomeField::Base, cx))
+                .child(self.home_meta_picker(HomeField::Branch, cx));
+        }
+        div().w_full().px_4().child(row)
+    }
+
+    /// One picker in the meta footer, styled like a tab.
+    fn home_meta_picker(&self, field: HomeField, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let active = self.home.focus() == HomeFocus::Picker(field)
+            || self.home.dropdown() == Some(field);
+        let fg = if active { theme.panel_fg } else { theme.muted };
+        let selected = match field {
+            HomeField::Base => self.home.base_mode().label().to_string(),
+            _ => self
+                .home
+                .choice(field)
+                .selected()
+                .unwrap_or_default()
+                .to_string(),
+        };
+        let leading: AnyElement = match field {
+            HomeField::Machine => icon(
+                include_bytes!("../../assets/icons/monitor.svg"),
+                15.0,
+                fg,
+            )
+            .into_any_element(),
+            HomeField::Project => match self.home_project().and_then(|project| {
+                project
+                    .name
+                    .chars()
+                    .next()
+                    .map(|ch| ch.to_uppercase().to_string())
+            }) {
+                Some(letter) => div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded_sm()
+                    .bg(theme.border)
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.fg)
+                    .child(letter)
+                    .into_any_element(),
+                None => icon(include_bytes!("../../assets/icons/folder.svg"), 15.0, fg)
+                    .into_any_element(),
+            },
+            HomeField::Base => icon(
+                include_bytes!("../../assets/icons/git-fork.svg"),
+                15.0,
+                fg,
+            )
+            .into_any_element(),
+            HomeField::Branch => icon(
+                include_bytes!("../../assets/icons/git-branch.svg"),
+                15.0,
+                fg,
+            )
+            .into_any_element(),
+            _ => div().into_any_element(),
+        };
+        let mut item = div()
+            .id(format!("l3s-home-meta-{}", field.label()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(TAB_HEIGHT))
+            .px_3()
+            .rounded_md()
+            .bg(if active {
+                theme.panel
+            } else {
+                theme.panel.opacity(0.0)
+            })
+            .text_color(fg)
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.home.set_focus(HomeFocus::Picker(field));
+                if this.home.dropdown() == Some(field) {
+                    this.home.close_dropdown();
+                } else {
+                    this.home.open_dropdown(field);
+                }
+                cx.notify();
+            }));
+        if active {
+            item = item.border_1().border_color(terminal_inset_border());
+        }
+        item.child(leading)
+            .child(
+                div()
+                    .max_w(px(180.0))
+                    .truncate()
+                    .text_size(px(self.chrome_font()))
+                    .text_color(fg)
+                    .child(selected),
+            )
+            .child(icon(
+                include_bytes!("../../assets/icons/chevron-down.svg"),
+                13.0,
+                theme.muted,
+            ))
+    }
+
+    /// The open picker's option list, shown under the composer.
+    ///
+    /// Large catalogs (Pi can list hundreds of models) are filtered and
+    /// capped, so opening the dropdown never builds an unbounded element tree.
+    fn home_dropdown(&self, cx: &mut Context<Self>) -> Div {
+        const MAX_ROWS: usize = 100;
+        let Some(field) = self.home.dropdown() else {
+            return div();
+        };
+        let theme = self.theme;
+        let cursor = self.home.choice(field).cursor();
+        let options = self.home.choice(field).options();
+        let matches = self.home.dropdown_matches();
+        let total = matches.len();
+        let filter = self.home.filter().to_string();
+        let mut list = div()
+            .id("l3s-home-dropdown")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_1()
+            .w_full()
+            .max_h(px(240.0))
+            .overflow_y_scroll()
+            .rounded_lg()
+            .bg(theme.bg)
+            .border_1()
+            .border_color(theme.border);
+        if !filter.is_empty() {
+            list = list.child(
+                div()
+                    .px_3()
+                    .pt_1()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child(format!("Filter: {filter}")),
+            );
+        }
+        if matches.is_empty() {
+            list = list.child(
+                div()
+                    .px_3()
+                    .py_3()
+                    .text_size(px(self.chrome_font()))
+                    .text_color(theme.muted)
+                    .child("No matches"),
+            );
+        }
+        for index in matches.into_iter().take(MAX_ROWS) {
+            let active = index == cursor;
+            let option = options.get(index).cloned().unwrap_or_default();
+            list = list.child(
+                div()
+                    .id(format!("l3s-home-option-{index}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(30.0))
+                    .px_3()
+                    .rounded_md()
+                    .bg(if active { theme.panel } else { theme.bg })
+                    .text_color(theme.panel_fg)
+                    .font_weight(if active {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_size(px(self.chrome_font()))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.panel))
+                    .child(option)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.home.choose_dropdown(index);
+                        this.home.close_dropdown();
+                        cx.notify();
+                    })),
+            );
+        }
+        if total > MAX_ROWS {
+            list = list.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child(format!("…{} more · type to filter", total - MAX_ROWS)),
+            );
+        }
+        div().w_full().child(list)
     }
 
     /// Machine choice rows for the project form: Local, then saved machines.
@@ -2870,7 +4009,7 @@ impl L3sView {
                 self.projects.start_edit(&ids);
             }
             "d" => {
-                let root = self.session_root.clone();
+                let root = self.l3s_root.clone();
                 let _ = self.projects.request_delete(&root);
             }
             "w" => self.projects.start_worktree(),
@@ -2910,7 +4049,7 @@ impl L3sView {
                 self.projects.move_machine(1, choices);
             }
             "enter" => {
-                let root = self.session_root.clone();
+                let root = self.l3s_root.clone();
                 let ids = self.project_machine_ids();
                 let _ = self.projects.submit(&root, &ids);
             }
@@ -2972,6 +4111,7 @@ impl L3sView {
                 .gap_6()
                 .child(self.projects_section_block(cx))
                 .child(self.machines_section_block(cx))
+                .child(self.agent_config_section_block(cx))
         };
         let status = self.projects.status().to_string();
         div()
@@ -3068,6 +4208,143 @@ impl L3sView {
                     .child(new_button),
             )
             .child(self.projects_list(cx))
+    }
+
+    /// The AGENT CONFIG section of the page: the coding agents installed on
+    /// this machine, their config source, and the model catalog each exposes.
+    fn agent_config_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let loading = self.agent_config_pending.contains("local");
+        let configs = self.agent_config_cache.get("local");
+        let mut section = div().flex().flex_col().gap_2().child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .child(
+                    div()
+                        .text_size(px(self.section_font()))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.muted)
+                        .child("AGENT CONFIG"),
+                )
+                .child(
+                    div()
+                        .id("l3s-agents-refresh")
+                        .flex()
+                        .items_center()
+                        .h(px(24.0))
+                        .px_2()
+                        .rounded_md()
+                        .bg(theme.panel_dim)
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_size(px(11.0))
+                        .text_color(theme.fg)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.border))
+                        .child("Refresh")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.agent_config_cache.remove("local");
+                            this.agent_config_pending.remove("local");
+                            this.ensure_agent_configs_for("local");
+                            cx.notify();
+                        })),
+                ),
+        );
+        match configs {
+            Some(configs) if !configs.is_empty() => {
+                for config in configs {
+                    section = section.child(self.agent_config_row(config));
+                }
+            }
+            Some(_) | None if loading => {
+                section = section.child(agent_config_empty(theme, "Detecting agents…"));
+            }
+            Some(_) | None => {
+                section = section.child(agent_config_empty(
+                    theme,
+                    "No coding agents found. Install one, then Refresh.",
+                ));
+            }
+        }
+        section
+    }
+
+    /// One installed agent row: name, config source, default, and model count.
+    fn agent_config_row(&self, config: &AgentConfig) -> Div {
+        let theme = self.theme;
+        let default = config
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "—".to_string());
+        let catalog = if config.models.is_empty() {
+            "no catalog".to_string()
+        } else if config.discovered {
+            format!("{} models · live", config.models.len())
+        } else {
+            format!("{} models", config.models.len())
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .mx_3()
+            .px_2()
+            .py_2()
+            .rounded_md()
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(theme.fg)
+                                    .child(config.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted)
+                                    .child(config.kind.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted)
+                            .child(config.source.clone())
+                            .child(format!("· default: {default}")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child(catalog),
+            )
     }
 
     /// The REMOTE MACHINES section of the page: every saved machine profile
@@ -3473,7 +4750,7 @@ impl L3sView {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.projects.select(index);
-                                let root = this.session_root.clone();
+                                let root = this.l3s_root.clone();
                                 let _ = this.projects.request_delete(&root);
                                 cx.notify();
                             })),
@@ -3669,7 +4946,7 @@ impl L3sView {
             .cursor_pointer()
             .child("Save")
             .on_click(cx.listener(|this, _, _, cx| {
-                let root = this.session_root.clone();
+                let root = this.l3s_root.clone();
                 let ids = this.project_machine_ids();
                 let _ = this.projects.submit(&root, &ids);
                 cx.notify();
@@ -6536,6 +7813,7 @@ impl L3sView {
 impl Render for L3sView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_metrics(window);
+        self.sync_home();
         if !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }
@@ -6705,6 +7983,15 @@ impl Render for L3sView {
             .on_action(cx.listener(|this, _: &OpenSettings, _window, cx| {
                 this.open_settings(cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenHome, _window, cx| {
+                // The chord toggles, so pressing it again dismisses the composer.
+                if this.home.is_open() {
+                    this.home.close();
+                    cx.notify();
+                } else {
+                    this.open_home(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenSessionMenu, _window, cx| {
                 this.session_menu_open = true;
                 cx.notify();
@@ -6762,7 +8049,12 @@ impl Render for L3sView {
             // Chrome layers live at the root so they paint above the content
             // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
-            .child(self.top_chrome(cx, cell_width))
+            // The Home composer fills the card, so its tab strip stays hidden.
+            .child(if self.home.is_open() {
+                div()
+            } else {
+                self.top_chrome(cx, cell_width)
+            })
             .child(self.session_menu(cx))
             .child(self.status_bar(cx))
             .child(self.palette_overlay(cx))
@@ -7347,6 +8639,20 @@ fn status_color(status: &str, theme: Theme) -> gpui::Rgba {
     }
 }
 
+/// A muted placeholder row for the AGENT CONFIG section.
+fn agent_config_empty(theme: Theme, message: &str) -> Div {
+    div()
+        .mx_3()
+        .px_3()
+        .py_3()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .text_size(px(12.0))
+        .text_color(theme.muted)
+        .child(message.to_string())
+}
+
 /// Title-case the daemon's lowercase status (`working` -> `Working`).
 fn status_label(status: &str) -> String {
     let mut chars = status.chars();
@@ -7364,6 +8670,44 @@ fn remove_dock(side: &mut l3s_protocol::SideConfig, name: &str) {
             side.dock_weights.remove(index);
         }
     }
+}
+
+/// Open the project's workspace (or a new worktree), then start and prompt
+/// the chosen agent there.
+///
+/// `agent.start` spawns beside the focused pane, so the workspace open must
+/// land first; both run in one background thread in the caller. The model and
+/// effort pickers are captured in the UI but not forwarded yet: their flags
+/// differ per agent manifest, so forwarding them blindly would fail launches.
+fn launch_home_agent(
+    client: &mut ControlClient,
+    location: &str,
+    base: BaseMode,
+    branch: &str,
+    name: &str,
+    agent: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    client
+        .open_workspace(location)
+        .map_err(|error| error.to_string())?;
+    if base == BaseMode::NewWorktree {
+        let branch = if branch.trim().is_empty() {
+            generate_session_name(&[])
+        } else {
+            branch.to_string()
+        };
+        client
+            .create_worktree(&branch)
+            .map_err(|error| error.to_string())?;
+    }
+    client
+        .start_agent(name, agent, &[])
+        .map_err(|error| error.to_string())?;
+    client
+        .prompt_agent(name, prompt)
+        .map_err(|error| error.to_string())?;
+    Ok(format!("started {agent} as {name}"))
 }
 
 #[cfg(test)]

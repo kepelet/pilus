@@ -1,0 +1,1817 @@
+//! The UI Playground window: a working catalogue of every native element l3s
+//! draws.
+//!
+//! Unlike a static gallery, the controls here actually work: the inputs take
+//! typing, the dropdowns open and select, the tabs switch, and the buttons and
+//! switches react. It runs against the active theme, so a palette change shows
+//! up everywhere at once without touching live daemon data.
+
+use gpui::{
+    App, Bounds, Context, Div, FocusHandle, FontWeight, KeyDownEvent, Render, Window, WindowBounds,
+    WindowOptions, div, prelude::*, px, size,
+};
+
+use super::text_field::TextField;
+use super::theme::Theme;
+use super::{CloseTab, CloseWindow, icon, terminal_inset_border};
+
+/// Width and height of the playground window.
+const WINDOW_SIZE: (f32, f32) = (820.0, 740.0);
+
+/// Every icon the app vendors, so the gallery renders the real set.
+const ICONS: &[(&str, &[u8])] = &[
+    ("arrow-up", include_bytes!("../../assets/icons/arrow-up.svg")),
+    (
+        "chevron-down",
+        include_bytes!("../../assets/icons/chevron-down.svg"),
+    ),
+    (
+        "chevron-right",
+        include_bytes!("../../assets/icons/chevron-right.svg"),
+    ),
+    ("circle", include_bytes!("../../assets/icons/circle.svg")),
+    ("clock", include_bytes!("../../assets/icons/clock.svg")),
+    ("cloud", include_bytes!("../../assets/icons/cloud.svg")),
+    (
+        "corner-down-right",
+        include_bytes!("../../assets/icons/corner-down-right.svg"),
+    ),
+    ("folder", include_bytes!("../../assets/icons/folder.svg")),
+    (
+        "folder-git",
+        include_bytes!("../../assets/icons/folder-git.svg"),
+    ),
+    ("house", include_bytes!("../../assets/icons/house.svg")),
+    (
+        "layout-panel-left",
+        include_bytes!("../../assets/icons/layout-panel-left.svg"),
+    ),
+    (
+        "list-checks",
+        include_bytes!("../../assets/icons/list-checks.svg"),
+    ),
+    ("monitor", include_bytes!("../../assets/icons/monitor.svg")),
+    (
+        "panel-left",
+        include_bytes!("../../assets/icons/panel-left.svg"),
+    ),
+    ("plus", include_bytes!("../../assets/icons/plus.svg")),
+    ("server", include_bytes!("../../assets/icons/server.svg")),
+    ("settings", include_bytes!("../../assets/icons/settings.svg")),
+    ("workflow", include_bytes!("../../assets/icons/workflow.svg")),
+    ("x", include_bytes!("../../assets/icons/x.svg")),
+    (
+        "agent: claude",
+        include_bytes!("../../assets/icons/agents/claude-code.svg"),
+    ),
+    (
+        "agent: codex",
+        include_bytes!("../../assets/icons/agents/codex.svg"),
+    ),
+    (
+        "agent: gemini",
+        include_bytes!("../../assets/icons/agents/gemini.svg"),
+    ),
+    (
+        "agent: pi",
+        include_bytes!("../../assets/icons/agents/pi.svg"),
+    ),
+    (
+        "agent: cursor",
+        include_bytes!("../../assets/icons/agents/cursor.svg"),
+    ),
+    (
+        "agent: amp",
+        include_bytes!("../../assets/icons/agents/amp.svg"),
+    ),
+    (
+        "agent: bot",
+        include_bytes!("../../assets/icons/agents/bot.svg"),
+    ),
+];
+
+/// The button treatments the app uses.
+#[derive(Clone, Copy)]
+enum ButtonKind {
+    /// Accent fill, the primary action.
+    Primary,
+    /// Panel fill with a border.
+    Secondary,
+    /// Text-only, fills on hover.
+    Ghost,
+    /// Panel fill with alert text.
+    Danger,
+}
+
+/// Which demo input owns the keyboard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputId {
+    Single,
+    Multi,
+}
+
+/// One working dropdown in the gallery.
+struct Picker {
+    prefix: &'static str,
+    options: Vec<&'static str>,
+    selected: usize,
+}
+
+/// The playground window root view.
+pub struct UiPlaygroundView {
+    theme: Theme,
+    focus_handle: FocusHandle,
+    single: TextField,
+    multi: TextField,
+    input: InputId,
+    pickers: Vec<Picker>,
+    open_picker: Option<usize>,
+    tab: usize,
+    toggle: bool,
+    checked: bool,
+    collapsed: bool,
+    confirm: bool,
+    clicks: u32,
+    status: String,
+}
+
+impl UiPlaygroundView {
+    fn new(theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle, cx);
+        Self {
+            theme,
+            focus_handle,
+            single: TextField::with_value("click and type".to_string()),
+            multi: TextField::with_value("A multi-line\ntextarea.".to_string()),
+            input: InputId::Single,
+            pickers: vec![
+                Picker {
+                    prefix: "Model:",
+                    options: vec!["Default", "DeepSeek V4.1 Flash", "Muse Spark 1.3"],
+                    selected: 1,
+                },
+                Picker {
+                    prefix: "Effort:",
+                    options: vec!["Default", "Low", "Medium", "High"],
+                    selected: 3,
+                },
+            ],
+            open_picker: None,
+            tab: 0,
+            toggle: true,
+            checked: false,
+            collapsed: false,
+            confirm: false,
+            clicks: 0,
+            status: "Everything here is live: type, open the dropdowns, switch tabs.".to_string(),
+        }
+    }
+
+    /// Record the last interaction in the footer.
+    fn note(&mut self, text: String, cx: &mut Context<Self>) {
+        self.status = text;
+        cx.notify();
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            window.remove_window();
+            return;
+        }
+        // Tab walks between the two inputs, so both are reachable by keyboard.
+        if key == "tab" {
+            self.input = match self.input {
+                InputId::Single => InputId::Multi,
+                InputId::Multi => InputId::Single,
+            };
+            cx.notify();
+            return;
+        }
+        let multiline = self.input == InputId::Multi;
+        let field = if multiline {
+            &mut self.multi
+        } else {
+            &mut self.single
+        };
+        match key {
+            "backspace" => field.backspace(),
+            "delete" | "del" => field.delete(),
+            "left" => field.left(),
+            "right" => field.right(),
+            "home" => field.home(),
+            "end" => field.end(),
+            "enter" if multiline => field.newline(),
+            "enter" => {}
+            _ => {
+                if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
+                    return;
+                }
+                if let Some(text) = event
+                    .keystroke
+                    .key_char
+                    .as_deref()
+                    .filter(|text| !text.is_empty())
+                {
+                    if multiline {
+                        field.insert_multiline(text);
+                    } else {
+                        field.insert(text);
+                    }
+                } else if event.keystroke.key.chars().count() == 1 {
+                    let typed = event.keystroke.key.clone();
+                    if multiline {
+                        field.insert_multiline(&typed);
+                    } else {
+                        field.insert(&typed);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// One titled group in the catalogue.
+    fn section(&self, title: &'static str, body: impl IntoElement) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.muted)
+                    .child(title),
+            )
+            .child(body)
+    }
+
+    /// A bordered surface holding a row of controls.
+    fn tray(&self, body: impl IntoElement) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_3()
+            .w_full()
+            .p_4()
+            .rounded_md()
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.border)
+            .child(body)
+    }
+
+    /// One button in the requested treatment.
+    fn button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        kind: ButtonKind,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let (bg, fg, border) = match kind {
+            ButtonKind::Primary => (theme.accent, theme.window_bg, theme.accent),
+            ButtonKind::Secondary => (theme.panel_dim, theme.fg, theme.border),
+            ButtonKind::Ghost => (theme.panel.opacity(0.0), theme.muted, theme.panel.opacity(0.0)),
+            ButtonKind::Danger => (theme.panel_dim, theme.alert, theme.border),
+        };
+        let hover_bg = match kind {
+            ButtonKind::Ghost => theme.panel_dim,
+            _ => theme.panel,
+        };
+        let hover_fg = match kind {
+            ButtonKind::Danger => theme.alert,
+            _ => theme.panel_fg,
+        };
+        div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .h(px(28.0))
+            .px_3()
+            .rounded_md()
+            .bg(bg)
+            .text_color(fg)
+            .border_1()
+            .border_color(border)
+            .text_size(px(12.0))
+            .font_weight(match kind {
+                ButtonKind::Primary => FontWeight::BOLD,
+                _ => FontWeight::NORMAL,
+            })
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover_bg).text_color(hover_fg))
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| match kind {
+                ButtonKind::Primary => {
+                    this.clicks = this.clicks.saturating_add(1);
+                    this.note(format!("Primary clicked {} times", this.clicks), cx);
+                }
+                ButtonKind::Secondary => {
+                    this.toggle = !this.toggle;
+                    this.note(format!("Toggle is now {}", if this.toggle { "on" } else { "off" }), cx);
+                }
+                ButtonKind::Ghost => this.note("Ghost clicked".to_string(), cx),
+                ButtonKind::Danger => this.note("Danger clicked".to_string(), cx),
+            }))
+    }
+
+    /// The circular icon-only send button.
+    fn circle_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .id("pg-send")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(30.0))
+            .h(px(30.0))
+            .rounded_full()
+            .bg(theme.panel)
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.border))
+            .on_click(cx.listener(|this, _, _, cx| this.note("Send clicked".to_string(), cx)))
+            .child(icon(
+                include_bytes!("../../assets/icons/arrow-up.svg"),
+                15.0,
+                theme.fg,
+            ))
+    }
+
+    /// A labelled input box, editable while it owns the keyboard.
+    fn input_box(&self, id: InputId, label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let focused = self.input == id;
+        let multiline = id == InputId::Multi;
+        let field = match id {
+            InputId::Single => &self.single,
+            InputId::Multi => &self.multi,
+        };
+        let lines = self.field_body(field, focused);
+        div()
+            .id(match id {
+                InputId::Single => "pg-input-single",
+                InputId::Multi => "pg-input-multi",
+            })
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w(px(240.0))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_h(px(if multiline { 84.0 } else { 30.0 }))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.panel_dim)
+                    .border_1()
+                    .border_color(if focused { theme.accent } else { theme.border })
+                    .text_size(px(13.0))
+                    .cursor_pointer()
+                    .child(lines),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.input = id;
+                    match id {
+                        InputId::Single => this.single.end(),
+                        InputId::Multi => this.multi.end(),
+                    }
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// Render an input's text, placing the caret on the cursor's line.
+    fn field_body(&self, field: &TextField, focused: bool) -> Div {
+        let theme = self.theme;
+        let text = field.value.clone();
+        let cursor = field.cursor;
+        let lines: Vec<&str> = text.split('\n').collect();
+        let mut caret_line = 0usize;
+        let mut caret_col = cursor;
+        let mut consumed = 0usize;
+        for (index, line) in lines.iter().enumerate() {
+            let len = line.chars().count();
+            if cursor <= consumed + len {
+                caret_line = index;
+                caret_col = cursor - consumed;
+                break;
+            }
+            consumed += len + 1;
+            caret_line = index;
+            caret_col = len;
+        }
+        let mut rows = div().flex().flex_col().gap_1();
+        if text.is_empty() && !focused {
+            rows = rows.child(div().text_color(theme.muted).child("Type…"));
+            return rows;
+        }
+        for (index, line) in lines.iter().enumerate() {
+            if index == caret_line && focused {
+                let before: String = line.chars().take(caret_col).collect();
+                let after: String = line.chars().skip(caret_col).collect();
+                rows = rows.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(div().text_color(theme.fg).child(before))
+                        .child(div().w(px(1.5)).h(px(16.0)).bg(theme.accent))
+                        .child(div().text_color(theme.fg).child(after)),
+                );
+            } else {
+                rows = rows.child(div().text_color(theme.fg).child((*line).to_string()));
+            }
+        }
+        rows
+    }
+
+    /// One chip in the interactive dropdown row.
+    fn picker_chip(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let picker = &self.pickers[index];
+        let value = picker
+            .options
+            .get(picker.selected)
+            .copied()
+            .unwrap_or_default();
+        let prefix = picker.prefix;
+        let active = self.open_picker == Some(index);
+        let fg = if active { theme.panel_fg } else { theme.muted };
+        let mut chip = div()
+            .id(format!("pg-picker-{index}"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(26.0))
+            .px_3()
+            .rounded_md()
+            .bg(if active { theme.panel } else { theme.window_bg })
+            .text_color(fg)
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_picker = (this.open_picker != Some(index)).then_some(index);
+                cx.notify();
+            }));
+        if active {
+            chip = chip.border_1().border_color(terminal_inset_border());
+        }
+        chip.child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme.muted)
+                .child(prefix),
+        )
+        .child(
+            div()
+                .max_w(px(180.0))
+                .truncate()
+                .text_size(px(13.0))
+                .text_color(fg)
+                .child(value),
+        )
+        .child(icon(
+            include_bytes!("../../assets/icons/chevron-down.svg"),
+            13.0,
+            theme.muted,
+        ))
+    }
+
+    /// The open picker's option list, shown under the chip row.
+    fn picker_options(&self, cx: &mut Context<Self>) -> Div {
+        let Some(index) = self.open_picker else {
+            return div();
+        };
+        let theme = self.theme;
+        let options = self.pickers[index].options.clone();
+        let selected = self.pickers[index].selected;
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_1()
+            .w(px(220.0))
+            .rounded_lg()
+            .bg(theme.bg)
+            .border_1()
+            .border_color(theme.border);
+        for (option_index, option) in options.into_iter().enumerate() {
+            let active = option_index == selected;
+            list = list.child(
+                div()
+                    .id(format!("pg-picker-{index}-{option_index}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(28.0))
+                    .px_3()
+                    .rounded_md()
+                    .bg(if active { theme.panel } else { theme.bg })
+                    .text_color(theme.panel_fg)
+                    .text_size(px(13.0))
+                    .font_weight(if active {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.panel))
+                    .child(option)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.pickers[index].selected = option_index;
+                        this.open_picker = None;
+                        this.note(format!("Selected {option}"), cx);
+                    })),
+            );
+        }
+        list
+    }
+
+    /// One working tab pill.
+    fn tab(&self, index: usize, label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let active = self.tab == index;
+        let fg = if active { theme.panel_fg } else { theme.muted };
+        let mut tab = div()
+            .id(format!("pg-tab-{index}"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(26.0))
+            .px_3()
+            .rounded_md()
+            .bg(if active { theme.panel } else { theme.window_bg })
+            .text_color(fg)
+            .text_size(px(13.0))
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.tab = index;
+                this.note(format!("{label} tab selected"), cx);
+            }))
+            .child(label);
+        if active {
+            tab = tab.border_1().border_color(terminal_inset_border());
+        }
+        tab
+    }
+
+    /// A working on/off switch.
+    fn toggle_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let on = self.toggle;
+        div()
+            .id("pg-switch")
+            .flex()
+            .items_center()
+            .w(px(38.0))
+            .h(px(20.0))
+            .p(px(2.0))
+            .rounded_full()
+            .bg(if on { theme.accent } else { theme.border })
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle = !this.toggle;
+                let on = this.toggle;
+                this.note(format!("Switch {}", if on { "on" } else { "off" }), cx);
+            }))
+            .child(
+                div()
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .rounded_full()
+                    .bg(if on { theme.window_bg } else { theme.muted })
+                    .ml(px(if on { 18.0 } else { 0.0 })),
+            )
+    }
+
+    /// A working checkbox.
+    fn checkbox(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let checked = self.checked;
+        div()
+            .id("pg-checkbox")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.checked = !this.checked;
+                let checked = this.checked;
+                this.note(format!("Checkbox {}", if checked { "on" } else { "off" }), cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .rounded_sm()
+                    .bg(if checked { theme.accent } else { theme.panel_dim })
+                    .border_1()
+                    .border_color(if checked { theme.accent } else { theme.border })
+                    .child(div().w(px(8.0)).h(px(8.0)).rounded_xs().bg(if checked {
+                        theme.window_bg
+                    } else {
+                        theme.panel.opacity(0.0)
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(theme.fg)
+                    .child("Checkbox"),
+            )
+    }
+
+    /// The color swatch grid.
+    fn colors(&self) -> Div {
+        let theme = self.theme;
+        let entries: [(&str, gpui::Rgba); 16] = [
+            ("window_bg", theme.window_bg),
+            ("bg", theme.bg),
+            ("sidebar_bg", theme.sidebar_bg),
+            ("panel", theme.panel),
+            ("panel_dim", theme.panel_dim),
+            ("border", theme.border),
+            ("fg", theme.fg),
+            ("panel_fg", theme.panel_fg),
+            ("muted", theme.muted),
+            ("accent", theme.accent),
+            ("branch", theme.branch),
+            ("ok", theme.ok),
+            ("alert", theme.alert),
+            ("selection_bg", theme.selection_bg),
+            ("selection_fg", theme.selection_fg),
+            ("inset_border", terminal_inset_border()),
+        ];
+        let mut grid = div().flex().flex_row().flex_wrap().gap_3();
+        for (name, color) in entries {
+            grid = grid.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .w(px(88.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(36.0))
+                            .rounded_md()
+                            .bg(color)
+                            .border_1()
+                            .border_color(theme.border),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted)
+                            .child(name),
+                    ),
+            );
+        }
+        grid
+    }
+
+    /// A representative saved-machine row.
+    fn machine_row(&self) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .w_full()
+            .px_2()
+            .py_2()
+            .rounded_md()
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.fg)
+                            .child("mac-mini"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted)
+                            .child("rizaldy@mac-mini")
+                            .child(div().text_color(theme.ok).child("online")),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.fg)
+                    .child("Disable"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child("Remove"),
+            )
+    }
+
+    /// A representative sidebar navigation row.
+    fn nav_row(&self, label: &'static str, active: bool) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(if active {
+                theme.panel
+            } else {
+                theme.window_bg.opacity(0.0)
+            })
+            .text_size(px(13.0))
+            .text_color(if active { theme.panel_fg } else { theme.muted })
+            .child(icon(
+                include_bytes!("../../assets/icons/layout-panel-left.svg"),
+                14.0,
+                theme.muted,
+            ))
+            .child(label)
+    }
+
+    /// The badge and dot treatments.
+    fn badges(&self) -> Div {
+        let theme = self.theme;
+        let letter = div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(20.0))
+            .h(px(20.0))
+            .rounded_sm()
+            .bg(theme.border)
+            .text_size(px(11.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.fg)
+            .child("L");
+        let nav_badge = div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(16.0))
+            .min_w(px(16.0))
+            .px_1()
+            .rounded_full()
+            .bg(theme.accent)
+            .text_size(px(10.0))
+            .text_color(theme.window_bg)
+            .child("3");
+        let dot = |color: gpui::Rgba, label: &'static str, theme: Theme| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(icon(
+                    include_bytes!("../../assets/icons/circle.svg"),
+                    10.0,
+                    color,
+                ))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted)
+                        .child(label),
+                )
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_4()
+            .child(letter)
+            .child(nav_badge)
+            .child(dot(theme.ok, "ok", theme))
+            .child(dot(theme.alert, "alert", theme))
+            .child(dot(theme.muted, "muted", theme))
+    }
+
+    /// The vendored icon grid.
+    fn icon_grid(&self) -> Div {
+        let theme = self.theme;
+        let mut grid = div().flex().flex_row().flex_wrap().gap_3();
+        for (name, bytes) in ICONS {
+            grid = grid.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .w(px(84.0))
+                    .child(icon(bytes, 18.0, theme.muted))
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(theme.muted)
+                            .child(*name),
+                    ),
+            );
+        }
+        grid
+    }
+
+    /// Cards, boxes, and the composer's attached footer shape.
+    fn containers(&self) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .w(px(210.0))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted)
+                            .child("Inset terminal card"),
+                    )
+                    .child(
+                        div()
+                            .h(px(64.0))
+                            .w_full()
+                            .rounded_md()
+                            .bg(theme.bg)
+                            .border_1()
+                            .border_color(terminal_inset_border()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .w(px(210.0))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted)
+                            .child("Composer card + footer"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .h(px(40.0))
+                                    .px_3()
+                                    .rounded_t_xl()
+                                    .bg(theme.panel.opacity(0.0))
+                                    .border_t_1()
+                                    .border_l_1()
+                                    .border_r_1()
+                                    .border_color(terminal_inset_border())
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(theme.muted)
+                                            .child("composer"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .px_3()
+                                    .py_2()
+                                    .bg(theme.window_bg)
+                                    .border_l_1()
+                                    .border_r_1()
+                                    .border_b_1()
+                                    .border_color(terminal_inset_border())
+                                    .rounded_b_3xl()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(theme.muted)
+                                            .child("footer"),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .w(px(210.0))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted)
+                            .child("Panel box"),
+                    )
+                    .child(
+                        div()
+                            .h(px(64.0))
+                            .w_full()
+                            .rounded_md()
+                            .bg(theme.panel)
+                            .border_1()
+                            .border_color(theme.border),
+                    ),
+            )
+    }
+
+    /// Hairline dividers, including the section-header rule.
+    fn divider_demos(&self) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w_full()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.muted)
+                    .child("SECTION")
+                    .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border())),
+            )
+            .child(div().w_full().h(px(1.0)).bg(terminal_inset_border()))
+            .child(div().w_full().h(px(1.0)).bg(theme.border))
+    }
+
+    /// A sidebar section header with a collapse toggle and add button.
+    fn section_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let collapsed = self.collapsed;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(22.0))
+            .pl_2()
+            .mr(px(-12.0))
+            .child(
+                div()
+                    .id("pg-section-toggle")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .flex_1()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.muted)
+                    .hover(move |style| style.text_color(theme.panel_fg))
+                    .child(icon(
+                        if collapsed {
+                            include_bytes!("../../assets/icons/chevron-right.svg")
+                        } else {
+                            include_bytes!("../../assets/icons/chevron-down.svg")
+                        },
+                        12.0,
+                        theme.muted,
+                    ))
+                    .child("WORKSPACES")
+                    .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.collapsed = !this.collapsed;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("pg-section-add")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(22.0))
+                    .w(px(22.0))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.panel))
+                    .child(icon(
+                        include_bytes!("../../assets/icons/plus.svg"),
+                        11.0,
+                        theme.muted,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.note("Add workspace".to_string(), cx)
+                    })),
+            )
+    }
+
+    /// A project row, active or not.
+    fn project_row_demo(&self, active: bool) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(if active {
+                theme.panel
+            } else {
+                theme.window_bg.opacity(0.0)
+            })
+            .child(icon(
+                include_bytes!("../../assets/icons/folder-git.svg"),
+                12.0,
+                theme.muted,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .text_color(theme.panel_fg)
+                    .font_weight(if active {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .child("l3s"),
+            )
+    }
+
+    /// A workspace row with its branch badge and cwd line.
+    fn workspace_row_demo(&self, active: bool) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(if active {
+                theme.panel
+            } else {
+                theme.window_bg.opacity(0.0)
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .min_w(px(0.0))
+                    .child(icon(
+                        include_bytes!("../../assets/icons/folder.svg"),
+                        14.0,
+                        theme.panel_fg,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(13.0))
+                            .text_color(theme.panel_fg)
+                            .font_weight(if active {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .child("quiet-comet"),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.0))
+                            .text_color(theme.branch)
+                            .child("main"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child("~/Developer/l3s"),
+            )
+    }
+
+    /// An agent row with its brand icon and status.
+    fn agent_row_demo(&self) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .child(icon(
+                include_bytes!("../../assets/icons/agents/pi.svg"),
+                14.0,
+                theme.muted,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .text_color(theme.panel_fg)
+                    .child("quiet-comet"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.ok)
+                    .child("working"),
+            )
+    }
+
+    /// The command palette: query field and result rows.
+    fn palette_demo(&self) -> Div {
+        let theme = self.theme;
+        let row = |title: &'static str,
+                   group: &'static str,
+                   shortcut: &'static str,
+                   active: bool,
+                   theme: Theme| {
+            let (bg, fg, dim) = if active {
+                (
+                    theme.selection_bg,
+                    theme.selection_fg,
+                    theme.selection_fg.opacity(0.75),
+                )
+            } else {
+                (theme.sidebar_bg, theme.panel_fg, theme.muted)
+            };
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .h(px(30.0))
+                .px_3()
+                .rounded_md()
+                .bg(bg)
+                .child(div().flex_1().text_size(px(13.0)).text_color(fg).child(title))
+                .child(div().text_size(px(11.0)).text_color(dim).child(group))
+                .child(div().text_size(px(11.0)).text_color(dim).child(shortcut))
+        };
+        div()
+            .flex()
+            .flex_col()
+            .w(px(360.0))
+            .rounded_lg()
+            .bg(theme.sidebar_bg)
+            .border_1()
+            .border_color(theme.border)
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(40.0))
+                    .px_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .text_size(px(13.0))
+                    .child(div().w(px(1.5)).h(px(16.0)).bg(theme.accent))
+                    .child(
+                        div()
+                            .pl(px(2.0))
+                            .text_color(theme.muted)
+                            .child("Type a command…"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_1()
+                    .child(row("New Tab", "Session", "⌘T", true, theme))
+                    .child(row("Open Settings", "Application", "⌘⇧.", false, theme)),
+            )
+    }
+
+    /// The Open Workspace picker: path bar, rows, and footer.
+    fn picker_demo(&self) -> Div {
+        let theme = self.theme;
+        let row = |name: &'static str, bytes: &'static [u8], active: bool, theme: Theme| {
+            let (bg, fg) = if active {
+                (theme.selection_bg, theme.selection_fg)
+            } else {
+                (theme.sidebar_bg, theme.panel_fg)
+            };
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .h(px(28.0))
+                .px_2()
+                .rounded_md()
+                .bg(bg)
+                .text_size(px(13.0))
+                .text_color(fg)
+                .child(icon(bytes, 14.0, theme.muted))
+                .child(name)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .w(px(360.0))
+            .rounded_lg()
+            .bg(theme.bg)
+            .border_1()
+            .border_color(theme.border)
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(38.0))
+                    .px_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .text_size(px(13.0))
+                    .text_color(theme.fg)
+                    .child("~/Developer"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_1()
+                    .child(row(
+                        "l3s",
+                        include_bytes!("../../assets/icons/folder.svg"),
+                        true,
+                        theme,
+                    ))
+                    .child(row(
+                        "luvus",
+                        include_bytes!("../../assets/icons/folder.svg"),
+                        false,
+                        theme,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.muted)
+                            .child("Cancel"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(26.0))
+                            .px_3()
+                            .rounded_md()
+                            .bg(theme.accent)
+                            .text_color(theme.window_bg)
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::BOLD)
+                            .child("Open"),
+                    ),
+            )
+    }
+
+    /// The status bar: session, breadcrumb, status, and right icon actions.
+    fn status_bar_demo(&self) -> Div {
+        let theme = self.theme;
+        let square = |id: &'static str, bytes: &'static [u8], theme: Theme| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(28.0))
+                .w(px(28.0))
+                .rounded_md()
+                .child(icon(bytes, 14.0, theme.muted))
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .h(px(28.0))
+            .px_3()
+            .text_size(px(11.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_color(theme.panel_fg).child("default"))
+                            .child(icon(
+                                include_bytes!("../../assets/icons/chevron-down.svg"),
+                                12.0,
+                                theme.muted,
+                            )),
+                    )
+                    .child(div().text_color(theme.muted).child("~/Developer/l3s"))
+                    .child(div().text_color(theme.muted).child("connected")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .h(px(28.0))
+                            .px_2()
+                            .rounded_md()
+                            .text_color(theme.accent)
+                            .child("Update available"),
+                    )
+                    .child(square(
+                        "pg-status-machines",
+                        include_bytes!("../../assets/icons/monitor.svg"),
+                        theme,
+                    ))
+                    .child(square(
+                        "pg-status-settings",
+                        include_bytes!("../../assets/icons/settings.svg"),
+                        theme,
+                    )),
+            )
+    }
+
+    /// A hover tooltip card.
+    fn tooltip_demo(&self) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w(px(260.0))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(theme.sidebar_bg)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.panel_fg)
+                    .child("quiet-comet"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child("Directory: ~/Developer/l3s"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.branch)
+                    .child("Branch: quiet-comet"),
+            )
+    }
+
+    /// Empty, error, loading, and shortcut treatments.
+    fn feedback_demos(&self) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_4()
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.muted)
+                    .child("No projects yet."),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.alert)
+                    .child("couldn't open workspace"),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.muted)
+                    .child("Loading…"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(20.0))
+                    .px_2()
+                    .rounded_sm()
+                    .bg(theme.panel_dim)
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child("⌘⇧P"),
+            )
+    }
+
+    /// Small icon and text action buttons, including a two-step confirm.
+    fn small_buttons(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let confirm = self.confirm;
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(24.0))
+                    .px_2()
+                    .rounded_md()
+                    .bg(theme.accent)
+                    .text_color(theme.window_bg)
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::BOLD)
+                    .child("New Project"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(24.0))
+                    .w(px(24.0))
+                    .rounded_md()
+                    .bg(theme.panel_dim)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(icon(
+                        include_bytes!("../../assets/icons/plus.svg"),
+                        12.0,
+                        theme.muted,
+                    )),
+            )
+            .child(
+                div()
+                    .id("pg-confirm")
+                    .flex()
+                    .items_center()
+                    .h(px(24.0))
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(if confirm { theme.alert } else { theme.muted })
+                    .hover(move |style| style.bg(theme.panel_dim))
+                    .child(if confirm { "Confirm" } else { "Remove" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.confirm = !this.confirm;
+                        let armed = this.confirm;
+                        this.note(
+                            if armed {
+                                "Remove armed".to_string()
+                            } else {
+                                "Remove cancelled".to_string()
+                            },
+                            cx,
+                        );
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(24.0))
+                    .px_2()
+                    .rounded_md()
+                    .text_size(px(11.0))
+                    .text_color(theme.fg)
+                    .child("Disable"),
+            )
+    }
+}
+
+impl Render for UiPlaygroundView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let clicks = self.clicks;
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .p_6()
+            .child(self.section("COLORS", self.colors()))
+            .child(self.section("CONTAINERS", self.containers()))
+            .child(self.section("DIVIDERS", self.divider_demos()))
+            .child(self.section(
+                "BUTTONS",
+                self.tray(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_3()
+                        .child(self.button("pg-primary", "Primary", ButtonKind::Primary, cx))
+                        .child(self.button(
+                            "pg-secondary",
+                            "Secondary",
+                            ButtonKind::Secondary,
+                            cx,
+                        ))
+                        .child(self.button("pg-ghost", "Ghost", ButtonKind::Ghost, cx))
+                        .child(self.button("pg-danger", "Danger", ButtonKind::Danger, cx))
+                        .child(self.circle_button(cx))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted)
+                                .child(format!("primary clicks: {clicks}")),
+                        ),
+                ),
+            ))
+            .child(self.section(
+                "INPUTS",
+                self.tray(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_start()
+                        .gap_4()
+                        .child(self.input_box(InputId::Single, "Single line", cx))
+                        .child(self.input_box(InputId::Multi, "Multi line", cx)),
+                ),
+            ))
+            .child(self.section(
+                "DROPDOWNS",
+                self.tray(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_3()
+                                .child(self.picker_chip(0, cx))
+                                .child(self.picker_chip(1, cx)),
+                        )
+                        .child(self.picker_options(cx)),
+                ),
+            ))
+            .child(self.section(
+                "TABS",
+                self.tray(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(self.tab(0, "Overview", cx))
+                        .child(self.tab(1, "Changes", cx)),
+                ),
+            ))
+            .child(self.section(
+                "TOGGLES",
+                self.tray(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_6()
+                        .child(self.toggle_switch(cx))
+                        .child(self.checkbox(cx)),
+                ),
+            ))
+            .child(self.section(
+                "SIDEBAR",
+                self.tray(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .w_full()
+                        .child(self.section_header(cx))
+                        .child(self.project_row_demo(true))
+                        .child(self.project_row_demo(false))
+                        .child(self.workspace_row_demo(true))
+                        .child(self.workspace_row_demo(false))
+                        .child(self.agent_row_demo()),
+                ),
+            ))
+            .child(self.section("COMMAND PALETTE", self.tray(self.palette_demo())))
+            .child(self.section("WORKSPACE PICKER", self.tray(self.picker_demo())))
+            .child(self.section("STATUS BAR", self.tray(self.status_bar_demo())))
+            .child(self.section("TOOLTIP", self.tray(self.tooltip_demo())))
+            .child(self.section("FEEDBACK", self.tray(self.feedback_demos())))
+            .child(self.section("SMALL BUTTONS", self.tray(self.small_buttons(cx))))
+            .child(self.section("BADGES & DOTS", self.tray(self.badges())))
+            .child(self.section(
+                "ROWS",
+                self.tray(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .w_full()
+                        .child(self.machine_row())
+                        .child(self.nav_row("Mission Control", false))
+                        .child(self.nav_row("Orchestration", true)),
+                ),
+            ))
+            .child(self.section(
+                "TYPOGRAPHY",
+                self.tray(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme.muted)
+                                .child("SECTION LABEL"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(theme.panel_fg)
+                                .child("Body panel text"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(theme.muted)
+                                .child("Muted secondary text"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(theme.branch)
+                                .child("branch-name"),
+                        )
+                        .child(
+                            div()
+                                .font_family("Menlo")
+                                .text_size(px(13.0))
+                                .text_color(theme.fg)
+                                .child("monospace 0123456789"),
+                        ),
+                ),
+            ))
+            .child(self.section("ICONS", self.tray(self.icon_grid())));
+
+        div()
+            .id("l3s-ui-playground")
+            .track_focus(&self.focus_handle)
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(theme.window_bg)
+            .text_color(theme.fg)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.on_key_down(event, window, cx);
+            }))
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
+            .on_action(|_: &CloseTab, window, _| window.remove_window())
+            .child(
+                div()
+                    .id("l3s-ui-playground-scroll")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px_4()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .text_size(px(11.0))
+                    .text_color(theme.muted)
+                    .child(self.status.clone()),
+            )
+    }
+}
+
+/// Open the UI Playground window.
+pub fn open(theme: Theme, cx: &mut App) {
+    let bounds = Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
+    let opened = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("UI Playground".into()),
+                appears_transparent: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        move |window, cx| cx.new(move |cx| UiPlaygroundView::new(theme, window, cx)),
+    );
+    if let Err(error) = opened {
+        eprintln!("l3s: could not open the UI playground: {error}");
+    }
+}

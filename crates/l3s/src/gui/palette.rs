@@ -32,6 +32,8 @@ pub enum Command {
     SelectAllGrid,
     OpenWorkspacePicker,
     OpenSettings,
+    OpenHome,
+    OpenUiPlayground,
     OpenProject(String),
     NewProjectWorktree(String),
     Quit,

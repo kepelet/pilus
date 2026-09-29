@@ -7,6 +7,7 @@
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod agents;
 pub mod ansi;
 mod autostart;
 mod connection;
@@ -18,6 +19,7 @@ mod projects;
 mod surface;
 mod transport;
 mod uhp;
+pub use agents::AgentConfig;
 pub use autostart::{ensure_server, ensure_server_for};
 pub use connection::{ClientEvent, Connection, EndpointIdentity};
 pub use control::{
@@ -25,9 +27,10 @@ pub use control::{
     FeedScope, FeedUpdate, Tab, TaskSummary, ThemeInfo,
 };
 pub use discovery::{
-    HOME_ENV, SessionInfo, active_session, api_socket_path_for, client_socket_path_for,
-    client_socket_path_under, config_dir, describe, generate_session_name, list_session_infos,
-    list_sessions, luvus_binary, session_dir_for, split_client_socket, validate_session,
+    HOME_ENV, L3S_HOME_ENV, SessionInfo, active_session, api_socket_path_for, client_socket_path_for,
+    client_socket_path_under, config_dir, describe, generate_session_name, l3s_config_dir,
+    l3s_workspaces_dir, list_session_infos, list_sessions, luvus_binary, session_dir_for,
+    split_client_socket, validate_session,
 };
 pub use error::{Error, Result};
 pub use l3s_protocol as protocol;
@@ -35,8 +38,8 @@ pub use machines::{MachineInfo, connect_machine, list_machines, refresh_machines
 pub use projects::{
     Project, RemoteRepos, common_git_dir, common_git_dirs_remote, current_branch,
     current_branches_remote, expand_local as expand_project_local,
-    expand_remote as expand_project_remote, id_for_name as project_id_for_name, load_projects,
-    projects_file, save_projects, validate as validate_project,
+    expand_remote as expand_project_remote, id_for_name as project_id_for_name, list_branches,
+    load_projects, projects_file, save_projects, validate as validate_project,
 };
 pub use surface::{Surface, SurfaceChange};
 pub use transport::SshTarget;

@@ -57,7 +57,7 @@ impl AboutView {
 
 /// The app's own icon, decoded once from the embedded PNG. GPUI's image
 /// buffers are BGRA, so the channels are swapped after decoding.
-fn app_icon() -> Option<Arc<RenderImage>> {
+pub(super) fn app_icon() -> Option<Arc<RenderImage>> {
     static ICON: OnceLock<Option<Arc<RenderImage>>> = OnceLock::new();
     ICON.get_or_init(|| {
         let decoded =

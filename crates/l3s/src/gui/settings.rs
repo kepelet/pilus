@@ -45,7 +45,7 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Load `<root>/l3s-client.json`, falling back to the defaults.
+    /// Load `<root>/settings.json`, falling back to the defaults.
     pub fn load(root: &Path) -> Self {
         std::fs::read_to_string(path(root))
             .ok()
@@ -53,17 +53,18 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    /// Persist to `<root>/l3s-client.json`, best-effort like the daemon's own
+    /// Persist to `<root>/settings.json`, best-effort like the daemon's own
     /// state writes.
     pub fn save(&self, root: &Path) {
         if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::create_dir_all(root);
             let _ = std::fs::write(path(root), text);
         }
     }
 }
 
 fn path(root: &Path) -> PathBuf {
-    root.join("l3s-client.json")
+    root.join("settings.json")
 }
 
 #[cfg(test)]

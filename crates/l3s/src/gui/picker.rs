@@ -83,6 +83,13 @@ pub enum PickerEvent {
         /// The create outcome.
         result: Result<(), String>,
     },
+    /// A Home composer launch finished; `machine` owns the project.
+    HomeLaunched {
+        /// The project's machine profile id, or `None` for local.
+        machine: Option<String>,
+        /// A success line, or the error that stopped the launch.
+        result: Result<String, String>,
+    },
 }
 
 /// The Open Workspace picker's state.

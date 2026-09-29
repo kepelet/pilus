@@ -448,6 +448,24 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Spawn a built-in agent, waiting until its pane is ready.
+    ///
+    /// `args` are passed through to the agent's own command line after `--`;
+    /// an empty slice launches with the manifest defaults.
+    pub fn start_agent(&mut self, name: &str, kind: &str, args: &[String]) -> Result<()> {
+        self.request(
+            "agent.start",
+            json!({ "name": name, "kind": kind, "args": args }),
+        )?;
+        Ok(())
+    }
+
+    /// Type `text` into a running agent and submit it as one prompt.
+    pub fn prompt_agent(&mut self, target: &str, text: &str) -> Result<()> {
+        self.request("agent.prompt", json!({ "target": target, "text": text }))?;
+        Ok(())
+    }
+
     /// The current status-bar widgets.
     pub fn bar_widgets(&mut self) -> Result<Vec<BarWidget>> {
         let result = self.request("ui.bar.list", json!({}))?;

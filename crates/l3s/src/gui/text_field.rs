@@ -26,7 +26,24 @@ impl TextField {
 
     /// Insert `text` at the caret, dropping control characters.
     pub fn insert(&mut self, text: &str) {
-        let clean: Vec<char> = text.chars().filter(|ch| !ch.is_control()).collect();
+        self.insert_filtered(text, false);
+    }
+
+    /// Insert `text` at the caret, keeping newlines for a multi-line editor.
+    pub fn insert_multiline(&mut self, text: &str) {
+        self.insert_filtered(text, true);
+    }
+
+    /// Insert a single newline at the caret.
+    pub fn newline(&mut self) {
+        self.insert_multiline("\n");
+    }
+
+    fn insert_filtered(&mut self, text: &str, keep_newlines: bool) {
+        let clean: Vec<char> = text
+            .chars()
+            .filter(|ch| (keep_newlines && *ch == '\n') || !ch.is_control())
+            .collect();
         if clean.is_empty() {
             return;
         }
@@ -85,5 +102,27 @@ impl TextField {
     pub fn clear(&mut self) {
         self.value.clear();
         self.cursor = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_line_insert_drops_newlines() {
+        let mut field = TextField::default();
+        field.insert("a\nb");
+        assert_eq!(field.value, "ab");
+    }
+
+    #[test]
+    fn multiline_insert_keeps_newlines() {
+        let mut field = TextField::default();
+        field.insert_multiline("a\nb");
+        assert_eq!(field.value, "a\nb");
+        assert_eq!(field.cursor, 3);
+        field.newline();
+        assert_eq!(field.value, "a\nb\n");
     }
 }

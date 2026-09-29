@@ -663,6 +663,42 @@ enum PickerPurpose {
     PickProjectDir,
 }
 
+/// Which surface owns the keyboard, in stacking order.
+///
+/// Overlays sit above content; [`L3sView::input_layer`] is the single source of
+/// truth for both key routing and focus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InputLayer {
+    /// The folder picker overlay, above everything.
+    Picker,
+    /// The command palette overlay.
+    Palette,
+    /// The Home composer page.
+    Home,
+    /// The Settings page (projects, machines, updates).
+    Settings,
+    /// The live terminal grid.
+    Terminal,
+}
+
+/// Resolve the keyboard owner from which surfaces are open.
+///
+/// Overlays sit above content, so the picker beats the palette and both beat
+/// the Home composer and Settings page.
+fn top_layer(picker: bool, palette: bool, home: bool, settings: bool) -> InputLayer {
+    if picker {
+        InputLayer::Picker
+    } else if palette {
+        InputLayer::Palette
+    } else if home {
+        InputLayer::Home
+    } else if settings {
+        InputLayer::Settings
+    } else {
+        InputLayer::Terminal
+    }
+}
+
 /// One background repo-resolution answer: git common dirs by workspace.
 type RepoFacts = Vec<((String, String), Option<String>)>;
 
@@ -2340,26 +2376,32 @@ impl L3sView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // The Open Workspace picker owns every keystroke while it is open.
-        if self.picker.is_open() {
-            self.picker_key(event, cx);
-            return;
+        match self.input_layer() {
+            InputLayer::Picker => self.picker_key(event, cx),
+            InputLayer::Palette => self.palette_key(event, window, cx),
+            InputLayer::Home => self.home_key(event, cx),
+            InputLayer::Settings => self.settings_key(event, cx),
+            InputLayer::Terminal => self.terminal_key(event, cx),
         }
-        // The Home composer owns every keystroke while it is open.
-        if self.home.is_open() {
-            self.home_key(event, cx);
-            return;
-        }
-        // The Settings page owns every keystroke while it is open.
-        if self.projects.is_open() {
-            self.settings_key(event, cx);
-            return;
-        }
-        // An open palette owns every keystroke: type, navigate, run, dismiss.
-        if self.palette.is_open() {
-            self.palette_key(event, window, cx);
-            return;
-        }
+    }
+
+    /// The surface that owns the keyboard this frame, in stacking order.
+    ///
+    /// Overlays sit above content: the folder picker over everything, the
+    /// command palette over the Home composer or the Settings page. Key
+    /// routing and focus both read this, so they cannot disagree about who is
+    /// on top.
+    fn input_layer(&self) -> InputLayer {
+        top_layer(
+            self.picker.is_open(),
+            self.palette.is_open(),
+            self.home.is_open(),
+            self.projects.is_open(),
+        )
+    }
+
+    /// Forward a keystroke to the daemon's terminal.
+    fn terminal_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         // Chords the native menu owns: consume them so they never reach the
         // pane as input. The keymap dispatches the matching action.
@@ -3530,22 +3572,38 @@ impl L3sView {
     }
 
     fn sync_focus(&self, window: &mut Window, cx: &mut App) {
-        let target = if self.picker.is_open() && self.picker.editing() {
-            Some(self.picker_path.focus_handle(cx))
-        } else if self.home.is_open() && self.home.focus() == HomeFocus::Prompt {
-            Some(self.home_prompt.focus_handle(cx))
-        } else if self.update_url_editing {
-            Some(self.update_feed_input.focus_handle(cx))
-        } else if self.projects.worktree_target().is_some() {
-            Some(self.worktree_input.focus_handle(cx))
-        } else if self.projects.in_form() {
-            self.projects
-                .focus()
-                .map(|field| self.project_input(field).focus_handle(cx))
-        } else if self.palette.is_open() {
-            Some(self.palette_input.focus_handle(cx))
-        } else {
-            None
+        let target = match self.input_layer() {
+            // The picker owns the keyboard; its path field only while editing,
+            // otherwise the window root so list navigation keeps working.
+            InputLayer::Picker => {
+                if self.picker.editing() {
+                    Some(self.picker_path.focus_handle(cx))
+                } else {
+                    None
+                }
+            }
+            InputLayer::Palette => Some(self.palette_input.focus_handle(cx)),
+            InputLayer::Home => {
+                if self.home.focus() == HomeFocus::Prompt {
+                    Some(self.home_prompt.focus_handle(cx))
+                } else {
+                    None
+                }
+            }
+            InputLayer::Settings => {
+                if self.update_url_editing {
+                    Some(self.update_feed_input.focus_handle(cx))
+                } else if self.projects.worktree_target().is_some() {
+                    Some(self.worktree_input.focus_handle(cx))
+                } else if self.projects.in_form() {
+                    self.projects
+                        .focus()
+                        .map(|field| self.project_input(field).focus_handle(cx))
+                } else {
+                    None
+                }
+            }
+            InputLayer::Terminal => None,
         };
         match target {
             Some(handle) => {
@@ -9158,6 +9216,20 @@ mod tests {
         assert!(frame_reachable(&frame(-650., -450.), display));
         // Gone with the display it was recorded on.
         assert!(!frame_reachable(&frame(2400., 0.), display));
+    }
+
+    #[test]
+    fn overlays_own_the_keyboard_over_content() {
+        // Each content page owns the keyboard on its own...
+        assert_eq!(top_layer(false, false, true, false), InputLayer::Home);
+        assert_eq!(top_layer(false, false, false, true), InputLayer::Settings);
+        // ...but an overlay opened above one takes over.
+        assert_eq!(top_layer(false, true, true, false), InputLayer::Palette);
+        assert_eq!(top_layer(false, true, false, true), InputLayer::Palette);
+        // The folder picker is the topmost overlay.
+        assert_eq!(top_layer(true, true, true, true), InputLayer::Picker);
+        // With nothing open, the grid has it.
+        assert_eq!(top_layer(false, false, false, false), InputLayer::Terminal);
     }
 
     #[test]

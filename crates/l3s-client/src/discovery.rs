@@ -192,7 +192,7 @@ fn alias_for(logical: PathBuf, _namespace: &str, _role: &str) -> PathBuf {
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     // SAFETY: `geteuid` takes no arguments, has no side effects, and is
     // async-signal-safe; it always succeeds.
     unsafe { libc::geteuid() }

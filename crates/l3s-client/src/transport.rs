@@ -10,7 +10,7 @@
 //! SSH client, which closes its pipes and unblocks the reader thread.
 
 use std::io::{BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -46,6 +46,10 @@ pub struct SshTarget {
 impl SshTarget {
     /// The SSH client with its connection options, before any remote command.
     fn base(&self) -> Command {
+        self.base_with_control_path(None)
+    }
+
+    fn base_with_control_path(&self, control_path: Option<&Path>) -> Command {
         let mut command = Command::new(ssh_binary());
         command
             .arg("-T")
@@ -56,8 +60,17 @@ impl SshTarget {
             .arg("-o")
             .arg("ServerAliveInterval=15")
             .arg("-o")
-            .arg("ServerAliveCountMax=3")
-            .arg(&self.destination);
+            .arg("ServerAliveCountMax=3");
+        if let Some(control_path) = control_path {
+            command
+                .arg("-o")
+                .arg("ControlMaster=auto")
+                .arg("-o")
+                .arg(format!("ControlPath={}/cm-%C", control_path.display()))
+                .arg("-o")
+                .arg("ControlPersist=60");
+        }
+        command.arg(&self.destination);
         command
     }
 
@@ -68,12 +81,29 @@ impl SshTarget {
     /// and keepalives so a dead link is noticed.
     pub fn command(&self, tail: &[&str]) -> Command {
         let mut command = self.base();
+        self.append_remote_command(&mut command, tail);
+        command
+    }
+
+    /// Build a multiplexed SSH invocation for short-lived control requests.
+    ///
+    /// The render bridge uses [`Self::command`] so it cannot share a master
+    /// process with independent control requests.
+    pub fn multiplexed_command(&self, tail: &[&str]) -> Command {
+        let Some(control_path) = control_dir() else {
+            return self.command(tail);
+        };
+        let mut command = self.base_with_control_path(Some(&control_path));
+        self.append_remote_command(&mut command, tail);
+        command
+    }
+
+    fn append_remote_command(&self, command: &mut Command, tail: &[&str]) {
         command.arg(&self.binary);
         if let Some(session) = self.session.as_deref().filter(|name| !name.is_empty()) {
             command.arg("--session").arg(session);
         }
         command.args(tail);
-        command
     }
 
     /// Build an SSH invocation that runs one shell command on the host.
@@ -86,6 +116,55 @@ impl SshTarget {
         command.arg(remote_command);
         command
     }
+
+    /// Ask OpenSSH to close the shared master without blocking the caller.
+    pub fn release_control_master(&self) {
+        let destination = self.destination.clone();
+        std::thread::spawn(move || {
+            let Some(control_path) = control_dir() else {
+                return;
+            };
+            let _ = Command::new(ssh_binary())
+                .arg("-o")
+                .arg(format!("ControlPath={}/cm-%C", control_path.display()))
+                .arg("-O")
+                .arg("exit")
+                .arg(destination)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        });
+    }
+}
+
+#[cfg(unix)]
+fn control_dir() -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let uid = crate::discovery::current_uid();
+    #[cfg(target_os = "macos")]
+    let root = "/private/tmp";
+    #[cfg(not(target_os = "macos"))]
+    let root = "/tmp";
+    let path = PathBuf::from(format!("{root}/l3s-{uid}"));
+    std::fs::create_dir_all(&path).ok()?;
+
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_dir() || metadata.uid() != uid {
+        return None;
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).ok()?;
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    (metadata.file_type().is_dir()
+        && metadata.uid() == uid
+        && metadata.permissions().mode() & 0o077 == 0)
+        .then_some(path)
+}
+
+#[cfg(not(unix))]
+fn control_dir() -> Option<PathBuf> {
+    None
 }
 
 /// A connected client stream.
@@ -341,6 +420,60 @@ mod tests {
         // Destination and binary precede the remote subcommand.
         assert_eq!(args[args.len() - 3], "dev@buildbox");
         assert_eq!(args[args.len() - 2], "/home/dev/.local/bin/luvus");
+        assert!(!args.iter().any(|arg| arg.contains("ControlMaster")));
+    }
+
+    #[test]
+    fn multiplexed_ssh_options_precede_destination_and_remote_command() {
+        let target = SshTarget {
+            destination: "dev@buildbox".to_string(),
+            binary: "/home/dev/.local/bin/luvus".to_string(),
+            session: Some("review".to_string()),
+        };
+        let command = target.multiplexed_command(&["uhp", "proxy"]);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let destination = args
+            .iter()
+            .position(|arg| arg == "dev@buildbox")
+            .expect("destination");
+        assert!(
+            args[..destination]
+                .windows(2)
+                .any(|pair| { pair == ["-o", "ControlMaster=auto"] })
+        );
+        assert!(
+            args[..destination]
+                .windows(2)
+                .any(|pair| pair[0] == "-o" && pair[1].starts_with("ControlPath="))
+        );
+        assert!(
+            args[..destination]
+                .windows(2)
+                .any(|pair| pair == ["-o", "ControlPersist=60"])
+        );
+        assert_eq!(
+            &args[destination + 1..],
+            &[
+                "/home/dev/.local/bin/luvus",
+                "--session",
+                "review",
+                "uhp",
+                "proxy"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_directory_has_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = control_dir().expect("private control directory");
+        let metadata = std::fs::metadata(path).expect("control directory metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     }
 
     #[test]

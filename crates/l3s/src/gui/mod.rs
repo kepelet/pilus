@@ -769,7 +769,8 @@ struct Endpoint {
     bar_widgets: Vec<BarWidget>,
     automations: AutomationSummary,
     tasks: TaskSummary,
-    /// Agents-only feed, so a hidden endpoint still lists its agents.
+    /// Hidden-endpoint feed: keeps its agents listed and caches the chrome
+    /// a later switch swaps in.
     feed: AgentFeed,
 }
 
@@ -946,6 +947,9 @@ struct L3sView {
     tab_sel: Option<u16>,
     /// When the optimistic tab pick was made, so stale picks age out.
     tab_sel_at: Instant,
+    /// Optimistic endpoint pick from a click, until the handoff commits or
+    /// every stage of the switch has ended.
+    endpoint_sel: Option<EndpointId>,
     /// Optimistic focused agent (endpoint, pane), until `agent.list` confirms.
     agent_sel: Option<(EndpointId, String)>,
     /// When the optimistic agent pick was made, so stale picks age out.
@@ -1268,6 +1272,7 @@ impl L3sView {
             nav_sel_at: Instant::now(),
             tab_sel: None,
             tab_sel_at: Instant::now(),
+            endpoint_sel: None,
             agent_sel: None,
             agent_sel_at: Instant::now(),
             sidebar_layout: None,
@@ -1414,13 +1419,26 @@ impl L3sView {
         if tabs_changed {
             self.reconcile_nav();
         }
+        // Drop the optimistic endpoint pick once the handoff commits (the
+        // committed highlight needs no pick) or every stage of the switch has
+        // ended without one (the highlight must revert to the real surface).
+        if let Some(selected) = self.endpoint_sel.clone()
+            && (selected == self.active || !self.switch_in_flight(&selected))
+        {
+            self.endpoint_sel = None;
+            if selected != self.active {
+                changed = true;
+            }
+        }
         // Drop the optimistic tab pick once `tab.list` agrees or it goes stale.
+        // The window covers a remote click's two SSH round trips (command,
+        // then the refresh that reads it back) with headroom for a slow link.
         if let Some(selected) = self.tab_sel {
             let confirmed = self
                 .tabs
                 .iter()
                 .any(|tab| tab.active && tab.index == selected);
-            if confirmed || self.tab_sel_at.elapsed() > Duration::from_secs(2) {
+            if confirmed || self.tab_sel_at.elapsed() > Duration::from_secs(4) {
                 self.tab_sel = None;
             }
         }
@@ -1431,7 +1449,7 @@ impl L3sView {
                     .agents
                     .iter()
                     .any(|agent| agent.pane == pane && agent.focused);
-            if confirmed || self.agent_sel_at.elapsed() > Duration::from_secs(2) {
+            if confirmed || self.agent_sel_at.elapsed() > Duration::from_secs(4) {
                 self.agent_sel = None;
             }
         }
@@ -1776,12 +1794,17 @@ impl L3sView {
                 }
             }
             // A hidden endpoint keeps its agent list fresh through its own
-            // agents-only feed; the rest of its chrome waits for activation.
+            // feed, and caches the tabs and bar a later switch will swap in,
+            // so committing a handoff never lands on a stale or empty strip.
+            // The cached chrome draws nowhere while hidden, so only an agent
+            // change costs a repaint.
             while let Some(update) = endpoint.feed.try_recv() {
                 if update.agents != endpoint.agents {
                     endpoint.agents = update.agents;
                     changed = true;
                 }
+                endpoint.tabs = update.tabs;
+                endpoint.bar_widgets = update.bar;
             }
             if disconnected.is_some() {
                 dropped.push(id.clone());
@@ -1882,7 +1905,19 @@ impl L3sView {
                     });
                     entry.failures = entry.failures.saturating_add(1);
                     entry.next_at = Instant::now() + reconnect_delay(entry.failures);
-                    self.status = if entry.failures >= RECONNECT_ATTEMPTS {
+                    // A paused machine will not produce the bridge a click is
+                    // waiting on; drop the request so the optimistic row
+                    // highlight does not stick on a host nobody is dialing.
+                    let paused = entry.failures >= RECONNECT_ATTEMPTS;
+                    if paused
+                        && self
+                            .wanted
+                            .as_ref()
+                            .is_some_and(|wanted| wanted.id.machine_id() == Some(id.as_str()))
+                    {
+                        self.wanted = None;
+                    }
+                    self.status = if paused {
                         format!("{id}: {error} (automatic retries paused)")
                     } else {
                         format!("{id}: {error}")
@@ -1944,13 +1979,14 @@ impl L3sView {
         self.switch_ticket = self.switch_ticket.wrapping_add(1);
         let ticket = self.switch_ticket;
         self.pending_switch = Some(PendingSwitch {
-            target,
+            target: target.clone(),
             focus,
             pane,
             ticket,
             prepared: false,
             started: Instant::now(),
         });
+        self.status = format!("switching to {}…", self.endpoint_label(&target));
     }
 
     /// Drop a pending handoff, returning its endpoint to a suspended state.
@@ -1961,6 +1997,11 @@ impl L3sView {
         if let Some(endpoint) = self.endpoints.get(&pending.target) {
             let _ = endpoint.connection.set_interest(SurfaceInterest::Suspended);
         }
+        // The visible surface keeps the window, so its session name is the
+        // honest status again; the "switching…" hint belongs to the handoff
+        // that just died. A superseding `begin_switch` or the timeout report
+        // overwrites this immediately.
+        self.status = self.connection.identity().session.clone();
     }
 
     /// Give up on a handoff whose target never produced a frame.
@@ -1973,13 +2014,17 @@ impl L3sView {
         if !expired {
             return;
         }
-        // A prepared-but-uncommitted frame still lets the handoff succeed; a
-        // target that never prepared is reported and cancelled.
-        if self
+        // A stalled handoff still commits when the target holds a frame —
+        // even a stale one keeps the window usable and refreshes once
+        // streaming resumes. A target with no frame at all is reported and
+        // cancelled: committing would blank a usable surface, and a failed or
+        // timed-out destination must not replace the current one.
+        let holds_frame = self
             .pending_switch
             .as_ref()
-            .is_some_and(|pending| pending.prepared)
-        {
+            .and_then(|pending| self.endpoints.get(&pending.target))
+            .is_some_and(|endpoint| endpoint.surface.frame().is_some());
+        if holds_frame {
             self.finish_switch();
             return;
         }
@@ -2004,8 +2049,8 @@ impl L3sView {
         }
         // The outgoing endpoint stops streaming but keeps its panes and size.
         let _ = self.connection.set_interest(SurfaceInterest::Suspended);
-        // Give the outgoing endpoint an agents-only feed so its agents stay in
-        // the list while it is hidden.
+        // Give the outgoing endpoint a hidden-endpoint feed so its agents
+        // stay in the list, and its cached chrome stays current, while hidden.
         let outgoing_feed = self.spawn_agents_feed(self.active_machine.as_ref());
 
         let Some(endpoint) = self.endpoints.remove(&target) else {
@@ -2021,9 +2066,9 @@ impl L3sView {
             bar_widgets,
             automations,
             tasks,
-            // The incoming agents-only feed is superseded by the full feed
-            // spawned below; the agent snapshot it already produced is moved
-            // into the active slots, so the list never flickers.
+            // The incoming hidden-endpoint feed is superseded by the full
+            // feed spawned below; the snapshots it already produced are moved
+            // into the active slots, so neither list nor tabs ever flicker.
             feed: _incoming_feed,
         } = endpoint;
         let outgoing_id = std::mem::replace(&mut self.active, target.clone());
@@ -2059,7 +2104,11 @@ impl L3sView {
         self.dragging = false;
         self.nav_sel = None;
         self.tab_sel = None;
+        self.endpoint_sel = None;
         self.close_picker();
+        // The swapped-in tabs carry their own active kind; follow it so the
+        // nav rows highlight the surface that just took the window.
+        self.reconcile_nav();
         self.active_live = true;
         self.status = self.connection.identity().session.clone();
         if let Some(workspace) = pending.focus {
@@ -2081,6 +2130,9 @@ impl L3sView {
         pane: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        // The row picks optimistically: the highlight reads the click now,
+        // while the handoff itself may still be crossing SSH.
+        self.endpoint_sel = Some(id.clone());
         if id == self.active {
             // Re-selecting the visible endpoint abandons any pending handoff.
             self.cancel_pending_switch();
@@ -2125,6 +2177,7 @@ impl L3sView {
             self.status = format!("unknown machine `{machine_id}`");
             return;
         };
+        self.status = format!("connecting to {}…", machine.display());
         // A manual click always retries and resets the backoff budget, even
         // after automatic attempts paused.
         self.reconnects.remove(&machine.id);
@@ -2309,6 +2362,32 @@ impl L3sView {
         ids
     }
 
+    /// Whether any stage of a switch to `endpoint` is still in flight: a
+    /// pending handoff, a bridge still connecting, or a requested endpoint
+    /// waiting for its bridge. The optimistic row highlight reads this, and
+    /// the poll loop drops the pick when every stage has ended.
+    fn switch_in_flight(&self, endpoint: &EndpointId) -> bool {
+        self.pending_switch
+            .as_ref()
+            .is_some_and(|pending| &pending.target == endpoint)
+            || self
+                .wanted
+                .as_ref()
+                .is_some_and(|wanted| &wanted.id == endpoint)
+            || self.connecting.contains(endpoint)
+    }
+
+    /// Whether an endpoint's rows draw as selected: an optimistic pick from
+    /// a click wins while the switch is in flight, then the committed surface.
+    /// Exactly one endpoint's rows light, so a click reads instantly even
+    /// while the two-phase handoff is still crossing SSH.
+    fn endpoint_selected(&self, endpoint: &EndpointId) -> bool {
+        match &self.endpoint_sel {
+            Some(selected) if self.switch_in_flight(selected) => selected == endpoint,
+            _ => *endpoint == self.active,
+        }
+    }
+
     /// A feed for the active endpoint: local socket or, for a machine, its
     /// remote UHP surface over the same SSH bridge family.
     fn spawn_feed_for_active(&self) -> AgentFeed {
@@ -2321,7 +2400,8 @@ impl L3sView {
         }
     }
 
-    /// An agents-only feed for a hidden endpoint, so its agents still list.
+    /// A hidden endpoint's feed, so its agents still list and the chrome a
+    /// later switch swaps in stays current.
     fn spawn_agents_feed(&self, machine: Option<&MachineInfo>) -> AgentFeed {
         match machine.and_then(MachineInfo::ssh_target) {
             Some(target) => AgentFeed::spawn_ssh_agents(target),
@@ -2329,7 +2409,7 @@ impl L3sView {
         }
     }
 
-    /// The agents-only feed for one machine.
+    /// The hidden-endpoint feed for one machine.
     fn agents_feed_for(&self, machine: &MachineInfo) -> AgentFeed {
         self.spawn_agents_feed(Some(machine))
     }
@@ -2739,14 +2819,15 @@ impl L3sView {
         }
     }
 
-    /// Whether an agent row draws as the focused pane.
+    /// Whether an agent row draws as the focused pane: an optimistic click
+    /// wins across a slow link, then the daemon's own focus.
     fn agent_focused(&self, endpoint: &EndpointId, agent: &Agent) -> bool {
         if let Some((selected, pane)) = &self.agent_sel
-            && self.agent_sel_at.elapsed() < Duration::from_secs(2)
+            && self.agent_sel_at.elapsed() < Duration::from_secs(4)
         {
             return selected == endpoint && *pane == agent.pane;
         }
-        *endpoint == self.active && agent.focused
+        self.endpoint_selected(endpoint) && agent.focused
     }
 
     /// Focus a workspace by id, switching the daemon's active workspace.
@@ -5909,6 +5990,7 @@ impl L3sView {
                 self.bar_widgets = Vec::new();
                 self.tabs = Vec::new();
                 self.tab_sel = None;
+                self.endpoint_sel = None;
                 self.agent_sel = None;
                 self.close_picker();
                 self.agents = Vec::new();
@@ -6609,10 +6691,11 @@ impl L3sView {
     }
 
     /// Whether a tab draws as active: an optimistic click wins briefly, then
-    /// the daemon's own active flag.
+    /// the daemon's own active flag. The window spans a remote click's SSH
+    /// round trips; a local one confirms long inside it.
     fn tab_active(&self, tab: &Tab) -> bool {
         match self.tab_sel {
-            Some(selected) if self.tab_sel_at.elapsed() < Duration::from_secs(2) => {
+            Some(selected) if self.tab_sel_at.elapsed() < Duration::from_secs(4) => {
                 tab.index == selected
             }
             _ => tab.active,
@@ -7277,7 +7360,7 @@ impl L3sView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
-        let active = *endpoint == self.active && workspace.active;
+        let active = self.endpoint_selected(endpoint) && workspace.active;
         let remote = endpoint.machine_id().is_some();
         let bg = if active { theme.panel } else { theme.window_bg };
         let cwd = shorten_home(&workspace.cwd);
@@ -8368,12 +8451,21 @@ impl L3sView {
         self.cols = cols;
         self.rows = rows;
         self.sent_cell = cell;
-        let _ = self.connection.send(ClientMessage::Resize {
+        let resize = ClientMessage::Resize {
             cols,
             rows,
             cell_width_px: cell.0,
             cell_height_px: cell.1,
-        });
+        };
+        let _ = self.connection.send(resize.clone());
+        // Suspended endpoints keep their panes and PTY sizes, so a window
+        // resized while they are hidden would leave them reflowing content
+        // the moment they are switched to. Push the new size down every
+        // bridge; the prepare handoff then renders a candidate that already
+        // matches, and committing it never visibly resizes the terminal.
+        for endpoint in self.endpoints.values() {
+            let _ = endpoint.connection.send(resize.clone());
+        }
     }
 }
 

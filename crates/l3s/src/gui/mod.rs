@@ -798,7 +798,7 @@ struct EndpointRequest {
     pane: Option<String>,
 }
 
-/// A background machine connection's outcome.
+/// A background endpoint connection's outcome.
 enum MachineConnect {
     Connected {
         machine: MachineInfo,
@@ -808,9 +808,17 @@ enum MachineConnect {
         id: String,
         error: String,
     },
+    /// The owner-local daemon answered again after its link dropped.
+    LocalConnected {
+        connection: Connection,
+    },
+    /// The owner-local daemon could not be reached or restarted.
+    LocalFailed {
+        error: String,
+    },
 }
 
-/// Automatic reconnect state for one machine, with bounded backoff.
+/// Automatic reconnect state for one endpoint, with capped backoff.
 struct Reconnect {
     /// Consecutive failed connection attempts since the last healthy link.
     failures: u32,
@@ -822,7 +830,8 @@ struct Reconnect {
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
 /// Ceiling for the exponential backoff.
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
-/// Consecutive failures before automatic attempts pause for a manual retry.
+/// Consecutive failures after which the status line says the endpoint is
+/// still being retried rather than merely erroring.
 const RECONNECT_ATTEMPTS: u32 = 3;
 
 struct L3sView {
@@ -992,8 +1001,10 @@ struct L3sView {
     /// Enabled machines auto-connected once this lifetime, so a slow catalog
     /// poll never restarts a bridge or retries a host that already failed.
     auto_connected: HashSet<String>,
-    /// Automatic reconnect state per machine id, with bounded backoff.
+    /// Automatic reconnect state per machine id, with capped backoff.
     reconnects: HashMap<String, Reconnect>,
+    /// Automatic reconnect state for the owner-local daemon.
+    local_reconnect: Option<Reconnect>,
     /// Whether the active connection is still alive; a dropped machine
     /// endpoint is replaced in place when its reconnect succeeds.
     active_live: bool,
@@ -1295,6 +1306,7 @@ impl L3sView {
             machine_connect_tx,
             auto_connected: HashSet::new(),
             reconnects: HashMap::new(),
+            local_reconnect: None,
             active_live: true,
             catalog_dirty: false,
             updater: updater.clone(),
@@ -1530,6 +1542,16 @@ impl L3sView {
                     .collect();
                 self.auto_connected.retain(|id| enabled.contains(id));
                 self.reconnects.retain(|id, _| enabled.contains(id));
+                // A host that answers its probe again can retry at once instead
+                // of waiting out the backoff its last failure earned.
+                for machine in self.machines.iter().filter(|m| m.online == Some(true)) {
+                    if let Some(entry) = self.reconnects.get_mut(&machine.id)
+                        && entry.failures > 0
+                    {
+                        entry.failures = 0;
+                        entry.next_at = Instant::now();
+                    }
+                }
                 self.auto_connect_machines();
                 changed = true;
             }
@@ -1718,9 +1740,12 @@ impl L3sView {
                     self.active_live = false;
                     // The remote feed is its own SSH bridge; stop it while the
                     // render bridge is down, and queue a backoff reconnect.
+                    // Local reconnects restart the daemon; a machine reconnects
+                    // start a fresh SSH bridge.
                     self.agent_feed = None;
-                    if let Some(machine) = self.active_machine.clone() {
-                        self.schedule_reconnect(machine);
+                    match self.active_machine.clone() {
+                        Some(machine) => self.schedule_reconnect(machine),
+                        None => self.schedule_local_reconnect(),
                     }
                     changed = true;
                 }
@@ -1811,26 +1836,30 @@ impl L3sView {
                 changed = true;
             }
         }
-        // A dropped suspended machine is torn down and reconnected from
-        // scratch; its surface closes with its SSH bridge.
+        // A dropped suspended endpoint is torn down and reconnected from
+        // scratch; its surface closes with its bridge. Local reconnects
+        // restart the daemon, so a stopped server recovers on its own.
         for id in dropped {
-            if let EndpointId::Machine(machine_id) = &id {
-                self.endpoints.remove(&id);
-                if self
-                    .pending_switch
-                    .as_ref()
-                    .is_some_and(|pending| pending.target == id)
-                {
-                    self.pending_switch = None;
+            self.endpoints.remove(&id);
+            if self
+                .pending_switch
+                .as_ref()
+                .is_some_and(|pending| pending.target == id)
+            {
+                self.pending_switch = None;
+            }
+            match &id {
+                EndpointId::Machine(machine_id) => {
+                    if let Some(machine) = self
+                        .machines
+                        .iter()
+                        .find(|machine| &machine.id == machine_id)
+                        .cloned()
+                    {
+                        self.schedule_reconnect(machine);
+                    }
                 }
-                if let Some(machine) = self
-                    .machines
-                    .iter()
-                    .find(|machine| &machine.id == machine_id)
-                    .cloned()
-                {
-                    self.schedule_reconnect(machine);
-                }
+                EndpointId::Local => self.schedule_local_reconnect(),
             }
         }
         self.catalog_dirty |= catalog;
@@ -1852,7 +1881,12 @@ impl L3sView {
                     connection,
                 } => {
                     let id = EndpointId::Machine(machine.id.clone());
-                    self.connecting.remove(&id);
+                    // A session switch empties `connecting`; a result for a
+                    // target no longer being dialed is stale and must not
+                    // install a bridge from the previous session.
+                    if !self.connecting.remove(&id) {
+                        continue;
+                    }
                     self.reconnects.remove(&machine.id);
                     // A reconnect of the machine already on screen swaps its
                     // connection in place; the stale surface stays until the
@@ -1869,59 +1903,56 @@ impl L3sView {
                         }
                         continue;
                     }
-                    let _ = connection.request_workspace_dock();
-                    let _ = connection.set_interest(SurfaceInterest::Suspended);
-                    let _ = connection.send(ClientMessage::Resize {
-                        cols: self.cols,
-                        rows: self.rows,
-                        cell_width_px: self.sent_cell.0,
-                        cell_height_px: self.sent_cell.1,
-                    });
-                    let feed = self.agents_feed_for(&machine);
-                    self.endpoints.insert(
-                        id,
-                        Endpoint {
-                            machine: Some(machine),
-                            connection,
-                            surface: Surface::new(),
-                            status: "connecting…".to_string(),
-                            tabs: Vec::new(),
-                            agents: Vec::new(),
-                            bar_widgets: Vec::new(),
-                            automations: AutomationSummary::default(),
-                            tasks: TaskSummary::default(),
-                            feed,
-                        },
-                    );
+                    self.install_suspended_endpoint(id, Some(machine), connection);
+                    changed = true;
+                }
+                MachineConnect::LocalConnected { connection } => {
+                    if !self.connecting.remove(&EndpointId::Local) {
+                        continue;
+                    }
+                    self.local_reconnect = None;
+                    if self.active == EndpointId::Local {
+                        self.replace_active_local(connection);
+                    } else {
+                        self.install_suspended_endpoint(EndpointId::Local, None, connection);
+                    }
                     changed = true;
                 }
                 MachineConnect::Failed { id, error } => {
-                    self.connecting.remove(&EndpointId::Machine(id.clone()));
-                    // Count the failure and arm the next backoff attempt; a
-                    // healthy link resets the budget on success.
+                    if !self.connecting.remove(&EndpointId::Machine(id.clone())) {
+                        continue;
+                    }
+                    // Count the failure and arm the next capped-backoff attempt;
+                    // a healthy link or a fresh probe resets the budget.
                     let entry = self.reconnects.entry(id.clone()).or_insert(Reconnect {
                         failures: 0,
                         next_at: Instant::now(),
                     });
                     entry.failures = entry.failures.saturating_add(1);
                     entry.next_at = Instant::now() + reconnect_delay(entry.failures);
-                    // A paused machine will not produce the bridge a click is
-                    // waiting on; drop the request so the optimistic row
-                    // highlight does not stick on a host nobody is dialing.
-                    let paused = entry.failures >= RECONNECT_ATTEMPTS;
-                    if paused
-                        && self
-                            .wanted
-                            .as_ref()
-                            .is_some_and(|wanted| wanted.id.machine_id() == Some(id.as_str()))
-                    {
-                        self.wanted = None;
-                    }
-                    self.status = if paused {
-                        format!("{id}: {error} (automatic retries paused)")
+                    self.status = if entry.failures >= RECONNECT_ATTEMPTS {
+                        format!("{id}: {error} (still retrying)")
                     } else {
                         format!("{id}: {error}")
                     };
+                    changed = true;
+                }
+                MachineConnect::LocalFailed { error } => {
+                    if !self.connecting.remove(&EndpointId::Local) {
+                        continue;
+                    }
+                    let entry = self.local_reconnect.get_or_insert(Reconnect {
+                        failures: 0,
+                        next_at: Instant::now(),
+                    });
+                    entry.failures = entry.failures.saturating_add(1);
+                    entry.next_at = Instant::now() + reconnect_delay(entry.failures);
+                    // Only the visible endpoint owns the status line; a
+                    // suspended local endpoint retries quietly.
+                    if self.active == EndpointId::Local {
+                        self.active_live = false;
+                        self.status = format!("local server unavailable: {error}");
+                    }
                     changed = true;
                 }
             }
@@ -2139,9 +2170,15 @@ impl L3sView {
             // A dropped active machine reconnects on demand; a healthy one
             // just focuses the requested workspace or pane.
             if !self.active_live {
-                if let Some(machine) = self.active_machine.clone() {
-                    self.reconnects.remove(&machine.id);
-                    self.spawn_machine_connect(machine);
+                match self.active_machine.clone() {
+                    Some(machine) => {
+                        self.reconnects.remove(&machine.id);
+                        self.spawn_machine_connect(machine);
+                    }
+                    None => {
+                        self.local_reconnect = None;
+                        self.spawn_local_connect();
+                    }
                 }
                 cx.notify();
                 return;
@@ -2157,6 +2194,16 @@ impl L3sView {
         }
         if self.endpoints.contains_key(&id) {
             self.begin_switch(id, focus, pane);
+            cx.notify();
+            return;
+        }
+        if id == EndpointId::Local {
+            // The local daemon is raised on demand, so a missing local
+            // endpoint is a request to reconnect rather than an unknown host.
+            self.wanted = Some(EndpointRequest { id, focus, pane });
+            self.local_reconnect = None;
+            self.status = "connecting to local…".to_string();
+            self.spawn_local_connect();
             cx.notify();
             return;
         }
@@ -2212,6 +2259,29 @@ impl L3sView {
         });
     }
 
+    /// Start a background attach for the owner-local daemon.
+    ///
+    /// Unlike a machine bridge this may start the daemon (`ensure_server`), so
+    /// it runs off the GUI thread like every other handshake and reports back
+    /// through the same channel.
+    fn spawn_local_connect(&mut self) {
+        if !self.connecting.insert(EndpointId::Local) {
+            return;
+        }
+        let target = self.target.clone();
+        let (cols, rows) = (self.cols, self.rows);
+        let tx = self.machine_connect_tx.clone();
+        std::thread::spawn(move || {
+            let result = match l3s_client::connect(&target, cols, rows) {
+                Ok(connection) => MachineConnect::LocalConnected { connection },
+                Err(error) => MachineConnect::LocalFailed {
+                    error: error.to_string(),
+                },
+            };
+            tx.send(result).ok();
+        });
+    }
+
     /// Whether `machine_id` already has a bridge, is connecting, or is active.
     fn machine_connected(&self, machine_id: &str) -> bool {
         self.active_machine
@@ -2248,7 +2318,7 @@ impl L3sView {
         }
     }
 
-    /// Arm bounded-backoff reconnect after a bridge drops.
+    /// Arm capped-backoff reconnect after a machine bridge drops.
     fn schedule_reconnect(&mut self, machine: MachineInfo) {
         let entry = self
             .reconnects
@@ -2257,22 +2327,40 @@ impl L3sView {
                 failures: 0,
                 next_at: Instant::now(),
             });
-        if entry.failures >= RECONNECT_ATTEMPTS {
-            return;
-        }
         entry.next_at = Instant::now() + reconnect_delay(entry.failures);
     }
 
-    /// Start the automatic attempts whose backoff has elapsed.
+    /// Arm capped-backoff reconnect after the owner-local daemon drops.
+    fn schedule_local_reconnect(&mut self) {
+        let entry = self.local_reconnect.get_or_insert(Reconnect {
+            failures: 0,
+            next_at: Instant::now(),
+        });
+        entry.next_at = Instant::now() + reconnect_delay(entry.failures);
+    }
+
+    /// Start the automatic attempts whose backoff has elapsed, local first.
     ///
-    /// Bounded and parallel like the first connection: one attempt per due
-    /// machine, no busy loop, and attempts stop after [`RECONNECT_ATTEMPTS`]
-    /// until a manual click resets the budget.
+    /// One attempt per due endpoint and none while one is in flight, so a slow
+    /// handshake is never restarted and an unreachable host is not hammered.
+    /// Retries continue at the capped backoff until a link sticks; a host that
+    /// answers its probe again resets the budget so recovery is prompt.
     fn pump_reconnects(&mut self) {
+        let now = Instant::now();
+        let local_due = self
+            .local_reconnect
+            .as_ref()
+            .is_some_and(|entry| now >= entry.next_at)
+            && !self.connecting.contains(&EndpointId::Local);
+        if local_due {
+            if let Some(entry) = self.local_reconnect.as_mut() {
+                entry.next_at = now + reconnect_delay(entry.failures);
+            }
+            self.spawn_local_connect();
+        }
         if self.reconnects.is_empty() {
             return;
         }
-        let now = Instant::now();
         let in_flight: HashSet<String> = self
             .connecting
             .iter()
@@ -2281,11 +2369,7 @@ impl L3sView {
         let due: Vec<String> = self
             .reconnects
             .iter()
-            .filter(|(id, entry)| {
-                entry.failures < RECONNECT_ATTEMPTS
-                    && now >= entry.next_at
-                    && !in_flight.contains(*id)
-            })
+            .filter(|(id, entry)| now >= entry.next_at && !in_flight.contains(*id))
             .map(|(id, _)| id.clone())
             .collect();
         for id in due {
@@ -2315,6 +2399,62 @@ impl L3sView {
         self.active_machine = Some(machine);
         self.endpoints
             .remove(&EndpointId::Machine(machine_id.clone()));
+        let _ = self.connection.request_workspace_dock();
+        let _ = self.connection.set_interest(SurfaceInterest::Active);
+        let _ = self.connection.send(ClientMessage::Resize {
+            cols: self.cols,
+            rows: self.rows,
+            cell_width_px: self.sent_cell.0,
+            cell_height_px: self.sent_cell.1,
+        });
+        self.push_sidebar_layout();
+        self.agent_feed = Some(self.spawn_feed_for_active());
+        self.status = "reconnected".to_string();
+    }
+
+    /// Install a freshly connected endpoint that is not taking the window.
+    ///
+    /// The endpoint is suspended: it owns its panes and PTY size but streams
+    /// no frames until a handoff makes it active.
+    fn install_suspended_endpoint(
+        &mut self,
+        id: EndpointId,
+        machine: Option<MachineInfo>,
+        connection: Connection,
+    ) {
+        let _ = connection.request_workspace_dock();
+        let _ = connection.set_interest(SurfaceInterest::Suspended);
+        let _ = connection.send(ClientMessage::Resize {
+            cols: self.cols,
+            rows: self.rows,
+            cell_width_px: self.sent_cell.0,
+            cell_height_px: self.sent_cell.1,
+        });
+        let feed = self.spawn_agents_feed(machine.as_ref());
+        self.endpoints.insert(
+            id,
+            Endpoint {
+                machine,
+                connection,
+                surface: Surface::new(),
+                status: "connecting…".to_string(),
+                tabs: Vec::new(),
+                agents: Vec::new(),
+                bar_widgets: Vec::new(),
+                automations: AutomationSummary::default(),
+                tasks: TaskSummary::default(),
+                feed,
+            },
+        );
+    }
+
+    /// Swap a reconnected local bridge into the active slots without a handoff.
+    fn replace_active_local(&mut self, connection: Connection) {
+        self.connection = connection;
+        self.active = EndpointId::Local;
+        self.active_machine = None;
+        self.active_live = true;
+        self.endpoints.remove(&EndpointId::Local);
         let _ = self.connection.request_workspace_dock();
         let _ = self.connection.set_interest(SurfaceInterest::Active);
         let _ = self.connection.send(ClientMessage::Resize {
@@ -2407,11 +2547,6 @@ impl L3sView {
             Some(target) => AgentFeed::spawn_ssh_agents(target),
             None => AgentFeed::spawn_agents(self.api_socket()),
         }
-    }
-
-    /// The hidden-endpoint feed for one machine.
-    fn agents_feed_for(&self, machine: &MachineInfo) -> AgentFeed {
-        self.spawn_agents_feed(Some(machine))
     }
 
     /// Rebuild the chrome palette from the selected appearance. A vendored
@@ -6001,6 +6136,7 @@ impl L3sView {
                 self.machines = list_machines(&self.session_root);
                 self.auto_connected.clear();
                 self.reconnects.clear();
+                self.local_reconnect = None;
                 self.active_live = true;
                 self.catalog_dirty = true;
                 self.auto_connect_machines();

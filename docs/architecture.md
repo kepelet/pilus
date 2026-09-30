@@ -220,11 +220,13 @@ Each enabled machine becomes one endpoint:
   whole catalog comes up in parallel; an attempt is recorded, so the slow
   catalog poll never restarts a healthy host, retries a failed one, or probes
   over SSH while every enabled machine is already connected.
-- **Reconnect.** A dropped bridge is retried with bounded exponential backoff
-  and jitter (1 s doubling to a 30 s ceiling), one attempt per machine, and at
-  most three consecutive failures before the row shows `attention` and
-  automatic attempts pause. Clicking the machine resumes immediately and
-  resets the budget; the active machine's replacement bridge is swapped in
+- **Reconnect.** A dropped bridge is retried with capped exponential backoff
+  and jitter (1 s doubling to a 30 s ceiling), one attempt per endpoint and
+  none while one is in flight. Retries continue until a link sticks; a host
+  that answers its probe again has its backoff budget reset so recovery is
+  prompt. The owner-local daemon is an endpoint too: a stopped server is
+  re-attached with backoff and `ensure_server` restarts it, so Local recovers
+  on its own. A reconnect of the endpoint already on screen is swapped in
   place, so its surface is never blanked.
 - **Sidebar and manager.** Workspaces across Local and every connected machine
   render as one flat list (a remote row carries a small server glyph and the

@@ -8,8 +8,12 @@
 //! commands, so the GUI never blocks on the socket.
 //!
 //! Refreshes are **event-driven**: the feed holds an `events.subscribe` stream
-//! and re-reads the three snapshots only when a structural event arrives, plus
-//! a slow reconciliation so a missed event cannot leave the chrome stale.
+//! and re-reads the snapshots only when a structural event arrives, plus a
+//! slow reconciliation so a missed event cannot leave the chrome stale.
+//! Commands run on their own thread and poke the reconcile thread when they
+//! land, so a click is never queued behind an in-flight refresh — a remote
+//! refresh is a full SSH round trip, and a click waiting behind one reads as
+//! an unresponsive tab strip.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, select, tick, unbounded};
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
@@ -629,12 +633,13 @@ pub struct AgentFeed {
 pub enum FeedScope {
     /// Agents, bar, tabs, automations, and tasks: the visible surface.
     Full,
-    /// Agents only: a connected endpoint that is not on screen, so its
-    /// workspace rows and agent list stay fresh without the full refresh.
+    /// Agents, bar, and tabs: a connected endpoint that is not on screen, so
+    /// its agent list stays fresh and a later switch lands on current chrome
+    /// instead of a stale or empty strip.
     Agents,
 }
 
-/// How long the feed waits for a command before reconciling on its own.
+/// Reconciliation cadence for a full local feed, driven by events.
 ///
 /// Events drive normal updates; this only covers state a structural event does
 /// not describe (the status bar's mode, for one) and any missed event.
@@ -644,7 +649,7 @@ const RECONCILE: Duration = Duration::from_secs(10);
 /// cannot wait ten seconds for a change to surface.
 const RECONCILE_REMOTE: Duration = Duration::from_secs(5);
 
-/// Reconciliation cadence for an agents-only feed behind a hidden endpoint.
+/// Reconciliation cadence for a hidden local endpoint's feed.
 const RECONCILE_AGENTS: Duration = Duration::from_secs(3);
 
 /// How long to wait before resubscribing after the event stream ends.
@@ -665,45 +670,55 @@ impl AgentFeed {
         Self::spawn_transport(ControlTransport::Ssh(target), true, FeedScope::Full)
     }
 
-    /// Start an agents-only feed for a hidden endpoint.
+    /// Start a hidden endpoint's feed: its agents plus the chrome a later
+    /// switch will show, so activating it lands on current state.
     pub fn spawn_agents(socket: PathBuf) -> Self {
         Self::spawn_transport(ControlTransport::Socket(socket), true, FeedScope::Agents)
     }
 
-    /// Start an agents-only feed for a hidden remote machine.
+    /// Start a hidden remote machine's feed.
     pub fn spawn_ssh_agents(target: SshTarget) -> Self {
         Self::spawn_transport(ControlTransport::Ssh(target), true, FeedScope::Agents)
     }
 
     fn spawn_transport(transport: ControlTransport, poll_only: bool, scope: FeedScope) -> Self {
         let (commands, command_rx) = unbounded();
+        let (pokes, pokes_rx) = unbounded::<()>();
         let (update_tx, updates) = unbounded();
         // Shared so a burst of structural events (one tab open emits several)
         // forwards a single snapshot instead of a redraw per event.
         let last: Arc<Mutex<Option<FeedUpdate>>> = Arc::new(Mutex::new(None));
-        let command_updates = update_tx.clone();
-        let command_last = Arc::clone(&last);
-        let command_transport = transport.clone();
-        let interval = match scope {
-            FeedScope::Agents => RECONCILE_AGENTS,
-            FeedScope::Full if poll_only => RECONCILE_REMOTE,
-            FeedScope::Full => RECONCILE,
+        let reconcile_updates = update_tx.clone();
+        let reconcile_last = Arc::clone(&last);
+        let reconcile_transport = transport.clone();
+        let interval = match (&scope, &transport) {
+            // A hidden remote feed reads three snapshots over one SSH child
+            // each, so it earns the slower cadence of the other remote polls.
+            (FeedScope::Agents, ControlTransport::Ssh(_)) => RECONCILE_REMOTE,
+            (FeedScope::Agents, _) => RECONCILE_AGENTS,
+            (FeedScope::Full, _) if poll_only => RECONCILE_REMOTE,
+            (FeedScope::Full, _) => RECONCILE,
         };
         thread::Builder::new()
-            .name("l3s-commands".to_string())
+            .name("l3s-reconcile".to_string())
             .spawn(move || {
-                run_commands(
-                    command_transport,
-                    interval,
+                run_reconcile(
+                    reconcile_transport,
                     scope,
-                    command_rx,
-                    command_updates,
-                    command_last,
+                    interval,
+                    pokes_rx,
+                    reconcile_updates,
+                    reconcile_last,
                 )
             })
             .ok();
-        // Only the full local feed holds an event subscription; an agents-only
-        // feed reconciles on its timer instead.
+        let command_transport = transport.clone();
+        thread::Builder::new()
+            .name("l3s-commands".to_string())
+            .spawn(move || run_commands(command_transport, command_rx, pokes))
+            .ok();
+        // Only the full local feed holds an event subscription; a hidden
+        // endpoint's feed reconciles on its timer instead.
         if scope == FeedScope::Full
             && let ControlTransport::Socket(socket) = transport
         {
@@ -746,12 +761,46 @@ impl AgentFeed {
     }
 }
 
-/// Service one command, then reconcile because a command is a state change.
-fn run_commands(
+/// Service queued commands on their own thread, then poke the reconcile
+/// thread once.
+///
+/// A command must never wait behind an in-flight refresh: a remote refresh
+/// is a full SSH round trip, so a click arriving mid-refresh would look
+/// unresponsive. Draining a queued burst into one reconcile also keeps rapid
+/// tab clicks to a single snapshot read.
+fn run_commands(transport: ControlTransport, commands: Receiver<Command>, pokes: Sender<()>) {
+    while let Ok(command) = commands.recv() {
+        let mut client = ControlClient::from_transport(transport.clone());
+        serve(&mut client, command);
+        // A burst of queued commands shares one reconcile pass.
+        while let Ok(extra) = commands.try_recv() {
+            serve(&mut client, extra);
+        }
+        // A command is a state change; reconcile reads it back.
+        pokes.send(()).ok();
+    }
+}
+
+/// Run one command against `client`, reporting nothing: a failed command is
+/// covered by the reconcile pass that follows it.
+fn serve(client: &mut ControlClient, command: Command) {
+    let _ = match command {
+        Command::FocusPane(pane) => client.focus_pane(&pane),
+        Command::FocusTab(index) => client.focus_tab(index),
+        Command::NewTab => client.new_tab(),
+        Command::CloseTab(index) => client.close_tab(index),
+        Command::Split(direction) => client.split_pane(&direction),
+    };
+}
+
+/// Keep the snapshot fresh: once immediately, then after every poke (a
+/// command just changed state) or tick (a structural event no event stream
+/// described, and any the stream missed).
+fn run_reconcile(
     transport: ControlTransport,
-    interval: Duration,
     scope: FeedScope,
-    commands: Receiver<Command>,
+    interval: Duration,
+    pokes: Receiver<()>,
     updates: Sender<FeedUpdate>,
     last: Arc<Mutex<Option<FeedUpdate>>>,
 ) {
@@ -760,28 +809,18 @@ fn run_commands(
     if !refresh(&transport, scope, &updates, &last) {
         return;
     }
-    let mut client: Option<ControlClient> = None;
+    let ticker = tick(interval);
     loop {
-        match commands.recv_timeout(interval) {
-            Ok(command) => {
-                if client.is_none() {
-                    client = Some(ControlClient::from_transport(transport.clone()));
-                }
-                if let Some(active) = client.as_mut() {
-                    let outcome = match command {
-                        Command::FocusPane(pane) => active.focus_pane(&pane),
-                        Command::FocusTab(index) => active.focus_tab(index),
-                        Command::NewTab => active.new_tab(),
-                        Command::CloseTab(index) => active.close_tab(index),
-                        Command::Split(direction) => active.split_pane(&direction),
-                    };
-                    if outcome.is_err() {
-                        client = None;
-                    }
+        select! {
+            // A dead poke channel means the command thread — and with it the
+            // feed — is gone; exiting here also keeps a disconnected channel
+            // (always ready) from spinning this loop.
+            recv(pokes) -> result => {
+                if result.is_err() {
+                    return;
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            recv(ticker) -> _ => {},
         }
         if !refresh(&transport, scope, &updates, &last) {
             break;
@@ -858,12 +897,21 @@ fn refresh(
 /// snapshot and retries on the next event or reconciliation tick.
 fn fetch_update(transport: &ControlTransport, scope: FeedScope) -> Option<FeedUpdate> {
     if scope == FeedScope::Agents {
-        let agents = ControlClient::from_transport(transport.clone())
-            .agents()
-            .ok()?;
-        return Some(FeedUpdate {
-            agents,
-            ..FeedUpdate::default()
+        // A hidden endpoint caches the chrome the swap will show (tabs, the
+        // status bar) alongside its agents, so switching to it never lands on
+        // a stale or empty strip while its full feed warms up.
+        return thread::scope(|threads| -> Option<FeedUpdate> {
+            let agents =
+                threads.spawn(|| ControlClient::from_transport(transport.clone()).agents());
+            let tabs = threads.spawn(|| ControlClient::from_transport(transport.clone()).tabs());
+            let bar =
+                threads.spawn(|| ControlClient::from_transport(transport.clone()).bar_widgets());
+            Some(FeedUpdate {
+                agents: agents.join().ok()?.ok()?,
+                tabs: tabs.join().ok()?.ok()?,
+                bar: bar.join().ok()?.ok()?,
+                ..FeedUpdate::default()
+            })
         });
     }
     thread::scope(|threads| -> Option<FeedUpdate> {

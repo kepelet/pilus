@@ -64,6 +64,9 @@ pub struct Palette {
     open: bool,
     input: TextField,
     selected: usize,
+    /// Query text the highlight last reset against, so caret-blink repaints
+    /// don't re-home it.
+    reset_query: String,
 }
 
 impl Palette {
@@ -103,11 +106,20 @@ impl Palette {
     pub fn clear(&mut self) {
         self.input.clear();
         self.selected = 0;
+        self.reset_query.clear();
     }
 
-    /// Re-point the highlight at the first row after an edit.
-    pub fn reset_selection(&mut self) {
-        self.selected = 0;
+    /// Re-point the highlight at the first row when the query changed since
+    /// the last call.
+    ///
+    /// The field notifies on every repaint, including the caret blink, so an
+    /// unconditional reset would yank the highlight back to the top while the
+    /// user walks the list with the arrow keys.
+    pub fn refresh_selection(&mut self) {
+        if self.input.value() != self.reset_query {
+            self.reset_query = self.input.value();
+            self.selected = 0;
+        }
     }
 
     /// Move the highlight by `delta`, clamped to `len` rows.
@@ -272,11 +284,24 @@ mod tests {
     }
 
     #[test]
-    fn reset_selection_rehomes_the_highlight() {
-        let mut palette = Palette::default();
+    fn refresh_selection_ignores_repaints_without_an_edit() {
+        let mut palette = seeded("new");
+        palette.refresh_selection();
         palette.move_selection(3, 5);
         assert_eq!(palette.selected(), 3);
-        palette.reset_selection();
+        // A caret-blink repaint notifies the field without changing the query,
+        // so the highlight must stay put.
+        palette.refresh_selection();
+        assert_eq!(palette.selected(), 3);
+    }
+
+    #[test]
+    fn refresh_selection_rehomes_the_highlight_after_an_edit() {
+        let mut palette = seeded("new");
+        palette.refresh_selection();
+        palette.move_selection(3, 5);
+        palette.input.set_value("newt".to_string());
+        palette.refresh_selection();
         assert_eq!(palette.selected(), 0);
     }
 }

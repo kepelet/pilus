@@ -1196,9 +1196,10 @@ impl L3sView {
                 cx,
             )
         });
-        // Every edit re-points the highlight at the best match.
+        // A query edit re-points the highlight at the best match. The field
+        // also notifies on caret blinks, which must not move the selection.
         cx.observe(&palette_input, |this, _, cx| {
-            this.palette.reset_selection();
+            this.palette.refresh_selection();
             cx.notify();
         })
         .detach();

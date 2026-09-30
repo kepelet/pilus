@@ -358,7 +358,7 @@ impl UiPlaygroundView {
         let glyph = picker.icon;
         let active = self.open_picker == Some(index);
         let fg = if active { theme.panel_fg } else { theme.muted };
-        let mut chip = div()
+        let chip = div()
             .id(format!("pg-picker-{index}"))
             .flex()
             .flex_row()
@@ -383,9 +383,6 @@ impl UiPlaygroundView {
                 }
                 cx.notify();
             }));
-        if active {
-            chip = chip.border_1().border_color(terminal_inset_border());
-        }
         chip.child(icon(glyph, 14.0, fg))
             .child(
                 div()

@@ -25,6 +25,8 @@ pub struct Theme {
     pub panel: Rgba,
     /// Dimmed panel for inactive tabs.
     pub panel_dim: Rgba,
+    /// Background of the composer's footer bar.
+    pub composer_footer: Rgba,
     /// Borders and dividers.
     pub border: Rgba,
     /// Accent for the connection indicator and links.
@@ -56,6 +58,7 @@ impl Default for Theme {
             fg: rgb(0xd8dde9),
             panel: rgb(0x1e1e24),
             panel_dim: rgb(0x141419),
+            composer_footer: rgb(0x181818),
             border: rgb(0x26262e),
             accent: rgb(0x7aa2f7),
             branch: rgb(0xbb9af7),
@@ -82,6 +85,7 @@ impl Theme {
             fg: p.text,
             panel: p.surface0,
             panel_dim: p.base,
+            composer_footer: p.surface0,
             border: p.border,
             accent: p.accent,
             branch: p.green,
@@ -107,6 +111,7 @@ impl Theme {
             fg: c(chrome.text, base.fg),
             panel: c(chrome.surface, base.panel), // surface0
             panel_dim: c(chrome.rule, base.panel_dim),
+            composer_footer: c(chrome.surface, base.composer_footer),
             border: c(chrome.border, base.border), // border_focus
             accent: c(chrome.accent, base.accent),
             branch: base.branch,

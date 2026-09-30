@@ -29,6 +29,8 @@ pub struct Updater {
     status: UpdateStatus,
     available: Option<Release>,
     engine: Arc<BoxedEngine>,
+    /// Resolved feed URL, kept so engine errors can name the source.
+    source: String,
     task: Option<Task<()>>,
 }
 
@@ -39,6 +41,7 @@ impl Updater {
             status: UpdateStatus::Idle,
             available: None,
             engine: Arc::new(crate::update::engine(request)),
+            source: request.resolved_feed_url(),
             task: None,
         }
     }
@@ -50,6 +53,7 @@ impl Updater {
     pub fn reconfigure(&mut self, request: &UpdateRequest, cx: &mut Context<Self>) {
         self.task = None;
         self.engine = Arc::new(crate::update::engine(request));
+        self.source = request.resolved_feed_url();
         self.available = None;
         self.set_status(UpdateStatus::Idle, cx);
     }
@@ -90,7 +94,10 @@ impl Updater {
                         this.set_status(UpdateStatus::Available(version), cx);
                     }
                     Ok(None) => this.set_status(UpdateStatus::UpToDate, cx),
-                    Err(error) => this.set_status(UpdateStatus::Errored(error.to_string()), cx),
+                    Err(error) => {
+                        let error = crate::update::error_with_source(&this.source, &error);
+                        this.set_status(UpdateStatus::Errored(error), cx);
+                    }
                 }
             })
             .ok();
@@ -161,7 +168,8 @@ impl Updater {
                 Err(error) => {
                     this.update(cx, |this, cx| {
                         this.task = None;
-                        this.set_status(UpdateStatus::Errored(error.to_string()), cx);
+                        let error = crate::update::error_with_source(&this.source, &error);
+                        this.set_status(UpdateStatus::Errored(error), cx);
                     })
                     .ok();
                     return;
@@ -187,7 +195,10 @@ impl Updater {
                         let version = release.version.clone();
                         this.set_status(UpdateStatus::Staged(version), cx);
                     }
-                    Err(error) => this.set_status(UpdateStatus::Errored(error.to_string()), cx),
+                    Err(error) => {
+                        let error = crate::update::error_with_source(&this.source, &error);
+                        this.set_status(UpdateStatus::Errored(error), cx);
+                    }
                 }
             })
             .ok();

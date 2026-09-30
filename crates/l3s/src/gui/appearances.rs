@@ -27,6 +27,9 @@ const WINDOW_SIZE: (f32, f32) = (640.0, 600.0);
 /// Smallest and largest selectable font size.
 const FONT_SIZE_RANGE: (f32, f32) = (9.0, 32.0);
 
+/// The label for the platform default chrome font, which is stored as `None`.
+const SYSTEM_FONT_LABEL: &str = "System";
+
 /// Which font a control edits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FontField {
@@ -203,7 +206,7 @@ impl AppearancesView {
                 .settings
                 .ui_font
                 .clone()
-                .unwrap_or_else(|| "System".to_string()),
+                .unwrap_or_else(|| SYSTEM_FONT_LABEL.to_string()),
             FontField::Terminal => self.settings.terminal_font.clone(),
         }
     }
@@ -433,8 +436,10 @@ impl AppearancesView {
     fn picker_overlay(&self, field: FontField, window: &Window, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let current = self.family(field);
+        let names = font_options(field, self.families(field));
+
         let mut list = div().flex().flex_col().p_1();
-        for name in self.families(field).iter().cloned() {
+        for name in names {
             let selected = name == current;
             let id = name.clone();
             list = list.child(
@@ -449,7 +454,13 @@ impl AppearancesView {
                     .hover(|style| style.bg(theme.panel))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         match field {
-                            FontField::Ui => this.settings.ui_font = Some(id.clone()),
+                            FontField::Ui => {
+                                this.settings.ui_font = if id == SYSTEM_FONT_LABEL {
+                                    None
+                                } else {
+                                    Some(id.clone())
+                                };
+                            }
                             FontField::Terminal => this.settings.terminal_font = id.clone(),
                         }
                         this.open_picker = None;
@@ -517,6 +528,24 @@ impl AppearancesView {
             )
             .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.stop_propagation()))
     }
+}
+
+/// The family choices offered for `field`.
+///
+/// The UI list leads with the platform default so a custom pick can always be
+/// undone; a real family named "System" is dropped rather than shadowing it.
+fn font_options(field: FontField, families: &[String]) -> Vec<String> {
+    let mut names = Vec::new();
+    if field == FontField::Ui {
+        names.push(SYSTEM_FONT_LABEL.to_string());
+    }
+    names.extend(
+        families
+            .iter()
+            .filter(|name| field != FontField::Ui || name.as_str() != SYSTEM_FONT_LABEL)
+            .cloned(),
+    );
+    names
 }
 
 /// Whether a family name looks monospaced enough for the terminal grid.
@@ -626,5 +655,34 @@ pub fn open(
     );
     if let Err(error) = opened {
         eprintln!("l3s: could not open appearances: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_font_options_lead_with_system() {
+        let families = vec!["Menlo".to_string(), "Inter".to_string()];
+        assert_eq!(
+            font_options(FontField::Ui, &families),
+            ["System", "Menlo", "Inter"]
+        );
+    }
+
+    #[test]
+    fn a_real_system_family_does_not_shadow_the_reset_entry() {
+        let families = vec!["System".to_string(), "Menlo".to_string()];
+        assert_eq!(font_options(FontField::Ui, &families), ["System", "Menlo"]);
+    }
+
+    #[test]
+    fn terminal_fonts_have_no_default_alias() {
+        let families = vec!["JetBrains Mono".to_string()];
+        assert_eq!(
+            font_options(FontField::Terminal, &families),
+            ["JetBrains Mono"]
+        );
     }
 }

@@ -5,6 +5,8 @@
 //! whichever command is chosen. Nothing here touches GPUI or the daemon, so the
 //! ranking is unit-testable on its own.
 
+use super::text_input::TextField;
+
 /// Rows the panel will draw at once; the list scrolls past this.
 const MAX_RESULTS: usize = 40;
 
@@ -16,6 +18,7 @@ const MAX_RESULTS: usize = 40;
 pub enum Command {
     NewWindow,
     NewTab,
+    OpenLocalTerminal,
     SplitVertical,
     SplitHorizontal,
     CloseTab,
@@ -55,16 +58,15 @@ pub struct Entry {
     pub shortcut: Option<&'static str>,
 }
 
-/// Query and caret state for the overlay.
+/// Query and highlight state for the overlay.
 #[derive(Debug, Default)]
 pub struct Palette {
     open: bool,
-    query: String,
-    /// Caret position, as a character index into `query`.
-    cursor: usize,
-    /// Whether the whole query is selected (⌘A); the next edit replaces it.
-    select_all: bool,
+    input: TextField,
     selected: usize,
+    /// Query text the highlight last reset against, so caret-blink repaints
+    /// don't re-home it.
+    reset_query: String,
 }
 
 impl Palette {
@@ -74,18 +76,13 @@ impl Palette {
     }
 
     /// The text typed so far.
-    pub fn query(&self) -> &str {
-        &self.query
+    pub fn query(&self) -> String {
+        self.input.value()
     }
 
-    /// The caret position, as a character index into [`Palette::query`].
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    /// Whether the query is selected, so the field paints it highlighted.
-    pub fn is_select_all(&self) -> bool {
-        self.select_all
+    /// The query buffer, for the window's input entity.
+    pub fn input(&self) -> &TextField {
+        &self.input
     }
 
     /// Index of the highlighted row, before clamping to the filtered list.
@@ -105,90 +102,24 @@ impl Palette {
         self.clear();
     }
 
-    /// Clear the query, caret, and selection.
+    /// Clear the query and re-point the highlight at the first row.
     pub fn clear(&mut self) {
-        self.query.clear();
-        self.cursor = 0;
-        self.select_all = false;
+        self.input.clear();
         self.selected = 0;
+        self.reset_query.clear();
     }
 
-    /// Select the whole query; the next edit replaces it.
-    pub fn select_all(&mut self) {
-        self.select_all = true;
-        self.cursor = self.query.chars().count();
-    }
-
-    /// Insert typed text at the caret, re-pointing the highlight at the best
-    /// match. Replaces the query first when it is selected.
-    pub fn insert(&mut self, text: &str) {
-        if self.select_all {
-            self.query.clear();
-            self.cursor = 0;
-            self.select_all = false;
-        }
-        let at = self.byte_at(self.cursor);
-        self.query.insert_str(at, text);
-        self.cursor += text.chars().count();
-        self.selected = 0;
-    }
-
-    /// Drop the character before the caret.
-    pub fn backspace(&mut self) {
-        if self.select_all {
-            self.query.clear();
-            self.cursor = 0;
-            self.select_all = false;
+    /// Re-point the highlight at the first row when the query changed since
+    /// the last call.
+    ///
+    /// The field notifies on every repaint, including the caret blink, so an
+    /// unconditional reset would yank the highlight back to the top while the
+    /// user walks the list with the arrow keys.
+    pub fn refresh_selection(&mut self) {
+        if self.input.value() != self.reset_query {
+            self.reset_query = self.input.value();
             self.selected = 0;
-            return;
         }
-        if self.cursor == 0 {
-            return;
-        }
-        let end = self.byte_at(self.cursor);
-        let start = self.byte_at(self.cursor - 1);
-        self.query.replace_range(start..end, "");
-        self.cursor -= 1;
-        self.selected = 0;
-    }
-
-    /// Drop the character under the caret.
-    pub fn delete(&mut self) {
-        if self.select_all {
-            self.query.clear();
-            self.cursor = 0;
-            self.select_all = false;
-            self.selected = 0;
-            return;
-        }
-        let count = self.query.chars().count();
-        if self.cursor >= count {
-            return;
-        }
-        let start = self.byte_at(self.cursor);
-        let end = self.byte_at(self.cursor + 1);
-        self.query.replace_range(start..end, "");
-        self.selected = 0;
-    }
-
-    /// Move the caret by `delta` characters, collapsing any selection.
-    pub fn move_cursor(&mut self, delta: isize) {
-        self.clear_selection();
-        let last = self.query.chars().count();
-        let next = self.cursor as isize + delta;
-        self.cursor = next.clamp(0, last as isize) as usize;
-    }
-
-    /// Move the caret to the start, collapsing any selection.
-    pub fn cursor_home(&mut self) {
-        self.clear_selection();
-        self.cursor = 0;
-    }
-
-    /// Move the caret to the end, collapsing any selection.
-    pub fn cursor_end(&mut self) {
-        self.clear_selection();
-        self.cursor = self.query.chars().count();
     }
 
     /// Move the highlight by `delta`, clamped to `len` rows.
@@ -202,26 +133,14 @@ impl Palette {
         self.selected = next.clamp(0, last as isize) as usize;
     }
 
-    /// Clear a select-all without touching the text.
-    fn clear_selection(&mut self) {
-        self.select_all = false;
-    }
-
-    /// The byte offset of character `index`, clamped to the string's end.
-    fn byte_at(&self, index: usize) -> usize {
-        self.query
-            .char_indices()
-            .nth(index)
-            .map_or(self.query.len(), |(byte, _)| byte)
-    }
-
     /// Commands matching the query, best first.
     pub fn matches<'a>(&self, entries: &'a [Entry]) -> Vec<&'a Entry> {
+        let query = self.query();
         let mut scored: Vec<(i32, usize, &Entry)> = entries
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                score(&self.query, &entry.title).map(|score| (score, index, entry))
+                score(&query, &entry.title).map(|score| (score, index, entry))
             })
             .collect();
         // Highest score first; ties keep the list's own order.
@@ -293,6 +212,12 @@ mod tests {
         matches.iter().map(|entry| entry.title.as_str()).collect()
     }
 
+    fn seeded(query: &str) -> Palette {
+        let mut palette = Palette::default();
+        palette.input.set_value(query.to_string());
+        palette
+    }
+
     #[test]
     fn empty_query_lists_every_entry() {
         let entries = vec![entry("New Tab"), entry("Quit")];
@@ -303,16 +228,14 @@ mod tests {
     #[test]
     fn query_keeps_only_subsequences() {
         let entries = vec![entry("New Tab"), entry("Open Appearances"), entry("Quit")];
-        let mut palette = Palette::default();
-        palette.insert("nt");
+        let palette = seeded("nt");
         assert_eq!(titles(&palette.matches(&entries)), ["New Tab"]);
     }
 
     #[test]
     fn contiguous_and_prefix_matches_rank_first() {
         let entries = vec![entry("Set Local"), entry("Select All"), entry("Renew")];
-        let mut palette = Palette::default();
-        palette.insert("sel");
+        let palette = seeded("sel");
         // "Select All" matches s-e-l contiguously; "Set Local" skips a word.
         assert_eq!(titles(&palette.matches(&entries))[0], "Select All");
     }
@@ -320,22 +243,8 @@ mod tests {
     #[test]
     fn prefix_beats_an_incidental_run() {
         let entries = vec![entry("Renew"), entry("New Tab")];
-        let mut palette = Palette::default();
-        palette.insert("new");
+        let palette = seeded("new");
         assert_eq!(titles(&palette.matches(&entries)), ["New Tab", "Renew"]);
-    }
-
-    #[test]
-    fn typing_resets_and_backspace_pops() {
-        let mut palette = Palette::default();
-        palette.insert("new");
-        palette.move_selection(1, 3);
-        assert_eq!(palette.selected(), 1);
-        palette.insert("x");
-        assert_eq!(palette.selected(), 0);
-        assert_eq!(palette.query(), "newx");
-        palette.backspace();
-        assert_eq!(palette.query(), "new");
     }
 
     #[test]
@@ -352,8 +261,7 @@ mod tests {
     #[test]
     fn highlighted_is_clamped_to_matches() {
         let entries = vec![entry("New Tab"), entry("Quit")];
-        let mut palette = Palette::default();
-        palette.insert("q");
+        let mut palette = seeded("q");
         let matches = palette.matches(&entries);
         assert_eq!(
             palette.highlighted(&matches).map(|e| e.title.as_str()),
@@ -367,56 +275,33 @@ mod tests {
     }
 
     #[test]
-    fn edits_land_at_the_caret() {
-        let mut palette = Palette::default();
-        palette.insert("nt");
-        palette.move_cursor(-1);
-        palette.insert("a");
-        assert_eq!(palette.query(), "nat");
-        assert_eq!(palette.cursor(), 2);
-        palette.cursor_home();
-        palette.delete();
-        assert_eq!(palette.query(), "at");
-        palette.cursor_end();
-        palette.backspace();
-        assert_eq!(palette.query(), "a");
-    }
-
-    #[test]
-    fn select_all_is_replaced_by_the_next_edit() {
-        let mut palette = Palette::default();
-        palette.insert("new");
-        palette.select_all();
-        assert!(palette.is_select_all());
-        palette.insert("q");
-        assert!(!palette.is_select_all());
-        assert_eq!(palette.query(), "q");
-        palette.select_all();
-        palette.backspace();
-        assert_eq!(palette.query(), "");
-    }
-
-    #[test]
     fn clear_drops_the_whole_query() {
-        let mut palette = Palette::default();
-        palette.insert("new");
+        let mut palette = seeded("new");
         palette.move_selection(2, 5);
         palette.clear();
         assert_eq!(palette.query(), "");
-        assert_eq!(palette.cursor(), 0);
         assert_eq!(palette.selected(), 0);
-        assert!(!palette.is_select_all());
     }
 
     #[test]
-    fn caret_steps_over_multibyte_characters() {
-        let mut palette = Palette::default();
-        palette.insert("aé");
-        assert_eq!(palette.cursor(), 2);
-        palette.move_cursor(-1);
-        palette.insert("x");
-        assert_eq!(palette.query(), "axé");
-        palette.backspace();
-        assert_eq!(palette.query(), "aé");
+    fn refresh_selection_ignores_repaints_without_an_edit() {
+        let mut palette = seeded("new");
+        palette.refresh_selection();
+        palette.move_selection(3, 5);
+        assert_eq!(palette.selected(), 3);
+        // A caret-blink repaint notifies the field without changing the query,
+        // so the highlight must stay put.
+        palette.refresh_selection();
+        assert_eq!(palette.selected(), 3);
+    }
+
+    #[test]
+    fn refresh_selection_rehomes_the_highlight_after_an_edit() {
+        let mut palette = seeded("new");
+        palette.refresh_selection();
+        palette.move_selection(3, 5);
+        palette.input.set_value("newt".to_string());
+        palette.refresh_selection();
+        assert_eq!(palette.selected(), 0);
     }
 }

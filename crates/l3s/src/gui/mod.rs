@@ -108,6 +108,9 @@ const TAB_HEIGHT: f32 = 26.0;
 /// Left inset for the collapsed tab strip: clears the floating traffic lights
 /// (the third light ends near 64px) with a comfortable gap before the toggle.
 const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
+/// Inset for the tab strip when nothing floats over its left edge: the sidebar
+/// is open, or fullscreen hides the traffic lights.
+const TAB_STRIP_EDGE: f32 = 12.0;
 /// Section label size (SESSIONS / PROJECTS).
 const SECTION_FONT: f32 = 11.0;
 /// Opening size of the main window when nothing is remembered.
@@ -6635,13 +6638,14 @@ impl L3sView {
 
     /// The native tab strip, full window width: toggle beside the traffic
     /// lights, tabs, and settings at the far right.
-    fn top_chrome(&self, cx: &mut Context<Self>, cell_width: f32) -> Div {
+    fn top_chrome(&self, cx: &mut Context<Self>, cell_width: f32, fullscreen: bool) -> Div {
         let theme = self.theme;
-        // Beside the sidebar when it is open; full width (clear of the
-        // traffic lights) when it is hidden.
+        // Beside the sidebar when it is open; full width when it is hidden.
+        // The left inset only clears the floating traffic lights, which
+        // fullscreen hides, so the strip runs to the edge there.
         let left = f32::from(self.sidebar_cells()) * cell_width;
-        let pad = if self.sidebar_visible {
-            12.0
+        let pad = if self.sidebar_visible || fullscreen {
+            TAB_STRIP_EDGE
         } else {
             TRAFFIC_LIGHT_CLEARANCE
         };
@@ -8557,7 +8561,8 @@ impl Render for L3sView {
             .child(if self.home.is_open() {
                 div()
             } else {
-                self.top_chrome(cx, cell_width)
+                let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
+                self.top_chrome(cx, cell_width, fullscreen)
             })
             .child(self.session_menu(cx))
             .child(self.status_bar(cx))

@@ -50,6 +50,9 @@ pub struct Frame {
 pub struct UhpClient {
     transport: ControlTransport,
     next_id: u64,
+    /// Delegated token for a paired `uhp access` gateway; the owner socket
+    /// omits `auth` entirely.
+    auth: Option<String>,
 }
 
 impl UhpClient {
@@ -58,6 +61,16 @@ impl UhpClient {
         Self {
             transport: ControlTransport::Socket(path.to_path_buf()),
             next_id: 0,
+            auth: None,
+        }
+    }
+
+    /// Bind to a `luvus uhp access` loopback gateway over TCP.
+    pub fn connect_tcp(address: impl Into<String>) -> Self {
+        Self {
+            transport: ControlTransport::Tcp(address.into()),
+            next_id: 0,
+            auth: None,
         }
     }
 
@@ -70,18 +83,46 @@ impl UhpClient {
         Self {
             transport: ControlTransport::Ssh(target),
             next_id: 0,
+            auth: None,
         }
+    }
+
+    /// Attach a delegated token, sent as `auth` on every request.
+    ///
+    /// This is what a client paired through a `luvus uhp access` gateway uses;
+    /// the owner socket leaves `auth` off.
+    #[must_use]
+    pub fn with_auth(mut self, token: impl Into<String>) -> Self {
+        self.auth = Some(token.into());
+        self
+    }
+
+    /// Build the next request line, including `auth` when a token is set.
+    fn envelope(&mut self, method: &str, params: Value) -> String {
+        self.next_id = self.next_id.wrapping_add(1);
+        let mut request = json!({
+            "id": self.next_id.to_string(),
+            "method": method,
+            "params": params,
+        });
+        if let Some(auth) = &self.auth
+            && let Some(object) = request.as_object_mut()
+        {
+            object.insert("auth".to_string(), Value::String(auth.clone()));
+        }
+        request.to_string()
+    }
+
+    /// Discover the server's protocol version, method registry, event catalog,
+    /// and — on a paired gateway — the effective access projection.
+    pub fn capabilities(&mut self) -> Result<Capabilities> {
+        let result = self.request("uhp.capabilities", json!({}))?;
+        Ok(Capabilities::from_json(&result))
     }
 
     /// Send one request on a fresh connection and return its `result`.
     pub fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.next_id = self.next_id.wrapping_add(1);
-        let line = json!({
-            "id": self.next_id.to_string(),
-            "method": method,
-            "params": params,
-        })
-        .to_string();
+        let line = self.envelope(method, params);
         let stream = self.transport.stream()?;
         {
             let mut writer = &stream;
@@ -121,19 +162,25 @@ impl UhpClient {
         ))
     }
 
-    /// Open the general event subscription.
-    ///
-    /// Subscribes from "now": replaying older sequences requires a snapshot
-    /// reconciliation the caller does not need, since a fresh subscription is
-    /// followed by a full refresh.
+    /// Open the general event subscription from "now": replaying older
+    /// sequences requires a snapshot reconciliation the caller does not need,
+    /// since a fresh subscription is followed by a full refresh.
     pub fn subscribe(&mut self) -> Result<EventStream> {
-        self.next_id = self.next_id.wrapping_add(1);
-        let line = json!({
-            "id": self.next_id.to_string(),
-            "method": "events.subscribe",
-            "params": {},
-        })
-        .to_string();
+        self.subscribe_after(None)
+    }
+
+    /// Open the general event subscription, replaying retained events after
+    /// `after_sequence` before live delivery when it is set.
+    ///
+    /// A cursor older than the retained window comes back as
+    /// [`Error::Control`] carrying `resync_required`, so the caller can take a
+    /// fresh snapshot first.
+    pub fn subscribe_after(&mut self, after_sequence: Option<u64>) -> Result<EventStream> {
+        let params = match after_sequence {
+            Some(sequence) => json!({ "after_sequence": sequence }),
+            None => json!({}),
+        };
+        let line = self.envelope("events.subscribe", params);
         let stream = self.transport.stream()?;
         {
             let mut writer = &stream;
@@ -161,13 +208,7 @@ impl UhpClient {
             "lines": lines,
             "ansi": ansi,
         });
-        self.next_id = self.next_id.wrapping_add(1);
-        let line = json!({
-            "id": self.next_id.to_string(),
-            "method": "terminal.backend.observe",
-            "params": params,
-        })
-        .to_string();
+        let line = self.envelope("terminal.backend.observe", params);
         let stream = self.transport.stream()?;
         {
             let mut writer = &stream;
@@ -277,6 +318,85 @@ impl EventStream {
                 data: value.get("data").cloned().unwrap_or(Value::Null),
             }));
         }
+    }
+}
+
+/// The server's advertised UHP surface, from `uhp.capabilities`.
+///
+/// Keep every field tolerant: a newer daemon may add methods or access fields,
+/// and an older one may omit them. Discovery, not the Luvus release number,
+/// decides what a caller may do.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Capabilities {
+    /// Protocol identity, e.g. `luvus-uhp 1.0`.
+    pub protocol_version: String,
+    /// Advertised method names.
+    pub methods: Vec<String>,
+    /// `read_only` or `control`, when reached through a paired gateway.
+    pub access_mode: Option<String>,
+    /// The gateway's effective allow-list; empty means the owner endpoint.
+    pub allowed_methods: Vec<String>,
+}
+
+impl Capabilities {
+    fn from_json(result: &Value) -> Self {
+        fn names(value: Option<&Value>) -> Vec<String> {
+            value
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(name) => Some(name.clone()),
+                    Value::Object(object) => object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // `protocol` is `{name, major, minor}`; older or hand-rolled replies
+        // may carry a flat version string instead.
+        fn version(result: &Value) -> String {
+            if let Some(protocol) = result.get("protocol") {
+                let name = protocol
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("luvus-uhp");
+                if let (Some(major), Some(minor)) = (
+                    protocol.get("major").and_then(Value::as_u64),
+                    protocol.get("minor").and_then(Value::as_u64),
+                ) {
+                    return format!("{name} {major}.{minor}");
+                }
+            }
+            ["protocol_version", "uhp_version", "version"]
+                .iter()
+                .find_map(|key| result.get(*key).and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string()
+        }
+
+        let access = result.get("access");
+        Self {
+            protocol_version: version(result),
+            methods: names(result.get("methods")),
+            access_mode: access
+                .and_then(|access| access.get("mode"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            allowed_methods: names(access.and_then(|access| access.get("allowed_methods"))),
+        }
+    }
+
+    /// Whether `method` may be called.
+    ///
+    /// The owner endpoint advertises no access projection, so an empty
+    /// allow-list means the full method registry is available.
+    pub fn allows(&self, method: &str) -> bool {
+        self.allowed_methods.is_empty() || self.allowed_methods.iter().any(|item| item == method)
     }
 }
 

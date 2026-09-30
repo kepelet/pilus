@@ -1,12 +1,19 @@
 # Architecture
 
-`pilus` is three crates with a one-way dependency chain:
+`pilus` is three crates with a one-way dependency chain, plus a fourth that
+shares the connection layer from the other side:
 
 ```
 pilus (GPUI window)
-  └── pilus-client (socket, handshake, event stream, Surface)
+  └── pilus-client (socket, handshake, event stream, Surface, UHP)
         └── pilus-protocol (messages, frames, framing)
+
+pilus-agent (host connector) ──▶ pilus-client
 ```
+
+`pilus-agent` is the host-side connector described under “Host connector”
+below; it depends on `pilus-client`'s UHP surface and is never in the desktop
+window's dependency chain.
 
 Nothing in `pilus-protocol` or `pilus-client` knows about GPUI, so the connection
 layer is testable headlessly (see `crates/pilus-client/tests/handshake.rs`).
@@ -322,6 +329,77 @@ event-driven chrome feed.
 
 The binary transport is what the window paints. The daemon emulates the
 terminal and projects finished cells; the client never parses VT output.
+
+## Host connector
+
+`pilus-agent` is the *transport provider* the UHP docs leave to the
+application. The daemon opens no TCP listener, and its access gateway binds
+loopback only, so a remote client needs a host-side process to launch the
+gateway, carry its bytes, and — later — authorize devices. That process is the
+connector.
+
+Its contract is narrow, and deliberately so:
+
+- `Gateway::start` launches `luvus [--session NAME] uhp access [--machines]
+  [--control] [--ttl N] [--no-expiry]`, reads the one-line descriptor, and
+  keeps the child alive. Dropping the gateway kills the child and revokes the
+delegated token.
+- `Descriptor::parse` reads that line against the installed
+  `access.descriptor` schema: `protocol` for the version, `endpoint.host/port`
+  for the address, `pairing.code`, `authority.{mode,scopes,expires_at}` for the
+  granted authority, and `features.machines`. Additive fields are ignored, so a
+  newer daemon does not need a new connector. `tests/live_gateway.rs` exercises
+  a real gateway when one is installed.
+- `proxy` is one transport: a TCP listener that forwards each accepted
+  connection to the gateway loopback, one upstream connection per client to
+  match UHP's one-request-per-connection contract. The connector never parses
+  or rewrites UHP frames past the pairing frame.
+- `p2p` is the other, and the one a phone uses: an iroh/QUIC endpoint
+  (`ALPN = b"luvus/uhp/1"`) whose identity is a persistent Ed25519 key under
+  the state root. Each accepted bidirectional stream is bridged to its own
+  gateway connection, so one QUIC stream is one UHP request. An `EndpointHooks`
+  allow-list rejects peers by `EndpointId` after the handshake, and `serve`
+  prints an `EndpointTicket` a device scans to enroll. Relays default to n0's
+  public servers unless `--relay` names a self-hosted one.
+
+`pilus-client` gained the seam this needs: `Stream::connect_tcp` and
+`ControlTransport::Tcp`, plus `UhpClient::{connect_tcp, with_auth,
+capabilities}`. `auth` rides every envelope when a token is set, and
+`Capabilities` parses the `access.mode`/`allowed_methods` projection a paired
+gateway adds. These are additive: the owner socket path is unchanged.
+
+`tests/live_gateway.rs` proves the descriptor, pairing, and capability
+projection against a real `luvus uhp access`, and `tests/iroh_bridge.rs` proves
+the whole broker: an unenrolled device is refused on the UHP ALPN, enrolls over
+the control ALPN with the printed code, receives the delegated token, and then
+calls `uhp.capabilities` with it. Both skip when no `luvus` binary is installed.
+
+A gateway's pairing code is one-use and short-lived, so a device cannot carry
+it. `enroll` takes over: the connector pairs once with the gateway, keeps the
+delegated token, and hands it to devices it has admitted. A device proves
+itself once with a short code shown on the host over the `luvus/agent/1`
+control ALPN (`{"type":"enroll","code":…}`), and its iroh `EndpointId` is
+persisted as the authorization from then on. `{"type":"token"}` returns the
+cached token for an enrolled peer; the UHP ALPN rejects any peer that is not
+enrolled while the control ALPN stays open so a new device can present its code.
+The connector runs the gateway `--no-expiry`, because it pairs once and must
+hold that token for its whole run.
+
+The **Settings** page puts a **REMOTE ACCESS** section above **REMOTE MACHINES**,
+with a `style::toggle` switch backed by `Settings.connector`, **off by default**.
+Turning it on starts the connector and persists the choice; `gui::connector` owns
+one process-wide child so it keeps running after the page closes and starts again
+on the next launch. The instruction line stays put and the connection details
+(`endpoint id`, `enroll` code, `ticket`, each with a Copy button) appear below it
+only while the connector runs. Each machine row in that page gains an **Install
+agent** action that copies this build's `pilus-agent` beside the verified remote
+`luvus` binary and starts it over SSH; a remote platform that does not match this
+build is refused before any bytes move. The separate Remote Machines window
+keeps add/enable/disable/remove.
+
+The connector must be found before any of this works: `scripts/bundle-macos.sh`
+builds and copies `pilus-agent` into `Contents/MacOS/` beside `pilus`, and
+`just build`/`just run` build it too, so the app can start it as a sibling.
 
 ## Mouse and selection
 

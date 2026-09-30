@@ -272,6 +272,102 @@ fn parse_machines(bytes: &[u8]) -> Vec<MachineInfo> {
     machines
 }
 
+/// Copy this build's connector onto `machine` and start it.
+///
+/// The agent is copied verbatim, so a remote platform that does not match this
+/// build is refused before any bytes move. The remote path mirrors the verified
+/// `luvus` binary's directory, so the two ship together.
+pub fn install_agent(machine: &MachineInfo, agent: &Path) -> Result<String> {
+    let target = machine.ssh_target().ok_or_else(|| {
+        Error::Machine(format!(
+            "machine `{}` has no verified remote binary; run `luvus machine enable {}`",
+            machine.id, machine.id
+        ))
+    })?;
+    let remote = run_ssh(&target, "uname -sm")?;
+    let remote = remote.trim();
+    let local = local_uname();
+    if remote != local {
+        return Err(Error::Machine(format!(
+            "`{}` runs `{remote}`, this build is `{local}`; install a matching pilus-agent there",
+            machine.id
+        )));
+    }
+    let remote_dir = target
+        .binary
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or(".");
+    let remote_path = format!("{remote_dir}/pilus-agent");
+    copy_agent(agent, &machine.destination, &remote_path)?;
+    let start = format!(
+        "chmod +x {path} && (nohup {path} serve --iroh --control >/dev/null 2>&1 & echo $!)",
+        path = shell_quote(&remote_path)
+    );
+    let pid = run_ssh(&target, &start)?;
+    let pid = pid.trim();
+    Ok(if pid.is_empty() {
+        format!("Installed pilus-agent on `{}`.", machine.id)
+    } else {
+        format!("Installed and started pilus-agent on `{}` (pid {pid}).", machine.id)
+    })
+}
+
+/// Run one shell command on the machine and return its stdout.
+fn run_ssh(target: &SshTarget, remote_command: &str) -> Result<String> {
+    let output = target.shell(remote_command).output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(Error::Machine(if stderr.is_empty() {
+            format!("`{remote_command}` failed on {}", target.destination)
+        } else {
+            stderr
+        }));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Copy a local file to `destination:path` with the same batch SSH options.
+fn copy_agent(local: &Path, destination: &str, remote_path: &str) -> Result<()> {
+    let output = std::process::Command::new("scp")
+        .arg("-q")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(local)
+        .arg(format!("{destination}:{remote_path}"))
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(Error::Machine(if stderr.is_empty() {
+            format!("could not copy the agent to {destination}")
+        } else {
+            stderr
+        }));
+    }
+    Ok(())
+}
+
+/// The local `uname -s -m` equivalent, matching OpenSSH's remote output.
+fn local_uname() -> String {
+    let system = match std::env::consts::OS {
+        "macos" => "Darwin",
+        "linux" => "Linux",
+        other => other,
+    };
+    let machine = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("{system} {machine}")
+}
+
+/// Single-quote a path for the remote POSIX shell.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +400,19 @@ mod tests {
     fn garbage_yields_no_machines() {
         assert!(parse_machines(b"not json").is_empty());
         assert!(parse_machines(b"{}").is_empty());
+    }
+
+    #[test]
+    fn shell_quote_survives_spaces_and_quotes() {
+        assert_eq!(shell_quote("/opt/my agent/pilus-agent"), "'/opt/my agent/pilus-agent'");
+        assert_eq!(shell_quote("/a'b"), "'/a'\\''b'");
+    }
+
+    #[test]
+    fn local_uname_looks_like_uname() {
+        let value = local_uname();
+        let (system, machine) = value.split_once(' ').expect("two fields");
+        assert!(!system.is_empty());
+        assert!(!machine.is_empty());
     }
 }

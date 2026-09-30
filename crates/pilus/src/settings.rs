@@ -58,6 +58,9 @@ pub struct Settings {
     pub update_feed_url: Option<String>,
     /// Frame of the main window, restored on the next launch.
     pub window: Option<WindowGeometry>,
+    /// Run the host connector ("this node" remote access) while pilus is open.
+    /// Off by default; the Remote Machines window toggles it.
+    pub connector: bool,
 }
 
 impl Default for Settings {
@@ -71,6 +74,7 @@ impl Default for Settings {
             auto_check_updates: false,
             update_feed_url: None,
             window: None,
+            connector: false,
         }
     }
 }
@@ -144,6 +148,7 @@ mod tests {
                 maximized: true,
                 display: Some("6d0f9a4c-30b2-4f25-9a2e-4a8f9c3b7d10".to_string()),
             }),
+            connector: true,
         };
         let text = serde_json::to_string(&settings).expect("serialize");
         let back: Settings = serde_json::from_str(&text).expect("deserialize");

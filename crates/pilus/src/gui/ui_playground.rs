@@ -488,31 +488,13 @@ impl UiPlaygroundView {
 
     /// A working on/off switch.
     fn toggle_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let on = self.toggle;
-        div()
-            .id("pg-switch")
-            .flex()
-            .items_center()
-            .w(px(38.0))
-            .h(px(20.0))
-            .p(px(2.0))
-            .rounded_full()
-            .bg(if on { theme.accent } else { theme.border })
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| {
+        style::toggle("pg-switch", self.toggle, self.theme).on_click(cx.listener(
+            |this, _, _, cx| {
                 this.toggle = !this.toggle;
                 let on = this.toggle;
                 this.note(format!("Switch {}", if on { "on" } else { "off" }), cx);
-            }))
-            .child(
-                div()
-                    .w(px(16.0))
-                    .h(px(16.0))
-                    .rounded_full()
-                    .bg(if on { theme.window_bg } else { theme.muted })
-                    .ml(px(if on { 18.0 } else { 0.0 })),
-            )
+            },
+        ))
     }
 
     /// A working checkbox.

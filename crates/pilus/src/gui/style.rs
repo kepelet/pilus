@@ -115,6 +115,28 @@ pub(super) fn small_button(
     )
 }
 
+/// A compact on/off switch. Callers attach their own handler.
+pub(super) fn toggle(id: impl Into<ElementId>, on: bool, theme: Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .w(px(38.0))
+        .h(px(20.0))
+        .p(px(2.0))
+        .rounded_full()
+        .bg(if on { theme.accent } else { theme.border })
+        .cursor_pointer()
+        .child(
+            div()
+                .w(px(16.0))
+                .h(px(16.0))
+                .rounded_full()
+                .bg(if on { theme.window_bg } else { theme.muted })
+                .ml(px(if on { 18.0 } else { 0.0 })),
+        )
+}
+
 /// One button at an explicit height and horizontal padding.
 fn button_at(
     id: impl Into<ElementId>,

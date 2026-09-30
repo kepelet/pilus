@@ -18,6 +18,7 @@ clippy:
 
 # Attach to the default session.
 run:
+    cargo build -p pilus-agent
     cargo run -p pilus
 
 # Connect once and print the first frame, without a window.
@@ -26,7 +27,7 @@ probe:
 
 # Build the release binary.
 build:
-    cargo build --release -p pilus
+    cargo build --release -p pilus -p pilus-agent
 
 # Assemble a macOS .app bundle with the icon and Info.plist.
 bundle:

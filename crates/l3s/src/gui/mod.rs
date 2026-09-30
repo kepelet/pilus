@@ -3847,11 +3847,10 @@ impl L3sView {
             )
     }
 
-    /// The fill color of a picker's leading glyph, brighter when active.
+    /// The fill color of a picker's leading glyph, brighter while its
+    /// dropdown is open.
     fn home_picker_fg(&self, field: HomeField) -> gpui::Rgba {
-        let active = self.home.focus() == HomeFocus::Picker(field)
-            || self.home.dropdown() == Some(field);
-        if active {
+        if self.home.dropdown() == Some(field) {
             self.theme.panel_fg
         } else {
             self.theme.muted
@@ -3904,10 +3903,9 @@ impl L3sView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = self.theme;
-        let active = self.home.focus() == HomeFocus::Picker(field)
-            || self.home.dropdown() == Some(field);
-        let fg = if active { theme.panel_fg } else { theme.muted };
-        let mut face = div()
+        let open = self.home.dropdown() == Some(field);
+        let fg = if open { theme.panel_fg } else { theme.muted };
+        let face = div()
             .id(format!("l3s-home-picker-{}", field.label()))
             .flex()
             .flex_row()
@@ -3916,7 +3914,7 @@ impl L3sView {
             .h(px(HOME_PICKER_HEIGHT))
             .px_2()
             .rounded_md()
-            .bg(if active {
+            .bg(if open {
                 theme.panel
             } else {
                 theme.panel.opacity(0.0)
@@ -3925,9 +3923,6 @@ impl L3sView {
             .cursor_pointer()
             .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(field, cx)));
-        if active {
-            face = face.border_1().border_color(terminal_inset_border());
-        }
         let mut face = face
             .child(leading)
             .child(

@@ -224,6 +224,30 @@ pub fn list_branches(cwd: &str) -> Vec<String> {
         .collect()
 }
 
+/// List `cwd`'s local branch names on a remote machine, most recent first.
+///
+/// The whole listing runs in one SSH invocation; a directory outside a git
+/// repository answers empty.
+#[must_use]
+pub fn list_branches_remote(target: &crate::transport::SshTarget, cwd: &str) -> Vec<String> {
+    let dir = remote_dir_arg(cwd);
+    let script = format!(
+        "git -C {dir} for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads 2>/dev/null"
+    );
+    let Ok(output) = target.shell(&script).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Resolve many `cwds` to their current branch names on a remote machine.
 ///
 /// One SSH invocation carries the whole batch as NUL-separated answers.

@@ -11,7 +11,7 @@ use std::path::Path;
 
 use l3s_client::{Project, load_projects, project_id_for_name as id_for, save_projects};
 
-use super::text_field::TextField;
+use super::text_input::TextField;
 
 /// Which form field owns the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,14 +153,9 @@ impl ProjectsPanel {
         &self.worktree_name
     }
 
-    /// The inline worktree name buffer for key handling.
-    pub fn worktree_name_mut(&mut self) -> &mut TextField {
-        &mut self.worktree_name
-    }
-
     /// Replace the location field, moving the caret to the end.
     pub fn set_location(&mut self, dir: String) {
-        self.location = TextField::with_value(dir);
+        self.location.set_value(dir);
         self.focus = Some(ProjectField::Location);
         self.status.clear();
     }
@@ -250,10 +245,10 @@ impl ProjectsPanel {
         self.mode = Mode::Form;
         self.editing = Some(project.id.clone());
         self.focus = Some(ProjectField::Name);
-        self.name = TextField::with_value(project.name.clone());
-        self.repository = TextField::with_value(project.repository.clone());
-        self.branch_prefix = TextField::with_value(project.branch_prefix.clone());
-        self.location = TextField::with_value(project.location.clone());
+        self.name.set_value(project.name.clone());
+        self.repository.set_value(project.repository.clone());
+        self.branch_prefix.set_value(project.branch_prefix.clone());
+        self.location.set_value(project.location.clone());
         self.machine_cursor = machine_ids
             .iter()
             .position(|id| *id == project.machine)
@@ -300,7 +295,9 @@ impl ProjectsPanel {
         }
     }
 
-    /// The form field buffer for `field`, mutably.
+    /// The form field buffer for `field`, mutably. Only tests need direct
+    /// mutation; the window edits through an entity.
+    #[cfg(test)]
     pub fn field_mut(&mut self, field: ProjectField) -> &mut TextField {
         match field {
             ProjectField::Name => &mut self.name,
@@ -312,10 +309,10 @@ impl ProjectsPanel {
 
     /// Validate and save the form to `root`.
     pub fn submit(&mut self, root: &Path, machine_ids: &[Option<String>]) -> Result<(), String> {
-        let name = self.name.value.trim().to_string();
-        let repository = self.repository.value.trim().to_string();
-        let branch_prefix = self.branch_prefix.value.trim().to_string();
-        let mut location = self.location.value.trim().to_string();
+        let name = self.name.value().trim().to_string();
+        let repository = self.repository.value().trim().to_string();
+        let branch_prefix = self.branch_prefix.value().trim().to_string();
+        let mut location = self.location.value().trim().to_string();
         if let Some(error) = l3s_client::validate_project(&name, &location) {
             self.status = error.clone();
             return Err(error);
@@ -424,7 +421,7 @@ impl ProjectsPanel {
     pub fn take_worktree(&mut self) -> Option<(Project, String)> {
         let id = self.worktree_target.clone()?;
         let project = self.projects.iter().find(|p| p.id == id)?.clone();
-        let name = self.worktree_name.value.trim().to_string();
+        let name = self.worktree_name.value().trim().to_string();
         if name.is_empty() {
             self.status = "A worktree name is required.".to_string();
             return None;
@@ -469,8 +466,8 @@ mod tests {
         let mut panel = ProjectsPanel::default();
         panel.open(&dir);
         panel.start_new();
-        panel.field_mut(ProjectField::Name).insert("flo");
-        panel.field_mut(ProjectField::Location).insert("/tmp/flo");
+        panel.field_mut(ProjectField::Name).set_value("flo".to_string());
+        panel.field_mut(ProjectField::Location).set_value("/tmp/flo".to_string());
         panel.submit(&dir, &[None]).expect("submit");
         assert_eq!(panel.projects().len(), 1);
         assert_eq!(panel.projects()[0].id, "flo");
@@ -483,7 +480,7 @@ mod tests {
         let mut panel = ProjectsPanel::default();
         panel.open(&dir);
         panel.start_new();
-        panel.field_mut(ProjectField::Location).insert("/tmp/x");
+        panel.field_mut(ProjectField::Location).set_value("/tmp/x".to_string());
         assert!(panel.submit(&dir, &[None]).is_err());
     }
 
@@ -491,7 +488,7 @@ mod tests {
     fn location_and_status_helpers() {
         let mut panel = ProjectsPanel::default();
         panel.set_location("/tmp/picked".to_string());
-        assert_eq!(panel.field(ProjectField::Location).value, "/tmp/picked");
+        assert_eq!(panel.field(ProjectField::Location).value(), "/tmp/picked");
         assert_eq!(panel.focus(), Some(ProjectField::Location));
         panel.set_status("hello".to_string());
         assert_eq!(panel.status(), "hello");
@@ -504,8 +501,8 @@ mod tests {
         let mut panel = ProjectsPanel::default();
         panel.open(&dir);
         panel.start_new();
-        panel.field_mut(ProjectField::Name).insert("flo");
-        panel.field_mut(ProjectField::Location).insert("/tmp/flo");
+        panel.field_mut(ProjectField::Name).set_value("flo".to_string());
+        panel.field_mut(ProjectField::Location).set_value("/tmp/flo".to_string());
         panel.submit(&dir, &[None]).expect("submit");
         assert!(matches!(
             panel.request_delete(&dir),

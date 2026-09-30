@@ -13,15 +13,15 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, Context, Div, FocusHandle, KeyDownEvent, MouseButton, Render, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, size,
+    App, Bounds, Context, Div, Entity, FocusHandle, Focusable, Font, KeyDownEvent, MouseButton,
+    Pixels, Render, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use l3s_client::{HOME_ENV, MachineInfo, luvus_binary, refresh_machines};
 
 use crate::settings::Settings;
 
 use super::style::{self, ButtonKind};
-use super::text_field::TextField;
+use super::text_input::TextInput;
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, MachineSignal};
 
@@ -64,40 +64,71 @@ impl Field {
 }
 
 /// The add-machine form.
-#[derive(Default)]
 struct Form {
-    id: TextField,
-    label: TextField,
-    host: TextField,
-    session: TextField,
+    id: Entity<TextInput>,
+    label: Entity<TextInput>,
+    host: Entity<TextInput>,
+    session: Entity<TextInput>,
     /// Whether an `--install` approval is attached to Add/Enable.
     install: bool,
 }
 
 impl Form {
-    fn field(&self, field: Field) -> &TextField {
-        match field {
-            Field::Id => &self.id,
-            Field::Label => &self.label,
-            Field::Host => &self.host,
-            Field::Session => &self.session,
+    fn new(
+        font: &Font,
+        font_size: Pixels,
+        theme: Theme,
+        cx: &mut Context<MachineManagerView>,
+    ) -> Self {
+        let input = |cx: &mut Context<MachineManagerView>, placeholder: &'static str| {
+            cx.new(|cx| {
+                TextInput::new(
+                    String::new(),
+                    placeholder,
+                    font.clone(),
+                    font_size,
+                    false,
+                    theme,
+                    cx,
+                )
+            })
+        };
+        Self {
+            id: input(cx, "Profile id"),
+            label: input(cx, "Label"),
+            host: input(cx, "SSH host or alias"),
+            session: input(cx, "Remote session"),
+            install: false,
         }
     }
 
-    fn field_mut(&mut self, field: Field) -> &mut TextField {
+    fn entity(&self, field: Field) -> Entity<TextInput> {
         match field {
-            Field::Id => &mut self.id,
-            Field::Label => &mut self.label,
-            Field::Host => &mut self.host,
-            Field::Session => &mut self.session,
+            Field::Id => self.id.clone(),
+            Field::Label => self.label.clone(),
+            Field::Host => self.host.clone(),
+            Field::Session => self.session.clone(),
         }
     }
 
-    fn clear(&mut self) {
-        self.id.clear();
-        self.label.clear();
-        self.host.clear();
-        self.session.clear();
+    /// The field that currently owns the keyboard, if any.
+    fn focused(&self, window: &Window, cx: &App) -> Option<Field> {
+        [Field::Id, Field::Label, Field::Host, Field::Session]
+            .into_iter()
+            .find(|field| self.entity(*field).read(cx).is_focused(window))
+    }
+
+    /// Move the keyboard to `field`.
+    fn focus(&self, field: Field, window: &mut Window, cx: &mut App) {
+        let handle = self.entity(field).focus_handle(cx);
+        window.focus(&handle, cx);
+    }
+
+    fn clear(&self, cx: &mut App) {
+        for field in [Field::Id, Field::Label, Field::Host, Field::Session] {
+            let entity = self.entity(field);
+            entity.update(cx, |input, cx| input.clear(cx));
+        }
     }
 }
 
@@ -139,7 +170,6 @@ pub struct MachineManagerView {
     machines: Vec<MachineInfo>,
     theme: Theme,
     form: Form,
-    focus: Option<Field>,
     /// The machine id (or `add`) whose command is running.
     busy: Option<String>,
     /// A remove awaiting its second click.
@@ -168,6 +198,8 @@ impl MachineManagerView {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let theme = *shared_theme.borrow();
+        let fonts = style::Fonts::resolve(&shared_settings);
+        let font = style::chrome_font(&shared_settings);
 
         let mut view = Self {
             root,
@@ -176,8 +208,7 @@ impl MachineManagerView {
             shared_theme,
             shared_settings,
             machines: Vec::new(),
-            form: Form::default(),
-            focus: None,
+            form: Form::new(&font, px(fonts.body), theme, cx),
             busy: None,
             pending_remove: None,
             status: "Loading machines…".to_string(),
@@ -294,15 +325,15 @@ impl MachineManagerView {
     }
 
     /// Submit the add form.
-    fn submit(&mut self) {
-        let id = self.form.id.value.trim().to_string();
-        let host = self.form.host.value.trim().to_string();
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.form.id.read(cx).value().trim().to_string();
+        let host = self.form.host.read(cx).value().trim().to_string();
         if id.is_empty() || host.is_empty() {
             self.status = "A profile id and an SSH host are required.".to_string();
             return;
         }
-        let label = self.form.label.value.trim().to_string();
-        let session = self.form.session.value.trim().to_string();
+        let label = self.form.label.read(cx).value().trim().to_string();
+        let session = self.form.session.read(cx).value().trim().to_string();
         let install = self.form.install;
         self.start_op(
             MachineOp::Add {
@@ -314,16 +345,20 @@ impl MachineManagerView {
             },
             "add",
         );
-        self.form.clear();
-        self.focus = None;
+        self.form.clear(cx);
+        let handle = self.focus_handle.clone();
+        window.focus(&handle, cx);
     }
 
     /// Escape clears focus, then a pending removal, then closes the window.
+    /// Tab walks the form; every other editing key belongs to the focused
+    /// field, which consumes what it handles before it reaches here.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         if key == "escape" {
-            if self.focus.is_some() {
-                self.focus = None;
+            if self.form.focused(window, cx).is_some() {
+                let handle = self.focus_handle.clone();
+                window.focus(&handle, cx);
             } else if self.pending_remove.is_some() {
                 self.pending_remove = None;
             } else {
@@ -336,43 +371,24 @@ impl MachineManagerView {
             self.pending_remove = None;
             cx.notify();
         }
-        let Some(field) = self.focus else {
+        let Some(field) = self.form.focused(window, cx) else {
             if key == "enter" {
-                self.submit();
+                self.submit(window, cx);
             }
             cx.notify();
             return;
         };
         match key {
             "tab" => {
-                self.focus = Some(if event.keystroke.modifiers.shift {
+                let next = if event.keystroke.modifiers.shift {
                     field.prev()
                 } else {
                     field.next()
-                });
+                };
+                self.form.focus(next, window, cx);
             }
-            "enter" => self.submit(),
-            "backspace" => self.form.field_mut(field).backspace(),
-            "delete" | "del" => self.form.field_mut(field).delete(),
-            "left" => self.form.field_mut(field).left(),
-            "right" => self.form.field_mut(field).right(),
-            "home" => self.form.field_mut(field).home(),
-            "end" => self.form.field_mut(field).end(),
-            _ => {
-                if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
-                    return;
-                }
-                if let Some(text) = event
-                    .keystroke
-                    .key_char
-                    .as_deref()
-                    .filter(|t| !t.is_empty())
-                {
-                    self.form.field_mut(field).insert(text);
-                } else if event.keystroke.key.chars().count() == 1 {
-                    self.form.field_mut(field).insert(&event.keystroke.key);
-                }
-            }
+            "enter" => self.submit(window, cx),
+            _ => {}
         }
         cx.notify();
     }
@@ -383,38 +399,33 @@ impl MachineManagerView {
     }
 
     /// A labelled single-line text field.
-    fn field_box(&self, field: Field, label: &str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn field_box(
+        &self,
+        field: Field,
+        label: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = self.theme;
-        let focused = self.focus == Some(field);
-        let text = self.form.field(field).value.clone();
-        let cursor = self.form.field(field).cursor;
-        let mut line = div().flex().flex_row().items_center().min_h(px(18.0));
-        if text.is_empty() && !focused {
-            line = line.child(div().text_color(theme.muted).child(label.to_string()));
-        } else {
-            let before: String = text.chars().take(cursor).collect();
-            let after: String = text.chars().skip(cursor).collect();
-            line = line.child(div().text_color(theme.fg).child(before));
-            if focused {
-                line = line.child(div().w(px(1.5)).h(px(14.0)).bg(theme.accent));
-            }
-            line = line.child(div().text_color(theme.fg).child(after));
-        }
+        let fonts = self.fonts();
+        let entity = self.form.entity(field);
+        entity.update(cx, |input, _| {
+            input.set_style(theme, style::chrome_font(&self.shared_settings), px(fonts.body));
+        });
+        let focused = entity.read(cx).is_focused(window);
         style::field(
             format!("l3s-machine-field-{label}"),
             label,
             focused,
             theme,
             28.0,
-            self.fonts().label,
-            line,
+            fonts.label,
+            entity,
         )
         .flex_1()
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                this.focus = Some(field);
-                this.form.field_mut(field).end();
+            cx.listener(|this, _, _, cx| {
                 this.pending_remove = None;
                 cx.notify();
             }),
@@ -422,7 +433,7 @@ impl MachineManagerView {
     }
 
     /// The add-machine form.
-    fn add_form(&self, cx: &mut Context<Self>) -> Div {
+    fn add_form(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let installing = self.busy.as_deref() == Some("add");
         let check = div()
@@ -478,8 +489,8 @@ impl MachineManagerView {
         if installing {
             add = add.bg(theme.panel_dim).text_color(theme.muted);
         }
-        let add = add.on_click(cx.listener(|this, _, _, cx| {
-            this.submit();
+        let add = add.on_click(cx.listener(|this, _, window, cx| {
+            this.submit(window, cx);
             cx.notify();
         }));
         div()
@@ -500,16 +511,16 @@ impl MachineManagerView {
                     .flex()
                     .flex_row()
                     .gap_2()
-                    .child(self.field_box(Field::Id, "Profile id", cx))
-                    .child(self.field_box(Field::Label, "Label", cx)),
+                    .child(self.field_box(Field::Id, "Profile id", window, cx))
+                    .child(self.field_box(Field::Label, "Label", window, cx)),
             )
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .gap_2()
-                    .child(self.field_box(Field::Host, "SSH host or alias", cx))
-                    .child(self.field_box(Field::Session, "Remote session", cx)),
+                    .child(self.field_box(Field::Host, "SSH host or alias", window, cx))
+                    .child(self.field_box(Field::Session, "Remote session", window, cx)),
             )
             .child(
                 div()
@@ -687,7 +698,7 @@ impl MachineManagerView {
 }
 
 impl Render for MachineManagerView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let refresh = style::small_button(
             "l3s-machine-refresh",
@@ -742,7 +753,7 @@ impl Render for MachineManagerView {
                     )
                     .child(refresh),
             )
-            .child(self.add_form(cx))
+            .child(self.add_form(window, cx))
             .child(self.machine_list(cx))
             .child(
                 div()

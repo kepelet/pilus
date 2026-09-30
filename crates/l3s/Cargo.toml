@@ -31,6 +31,7 @@ l3s-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+unicode-segmentation.workspace = true
 gpui = { workspace = true, optional = true }
 image.workspace = true
 gpui_platform = { workspace = true, optional = true }

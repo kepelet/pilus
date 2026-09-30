@@ -245,9 +245,11 @@ Each enabled machine becomes one endpoint:
   `workspace.open` control request to that endpoint, while **Open with new
   worktree** generates a branch name and issues `worktree.create`, so the daemon
   still owns workspace and worktree creation.
-- **Agents.** Every connected endpoint also runs an agents-only feed (one
-  `agent.list` per reconciliation, no full chrome refresh), so the AGENTS dock
-  lists live agents from Local and each hidden machine, grouped by endpoint.
+- **Agents.** Every connected endpoint also runs a hidden-endpoint feed (one
+  `agent.list`, `tab.list`, and `ui.bar.list` per reconciliation, no full
+  chrome refresh), so the AGENTS dock lists live agents from Local and each
+  hidden machine, grouped by endpoint, and the tabs and status bar a later
+  switch swaps in are already current instead of stale or empty.
   The row whose pane currently holds focus is highlighted (optimistically on
   click, then confirmed by `agent.list`). Clicking one focuses its pane,
   activating the owning endpoint first when it is hidden.
@@ -260,8 +262,14 @@ Each enabled machine becomes one endpoint:
 - **Switch.** Selecting an endpoint sends `SurfaceInterest::Prepared` and a
   ticket-tagged `PrepareSurface`; the matching `PreparedFrame` is committed by
   swapping the endpoints' surfaces, then `SurfaceInterest::Active` and a
-  `Resize` go to the new one. A stalled handoff falls back after a bounded
-  timeout, and re-selecting the visible endpoint cancels it. (The events exist
+  `Resize` go to the new one. The clicked row highlights optimistically until
+  the handoff commits or every stage of the switch ends without one, so a
+  slow SSH round trip never reads as a dead click. A stalled handoff commits
+  after a bounded timeout only when the target holds a frame — a timed-out
+  destination never blanks a usable surface — and re-selecting the visible
+  endpoint cancels it. Window resizes are pushed to every bridge, not only the
+  active one, so a hidden machine's panes and PTYs stay at the window's size
+  and switching to it never visibly reflows the terminal. (The events exist
   in `ServerMessage`/`ClientMessage`: `PreparedFrame`, `SurfaceInterest`,
   `PrepareSurface`.)
 - **Chrome.** The active endpoint's tabs, agents, and bar widgets come from its

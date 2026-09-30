@@ -215,6 +215,20 @@ pub fn run_main() -> Result<()> {
     settle(&mut cx, 12);
     capture(&mut cx, window.into(), "main-home")?;
 
+    // A Home picker dropdown open: it floats above the composer, so the
+    // centered layout does not shift when it opens.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.home.open_dropdown(super::HomeField::Agent);
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 4);
+    capture(&mut cx, window.into(), "main-home-dropdown")?;
+    cx.update(|app| {
+        view.update(app, |view, _| view.home.close_dropdown());
+    });
+
     // The Settings page: projects, machines, agent config, updates.
     cx.update(|app| {
         view.update(app, |view, cx| {

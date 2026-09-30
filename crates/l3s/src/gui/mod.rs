@@ -20,7 +20,7 @@ mod selection;
 pub(crate) mod shots;
 pub(crate) mod sound;
 mod style;
-mod text_field;
+mod text_input;
 mod theme;
 mod ui_playground;
 mod update_window;
@@ -40,11 +40,11 @@ use crossterm::event::{
     MouseEventKind,
 };
 use gpui::{
-    Action, AnyElement, App, Bounds, ClipboardItem, Context, DisplayId, Div, Entity, FocusHandle,
+    Action, Anchor, AnyElement, App, Bounds, ClipboardItem, Context, DisplayId, Div, Entity, FocusHandle,
     FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
+    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
     ScrollHandle, ScrollWheelEvent, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    div, font, img, point, prelude::*, px, size, svg,
+    anchored, deferred, div, font, img, point, prelude::*, px, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
@@ -54,7 +54,8 @@ use l3s_client::{
     Surface, SurfaceChange, Tab, TaskSummary, common_git_dir, common_git_dirs_remote, config_dir,
     connect_machine, current_branch, current_branches_remote, expand_project_local,
     expand_project_remote, generate_session_name, l3s_config_dir, l3s_workspaces_dir,
-    list_branches, list_machines, list_session_infos, luvus_binary, refresh_machines,
+    list_branches, list_branches_remote, list_machines, list_session_infos, luvus_binary,
+    refresh_machines,
     split_client_socket,
 };
 use l3s_protocol::{
@@ -65,7 +66,7 @@ use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use projects::{ProjectField, ProjectsPanel};
 use selection::{Cell, Selection};
-use text_field::TextField;
+use text_input::{TextField, TextInput};
 use theme::Theme;
 use updater::Updater;
 
@@ -73,6 +74,8 @@ use updater::Updater;
 const LINE_HEIGHT_RATIO: f32 = 1.3;
 /// Height of our native tab strip; the grid starts below it.
 const TAB_STRIP_HEIGHT: f32 = 36.0;
+/// Height of a compact composer picker, above or inside the footer.
+const HOME_PICKER_HEIGHT: f32 = 24.0;
 /// Grid offset from the window top: tab strip plus its top spacing.
 const HEADER_HEIGHT: f32 = 40.0;
 /// Daemon rows skipped at the top of the grid. The daemon draws its own tab
@@ -88,23 +91,26 @@ const SKIPPED_DAEMON_BOTTOM_ROWS: u16 = 1;
 /// footer widgets. Assumes a single-row status line.
 /// Height of the native footer bar.
 const FOOTER_HEIGHT: f32 = 28.0;
-/// Gap around the floating terminal card, on top/left/bottom.
+/// Gap around the floating terminal card, on every side.
 const CARD_GAP: f32 = 8.0;
 /// Slides the sidebar's first row down so it lines up with the top of the
 /// inset terminal card. The list's own `gap_1` already covers the rest of the
 /// `CARD_GAP` between the header and the card.
 const SIDEBAR_TOP_INSET: f32 = 4.0;
-/// Breathing room below the last row is intentionally zero: the grid runs
-/// flush to the card's bottom border.
-/// Breathing room above the first row, mirroring the bottom.
-const TERMINAL_TOP_AIR: f32 = 6.0;
-/// Wider right margin on the card, for breathing room at the window edge.
-const CARD_GAP_RIGHT: f32 = 16.0;
+/// Breathing room between the terminal grid and the card's inset border.
+/// Opposite gaps stay equal because the whole-cell grid is centered.
+const TERMINAL_PAD: f32 = 6.0;
+/// Right margin on the card. Matches the other sides so the terminal sits
+/// centered between the sidebar and the window edge.
+const CARD_GAP_RIGHT: f32 = CARD_GAP;
 /// Height of a tab pill in the top chrome.
 const TAB_HEIGHT: f32 = 26.0;
 /// Left inset for the collapsed tab strip: clears the floating traffic lights
 /// (the third light ends near 64px) with a comfortable gap before the toggle.
 const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
+/// Inset for the tab strip when nothing floats over its left edge: the sidebar
+/// is open, or fullscreen hides the traffic lights.
+const TAB_STRIP_EDGE: f32 = 12.0;
 /// Section label size (SESSIONS / PROJECTS).
 const SECTION_FONT: f32 = 11.0;
 /// Opening size of the main window when nothing is remembered.
@@ -197,6 +203,8 @@ gpui::actions!([
     NewWindow,
     /// Open a new daemon tab.
     NewTab,
+    /// Open a terminal on the local machine.
+    OpenLocalTerminal,
     /// Split the focused pane side by side.
     SplitVertical,
     /// Split the focused pane stacked.
@@ -367,6 +375,7 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             Menu::new("File").items([
                 MenuItem::action("New Window", NewWindow),
                 MenuItem::action("New Tab", NewTab),
+                MenuItem::action("Open Local Terminal", OpenLocalTerminal),
                 MenuItem::action("New Agent…", OpenHome),
                 MenuItem::action("Open Workspace", OpenWorkspacePicker),
                 MenuItem::separator(),
@@ -446,13 +455,14 @@ fn app_key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("cmd-,", OpenAppearances, None),
         KeyBinding::new("cmd-q", QuitApp, None),
-        KeyBinding::new("cmd-c", CopySelection, None),
-        KeyBinding::new("cmd-v", PasteClipboard, None),
-        KeyBinding::new("cmd-a", SelectAllGrid, None),
+        KeyBinding::new("cmd-c", CopySelection, Some("!Input")),
+        KeyBinding::new("cmd-v", PasteClipboard, Some("!Input")),
+        KeyBinding::new("cmd-a", SelectAllGrid, Some("!Input")),
         KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("cmd-n", NewWindow, None),
         KeyBinding::new("cmd-shift-n", OpenHome, None),
         KeyBinding::new("cmd-t", NewTab, None),
+        KeyBinding::new("cmd-shift-t", OpenLocalTerminal, None),
         KeyBinding::new("cmd-d", SplitVertical, None),
         KeyBinding::new("cmd-shift-d", SplitHorizontal, None),
         KeyBinding::new("cmd-w", CloseTab, None),
@@ -643,6 +653,10 @@ fn migrate_legacy_stores(luvus_root: &Path, l3s_root: &Path) {
 struct CardLayout {
     /// Card's left edge in window pixels (sidebar plus gap, or just gap).
     card_x: f32,
+    /// Inset of the first cell from the border, after centering the
+    /// whole-cell grid in the card's inner box.
+    pad_x: f32,
+    pad_y: f32,
     /// First visible cell's top-left corner in window pixels.
     origin_x: f32,
     origin_y: f32,
@@ -661,6 +675,42 @@ enum PickerPurpose {
     OpenWorkspace,
     /// Choose the base directory for the project form's location field.
     PickProjectDir,
+}
+
+/// Which surface owns the keyboard, in stacking order.
+///
+/// Overlays sit above content; [`L3sView::input_layer`] is the single source of
+/// truth for both key routing and focus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InputLayer {
+    /// The folder picker overlay, above everything.
+    Picker,
+    /// The command palette overlay.
+    Palette,
+    /// The Home composer page.
+    Home,
+    /// The Settings page (projects, machines, updates).
+    Settings,
+    /// The live terminal grid.
+    Terminal,
+}
+
+/// Resolve the keyboard owner from which surfaces are open.
+///
+/// Overlays sit above content, so the picker beats the palette and both beat
+/// the Home composer and Settings page.
+fn top_layer(picker: bool, palette: bool, home: bool, settings: bool) -> InputLayer {
+    if picker {
+        InputLayer::Picker
+    } else if palette {
+        InputLayer::Palette
+    } else if home {
+        InputLayer::Home
+    } else if settings {
+        InputLayer::Settings
+    } else {
+        InputLayer::Terminal
+    }
 }
 
 /// One background repo-resolution answer: git common dirs by workspace.
@@ -719,7 +769,8 @@ struct Endpoint {
     bar_widgets: Vec<BarWidget>,
     automations: AutomationSummary,
     tasks: TaskSummary,
-    /// Agents-only feed, so a hidden endpoint still lists its agents.
+    /// Hidden-endpoint feed: keeps its agents listed and caches the chrome
+    /// a later switch swaps in.
     feed: AgentFeed,
 }
 
@@ -831,10 +882,14 @@ struct L3sView {
     session_menu_open: bool,
     /// The ⌘⇧P command palette's query and selection.
     palette: Palette,
+    /// The palette's query field, an IME-capable field over `palette`'s buffer.
+    palette_input: Entity<TextInput>,
     /// Keeps the highlighted palette row scrolled into view.
     palette_scroll: ScrollHandle,
     /// The native Open Workspace folder picker.
     picker: WorkspacePicker,
+    /// The picker's path field, an IME-capable field over `picker`'s buffer.
+    picker_path: Entity<TextInput>,
     /// What the picker is currently being used for.
     picker_purpose: PickerPurpose,
     /// Keeps the highlighted picker row scrolled into view.
@@ -892,6 +947,9 @@ struct L3sView {
     tab_sel: Option<u16>,
     /// When the optimistic tab pick was made, so stale picks age out.
     tab_sel_at: Instant,
+    /// Optimistic endpoint pick from a click, until the handoff commits or
+    /// every stage of the switch has ended.
+    endpoint_sel: Option<EndpointId>,
     /// Optimistic focused agent (endpoint, pane), until `agent.list` confirms.
     agent_sel: Option<(EndpointId, String)>,
     /// When the optimistic agent pick was made, so stale picks age out.
@@ -948,6 +1006,8 @@ struct L3sView {
     app_version: String,
     /// Update feed URL while the Settings page is editing it.
     update_feed: TextField,
+    /// The feed-URL input, an IME-capable field over `update_feed`.
+    update_feed_input: Entity<TextInput>,
     /// Whether the update feed URL field owns the keyboard.
     update_url_editing: bool,
     /// Machine-manager revision signal, shared with the manager window.
@@ -956,6 +1016,10 @@ struct L3sView {
     seen_machine_revision: u64,
     /// Persistent projects and the in-window manager panel.
     projects: ProjectsPanel,
+    /// The project form's four inputs, entities over the panel's buffers.
+    project_inputs: [Entity<TextInput>; 4],
+    /// The inline new-worktree name input.
+    worktree_input: Entity<TextInput>,
     /// Git common dirs by `(endpoint key, cwd)`, resolving which repository
     /// a workspace belongs to no matter where its worktree lives.
     project_repo: HashMap<(String, String), Option<String>>,
@@ -976,6 +1040,8 @@ struct L3sView {
     project_repo_pending: bool,
     /// The Home composer's state.
     home: HomePanel,
+    /// The composer's prompt, an IME-capable field over `home`'s buffer.
+    home_prompt: Entity<TextInput>,
     /// Local branches of the Home composer's selected project.
     home_branches: Vec<String>,
     /// The project a branch listing belongs to, so a change reloads once.
@@ -984,7 +1050,7 @@ struct L3sView {
     home_branch_rx: Receiver<(String, Vec<String>)>,
     /// Sender half for the background branch reader.
     home_branch_tx: Sender<(String, Vec<String>)>,
-    /// Agent availability and models for the Home composer's machine.
+    /// Agent availability and models for the Home composer's project.
     agent_configs: Vec<AgentConfig>,
     /// Agent configs by machine key (`local` or a machine id), so switching
     /// back to a machine is instant.
@@ -1063,6 +1129,84 @@ impl L3sView {
         );
         let updater = cx.new(|cx| Updater::from_request(&update_request, cx));
         let auto_check = settings.auto_check_updates;
+        let initial_theme = *shared_theme.borrow();
+        let initial_fonts = style::Fonts::resolve(&shared_settings);
+        let home = HomePanel::default();
+        let home_prompt = cx.new(|cx| {
+            TextInput::from_shared(
+                home.prompt().shared(),
+                "Describe the work…",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                true,
+                initial_theme,
+                cx,
+            )
+            .submit_on_enter()
+        });
+        let picker = WorkspacePicker::default();
+        let picker_path = cx.new(|cx| {
+            TextInput::from_shared(
+                picker.path().shared(),
+                "Path",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+
+        let projects = ProjectsPanel::default();
+        let update_feed = TextField::default();
+        let update_feed_input = cx.new(|cx| {
+            TextInput::from_shared(
+                update_feed.shared(),
+                "Feed URL",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+        let project_inputs = [
+            Self::build_project_input(cx, &projects, ProjectField::Name, "Name", &shared_settings, initial_theme, initial_fonts.body),
+            Self::build_project_input(cx, &projects, ProjectField::Repository, "Repository", &shared_settings, initial_theme, initial_fonts.body),
+            Self::build_project_input(cx, &projects, ProjectField::BranchPrefix, "Branch prefix", &shared_settings, initial_theme, initial_fonts.body),
+            Self::build_project_input(cx, &projects, ProjectField::Location, "Location", &shared_settings, initial_theme, initial_fonts.body),
+        ];
+        let worktree_input = cx.new(|cx| {
+            TextInput::from_shared(
+                projects.worktree_name().shared(),
+                "Worktree name",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+
+        let palette = Palette::default();
+        let palette_input = cx.new(|cx| {
+            TextInput::from_shared(
+                palette.input().shared(),
+                "Type a command…",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+        // A query edit re-points the highlight at the best match. The field
+        // also notifies on caret blinks, which must not move the selection.
+        cx.observe(&palette_input, |this, _, cx| {
+            this.palette.refresh_selection();
+            cx.notify();
+        })
+        .detach();
 
         let mut view = Self {
             target,
@@ -1094,9 +1238,11 @@ impl L3sView {
             sessions,
             last_session_poll: Instant::now(),
             session_menu_open: false,
-            palette: Palette::default(),
+            palette,
+            palette_input,
             palette_scroll: ScrollHandle::new(),
             picker: WorkspacePicker::default(),
+            picker_path,
             picker_purpose: PickerPurpose::OpenWorkspace,
             picker_scroll: ScrollHandle::new(),
             picker_rx,
@@ -1126,6 +1272,7 @@ impl L3sView {
             nav_sel_at: Instant::now(),
             tab_sel: None,
             tab_sel_at: Instant::now(),
+            endpoint_sel: None,
             agent_sel: None,
             agent_sel_at: Instant::now(),
             sidebar_layout: None,
@@ -1153,11 +1300,14 @@ impl L3sView {
             updater: updater.clone(),
             last_update_status: UpdateStatus::Idle,
             app_version: crate::update::current_version().to_string(),
-            update_feed: TextField::default(),
+            update_feed,
+            update_feed_input,
             update_url_editing: false,
             machine_signal,
             seen_machine_revision: 0,
-            projects: ProjectsPanel::default(),
+            projects,
+            project_inputs,
+            worktree_input,
             project_repo: HashMap::new(),
             project_repo_rx,
             project_repo_tx,
@@ -1166,7 +1316,8 @@ impl L3sView {
             project_branch: HashMap::new(),
             project_sel: None,
             project_sel_at: Instant::now(),
-            home: HomePanel::default(),
+            home,
+            home_prompt,
             home_branches: Vec::new(),
             home_branch_project: None,
             home_branch_rx,
@@ -1268,13 +1419,26 @@ impl L3sView {
         if tabs_changed {
             self.reconcile_nav();
         }
+        // Drop the optimistic endpoint pick once the handoff commits (the
+        // committed highlight needs no pick) or every stage of the switch has
+        // ended without one (the highlight must revert to the real surface).
+        if let Some(selected) = self.endpoint_sel.clone()
+            && (selected == self.active || !self.switch_in_flight(&selected))
+        {
+            self.endpoint_sel = None;
+            if selected != self.active {
+                changed = true;
+            }
+        }
         // Drop the optimistic tab pick once `tab.list` agrees or it goes stale.
+        // The window covers a remote click's two SSH round trips (command,
+        // then the refresh that reads it back) with headroom for a slow link.
         if let Some(selected) = self.tab_sel {
             let confirmed = self
                 .tabs
                 .iter()
                 .any(|tab| tab.active && tab.index == selected);
-            if confirmed || self.tab_sel_at.elapsed() > Duration::from_secs(2) {
+            if confirmed || self.tab_sel_at.elapsed() > Duration::from_secs(4) {
                 self.tab_sel = None;
             }
         }
@@ -1285,7 +1449,7 @@ impl L3sView {
                     .agents
                     .iter()
                     .any(|agent| agent.pane == pane && agent.focused);
-            if confirmed || self.agent_sel_at.elapsed() > Duration::from_secs(2) {
+            if confirmed || self.agent_sel_at.elapsed() > Duration::from_secs(4) {
                 self.agent_sel = None;
             }
         }
@@ -1443,6 +1607,18 @@ impl L3sView {
                     match result {
                         Ok(()) => self.status = "created a new worktree".to_string(),
                         Err(error) => self.status = format!("couldn't create worktree: {error}"),
+                    }
+                    changed = true;
+                }
+                PickerEvent::LocalTerminalOpened(result) => {
+                    match result {
+                        Ok(()) => {
+                            self.status = "opened a local terminal".to_string();
+                            self.activate_project_endpoint(None, cx);
+                        }
+                        Err(error) => {
+                            self.status = format!("couldn't open a local terminal: {error}");
+                        }
                     }
                     changed = true;
                 }
@@ -1618,12 +1794,17 @@ impl L3sView {
                 }
             }
             // A hidden endpoint keeps its agent list fresh through its own
-            // agents-only feed; the rest of its chrome waits for activation.
+            // feed, and caches the tabs and bar a later switch will swap in,
+            // so committing a handoff never lands on a stale or empty strip.
+            // The cached chrome draws nowhere while hidden, so only an agent
+            // change costs a repaint.
             while let Some(update) = endpoint.feed.try_recv() {
                 if update.agents != endpoint.agents {
                     endpoint.agents = update.agents;
                     changed = true;
                 }
+                endpoint.tabs = update.tabs;
+                endpoint.bar_widgets = update.bar;
             }
             if disconnected.is_some() {
                 dropped.push(id.clone());
@@ -1724,7 +1905,19 @@ impl L3sView {
                     });
                     entry.failures = entry.failures.saturating_add(1);
                     entry.next_at = Instant::now() + reconnect_delay(entry.failures);
-                    self.status = if entry.failures >= RECONNECT_ATTEMPTS {
+                    // A paused machine will not produce the bridge a click is
+                    // waiting on; drop the request so the optimistic row
+                    // highlight does not stick on a host nobody is dialing.
+                    let paused = entry.failures >= RECONNECT_ATTEMPTS;
+                    if paused
+                        && self
+                            .wanted
+                            .as_ref()
+                            .is_some_and(|wanted| wanted.id.machine_id() == Some(id.as_str()))
+                    {
+                        self.wanted = None;
+                    }
+                    self.status = if paused {
                         format!("{id}: {error} (automatic retries paused)")
                     } else {
                         format!("{id}: {error}")
@@ -1786,13 +1979,14 @@ impl L3sView {
         self.switch_ticket = self.switch_ticket.wrapping_add(1);
         let ticket = self.switch_ticket;
         self.pending_switch = Some(PendingSwitch {
-            target,
+            target: target.clone(),
             focus,
             pane,
             ticket,
             prepared: false,
             started: Instant::now(),
         });
+        self.status = format!("switching to {}…", self.endpoint_label(&target));
     }
 
     /// Drop a pending handoff, returning its endpoint to a suspended state.
@@ -1803,6 +1997,11 @@ impl L3sView {
         if let Some(endpoint) = self.endpoints.get(&pending.target) {
             let _ = endpoint.connection.set_interest(SurfaceInterest::Suspended);
         }
+        // The visible surface keeps the window, so its session name is the
+        // honest status again; the "switching…" hint belongs to the handoff
+        // that just died. A superseding `begin_switch` or the timeout report
+        // overwrites this immediately.
+        self.status = self.connection.identity().session.clone();
     }
 
     /// Give up on a handoff whose target never produced a frame.
@@ -1815,13 +2014,17 @@ impl L3sView {
         if !expired {
             return;
         }
-        // A prepared-but-uncommitted frame still lets the handoff succeed; a
-        // target that never prepared is reported and cancelled.
-        if self
+        // A stalled handoff still commits when the target holds a frame —
+        // even a stale one keeps the window usable and refreshes once
+        // streaming resumes. A target with no frame at all is reported and
+        // cancelled: committing would blank a usable surface, and a failed or
+        // timed-out destination must not replace the current one.
+        let holds_frame = self
             .pending_switch
             .as_ref()
-            .is_some_and(|pending| pending.prepared)
-        {
+            .and_then(|pending| self.endpoints.get(&pending.target))
+            .is_some_and(|endpoint| endpoint.surface.frame().is_some());
+        if holds_frame {
             self.finish_switch();
             return;
         }
@@ -1846,8 +2049,8 @@ impl L3sView {
         }
         // The outgoing endpoint stops streaming but keeps its panes and size.
         let _ = self.connection.set_interest(SurfaceInterest::Suspended);
-        // Give the outgoing endpoint an agents-only feed so its agents stay in
-        // the list while it is hidden.
+        // Give the outgoing endpoint a hidden-endpoint feed so its agents
+        // stay in the list, and its cached chrome stays current, while hidden.
         let outgoing_feed = self.spawn_agents_feed(self.active_machine.as_ref());
 
         let Some(endpoint) = self.endpoints.remove(&target) else {
@@ -1863,9 +2066,9 @@ impl L3sView {
             bar_widgets,
             automations,
             tasks,
-            // The incoming agents-only feed is superseded by the full feed
-            // spawned below; the agent snapshot it already produced is moved
-            // into the active slots, so the list never flickers.
+            // The incoming hidden-endpoint feed is superseded by the full
+            // feed spawned below; the snapshots it already produced are moved
+            // into the active slots, so neither list nor tabs ever flicker.
             feed: _incoming_feed,
         } = endpoint;
         let outgoing_id = std::mem::replace(&mut self.active, target.clone());
@@ -1901,7 +2104,11 @@ impl L3sView {
         self.dragging = false;
         self.nav_sel = None;
         self.tab_sel = None;
+        self.endpoint_sel = None;
         self.close_picker();
+        // The swapped-in tabs carry their own active kind; follow it so the
+        // nav rows highlight the surface that just took the window.
+        self.reconcile_nav();
         self.active_live = true;
         self.status = self.connection.identity().session.clone();
         if let Some(workspace) = pending.focus {
@@ -1923,6 +2130,9 @@ impl L3sView {
         pane: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        // The row picks optimistically: the highlight reads the click now,
+        // while the handoff itself may still be crossing SSH.
+        self.endpoint_sel = Some(id.clone());
         if id == self.active {
             // Re-selecting the visible endpoint abandons any pending handoff.
             self.cancel_pending_switch();
@@ -1967,6 +2177,7 @@ impl L3sView {
             self.status = format!("unknown machine `{machine_id}`");
             return;
         };
+        self.status = format!("connecting to {}…", machine.display());
         // A manual click always retries and resets the backoff budget, even
         // after automatic attempts paused.
         self.reconnects.remove(&machine.id);
@@ -2151,6 +2362,32 @@ impl L3sView {
         ids
     }
 
+    /// Whether any stage of a switch to `endpoint` is still in flight: a
+    /// pending handoff, a bridge still connecting, or a requested endpoint
+    /// waiting for its bridge. The optimistic row highlight reads this, and
+    /// the poll loop drops the pick when every stage has ended.
+    fn switch_in_flight(&self, endpoint: &EndpointId) -> bool {
+        self.pending_switch
+            .as_ref()
+            .is_some_and(|pending| &pending.target == endpoint)
+            || self
+                .wanted
+                .as_ref()
+                .is_some_and(|wanted| &wanted.id == endpoint)
+            || self.connecting.contains(endpoint)
+    }
+
+    /// Whether an endpoint's rows draw as selected: an optimistic pick from
+    /// a click wins while the switch is in flight, then the committed surface.
+    /// Exactly one endpoint's rows light, so a click reads instantly even
+    /// while the two-phase handoff is still crossing SSH.
+    fn endpoint_selected(&self, endpoint: &EndpointId) -> bool {
+        match &self.endpoint_sel {
+            Some(selected) if self.switch_in_flight(selected) => selected == endpoint,
+            _ => *endpoint == self.active,
+        }
+    }
+
     /// A feed for the active endpoint: local socket or, for a machine, its
     /// remote UHP surface over the same SSH bridge family.
     fn spawn_feed_for_active(&self) -> AgentFeed {
@@ -2163,7 +2400,8 @@ impl L3sView {
         }
     }
 
-    /// An agents-only feed for a hidden endpoint, so its agents still list.
+    /// A hidden endpoint's feed, so its agents still list and the chrome a
+    /// later switch swaps in stays current.
     fn spawn_agents_feed(&self, machine: Option<&MachineInfo>) -> AgentFeed {
         match machine.and_then(MachineInfo::ssh_target) {
             Some(target) => AgentFeed::spawn_ssh_agents(target),
@@ -2171,7 +2409,7 @@ impl L3sView {
         }
     }
 
-    /// The agents-only feed for one machine.
+    /// The hidden-endpoint feed for one machine.
     fn agents_feed_for(&self, machine: &MachineInfo) -> AgentFeed {
         self.spawn_agents_feed(Some(machine))
     }
@@ -2245,26 +2483,32 @@ impl L3sView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // The Open Workspace picker owns every keystroke while it is open.
-        if self.picker.is_open() {
-            self.picker_key(event, cx);
-            return;
+        match self.input_layer() {
+            InputLayer::Picker => self.picker_key(event, cx),
+            InputLayer::Palette => self.palette_key(event, window, cx),
+            InputLayer::Home => self.home_key(event, cx),
+            InputLayer::Settings => self.settings_key(event, cx),
+            InputLayer::Terminal => self.terminal_key(event, cx),
         }
-        // The Home composer owns every keystroke while it is open.
-        if self.home.is_open() {
-            self.home_key(event, cx);
-            return;
-        }
-        // The Settings page owns every keystroke while it is open.
-        if self.projects.is_open() {
-            self.settings_key(event, cx);
-            return;
-        }
-        // An open palette owns every keystroke: type, navigate, run, dismiss.
-        if self.palette.is_open() {
-            self.palette_key(event, window, cx);
-            return;
-        }
+    }
+
+    /// The surface that owns the keyboard this frame, in stacking order.
+    ///
+    /// Overlays sit above content: the folder picker over everything, the
+    /// command palette over the Home composer or the Settings page. Key
+    /// routing and focus both read this, so they cannot disagree about who is
+    /// on top.
+    fn input_layer(&self) -> InputLayer {
+        top_layer(
+            self.picker.is_open(),
+            self.palette.is_open(),
+            self.home.is_open(),
+            self.projects.is_open(),
+        )
+    }
+
+    /// Forward a keystroke to the daemon's terminal.
+    fn terminal_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         // Chords the native menu owns: consume them so they never reach the
         // pane as input. The keymap dispatches the matching action.
@@ -2335,49 +2579,9 @@ impl L3sView {
                 self.palette_scroll
                     .scroll_to_item(self.palette.selected().min(len.saturating_sub(1)));
             }
-            "left" => self.palette.move_cursor(-1),
-            "right" => self.palette.move_cursor(1),
-            "home" => self.palette.cursor_home(),
-            "end" => self.palette.cursor_end(),
-            "delete" | "del" => {
-                // ⌘Delete clears the whole query, matching the field convention.
-                if keystroke.modifiers.platform {
-                    self.palette.clear();
-                } else {
-                    self.palette.delete();
-                }
-                self.palette_scroll.scroll_to_item(0);
-            }
-            "backspace" => {
-                if keystroke.modifiers.platform {
-                    self.palette.clear();
-                } else {
-                    self.palette.backspace();
-                }
-                self.palette_scroll.scroll_to_item(0);
-            }
-            "space" => {
-                self.palette.insert(" ");
-                self.palette_scroll.scroll_to_item(0);
-            }
-            _ => {
-                // Only unmodified text edits the query; chords stay inert.
-                if keystroke.modifiers.platform || keystroke.modifiers.control {
-                    return;
-                }
-                if let Some(text) = keystroke
-                    .key_char
-                    .as_deref()
-                    .filter(|text| !text.is_empty())
-                {
-                    self.palette.insert(text);
-                    self.palette_scroll.scroll_to_item(0);
-                } else if keystroke.key.chars().count() == 1 {
-                    // Some layouts deliver a bare character without `key_char`.
-                    self.palette.insert(&keystroke.key);
-                    self.palette_scroll.scroll_to_item(0);
-                }
-            }
+            // Everything else belongs to the query field: the entity handles
+            // editing and stops propagation, so only these keys reach here.
+            _ => {}
         }
         cx.notify();
     }
@@ -2392,6 +2596,12 @@ impl L3sView {
         };
         let mut entries = vec![
             entry(Command::NewTab, "New Tab", "Session", Some("⌘T")),
+            entry(
+                Command::OpenLocalTerminal,
+                "Open Local Terminal",
+                "Session",
+                Some("⌘⇧T"),
+            ),
             entry(Command::CloseTab, "Close Tab", "Session", Some("⌘W")),
             entry(
                 Command::SplitVertical,
@@ -2532,6 +2742,7 @@ impl L3sView {
         match command {
             Command::NewWindow => window.dispatch_action(NewWindow.boxed_clone(), cx),
             Command::NewTab => window.dispatch_action(NewTab.boxed_clone(), cx),
+            Command::OpenLocalTerminal => self.open_local_terminal(cx),
             Command::SplitVertical => window.dispatch_action(SplitVertical.boxed_clone(), cx),
             Command::SplitHorizontal => window.dispatch_action(SplitHorizontal.boxed_clone(), cx),
             Command::CloseTab => window.dispatch_action(CloseTab.boxed_clone(), cx),
@@ -2596,29 +2807,6 @@ impl L3sView {
         }
     }
 
-    /// Copy the palette query, mirroring [`Self::copy_selection`] for the grid.
-    fn copy_query(&self, cx: &mut Context<Self>) {
-        let query = self.palette.query();
-        if !query.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(query.to_string()));
-        }
-    }
-
-    /// Paste the system clipboard into the palette query, folding newlines so a
-    /// pasted block stays a single search line.
-    fn paste_into_palette(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            return;
-        };
-        if text.is_empty() {
-            return;
-        }
-        let text = text.replace(['\n', '\r'], " ");
-        self.palette.insert(&text);
-        self.palette_scroll.scroll_to_item(0);
-        cx.notify();
-    }
-
     /// Focus an agent's pane, switching workspace and tab as needed.
     ///
     /// The AGENTS row highlights immediately from the optimistic pick; the
@@ -2631,14 +2819,15 @@ impl L3sView {
         }
     }
 
-    /// Whether an agent row draws as the focused pane.
+    /// Whether an agent row draws as the focused pane: an optimistic click
+    /// wins across a slow link, then the daemon's own focus.
     fn agent_focused(&self, endpoint: &EndpointId, agent: &Agent) -> bool {
         if let Some((selected, pane)) = &self.agent_sel
-            && self.agent_sel_at.elapsed() < Duration::from_secs(2)
+            && self.agent_sel_at.elapsed() < Duration::from_secs(4)
         {
             return selected == endpoint && *pane == agent.pane;
         }
-        *endpoint == self.active && agent.focused
+        self.endpoint_selected(endpoint) && agent.focused
     }
 
     /// Focus a workspace by id, switching the daemon's active workspace.
@@ -2750,7 +2939,7 @@ impl L3sView {
         let current = self
             .projects
             .field(ProjectField::Location)
-            .value
+            .value()
             .trim()
             .to_string();
         let start = if current.is_empty() {
@@ -2835,34 +3024,11 @@ impl L3sView {
             return;
         }
         if self.picker.editing() {
-            match key {
-                "enter" => {
-                    if self.picker.jump().is_some() {
-                        self.list_picker(cx);
-                        self.picker_scroll.scroll_to_item(0);
-                    }
-                }
-                "backspace" => self.picker.path_mut().backspace(),
-                "delete" | "del" => self.picker.path_mut().delete(),
-                "left" => self.picker.path_mut().left(),
-                "right" => self.picker.path_mut().right(),
-                "home" => self.picker.path_mut().home(),
-                "end" => self.picker.path_mut().end(),
-                _ => {
-                    if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
-                        return;
-                    }
-                    if let Some(text) = event
-                        .keystroke
-                        .key_char
-                        .as_deref()
-                        .filter(|t| !t.is_empty())
-                    {
-                        self.picker.path_mut().insert(text);
-                    } else if event.keystroke.key.chars().count() == 1 {
-                        self.picker.path_mut().insert(&event.keystroke.key);
-                    }
-                }
+            // The path entity handles editing; a bare Enter is all that
+            // reaches here.
+            if key == "enter" && self.picker.jump().is_some() {
+                self.list_picker(cx);
+                self.picker_scroll.scroll_to_item(0);
             }
             cx.notify();
             return;
@@ -2951,7 +3117,7 @@ impl L3sView {
     /// The card's content: the Settings page while it is open, else the
     /// terminal grid. Sharing the card keeps the page inset exactly like
     /// the terminal, with the sidebar still showing beside it.
-    fn card_content(&self, cx: &mut Context<Self>, grid: Div) -> Div {
+    fn card_content(&self, cx: &mut Context<Self>, grid: Div, pad_x: f32, pad_y: f32) -> Div {
         if self.home.is_open() {
             return div()
                 .flex_1()
@@ -2965,7 +3131,8 @@ impl L3sView {
         div()
             .flex_1()
             .overflow_hidden()
-            .pt(px(TERMINAL_TOP_AIR))
+            .pl(px(pad_x))
+            .pt(px(pad_y))
             .child(grid)
     }
 
@@ -3000,10 +3167,6 @@ impl L3sView {
         self.leave_settings_page();
         self.picker.close();
         self.projects.reload(&self.l3s_root);
-        if self.home.new_branch().is_empty() {
-            self.home
-                .set_new_branch(generate_session_name(&self.session_names()));
-        }
         self.home.open();
         self.home_sync_key.clear();
         self.probe_machines();
@@ -3021,27 +3184,9 @@ impl L3sView {
             .collect()
     }
 
-    /// The enabled machine the Home composer's machine chip selects, if any.
-    fn home_machine_id(&self) -> Option<String> {
-        let cursor = self.home.choice(HomeField::Machine).cursor();
-        if cursor == 0 {
-            return None;
-        }
-        self.machines
-            .iter()
-            .filter(|machine| machine.id != "local" && machine.enabled)
-            .nth(cursor - 1)
-            .map(|machine| machine.id.clone())
-    }
-
-    /// The projects the Home composer offers, scoped to the machine chip.
+    /// The projects the Home composer offers.
     fn home_projects(&self) -> Vec<&Project> {
-        let machine = self.home_machine_id();
-        self.projects
-            .projects()
-            .iter()
-            .filter(|project| project.machine == machine)
-            .collect()
+        self.projects.projects().iter().collect()
     }
 
     /// The project the Home composer currently has highlighted.
@@ -3051,37 +3196,12 @@ impl L3sView {
             .and_then(|index| self.home_projects().get(index).copied())
     }
 
-    /// Whether the Home composer's selected project is a git repository with a
-    /// resolvable branch, so the branch and worktree pickers apply.
-    ///
-    /// Git facts resolve in the background; before the first answer the pickers
-    /// stay visible so a git project never flashes them off.
-    fn home_project_git(&self) -> bool {
-        let Some(project) = self.home_project() else {
-            return false;
-        };
-        let key = (project.endpoint_key().to_string(), project.location.clone());
-        match self.project_branch.get(&key) {
-            Some(None) => false,
-            Some(Some(_)) | None => true,
-        }
-    }
-
-    /// Move Home focus by one visible field, skipping the git pickers when the
-    /// selected project is not a repository.
+    /// Move Home focus by one field.
     fn home_move_focus(&mut self, backward: bool) {
-        for _ in 0..HomeField::ALL.len() + 2 {
-            if backward {
-                self.home.focus_prev();
-            } else {
-                self.home.focus_next();
-            }
-            match self.home.focus() {
-                HomeFocus::Prompt => return,
-                HomeFocus::Picker(HomeField::Base | HomeField::Branch)
-                    if !self.home_project_git() => {}
-                HomeFocus::Picker(_) => return,
-            }
+        if backward {
+            self.home.focus_prev();
+        } else {
+            self.home.focus_next();
         }
     }
 
@@ -3093,9 +3213,11 @@ impl L3sView {
             .find(|config| config.label == label)
     }
 
-    /// The machine key the Home composer's machine chip selects.
+    /// The machine key backing the selected project, `local` when none.
     fn home_machine_key(&self) -> String {
-        self.home_machine_id().unwrap_or_else(|| "local".to_string())
+        self.home_project()
+            .and_then(|project| project.machine.clone())
+            .unwrap_or_else(|| "local".to_string())
     }
 
     /// The SSH target for a machine key, or `None` for the local machine.
@@ -3150,8 +3272,7 @@ impl L3sView {
             return;
         }
         let signature = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            self.home.choice(HomeField::Machine).cursor(),
+            "{}|{}|{}|{}|{}|{}|{}",
             self.home
                 .choice(HomeField::Agent)
                 .selected()
@@ -3162,7 +3283,6 @@ impl L3sView {
                 .unwrap_or_default(),
             self.home.choice(HomeField::Project).cursor(),
             self.home_branches.len(),
-            self.machines.len(),
             self.projects.projects().len(),
             self.agent_configs.len(),
             self.agent_config_key.as_deref().unwrap_or_default(),
@@ -3171,15 +3291,6 @@ impl L3sView {
             return;
         }
         self.home_sync_key = signature;
-
-        let mut machines = vec!["Local".to_string()];
-        machines.extend(
-            self.machines
-                .iter()
-                .filter(|machine| machine.id != "local" && machine.enabled)
-                .map(|machine| machine.display().to_string()),
-        );
-        self.home.choice_mut(HomeField::Machine).set(machines);
 
         let mut agents: Vec<String> = self
             .agent_configs
@@ -3248,11 +3359,7 @@ impl L3sView {
             }
         }
 
-        let mut branches = vec![self.home.new_branch().to_string()];
-        branches.extend(self.home_branches.iter().cloned());
-        self.home.choice_mut(HomeField::Branch).set(branches);
-
-        let mut projects = vec!["No project".to_string()];
+        let mut projects = vec!["a personal workspace".to_string()];
         projects.extend(
             self.home_projects()
                 .iter()
@@ -3260,22 +3367,16 @@ impl L3sView {
         );
         self.home.choice_mut(HomeField::Project).set(projects);
 
-        // A hidden picker must not hold focus when the project changes.
-        if !self.home_project_git()
-            && matches!(
-                self.home.focus(),
-                HomeFocus::Picker(HomeField::Base | HomeField::Branch)
-            )
-        {
-            self.home.set_focus(HomeFocus::Picker(HomeField::Project));
-        }
+        self.home
+            .choice_mut(HomeField::Branch)
+            .set(self.home_branches.clone());
     }
 
     /// Load the selected project's local branches when the pick changes.
     ///
     /// Branch listing shells out to git, so it runs off-thread and reports
-    /// through a channel; remote projects keep only the generated name until
-    /// remote listing lands.
+    /// through a channel; remote projects keep the last listing until remote
+    /// listing lands.
     fn load_home_branches(&mut self) -> bool {
         let mut changed = false;
         while let Ok((id, branches)) = self.home_branch_rx.try_recv() {
@@ -3302,14 +3403,20 @@ impl L3sView {
         }) else {
             return changed;
         };
-        if project.machine.is_some() {
-            return changed;
-        }
+        let target = project
+            .machine
+            .as_deref()
+            .and_then(|id| self.machines.iter().find(|machine| machine.id == id))
+            .and_then(MachineInfo::ssh_target);
         let tx = self.home_branch_tx.clone();
         let id = project.id;
         let location = project.location;
         std::thread::spawn(move || {
-            tx.send((id, list_branches(&location))).ok();
+            let branches = match target {
+                Some(target) => list_branches_remote(&target, &location),
+                None => list_branches(&location),
+            };
+            tx.send((id, branches)).ok();
         });
         changed
     }
@@ -3359,38 +3466,12 @@ impl L3sView {
         }
 
         if self.home.focus() == HomeFocus::Prompt {
+            // The prompt entity handles editing and stops propagation; only
+            // the keys it declines (Tab, a bare Enter) reach here.
             match key {
-                "enter" => {
-                    if mods.shift {
-                        self.home.prompt_mut().newline();
-                    } else {
-                        self.home_send(cx);
-                        return;
-                    }
-                }
+                "enter" => self.home_send(cx),
                 "tab" => self.home_move_focus(mods.shift),
-                "backspace" => self.home.prompt_mut().backspace(),
-                "delete" | "del" => self.home.prompt_mut().delete(),
-                "left" => self.home.prompt_mut().left(),
-                "right" => self.home.prompt_mut().right(),
-                "home" => self.home.prompt_mut().home(),
-                "end" => self.home.prompt_mut().end(),
-                _ => {
-                    if mods.platform || mods.control {
-                        return;
-                    }
-                    if let Some(text) = event
-                        .keystroke
-                        .key_char
-                        .as_deref()
-                        .filter(|text| !text.is_empty())
-                    {
-                        self.home.prompt_mut().insert_multiline(text);
-                    } else if event.keystroke.key.chars().count() == 1 {
-                        let text = event.keystroke.key.clone();
-                        self.home.prompt_mut().insert_multiline(&text);
-                    }
-                }
+                _ => {}
             }
             cx.notify();
             return;
@@ -3417,7 +3498,7 @@ impl L3sView {
     /// Workspace setup and the agent start share one background thread and
     /// report through the picker channel, like the project worktree action.
     fn home_send(&mut self, cx: &mut Context<Self>) {
-        let prompt = self.home.prompt().value.trim().to_string();
+        let prompt = self.home.prompt().value().trim().to_string();
         if prompt.is_empty() {
             self.home.set_status("Write a prompt to send.".to_string());
             cx.notify();
@@ -3468,13 +3549,6 @@ impl L3sView {
         prompt: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(machine) = self.home_machine_id() {
-            self.home.set_status(format!(
-                "Personal workspaces are local; `{machine}` was selected."
-            ));
-            cx.notify();
-            return;
-        }
         let Ok(mut client) = ControlClient::connect(&self.api_socket()) else {
             self.home
                 .set_status("No control connection for this machine.".to_string());
@@ -3490,15 +3564,7 @@ impl L3sView {
                 .map_err(|error| format!("couldn't create {}: {error}", dir.display()))
                 .and_then(|()| {
                     let location = dir.to_string_lossy().into_owned();
-                    launch_home_agent(
-                        &mut client,
-                        &location,
-                        BaseMode::Local,
-                        "",
-                        &name,
-                        &agent,
-                        &prompt,
-                    )
+                    launch_home_agent(&mut client, &location, BaseMode::Checkout, "", &name, &agent, &prompt)
                 });
             tx.send(PickerEvent::HomeLaunched { machine: None, result })
                 .ok();
@@ -3506,16 +3572,99 @@ impl L3sView {
         cx.notify();
     }
 
+    /// Keep the keyboard where the Home composer says it is.
+    ///
+    /// The prompt is its own entity, so the window root cannot simply claim
+    /// focus each frame; when the composer is on a picker (or closed) the root
+    /// takes it back so chip navigation still works.
+    /// The form input entity for `field`.
+    fn project_input(&self, field: ProjectField) -> Entity<TextInput> {
+        self.project_inputs[match field {
+            ProjectField::Name => 0,
+            ProjectField::Repository => 1,
+            ProjectField::BranchPrefix => 2,
+            ProjectField::Location => 3,
+        }]
+        .clone()
+    }
+
+    /// Build a form input over the panel's shared buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn build_project_input(
+        cx: &mut Context<Self>,
+        projects: &ProjectsPanel,
+        field: ProjectField,
+        placeholder: &'static str,
+        settings: &Rc<RefCell<Settings>>,
+        theme: Theme,
+        font_size: f32,
+    ) -> Entity<TextInput> {
+        cx.new(|cx| {
+            TextInput::from_shared(
+                projects.field(field).shared(),
+                placeholder,
+                style::chrome_font(settings),
+                px(font_size),
+                false,
+                theme,
+                cx,
+            )
+        })
+    }
+
+    fn sync_focus(&self, window: &mut Window, cx: &mut App) {
+        let target = match self.input_layer() {
+            // The picker owns the keyboard; its path field only while editing,
+            // otherwise the window root so list navigation keeps working.
+            InputLayer::Picker => {
+                if self.picker.editing() {
+                    Some(self.picker_path.focus_handle(cx))
+                } else {
+                    None
+                }
+            }
+            InputLayer::Palette => Some(self.palette_input.focus_handle(cx)),
+            InputLayer::Home => {
+                if self.home.focus() == HomeFocus::Prompt {
+                    Some(self.home_prompt.focus_handle(cx))
+                } else {
+                    None
+                }
+            }
+            InputLayer::Settings => {
+                if self.update_url_editing {
+                    Some(self.update_feed_input.focus_handle(cx))
+                } else if self.projects.worktree_target().is_some() {
+                    Some(self.worktree_input.focus_handle(cx))
+                } else if self.projects.in_form() {
+                    self.projects
+                        .focus()
+                        .map(|field| self.project_input(field).focus_handle(cx))
+                } else {
+                    None
+                }
+            }
+            InputLayer::Terminal => None,
+        };
+        match target {
+            Some(handle) => {
+                if !handle.is_focused(window) {
+                    window.focus(&handle, cx);
+                }
+            }
+            None => {
+                let root = self.focus_handle.clone();
+                if !root.is_focused(window) {
+                    window.focus(&root, cx);
+                }
+            }
+        }
+    }
+
     /// The Home screen: the launch composer that fills the inset card.
     fn home_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let status = self.home.status().to_string();
-        let card = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .child(self.home_composer(cx))
-            .child(self.home_meta_row(cx));
         let mut column = div()
             .flex()
             .flex_col()
@@ -3524,14 +3673,15 @@ impl L3sView {
             .w_full()
             .max_w(px(720.0))
             .child(self.home_mark())
+            .child(self.home_headline(cx))
             .child(
                 div()
-                    .text_size(px(style::scaled(&self.shared_settings, 18.0)))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.fg)
-                    .child("Ready when you are"),
-            )
-            .child(card);
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(self.home_composer(cx))
+                    .child(self.home_footer(cx)),
+            );
         if !status.is_empty() {
             column = column.child(
                 div()
@@ -3542,7 +3692,6 @@ impl L3sView {
                     .child(status),
             );
         }
-        column = column.child(self.home_dropdown(cx));
         div()
             .id("l3s-home-scroll")
             .flex()
@@ -3555,6 +3704,107 @@ impl L3sView {
             .px_6()
             .py_8()
             .child(column)
+    }
+
+    /// The headline above the composer, naming the launch target inline.
+    fn home_headline(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .text_size(px(style::scaled(&self.shared_settings, 18.0)))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.fg)
+            .child("What should we build next in")
+            .child(self.home_headline_project(cx))
+    }
+
+    /// The project picker embedded in the headline.
+    ///
+    /// A secondary button, so it reads as the one clickable target in the
+    /// sentence.
+    fn home_headline_project(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let open = self.home.dropdown() == Some(HomeField::Project);
+        let value = self
+            .home
+            .choice(HomeField::Project)
+            .selected()
+            .unwrap_or_default()
+            .to_string();
+        let mut picker = style::small_button(
+            "l3s-home-headline-project",
+            div().max_w(px(320.0)).truncate().child(value),
+            style::ButtonKind::Secondary,
+            theme,
+            self.footer_font(),
+        )
+        .relative()
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(HomeField::Project, cx)))
+        .child(icon(
+            include_bytes!("../../assets/icons/chevron-down.svg"),
+            14.0,
+            theme.muted,
+        ));
+        if open {
+            picker = picker.child(self.home_dropdown_anchor(HomeField::Project, cx));
+        }
+        picker
+    }
+
+    /// The compact footer: the base picker on the left, the branch on the
+    /// right. In new-worktree mode the branch reads as `origin/<branch>`.
+    fn home_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .w_full()
+            .px_3()
+            .py(px(2.0))
+            .bg(theme.composer_footer)
+            .border_l_1()
+            .border_r_1()
+            .border_b_1()
+            .border_color(terminal_inset_border())
+            .rounded_b_lg()
+            .child(self.home_base_picker(cx))
+            .child(self.home_branch_picker(cx));
+        div().w_full().px_4().child(row)
+    }
+
+    /// The base-mode picker on the footer's left.
+    fn home_base_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let value = self
+            .home
+            .choice(HomeField::Base)
+            .selected()
+            .unwrap_or_default()
+            .to_string();
+        let leading = self.home_picker_leading(HomeField::Base, &value);
+        self.home_picker_face(HomeField::Base, leading, value, cx)
+    }
+
+    /// The branch picker in the footer. Under New worktree it names the
+    /// upstream it will branch from, so it reads `origin/<branch>`.
+    fn home_branch_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.home.choice(HomeField::Branch).selected();
+        let value = match selected {
+            Some(branch) if self.home.base_mode() == BaseMode::NewWorktree => {
+                format!("From: origin/{branch}")
+            }
+            Some(branch) => branch.to_string(),
+            None => "No branch".to_string(),
+        };
+        let leading = self.home_picker_leading(HomeField::Branch, &value);
+        self.home_picker_face(HomeField::Branch, leading, value, cx)
     }
 
     /// The app icon above the headline, falling back to the wordmark.
@@ -3572,79 +3822,42 @@ impl L3sView {
 
     /// The prompt edit area, with a caret on the cursor's line.
     fn home_prompt_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let text = self.home.prompt().value.clone();
-        let cursor = self.home.prompt().cursor;
-        let focused = self.home.focus() == HomeFocus::Prompt;
-        let lines: Vec<&str> = text.split('\n').collect();
-        // Locate the caret's line and column in characters.
-        let mut caret_line = 0usize;
-        let mut caret_col = cursor;
-        let mut consumed = 0usize;
-        for (index, line) in lines.iter().enumerate() {
-            let len = line.chars().count();
-            if cursor <= consumed + len {
-                caret_line = index;
-                caret_col = cursor - consumed;
-                break;
-            }
-            consumed += len + 1;
-            caret_line = index;
-            caret_col = len;
-        }
-        let mut rows = div().flex().flex_col().gap_1();
-        if text.is_empty() && !focused {
-            rows = rows.child(div().text_color(theme.muted).child("Describe the work…"));
-        } else {
-            for (index, line) in lines.iter().enumerate() {
-                if index == caret_line && focused {
-                    let before: String = line.chars().take(caret_col).collect();
-                    let after: String = line.chars().skip(caret_col).collect();
-                    rows = rows.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .child(div().text_color(theme.fg).child(before))
-                            .child(div().w(px(1.5)).h(px(18.0)).bg(theme.accent))
-                            .child(div().text_color(theme.fg).child(after)),
-                    );
-                } else {
-                    rows = rows.child(div().text_color(theme.fg).child((*line).to_string()));
-                }
-            }
-        }
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let entity = self.home_prompt.clone();
+        entity.update(cx, |input, _| {
+            input.set_style(self.theme, style::chrome_font(&self.shared_settings), px(fonts.body));
+        });
         div()
             .id("l3s-home-prompt")
             .flex()
             .flex_col()
             .min_h(px(112.0))
-            .px_5()
-            .pt_5()
-            .pb_3()
+            .px_4()
+            .pt_4()
+            .pb(px(0.0))
             .text_size(px(style::scaled(&self.shared_settings, 15.0)))
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.home.set_focus(HomeFocus::Prompt);
-                    this.home.prompt_mut().end();
+                    this.home.close_dropdown();
                     cx.notify();
                 }),
             )
-            .child(rows)
+            .child(entity)
     }
 
     /// The composer card: the prompt above a row of pickers and the send button.
     ///
-    /// Only the top corners round; the meta footer continues the same card.
+    /// The card rounds on every corner and floats above the meta footer.
     fn home_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         div()
             .flex()
             .flex_col()
             .w_full()
-            .rounded_t_lg()
+            .rounded_lg()
             .bg(theme.panel.opacity(0.0))
             .border_t_1()
             .border_l_1()
@@ -3661,8 +3874,8 @@ impl L3sView {
                     .justify_between()
                     .gap_3()
                     .px_4()
-                    .pt_1()
-                    .pb_4()
+                    .pt_2()
+                    .pb_2()
                     .child(
                         div()
                             .flex()
@@ -3677,156 +3890,77 @@ impl L3sView {
             )
     }
 
-    /// One picker chip inside the composer, styled like a tab.
+    /// One picker chip inside the composer, drawn like the footer pickers.
     fn home_chip(&self, field: HomeField, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let active = self.home.focus() == HomeFocus::Picker(field)
-            || self.home.dropdown() == Some(field);
         let value = self
             .home
             .choice(field)
             .selected()
             .unwrap_or_default()
             .to_string();
-        let fg = if active { theme.panel_fg } else { theme.muted };
-        let mut chip = div()
-            .id(format!("l3s-home-chip-{}", field.label()))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .h(px(TAB_HEIGHT))
-            .px_3()
-            .rounded_md()
-            .bg(if active { theme.panel } else { theme.window_bg })
-            .text_color(fg)
-            .cursor_pointer()
-            .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.home.set_focus(HomeFocus::Picker(field));
-                if this.home.dropdown() == Some(field) {
-                    this.home.close_dropdown();
-                } else {
-                    this.home.open_dropdown(field);
-                }
-                cx.notify();
-            }));
-        if active {
-            chip = chip.border_1().border_color(terminal_inset_border());
-        }
-        if field == HomeField::Agent {
-            chip = chip.child(icon(agent_icon(&value), 14.0, fg));
-        } else {
-            chip = chip.child(
-                div()
-                    .text_size(px(self.footer_font()))
-                    .text_color(theme.muted)
-                    .child(format!("{}:", field.label())),
-            );
-        }
-        chip.child(
-            div()
-                .max_w(px(200.0))
-                .truncate()
-                .text_size(px(self.chrome_font()))
-                .text_color(fg)
-                .child(value),
-        )
-        .child(icon(
-            include_bytes!("../../assets/icons/chevron-down.svg"),
-            13.0,
-            theme.muted,
-        ))
+        let leading = self.home_picker_leading(field, &value);
+        self.home_picker_face(field, leading, value, cx)
     }
 
     /// The icon-only circular send button.
     fn home_send_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         div()
-            .id("l3s-home-send")
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(30.0))
-            .h(px(30.0))
-            .rounded_full()
-            .bg(theme.panel)
-            .cursor_pointer()
-            .hover(move |style| style.bg(theme.border))
-            .on_click(cx.listener(|this, _, _, cx| this.home_send(cx)))
-            .child(icon(
-                include_bytes!("../../assets/icons/arrow-up.svg"),
-                15.0,
-                theme.fg,
-            ))
-    }
-
-    /// The machine, project, and git pickers below the composer.
-    fn home_meta_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let mut row = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .justify_center()
-            .gap_5()
-            .w_full()
-            .px_3()
-            .py_2()
-            .bg(theme.window_bg)
-            .border_l_1()
-            .border_r_1()
-            .border_b_1()
-            .border_color(terminal_inset_border())
-            .rounded_b_lg()
-            .child(self.home_meta_picker(HomeField::Machine, cx))
-            .child(self.home_meta_picker(HomeField::Project, cx));
-        // Branch and worktree only apply to a git project; a personal
-        // workspace has neither.
-        if self.home_project_git() {
-            row = row
-                .child(self.home_meta_picker(HomeField::Base, cx))
-                .child(self.home_meta_picker(HomeField::Branch, cx));
-        }
-        div().w_full().px_4().child(row)
-    }
-
-    /// One picker in the meta footer, styled like a tab.
-    fn home_meta_picker(&self, field: HomeField, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let active = self.home.focus() == HomeFocus::Picker(field)
-            || self.home.dropdown() == Some(field);
-        let fg = if active { theme.panel_fg } else { theme.muted };
-        let selected = match field {
-            HomeField::Base => self.home.base_mode().label().to_string(),
-            _ => self
-                .home
-                .choice(field)
-                .selected()
-                .unwrap_or_default()
-                .to_string(),
-        };
-        let leading: AnyElement = match field {
-            HomeField::Machine => icon(
-                include_bytes!("../../assets/icons/monitor.svg"),
-                15.0,
-                fg,
+            .pt_2()
+            .pb_2()
+            .child(
+                div()
+                    .id("l3s-home-send")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(30.0))
+                    .h(px(30.0))
+                    .rounded_full()
+                    .bg(theme.panel)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.border))
+                    .on_click(cx.listener(|this, _, _, cx| this.home_send(cx)))
+                    .child(icon(
+                        include_bytes!("../../assets/icons/arrow-up.svg"),
+                        15.0,
+                        theme.fg,
+                    )),
             )
-            .into_any_element(),
-            HomeField::Project => match self.home_project().and_then(|project| {
-                project
-                    .name
-                    .chars()
-                    .next()
-                    .map(|ch| ch.to_uppercase().to_string())
-            }) {
+    }
+
+    /// The fill color of a picker's leading glyph, brighter while its
+    /// dropdown is open.
+    fn home_picker_fg(&self, field: HomeField) -> gpui::Rgba {
+        if self.home.dropdown() == Some(field) {
+            self.theme.panel_fg
+        } else {
+            self.theme.muted
+        }
+    }
+
+    /// The leading glyph shared by a composer chip and a footer picker.
+    fn home_picker_leading(&self, field: HomeField, value: &str) -> AnyElement {
+        let fg = self.home_picker_fg(field);
+        let theme = self.theme;
+        let glyph = |bytes: &'static [u8]| icon(bytes, 14.0, fg).into_any_element();
+        match field {
+            HomeField::Agent => glyph(agent_icon(value)),
+            HomeField::Model => glyph(include_bytes!("../../assets/icons/cpu.svg")),
+            HomeField::Effort => glyph(include_bytes!("../../assets/icons/gauge.svg")),
+            HomeField::Base => glyph(include_bytes!("../../assets/icons/git-fork.svg")),
+            HomeField::Branch => glyph(include_bytes!("../../assets/icons/git-branch.svg")),
+            HomeField::Project => match self
+                .home_project()
+                .and_then(|project| project.name.chars().next())
+                .map(|ch| ch.to_uppercase().to_string())
+            {
                 Some(letter) => div()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .w(px(18.0))
-                    .h(px(18.0))
+                    .w(px(16.0))
+                    .h(px(16.0))
                     .rounded_sm()
                     .bg(theme.border)
                     .text_size(px(self.section_font()))
@@ -3834,33 +3968,35 @@ impl L3sView {
                     .text_color(theme.fg)
                     .child(letter)
                     .into_any_element(),
-                None => icon(include_bytes!("../../assets/icons/folder.svg"), 15.0, fg)
-                    .into_any_element(),
+                None => glyph(include_bytes!("../../assets/icons/folder.svg")),
             },
-            HomeField::Base => icon(
-                include_bytes!("../../assets/icons/git-fork.svg"),
-                15.0,
-                fg,
-            )
-            .into_any_element(),
-            HomeField::Branch => icon(
-                include_bytes!("../../assets/icons/git-branch.svg"),
-                15.0,
-                fg,
-            )
-            .into_any_element(),
-            _ => div().into_any_element(),
-        };
-        let mut item = div()
-            .id(format!("l3s-home-meta-{}", field.label()))
+        }
+    }
+
+    /// The compact face shared by every composer picker.
+    ///
+    /// Agent, model, and effort all draw through this, so the chips read as
+    /// one control with one interaction.
+    fn home_picker_face(
+        &self,
+        field: HomeField,
+        leading: AnyElement,
+        value: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let open = self.home.dropdown() == Some(field);
+        let fg = if open { theme.panel_fg } else { theme.muted };
+        let face = div()
+            .id(format!("l3s-home-picker-{}", field.label()))
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .h(px(TAB_HEIGHT))
-            .px_3()
+            .h(px(HOME_PICKER_HEIGHT))
+            .px_2()
             .rounded_md()
-            .bg(if active {
+            .bg(if open {
                 theme.panel
             } else {
                 theme.panel.opacity(0.0)
@@ -3868,43 +4004,66 @@ impl L3sView {
             .text_color(fg)
             .cursor_pointer()
             .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.home.set_focus(HomeFocus::Picker(field));
-                if this.home.dropdown() == Some(field) {
-                    this.home.close_dropdown();
-                } else {
-                    this.home.open_dropdown(field);
-                }
-                cx.notify();
-            }));
-        if active {
-            item = item.border_1().border_color(terminal_inset_border());
-        }
-        item.child(leading)
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(field, cx)));
+        let mut face = face
+            .child(leading)
             .child(
                 div()
                     .max_w(px(180.0))
                     .truncate()
-                    .text_size(px(self.chrome_font()))
+                    .text_size(px(self.footer_font()))
                     .text_color(fg)
-                    .child(selected),
+                    .child(value),
             )
             .child(icon(
                 include_bytes!("../../assets/icons/chevron-down.svg"),
-                13.0,
+                12.0,
                 theme.muted,
-            ))
+            ));
+        if self.home.dropdown() == Some(field) {
+            face = face.relative().child(self.home_dropdown_anchor(field, cx));
+        }
+        face.into_any_element()
     }
 
-    /// The open picker's option list, shown under the composer.
+    /// Toggle `field`'s dropdown from its chip.
     ///
+    /// A press outside the dropdown already closed it in the capture phase;
+    /// in that case this click is a toggle-off and must not reopen the picker.
+    fn toggle_home_dropdown(&mut self, field: HomeField, cx: &mut Context<Self>) {
+        self.home.set_focus(HomeFocus::Picker(field));
+        if self.home.take_dismissed() == Some(field) {
+            // Already closed by the outside press; stay closed.
+        } else if self.home.dropdown() == Some(field) {
+            self.home.close_dropdown();
+        } else {
+            self.home.open_dropdown(field);
+        }
+        cx.notify();
+    }
+
+    /// A zero-size anchor at the chip's top-left corner.
+    ///
+    /// The chip centers its real children, so an anchored child would inherit
+    /// that centering; pinning this wrapper to the top-left gives the dropdown
+    /// a stable origin without adding a flex item (and its gap) to the chip.
+    fn home_dropdown_anchor(&self, field: HomeField, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .child(self.home_dropdown(field, cx))
+            .into_any_element()
+    }
+
+    /// The open picker's option list, floated under the chip that owns it.
+    ///
+    /// Rendering it through `deferred`/`anchored` keeps it out of the centered
+    /// composer's flow, so opening a picker no longer shifts the layout.
     /// Large catalogs (Pi can list hundreds of models) are filtered and
     /// capped, so opening the dropdown never builds an unbounded element tree.
-    fn home_dropdown(&self, cx: &mut Context<Self>) -> Div {
+    fn home_dropdown(&self, field: HomeField, cx: &mut Context<Self>) -> AnyElement {
         const MAX_ROWS: usize = 100;
-        let Some(field) = self.home.dropdown() else {
-            return div();
-        };
         let theme = self.theme;
         let cursor = self.home.choice(field).cursor();
         let options = self.home.choice(field).options();
@@ -3917,9 +4076,14 @@ impl L3sView {
             .flex_col()
             .gap_1()
             .p_1()
-            .w_full()
+            .w(px(260.0))
             .max_h(px(240.0))
             .overflow_y_scroll()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.home.dismiss_dropdown();
+                cx.notify();
+            }))
             .rounded_lg()
             .bg(theme.bg)
             .border_1()
@@ -3984,7 +4148,15 @@ impl L3sView {
                     .child(format!("…{} more · type to filter", total - MAX_ROWS)),
             );
         }
-        div().w_full().child(list)
+        deferred(
+            anchored()
+                .anchor(Anchor::TopLeft)
+                .offset(point(px(0.0), px(HOME_PICKER_HEIGHT + 4.0)))
+                .snap_to_window_with_margin(px(8.0))
+                .child(list),
+        )
+        .with_priority(1)
+        .into_any_element()
     }
 
     /// Machine choice rows for the project form: Local, then saved machines.
@@ -4136,33 +4308,13 @@ impl L3sView {
     /// Route a keystroke to the open Settings page.
     fn settings_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
-        // The feed-URL input owns the keyboard while it is being edited.
+        // The feed-URL input owns the keyboard while it is being edited; only
+        // the keys it declines reach here.
         if self.update_url_editing {
             match key {
                 "escape" => self.update_url_editing = false,
                 "enter" => self.commit_update_feed(cx),
-                "backspace" => self.update_feed.backspace(),
-                "delete" | "del" => self.update_feed.delete(),
-                "left" => self.update_feed.left(),
-                "right" => self.update_feed.right(),
-                "home" => self.update_feed.home(),
-                "end" => self.update_feed.end(),
-                _ => {
-                    if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
-                        return;
-                    }
-                    if let Some(text) = event
-                        .keystroke
-                        .key_char
-                        .as_deref()
-                        .filter(|text| !text.is_empty())
-                    {
-                        self.update_feed.insert(text);
-                    } else if event.keystroke.key.chars().count() == 1 {
-                        let text = event.keystroke.key.clone();
-                        self.update_feed.insert(&text);
-                    }
-                }
+                _ => {}
             }
             cx.notify();
             return;
@@ -4186,26 +4338,13 @@ impl L3sView {
         if self.machine_pending_remove.is_some() && key != "shift" {
             self.machine_pending_remove = None;
         }
-        // The inline new-worktree input owns the keyboard while open.
+        // The inline new-worktree input owns the keyboard while open; only a
+        // bare Enter (submit) reaches here.
         if self.projects.worktree_target().is_some() {
-            match key {
-                "enter" => {
-                    if let Some((project, branch)) = self.projects.take_worktree() {
-                        self.create_project_worktree(project, branch, cx);
-                    }
-                }
-                "backspace" => self.projects.worktree_name_mut().backspace(),
-                "delete" | "del" => self.projects.worktree_name_mut().delete(),
-                "left" => self.projects.worktree_name_mut().left(),
-                "right" => self.projects.worktree_name_mut().right(),
-                "home" => self.projects.worktree_name_mut().home(),
-                "end" => self.projects.worktree_name_mut().end(),
-                _ => {
-                    if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
-                        return;
-                    }
-                    self.insert_into_worktree_name(event);
-                }
+            if key == "enter"
+                && let Some((project, branch)) = self.projects.take_worktree()
+            {
+                self.create_project_worktree(project, branch, cx);
             }
             cx.notify();
             return;
@@ -4238,22 +4377,10 @@ impl L3sView {
         cx.notify();
     }
 
-    /// Insert typed text into the inline worktree name field.
-    fn insert_into_worktree_name(&mut self, event: &KeyDownEvent) {
-        if let Some(text) = event
-            .keystroke
-            .key_char
-            .as_deref()
-            .filter(|text| !text.is_empty())
-        {
-            self.projects.worktree_name_mut().insert(text);
-        } else if event.keystroke.key.chars().count() == 1 {
-            let key = event.keystroke.key.clone();
-            self.projects.worktree_name_mut().insert(&key);
-        }
-    }
-
     /// Route a keystroke to the project create/edit form.
+    ///
+    /// The focused field entity handles editing; Tab, the machine chooser,
+    /// and submit are the only keys that reach here.
     fn projects_form_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         match key {
@@ -4273,39 +4400,7 @@ impl L3sView {
                 let ids = self.project_machine_ids();
                 let _ = self.projects.submit(&root, &ids);
             }
-            "backspace" | "delete" | "del" | "left" | "right" | "home" | "end" => {
-                let Some(field) = self.projects.focus() else {
-                    return;
-                };
-                let slot = self.projects.field_mut(field);
-                match key {
-                    "backspace" => slot.backspace(),
-                    "delete" | "del" => slot.delete(),
-                    "left" => slot.left(),
-                    "right" => slot.right(),
-                    "home" => slot.home(),
-                    _ => slot.end(),
-                }
-            }
-            _ => {
-                if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
-                    return;
-                }
-                let Some(field) = self.projects.focus() else {
-                    return;
-                };
-                if let Some(text) = event
-                    .keystroke
-                    .key_char
-                    .as_deref()
-                    .filter(|text| !text.is_empty())
-                {
-                    self.projects.field_mut(field).insert(text);
-                } else if event.keystroke.key.chars().count() == 1 {
-                    let key = event.keystroke.key.clone();
-                    self.projects.field_mut(field).insert(&key);
-                }
-            }
+            _ => {}
         }
         cx.notify();
     }
@@ -4773,11 +4868,16 @@ impl L3sView {
                 .projects()
                 .iter()
                 .find(|project| project.id == target)
-                .map(|project| project.branch_for(&self.projects.worktree_name().value))
+                .map(|project| project.branch_for(&self.projects.worktree_name().value()))
                 .unwrap_or_default();
-            let field = self.projects.worktree_name();
-            let before: String = field.value.chars().take(field.cursor).collect();
-            let after: String = field.value.chars().skip(field.cursor).collect();
+            let worktree_input = self.worktree_input.clone();
+            worktree_input.update(cx, |input, _| {
+                input.set_style(
+                    theme,
+                    style::chrome_font(&self.shared_settings),
+                    px(self.footer_font()),
+                );
+            });
             list = list.child(
                 div()
                     .flex()
@@ -4804,16 +4904,7 @@ impl L3sView {
                             .border_1()
                             .border_color(theme.accent)
                             .cursor_pointer()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .text_size(px(self.footer_font()))
-                                    .child(div().text_color(theme.fg).child(before))
-                                    .child(div().w(px(1.5)).h(px(14.0)).bg(theme.accent))
-                                    .child(div().text_color(theme.fg).child(after)),
-                            ),
+                            .child(worktree_input),
                     ),
             );
         }
@@ -5149,20 +5240,14 @@ impl L3sView {
     ) -> impl IntoElement {
         let theme = self.theme;
         let focused = self.projects.focus() == Some(field);
-        let text = self.projects.field(field).value.clone();
-        let cursor = self.projects.field(field).cursor;
-        let mut line = div().flex().flex_row().items_center().min_h(px(18.0));
-        if text.is_empty() && !focused {
-            line = line.child(div().text_color(theme.muted).child(label.to_string()));
-        } else {
-            let before: String = text.chars().take(cursor).collect();
-            let after: String = text.chars().skip(cursor).collect();
-            line = line.child(div().text_color(theme.fg).child(before));
-            if focused {
-                line = line.child(div().w(px(1.5)).h(px(14.0)).bg(theme.accent));
-            }
-            line = line.child(div().text_color(theme.fg).child(after));
-        }
+        let entity = self.project_input(field);
+        entity.update(cx, |input, _| {
+            input.set_style(
+                theme,
+                style::chrome_font(&self.shared_settings),
+                px(self.section_font()),
+            );
+        });
         style::field(
             format!("l3s-project-field-{label}"),
             label,
@@ -5170,20 +5255,19 @@ impl L3sView {
             theme,
             28.0,
             self.section_font(),
-            line,
+            entity,
         )
         .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    // Focus the field; Tab cycles from here.
-                    this.projects.cancel_delete();
-                    while this.projects.focus() != Some(field) {
-                        this.projects.cycle_focus(false);
-                    }
-                    this.projects.field_mut(field).end();
-                    cx.notify();
-                }),
-            )
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                // Focus the field; Tab cycles from here.
+                this.projects.cancel_delete();
+                while this.projects.focus() != Some(field) {
+                    this.projects.cycle_focus(false);
+                }
+                cx.notify();
+            }),
+        )
     }
 
     /// The UPDATES section of the page: channel, feed override, auto-check,
@@ -5204,14 +5288,15 @@ impl L3sView {
 
         let mut line = div().flex().flex_row().items_center().min_h(px(18.0));
         if editing {
-            let text = self.update_feed.value.clone();
-            let cursor = self.update_feed.cursor;
-            let before: String = text.chars().take(cursor).collect();
-            let after: String = text.chars().skip(cursor).collect();
-            line = line
-                .child(div().text_color(theme.fg).child(before))
-                .child(div().w(px(1.5)).h(px(14.0)).bg(theme.accent))
-                .child(div().text_color(theme.fg).child(after));
+            let input = self.update_feed_input.clone();
+            input.update(cx, |input, _| {
+                input.set_style(
+                    theme,
+                    style::chrome_font(&self.shared_settings),
+                    px(self.section_font()),
+                );
+            });
+            line = line.child(input);
         } else if let Some(url) = &explicit {
             line = line.child(div().truncate().text_color(theme.fg).child(url.clone()));
         } else {
@@ -5451,20 +5536,16 @@ impl L3sView {
         let theme = self.theme;
         let cwd = self.picker.cwd().to_string();
         let editing = self.picker.editing();
-        let path = self.picker.path();
-        let mut line = div().flex().flex_row().items_center().flex_1();
-        if editing {
-            let text = path.value.clone();
-            let cursor = path.cursor;
-            let before: String = text.chars().take(cursor).collect();
-            let after: String = text.chars().skip(cursor).collect();
-            line = line
-                .child(div().text_color(theme.fg).child(before))
-                .child(div().w(px(1.5)).h(px(16.0)).bg(theme.accent))
-                .child(div().text_color(theme.fg).child(after));
+        let picker_path = self.picker_path.clone();
+        picker_path.update(cx, |input, _| {
+            let fonts = style::Fonts::resolve(&self.shared_settings);
+            input.set_style(self.theme, style::chrome_font(&self.shared_settings), px(fonts.body));
+        });
+        let line = div().flex().flex_row().items_center().flex_1().child(if editing {
+            picker_path.into_any_element()
         } else {
-            line = line.child(div().text_color(theme.fg).child(cwd.clone()));
-        }
+            div().text_color(theme.fg).child(cwd.clone()).into_any_element()
+        });
         let path_field = div()
             .id("l3s-picker-path")
             .flex()
@@ -5909,6 +5990,7 @@ impl L3sView {
                 self.bar_widgets = Vec::new();
                 self.tabs = Vec::new();
                 self.tab_sel = None;
+                self.endpoint_sel = None;
                 self.agent_sel = None;
                 self.close_picker();
                 self.agents = Vec::new();
@@ -5978,15 +6060,15 @@ impl L3sView {
 
     /// Seed the feed-URL input and give it the keyboard.
     fn edit_update_feed(&mut self, cx: &mut Context<Self>) {
-        self.update_feed =
-            TextField::with_value(self.settings.update_feed_url.clone().unwrap_or_default());
+        self.update_feed
+            .set_value(self.settings.update_feed_url.clone().unwrap_or_default());
         self.update_url_editing = true;
         cx.notify();
     }
 
     /// Commit the feed-URL input; blank falls back to the channel default.
     fn commit_update_feed(&mut self, cx: &mut Context<Self>) {
-        let value = self.update_feed.value.trim().to_string();
+        let value = self.update_feed.value().trim().to_string();
         self.settings.update_feed_url = (!value.is_empty()).then_some(value);
         self.update_url_editing = false;
         self.save_update_settings(cx);
@@ -6609,10 +6691,11 @@ impl L3sView {
     }
 
     /// Whether a tab draws as active: an optimistic click wins briefly, then
-    /// the daemon's own active flag.
+    /// the daemon's own active flag. The window spans a remote click's SSH
+    /// round trips; a local one confirms long inside it.
     fn tab_active(&self, tab: &Tab) -> bool {
         match self.tab_sel {
-            Some(selected) if self.tab_sel_at.elapsed() < Duration::from_secs(2) => {
+            Some(selected) if self.tab_sel_at.elapsed() < Duration::from_secs(4) => {
                 tab.index == selected
             }
             _ => tab.active,
@@ -6624,6 +6707,25 @@ impl L3sView {
         if let Some(feed) = self.agent_feed.as_ref() {
             feed.new_tab();
         }
+    }
+
+    /// Open a terminal on the local machine, wherever the surface is pointed.
+    ///
+    /// `tab.new` creates a neutral workspace and terminal at the user's home
+    /// when none is open, so this is the local scratch shell even while a
+    /// remote endpoint owns the visible surface.
+    fn open_local_terminal(&mut self, cx: &mut Context<Self>) {
+        self.leave_settings_page();
+        self.status = "opening a local terminal…".to_string();
+        let socket = self.api_socket();
+        let tx = self.picker_tx.clone();
+        std::thread::spawn(move || {
+            let result = ControlClient::connect(&socket)
+                .and_then(|mut client| client.new_tab())
+                .map_err(|error| error.to_string());
+            tx.send(PickerEvent::LocalTerminalOpened(result)).ok();
+        });
+        cx.notify();
     }
 
     /// Split the focused pane; `right` is side by side, `down` is stacked.
@@ -6662,13 +6764,14 @@ impl L3sView {
 
     /// The native tab strip, full window width: toggle beside the traffic
     /// lights, tabs, and settings at the far right.
-    fn top_chrome(&self, cx: &mut Context<Self>, cell_width: f32) -> Div {
+    fn top_chrome(&self, cx: &mut Context<Self>, cell_width: f32, fullscreen: bool) -> Div {
         let theme = self.theme;
-        // Beside the sidebar when it is open; full width (clear of the
-        // traffic lights) when it is hidden.
+        // Beside the sidebar when it is open; full width when it is hidden.
+        // The left inset only clears the floating traffic lights, which
+        // fullscreen hides, so the strip runs to the edge there.
         let left = f32::from(self.sidebar_cells()) * cell_width;
-        let pad = if self.sidebar_visible {
-            12.0
+        let pad = if self.sidebar_visible || fullscreen {
+            TAB_STRIP_EDGE
         } else {
             TRAFFIC_LIGHT_CLEARANCE
         };
@@ -7109,9 +7212,6 @@ impl L3sView {
         let entries = self.palette_entries();
         let matches = self.palette.matches(&entries);
         let selected = self.palette.selected().min(matches.len().saturating_sub(1));
-        let query = self.palette.query().to_string();
-        let cursor = self.palette.cursor();
-        let select_all = self.palette.is_select_all();
 
         let mut rows = div()
             .id("l3s-palette-list")
@@ -7188,33 +7288,14 @@ impl L3sView {
             );
         }
 
-        let caret = div().w(px(1.5)).h(px(16.0)).bg(theme.accent);
-        let mut line = div().flex().flex_row().items_center().flex_1();
-        if query.is_empty() {
-            // Caret first, so the hint reads as a placeholder rather than text.
-            line = line.child(caret).child(
-                div()
-                    .pl(px(2.0))
-                    .text_color(theme.muted)
-                    .child("Type a command…"),
+        let palette_input = self.palette_input.clone();
+        palette_input.update(cx, |input, _| {
+            input.set_style(
+                theme,
+                style::chrome_font(&self.shared_settings),
+                px(self.chrome_font()),
             );
-        } else if select_all {
-            line = line.child(
-                div()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(theme.selection_bg)
-                    .text_color(theme.selection_fg)
-                    .child(query.clone()),
-            );
-        } else {
-            let before: String = query.chars().take(cursor).collect();
-            let after: String = query.chars().skip(cursor).collect();
-            line = line
-                .child(div().text_color(theme.fg).child(before))
-                .child(caret)
-                .child(div().text_color(theme.fg).child(after));
-        }
+        });
         let field = div()
             .flex()
             .flex_row()
@@ -7224,7 +7305,7 @@ impl L3sView {
             .border_b_1()
             .border_color(terminal_inset_border())
             .text_size(px(self.chrome_font()))
-            .child(line);
+            .child(palette_input);
 
         div()
             .absolute()
@@ -7279,7 +7360,7 @@ impl L3sView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
-        let active = *endpoint == self.active && workspace.active;
+        let active = self.endpoint_selected(endpoint) && workspace.active;
         let remote = endpoint.machine_id().is_some();
         let bg = if active { theme.panel } else { theme.window_bg };
         let cwd = shorten_home(&workspace.cwd);
@@ -8322,15 +8403,24 @@ impl L3sView {
         let cell_h = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
         let viewport = window.viewport_size();
         let card_x = f32::from(self.sidebar_cells()) * cell_w + CARD_GAP;
-        let grid_w = f32::from(viewport.width) - card_x - CARD_GAP_RIGHT - 2.0;
-        let grid_h =
+        // The card's inner box: inside the hairline border, before the grid's
+        // own breathing room.
+        let inner_w = f32::from(viewport.width) - card_x - CARD_GAP_RIGHT - 2.0;
+        let inner_h =
             f32::from(viewport.height) - HEADER_HEIGHT - FOOTER_HEIGHT - CARD_GAP - CARD_GAP - 2.0;
-        let cols = (grid_w / cell_w).clamp(20.0, 500.0) as u16;
-        let rows = ((grid_h - TERMINAL_TOP_AIR) / cell_h).clamp(5.0, 300.0) as u16;
+        let cols = ((inner_w - 2.0 * TERMINAL_PAD) / cell_w).clamp(20.0, 500.0) as u16;
+        let rows = ((inner_h - 2.0 * TERMINAL_PAD) / cell_h).clamp(5.0, 300.0) as u16;
+        // Center the whole-cell grid in the inner box so opposite gaps match;
+        // the sub-cell remainder splits instead of pooling on the right and
+        // bottom. Every gap is at least `TERMINAL_PAD` by construction.
+        let pad_x = ((inner_w - f32::from(cols) * cell_w) / 2.0).max(0.0);
+        let pad_y = ((inner_h - f32::from(rows) * cell_h) / 2.0).max(0.0);
         CardLayout {
             card_x,
-            origin_x: card_x + 1.0,
-            origin_y: HEADER_HEIGHT + CARD_GAP + 1.0 + TERMINAL_TOP_AIR,
+            pad_x,
+            pad_y,
+            origin_x: card_x + 1.0 + pad_x,
+            origin_y: HEADER_HEIGHT + CARD_GAP + 1.0 + pad_y,
             cols,
             rows,
             cell_w,
@@ -8361,12 +8451,21 @@ impl L3sView {
         self.cols = cols;
         self.rows = rows;
         self.sent_cell = cell;
-        let _ = self.connection.send(ClientMessage::Resize {
+        let resize = ClientMessage::Resize {
             cols,
             rows,
             cell_width_px: cell.0,
             cell_height_px: cell.1,
-        });
+        };
+        let _ = self.connection.send(resize.clone());
+        // Suspended endpoints keep their panes and PTY sizes, so a window
+        // resized while they are hidden would leave them reflowing content
+        // the moment they are switched to. Push the new size down every
+        // bridge; the prepare handoff then renders a candidate that already
+        // matches, and committing it never visibly resizes the terminal.
+        for endpoint in self.endpoints.values() {
+            let _ = endpoint.connection.send(resize.clone());
+        }
     }
 }
 
@@ -8381,9 +8480,7 @@ impl Render for L3sView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_metrics(window);
         self.sync_home();
-        if !self.focus_handle.is_focused(window) {
-            window.focus(&self.focus_handle, cx);
-        }
+        self.sync_focus(window, cx);
 
         let theme = self.theme;
         let cell_height = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
@@ -8510,29 +8607,18 @@ impl Render for L3sView {
                 this.control_held = event.modifiers.control;
             }))
             .on_action(cx.listener(|this, _: &CopySelection, _window, cx| {
-                if this.palette.is_open() {
-                    this.copy_query(cx);
-                } else {
-                    this.copy_selection(cx);
-                }
+                this.copy_selection(cx);
             }))
             .on_action(cx.listener(|this, _: &PasteClipboard, _window, cx| {
-                if this.palette.is_open() {
-                    this.paste_into_palette(cx);
-                } else {
-                    this.paste_clipboard(cx);
-                }
+                this.paste_clipboard(cx);
             }))
             .on_action(cx.listener(|this, _: &SelectAllGrid, window, cx| {
-                // With the palette open, ⌘A selects the query, not the grid.
-                if this.palette.is_open() {
-                    this.palette.select_all();
-                    cx.notify();
-                } else {
-                    this.select_all(window, cx);
-                }
+                this.select_all(window, cx);
             }))
             .on_action(cx.listener(|this, _: &NewTab, _window, _cx| this.new_tab()))
+            .on_action(cx.listener(|this, _: &OpenLocalTerminal, _window, cx| {
+                this.open_local_terminal(cx);
+            }))
             .on_action(cx.listener(|this, _: &SplitVertical, _window, _cx| this.split("right")))
             .on_action(cx.listener(|this, _: &SplitHorizontal, _window, _cx| this.split("down")))
             .on_action(cx.listener(|this, _: &CloseTab, _window, cx| {
@@ -8612,7 +8698,7 @@ impl Render for L3sView {
                         .border_color(terminal_inset_border())
                         .rounded_md()
                         .overflow_hidden()
-                        .child(self.card_content(cx, grid)),
+                        .child(self.card_content(cx, grid, layout.pad_x, layout.pad_y)),
                 ),
             )
             // Chrome layers live at the root so they paint above the content
@@ -8622,7 +8708,8 @@ impl Render for L3sView {
             .child(if self.home.is_open() {
                 div()
             } else {
-                self.top_chrome(cx, cell_width)
+                let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
+                self.top_chrome(cx, cell_width, fullscreen)
             })
             .child(self.session_menu(cx))
             .child(self.status_bar(cx))
@@ -9311,6 +9398,20 @@ mod tests {
         assert!(frame_reachable(&frame(-650., -450.), display));
         // Gone with the display it was recorded on.
         assert!(!frame_reachable(&frame(2400., 0.), display));
+    }
+
+    #[test]
+    fn overlays_own_the_keyboard_over_content() {
+        // Each content page owns the keyboard on its own...
+        assert_eq!(top_layer(false, false, true, false), InputLayer::Home);
+        assert_eq!(top_layer(false, false, false, true), InputLayer::Settings);
+        // ...but an overlay opened above one takes over.
+        assert_eq!(top_layer(false, true, true, false), InputLayer::Palette);
+        assert_eq!(top_layer(false, true, false, true), InputLayer::Palette);
+        // The folder picker is the topmost overlay.
+        assert_eq!(top_layer(true, true, true, true), InputLayer::Picker);
+        // With nothing open, the grid has it.
+        assert_eq!(top_layer(false, false, false, false), InputLayer::Terminal);
     }
 
     #[test]

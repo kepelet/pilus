@@ -37,7 +37,9 @@ package-dmg:
     ./scripts/package-macos-dmg.sh
 
 # Build the preview payload (DMG + manifest) the preview channel reads locally.
-preview-feed base_url="http://0.0.0.0:8000":
+# The base URL is baked into the manifest's asset URLs, so it must be an address
+# clients can reach: pass a Tailscale/LAN host to update another machine.
+preview-feed base_url="http://127.0.0.1:8000":
     L3S_PREVIEW_BASE_URL="{{base_url}}" ./scripts/preview-feed.sh
 
 # Serve the preview payload on the port the preview channel expects.

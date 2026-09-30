@@ -18,6 +18,7 @@ const MAX_RESULTS: usize = 40;
 pub enum Command {
     NewWindow,
     NewTab,
+    OpenLocalTerminal,
     SplitVertical,
     SplitHorizontal,
     CloseTab,

@@ -68,6 +68,8 @@ pub enum PickerEvent {
     Opened(Result<(), String>),
     /// A `worktree.create` request finished.
     WorktreeOpened(Result<(), String>),
+    /// A local terminal's `tab.new` finished.
+    LocalTerminalOpened(Result<(), String>),
     /// A project's `workspace.open` finished; `machine` owns the project
     /// (`None` is local), so the surface can hand off to its endpoint.
     ProjectOpened {

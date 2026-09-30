@@ -203,6 +203,8 @@ gpui::actions!([
     NewWindow,
     /// Open a new daemon tab.
     NewTab,
+    /// Open a terminal on the local machine.
+    OpenLocalTerminal,
     /// Split the focused pane side by side.
     SplitVertical,
     /// Split the focused pane stacked.
@@ -373,6 +375,7 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             Menu::new("File").items([
                 MenuItem::action("New Window", NewWindow),
                 MenuItem::action("New Tab", NewTab),
+                MenuItem::action("Open Local Terminal", OpenLocalTerminal),
                 MenuItem::action("New Agent…", OpenHome),
                 MenuItem::action("Open Workspace", OpenWorkspacePicker),
                 MenuItem::separator(),
@@ -459,6 +462,7 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-n", NewWindow, None),
         KeyBinding::new("cmd-shift-n", OpenHome, None),
         KeyBinding::new("cmd-t", NewTab, None),
+        KeyBinding::new("cmd-shift-t", OpenLocalTerminal, None),
         KeyBinding::new("cmd-d", SplitVertical, None),
         KeyBinding::new("cmd-shift-d", SplitHorizontal, None),
         KeyBinding::new("cmd-w", CloseTab, None),
@@ -1583,6 +1587,18 @@ impl L3sView {
                     }
                     changed = true;
                 }
+                PickerEvent::LocalTerminalOpened(result) => {
+                    match result {
+                        Ok(()) => {
+                            self.status = "opened a local terminal".to_string();
+                            self.activate_project_endpoint(None, cx);
+                        }
+                        Err(error) => {
+                            self.status = format!("couldn't open a local terminal: {error}");
+                        }
+                    }
+                    changed = true;
+                }
                 PickerEvent::ProjectOpened { machine, result } => {
                     match result {
                         Ok(()) => {
@@ -2495,6 +2511,12 @@ impl L3sView {
         };
         let mut entries = vec![
             entry(Command::NewTab, "New Tab", "Session", Some("⌘T")),
+            entry(
+                Command::OpenLocalTerminal,
+                "Open Local Terminal",
+                "Session",
+                Some("⌘⇧T"),
+            ),
             entry(Command::CloseTab, "Close Tab", "Session", Some("⌘W")),
             entry(
                 Command::SplitVertical,
@@ -2635,6 +2657,7 @@ impl L3sView {
         match command {
             Command::NewWindow => window.dispatch_action(NewWindow.boxed_clone(), cx),
             Command::NewTab => window.dispatch_action(NewTab.boxed_clone(), cx),
+            Command::OpenLocalTerminal => self.open_local_terminal(cx),
             Command::SplitVertical => window.dispatch_action(SplitVertical.boxed_clone(), cx),
             Command::SplitHorizontal => window.dispatch_action(SplitHorizontal.boxed_clone(), cx),
             Command::CloseTab => window.dispatch_action(CloseTab.boxed_clone(), cx),
@@ -6602,6 +6625,25 @@ impl L3sView {
         }
     }
 
+    /// Open a terminal on the local machine, wherever the surface is pointed.
+    ///
+    /// `tab.new` creates a neutral workspace and terminal at the user's home
+    /// when none is open, so this is the local scratch shell even while a
+    /// remote endpoint owns the visible surface.
+    fn open_local_terminal(&mut self, cx: &mut Context<Self>) {
+        self.leave_settings_page();
+        self.status = "opening a local terminal…".to_string();
+        let socket = self.api_socket();
+        let tx = self.picker_tx.clone();
+        std::thread::spawn(move || {
+            let result = ControlClient::connect(&socket)
+                .and_then(|mut client| client.new_tab())
+                .map_err(|error| error.to_string());
+            tx.send(PickerEvent::LocalTerminalOpened(result)).ok();
+        });
+        cx.notify();
+    }
+
     /// Split the focused pane; `right` is side by side, `down` is stacked.
     fn split(&self, direction: &str) {
         if let Some(feed) = self.agent_feed.as_ref() {
@@ -8472,6 +8514,9 @@ impl Render for L3sView {
                 this.select_all(window, cx);
             }))
             .on_action(cx.listener(|this, _: &NewTab, _window, _cx| this.new_tab()))
+            .on_action(cx.listener(|this, _: &OpenLocalTerminal, _window, cx| {
+                this.open_local_terminal(cx);
+            }))
             .on_action(cx.listener(|this, _: &SplitVertical, _window, _cx| this.split("right")))
             .on_action(cx.listener(|this, _: &SplitHorizontal, _window, _cx| this.split("down")))
             .on_action(cx.listener(|this, _: &CloseTab, _window, cx| {

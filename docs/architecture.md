@@ -1,15 +1,15 @@
 # Architecture
 
-`l3s` is three crates with a one-way dependency chain:
+`pilus` is three crates with a one-way dependency chain:
 
 ```
-l3s (GPUI window)
-  └── l3s-client (socket, handshake, event stream, Surface)
-        └── l3s-protocol (messages, frames, framing)
+pilus (GPUI window)
+  └── pilus-client (socket, handshake, event stream, Surface)
+        └── pilus-protocol (messages, frames, framing)
 ```
 
-Nothing in `l3s-protocol` or `l3s-client` knows about GPUI, so the connection
-layer is testable headlessly (see `crates/l3s-client/tests/handshake.rs`).
+Nothing in `pilus-protocol` or `pilus-client` knows about GPUI, so the connection
+layer is testable headlessly (see `crates/pilus-client/tests/handshake.rs`).
 
 ## Why the client is a thin painter
 
@@ -32,17 +32,17 @@ debug build). Sockets live there:
 <root>/sessions/<name>/luvus-client.sock named session render socket
 ```
 
-`l3s` attaches to the **render** socket (`luvus-client.sock`). `$LUVUS_SESSION`
+`pilus` attaches to the **render** socket (`luvus-client.sock`). `$LUVUS_SESSION`
 selects a session, matching the daemon's own environment convention; `--session`
 and `--socket` override it. When the derived path is too long for `sun_path`,
-both the daemon and `l3s` relocate it to a hashed, owner-scoped alias under the
+both the daemon and `pilus` relocate it to a hashed, owner-scoped alias under the
 temporary directory (`discovery::alias_for`).
 
-When nothing answers at the socket, the daemon isn't running, so `l3s` starts
+When nothing answers at the socket, the daemon isn't running, so `pilus` starts
 it with `luvus [--session NAME] server start` and waits for the socket
 (`autostart::ensure_server`, called from `connect`). The child gets
 `LUVUS_HOME` pinned to the target's state root, so it starts the same daemon
-`l3s` would have attached to. Liveness is checked by dialing, not by file
+`pilus` would have attached to. Liveness is checked by dialing, not by file
 existence, because a stopped server leaves its socket file behind.
 
 ## Handshake
@@ -58,7 +58,7 @@ client → TerminalColors(None)          // only when probe_terminal
 ```
 
 `Welcome` is decoded before the version check so a mismatch still produces a
-readable error. `l3s` paints its own surfaces and reports no terminal palette,
+readable error. `pilus` paints its own surfaces and reports no terminal palette,
 but it must still answer the color probe or the server will not stream frames.
 
 After the handshake the server streams `ServerMessage`s and the client may send
@@ -101,9 +101,9 @@ and never paints from a non-GUI thread.
 ## Client-owned sidebar
 
 By default the daemon renders the workspaces and agents docks into the grid
-like any other panel. `l3s` takes the whole left sidebar instead.
+like any other panel. `pilus` takes the whole left sidebar instead.
 
-**Workspaces.** After the handshake, `l3s` sends:
+**Workspaces.** After the handshake, `pilus` sends:
 
 ```text
 ShellDockLayout { owns_workspaces: true, owns_session_chrome: true, .. }
@@ -123,14 +123,14 @@ session-name slot (`session_button: None`) and exposes no hit target, so the
 native shell draws that top-row chrome itself.
 
 **The agents dock.** The protocol does not project agents, but the daemon sends
-its current layout as `ShellSidebars`. `l3s` drops the `agents` dock from that
+its current layout as `ShellSidebars`. `pilus` drops the `agents` dock from that
 layout, bumps the revision, and sends it back. The daemon then renders no
 agents dock, and the workspaces slot grows to fill the sidebar — the `ShellDock`
 rectangle gets taller, which is where the native panel is painted. This is
 per-connection state; the daemon's own config is untouched.
 
 **Agents.** The live agent list comes from a different surface: UHP on
-`luvus.sock`, method `agent.list`. `l3s-client`'s `ControlClient` speaks the
+`luvus.sock`, method `agent.list`. `pilus-client`'s `ControlClient` speaks the
 newline-delimited `{id, method, params}` protocol. Refreshes are event-driven:
 `AgentFeed` holds an `events.subscribe` stream and re-reads `agent.list`,
 `ui.bar.list`, and `tab.list` only when a structural event arrives, plus a
@@ -183,8 +183,8 @@ one. Only two regions are client-claimable:
 | --- | --- | --- |
 | Workspaces sidebar | yes | `ShellDockLayout.owns_workspaces` |
 | Session-name pill | yes | `ShellDockLayout.owns_session_chrome` |
-| Tab bar (1 row) | no | always drawn; `l3s` covers it |
-| Status line (1 row) | no | always drawn unless width-based mobile mode; `l3s` covers it |
+| Tab bar (1 row) | no | always drawn; `pilus` covers it |
+| Status line (1 row) | no | always drawn unless width-based mobile mode; `pilus` covers it |
 
 There is no `owns_tabs` or `owns_status` flag, no `show_tab_bar`/`hide_chrome`
 config, and no message that reclaims those rows for pane content. The tab bar
@@ -204,12 +204,12 @@ decides how to draw the rows.
 Saved SSH profiles turn one window into several endpoints. A profile is
 owner-local to the local named session (`machines.json` under the state root)
 and is read with `luvus machine list --json`; the CLI remains the authority for
-provisioning and reachability, so `l3s` never installs or replaces a remote
+provisioning and reachability, so `pilus` never installs or replaces a remote
 binary itself.
 
 Each enabled machine becomes one endpoint:
 
-- **Transport.** `l3s-client` spawns `ssh -T -o BatchMode=yes …
+- **Transport.** `pilus-client` spawns `ssh -T -o BatchMode=yes …
   <destination> <remote_binary> [--session NAME] remote-client-bridge` and
   treats the child's stdin/stdout as the same `Stream` a local socket uses
   (`transport::SshTarget`, `machines::connect_machine`). Stderr is drained on a
@@ -301,7 +301,7 @@ joined by `\n`, colour expressed only through SGR, with no cursor addressing,
 no scrolling, and no `\r`. `terminal.backend.capture` returns the same text on
 demand, and `terminal.backend.control` sends input back.
 
-So `l3s-client` needs no VT emulator for this path — only an SGR parser. That
+So `pilus-client` needs no VT emulator for this path — only an SGR parser. That
 lives in `ansi.rs` (`ansi::parse(text, lines) -> Screen`), which folds a frame
 into rows of styled runs and which `--probe-uhp` uses to print frames.
 `uhp.rs` wraps the socket: one connection per ordinary request
@@ -353,6 +353,6 @@ Selection lives in `gui/selection.rs`: it normalizes a reversed drag, answers
   so they are visible but not client-native.
 - Double-click to select a word, and triple-click to select a line.
 - Named-pipe transport on Windows.
-- Remote install/repair from the window: `l3s` connects with an already
+- Remote install/repair from the window: `pilus` connects with an already
   provisioned remote binary and tells you to run `luvus machine enable` when
   one is missing; the machine-create form is not drawn natively yet.

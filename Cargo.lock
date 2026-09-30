@@ -3003,54 +3003,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "l3s"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "gpui-pre",
- "gpui-pre-platform",
- "gpui-updater-core",
- "image",
- "l3s-client",
- "l3s-protocol",
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "objc2-foundation 0.3.2",
- "resvg",
- "serde",
- "serde_json",
- "tracing",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "l3s-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossbeam-channel",
- "interprocess",
- "l3s-protocol",
- "libc",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tracing",
-]
-
-[[package]]
-name = "l3s-protocol"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "crossterm",
- "serde",
- "thiserror 2.0.21",
- "unicode-width",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4135,6 +4087,54 @@ name = "pico-args"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
+
+[[package]]
+name = "pilus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "gpui-updater-core",
+ "image",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "pilus-client",
+ "pilus-protocol",
+ "resvg",
+ "serde",
+ "serde_json",
+ "tracing",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "pilus-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "interprocess",
+ "libc",
+ "pilus-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "pilus-protocol"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "crossterm",
+ "serde",
+ "thiserror 2.0.21",
+ "unicode-width",
+]
 
 [[package]]
 name = "pin-project"

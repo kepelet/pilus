@@ -18,15 +18,15 @@ clippy:
 
 # Attach to the default session.
 run:
-    cargo run -p l3s
+    cargo run -p pilus
 
 # Connect once and print the first frame, without a window.
 probe:
-    cargo run -p l3s --no-default-features -- --probe
+    cargo run -p pilus --no-default-features -- --probe
 
 # Build the release binary.
 build:
-    cargo build --release -p l3s
+    cargo build --release -p pilus
 
 # Assemble a macOS .app bundle with the icon and Info.plist.
 bundle:
@@ -40,7 +40,7 @@ package-dmg:
 # The base URL is baked into the manifest's asset URLs, so it must be an address
 # clients can reach: pass a Tailscale/LAN host to update another machine.
 preview-feed base_url="http://127.0.0.1:8000":
-    L3S_PREVIEW_BASE_URL="{{base_url}}" ./scripts/preview-feed.sh
+    PILUS_PREVIEW_BASE_URL="{{base_url}}" ./scripts/preview-feed.sh
 
 # Serve the preview payload on the port the preview channel expects.
 serve-preview:
@@ -48,4 +48,4 @@ serve-preview:
 
 # Check the OTA release source without opening a window.
 check-updates *args:
-    cargo run -p l3s --no-default-features -- --check-updates {{args}}
+    cargo run -p pilus --no-default-features -- --check-updates {{args}}

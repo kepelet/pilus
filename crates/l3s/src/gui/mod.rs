@@ -763,6 +763,9 @@ struct Endpoint {
     machine: Option<MachineInfo>,
     connection: Connection,
     surface: Surface,
+    last_rx: Instant,
+    probe_sent: Option<Instant>,
+    answers_probes: bool,
     status: String,
     tabs: Vec<Tab>,
     agents: Vec<Agent>,
@@ -986,6 +989,8 @@ struct L3sView {
     pending_switch: Option<PendingSwitch>,
     /// Monotonic ticket source for prepared frames.
     switch_ticket: u64,
+    /// Nonce source for hidden-endpoint liveness probes.
+    health_nonce: u64,
     /// Background machine connections.
     machine_connect_rx: Receiver<MachineConnect>,
     machine_connect_tx: Sender<MachineConnect>,
@@ -1291,6 +1296,7 @@ impl L3sView {
             wanted: None,
             pending_switch: None,
             switch_ticket: 0,
+            health_nonce: 0,
             machine_connect_rx,
             machine_connect_tx,
             auto_connected: HashSet::new(),
@@ -1720,6 +1726,9 @@ impl L3sView {
                     // render bridge is down, and queue a backoff reconnect.
                     self.agent_feed = None;
                     if let Some(machine) = self.active_machine.clone() {
+                        if let Some(target) = machine.ssh_target() {
+                            target.release_control_master();
+                        }
                         self.schedule_reconnect(machine);
                     }
                     changed = true;
@@ -1764,6 +1773,9 @@ impl L3sView {
             .pending_switch
             .as_ref()
             .map(|pending| (pending.target.clone(), pending.ticket));
+        let our_revision = self.sidebar_revision;
+        let our_layout = self.sidebar_layout.clone();
+        let mut newer_sidebar_revision = false;
         let ids: Vec<EndpointId> = self.endpoints.keys().cloned().collect();
         for id in ids {
             let Some(endpoint) = self.endpoints.get_mut(&id) else {
@@ -1771,12 +1783,25 @@ impl L3sView {
             };
             let mut disconnected = None;
             while let Some(event) = endpoint.connection.try_recv() {
+                endpoint.last_rx = Instant::now();
+                endpoint.probe_sent = None;
                 match event {
                     ClientEvent::Ready { identity, .. } => {
                         endpoint.status = identity.session;
                         changed = true;
                     }
                     ClientEvent::Message(message) => {
+                        // Only a rejected layout needs a re-push; a daemon that adopted
+                        // ours under its own revision must not trigger an echo loop.
+                        if let l3s_protocol::ServerMessage::ShellSidebars(sidebars) = &message
+                            && sidebars.revision > our_revision
+                            && !adopts_layout(sidebars, our_layout.as_ref())
+                        {
+                            newer_sidebar_revision = true;
+                        }
+                        if matches!(&message, l3s_protocol::ServerMessage::HealthCheck { .. }) {
+                            endpoint.answers_probes = true;
+                        }
                         if let l3s_protocol::ServerMessage::MachineCatalogChanged { .. } = &message
                         {
                             catalog = true;
@@ -1806,28 +1831,58 @@ impl L3sView {
                 endpoint.tabs = update.tabs;
                 endpoint.bar_widgets = update.bar;
             }
+            if disconnected.is_none() {
+                if endpoint.probe_sent.is_some_and(|sent| {
+                    endpoint.answers_probes && sent.elapsed() >= Duration::from_secs(10)
+                }) {
+                    disconnected = Some("health check timed out".to_string());
+                } else if endpoint.probe_sent.is_none()
+                    && endpoint.last_rx.elapsed() >= Duration::from_secs(5)
+                {
+                    self.health_nonce = self.health_nonce.wrapping_add(1);
+                    let _ = endpoint.connection.health_check(self.health_nonce);
+                    endpoint.probe_sent = Some(Instant::now());
+                }
+            }
             if disconnected.is_some() {
                 dropped.push(id.clone());
                 changed = true;
             }
         }
+        if newer_sidebar_revision && self.sidebar_layout.is_some() {
+            self.push_sidebar_layout();
+        }
         // A dropped suspended machine is torn down and reconnected from
         // scratch; its surface closes with its SSH bridge.
         for id in dropped {
             if let EndpointId::Machine(machine_id) = &id {
-                self.endpoints.remove(&id);
-                if self
+                let pending_switch = self
                     .pending_switch
                     .as_ref()
-                    .is_some_and(|pending| pending.target == id)
+                    .is_some_and(|pending| pending.target == id);
+                let label = self.endpoint_label(&id);
+                let endpoint = self.endpoints.remove(&id);
+                if let Some(target) = endpoint
+                    .as_ref()
+                    .and_then(|endpoint| endpoint.machine.as_ref())
+                    .and_then(MachineInfo::ssh_target)
                 {
-                    self.pending_switch = None;
+                    target.release_control_master();
                 }
-                if let Some(machine) = self
-                    .machines
-                    .iter()
-                    .find(|machine| &machine.id == machine_id)
-                    .cloned()
+                if pending_switch {
+                    self.pending_switch = None;
+                    self.status = format!(
+                        "{} · lost connection to {label}",
+                        self.connection.identity().session
+                    );
+                }
+                if let Some(machine) =
+                    endpoint.and_then(|endpoint| endpoint.machine).or_else(|| {
+                        self.machines
+                            .iter()
+                            .find(|machine| &machine.id == machine_id)
+                            .cloned()
+                    })
                 {
                     self.schedule_reconnect(machine);
                 }
@@ -1877,6 +1932,9 @@ impl L3sView {
                         cell_width_px: self.sent_cell.0,
                         cell_height_px: self.sent_cell.1,
                     });
+                    if let Some(message) = self.sidebar_message() {
+                        let _ = connection.send(message);
+                    }
                     let feed = self.agents_feed_for(&machine);
                     self.endpoints.insert(
                         id,
@@ -1884,6 +1942,9 @@ impl L3sView {
                             machine: Some(machine),
                             connection,
                             surface: Surface::new(),
+                            last_rx: Instant::now(),
+                            probe_sent: None,
+                            answers_probes: false,
                             status: "connecting…".to_string(),
                             tabs: Vec::new(),
                             agents: Vec::new(),
@@ -1948,6 +2009,13 @@ impl L3sView {
         let ticket = pending.ticket;
         let (cols, rows) = (self.cols, self.rows);
         if let Some(endpoint) = self.endpoints.get(&target) {
+            if let Some(workspace_id) = pending.focus.as_ref() {
+                let _ = endpoint
+                    .connection
+                    .send(ClientMessage::ShellWorkspaceFocus {
+                        workspace_id: workspace_id.clone(),
+                    });
+            }
             let _ = endpoint.connection.set_interest(SurfaceInterest::Prepared);
             let _ = endpoint.connection.prepare_surface(ticket, cols, rows);
             if let Some(pending) = self.pending_switch.as_mut() {
@@ -2019,12 +2087,12 @@ impl L3sView {
         // streaming resumes. A target with no frame at all is reported and
         // cancelled: committing would blank a usable surface, and a failed or
         // timed-out destination must not replace the current one.
-        let holds_frame = self
-            .pending_switch
-            .as_ref()
-            .and_then(|pending| self.endpoints.get(&pending.target))
-            .is_some_and(|endpoint| endpoint.surface.frame().is_some());
-        if holds_frame {
+        let can_commit = self.pending_switch.as_ref().is_some_and(|pending| {
+            self.endpoints.get(&pending.target).is_some_and(|endpoint| {
+                endpoint.surface.frame().is_some() && endpoint.last_rx >= pending.started
+            })
+        });
+        if can_commit {
             self.finish_switch();
             return;
         }
@@ -2060,6 +2128,9 @@ impl L3sView {
             machine,
             connection,
             surface,
+            last_rx: _,
+            probe_sent: _,
+            answers_probes: _,
             status,
             tabs,
             agents,
@@ -2082,6 +2153,9 @@ impl L3sView {
             bar_widgets: std::mem::replace(&mut self.bar_widgets, bar_widgets),
             automations: std::mem::replace(&mut self.automations, automations),
             tasks: std::mem::replace(&mut self.tasks, tasks),
+            last_rx: Instant::now(),
+            probe_sent: None,
+            answers_probes: false,
             feed: outgoing_feed,
         };
         self.endpoints.insert(outgoing_id, outgoing);
@@ -2094,9 +2168,6 @@ impl L3sView {
             cell_width_px: self.sent_cell.0,
             cell_height_px: self.sent_cell.1,
         });
-        // Sidebar preferences belong to this window, not the endpoint: make the
-        // newly active server blank the same docks the previous one did.
-        self.push_sidebar_layout();
         self.agent_feed = Some(self.spawn_feed_for_active());
         self.selection = None;
         self.hover_cell = None;
@@ -2111,6 +2182,14 @@ impl L3sView {
         self.reconcile_nav();
         self.active_live = true;
         self.status = self.connection.identity().session.clone();
+        let adopted = self
+            .surface
+            .shell_sidebars()
+            .is_some_and(|sidebars| adopts_layout(sidebars, self.sidebar_layout.as_ref()));
+        // Re-pushing an adopted layout forces a needless relayout.
+        if !adopted {
+            self.push_sidebar_layout();
+        }
         if let Some(workspace) = pending.focus {
             self.focus_workspace(&workspace);
         }
@@ -6132,17 +6211,38 @@ impl L3sView {
 
     /// Send our sidebar layout to the daemon with a fresh revision.
     fn push_sidebar_layout(&mut self) {
-        let Some(layout) = self.sidebar_layout.clone() else {
+        if self.sidebar_layout.is_none() {
+            return;
+        }
+        let max_revision = self
+            .endpoints
+            .values()
+            .filter_map(|endpoint| endpoint.surface.shell_sidebars())
+            .map(|sidebars| sidebars.revision)
+            .fold(
+                self.surface
+                    .shell_sidebars()
+                    .map(|sidebars| sidebars.revision)
+                    .unwrap_or(0)
+                    .max(self.sidebar_revision),
+                u64::max,
+            );
+        self.sidebar_revision = max_revision.saturating_add(1);
+        let Some(message) = self.sidebar_message() else {
             return;
         };
-        self.sidebar_revision = self.sidebar_revision.saturating_add(1);
-        let _ = self
-            .connection
-            .send(ClientMessage::ShellSidebars(ShellSidebars {
-                revision: self.sidebar_revision,
-                layout,
-                workspace_paths: self.sidebar_workspace_paths,
-            }));
+        let _ = self.connection.send(message.clone());
+        for endpoint in self.endpoints.values() {
+            let _ = endpoint.connection.send(message.clone());
+        }
+    }
+
+    fn sidebar_message(&self) -> Option<ClientMessage> {
+        Some(ClientMessage::ShellSidebars(ShellSidebars {
+            revision: self.sidebar_revision,
+            layout: self.sidebar_layout.clone()?,
+            workspace_paths: self.sidebar_workspace_paths,
+        }))
     }
 
     /// Collapse or expand the native sidebar, reclaiming the columns for panes.
@@ -9327,6 +9427,15 @@ fn status_label(status: &str) -> String {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
+}
+
+/// Whether a daemon's reported sidebars match the window's layout, ignoring
+/// the `agents` dock the window strips before sending.
+fn adopts_layout(sidebars: &ShellSidebars, layout: Option<&l3s_protocol::SidebarsConfig>) -> bool {
+    let mut reported = sidebars.layout.clone();
+    remove_dock(&mut reported.left, "agents");
+    remove_dock(&mut reported.right, "agents");
+    Some(&reported) == layout
 }
 
 /// Remove one dock id and its parallel weight from a sidebar config.

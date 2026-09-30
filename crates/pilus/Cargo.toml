@@ -1,0 +1,45 @@
+[package]
+name = "pilus"
+description = "Native desktop client for a Luvus daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+default-run = "pilus"
+
+[[bin]]
+name = "pilus"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = ["gui"]
+gui = ["dep:gpui", "dep:gpui_platform"]
+# Headless Metal rendering used by `gui::shots` to capture each surface to a
+# PNG for visual consistency review. Not part of a normal build.
+visual-test = ["gui", "gpui/test-support", "gpui_platform/test-support"]
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+gpui-updater-core.workspace = true
+pilus-client.workspace = true
+pilus-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+unicode-segmentation.workspace = true
+gpui = { workspace = true, optional = true }
+image.workspace = true
+gpui_platform = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
+
+[dev-dependencies]
+resvg = "=0.46.0"

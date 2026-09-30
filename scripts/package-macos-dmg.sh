@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Package a signed, notarized macOS DMG for OTA distribution.
 #
-# The updater's macOS installer expects a `.dmg` containing a single `l3s.app`
+# The updater's macOS installer expects a `.dmg` containing a single `pilus.app`
 # at its root; on download it mounts the image with `hdiutil`, copies the new
 # bundle over the running one with `ditto` (preserving its signature), and
 # relaunches via `open`. Asset names must stay
-# `l3s-v<version>-macos-<arch>.dmg` — the client's GitHub source matches on
+# `pilus-v<version>-macos-<arch>.dmg` — the client's GitHub source matches on
 # the `macos`, `<arch>`, and `.dmg` substrings.
 #
 # Environment:
@@ -22,7 +22,7 @@ cd "$root"
 
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 if [ "$(uname -m)" != "arm64" ] && [ "$(uname -m)" != "aarch64" ]; then
-    echo "l3s ships Apple Silicon only; refusing on $(uname -m)" >&2
+    echo "pilus ships Apple Silicon only; refusing on $(uname -m)" >&2
     exit 1
 fi
 arch="arm64"
@@ -30,13 +30,13 @@ arch="arm64"
 ./scripts/bundle-macos.sh
 
 stage="target/release/dmg-stage"
-dmg="target/release/l3s-v${version}-macos-${arch}.dmg"
+dmg="target/release/pilus-v${version}-macos-${arch}.dmg"
 rm -rf "$stage" "$dmg"
 mkdir -p "$stage"
-cp -R target/release/l3s.app "$stage/l3s.app"
+cp -R target/release/pilus.app "$stage/pilus.app"
 
 hdiutil create \
-    -volname "l3s" \
+    -volname "pilus" \
     -srcfolder "$stage" \
     -ov -format UDZO \
     "$dmg" >/dev/null

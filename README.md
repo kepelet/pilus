@@ -1,16 +1,16 @@
-# l3s
+# pilus
 
 **A native desktop client for a [Luvus](https://github.com/RizRiyz/luvus) daemon.**
 
 Luvus is mission control for AI coding agents: persistent workspaces, panes,
 tabs, and a live sidebar of agent state, all rendered by a daemon that keeps
-running when you detach. `l3s` attaches to that daemon and paints its rendered
+running when you detach. `pilus` attaches to that daemon and paints its rendered
 surface in a real window instead of a terminal — the same cells, splits, and
 sidebar, without running another terminal emulator.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│ ● l3s · default                                  connected│
+│ ● pilus · default                                  connected│
 ├──────────────────────────────────────────────────────────┤
 │  workspaces        │  agent: claude          working      │
 │  ▸ api             │  $ cargo test                        │
@@ -21,7 +21,7 @@ sidebar, without running another terminal emulator.
 
 ## Status
 
-Early. `l3s` today is a focused vertical slice:
+Early. `pilus` today is a focused vertical slice:
 
 - discovers the daemon's client socket (default or named session), starting the daemon itself when it isn't running;
 - completes the version-checked handshake and probes terminal colors;
@@ -53,27 +53,27 @@ dashboard, agents dock) is still painted from the daemon's cells — see
 ## Build and run
 
 Requires Rust 1.96+, the `luvus` CLI on `PATH`, and — on macOS — either full
-Xcode or the Metal toolchain. `l3s` starts the Luvus daemon itself when it
+Xcode or the Metal toolchain. `pilus` starts the Luvus daemon itself when it
 isn't already running. The GUI links a stitched Metal shader and does not
 invoke the `metal` compiler at build time, so the command-line tools alone are
 usually sufficient.
 
 ```sh
 # Attach to the default session.
-cargo run -p l3s
+cargo run -p pilus
 
 # Attach to a named session, or an explicit socket.
-cargo run -p l3s -- --session work
-cargo run -p l3s -- --socket /path/to/luvus-client.sock
+cargo run -p pilus -- --session work
+cargo run -p pilus -- --socket /path/to/luvus-client.sock
 
 # Connect once and print the first frame (no window).
-cargo run -p l3s --no-default-features -- --probe
+cargo run -p pilus --no-default-features -- --probe
 
 # Same, but claim the workspaces dock and print its projection.
-cargo run -p l3s --no-default-features -- --probe-workspaces
+cargo run -p pilus --no-default-features -- --probe-workspaces
 
 # Attach to one saved machine over SSH and print its workspace catalog.
-cargo run -p l3s --no-default-features -- --probe-machine mac-mini
+cargo run -p pilus --no-default-features -- --probe-machine mac-mini
 ```
 
 ### macOS app bundle
@@ -82,24 +82,24 @@ cargo run -p l3s --no-default-features -- --probe-machine mac-mini
 Finder, the Dock, and Launchpad show the icon and name:
 
 ```sh
-just bundle                 # builds target/release/l3s.app
-open target/release/l3s.app
+just bundle                 # builds target/release/pilus.app
+open target/release/pilus.app
 ```
 
-The bundle's icon comes from `crates/l3s/assets/l3s.icns`, generated from
-`l3s-icon-1024.png` with `iconutil`. Regenerate it after changing the artwork:
+The bundle's icon comes from `crates/pilus/assets/pilus.icns`, generated from
+`pilus-icon-1024.png` with `iconutil`. Regenerate it after changing the artwork:
 
 ```sh
-sips -z 1024 1024 art.png --out crates/l3s/assets/l3s-icon-1024.png
+sips -z 1024 1024 art.png --out crates/pilus/assets/pilus-icon-1024.png
 ```
 
 ## Updates
 
-`l3s` updates itself from a release feed: `l3s → Check for Updates…` checks
+`pilus` updates itself from a release feed: `pilus → Check for Updates…` checks
 on demand, a footer badge tracks download and restart-into-update, and
 **Settings → UPDATES** picks the channel and feed URL. Stable builds read
-`https://releases.kepelet.com/l3s/stable.json`; preview/nightly builds read
-`https://releases.kepelet.com/l3s/preview.json`. See
+`https://releases.kepelet.com/pilus/stable.json`; preview/nightly builds read
+`https://releases.kepelet.com/pilus/preview.json`. See
 [`docs/ota.md`](docs/ota.md) for the release process, signing, and channels.
 
 ```sh
@@ -113,9 +113,9 @@ just serve-preview  # serve that payload on 127.0.0.1:8000
 
 | Crate | Responsibility |
 | --- | --- |
-| `crates/l3s-protocol` | The wire vocabulary: client/server messages, cell frames, framing. |
-| `crates/l3s-client` | Socket discovery, transport, handshake, the event stream, and the folded `Surface`. |
-| `crates/l3s` | The GPUI window, key mapping, and native painting. |
+| `crates/pilus-protocol` | The wire vocabulary: client/server messages, cell frames, framing. |
+| `crates/pilus-client` | Socket discovery, transport, handshake, the event stream, and the folded `Surface`. |
+| `crates/pilus` | The GPUI window, key mapping, and native painting. |
 
 The protocol crate is the only place that knows the wire format, and its
 declaration order is load-bearing — see [`AGENTS.md`](AGENTS.md) before editing

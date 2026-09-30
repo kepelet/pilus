@@ -1,14 +1,14 @@
-# Release `l3s` artifacts; the client's channel manifests point at them.
+# Release `pilus` artifacts; the client's channel manifests point at them.
 #
 # Tag `vX.Y.Z` (matching `Cargo.toml`) to ship stable. The workflow packages
-# `l3s-v<version>-macos-arm64.dmg` and attaches it to the GitHub release. The
+# `pilus-v<version>-macos-arm64.dmg` and attaches it to the GitHub release. The
 # client reads channel manifests on `releases.kepelet.com` (`stable.json` /
 # `preview.json`), so point those at the uploaded asset (the manifest's
 # `macos` / `arm64` / `.dmg` fields select it).
 #
 # Required secrets: none for unsigned checksums-only releases.
 # Recommended: `MINISIGN_SECRET_KEY` (the minisign secret key contents) plus
-# the matching public key in `crates/l3s/src/update.rs`, and Apple signing:
+# the matching public key in `crates/pilus/src/update.rs`, and Apple signing:
 # `APPLE_DEVELOPER_IDENTITY` (e.g. `Developer ID Application: Name (TEAMID)`),
 # `APPLE_CERTIFICATE` (base64 of the matching .p12) and `APPLE_CERT_PASSWORD`
 # for signing, `APPLE_ID`, `APPLE_APP_PASSWORD` (an app-specific password),
@@ -43,14 +43,14 @@ jobs:
           CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
         run: |
           echo "$CERT_P12" | base64 --decode > /tmp/signing.p12
-          security create-keychain -p actions l3s-signing.keychain
-          security set-keychain-settings -t 3600 -u l3s-signing.keychain
-          security unlock-keychain -p actions l3s-signing.keychain
-          security import /tmp/signing.p12 -k l3s-signing.keychain \
+          security create-keychain -p actions pilus-signing.keychain
+          security set-keychain-settings -t 3600 -u pilus-signing.keychain
+          security unlock-keychain -p actions pilus-signing.keychain
+          security import /tmp/signing.p12 -k pilus-signing.keychain \
             -P "$CERT_PASSWORD" -T /usr/bin/codesign
-          security list-keychains -s l3s-signing.keychain
+          security list-keychains -s pilus-signing.keychain
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k actions l3s-signing.keychain
+            -s -k actions pilus-signing.keychain
           rm -f /tmp/signing.p12
 
       - name: Install minisign
@@ -60,7 +60,7 @@ jobs:
       - name: Set up notarization credentials
         if: ${{ secrets.APPLE_ID != '' }}
         run: |
-          xcrun notarytool store-credentials l3s-notary \
+          xcrun notarytool store-credentials pilus-notary \
             --apple-id "${{ secrets.APPLE_ID }}" \
             --password "${{ secrets.APPLE_APP_PASSWORD }}" \
             --team-id "${{ secrets.APPLE_TEAM_ID }}"
@@ -70,7 +70,7 @@ jobs:
           APPLE_DEVELOPER_IDENTITY: ${{ secrets.APPLE_DEVELOPER_IDENTITY }}
           # Empty unless notarization credentials were stored above; the
           # packaging script skips notarization when this is unset.
-          NOTARY_PROFILE: ${{ secrets.APPLE_ID != '' && 'l3s-notary' || '' }}
+          NOTARY_PROFILE: ${{ secrets.APPLE_ID != '' && 'pilus-notary' || '' }}
           MINISIGN_SECRET_KEY: minisign.key
         run: |
           if [ -n "${{ secrets.MINISIGN_SECRET_KEY }}" ]; then

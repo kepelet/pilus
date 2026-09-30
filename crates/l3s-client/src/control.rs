@@ -17,15 +17,18 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, select, tick, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, select, tick, unbounded};
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
 use crate::transport::{SshTarget, Stream};
+
+const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// One segment of a status-bar widget.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -345,7 +348,7 @@ impl ControlTransport {
         match self {
             Self::Socket(path) => Stream::connect(path),
             Self::Ssh(target) => {
-                let mut command = target.command(&["uhp", "proxy"]);
+                let mut command = target.multiplexed_command(&["uhp", "proxy"]);
                 Stream::spawn(&mut command)
             }
         }
@@ -395,17 +398,28 @@ impl ControlClient {
             "params": params,
         })
         .to_string();
-        let stream = self.transport.stream()?;
+        let stream = Arc::new(self.transport.stream()?);
         {
-            let mut writer = &stream;
+            let mut writer = &*stream;
             writer.write_all(line.as_bytes())?;
             writer.write_all(b"\n")?;
             writer.flush()?;
         }
 
-        let response = read_line(&stream).map_err(|error| match stream.stderr_tail() {
-            Some(tail) => Error::Control(format!("{method}: {tail}")),
-            None => error,
+        let response = match &self.transport {
+            ControlTransport::Ssh(_) => {
+                read_line_within(Arc::clone(&stream), REMOTE_REQUEST_TIMEOUT)
+            }
+            ControlTransport::Socket(_) => read_line(&stream),
+        }
+        .map_err(|error| {
+            if matches!(&error, Error::Control(message) if message == "timed out") {
+                return Error::Control(format!("{method}: timed out"));
+            }
+            match stream.stderr_tail() {
+                Some(tail) => Error::Control(format!("{method}: {tail}")),
+                None => error,
+            }
         })?;
         if response.is_empty() {
             return Err(Error::Control("control socket closed".to_string()));
@@ -570,6 +584,32 @@ fn read_line(stream: &Stream) -> Result<String> {
     }
     String::from_utf8(bytes)
         .map_err(|error| Error::Control(format!("control response was not UTF-8: {error}")))
+}
+
+fn read_line_within(stream: Arc<Stream>, deadline: Duration) -> Result<String> {
+    let (done_tx, done_rx) = bounded::<()>(0);
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let watchdog_stream = Arc::clone(&stream);
+    let watchdog_timed_out = Arc::clone(&timed_out);
+    thread::Builder::new()
+        .name("l3s-control-timeout".to_string())
+        .spawn(move || {
+            if matches!(
+                done_rx.recv_timeout(deadline),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ) {
+                watchdog_timed_out.store(true, Ordering::Release);
+                watchdog_stream.terminate();
+            }
+        })
+        .map_err(Error::Io)?;
+
+    let response = read_line(&stream);
+    drop(done_tx);
+    if timed_out.load(Ordering::Acquire) {
+        return Err(Error::Control("timed out".to_string()));
+    }
+    response
 }
 
 impl BarWidget {
@@ -949,8 +989,12 @@ fn is_structural(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AutomationSummary, TaskSummary, is_structural};
+    use super::{AutomationSummary, TaskSummary, is_structural, read_line_within};
+    use crate::transport::Stream;
     use serde_json::json;
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn structural_events_exclude_output_ready() {
@@ -1001,5 +1045,16 @@ mod tests {
             TaskSummary::from_json(&value),
             TaskSummary { open: 2, total: 4 }
         );
+    }
+
+    #[test]
+    fn remote_control_read_times_out_and_terminates_stream() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let stream = Arc::new(Stream::spawn(&mut command).expect("spawn stream"));
+        let started = Instant::now();
+        let result = read_line_within(stream, Duration::from_millis(200));
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pilus-protocol", "crates/pilus-client", "crates/pilus"]
+members = ["crates/pilus-protocol", "crates/pilus-client", "crates/pilus", "crates/pilus-agent"]
 resolver = "2"
 
 [workspace.package]

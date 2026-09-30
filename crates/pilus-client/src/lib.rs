@@ -11,6 +11,7 @@ pub mod agents;
 pub mod ansi;
 mod autostart;
 mod connection;
+mod connector;
 mod control;
 mod discovery;
 mod error;
@@ -22,6 +23,7 @@ mod uhp;
 pub use agents::AgentConfig;
 pub use autostart::{ensure_server, ensure_server_for};
 pub use connection::{ClientEvent, Connection, EndpointIdentity};
+pub use connector::{Connector, ConnectorOptions, ConnectorStatus, agent_binary};
 pub use control::{
     Agent, AgentFeed, Appearance, AutomationSummary, BarSegment, BarWidget, ControlClient,
     FeedScope, FeedUpdate, Tab, TaskSummary, ThemeInfo,
@@ -34,7 +36,7 @@ pub use discovery::{
 };
 pub use error::{Error, Result};
 pub use pilus_protocol as protocol;
-pub use machines::{MachineInfo, connect_machine, list_machines, refresh_machines};
+pub use machines::{MachineInfo, connect_machine, install_agent, list_machines, refresh_machines};
 pub use projects::{
     Project, RemoteRepos, common_git_dir, common_git_dirs_remote, current_branch,
     current_branches_remote, expand_local as expand_project_local,
@@ -44,7 +46,7 @@ pub use projects::{
 };
 pub use surface::{Surface, SurfaceChange};
 pub use transport::SshTarget;
-pub use uhp::{Event, EventStream, Frame, Observer, Terminal, UhpClient};
+pub use uhp::{Capabilities, Event, EventStream, Frame, Observer, Terminal, UhpClient};
 
 use std::path::PathBuf;
 

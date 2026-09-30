@@ -335,6 +335,8 @@ impl Agent {
 pub enum ControlTransport {
     /// The owner-local control socket.
     Socket(PathBuf),
+    /// A `luvus uhp access` loopback gateway carrying UHP frames over TCP.
+    Tcp(String),
     /// A remote host over the local OpenSSH client.
     Ssh(SshTarget),
 }
@@ -344,6 +346,7 @@ impl ControlTransport {
     pub(crate) fn stream(&self) -> Result<Stream> {
         match self {
             Self::Socket(path) => Stream::connect(path),
+            Self::Tcp(address) => Stream::connect_tcp(address),
             Self::Ssh(target) => {
                 let mut command = target.command(&["uhp", "proxy"]);
                 Stream::spawn(&mut command)
@@ -382,6 +385,14 @@ impl ControlClient {
     pub fn connect_ssh(target: SshTarget) -> Result<Self> {
         Ok(Self {
             transport: ControlTransport::Ssh(target),
+            next_id: 0,
+        })
+    }
+
+    /// Connect to a `luvus uhp access` loopback gateway over TCP.
+    pub fn connect_tcp(address: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            transport: ControlTransport::Tcp(address.into()),
             next_id: 0,
         })
     }

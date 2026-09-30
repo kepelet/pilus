@@ -8,6 +8,7 @@
 mod about;
 mod app_icon;
 mod appearances;
+mod connector;
 mod home;
 mod keys;
 mod machines;
@@ -50,10 +51,12 @@ use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
 use pilus_client::{
     Agent, AgentConfig, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent,
-    ConnectTarget, Connection, ControlClient, HOME_ENV, MachineInfo, Project, SessionInfo, SshTarget,
-    Surface, SurfaceChange, Tab, TaskSummary, common_git_dir, common_git_dirs_remote, config_dir,
+    ConnectTarget, Connection, ConnectorStatus, ControlClient, HOME_ENV, MachineInfo, Project,
+    SessionInfo, SshTarget, Surface, SurfaceChange, Tab, TaskSummary, agent_binary, common_git_dir,
+    common_git_dirs_remote, config_dir,
     connect_machine, current_branch, current_branches_remote, expand_project_local,
-    expand_project_remote, generate_session_name, pilus_config_dir, pilus_workspaces_dir,
+    expand_project_remote, generate_session_name, install_agent, pilus_config_dir,
+    pilus_workspaces_dir,
     list_branches, list_branches_remote, list_machines, list_session_infos, luvus_binary,
     refresh_machines,
     split_client_socket,
@@ -281,6 +284,19 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
 
     application().run(move |cx: &mut App| {
         app_icon::install();
+        // A persisted "this node" choice starts the connector with the app, so
+        // it survives closing the Remote Machines window. A failed start clears
+        // the flag rather than failing on every launch.
+        if settings.borrow().connector {
+            match connector::start(&connector::default_options()) {
+                Ok(()) => {}
+                Err(error) => {
+                    eprintln!("pilus: remote access did not start: {error}");
+                    settings.borrow_mut().connector = false;
+                    settings.borrow().save(&pilus_root);
+                }
+            }
+        }
         cx.on_action({
             let api = appearances_socket.clone();
             let settings = settings.clone();
@@ -936,6 +952,8 @@ struct PilusView {
     machine_op_tx: Sender<String>,
     /// The machine id whose CLI mutation is running, if any.
     machine_busy: Option<String>,
+    /// The host connector's latest observed state, polled each tick.
+    connector_status: ConnectorStatus,
     /// A machine remove awaiting its second click, if any.
     machine_pending_remove: Option<String>,
     /// Registered appearance themes and the selected id, from `theme.list`.
@@ -1273,6 +1291,7 @@ impl PilusView {
             machine_tx,
             machine_op_tx,
             machine_busy: None,
+            connector_status: ConnectorStatus::default(),
             machine_pending_remove: None,
             appearance: Appearance::default(),
             last_theme_poll: Instant::now() - Duration::from_secs(11),
@@ -1408,6 +1427,11 @@ impl PilusView {
         if machine_revision != self.seen_machine_revision {
             self.seen_machine_revision = machine_revision;
             self.catalog_dirty = true;
+            changed = true;
+        }
+        let connector_status = connector::status();
+        if connector_status != self.connector_status {
+            self.connector_status = connector_status;
             changed = true;
         }
         changed |= self.poll_active(cx);
@@ -4560,6 +4584,7 @@ impl PilusView {
                 .flex_col()
                 .gap_6()
                 .child(self.projects_section_block(cx))
+                .child(self.remote_access_section_block(cx))
                 .child(self.machines_section_block(cx))
                 .child(self.agent_config_section_block(cx))
                 .child(self.updates_section_block(cx))
@@ -4776,6 +4801,164 @@ impl PilusView {
     /// The REMOTE MACHINES section of the page: every saved machine profile
     /// with the same status and enable/remove actions as the manager window.
     /// Adding and provisioning stay in the full manager window.
+    /// The REMOTE ACCESS section: reach this machine from another device.
+    fn remote_access_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let running = connector::running();
+        let status = &self.connector_status;
+        let toggle = style::toggle("pilus-remote-access-toggle", running, theme).on_click(
+            cx.listener(|this, _, _, cx| {
+                this.toggle_connector();
+                cx.notify();
+            }),
+        );
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .child(style::section_label(
+                        theme,
+                        "REMOTE ACCESS",
+                        self.section_font(),
+                    ))
+                    .child(toggle),
+            )
+            // The instruction stays put; the connection details appear below.
+            .child(
+                div()
+                    .px_3()
+                    .text_size(px(self.footer_font()))
+                    .text_color(theme.muted)
+                    .child("Enable to reach this machine from another device"),
+            );
+        if let Some(error) = &status.error {
+            section = section.child(
+                div()
+                    .px_3()
+                    .text_size(px(self.footer_font()))
+                    .text_color(theme.alert)
+                    .child(error.clone()),
+            );
+        } else if running {
+            let mut output = div()
+                .mx_3()
+                .px_3()
+                .py_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .rounded_md()
+                .bg(theme.panel)
+                .border_1()
+                .border_color(theme.border);
+            match (&status.endpoint_id, &status.ticket) {
+                (Some(id), Some(ticket)) => {
+                    output = output.child(self.copy_row(
+                        "endpoint",
+                        id.clone(),
+                        "pilus-copy-endpoint",
+                        cx,
+                    ));
+                    if let Some(enrollment) = &status.enrollment {
+                        output = output.child(self.copy_row(
+                            "enroll",
+                            enrollment.clone(),
+                            "pilus-copy-enroll",
+                            cx,
+                        ));
+                    }
+                    output = output.child(self.copy_row(
+                        "ticket",
+                        ticket.clone(),
+                        "pilus-copy-ticket",
+                        cx,
+                    ));
+                }
+                _ => {
+                    output = output.child(
+                        div()
+                            .text_size(px(self.footer_font()))
+                            .text_color(theme.muted)
+                            .child("Starting…"),
+                    );
+                }
+            }
+            section = section.child(output);
+        } else if agent_binary().is_none() {
+            section = section.child(
+                div()
+                    .px_3()
+                    .text_size(px(self.footer_font()))
+                    .text_color(theme.muted)
+                    .child("pilus-agent is not installed next to pilus."),
+            );
+        }
+        section
+    }
+
+    /// A muted read-only value with a Copy button beside it.
+    fn copy_row(
+        &self,
+        label: &'static str,
+        value: String,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = self.theme;
+        let size = self.section_font();
+        let copied = value.clone();
+        let button = style::small_button(id, "Copy", style::ButtonKind::Ghost, theme, size)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+                this.projects.set_status(format!("Copied {label}."));
+                cx.notify();
+            }));
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(size))
+                    .text_color(theme.muted)
+                    .child(format!("{label}: {value}")),
+            )
+            .child(button)
+    }
+
+    /// Turn this node's connector on or off from the settings page.
+    fn toggle_connector(&mut self) {
+        if connector::running() {
+            connector::stop();
+            self.connector_status = ConnectorStatus::default();
+            self.set_connector(false);
+            self.projects
+                .set_status("Remote access disabled.".to_string());
+        } else {
+            match connector::start(&connector::default_options()) {
+                Ok(()) => self.set_connector(true),
+                Err(error) => self.projects.set_status(error),
+            }
+        }
+    }
+
+    /// Persist the connector choice so it restarts on the next launch.
+    fn set_connector(&mut self, on: bool) {
+        self.shared_settings.borrow_mut().connector = on;
+        self.shared_settings.borrow().save(&pilus_config_dir());
+    }
+
     fn machines_section_block(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let mut section = div().flex().flex_col().gap_2().child(
@@ -4828,6 +5011,7 @@ impl PilusView {
         let (status, status_color) = machine_status_text(machine, theme);
         let toggle_id = id.clone();
         let toggle_label = if machine.enabled { "Disable" } else { "Enable" };
+        let install_id = id.clone();
         let remove_id = id.clone();
         div()
             .flex()
@@ -4893,6 +5077,20 @@ impl PilusView {
                 .text_color(if busy { theme.muted } else { theme.fg })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle_machine_page(toggle_id.clone());
+                    cx.notify();
+                })),
+            )
+            .child(
+                style::small_button(
+                    format!("pilus-machine-page-agent-{id}"),
+                    "Install agent",
+                    style::ButtonKind::Ghost,
+                    theme,
+                    self.section_font(),
+                )
+                .text_color(theme.muted)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.install_machine_page(install_id.clone());
                     cx.notify();
                 })),
             )
@@ -4968,6 +5166,36 @@ impl PilusView {
             let message = match run_machine_cli(&root, args) {
                 Ok(()) => success,
                 Err(error) => error,
+            };
+            op_tx.send(message).ok();
+            machine_tx.send(list_machines(&root)).ok();
+        });
+    }
+
+    /// Install and start the connector on `machine` over SSH, off-thread.
+    fn install_machine_page(&mut self, id: String) {
+        if self.machine_busy.is_some() {
+            return;
+        }
+        let Some(machine) = self.machines.iter().find(|machine| machine.id == id).cloned() else {
+            return;
+        };
+        self.machine_pending_remove = None;
+        let Some(agent) = agent_binary() else {
+            self.projects.set_status(
+                "pilus-agent not found; set PILUS_AGENT_BIN or install it beside pilus".to_string(),
+            );
+            return;
+        };
+        self.machine_busy = Some(id);
+        self.projects.set_status("Installing agent…".to_string());
+        let op_tx = self.machine_op_tx.clone();
+        let machine_tx = self.machine_tx.clone();
+        let root = self.session_root.clone();
+        std::thread::spawn(move || {
+            let message = match install_agent(&machine, &agent) {
+                Ok(message) => message,
+                Err(error) => error.to_string(),
             };
             op_tx.send(message).ok();
             machine_tx.send(list_machines(&root)).ok();

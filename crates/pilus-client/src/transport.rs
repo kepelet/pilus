@@ -95,6 +95,10 @@ pub struct Stream {
 
 enum Inner {
     Local(interprocess::local_socket::Stream),
+    /// A TCP connection to a UHP access gateway's loopback listener. The
+    /// gateway speaks the same newline-delimited UHP frames as the owner
+    /// socket, so the rest of the client is unchanged.
+    Tcp(std::net::TcpStream),
     Remote(Remote),
 }
 
@@ -170,6 +174,18 @@ impl Stream {
         }
     }
 
+    /// Connect to a TCP endpoint, e.g. a `luvus uhp access` loopback address.
+    ///
+    /// Unlike [`Stream::connect`], a refused connection is a plain IO error:
+    /// a gateway is an ephemeral process, not the daemon whose absence maps to
+    /// [`Error::NotFound`].
+    pub fn connect_tcp(address: &str) -> Result<Self> {
+        let stream = std::net::TcpStream::connect(address)?;
+        Ok(Self {
+            inner: Inner::Tcp(stream),
+        })
+    }
+
     /// Spawn `command` and bridge its standard IO as a stream.
     ///
     /// Stdin and stdout carry protocol bytes; stderr is drained on a helper
@@ -227,7 +243,7 @@ impl Stream {
                 Ok(guard) if !guard.trim().is_empty() => Some(guard.trim().to_string()),
                 _ => None,
             },
-            Inner::Local(_) => None,
+            Inner::Local(_) | Inner::Tcp(_) => None,
         }
     }
 
@@ -248,6 +264,7 @@ impl Read for Stream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match &mut self.inner {
             Inner::Local(stream) => stream.read(buffer),
+            Inner::Tcp(stream) => stream.read(buffer),
             Inner::Remote(remote) => remote.stdout.lock().map_err(|_| poisoned())?.read(buffer),
         }
     }
@@ -257,6 +274,7 @@ impl Write for Stream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         match &mut self.inner {
             Inner::Local(stream) => stream.write(buffer),
+            Inner::Tcp(stream) => stream.write(buffer),
             Inner::Remote(remote) => remote.stdin.lock().map_err(|_| poisoned())?.write(buffer),
         }
     }
@@ -264,6 +282,7 @@ impl Write for Stream {
     fn flush(&mut self) -> std::io::Result<()> {
         match &mut self.inner {
             Inner::Local(stream) => stream.flush(),
+            Inner::Tcp(stream) => stream.flush(),
             Inner::Remote(remote) => remote.stdin.lock().map_err(|_| poisoned())?.flush(),
         }
     }
@@ -273,6 +292,7 @@ impl Read for &Stream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match &self.inner {
             Inner::Local(stream) => (&*stream).read(buffer),
+            Inner::Tcp(stream) => (&*stream).read(buffer),
             Inner::Remote(remote) => remote.stdout.lock().map_err(|_| poisoned())?.read(buffer),
         }
     }
@@ -282,6 +302,7 @@ impl Write for &Stream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         match &self.inner {
             Inner::Local(stream) => (&*stream).write(buffer),
+            Inner::Tcp(stream) => (&*stream).write(buffer),
             Inner::Remote(remote) => remote.stdin.lock().map_err(|_| poisoned())?.write(buffer),
         }
     }
@@ -289,6 +310,7 @@ impl Write for &Stream {
     fn flush(&mut self) -> std::io::Result<()> {
         match &self.inner {
             Inner::Local(stream) => (&*stream).flush(),
+            Inner::Tcp(stream) => (&*stream).flush(),
             Inner::Remote(remote) => remote.stdin.lock().map_err(|_| poisoned())?.flush(),
         }
     }

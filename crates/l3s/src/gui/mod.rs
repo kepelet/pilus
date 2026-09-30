@@ -91,18 +91,18 @@ const SKIPPED_DAEMON_BOTTOM_ROWS: u16 = 1;
 /// footer widgets. Assumes a single-row status line.
 /// Height of the native footer bar.
 const FOOTER_HEIGHT: f32 = 28.0;
-/// Gap around the floating terminal card, on top/left/bottom.
+/// Gap around the floating terminal card, on every side.
 const CARD_GAP: f32 = 8.0;
 /// Slides the sidebar's first row down so it lines up with the top of the
 /// inset terminal card. The list's own `gap_1` already covers the rest of the
 /// `CARD_GAP` between the header and the card.
 const SIDEBAR_TOP_INSET: f32 = 4.0;
-/// Breathing room below the last row is intentionally zero: the grid runs
-/// flush to the card's bottom border.
-/// Breathing room above the first row, mirroring the bottom.
-const TERMINAL_TOP_AIR: f32 = 6.0;
-/// Wider right margin on the card, for breathing room at the window edge.
-const CARD_GAP_RIGHT: f32 = 16.0;
+/// Breathing room between the terminal grid and the card's inset border.
+/// Opposite gaps stay equal because the whole-cell grid is centered.
+const TERMINAL_PAD: f32 = 6.0;
+/// Right margin on the card. Matches the other sides so the terminal sits
+/// centered between the sidebar and the window edge.
+const CARD_GAP_RIGHT: f32 = CARD_GAP;
 /// Height of a tab pill in the top chrome.
 const TAB_HEIGHT: f32 = 26.0;
 /// Left inset for the collapsed tab strip: clears the floating traffic lights
@@ -653,6 +653,10 @@ fn migrate_legacy_stores(luvus_root: &Path, l3s_root: &Path) {
 struct CardLayout {
     /// Card's left edge in window pixels (sidebar plus gap, or just gap).
     card_x: f32,
+    /// Inset of the first cell from the border, after centering the
+    /// whole-cell grid in the card's inner box.
+    pad_x: f32,
+    pad_y: f32,
     /// First visible cell's top-left corner in window pixels.
     origin_x: f32,
     origin_y: f32,
@@ -3031,7 +3035,7 @@ impl L3sView {
     /// The card's content: the Settings page while it is open, else the
     /// terminal grid. Sharing the card keeps the page inset exactly like
     /// the terminal, with the sidebar still showing beside it.
-    fn card_content(&self, cx: &mut Context<Self>, grid: Div) -> Div {
+    fn card_content(&self, cx: &mut Context<Self>, grid: Div, pad_x: f32, pad_y: f32) -> Div {
         if self.home.is_open() {
             return div()
                 .flex_1()
@@ -3045,7 +3049,8 @@ impl L3sView {
         div()
             .flex_1()
             .overflow_hidden()
-            .pt(px(TERMINAL_TOP_AIR))
+            .pl(px(pad_x))
+            .pt(px(pad_y))
             .child(grid)
     }
 
@@ -8319,15 +8324,24 @@ impl L3sView {
         let cell_h = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
         let viewport = window.viewport_size();
         let card_x = f32::from(self.sidebar_cells()) * cell_w + CARD_GAP;
-        let grid_w = f32::from(viewport.width) - card_x - CARD_GAP_RIGHT - 2.0;
-        let grid_h =
+        // The card's inner box: inside the hairline border, before the grid's
+        // own breathing room.
+        let inner_w = f32::from(viewport.width) - card_x - CARD_GAP_RIGHT - 2.0;
+        let inner_h =
             f32::from(viewport.height) - HEADER_HEIGHT - FOOTER_HEIGHT - CARD_GAP - CARD_GAP - 2.0;
-        let cols = (grid_w / cell_w).clamp(20.0, 500.0) as u16;
-        let rows = ((grid_h - TERMINAL_TOP_AIR) / cell_h).clamp(5.0, 300.0) as u16;
+        let cols = ((inner_w - 2.0 * TERMINAL_PAD) / cell_w).clamp(20.0, 500.0) as u16;
+        let rows = ((inner_h - 2.0 * TERMINAL_PAD) / cell_h).clamp(5.0, 300.0) as u16;
+        // Center the whole-cell grid in the inner box so opposite gaps match;
+        // the sub-cell remainder splits instead of pooling on the right and
+        // bottom. Every gap is at least `TERMINAL_PAD` by construction.
+        let pad_x = ((inner_w - f32::from(cols) * cell_w) / 2.0).max(0.0);
+        let pad_y = ((inner_h - f32::from(rows) * cell_h) / 2.0).max(0.0);
         CardLayout {
             card_x,
-            origin_x: card_x + 1.0,
-            origin_y: HEADER_HEIGHT + CARD_GAP + 1.0 + TERMINAL_TOP_AIR,
+            pad_x,
+            pad_y,
+            origin_x: card_x + 1.0 + pad_x,
+            origin_y: HEADER_HEIGHT + CARD_GAP + 1.0 + pad_y,
             cols,
             rows,
             cell_w,
@@ -8596,7 +8610,7 @@ impl Render for L3sView {
                         .border_color(terminal_inset_border())
                         .rounded_md()
                         .overflow_hidden()
-                        .child(self.card_content(cx, grid)),
+                        .child(self.card_content(cx, grid, layout.pad_x, layout.pad_y)),
                 ),
             )
             // Chrome layers live at the root so they paint above the content

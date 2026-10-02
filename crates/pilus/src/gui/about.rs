@@ -78,14 +78,35 @@ impl AboutView {
     }
 }
 
-/// The app's own icon, decoded once from the embedded PNG. GPUI's image
-/// buffers are BGRA, so the channels are swapped after decoding.
+/// The in-app mark, rasterized once from the embedded SVG so its two-tone
+/// face survives: GPUI's `svg()` element repaints as a single-color alpha
+/// mask, which would flatten the mark into a silhouette. GPUI's image
+/// buffers are BGRA, so the channels are swapped after rasterizing.
 pub(super) fn app_icon() -> Option<Arc<RenderImage>> {
     static ICON: OnceLock<Option<Arc<RenderImage>>> = OnceLock::new();
     ICON.get_or_init(|| {
-        let decoded =
-            image::load_from_memory(include_bytes!("../../assets/pilus-icon-1024.png")).ok()?;
-        let mut buffer = decoded.to_rgba8();
+        let tree = resvg::usvg::Tree::from_data(
+            include_bytes!("../../assets/pilus.svg"),
+            &resvg::usvg::Options::default(),
+        )
+        .ok()?;
+        let extent = tree.size();
+        // Well above the largest paint size (64px About, 52px Home) so both
+        // downscale from one crisp buffer.
+        let scale = 256.0 / extent.width().max(extent.height());
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(256, 256)?;
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(scale, scale),
+            &mut pixmap.as_mut(),
+        );
+        // A fully transparent raster paints as an empty box, so fall back
+        // to the wordmark instead.
+        if pixmap.pixels().iter().all(|pixel| pixel.alpha() == 0) {
+            return None;
+        }
+        let mut buffer =
+            image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())?;
         for pixel in buffer.chunks_exact_mut(4) {
             pixel.swap(0, 2);
         }

@@ -75,3 +75,8 @@ fn agent_icons_rasterize_to_nonempty_alpha() {
         assert_alpha(&format!("assets/icons/agents/{name}.svg"));
     }
 }
+
+#[test]
+fn app_mark_rasterizes_to_nonempty_alpha() {
+    assert_alpha("assets/pilus.svg");
+}

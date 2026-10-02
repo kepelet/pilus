@@ -1,0 +1,2357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pilus — Pi + Iroh + Luvus, one native software factory</title>
+<meta name="description" content="pilus brings Pi, Iroh, and Luvus into one native Mac workspace for persistent sessions, live agent state, and local or SSH machines.">
+<meta property="og:title" content="pilus — Every agent. Every machine. One window.">
+<meta property="og:description" content="Pi + Iroh + Luvus in one native Mac workspace that makes the software factory easier to run.">
+<meta property="og:url" content="https://usepilus.dev">
+<meta property="og:type" content="website">
+<meta property="og:image" content="https://usepilus.dev/assets/main-home.png">
+<link rel="icon" type="image/svg+xml" href="assets/pilus.svg">
+<link rel="stylesheet" href="tokens.css">
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html {
+    scroll-behavior: smooth;
+    overflow-x: clip;
+  }
+
+  body {
+    margin: 0;
+    overflow-x: clip;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: 16px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    color: var(--ink);
+    background: var(--amber-pale);
+  }
+
+  :focus-visible {
+    outline: 3px solid var(--amber);
+    outline-offset: 4px;
+    border-radius: 7px;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+  }
+
+  button, a {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--scroll-thumb);
+    border: 3px solid var(--paper);
+    border-radius: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: var(--paper);
+  }
+
+  .wrap {
+    width: var(--page);
+    margin-inline: auto;
+  }
+
+  .site-nav {
+    position: absolute;
+    inset: 0 0 auto;
+    z-index: 20;
+  }
+
+  .nav-inner {
+    width: var(--page);
+    height: 78px;
+    margin-inline: auto;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 28px;
+  }
+
+  .brand {
+    width: fit-content;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.22em;
+    font-size: 24px;
+    font-weight: 690;
+    letter-spacing: -0.04em;
+  }
+
+  .nav-action {
+    justify-self: end;
+  }
+
+  .button {
+    min-height: 46px;
+    padding: 0 21px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 9px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--white);
+    color: var(--ink);
+    font-size: 14px;
+    font-weight: 620;
+    white-space: nowrap;
+    letter-spacing: -0.015em;
+    transition: transform 180ms cubic-bezier(.16, 1, .3, 1), background 180ms ease-out, border-color 180ms ease-out;
+  }
+
+  .button:hover {
+    background: var(--paper-hover);
+    border-color: var(--line-strong);
+  }
+
+  .button:active {
+    transform: translateY(1px);
+  }
+
+  .button-dark {
+    background: var(--night);
+    color: var(--white);
+    border-color: var(--night);
+  }
+
+  .button-dark:hover {
+    background: var(--night-hover);
+    color: var(--white);
+    border-color: var(--night-hover);
+  }
+
+  .button-small {
+    min-height: 40px;
+    padding-inline: 17px;
+    font-size: 13px;
+  }
+
+  .arrow {
+    font-size: 16px;
+    line-height: 1;
+  }
+
+  .hero {
+    position: relative;
+    height: 100vh;
+    overflow: hidden;
+    background: var(--white);
+  }
+
+  .hero-atmosphere {
+    position: relative;
+    padding: 132px 0 72px;
+    overflow: hidden;
+    background-image:
+      linear-gradient(to bottom, var(--hero-copy-wash), var(--hero-copy-wash) 58%, var(--hero-copy-fade) 83%, var(--white) 100%),
+      url("assets/hero-factory.webp");
+    background-position: center 54%;
+    background-size: cover;
+  }
+
+  .hero-atmosphere::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background-image:
+      linear-gradient(var(--hero-grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--hero-grid) 1px, transparent 1px);
+    background-size: 76px 76px;
+    mask-image: linear-gradient(to bottom, var(--mask-opaque), transparent 92%);
+  }
+
+  .hero-copy {
+    position: relative;
+    z-index: 1;
+    text-align: center;
+  }
+
+  .hero h1 {
+    max-width: 980px;
+    margin: 0 auto;
+    font-size: clamp(3.8rem, 7vw, 6.25rem);
+    font-weight: 690;
+    line-height: 0.93;
+    letter-spacing: -0.04em;
+    text-wrap: balance;
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .hero h1 span {
+    display: block;
+  }
+
+  .hero-title-row {
+    display: flex !important;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(12px, 1.7vw, 22px);
+  }
+
+  /* The pilus mark: one lockup shared by the nav brand and the hero headline. */
+  .pilus-mark {
+    width: 1.2em;
+    height: 1.2em;
+    flex: 0 0 auto;
+    margin-top: 4px;
+    /* The viewBox carries side padding, so pull the mark tight to the word. */
+    margin-right: -0.3em;
+  }
+
+  .hero h1 .pilus-mark {
+    margin-top: 8px;
+  }
+
+  .pilus-mark .mark-eyes {
+    transition: transform 280ms cubic-bezier(.16, 1, .3, 1);
+  }
+
+  .pilus-mark .mark-eye {
+    transform-box: fill-box;
+    transform-origin: center;
+    transition: transform 90ms ease;
+  }
+
+  .pilus-mark .mark-eye.is-blinking {
+    transform: scaleY(0.08);
+  }
+
+  .hero-lede {
+    max-width: 720px;
+    margin: 27px auto 0;
+    color: var(--muted);
+    font-size: clamp(1.04rem, 1.55vw, 1.22rem);
+    line-height: 1.5;
+    letter-spacing: -0.02em;
+    text-wrap: pretty;
+  }
+
+  .hero-lede-note {
+    display: block;
+    margin-top: 8px;
+    font-size: 0.85em;
+  }
+
+  .hero-actions {
+    margin-top: 29px;
+    display: flex;
+    justify-content: center;
+    gap: 11px;
+    flex-wrap: wrap;
+  }
+
+  .hero-scene {
+    position: relative;
+    min-height: 710px;
+    padding: 64px 20px 0;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    overflow: hidden;
+    background: var(--white);
+  }
+
+  .hero-shot {
+    width: min(1180px, calc(100vw - 40px));
+    aspect-ratio: 16 / 9;
+    overflow: hidden;
+    border: 1px solid var(--line-dark);
+    border-radius: 18px 18px 0 0;
+  }
+
+  .hero-shot img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: center top;
+  }
+
+  .architecture {
+    padding: clamp(100px, 13vw, 180px) 0;
+  }
+
+  .architecture-intro {
+    margin-bottom: clamp(50px, 7vw, 82px);
+  }
+
+  .architecture-label {
+    color: var(--amber-ink);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 620;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .section-heading {
+    margin: 0;
+    font-size: clamp(2.8rem, 5.7vw, 5.25rem);
+    font-weight: 680;
+    line-height: 0.94;
+    letter-spacing: -0.04em;
+    text-wrap: balance;
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .architecture-intro p {
+    max-width: 590px;
+    margin: 0;
+    color: var(--muted);
+    font-size: clamp(1.05rem, 1.7vw, 1.28rem);
+    letter-spacing: -0.02em;
+    text-wrap: pretty;
+  }
+
+  .architecture-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 24px;
+    background: var(--white);
+  }
+
+  .architecture-layers {
+    display: grid;
+    grid-template-rows: auto repeat(3, minmax(0, 1fr));
+  }
+
+  .architecture-label {
+    min-height: 92px;
+    padding: 36px 40px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .architecture-layer {
+    min-height: 192px;
+    padding: 31px 40px 34px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 22px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .architecture-layer:last-child {
+    border-bottom: 0;
+  }
+
+  .architecture-layer h3 {
+    margin: 0;
+    font-size: clamp(2.1rem, 3.4vw, 3.35rem);
+    font-weight: 610;
+    line-height: 0.95;
+    letter-spacing: -0.045em;
+  }
+
+  .architecture-layer p {
+    max-width: 520px;
+    margin: 18px 0 0;
+    color: var(--card-copy-strong);
+    line-height: 1.5;
+    text-wrap: pretty;
+  }
+
+  .architecture-layer a {
+    display: inline-block;
+    margin-top: 16px;
+    color: var(--ink-subtle);
+    font-size: 13px;
+    font-weight: 580;
+    text-decoration: underline;
+    text-decoration-color: var(--line-strong);
+    text-underline-offset: 4px;
+    white-space: nowrap;
+  }
+
+  .layer-number {
+    width: 30px;
+    height: 30px;
+    display: grid;
+    place-items: center;
+    background: var(--amber-pale);
+    color: var(--amber-ink);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 650;
+  }
+
+  .architecture-visual {
+    min-width: 0;
+    min-height: 760px;
+    padding: clamp(32px, 4vw, 54px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background-color: var(--night);
+    background-image:
+      linear-gradient(var(--line-dark) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line-dark) 1px, transparent 1px);
+    background-size: 54px 54px;
+    color: var(--white);
+  }
+
+  .architecture-visual-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    padding-bottom: 25px;
+    border-bottom: 1px solid var(--line-dark);
+  }
+
+  .architecture-visual-brand {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+  }
+
+  .architecture-visual-brand img {
+    width: 42px;
+    height: 42px;
+    border-radius: 12px;
+  }
+
+  .architecture-visual-brand strong {
+    display: block;
+    font-size: 20px;
+    letter-spacing: -0.03em;
+  }
+
+  .architecture-visual-brand span,
+  .architecture-visual-head > span,
+  .architecture-machines span {
+    color: var(--night-copy);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  .architecture-diagram {
+    flex: 1;
+    display: grid;
+    place-items: center;
+    min-height: 0;
+    padding-block: 24px;
+  }
+
+  .isometric-architecture {
+    width: 100%;
+    height: auto;
+    max-height: 560px;
+    overflow: visible;
+  }
+
+  .isometric-architecture .iso-face,
+  .isometric-architecture .iso-line {
+    vector-effect: non-scaling-stroke;
+    stroke: var(--terminal-copy);
+    stroke-width: 1.35;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .isometric-architecture .iso-face {
+    fill: var(--night);
+  }
+
+  .isometric-architecture .iso-top {
+    fill: var(--night-raised);
+  }
+
+  .isometric-architecture .iso-plane {
+    fill: var(--factory-accent-surface);
+    stroke: var(--factory-accent-line);
+  }
+
+  .isometric-architecture .iso-line {
+    fill: none;
+  }
+
+  .isometric-architecture text {
+    fill: var(--terminal-copy);
+    font-family: var(--font-mono);
+    text-anchor: middle;
+  }
+
+  .isometric-architecture .iso-label {
+    font-size: 11px;
+    letter-spacing: 0.06em;
+  }
+
+  .isometric-architecture .iso-system {
+    fill: var(--white);
+    font-family: var(--font-sans);
+    font-size: 28px;
+    font-weight: 560;
+    letter-spacing: -0.04em;
+  }
+
+  .isometric-architecture .iso-pilus {
+    fill: var(--amber-pale);
+    font-size: 12px;
+    font-weight: 650;
+    letter-spacing: 0.12em;
+  }
+
+  .architecture-machines {
+    padding-top: 23px;
+    display: flex;
+    justify-content: space-between;
+    gap: 20px;
+    border-top: 1px solid var(--line-dark);
+  }
+
+  .explainer {
+    color: var(--blueprint-ink);
+    background-color: var(--blueprint);
+    background-image:
+      linear-gradient(to bottom, var(--blueprint) 0%, transparent 30%),
+      linear-gradient(to top, var(--blueprint) 0%, transparent 30%),
+      linear-gradient(var(--blueprint-grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--blueprint-grid) 1px, transparent 1px),
+      linear-gradient(var(--blueprint-grid-strong) 1px, transparent 1px),
+      linear-gradient(90deg, var(--blueprint-grid-strong) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 26px 26px, 26px 26px, 130px 130px, 130px 130px;
+    border-top: 1px solid var(--blueprint-line);
+    border-bottom: 1px solid var(--blueprint-line);
+  }
+
+  .explainer .wrap {
+    position: relative;
+    padding: clamp(48px, 6vw, 96px) clamp(20px, 3vw, 40px) 0;
+    border-left: 1px solid var(--blueprint-line);
+    border-right: 1px solid var(--blueprint-line);
+  }
+
+  .explainer .wrap::before {
+    content: "";
+    position: absolute;
+    inset: 4px;
+    border: 1px solid var(--blueprint-line);
+    pointer-events: none;
+  }
+
+  .explainer-head {
+    max-width: 720px;
+    margin-bottom: clamp(38px, 5vw, 64px);
+  }
+
+  .explainer-head p {
+    margin: 20px 0 0;
+    color: var(--blueprint-copy);
+    font-size: clamp(1.05rem, 1.7vw, 1.28rem);
+    letter-spacing: -0.02em;
+  }
+
+  .explainer-thanks-button {
+    margin-top: 22px;
+  }
+
+  .explainer-term {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 16px;
+    background: #0c0c0b;
+    border-bottom: 1px solid var(--blueprint-line);
+  }
+
+  .explainer-term-dots {
+    display: inline-flex;
+    gap: 5px;
+  }
+
+  .explainer-term-dots i {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--blueprint-line);
+  }
+
+  .explainer-term-title {
+    color: var(--blueprint-copy);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 660;
+    letter-spacing: -0.01em;
+  }
+
+  .explainer-diagram {
+    width: 100%;
+    height: auto;
+    display: block;
+    margin-bottom: clamp(16px, 2.5vw, 28px);
+  }
+
+  .explainer-diagram .diagram-link {
+    fill: none;
+    stroke: var(--blueprint-link);
+    stroke-width: 1.2;
+    stroke-dasharray: 3 6;
+  }
+
+  /* On the black plan every mark is drawn light so it reads. */
+  .explainer-diagram image,
+  .explainer-logo {
+    filter: brightness(0) invert(1);
+  }
+
+  .explainer-diagram .pilus-mark > path {
+    fill: var(--blueprint-ink);
+  }
+
+  .explainer-diagram .mark-eye {
+    fill: var(--blueprint);
+  }
+
+  /* Hostnames and latency pills annotate the four machines on the plan. */
+  .explainer-diagram .diagram-node text {
+    font-family: var(--font-mono);
+    letter-spacing: 0.02em;
+  }
+
+  .explainer-diagram .node-name {
+    fill: var(--blueprint-ink);
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .explainer-diagram .node-latency {
+    fill: var(--blueprint-copy);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+  }
+
+  .explainer-bento {
+    display: grid;
+    grid-template-columns: minmax(0, 0.62fr) minmax(0, 1.38fr);
+    margin-inline: calc(4px - clamp(20px, 3vw, 40px));
+    border-top: 1px solid var(--blueprint-line);
+    border-bottom: 1px solid var(--blueprint-line);
+    background: #0c0c0b;
+    overflow: hidden;
+  }
+
+  .explainer-rows {
+    background: #0c0c0b;
+    border-right: 1px solid var(--blueprint-line);
+  }
+
+  .explainer-panel {
+    display: flex;
+    background-color: #0c0c0b;
+    background-image: radial-gradient(var(--blueprint-grid-strong) 1px, transparent 1px);
+    background-size: 18px 18px;
+  }
+
+  .mc {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--blueprint-copy);
+  }
+
+  .mc-top {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--blueprint-line);
+  }
+
+  .mc-title {
+    color: var(--blueprint-ink);
+    font-weight: 650;
+    letter-spacing: 0.06em;
+  }
+
+  .mc-sub {
+    letter-spacing: 0.06em;
+  }
+
+  .mc-action {
+    margin-left: auto;
+    color: var(--white);
+    letter-spacing: 0.06em;
+  }
+
+  .mc-stats {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+    padding: 10px 12px;
+  }
+
+  .mc-card {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 10px;
+    border: 1px solid var(--blueprint-line);
+  }
+
+  .mc-label {
+    color: rgba(255, 255, 255, 0.42);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+  }
+
+  .mc-value {
+    color: var(--blueprint-ink);
+    font-size: 18px;
+    line-height: 1.1;
+  }
+
+  .mc-meta {
+    color: rgba(255, 255, 255, 0.42);
+  }
+
+  .mc-automation {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    padding: 7px 12px;
+    border-top: 1px solid var(--blueprint-line);
+    border-bottom: 1px solid var(--blueprint-line);
+  }
+
+  .mc-automation .mc-label {
+    padding: 2px 7px;
+    background: rgba(255, 255, 255, 0.07);
+  }
+
+  .mc-main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: minmax(0, 2.8fr) minmax(0, 1fr);
+    gap: 8px;
+    padding: 10px 12px;
+  }
+
+  .mc-sessions,
+  .mc-block {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 10px;
+    border: 1px solid var(--blueprint-line);
+  }
+
+  .mc-sessions {
+    overflow: hidden;
+  }
+
+  .mc-panel-title {
+    color: rgba(255, 255, 255, 0.42);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+  }
+
+  .mc-table {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .mc-tr {
+    display: grid;
+    grid-template-columns: 28px 1.15fr 0.85fr 1fr 2.15fr 0.85fr 0.5fr 0.95fr;
+    gap: 8px;
+    padding: 4px 6px;
+    color: rgba(255, 255, 255, 0.42);
+    font-size: 10px;
+    white-space: nowrap;
+  }
+
+  .mc-tr.is-active {
+    background: rgba(255, 255, 255, 0.07);
+  }
+
+  /* AGENT and STATE carry the signal; the rest is secondary. */
+  .mc-tr:not(.mc-th) span:nth-child(2),
+  .mc-tr:not(.mc-th) span:nth-child(3) {
+    color: var(--blueprint-ink);
+  }
+
+  .mc-tr span {
+    overflow: hidden;
+  }
+
+  .mc-th {
+    color: rgba(255, 255, 255, 0.42);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+  }
+
+  .mc-side {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  /* The last side block fills the column so its base meets the sessions panel. */
+  .mc-side .mc-block:last-child {
+    flex: 1;
+  }
+
+  .mc-line {
+    color: var(--blueprint-ink);
+  }
+
+  .mc-line.is-dim {
+    color: rgba(255, 255, 255, 0.42);
+  }
+
+  .mc-footer {
+    padding: 7px 12px;
+    border-top: 1px solid var(--blueprint-line);
+    color: rgba(255, 255, 255, 0.42);
+  }
+
+  .mc-nodes {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 7px 12px;
+    border-top: 1px solid var(--blueprint-line);
+  }
+
+  .mc-node {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--blueprint-copy);
+  }
+
+  .mc-node i {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--white);
+  }
+
+  .mc-node b {
+    margin-left: 3px;
+    color: var(--blueprint-ink);
+    font-weight: 500;
+  }
+
+  .mc-node.is-offline,
+  .mc-node.is-offline b {
+    color: rgba(255, 255, 255, 0.35);
+  }
+
+  .mc-node.is-offline i {
+    background: rgba(255, 255, 255, 0.35);
+  }
+
+  /* Live feed drawn on the plan: a fake stream of agents at work. Items
+     arrive, then fade and collapse on their own so the stack never fills up. */
+  .diagram-feed {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--blueprint-copy);
+  }
+
+  .diagram-feed-list {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-height: 57px;
+  }
+
+  .diagram-feed-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    height: 18px;
+    white-space: nowrap;
+    color: rgba(255, 255, 255, 0.42);
+    transition: opacity 0.4s ease, transform 0.4s ease, height 0.4s ease;
+  }
+
+  .diagram-feed-item.is-new {
+    animation: diagram-feed-in 0.4s ease both;
+  }
+
+  .diagram-feed-item.is-leaving {
+    height: 0;
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+
+  .diagram-feed-logo {
+    width: 12px;
+    height: 12px;
+    flex: 0 0 auto;
+    filter: brightness(0) invert(1);
+    opacity: 0.8;
+  }
+
+  .diagram-feed-agent {
+    color: var(--blueprint-ink);
+    font-weight: 500;
+  }
+
+  .diagram-feed-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .diagram-feed-time {
+    margin-left: auto;
+    flex: 0 0 auto;
+    color: rgba(255, 255, 255, 0.3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  @keyframes diagram-feed-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+  }
+
+  .explainer-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .explainer-list li {
+    padding: clamp(14px, 1.8vw, 22px) clamp(20px, 2.6vw, 34px);
+    border-bottom: 1px solid var(--blueprint-line);
+  }
+
+  .explainer-list li:last-child {
+    border-bottom: 0;
+  }
+
+  .explainer-title {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .explainer-logo {
+    width: clamp(30px, 3.2vw, 40px);
+    height: clamp(30px, 3.2vw, 40px);
+    flex: 0 0 auto;
+    object-fit: contain;
+  }
+
+  .explainer-logo--pi {
+    width: 28px;
+    height: 28px;
+  }
+
+  .explainer-logo--iroh {
+    width: 48px;
+    height: 48px;
+  }
+
+  .explainer-copy h3 {
+    margin: 0;
+    font-size: clamp(1.7rem, 2.8vw, 2.6rem);
+    font-weight: 620;
+    line-height: 1.0;
+    letter-spacing: -0.035em;
+  }
+
+  .explainer-copy p {
+    max-width: 640px;
+    margin: 10px 0 0;
+    color: var(--blueprint-copy);
+    font-size: clamp(1rem, 1.35vw, 1.15rem);
+    line-height: 1.55;
+    text-wrap: pretty;
+  }
+
+  .feature-stack {
+    padding: 18px 0 clamp(110px, 13vw, 180px);
+  }
+
+  .feature-head {
+    max-width: 900px;
+    margin: 0 auto 65px;
+    text-align: center;
+  }
+
+  .feature-head p {
+    max-width: 660px;
+    margin: 23px auto 0;
+    color: var(--muted);
+    font-size: 18px;
+    letter-spacing: -0.02em;
+  }
+
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px;
+  }
+
+  .feature-card {
+    min-width: 0;
+    overflow: hidden;
+    border-radius: 18px;
+    background: var(--card);
+  }
+
+  .feature-visual {
+    aspect-ratio: 16 / 9;
+    overflow: hidden;
+    background: var(--night);
+  }
+
+  .feature-visual img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: center top;
+  }
+
+  .feature-copy {
+    padding: 31px 32px 35px;
+  }
+
+  .feature-copy h3 {
+    margin: 0;
+    font-size: clamp(2rem, 3.2vw, 3rem);
+    font-weight: 660;
+    line-height: 0.98;
+    letter-spacing: -0.04em;
+    text-wrap: balance;
+  }
+
+  .feature-copy p {
+    margin: 17px 0 0;
+    color: var(--card-copy);
+    font-size: 16px;
+    line-height: 1.5;
+    letter-spacing: -0.018em;
+  }
+
+  .feature-copy ul {
+    margin: 25px 0 0;
+    padding: 0;
+    list-style: none;
+    border-top: 1px solid var(--line);
+  }
+
+  .feature-copy li {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 0;
+    border-bottom: 1px solid var(--line);
+    color: var(--card-copy-strong);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  .feature-copy li::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--amber);
+  }
+
+  .feature-wide {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: minmax(0, 0.78fr) minmax(0, 1.22fr);
+    align-items: center;
+    background: var(--card-wide);
+  }
+
+  .feature-wide .feature-copy {
+    padding: clamp(38px, 5.6vw, 70px);
+  }
+
+  .feature-wide .feature-visual {
+    order: 2;
+    height: 100%;
+    aspect-ratio: auto;
+  }
+
+  .inventory {
+    padding: 0 0 clamp(110px, 14vw, 180px);
+  }
+
+  .inventory .wrap {
+    position: relative;
+    padding: clamp(32px, 4vw, 56px) clamp(20px, 3vw, 40px) 4px;
+    border-left: 1px solid var(--line);
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .inventory .wrap::before {
+    content: "";
+    position: absolute;
+    inset: 4px;
+    border: 1px solid var(--line);
+    pointer-events: none;
+  }
+
+  .inventory-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: clamp(24px, 4vw, 64px);
+    text-align: left;
+    margin-bottom: 56px;
+  }
+
+  .inventory-head p {
+    margin: 0;
+    justify-self: end;
+    line-height: 0;
+  }
+
+  .inventory-head .pilus-mark {
+    width: clamp(140px, 18vw, 220px);
+    height: auto;
+    margin: 0;
+  }
+
+  .inventory-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    margin-inline: calc(4px - clamp(20px, 3vw, 40px));
+    border-top: 1px solid var(--line);
+  }
+
+  .inventory-item {
+    padding: 29px 28px 30px;
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .inventory-item:nth-child(3n) {
+    border-right: 0;
+  }
+
+  .inventory-item:nth-last-child(-n+3) {
+    border-bottom: 0;
+  }
+
+  .inventory-item h3 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 640;
+    line-height: 1.02;
+    letter-spacing: -0.04em;
+  }
+
+  .inventory-item p {
+    max-width: 31ch;
+    margin: 11px 0 0;
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+
+  .faq {
+    padding: 0 0 clamp(110px, 14vw, 180px);
+  }
+
+  .faq-inner {
+    position: relative;
+    overflow: hidden;
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+    gap: clamp(32px, 5vw, 72px);
+    padding: clamp(28px, 4vw, 56px);
+    border-radius: 24px;
+    background: var(--night);
+    color: var(--white);
+  }
+
+  .faq h2 {
+    margin: 0;
+    font-size: clamp(2rem, 4vw, 6rem);
+    text-wrap: balance;
+    font-weight: 680;
+    line-height: 1.1;
+    letter-spacing: -0.04em;
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  /* Light mark for the dark panel: white body, night eyes. */
+  .faq-inner .pilus-mark > path {
+    fill: var(--white);
+  }
+
+  .faq-inner .mark-eye {
+    fill: var(--night);
+  }
+
+  .faq-mark-above {
+    position: relative;
+    z-index: 1;
+    width: var(--page);
+    margin: 0 auto -160px;
+    text-align: right;
+    line-height: 0;
+    pointer-events: none;
+  }
+
+  .faq-mark {
+    width: 360px;
+    height: 360px;
+    margin-right: 3em;
+  }
+
+  details {
+    border-bottom: 1px solid var(--line-dark);
+  }
+
+  details:last-child {
+    border-bottom: 0;
+  }
+
+  summary {
+    position: relative;
+    padding: 24px 48px 24px 0;
+    cursor: pointer;
+    list-style: none;
+    color: var(--white);
+    font-size: 17px;
+    font-weight: 610;
+    letter-spacing: -0.02em;
+  }
+
+  summary::-webkit-details-marker {
+    display: none;
+  }
+
+  summary::after {
+    content: "+";
+    position: absolute;
+    right: 3px;
+    top: 21px;
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--dark-control);
+    color: var(--terminal-copy);
+    font-weight: 400;
+  }
+
+  details[open] summary::after {
+    content: "−";
+  }
+
+  details p {
+    max-width: 65ch;
+    margin: -3px 52px 24px 0;
+    color: var(--night-copy);
+  }
+
+  .faq details p a {
+    color: var(--white);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  /* Footer mirrors the hero's atmospheric field as the page's closing beat. */
+  footer {
+    position: relative;
+    overflow: hidden;
+    border-top: 1px solid var(--line);
+    background-color: var(--paper);
+    background-image: url("assets/hero-factory.webp");
+    background-position: center 56%;
+    background-size: cover;
+  }
+
+  /* Blueprint ticker wired to the footer's top rule. */
+  .footer-marquee {
+    position: relative;
+    z-index: 1;
+    overflow: hidden;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--line);
+    background-color: var(--paper);
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    user-select: none;
+  }
+
+  .footer-marquee-track {
+    display: inline-flex;
+    animation: footer-marquee 144s linear infinite;
+    will-change: transform;
+  }
+
+  .footer-marquee-group {
+    padding-right: 8px;
+  }
+
+  @keyframes footer-marquee {
+    to {
+      transform: translateX(-50%);
+    }
+  }
+
+  .footer-brand {
+    position: relative;
+    z-index: 1;
+    padding: 96px 0 0;
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+  }
+
+  .footer-brand .brand {
+    font-size: clamp(9rem, 30vw, 19rem);
+    line-height: 0;
+  }
+
+  .footer-brand .brand-mark {
+    width: 1em;
+    height: 1em;
+    display: block;
+    flex: 0 0 auto;
+    /* Override the shared mark spacing; anchor to the footer's bottom edge. */
+    margin: 0 0 -0.4em;
+  }
+
+  .footer-bottom {
+    padding: 22px 0 27px;
+    display: flex;
+    justify-content: space-between;
+    gap: 24px;
+    border-top: 1px solid var(--line);
+    color: var(--soft);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  @keyframes hero-copy-arrive {
+    from {
+      opacity: 0.12;
+      transform: translateY(18px);
+      filter: blur(7px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+      filter: none;
+    }
+  }
+
+  @keyframes shot-arrive {
+    from {
+      opacity: 0.38;
+      transform: translateY(34px);
+      clip-path: inset(0 0 14% 0 round 18px 18px 0 0);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+      clip-path: inset(0 round 18px 18px 0 0);
+    }
+  }
+
+  .hero-copy {
+    animation: hero-copy-arrive 780ms cubic-bezier(.16, 1, .3, 1) both;
+  }
+
+  .hero-shot {
+    animation: shot-arrive 980ms cubic-bezier(.16, 1, .3, 1) 120ms both;
+  }
+
+  @media (max-width: 900px) {
+    .hero-atmosphere {
+      min-height: auto;
+      padding-top: 132px;
+    }
+
+    .explainer-bento {
+      grid-template-columns: 1fr;
+    }
+
+    .explainer-rows {
+      border-right: 0;
+      border-bottom: 1px solid var(--blueprint-line);
+    }
+
+    .architecture-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .architecture-visual {
+      order: -1;
+      min-height: 610px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .architecture-label {
+      min-height: auto;
+    }
+
+    .feature-wide {
+      grid-template-columns: 1fr;
+    }
+
+    .feature-wide .feature-visual {
+      order: initial;
+    }
+
+    .inventory-head,
+    .faq-inner {
+      grid-template-columns: 1fr;
+    }
+
+    .inventory-head {
+      gap: 28px;
+    }
+  }
+
+  @media (max-width: 680px) {
+    :root {
+      --page: min(100% - 28px, 1180px);
+    }
+
+    .nav-inner {
+      height: 66px;
+    }
+
+    .nav-action {
+      min-height: 38px;
+      padding-inline: 15px;
+    }
+
+    .hero-atmosphere {
+      padding: 111px 0 54px;
+    }
+
+    .hero h1 {
+      font-size: clamp(3.2rem, 15vw, 4.55rem);
+      line-height: 0.91;
+    }
+
+    .hero-title-row {
+      gap: 10px;
+    }
+
+    .hero h1 .pilus-mark {
+      width: 1em;
+      height: 1em;
+    }
+
+    .hero-lede {
+      margin-top: 23px;
+      font-size: 17px;
+    }
+
+    .hero-actions .button {
+      width: 100%;
+    }
+
+    .hero-scene {
+      min-height: 430px;
+      padding: 42px 14px 0;
+    }
+
+    .hero-shot {
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      border-radius: 12px 12px 0 0;
+    }
+
+    .architecture {
+      padding-block: 90px;
+    }
+
+    .architecture-grid {
+      border-radius: 18px;
+    }
+
+    .architecture-intro {
+      margin-bottom: 43px;
+    }
+
+    .section-heading {
+      font-size: clamp(2.7rem, 12vw, 4rem);
+    }
+
+    .architecture-visual {
+      min-height: 535px;
+      padding: 24px;
+    }
+
+    .architecture-visual-head {
+      align-items: flex-start;
+    }
+
+    .architecture-visual-head > span {
+      max-width: 90px;
+      text-align: right;
+    }
+
+    .architecture-diagram {
+      padding-block: 12px;
+    }
+
+    .isometric-architecture .iso-label {
+      font-size: 20px;
+      letter-spacing: 0.02em;
+    }
+
+    .isometric-architecture .iso-pilus {
+      font-size: 18px;
+    }
+
+    .architecture-label,
+    .architecture-layer {
+      padding-inline: 24px;
+    }
+
+    .architecture-label {
+      padding-block: 27px;
+    }
+
+    .architecture-layer {
+      min-height: 0;
+      padding-block: 27px 30px;
+      gap: 16px;
+    }
+
+    .architecture-layer h3 {
+      font-size: 2.5rem;
+    }
+
+    .architecture-layer p {
+      margin-top: 15px;
+    }
+
+    .architecture-machines {
+      gap: 12px;
+    }
+
+    .architecture-machines span {
+      font-size: 10px;
+    }
+
+    .feature-stack {
+      padding-top: 8px;
+    }
+
+    .feature-head {
+      margin-bottom: 43px;
+      text-align: left;
+    }
+
+    .feature-head p {
+      margin-left: 0;
+    }
+
+    .feature-grid {
+      grid-template-columns: 1fr;
+      gap: 14px;
+    }
+
+    .feature-wide {
+      grid-column: auto;
+    }
+
+    .feature-card {
+      border-radius: 16px;
+    }
+
+    .feature-copy {
+      padding: 27px 24px 30px;
+    }
+
+    .feature-copy h3 {
+      font-size: 2.45rem;
+    }
+
+    .feature-wide .feature-copy {
+      padding: 27px 24px 30px;
+    }
+
+    .feature-wide .feature-visual {
+      aspect-ratio: 16 / 10;
+    }
+
+    .inventory {
+      padding-bottom: 105px;
+    }
+
+    .inventory-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .inventory-item {
+      padding: 25px 20px;
+      border-right: 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .inventory-item:last-child {
+      border-bottom: 0;
+    }
+
+    .faq {
+      padding: 0 0 105px;
+    }
+
+    .faq-inner {
+      border-radius: 18px;
+    }
+
+    .footer-brand {
+      padding: 56px 0 0;
+    }
+
+    .footer-bottom {
+      flex-direction: column;
+      gap: 8px;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+
+    *, *::before, *::after {
+      animation-duration: 0.001ms !important;
+      animation-delay: 0ms !important;
+      transition-duration: 0.001ms !important;
+    }
+  }
+</style>
+</head>
+<body>
+
+<header class="site-nav">
+  <div class="nav-inner">
+    <a class="brand" href="/" aria-label="pilus home">
+      <svg class="pilus-mark" viewBox="0 0 100 100" aria-hidden="true" focusable="false">
+        <path fill="#061116" d="M81.28 50.19C81.28 69.32 70.37 79.47 49.82 79.47C29.27 79.47 18.36 69.32 18.36 50.19C18.36 31.07 29.27 20.92 49.82 20.92C70.37 20.92 81.28 31.07 81.28 50.19Z"/>
+        <g class="mark-eyes">
+          <path class="mark-eye" fill="#ffffff" d="M42.98 46.05C42.72 50.76 42.44 51.27 40.21 51.14C37.97 51.02 37.75 50.48 38.01 45.77C38.27 41.06 38.55 40.55 40.79 40.67C43.03 40.8 43.25 41.33 42.98 46.05Z"/>
+          <path class="mark-eye" fill="#ffffff" d="M62.69 45.07C62.47 49.93 62.16 50.46 59.56 50.34C56.97 50.22 56.7 49.66 56.93 44.81C57.15 39.95 57.46 39.43 60.06 39.54C62.65 39.66 62.92 40.22 62.69 45.07Z"/>
+        </g>
+      </svg>
+      pilus
+    </a>
+    <a class="button button-small nav-action" href="https://usepilus.dev/ios">Install pilus via TestFlight</a>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="hero-atmosphere">
+      <div class="wrap hero-copy">
+        <h1>
+          <span class="hero-title-row">
+            one
+            <svg class="pilus-mark" viewBox="0 0 100 100" aria-hidden="true" focusable="false">
+              <path fill="#061116" d="M81.28 50.19C81.28 69.32 70.37 79.47 49.82 79.47C29.27 79.47 18.36 69.32 18.36 50.19C18.36 31.07 29.27 20.92 49.82 20.92C70.37 20.92 81.28 31.07 81.28 50.19Z"/>
+              <g class="mark-eyes">
+                <path class="mark-eye" fill="#ffffff" d="M42.98 46.05C42.72 50.76 42.44 51.27 40.21 51.14C37.97 51.02 37.75 50.48 38.01 45.77C38.27 41.06 38.55 40.55 40.79 40.67C43.03 40.8 43.25 41.33 42.98 46.05Z"/>
+                <path class="mark-eye" fill="#ffffff" d="M62.69 45.07C62.47 49.93 62.16 50.46 59.56 50.34C56.97 50.22 56.7 49.66 56.93 44.81C57.15 39.95 57.46 39.43 60.06 39.54C62.65 39.66 62.92 40.22 62.69 45.07Z"/>
+              </g>
+            </svg>
+            pilus is
+          </span>
+          <span>all you need</span>
+        </h1>
+        <p class="hero-lede">
+          pilus brings <strong>P</strong>i, <strong>I</strong>roh, and <strong>Lu</strong>vu<strong>s</strong> together so you can
+          work, automate, and access all your agents anytime, on any of your computers.
+          <span class="hero-lede-note">Also, pilus is a terminal after all.</span>
+        </p>
+        <div class="hero-actions">
+          <a class="button button-dark" href="https://usepilus.dev/download">Download for macOS</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="hero-scene">
+      <div class="hero-shot" aria-label="pilus running a four-pane workspace">
+        <img src="assets/main-home.png" alt="pilus workspace showing request logs, git history, live agent output, a build, and system activity across four panes" width="1600" height="1200" fetchpriority="high">
+      </div>
+    </div>
+  </section>
+
+  <!-- Original architecture section, kept for future reference. Uncomment to restore.
+  <section class="architecture" id="how-it-works" aria-label="The pilus architecture">
+    <div class="wrap">
+      <div class="architecture-intro">
+        <p>
+          Pi runs the agents. Iroh connects the edges. Luvus keeps the workspace
+          alive. Pilus turns the three into one native Mac control surface.
+        </p>
+      </div>
+
+      <div class="architecture-grid">
+        <div class="architecture-layers">
+          <div class="architecture-label">Architecture</div>
+          <article class="architecture-layer">
+            <div>
+              <h3>Pi</h3>
+              <p>
+                The agent harness. Pilus gives Pi first-class support, keeping
+                active work visible beside the panes and workspaces it operates in.
+              </p>
+              <a href="https://pi.dev">pi.dev ↗</a>
+            </div>
+            <span class="layer-number">01</span>
+          </article>
+          <article class="architecture-layer">
+            <div>
+              <h3>Iroh</h3>
+              <p>
+                The connectivity layer. Iroh links apps, agents, and workflows
+                peer to peer, across local, edge, and remote environments.
+              </p>
+              <a href="https://iroh.computer">iroh.computer ↗</a>
+            </div>
+            <span class="layer-number">02</span>
+          </article>
+          <article class="architecture-layer">
+            <div>
+              <h3>Luvus</h3>
+              <p>
+                The persistence layer. Luvus owns workspaces, tabs, panes,
+                agent state, and local or SSH machines so work stays alive.
+              </p>
+              <a href="https://github.com/RizRiyz/luvus">workspace daemon ↗</a>
+            </div>
+            <span class="layer-number">03</span>
+          </article>
+        </div>
+
+        <div class="architecture-visual" aria-label="Pilus software factory architecture">
+          <div class="architecture-visual-head">
+            <div class="architecture-visual-brand">
+              <img src="assets/pilus.svg" alt="" width="42" height="42">
+              <div>
+                <strong>Pilus</strong>
+                <span>native mission control</span>
+              </div>
+            </div>
+            <span>one workspace</span>
+          </div>
+
+          <div class="architecture-diagram">
+            <svg class="isometric-architecture" viewBox="0 0 720 680" role="img" aria-labelledby="factory-diagram-title">
+              <title id="factory-diagram-title">Pi and Iroh systems running on the Luvus foundation, joined through Pilus</title>
+
+              <g aria-hidden="true">
+                <polygon class="iso-face iso-top" points="100,470 360,320 620,470 360,620"></polygon>
+                <polygon class="iso-face" points="100,470 360,620 360,651 100,501"></polygon>
+                <polygon class="iso-face" points="360,620 620,470 620,501 360,651"></polygon>
+                <line class="iso-line" x1="132" y1="489" x2="360" y2="620"></line>
+                <line class="iso-line" x1="164" y1="507" x2="360" y2="620"></line>
+                <line class="iso-line" x1="196" y1="526" x2="360" y2="620"></line>
+                <line class="iso-line" x1="228" y1="544" x2="360" y2="620"></line>
+                <line class="iso-line" x1="260" y1="563" x2="360" y2="620"></line>
+                <line class="iso-line" x1="588" y1="489" x2="360" y2="620"></line>
+                <line class="iso-line" x1="556" y1="507" x2="360" y2="620"></line>
+                <line class="iso-line" x1="524" y1="526" x2="360" y2="620"></line>
+                <line class="iso-line" x1="492" y1="544" x2="360" y2="620"></line>
+                <line class="iso-line" x1="460" y1="563" x2="360" y2="620"></line>
+
+                <polygon class="iso-face iso-plane" points="344,148 360,139 360,536 344,545"></polygon>
+                <polygon class="iso-face iso-plane" points="360,139 376,148 376,545 360,536"></polygon>
+                <text class="iso-pilus" x="360" y="116">PILUS</text>
+
+                <g transform="translate(114 390)">
+                  <polygon class="iso-face iso-top" points="0,20 45,0 90,20 45,40"></polygon>
+                  <polygon class="iso-face" points="0,20 45,40 45,100 0,80"></polygon>
+                  <polygon class="iso-face" points="45,40 90,20 90,80 45,100"></polygon>
+                  <text class="iso-label" x="45" y="25">TOOLS</text>
+                </g>
+                <g transform="translate(204 410)">
+                  <polygon class="iso-face iso-top" points="0,20 45,0 90,20 45,40"></polygon>
+                  <polygon class="iso-face" points="0,20 45,40 45,100 0,80"></polygon>
+                  <polygon class="iso-face" points="45,40 90,20 90,80 45,100"></polygon>
+                  <text class="iso-label" x="45" y="25">SKILLS</text>
+                </g>
+                <g transform="translate(159 310)">
+                  <polygon class="iso-face iso-top" points="0,20 45,0 90,20 45,40"></polygon>
+                  <polygon class="iso-face" points="0,20 45,40 45,110 0,90"></polygon>
+                  <polygon class="iso-face" points="45,40 90,20 90,90 45,110"></polygon>
+                  <text class="iso-label" x="45" y="25">MODELS</text>
+                </g>
+                <g transform="translate(204 220)">
+                  <polygon class="iso-face iso-top" points="0,20 45,0 90,20 45,40"></polygon>
+                  <polygon class="iso-face" points="0,20 45,40 45,110 0,90"></polygon>
+                  <polygon class="iso-face" points="45,40 90,20 90,90 45,110"></polygon>
+                  <text class="iso-label" x="45" y="25">AGENT</text>
+                </g>
+
+                <g transform="translate(426 410)">
+                  <polygon class="iso-face iso-top" points="0,20 45,0 90,20 45,40"></polygon>
+                  <polygon class="iso-face" points="0,20 45,40 45,100 0,80"></polygon>
+                  <polygon class="iso-face" points="45,40 90,20 90,80 45,100"></polygon>
+                  <text class="iso-label" x="45" y="25">P2P</text>
+                </g>
+                <g transform="translate(516 390)">
+                  <polygon class="iso-face iso-top" points="0,20 45,0 90,20 45,40"></polygon>
+                  <polygon class="iso-face" points="0,20 45,40 45,100 0,80"></polygon>
+                  <polygon class="iso-face" points="45,40 90,20 90,80 45,100"></polygon>
+                  <text class="iso-label" x="45" y="25">RELAYS</text>
+                </g>
+                <g transform="translate(471 310)">
+                  <polygon class="iso-face iso-top" points="0,20 45,0 90,20 45,40"></polygon>
+                  <polygon class="iso-face" points="0,20 45,40 45,110 0,90"></polygon>
+                  <polygon class="iso-face" points="45,40 90,20 90,90 45,110"></polygon>
+                  <text class="iso-label" x="45" y="25">KEYS</text>
+                </g>
+                <g transform="translate(426 220)">
+                  <polygon class="iso-face iso-top" points="0,20 45,0 90,20 45,40"></polygon>
+                  <polygon class="iso-face" points="0,20 45,40 45,110 0,90"></polygon>
+                  <polygon class="iso-face" points="45,40 90,20 90,90 45,110"></polygon>
+                  <text class="iso-label" x="45" y="25">QUIC</text>
+                </g>
+
+                <text class="iso-system" x="182" y="184">Pi</text>
+                <text class="iso-system" x="538" y="184">Iroh</text>
+                <text class="iso-system" x="360" y="675">Luvus</text>
+              </g>
+            </svg>
+          </div>
+
+          <div class="architecture-machines">
+            <span>local machines</span>
+            <span>live agent state</span>
+            <span>SSH machines</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+  -->
+
+  <section class="explainer" id="how-it-works" aria-labelledby="explainer-title">
+    <div class="wrap">
+      <div class="explainer-head">
+        <h2 class="section-heading" id="explainer-title">Create. Automate. Orchestrate.</h2>
+        <p>From your Mac or from your phone.<br>On your Mac or on some cloud.</p>
+        <p class="explainer-thanks">Thanks to Luvus Universal Harness Protocol (UHP)</p>
+        <a class="button explainer-thanks-button" href="https://luvus.dev/docs/uhp/">Learn More about UHP</a>
+      </div>
+      <svg class="explainer-diagram" viewBox="0 0 1240 666" role="img" aria-label="Pi, Iroh, and Luvus connected through pilus, with computers and coding agents attached">
+            <defs>
+              <mask id="explainer-links-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="1240" height="666">
+                <rect x="0" y="0" width="1240" height="666" fill="#ffffff"/>
+        <circle cx="620" cy="120" r="56" fill="#000000"/>
+        <circle cx="380" cy="250" r="40" fill="#000000"/>
+        <circle cx="860" cy="250" r="44" fill="#000000"/>
+        <circle cx="620" cy="410" r="40" fill="#000000"/>
+        <circle cx="140" cy="220" r="28" fill="#000000"/>
+        <circle cx="140" cy="500" r="28" fill="#000000"/>
+        <circle cx="1100" cy="220" r="28" fill="#000000"/>
+        <circle cx="1100" cy="500" r="28" fill="#000000"/>
+        <circle cx="260" cy="620" r="28" fill="#000000"/>
+        <circle cx="332" cy="620" r="28" fill="#000000"/>
+        <circle cx="404" cy="620" r="28" fill="#000000"/>
+        <circle cx="476" cy="620" r="28" fill="#000000"/>
+        <circle cx="548" cy="620" r="28" fill="#000000"/>
+        <circle cx="620" cy="620" r="28" fill="#000000"/>
+        <circle cx="692" cy="620" r="28" fill="#000000"/>
+        <circle cx="764" cy="620" r="28" fill="#000000"/>
+        <circle cx="836" cy="620" r="28" fill="#000000"/>
+        <circle cx="908" cy="620" r="28" fill="#000000"/>
+        <circle cx="980" cy="620" r="28" fill="#000000"/>
+              </mask>
+            </defs>
+            <g class="diagram-links" mask="url(#explainer-links-mask)">
+              <path class="diagram-link" d="M860 250 Q960 380 620 410"></path>
+              <path class="diagram-link" d="M620 410 Q200 380 380 250"></path>
+              <path class="diagram-link" d="M380 250 Q480 160 620 120"></path>
+              <path class="diagram-link" d="M860 250 Q740 160 620 120"></path>
+              <path class="diagram-link" d="M620 410 Q640 250 620 120"></path>
+              <line class="diagram-link" x1="140" y1="220" x2="620" y2="120"></line>
+              <line class="diagram-link" x1="140" y1="220" x2="860" y2="250"></line>
+              <line class="diagram-link" x1="140" y1="220" x2="620" y2="410"></line>
+              <line class="diagram-link" x1="140" y1="500" x2="620" y2="120"></line>
+              <line class="diagram-link" x1="140" y1="500" x2="860" y2="250"></line>
+              <line class="diagram-link" x1="140" y1="500" x2="620" y2="410"></line>
+              <line class="diagram-link" x1="1100" y1="220" x2="620" y2="120"></line>
+              <line class="diagram-link" x1="1100" y1="220" x2="860" y2="250"></line>
+              <line class="diagram-link" x1="1100" y1="220" x2="620" y2="410"></line>
+              <line class="diagram-link" x1="1100" y1="500" x2="620" y2="120"></line>
+              <line class="diagram-link" x1="1100" y1="500" x2="860" y2="250"></line>
+              <line class="diagram-link" x1="1100" y1="500" x2="620" y2="410"></line>
+              <line class="diagram-link" x1="620" y1="410" x2="260" y2="620"></line>
+              <line class="diagram-link" x1="620" y1="410" x2="332" y2="620"></line>
+              <line class="diagram-link" x1="620" y1="410" x2="404" y2="620"></line>
+              <line class="diagram-link" x1="620" y1="410" x2="476" y2="620"></line>
+              <line class="diagram-link" x1="620" y1="410" x2="548" y2="620"></line>
+              <line class="diagram-link" x1="620" y1="410" x2="620" y2="620"></line>
+              <line class="diagram-link" x1="620" y1="410" x2="692" y2="620"></line>
+              <line class="diagram-link" x1="620" y1="410" x2="764" y2="620"></line>
+              <line class="diagram-link" x1="620" y1="410" x2="836" y2="620"></line>
+              <line class="diagram-link" x1="620" y1="410" x2="908" y2="620"></line>
+              <line class="diagram-link" x1="620" y1="410" x2="980" y2="620"></line>
+            </g>
+            <image href="assets/logos/pi.svg" x="358" y="228" width="44" height="44"></image>
+            <image href="assets/logos/iroh.png" x="824" y="214" width="72" height="72"></image>
+            <image href="assets/logos/luvus.svg" x="590" y="380" width="60" height="60"></image>
+            <g class="diagram-node">
+              <image href="assets/logos/computer.svg" x="120" y="200" width="40" height="40"></image>
+              <text class="node-name" x="104" y="214" text-anchor="end">macbook-air</text>
+              <text class="node-latency" x="104" y="237" text-anchor="end">3 ms</text>
+            </g>
+            <g class="diagram-node">
+              <image href="assets/logos/computer.svg" x="120" y="480" width="40" height="40"></image>
+              <text class="node-name" x="104" y="494" text-anchor="end">devbox</text>
+              <text class="node-latency" x="104" y="517" text-anchor="end">1 ms</text>
+            </g>
+            <g class="diagram-node">
+              <image href="assets/logos/computer.svg" x="1080" y="200" width="40" height="40"></image>
+              <text class="node-name" x="1136" y="214" text-anchor="start">cloud-runner</text>
+              <text class="node-latency" x="1136" y="237" text-anchor="start">28 ms</text>
+            </g>
+            <g class="diagram-node">
+              <image href="assets/logos/computer.svg" x="1080" y="480" width="40" height="40"></image>
+              <text class="node-name" x="1136" y="494" text-anchor="start">mac-mini</text>
+              <text class="node-latency" x="1136" y="517" text-anchor="start">42 ms</text>
+            </g>
+            <image href="assets/logos/agents/antigravity.svg" x="240" y="600" width="40" height="40"></image>
+            <image href="assets/logos/agents/claude-code.svg" x="312" y="600" width="40" height="40"></image>
+            <image href="assets/logos/agents/codex.svg" x="384" y="600" width="40" height="40"></image>
+            <image href="assets/logos/agents/cursor.svg" x="456" y="600" width="40" height="40"></image>
+            <image href="assets/logos/agents/gemini.svg" x="528" y="600" width="40" height="40"></image>
+            <image href="assets/logos/agents/github-copilot.svg" x="600" y="600" width="40" height="40"></image>
+            <image href="assets/logos/agents/grok.svg" x="672" y="600" width="40" height="40"></image>
+            <image href="assets/logos/agents/kilo-code.svg" x="744" y="600" width="40" height="40"></image>
+            <image href="assets/logos/agents/kimi.svg" x="816" y="600" width="40" height="40"></image>
+            <image href="assets/logos/agents/opencode.svg" x="888" y="600" width="40" height="40"></image>
+            <image href="assets/logos/agents/qwen.svg" x="960" y="600" width="40" height="40"></image>
+            <g class="pilus-mark" transform="translate(575 75)">
+              <path fill="#061116" d="M81.28 50.19C81.28 69.32 70.37 79.47 49.82 79.47C29.27 79.47 18.36 69.32 18.36 50.19C18.36 31.07 29.27 20.92 49.82 20.92C70.37 20.92 81.28 31.07 81.28 50.19Z"/>
+              <g class="mark-eyes">
+                <path class="mark-eye" fill="#ffffff" d="M42.98 46.05C42.72 50.76 42.44 51.27 40.21 51.14C37.97 51.02 37.75 50.48 38.01 45.77C38.27 41.06 38.55 40.55 40.79 40.67C43.03 40.8 43.25 41.33 42.98 46.05Z"/>
+                <path class="mark-eye" fill="#ffffff" d="M62.69 45.07C62.47 49.93 62.16 50.46 59.56 50.34C56.97 50.22 56.7 49.66 56.93 44.81C57.15 39.95 57.46 39.43 60.06 39.54C62.65 39.66 62.92 40.22 62.69 45.07Z"/>
+              </g>
+            </g>
+            <foreignObject x="872" y="16" width="344" height="66">
+              <div class="diagram-feed" xmlns="http://www.w3.org/1999/xhtml">
+                <div class="diagram-feed-list" id="agent-feed" aria-hidden="true">
+                  <div class="diagram-feed-item">
+                    <img class="diagram-feed-logo" src="assets/logos/agents/claude-code.svg" alt="" width="12" height="12">
+                    <span class="diagram-feed-agent">claude-code</span>
+                    <span class="diagram-feed-text">edited crates/pilus/src/gui/home.rs</span>
+                    <span class="diagram-feed-time">now</span>
+                  </div>
+                  <div class="diagram-feed-item">
+                    <img class="diagram-feed-logo" src="assets/logos/agents/codex.svg" alt="" width="12" height="12">
+                    <span class="diagram-feed-agent">codex</span>
+                    <span class="diagram-feed-text">ran cargo test -p pilus-client</span>
+                    <span class="diagram-feed-time">now</span>
+                  </div>
+                  <div class="diagram-feed-item">
+                    <img class="diagram-feed-logo" src="assets/logos/agents/opencode.svg" alt="" width="12" height="12">
+                    <span class="diagram-feed-agent">opencode</span>
+                    <span class="diagram-feed-text">opened PR #214</span>
+                    <span class="diagram-feed-time">now</span>
+                  </div>
+                </div>
+              </div>
+            </foreignObject>
+          </svg>
+      <div class="explainer-bento">
+        <div class="explainer-term">
+          <span class="explainer-term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="explainer-term-title">What makes pilus, pilus</span>
+        </div>
+        <div class="explainer-rows">
+          <ol class="explainer-list">
+            <li>
+              <div class="explainer-copy">
+                <div class="explainer-title">
+                  <img class="explainer-logo explainer-logo--pi" src="assets/logos/pi.svg" alt="" width="28" height="28">
+                  <h3>Pi</h3>
+                </div>
+                <p>Pi powers the pilus Chief of Staff. It can put your Claude Code, Codex, or any other agent on the job. Just say the word.</p>
+              </div>
+            </li>
+            <li>
+              <div class="explainer-copy">
+                <div class="explainer-title">
+                  <img class="explainer-logo explainer-logo--iroh" src="assets/logos/iroh.png" alt="" width="48" height="48">
+                  <h3>Iroh</h3>
+                </div>
+                <p>Iroh keeps your computers talking anywhere, including in your pocket.</p>
+              </div>
+            </li>
+            <li>
+              <div class="explainer-copy">
+                <div class="explainer-title">
+                  <img class="explainer-logo" src="assets/logos/luvus.svg" alt="" width="40" height="40">
+                  <h3>Luvus</h3>
+                </div>
+                <p>Luvus keeps your agents working in any workspace, one session, automations, or loops.</p>
+              </div>
+            </li>
+          </ol>
+        </div>
+        <div class="explainer-panel">
+          <div class="mc">
+            <div class="mc-top">
+              <span class="mc-title">WORKSPACE</span>
+              <span class="mc-sub">ALL WORKSPACES</span>
+              <span class="mc-action">REFRESH</span>
+            </div>
+            <div class="mc-stats">
+              <div class="mc-card">
+                <span class="mc-label">AGENTS</span>
+                <span class="mc-value">03</span>
+                <span class="mc-meta">3 live · 3 total</span>
+              </div>
+              <div class="mc-card">
+                <span class="mc-label">WORKING</span>
+                <span class="mc-value">01</span>
+                <span class="mc-meta">currently working</span>
+              </div>
+              <div class="mc-card">
+                <span class="mc-label">BLOCKED</span>
+                <span class="mc-value">01</span>
+                <span class="mc-meta">waiting on a label</span>
+              </div>
+              <div class="mc-card">
+                <span class="mc-label">SPEND</span>
+                <span class="mc-value">$9.42</span>
+                <span class="mc-meta">today · 1.4M tokens</span>
+              </div>
+            </div>
+            <div class="mc-automation">
+              <span class="mc-label">AUTOMATION</span>
+              <span class="mc-meta">IDLE · 2 armed · 0 live · 0 review · 0 failed · NEXT RUN 13:37</span>
+            </div>
+            <div class="mc-main">
+              <div class="mc-sessions">
+                <span class="mc-panel-title">AGENT SESSIONS</span>
+                <div class="mc-table">
+                  <div class="mc-tr mc-th">
+                    <span>#</span><span>AGENT</span><span>STATE</span><span>LOCATION</span><span>MODEL</span><span>TOKENS</span><span>CTX</span><span>COST</span>
+                  </div>
+                  <div class="mc-tr is-active">
+                    <span>01</span><span>PI</span><span>working</span><span>pilus</span><span>deepseek-v4.1-flash</span><span>142k</span><span>64%</span><span>$0.04</span>
+                  </div>
+                  <div class="mc-tr">
+                    <span>02</span><span>Claude Code</span><span>idle</span><span>pilus-ios</span><span>claude-opus-5.5</span><span>1.2M</span><span>92%</span><span>$8.64</span>
+                  </div>
+                  <div class="mc-tr">
+                    <span>03</span><span>Codex</span><span>blocked</span><span>site</span><span>gpt-6-astra</span><span>41k</span><span>22%</span><span>$0.74</span>
+                  </div>
+                </div>
+              </div>
+              <div class="mc-side">
+                <div class="mc-block">
+                  <span class="mc-panel-title">SELECTED AGENT</span>
+                  <span class="mc-line">◉ PI  working</span>
+                  <span class="mc-line is-dim">LOCATION  pilus</span>
+                  <span class="mc-line is-dim">MODEL  deepseek-v4.1-flash</span>
+                  <span class="mc-line is-dim">COST  $0.04</span>
+                </div>
+                <div class="mc-block">
+                  <span class="mc-panel-title">AGENT STATUS</span>
+                  <span class="mc-line">● working 01  ● blocked 01  ● done 00  ○ idle 01</span>
+                </div>
+                <div class="mc-block">
+                  <span class="mc-panel-title">COST BY MODEL</span>
+                  <span class="mc-line">deepseek-v4.1-flash  $0.04</span>
+                  <span class="mc-line">claude-opus-5.5  $8.64</span>
+                  <span class="mc-line">gpt-6-astra  $0.74</span>
+                </div>
+              </div>
+            </div>
+            <div class="mc-footer">↑↓ navigate · tab scope · r refresh · ⏎ go · a answer · i stop · x close · o details</div>
+            <div class="mc-nodes">
+              <span class="mc-node"><i></i>homelab <b>12ms</b></span>
+              <span class="mc-node"><i></i>laptop <b>3ms</b></span>
+              <span class="mc-node"><i></i>exe-ci <b>41ms</b></span>
+              <span class="mc-node is-offline"><i></i>box <b>offline</b></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </section>
+
+  <section class="inventory" aria-labelledby="inventory-title">
+    <div class="wrap">
+      <div class="inventory-head">
+        <h2 class="section-heading" id="inventory-title">After all, pilus is a terminal client.</h2>
+        <p>
+          <svg class="pilus-mark inventory-mark" viewBox="0 0 100 100" aria-hidden="true" focusable="false">
+            <path fill="#061116" d="M81.28 50.19C81.28 69.32 70.37 79.47 49.82 79.47C29.27 79.47 18.36 69.32 18.36 50.19C18.36 31.07 29.27 20.92 49.82 20.92C70.37 20.92 81.28 31.07 81.28 50.19Z"/>
+            <g class="mark-eyes">
+              <path class="mark-eye" fill="#ffffff" d="M42.98 46.05C42.72 50.76 42.44 51.27 40.21 51.14C37.97 51.02 37.75 50.48 38.01 45.77C38.27 41.06 38.55 40.55 40.79 40.67C43.03 40.8 43.25 41.33 42.98 46.05Z"/>
+              <path class="mark-eye" fill="#ffffff" d="M62.69 45.07C62.47 49.93 62.16 50.46 59.56 50.34C56.97 50.22 56.7 49.66 56.93 44.81C57.15 39.95 57.46 39.43 60.06 39.54C62.65 39.66 62.92 40.22 62.69 45.07Z"/>
+            </g>
+          </svg>
+        </p>
+      </div>
+      <div class="inventory-grid">
+        <div class="inventory-item">
+          <h3>Built on Rust &amp; GPUI</h3>
+          <p>I'm daily driving a MacBook Neo now. The app should be thin, lightweight and efficient. Never imagined myself with 6 CPUs &amp; 8GB memory in 2026 tho.</p>
+        </div>
+        <div class="inventory-item">
+          <h3>Remote-workspace ready</h3>
+          <p>All my work is mostly on remote servers — some in the cloud and others on my dusty Mac and poor Mac mini M2. I can't leave this workflow since forever.</p>
+        </div>
+        <div class="inventory-item">
+          <h3>Persistent by default</h3>
+          <p>All open tabs, panes, agents are still there and working when I close the laptop, reopen, or survived from a flaky mobile connection. Maybe survived the power outage too.</p>
+        </div>
+        <div class="inventory-item">
+          <h3>Not a harness</h3>
+          <p>Your favorite agents already did the best. Luvus gives everything your agents need, pilus gives you the client you need.</p>
+        </div>
+        <div class="inventory-item">
+          <h3>Mobile-ready</h3>
+          <p>Sometimes all your agents need the most is your confirmation. Give them a yes or no or other without opening your laptop.</p>
+        </div>
+        <div class="inventory-item">
+          <h3>Open Source</h3>
+          <p>Inspect the code, fork it, run your own custom. The software is provided as-is with no warranty.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="faq" aria-labelledby="faq-title">
+    <p class="faq-mark-above" aria-hidden="true">
+      <svg class="pilus-mark faq-mark" viewBox="0 0 100 100" focusable="false">
+        <path fill="#0c0c0b" d="M81.28 50.19C81.28 69.32 70.37 79.47 49.82 79.47C29.27 79.47 18.36 69.32 18.36 50.19C18.36 31.07 29.27 20.92 49.82 20.92C70.37 20.92 81.28 31.07 81.28 50.19Z"/>
+        <g class="mark-eyes">
+          <path class="mark-eye" fill="#ffffff" d="M42.98 46.05C42.72 50.76 42.44 51.27 40.21 51.14C37.97 51.02 37.75 50.48 38.01 45.77C38.27 41.06 38.55 40.55 40.79 40.67C43.03 40.8 43.25 41.33 42.98 46.05Z"/>
+          <path class="mark-eye" fill="#ffffff" d="M62.69 45.07C62.47 49.93 62.16 50.46 59.56 50.34C56.97 50.22 56.7 49.66 56.93 44.81C57.15 39.95 57.46 39.43 60.06 39.54C62.65 39.66 62.92 40.22 62.69 45.07Z"/>
+        </g>
+      </svg>
+    </p>
+    <div class="wrap faq-inner">
+      <h2 id="faq-title">Before you get started.</h2>
+      <div>
+        <details>
+          <summary>What do I need to use pilus?</summary>
+          <p>A Mac and the Luvus CLI. pilus starts the local daemon if needed; Luvus keeps your workspaces and sessions running.</p>
+        </details>
+        <details>
+          <summary>Will my work keep running when I close pilus?</summary>
+          <p>Yes. Closing the window detaches the client, not the Luvus daemon. Reopen pilus to reconnect to your workspace.</p>
+        </details>
+        <details>
+          <summary>Can I connect to remote machines?</summary>
+          <p>Yes. Save an SSH machine in pilus to see its Luvus workspaces and agents alongside your local ones.</p>
+        </details>
+        <details>
+          <summary>Which agents can I use?</summary>
+          <p>Pi is the default when installed. pilus also shows the agents Luvus reports across your connected workspaces.</p>
+        </details>
+        <details>
+          <summary>Where can I run pilus?</summary>
+          <p>pilus is a native macOS app today. You can connect from your Mac to Luvus on saved remote machines over SSH.</p>
+        </details>
+        <details>
+          <summary>How can I try it?</summary>
+          <p>There is no public macOS binary yet. You can build the early v0.1 client from the <a href="https://github.com/kepelet/pilus">source repository</a>.</p>
+        </details>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="footer-marquee">
+    <div class="footer-marquee-track">
+      <span class="footer-marquee-group">© 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · © 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · © 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · © 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · © 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · © 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · </span>
+      <span class="footer-marquee-group" aria-hidden="true">© 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · © 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · © 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · © 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · © 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · © 2026 Kepelet · built in Pi, Vi, and pilus · ↑1.3M ↓456k R236M CH99.9% $1.172 69.0%/1.0M deepseek-v4.1-flash • high · </span>
+    </div>
+  </div>
+  <div class="wrap footer-brand">
+    <a class="brand" href="/" aria-label="pilus home">
+      <svg class="brand-mark pilus-mark" viewBox="0 0 100 100" aria-hidden="true" focusable="false">
+        <path fill="#10100f" d="M81.28 50.19C81.28 69.32 70.37 79.47 49.82 79.47C29.27 79.47 18.36 69.32 18.36 50.19C18.36 31.07 29.27 20.92 49.82 20.92C70.37 20.92 81.28 31.07 81.28 50.19Z"/>
+        <g class="mark-eyes">
+          <path class="mark-eye" fill="#ffffff" d="M42.98 46.05C42.72 50.76 42.44 51.27 40.21 51.14C37.97 51.02 37.75 50.48 38.01 45.77C38.27 41.06 38.55 40.55 40.79 40.67C43.03 40.8 43.25 41.33 42.98 46.05Z"/>
+          <path class="mark-eye" fill="#ffffff" d="M62.69 45.07C62.47 49.93 62.16 50.46 59.56 50.34C56.97 50.22 56.7 49.66 56.93 44.81C57.15 39.95 57.46 39.43 60.06 39.54C62.65 39.66 62.92 40.22 62.69 45.07Z"/>
+        </g>
+      </svg>
+    </a>
+  </div>
+</footer>
+
+<script>
+  (() => {
+    const marks = document.querySelectorAll('.pilus-mark');
+    if (!marks.length) return;
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+    const between = (min, max) => min + Math.random() * (max - min);
+
+    // Random gaze: the eyes wander on their own, they do not track anything.
+    const look = (eyes) => {
+      eyes.style.transform = `translate(${between(-5, 5).toFixed(2)}px, ${between(-3, 3).toFixed(2)}px)`;
+      window.setTimeout(() => look(eyes), between(700, 2600));
+    };
+
+    const blink = (eyeShapes) => {
+      eyeShapes.forEach((eye) => eye.classList.add('is-blinking'));
+      window.setTimeout(() => {
+        eyeShapes.forEach((eye) => eye.classList.remove('is-blinking'));
+        window.setTimeout(() => blink(eyeShapes), between(1400, 4200));
+      }, between(90, 160));
+    };
+
+    marks.forEach((mark) => {
+      const eyes = mark.querySelector('.mark-eyes');
+      const eyeShapes = mark.querySelectorAll('.mark-eye');
+      if (!eyes || !eyeShapes.length) return;
+      window.setTimeout(() => look(eyes), between(300, 900));
+      window.setTimeout(() => blink(eyeShapes), between(900, 2200));
+    });
+  })();
+
+  (() => {
+    const feed = document.getElementById('agent-feed');
+    if (!feed) return;
+
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce) {
+      feed.querySelectorAll('.diagram-feed-time').forEach((time) => (time.textContent = 'live'));
+      return;
+    }
+
+    const between = (min, max) => min + Math.random() * (max - min);
+    const MAX_ITEMS = 3;
+    const events = [
+      ['claude-code', 'edited crates/pilus/src/gui/home.rs'],
+      ['codex', 'ran cargo test -p pilus-client'],
+      ['github-copilot', 'committed 4 files'],
+      ['opencode', 'opened PR #214'],
+    ];
+
+    const build = ([agent, text]) => {
+      const item = document.createElement('div');
+      item.className = 'diagram-feed-item is-new';
+
+      const logo = document.createElement('img');
+      logo.className = 'diagram-feed-logo';
+      logo.src = `assets/logos/agents/${agent}.svg`;
+      logo.alt = '';
+      logo.width = 13;
+      logo.height = 13;
+
+      const name = document.createElement('span');
+      name.className = 'diagram-feed-agent';
+      name.textContent = agent;
+
+      const action = document.createElement('span');
+      action.className = 'diagram-feed-text';
+      action.textContent = text;
+
+      const time = document.createElement('span');
+      time.className = 'diagram-feed-time';
+      time.textContent = '0s';
+
+      item.append(logo, name, action, time);
+      item.dataset.born = String(Date.now());
+      return item;
+    };
+
+    const remove = (item) => {
+      if (!item || !item.isConnected || item.classList.contains('is-leaving')) return;
+      item.classList.add('is-leaving');
+      window.setTimeout(() => item.remove(), 420);
+    };
+
+    // Prefer an agent that is not already on screen so the feed stays varied.
+    const next = () => {
+      const visible = new Set(
+        [...feed.children].map((item) => item.querySelector('.diagram-feed-agent')?.textContent),
+      );
+      const pool = events.filter(([agent]) => !visible.has(agent));
+      const choices = pool.length ? pool : events;
+      return choices[Math.floor(Math.random() * choices.length)];
+    };
+
+    const add = () => {
+      const item = build(next());
+      feed.prepend(item);
+
+      const active = [...feed.children].filter((el) => !el.classList.contains('is-leaving'));
+      active.slice(MAX_ITEMS).forEach(remove);
+
+      window.setTimeout(() => remove(item), between(6500, 9500));
+      window.setTimeout(add, between(1700, 2600));
+    };
+
+    // Age the labels so the feed reads like it is ticking in real time.
+    window.setInterval(() => {
+      const now = Date.now();
+      feed.querySelectorAll('.diagram-feed-item').forEach((item) => {
+        const label = item.querySelector('.diagram-feed-time');
+        if (label) label.textContent = `${Math.round((now - Number(item.dataset.born)) / 1000)}s`;
+      });
+    }, 1000);
+
+    // Adopt the server-rendered rows, then keep streaming new ones in.
+    [...feed.children].forEach((item, index) => {
+      item.dataset.born = String(Date.now() - index * 2200);
+      window.setTimeout(() => remove(item), between(6500, 9500));
+    });
+    window.setTimeout(add, between(1200, 2000));
+  })();
+</script>
+</body>
+</html>

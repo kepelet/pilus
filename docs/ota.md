@@ -1,18 +1,18 @@
 # OTA updates
 
-`l3s` updates itself from channel manifests on `releases.kepelet.com`: stable
+`pilus` updates itself from channel manifests on `releases.kepelet.com`: stable
 at `stable.json`, preview/nightly at `preview.json`. A local payload can be
 tested by pointing the feed URL at `http://127.0.0.1:8000/latest.json`.
 
 | Piece | Where |
 | --- | --- |
-| Release source + channel policy | `crates/l3s/src/update.rs` |
-| Settings (channel, feed URL, auto-check) | `crates/l3s/src/settings.rs` |
-| GPUI entity (check → download → stage) | `crates/l3s/src/gui/updater.rs` |
-| Build version stamp | `crates/l3s/build.rs` |
-| Footer badge + `l3s → Check for Updates` | `crates/l3s/src/gui/mod.rs` |
-| Settings page (channel, feed URL, auto-check) | `crates/l3s/src/gui/mod.rs` |
-| Update window (live status + Retry) | `crates/l3s/src/gui/update_window.rs` |
+| Release source + channel policy | `crates/pilus/src/update.rs` |
+| Settings (channel, feed URL, auto-check) | `crates/pilus/src/settings.rs` |
+| GPUI entity (check → download → stage) | `crates/pilus/src/gui/updater.rs` |
+| Build version stamp | `crates/pilus/build.rs` |
+| Footer badge + `pilus → Check for Updates` | `crates/pilus/src/gui/mod.rs` |
+| Settings page (channel, feed URL, auto-check) | `crates/pilus/src/gui/mod.rs` |
+| Update window (live status + Retry) | `crates/pilus/src/gui/update_window.rs` |
 | DMG packaging | `scripts/package-macos-dmg.sh` |
 | Preview payload (DMG + manifest) | `scripts/preview-feed.sh` |
 | Release automation | `.github/workflows/release.yml` |
@@ -36,18 +36,18 @@ support outgrow this setup.
 
 | Channel | Default manifest | Aliases |
 | --- | --- | --- |
-| `stable` (default) | `https://releases.kepelet.com/l3s/stable.json` | — |
-| `preview` | `https://releases.kepelet.com/l3s/preview.json` | `beta`, `nightly`, `canary`, `dev`, `pre-release` |
+| `stable` (default) | `https://releases.kepelet.com/pilus/stable.json` | — |
+| `preview` | `https://releases.kepelet.com/pilus/preview.json` | `beta`, `nightly`, `canary`, `dev`, `pre-release` |
 
 Settings carry `update_channel`, `update_feed_url`, and `auto_check_updates`;
-the Settings page (`l3s → Settings → UPDATES`) edits all three and applies the
+the Settings page (`pilus → Settings → UPDATES`) edits all three and applies the
 change immediately. An explicit `update_feed_url` wins over the channel
 default, so a self-hosted preview manifest needs no code change.
 
 Overrides, strongest first:
 
 1. `--channel NAME` / `--feed-url URL` (with `--check-updates` only)
-2. `L3S_UPDATE_CHANNEL` / `L3S_UPDATE_FEED_URL`
+2. `PILUS_UPDATE_CHANNEL` / `PILUS_UPDATE_FEED_URL`
 3. `settings.json`
 
 Manifest shape (served by the release host, or any HTTPS host for a local or
@@ -60,8 +60,8 @@ self-hosted feed):
   "notes": "Highlights…",
   "assets": [
     {
-      "name": "l3s-v0.2.0-macos-arm64.dmg",
-      "url": "https://dl.example.com/l3s-v0.2.0-macos-arm64.dmg",
+      "name": "pilus-v0.2.0-macos-arm64.dmg",
+      "url": "https://dl.example.com/pilus-v0.2.0-macos-arm64.dmg",
       "sha256": "<hex>",
       "os": "macos",
       "arch": "arm64",
@@ -75,7 +75,7 @@ self-hosted feed):
 
 1. Bump `version` in the workspace `Cargo.toml`.
 2. Tag and push `vX.Y.Z`. The workflow packages
-   `l3s-v<version>-macos-arm64.dmg` (one `l3s.app` at the image root), writes
+   `pilus-v<version>-macos-arm64.dmg` (one `pilus.app` at the image root), writes
    `SHA256SUMS`, and attaches everything to the GitHub release. Apple Silicon
    only.
 3. Upload the DMG and write `stable.json` (or `preview.json`) on
@@ -91,14 +91,14 @@ and `.dmg` substrings. Don't rename them.
 `target/release/preview-feed/`; the packaging script names the artifact, so
 the manifest checksum and URL always match it. The manifest version is
 generated automatically as `<next-patch>-preview.<utc timestamp>` and stamped
-into the app through `L3S_BUILD_VERSION` (`crates/l3s/build.rs`, plus the
+into the app through `PILUS_BUILD_VERSION` (`crates/pilus/build.rs`, plus the
 bundle's `Info.plist`), so the running app reports exactly what the feed
 advertises:
 
 - every payload is newer than the previous one — a preview never needs a
   `Cargo.toml` bump;
 - installing a payload and re-checking the same feed reports up to date;
-- **About l3s** shows the stamped version.
+- **About pilus** shows the stamped version.
 
 The DMG filename keeps the Cargo version (only the embedded build version and
 the manifest are stamped). `SKIP_PACKAGE=1` reuses an existing DMG without
@@ -116,10 +116,10 @@ just serve-preview
 just check-updates --feed-url http://127.0.0.1:8000/latest.json
 
 # Or point the window at it for a session.
-L3S_UPDATE_FEED_URL=http://127.0.0.1:8000/latest.json just run
+PILUS_UPDATE_FEED_URL=http://127.0.0.1:8000/latest.json just run
 ```
 
-Without the override, `--channel preview` and `L3S_UPDATE_CHANNEL=preview`
+Without the override, `--channel preview` and `PILUS_UPDATE_CHANNEL=preview`
 read the hosted `preview.json`.
 
 The base URL passed to `just preview-feed` is baked into each asset's `url`,
@@ -133,7 +133,7 @@ Tailscale/LAN host for another one:
 just preview-feed http://<tailnet-host>:8000
 ```
 
-Set `L3S_PREVIEW_VERSION` only when you want the feed to advertise a real
+Set `PILUS_PREVIEW_VERSION` only when you want the feed to advertise a real
 version (for example when publishing a hosted preview for others).
 
 For a hosted preview, pass the public prefix and upload the directory:
@@ -158,7 +158,7 @@ Three layers, weakest first:
    and staple. Without this, Gatekeeper quarantines the swapped-in bundle and
    the update looks like malware.
 3. **Minisign (recommended).** Generate once:
-   `minisign -G -p l3s.pub -s l3s.key`. Store the secret key contents as the
+   `minisign -G -p pilus.pub -s pilus.key`. Store the secret key contents as the
    `MINISIGN_SECRET_KEY` repo secret, put the public key into
    `MINISIGN_PUBLIC_KEY` in `update.rs` — verification then flips from
    `BestEffort` to `Signature` automatically and unsigned releases are

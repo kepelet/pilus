@@ -1,0 +1,20 @@
+[package]
+name = "pilus-agent"
+description = "Host-side connector: exposes a local Luvus session to remote UHP clients"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+iroh = "1.3.0"
+iroh-tickets = "1.0.0"
+pilus-client.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }

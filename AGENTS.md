@@ -1,12 +1,12 @@
 # Working in this repository
 
-`l3s` is a native desktop client for a Luvus daemon. The daemon renders its
-entire TUI surface to clients as a grid of styled cells; `l3s` attaches, folds
+`pilus` is a native desktop client for a Luvus daemon. The daemon renders its
+entire TUI surface to clients as a grid of styled cells; `pilus` attaches, folds
 that grid into a `Surface`, and paints it in a GPUI window.
 
 ## The one rule that bites
 
-`crates/l3s-protocol` mirrors a binary wire format encoded with
+`crates/pilus-protocol` mirrors a binary wire format encoded with
 `bincode`'s positional serde encoding. In that encoding, an enum's variant
 index and a struct's field order **are** the wire format. Adding a field in the
 middle of a struct, reordering enum variants, or deleting a variant will
@@ -16,7 +16,7 @@ If you must change a message:
 
 1. append new variants and fields at the end;
 2. bump `PROTOCOL_VERSION`;
-3. extend `crates/l3s-client/tests/handshake.rs` so the change is exercised
+3. extend `crates/pilus-client/tests/handshake.rs` so the change is exercised
    against a scripted peer.
 
 The enabling feature in `Cargo.toml` (`runtime_shaders`) is also deliberate: it
@@ -29,15 +29,15 @@ with only the command-line tools can build the app.
   mutate a grid. A malformed diff returns an error and leaves the frame
   untouched, so a client can request a full frame instead of painting a torn
   surface.
-- `l3s-client` owns no rendering. It emits `ClientEvent`s and folds
+- `pilus-client` owns no rendering. It emits `ClientEvent`s and folds
   `ServerMessage`s into `Surface`; the window decides how to draw.
 - The GUI thread never blocks on socket IO. Reads happen on a background reader
   thread; writes go through an unbounded channel to a writer thread.
 
 ## UI
 
-`crates/l3s/src/gui/ui_playground.rs` is the visual contract: a working
-catalogue of every native element the app draws. `crates/l3s/src/gui/style.rs`
+`crates/pilus/src/gui/ui_playground.rs` is the visual contract: a working
+catalogue of every native element the app draws. `crates/pilus/src/gui/style.rs`
 is the only implementation of it. Draw controls through `style::button`,
 `style::small_button`, `style::field`, and `style::section_label`; do not
 hand-roll a button, field, or section label in another window. When an element
@@ -69,19 +69,19 @@ is missing, add it to `style.rs` and to the playground first, then use it.
 
 ```sh
 cargo test                    # unit + handshake integration tests
-cargo run -p l3s              # the window (needs a running daemon)
-cargo run -p l3s -- --probe   # headless: print the first frame
+cargo run -p pilus              # the window (needs a running daemon)
+cargo run -p pilus -- --probe   # headless: print the first frame
 ```
 
 Before shipping a UI change, render it. The `visual-test` feature (not part of
-a normal build) captures every surface to `/tmp/l3s-shots`:
+a normal build) captures every surface to `/tmp/pilus-shots`:
 
 ```sh
-cargo run -p l3s --features visual-test -- --ui-shots       # standalone windows
-cargo run -p l3s --features visual-test -- --ui-shots-main  # main window + overlays
+cargo run -p pilus --features visual-test -- --ui-shots       # standalone windows
+cargo run -p pilus --features visual-test -- --ui-shots-main  # main window + overlays
 ```
 
-`L3S_SHOT_FONT_SIZE` overrides the Interface size for those captures, which is
+`PILUS_SHOT_FONT_SIZE` overrides the Interface size for those captures, which is
 the quickest way to catch chrome that ignores the setting.
 
 ## Style

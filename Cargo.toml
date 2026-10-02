@@ -1,12 +1,12 @@
 [workspace]
-members = ["crates/l3s-protocol", "crates/l3s-client", "crates/l3s"]
+members = ["crates/pilus-protocol", "crates/pilus-client", "crates/pilus", "crates/pilus-agent"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/kepelet/l3s"
+repository = "https://github.com/kepelet/pilus"
 rust-version = "1.96"
 
 [workspace.lints.rust]
@@ -40,8 +40,8 @@ tracing = "0.1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
-l3s-client = { path = "crates/l3s-client" }
-l3s-protocol = { path = "crates/l3s-protocol" }
+pilus-client = { path = "crates/pilus-client" }
+pilus-protocol = { path = "crates/pilus-protocol" }
 
 [profile.release]
 lto = "thin"

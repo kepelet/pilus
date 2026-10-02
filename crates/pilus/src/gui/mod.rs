@@ -7250,7 +7250,7 @@ impl PilusView {
                 .h(px(14.0))
                 .w(px(1.0))
                 .flex_shrink_0()
-                .bg(theme.border);
+                .bg(theme.border.opacity(0.5));
             tab_strip = tab_strip.child(separator).child(tabs).child(new_tab);
         }
         div()

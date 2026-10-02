@@ -533,15 +533,43 @@ impl ControlClient {
         Ok(())
     }
 
+    /// The focused pane's id when it runs no agent, so a launch can reuse it
+    /// instead of splitting a second pane beside a shell.
+    ///
+    /// A pane's own `agent` field names its detected command (`fish`, `zsh`),
+    /// so membership in `agent.list` is what identifies a busy pane.
+    pub fn idle_pane(&mut self) -> Result<Option<String>> {
+        let result = self.request("pane.current", json!({}))?;
+        let Some(pane) = result
+            .get("pane")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return Ok(None);
+        };
+        if self.agents()?.iter().any(|agent| agent.pane == pane) {
+            return Ok(None);
+        }
+        Ok(Some(pane))
+    }
+
     /// Spawn a built-in agent, waiting until its pane is ready.
     ///
-    /// `args` are passed through to the agent's own command line after `--`;
-    /// an empty slice launches with the manifest defaults.
-    pub fn start_agent(&mut self, name: &str, kind: &str, args: &[String]) -> Result<()> {
-        self.request(
-            "agent.start",
-            json!({ "name": name, "kind": kind, "args": args }),
-        )?;
+    /// `pane` reuses that pane instead of splitting beside the focused one;
+    /// `args` are passed through to the agent's own command line after `--`
+    /// (an empty slice launches with the manifest defaults).
+    pub fn start_agent(
+        &mut self,
+        name: &str,
+        kind: &str,
+        pane: Option<&str>,
+        args: &[String],
+    ) -> Result<()> {
+        let mut params = json!({ "name": name, "kind": kind, "args": args });
+        if let Some(pane) = pane {
+            params["pane"] = json!(pane);
+        }
+        self.request("agent.start", params)?;
         Ok(())
     }
 

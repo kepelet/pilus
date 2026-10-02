@@ -300,7 +300,7 @@ pub fn run_main() -> Result<()> {
     // centered layout does not shift when it opens.
     cx.update(|app| {
         view.update(app, |view, cx| {
-            view.home.open_dropdown(super::HomeField::Agent);
+            view.home.open_dropdown(super::HomeField::Project);
             cx.notify();
         });
     });

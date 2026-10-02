@@ -61,6 +61,9 @@ pub struct Settings {
     /// Run the host connector ("this node" remote access) while pilus is open.
     /// Off by default; the Remote Machines window toggles it.
     pub connector: bool,
+    /// Raise a native desktop notification when the daemon pushes one, unless
+    /// this window is already in front. On by default.
+    pub notifications: bool,
 }
 
 impl Default for Settings {
@@ -75,6 +78,7 @@ impl Default for Settings {
             update_feed_url: None,
             window: None,
             connector: false,
+            notifications: true,
         }
     }
 }
@@ -120,6 +124,15 @@ mod tests {
         assert_eq!(settings.update_channel, "stable");
         assert!(settings.update_feed_url.is_none());
         assert!(settings.window.is_none());
+        assert!(settings.notifications);
+    }
+
+    #[test]
+    fn missing_notifications_defaults_on() {
+        // Settings written before the toggle existed must still notify.
+        let back: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert!(back.notifications);
     }
 
     #[test]
@@ -149,6 +162,7 @@ mod tests {
                 display: Some("6d0f9a4c-30b2-4f25-9a2e-4a8f9c3b7d10".to_string()),
             }),
             connector: true,
+            notifications: false,
         };
         let text = serde_json::to_string(&settings).expect("serialize");
         let back: Settings = serde_json::from_str(&text).expect("deserialize");

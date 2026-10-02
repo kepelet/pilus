@@ -11,6 +11,11 @@
 #[cfg(target_os = "macos")]
 const ICNS: &[u8] = include_bytes!("../../assets/pilus.icns");
 
+/// Bundle identifier for unbundled builds. A packaged `.app` carries the real
+/// identifier in its `Info.plist`; `scripts/bundle-macos.sh` sets it from
+/// `PILUS_BUNDLE_ID`, and this is the fallback it defaults to.
+pub const DEV_BUNDLE_ID: &str = "dev.pilus.app";
+
 /// Install the Dock icon and process name on macOS; a no-op elsewhere.
 #[cfg(target_os = "macos")]
 pub fn install() {
@@ -42,3 +47,22 @@ pub fn install() {
 /// Install the Dock icon on macOS; a no-op elsewhere.
 #[cfg(not(target_os = "macos"))]
 pub fn install() {}
+
+/// The running app's bundle identifier, or [`DEV_BUNDLE_ID`] outside a `.app`.
+///
+/// `cargo run` has no bundle, so the development identifier stands in; a
+/// packaged app reports whatever `Info.plist` names.
+#[cfg(target_os = "macos")]
+pub fn bundle_identifier() -> String {
+    use objc2_foundation::NSBundle;
+    NSBundle::mainBundle()
+        .bundleIdentifier()
+        .map(|identifier| identifier.to_string())
+        .unwrap_or_else(|| DEV_BUNDLE_ID.to_string())
+}
+
+/// The development bundle identifier; only macOS bundles carry a real one.
+#[cfg(not(target_os = "macos"))]
+pub fn bundle_identifier() -> String {
+    DEV_BUNDLE_ID.to_string()
+}

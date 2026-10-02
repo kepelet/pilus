@@ -41,12 +41,12 @@ use crossterm::event::{
     MouseEventKind,
 };
 use gpui::{
-    Action, Anchor, AnyElement, App, Bounds, ClipboardItem, Context, DisplayId, Div, Entity,
-    FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Stateful, TextRun, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, anchored, deferred, div, font, img, point, prelude::*, px,
-    size, svg,
+    Action, Anchor, Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context,
+    DisplayId, Div, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent,
+    Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Stateful,
+    TextRun, TitlebarOptions, Transformation, Window, WindowBounds, WindowOptions, anchored,
+    deferred, div, font, img, percentage, point, prelude::*, px, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
@@ -7245,7 +7245,13 @@ impl PilusView {
         // page owns the card; the session picker stays on every page. The plus
         // follows the tabs until overflow makes the scroll viewport shrink.
         if !self.projects.is_open() && !self.home.is_open() {
-            tab_strip = tab_strip.child(tabs).child(new_tab);
+            let separator = div()
+                .mx_1()
+                .h(px(14.0))
+                .w(px(1.0))
+                .flex_shrink_0()
+                .bg(theme.border);
+            tab_strip = tab_strip.child(separator).child(tabs).child(new_tab);
         }
         div()
             .absolute()
@@ -7279,15 +7285,18 @@ impl PilusView {
         } else {
             tab.process.as_str()
         };
-        let tip = row_tooltip(
-            format!("Tab {index}"),
-            fg,
-            vec![
-                (format!("Directory: {cwd}"), theme.muted),
-                (format!("Process: {process}"), theme.muted),
-            ],
-            theme,
-        );
+        let agent = self.tab_agent(index);
+        let mut tip_lines = vec![
+            (format!("Directory: {cwd}"), theme.muted),
+            (format!("Process: {process}"), theme.muted),
+        ];
+        if let Some(agent) = agent {
+            tip_lines.push((
+                format!("Agent: {} · {}", agent.agent, status_label(&agent.status)),
+                status_color(&agent.status, theme),
+            ));
+        }
+        let tip = row_tooltip(format!("Tab {index}"), fg, tip_lines, theme);
         let group = format!("pilus-tab-{index}");
         let close = div()
             .id(format!("pilus-tab-close-{index}"))
@@ -7335,12 +7344,73 @@ impl PilusView {
             .gap_2()
             .overflow_hidden()
             .whitespace_nowrap();
-        if let Some(agent) = self.tab_agent(index) {
-            content = content.child(div().flex_shrink_0().child(icon(
-                agent_icon(&agent.agent),
-                12.0,
-                fg,
-            )));
+        if let Some(agent) = agent {
+            let status = status_color(&agent.status, theme);
+            let indicator = if agent.status == "working" {
+                svg()
+                    .data(include_bytes!("../../assets/icons/loader-circle.svg"))
+                    .w(px(7.0))
+                    .h(px(7.0))
+                    .flex_shrink_0()
+                    .text_color(status)
+                    .with_animation(
+                        format!("pilus-tab-agent-spinner-{index}"),
+                        Animation::new(Duration::from_millis(900))
+                            .repeat_synced()
+                            .with_max_fps(30.0),
+                        |svg, phase| {
+                            svg.with_transformation(Transformation::rotate(percentage(phase)))
+                        },
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .w(px(5.0))
+                    .h(px(5.0))
+                    .rounded_full()
+                    .bg(status)
+                    .into_any_element()
+            };
+            content = content.child(
+                div()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .flex_shrink_0()
+                    .child(icon(agent_icon(&agent.agent), 12.0, fg))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(-2.0))
+                            .right(px(-2.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(8.0))
+                            .h(px(8.0))
+                            .rounded_full()
+                            .bg(if active { theme.panel } else { theme.window_bg })
+                            .child(indicator),
+                    ),
+            );
+        } else {
+            content = content.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .flex_shrink_0()
+                    .child(icon(
+                        include_bytes!("../../assets/icons/terminal.svg"),
+                        12.0,
+                        fg,
+                    )),
+            );
         }
         content = content.child(
             div()

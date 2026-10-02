@@ -85,7 +85,7 @@ impl Render for UpdateWindow {
                 UpdateStatus::Available(version) => (
                     "Update available".to_string(),
                     format!("Version {version} is ready to download."),
-                    Some((Action::Download, "Download")),
+                    Some((Action::Download, "Start Update")),
                 ),
                 UpdateStatus::Downloading { downloaded, total } => {
                     let total = total.map_or_else(|| "…".to_string(), human_bytes);
@@ -103,7 +103,7 @@ impl Render for UpdateWindow {
                 UpdateStatus::Staged(version) => (
                     "Restart to install".to_string(),
                     format!("Version {version} is staged."),
-                    Some((Action::Restart, "Restart")),
+                    Some((Action::Restart, "Restart App")),
                 ),
                 UpdateStatus::Checking => (
                     "Checking for updates".to_string(),
@@ -204,6 +204,22 @@ pub fn is_open(cx: &App) -> bool {
     cx.windows()
         .iter()
         .any(|handle| handle.downcast::<UpdateWindow>().is_some())
+}
+
+/// Show the Update window for a shared updater entity: foreground the
+/// existing one, or open it.
+pub fn show(updater: Entity<Updater>, theme: Theme, settings: Rc<RefCell<Settings>>, cx: &mut App) {
+    if let Some(handle) = cx
+        .windows()
+        .iter()
+        .find_map(|handle| handle.downcast::<UpdateWindow>())
+    {
+        handle
+            .update(cx, |_, window, _| window.activate_window())
+            .ok();
+        return;
+    }
+    open(updater, theme, settings, cx);
 }
 
 /// Open the Update window for a shared updater entity.

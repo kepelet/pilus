@@ -62,6 +62,10 @@ pub struct Tab {
     pub name: String,
     /// `panes`, `git`, `orch`, or `mission`.
     pub kind: String,
+    /// Focused terminal cwd, or the workspace cwd when no terminal exists.
+    pub cwd: String,
+    /// Focused terminal's detected command/process, empty for a native view.
+    pub process: String,
 }
 
 impl Tab {
@@ -87,6 +91,8 @@ impl Tab {
                 .and_then(Value::as_str)
                 .unwrap_or("panes")
                 .to_string(),
+            cwd: String::new(),
+            process: String::new(),
         })
     }
 
@@ -239,6 +245,63 @@ impl TaskSummary {
     }
 }
 
+/// Fill each tab's cwd/process from `session.snapshot`: the focused terminal
+/// pane wins, then any terminal, then the active workspace's own cwd.
+fn enrich_tab_runtime(tabs: &mut [Tab], snapshot: &Value) {
+    let Some(workspace) = snapshot
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .and_then(|workspaces| {
+            workspaces
+                .iter()
+                .find(|workspace| workspace.get("active").and_then(Value::as_bool) == Some(true))
+        })
+    else {
+        return;
+    };
+    let workspace_cwd = workspace
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(runtime_tabs) = workspace.get("tabs").and_then(Value::as_array) else {
+        return;
+    };
+    for tab in tabs {
+        let Some(runtime) = runtime_tabs.iter().find(|runtime| {
+            runtime.get("index").and_then(Value::as_u64) == Some(u64::from(tab.index))
+        }) else {
+            tab.cwd = workspace_cwd.to_string();
+            continue;
+        };
+        let pane = runtime
+            .get("panes")
+            .and_then(Value::as_array)
+            .and_then(|panes| {
+                panes
+                    .iter()
+                    .find(|pane| {
+                        pane.get("kind").and_then(Value::as_str) == Some("terminal")
+                            && pane.get("focused").and_then(Value::as_bool) == Some(true)
+                    })
+                    .or_else(|| {
+                        panes.iter().find(|pane| {
+                            pane.get("kind").and_then(Value::as_str) == Some("terminal")
+                        })
+                    })
+            });
+        tab.cwd = pane
+            .and_then(|pane| pane.get("cwd"))
+            .and_then(Value::as_str)
+            .unwrap_or(workspace_cwd)
+            .to_string();
+        tab.process = pane
+            .and_then(|pane| pane.get("agent"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    }
+}
+
 /// A task needs attention unless its status reached a terminal state.
 fn is_open(item: &Value) -> bool {
     match item.get("status").and_then(Value::as_str) {
@@ -255,6 +318,8 @@ fn is_open(item: &Value) -> bool {
 pub struct Agent {
     /// The pane the agent runs in.
     pub pane: String,
+    /// 1-based tab position inside the agent's workspace.
+    pub tab: u16,
     /// The agent kind, e.g. `claude` or `codex`.
     pub agent: String,
     /// The agent's live alias, if the user gave it one.
@@ -277,6 +342,11 @@ impl Agent {
     fn from_json(value: &Value) -> Option<Self> {
         Some(Self {
             pane: value.get("pane")?.as_str()?.to_string(),
+            tab: value
+                .get("tab")
+                .and_then(Value::as_str)
+                .and_then(|tab| tab.parse().ok())
+                .unwrap_or_default(),
             agent: value.get("agent")?.as_str()?.to_string(),
             name: value
                 .get("name")
@@ -492,15 +562,21 @@ impl ControlClient {
         Ok(widgets.iter().filter_map(BarWidget::from_json).collect())
     }
 
-    /// The tabs of the active workspace.
+    /// The tabs of the active workspace, enriched with each tab's terminal
+    /// cwd and running process from `session.snapshot`.
     pub fn tabs(&mut self) -> Result<Vec<Tab>> {
         let result = self.request("tab.list", json!({}))?;
-        let tabs = result
+        let mut tabs: Vec<Tab> = result
             .get("tabs")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
-            .unwrap_or_default();
-        Ok(tabs.iter().filter_map(Tab::from_json).collect())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Tab::from_json)
+            .collect();
+        let snapshot = self.request("session.snapshot", json!({}))?;
+        enrich_tab_runtime(&mut tabs, &snapshot);
+        Ok(tabs)
     }
 
     /// The automation definitions and their armed count.
@@ -960,8 +1036,66 @@ fn is_structural(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AutomationSummary, TaskSummary, is_structural};
+    use super::{AutomationSummary, Tab, TaskSummary, enrich_tab_runtime, is_structural};
     use serde_json::json;
+
+    #[test]
+    fn tabs_enrich_from_the_active_workspace_snapshot() {
+        let mut tabs = vec![
+            Tab {
+                index: 1,
+                ..Tab::default()
+            },
+            Tab {
+                index: 2,
+                ..Tab::default()
+            },
+            Tab {
+                index: 3,
+                ..Tab::default()
+            },
+        ];
+        let snapshot = json!({
+            "workspaces": [
+                { "cwd": "/other", "active": false, "tabs": [] },
+                {
+                    "cwd": "/repo",
+                    "active": true,
+                    "tabs": [
+                        {
+                            "index": 1,
+                            "panes": [
+                                { "kind": "terminal", "cwd": "/repo/api", "agent": "fish", "focused": false },
+                                { "kind": "terminal", "cwd": "/repo/web", "agent": "node", "focused": true }
+                            ]
+                        },
+                        {
+                            "index": 2,
+                            "panes": [
+                                { "kind": "terminal", "cwd": "/repo/docs", "agent": "devin", "focused": false }
+                            ]
+                        },
+                        {
+                            "index": 3,
+                            "panes": [
+                                { "kind": "git" }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        enrich_tab_runtime(&mut tabs, &snapshot);
+        // The focused terminal wins over the first one.
+        assert_eq!(tabs[0].cwd, "/repo/web");
+        assert_eq!(tabs[0].process, "node");
+        // No focused pane falls back to the first terminal.
+        assert_eq!(tabs[1].cwd, "/repo/docs");
+        assert_eq!(tabs[1].process, "devin");
+        // A native-view tab (no terminal pane) shows the workspace cwd.
+        assert_eq!(tabs[2].cwd, "/repo");
+        assert_eq!(tabs[2].process, "");
+    }
 
     #[test]
     fn structural_events_exclude_output_ready() {

@@ -44,9 +44,9 @@ use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClipboardItem, Context, DisplayId, Div, Entity,
     FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, TextRun, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, anchored, deferred, div, font, img, point, prelude::*, px, size,
-    svg,
+    Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Stateful, TextRun, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, anchored, deferred, div, font, img, point, prelude::*, px,
+    size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
@@ -81,17 +81,12 @@ const HOME_PICKER_HEIGHT: f32 = 24.0;
 const HEADER_HEIGHT: f32 = 40.0;
 /// Daemon rows skipped at the top of the grid. The daemon draws its own tab
 /// strip plus a cwd breadcrumb there; the grid starts below them so only
-/// native chrome shows. (Our footer already carries the cwd.) Selection and
-/// click coordinates stay in daemon rows, so copy and gear clicks keep
-/// working.
+/// native chrome shows. Selection and click coordinates stay in daemon rows,
+/// so copy and gear clicks keep working.
 const SKIPPED_DAEMON_ROWS: u16 = 2;
-/// Daemon rows skipped at the grid bottom: its one-row status line, which our
-/// footer widgets already mirror.
+/// Daemon rows skipped at the grid bottom: its one-row status line, which the
+/// native shell omits. Assumes a single-row status line.
 const SKIPPED_DAEMON_BOTTOM_ROWS: u16 = 1;
-/// Daemon rows skipped at the bottom: its status line, mirrored by our own
-/// footer widgets. Assumes a single-row status line.
-/// Height of the native footer bar.
-const FOOTER_HEIGHT: f32 = 28.0;
 /// Gap around the floating terminal card: left, right, and bottom.
 const CARD_GAP: f32 = 8.0;
 /// Gap between the tab strip and the card. The card hugs the header tighter
@@ -952,7 +947,7 @@ struct PilusView {
     sessions: Vec<SessionInfo>,
     /// Last session-directory poll, so the disk isn't hit every frame.
     last_session_poll: Instant,
-    /// Whether the footer session menu is open.
+    /// Whether the session menu is open.
     session_menu_open: bool,
     /// The ⌘⇧P command palette's query and selection.
     palette: Palette,
@@ -1023,6 +1018,8 @@ struct PilusView {
     tab_sel: Option<u16>,
     /// When the optimistic tab pick was made, so stale picks age out.
     tab_sel_at: Instant,
+    /// Keeps the tab list scrolled when tabs overflow the strip.
+    tab_scroll: ScrollHandle,
     /// Optimistic endpoint pick from a click, until the handoff commits or
     /// every stage of the switch has ended.
     endpoint_sel: Option<EndpointId>,
@@ -1080,8 +1077,6 @@ struct PilusView {
     /// OTA updater entity and the last status the view painted.
     updater: Entity<Updater>,
     last_update_status: UpdateStatus,
-    /// The running build's version (stamped for previews), shown in the footer.
-    app_version: String,
     /// Update feed URL while the Settings page is editing it.
     update_feed: TextField,
     /// The feed-URL input, an IME-capable field over `update_feed`.
@@ -1384,6 +1379,7 @@ impl PilusView {
             nav_sel_at: Instant::now(),
             tab_sel: None,
             tab_sel_at: Instant::now(),
+            tab_scroll: ScrollHandle::new(),
             endpoint_sel: None,
             agent_sel: None,
             agent_sel_at: Instant::now(),
@@ -1412,7 +1408,6 @@ impl PilusView {
             catalog_dirty: false,
             updater: updater.clone(),
             last_update_status: UpdateStatus::Idle,
-            app_version: crate::update::current_version().to_string(),
             update_feed,
             update_feed_input,
             update_url_editing: false,
@@ -1483,15 +1478,14 @@ impl PilusView {
     /// Drain pending connection events. Returns whether a repaint is needed.
     fn poll(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
-        // The updater notifies its own entity; this 16 ms loop forwards its
-        // transitions to the window so the footer badge stays live.
+        // Track updater transitions here so a failure from an automatic check
+        // can open the Update window once.
         let update_status = self.updater.read(cx).status().clone();
         if update_status != self.last_update_status {
             let was_error = matches!(self.last_update_status, UpdateStatus::Errored(_));
             self.last_update_status = update_status.clone();
             changed = true;
-            // A failure surfaces in a window with a retry button instead of a
-            // footer pill.
+            // A failure surfaces in a window with a retry button.
             if matches!(update_status, UpdateStatus::Errored(_))
                 && !was_error
                 && !update_window::is_open(cx)
@@ -5949,16 +5943,6 @@ impl PilusView {
                             .flex_shrink_0()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.check_for_updates(cx);
-                                // Surface the result live (progress, up-to-date,
-                                // or retry) instead of only the footer badge.
-                                if !update_window::is_open(cx) {
-                                    update_window::open(
-                                        this.updater.clone(),
-                                        this.theme,
-                                        this.shared_settings.clone(),
-                                        cx,
-                                    );
-                                }
                             })),
                         ),
                     ),
@@ -6521,9 +6505,16 @@ impl PilusView {
         });
     }
 
-    /// Manual check from the menu bar (`pilus → Check for Updates…`).
+    /// Manual check from the menu bar or Settings: run the check and
+    /// foreground the Update window so the result is visible immediately.
     fn check_for_updates(&mut self, cx: &mut Context<Self>) {
         self.updater.update(cx, |updater, cx| updater.check(cx));
+        update_window::show(
+            self.updater.clone(),
+            self.theme,
+            self.shared_settings.clone(),
+            cx,
+        );
     }
 
     /// Persist update preferences and rebuild the updater engine in place.
@@ -6574,55 +6565,6 @@ impl PilusView {
         self.save_update_settings(cx);
     }
 
-    /// The badge's next step: download an available update, restart into a
-    /// staged one, or re-check after an error.
-    fn advance_update(&mut self, cx: &mut Context<Self>) {
-        self.updater
-            .update(cx, |updater, cx| match updater.status() {
-                UpdateStatus::Staged(_) => updater.restart(cx),
-                UpdateStatus::Available(_)
-                | UpdateStatus::Errored(_)
-                | UpdateStatus::UpToDate
-                | UpdateStatus::Idle => {
-                    // A known release downloads; otherwise (re)check. The engine
-                    // itself no-ops a download with nothing staged.
-                    if updater.available().is_some() {
-                        updater.download_and_install(cx);
-                    } else {
-                        updater.check(cx);
-                    }
-                }
-                UpdateStatus::Checking
-                | UpdateStatus::Downloading { .. }
-                | UpdateStatus::Installing => {}
-            });
-    }
-
-    /// Short footer badge text for the update state, plus whether clicking
-    /// it advances the flow. `None` keeps the footer clean.
-    fn update_badge(&self) -> Option<(String, bool)> {
-        match &self.last_update_status {
-            UpdateStatus::Idle | UpdateStatus::UpToDate => None,
-            UpdateStatus::Checking => Some(("Checking for updates…".to_string(), false)),
-            UpdateStatus::Available(version) => Some((format!("Update to {version}"), true)),
-            UpdateStatus::Downloading { downloaded, total } => {
-                let label = match total {
-                    Some(total) => format!(
-                        "Downloading {} / {}",
-                        human_bytes(*downloaded),
-                        human_bytes(*total)
-                    ),
-                    None => format!("Downloading {}", human_bytes(*downloaded)),
-                };
-                Some((label, false))
-            }
-            UpdateStatus::Installing => Some(("Installing update…".to_string(), false)),
-            UpdateStatus::Staged(version) => Some((format!("Restart to install {version}"), true)),
-            // Failures open the Update window with a retry button instead.
-            UpdateStatus::Errored(_) => None,
-        }
-    }
-
     /// Send our sidebar layout to the daemon with a fresh revision.
     fn push_sidebar_layout(&mut self) {
         let Some(layout) = self.sidebar_layout.clone() else {
@@ -6645,21 +6587,6 @@ impl PilusView {
             layout.left.visible = self.sidebar_visible;
         }
         self.push_sidebar_layout();
-    }
-
-    /// Forward a synthetic left click at `cell` to the daemon.
-    fn forward_click(&self, cell: Cell) {
-        let modifiers = Modifiers::default();
-        self.forward_mouse(
-            MouseEventKind::Down(TerminalMouseButton::Left),
-            cell,
-            modifiers,
-        );
-        self.forward_mouse(
-            MouseEventKind::Up(TerminalMouseButton::Left),
-            cell,
-            modifiers,
-        );
     }
 
     /// The measured cell advance in pixels, resolved from the font once.
@@ -6700,7 +6627,7 @@ impl PilusView {
         (self.settings.ui_font_size - (CHROME_FONT - SECTION_FONT)).max(8.0)
     }
 
-    /// Secondary chrome text (footer, rows, badges), one step below the base.
+    /// Secondary chrome text (rows, badges), one step below the base.
     fn footer_font(&self) -> f32 {
         (self.settings.ui_font_size - 1.0).max(8.0)
     }
@@ -6725,16 +6652,13 @@ impl PilusView {
         if y < HEADER_HEIGHT {
             return true;
         }
-        if y >= f32::from(window.viewport_size().height) - FOOTER_HEIGHT {
-            return true;
-        }
         if self.sidebar_visible
             && let Some(dock) = self.surface.shell_dock()
         {
             let cell_width = self.cell_width(window);
             let left = f32::from(dock.x) * cell_width;
             let right = left + f32::from(dock.width) * cell_width;
-            let bottom = f32::from(window.viewport_size().height) - FOOTER_HEIGHT;
+            let bottom = f32::from(window.viewport_size().height);
             if x >= left && x < right && y < bottom {
                 return true;
             }
@@ -7115,9 +7039,8 @@ impl PilusView {
             .child(content);
 
         // The panel starts on row 0, covering the daemon's `« session Menu`
-        // chrome so the sidebar shows only native sections. It runs full
-        // height down to the footer; the footer itself spans the full width
-        // beneath it, VS Code style.
+        // chrome so the sidebar shows only native sections, and runs the
+        // full viewport height.
         div()
             .absolute()
             .left(px(f32::from(dock.x) * cell_width))
@@ -7132,39 +7055,6 @@ impl PilusView {
             // scroll under it instead of disappearing beneath the titlebar.
             .child(div().h(px(40.0)).flex_shrink_0())
             .child(list)
-    }
-
-    /// The daemon's Menu-pill cell: scanned from the top rows, falling back
-    /// to the dock's trailing cells when the label isn't visible (yet).
-    ///
-    /// Scanning (instead of trusting the dock rect) keeps the click working
-    /// when hiding our sidebar reshuffles the daemon's chrome.
-    fn menu_cell(&self) -> Option<Cell> {
-        const LABEL: [&str; 4] = ["M", "e", "n", "u"];
-        if let Some(frame) = self.surface.frame() {
-            let width = usize::from(frame.width);
-            for row in 0usize..3 {
-                for start in 0..width.saturating_sub(LABEL.len()) {
-                    let found = LABEL.iter().enumerate().all(|(offset, want)| {
-                        frame
-                            .cells
-                            .get(row * width + start + offset)
-                            .is_some_and(|cell| symbol(cell) == *want)
-                    });
-                    if found {
-                        return Some(Cell {
-                            column: start as u16 + 2,
-                            row: row as u16,
-                        });
-                    }
-                }
-            }
-        }
-        let dock = self.surface.shell_dock()?;
-        Some(Cell {
-            column: dock.x + dock.width.saturating_sub(4),
-            row: 0,
-        })
     }
 
     /// Focus a workspace tab.
@@ -7195,6 +7085,24 @@ impl PilusView {
             }
             _ => tab.active,
         }
+    }
+
+    /// The agent running on tab `index` in the active workspace, if any.
+    ///
+    /// `agent.list` tab positions repeat across workspaces, so a match must
+    /// pin the workspace id too; a focused or working agent wins over another
+    /// agent on the same tab.
+    fn tab_agent(&self, index: u16) -> Option<&Agent> {
+        let workspace_id = &self
+            .surface
+            .workspaces()
+            .iter()
+            .find(|workspace| workspace.active)?
+            .id;
+        self.agents
+            .iter()
+            .filter(|agent| agent.workspace_id == *workspace_id && agent.tab == index)
+            .max_by_key(|agent| (agent.focused, agent.status == "working"))
     }
 
     /// Open a new tab in the active workspace.
@@ -7257,8 +7165,8 @@ impl PilusView {
         }
     }
 
-    /// The native tab strip, full window width: toggle beside the traffic
-    /// lights, tabs, and settings at the far right.
+    /// The native tab strip, full window width: sidebar toggle, session picker,
+    /// terminal tabs, and the new-tab action.
     fn top_chrome(&self, cx: &mut Context<Self>, cell_width: f32, fullscreen: bool) -> Div {
         let theme = self.theme;
         // Beside the sidebar when it is open; full width when it is hidden.
@@ -7271,40 +7179,44 @@ impl PilusView {
             TRAFFIC_LIGHT_CLEARANCE
         };
         let mut tabs = div()
+            .id("pilus-tabs-scroll")
             .flex()
             .flex_row()
             .items_center()
             .gap_1()
-            .flex_1()
-            .overflow_hidden();
+            .flex_initial()
+            .min_w_0()
+            .overflow_x_scroll()
+            .overflow_y_hidden()
+            .track_scroll(&self.tab_scroll);
         for tab in &self.tabs {
             tabs = tabs.child(self.tab_item(tab, cx));
         }
-        tabs = tabs.child(
-            div()
-                .id("pilus-new-tab")
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(TAB_HEIGHT))
-                .w(px(28.0))
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(px(self.chrome_font()))
-                .text_color(theme.muted)
-                .hover(|style| style.text_color(theme.panel_fg).bg(theme.panel))
-                .child(icon(
-                    include_bytes!("../../assets/icons/plus.svg"),
-                    13.0,
-                    theme.muted,
-                ))
-                .on_click(cx.listener(|this, _, _, _| this.new_tab())),
-        );
+        let new_tab = div()
+            .id("pilus-new-tab")
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .h(px(TAB_HEIGHT))
+            .w(px(28.0))
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(self.chrome_font()))
+            .text_color(theme.muted)
+            .hover(|style| style.text_color(theme.panel_fg).bg(theme.panel))
+            .child(icon(
+                include_bytes!("../../assets/icons/plus.svg"),
+                13.0,
+                theme.muted,
+            ))
+            .on_click(cx.listener(|this, _, _, _| this.new_tab()));
         let toggle = div()
             .id("pilus-sidebar-toggle")
             .flex()
             .items_center()
             .justify_center()
+            .flex_shrink_0()
             .h(px(TAB_HEIGHT))
             .w(px(28.0))
             .rounded_md()
@@ -7327,11 +7239,13 @@ impl PilusView {
             .h(px(TAB_STRIP_HEIGHT))
             .pl(px(pad))
             .pr(px(8.0))
-            .child(toggle);
+            .child(toggle)
+            .child(self.session_picker(cx).flex_shrink_0());
         // Tabs belong to the terminal surface, so they hide with it while a
-        // page owns the card.
-        if !self.projects.is_open() {
-            tab_strip = tab_strip.child(tabs);
+        // page owns the card; the session picker stays on every page. The plus
+        // follows the tabs until overflow makes the scroll viewport shrink.
+        if !self.projects.is_open() && !self.home.is_open() {
+            tab_strip = tab_strip.child(tabs).child(new_tab);
         }
         div()
             .absolute()
@@ -7351,7 +7265,29 @@ impl PilusView {
         let active = self.tab_active(tab);
         let index = tab.index;
         let close_index = tab.index;
-        let label = truncate_label(&tab.label(), 28);
+        let fg = if active { theme.panel_fg } else { theme.muted };
+        // Until `session.snapshot` enriches the tab, show the workspace's
+        // breadcrumb cwd.
+        let cwd = if tab.cwd.is_empty() {
+            self.crumb_path()
+        } else {
+            shorten_home(&tab.cwd)
+        };
+        let label = tab_label(&cwd, index);
+        let process = if tab.process.is_empty() {
+            "No terminal process"
+        } else {
+            tab.process.as_str()
+        };
+        let tip = row_tooltip(
+            format!("Tab {index}"),
+            fg,
+            vec![
+                (format!("Directory: {cwd}"), theme.muted),
+                (format!("Process: {process}"), theme.muted),
+            ],
+            theme,
+        );
         let group = format!("pilus-tab-{index}");
         let close = div()
             .id(format!("pilus-tab-close-{index}"))
@@ -7372,7 +7308,6 @@ impl PilusView {
                 this.close_tab(close_index);
                 cx.notify();
             }));
-        let fg = if active { theme.panel_fg } else { theme.muted };
         let tab = div()
             .id(format!("pilus-tab-{index}"))
             .group(group)
@@ -7380,25 +7315,41 @@ impl PilusView {
             .flex_row()
             .items_center()
             .gap_2()
+            .flex_shrink_0()
             .h(px(TAB_HEIGHT))
-            .min_w(px(100.0))
+            .min_w(px(140.0))
+            .max_w(px(280.0))
             .px_3()
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .bg(if active { theme.panel } else { theme.window_bg })
             .text_color(fg)
-            .hover(|style| style.bg(theme.panel).text_color(theme.panel_fg));
-        tab.child(div().flex_1().child(label))
+            .hover(|style| style.bg(theme.panel).text_color(theme.panel_fg))
+            .tooltip(tip);
+        let mut content = div()
+            .flex_1()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .overflow_hidden()
+            .whitespace_nowrap();
+        if let Some(agent) = self.tab_agent(index) {
+            content = content.child(div().flex_shrink_0().child(icon(
+                agent_icon(&agent.agent),
+                12.0,
+                fg,
+            )));
+        }
+        content = content.child(
+            div()
+                .font_family(style::mono_family(&self.shared_settings))
+                .child(label),
+        );
+        tab.child(content)
             .child(close)
             .on_click(cx.listener(move |this, _, _, cx| this.focus_tab(index, cx)))
-    }
-
-    /// Open the daemon's Settings menu by clicking its Menu pill.
-    fn click_menu(&self) {
-        if let Some(cell) = self.menu_cell() {
-            self.forward_click(cell);
-        }
     }
 
     /// Daemon columns hidden beneath our sidebar: the dock the daemon blanks
@@ -7423,163 +7374,56 @@ impl PilusView {
         }
     }
 
-    /// Pixels the bottom chrome insets past the sidebar, when it is visible.
-    /// The native bottom bar: session switcher on the left, widgets on right.
-    ///
-    /// The right side mirrors the daemon's own status-bar widgets (fetched
-    /// via `ui.bar.list`). The session pill opens the session menu; the bar
-    /// starts past the sidebar so it never hides beneath it.
-    fn status_bar(&self, cx: &mut Context<Self>) -> Div {
+    /// The session picker in the top tab strip: current session name plus a
+    /// chevron, opening the session menu below it.
+    fn session_picker(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
-        let mut right = div().flex().flex_row().items_center().gap_2();
-        // The running build's version, beside the update state so a preview
-        // stamp is identifiable without opening About.
-        right = right.child(
-            div()
-                .flex()
-                .items_center()
-                .h(px(28.0))
-                .px_1()
-                .text_color(theme.muted)
-                .child(format!("v{}", self.app_version)),
-        );
-        // OTA state lives next to the settings gear: quiet when idle, a
-        // progress label while busy, and a clickable pill when the user can
-        // advance the flow (download, restart, or retry).
-        if let Some((label, actionable)) = self.update_badge() {
-            let pill = div()
-                .id("pilus-update")
-                .flex()
-                .flex_row()
-                .items_center()
-                .h(px(28.0))
-                .px_2()
-                .rounded_md()
-                .text_color(if actionable {
-                    theme.accent
-                } else {
-                    theme.muted
-                });
-            right = right.child(if actionable {
-                pill.cursor_pointer()
-                    .hover(|style| style.bg(theme.panel))
-                    .child(label)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.advance_update(cx);
-                        cx.notify();
-                    }))
-            } else {
-                pill.child(label)
-            });
-        }
-        // Remote-machine manager, beside the settings gear.
-        right = right.child(
-            div()
-                .id("pilus-machines")
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(28.0))
-                .w(px(28.0))
-                .rounded_md()
-                .cursor_pointer()
-                .hover(|style| style.bg(theme.panel))
-                .child(icon(
-                    include_bytes!("../../assets/icons/monitor.svg"),
-                    14.0,
-                    theme.muted,
-                ))
-                .on_click(cx.listener(|_, _, window, cx| {
-                    window.dispatch_action(OpenMachineManager.boxed_clone(), cx);
-                })),
-        );
-        right = right.child(
-            div()
-                .id("pilus-settings")
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(28.0))
-                .w(px(28.0))
-                .rounded_md()
-                .cursor_pointer()
-                .hover(|style| style.bg(theme.panel))
-                .child(icon(
-                    include_bytes!("../../assets/icons/settings.svg"),
-                    14.0,
-                    theme.muted,
-                ))
-                .on_click(cx.listener(|this, _, _, _| this.click_menu())),
-        );
         div()
-            .absolute()
-            .left(px(0.0))
-            .bottom(px(4.0))
-            .w_full()
-            .h(px(FOOTER_HEIGHT))
+            .id("pilus-session-button")
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
-            .px_3()
-            .text_size(px(self.footer_font()))
+            .gap_2()
+            .h(px(TAB_HEIGHT))
+            .px_2()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(self.chrome_font()))
+            .hover(|style| style.bg(theme.panel))
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("pilus-session-button")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .h(px(28.0))
-                            .px_2()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme.panel))
-                            .child(
-                                div()
-                                    .text_color(theme.panel_fg)
-                                    .child(self.current_session_name().to_string()),
-                            )
-                            .child(icon(
-                                include_bytes!("../../assets/icons/chevron-down.svg"),
-                                12.0,
-                                theme.muted,
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.session_menu_open = !this.session_menu_open;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .font_family(style::mono_family(&self.shared_settings))
-                            .text_color(theme.muted)
-                            .child(truncate_label(&self.crumb_path(), 48)),
-                    )
-                    .child(session_status(
-                        self.status.clone(),
-                        self.current_session_name(),
-                        theme.muted,
-                    )),
+                    .text_color(theme.panel_fg)
+                    .child(self.current_session_name().to_string()),
             )
-            .child(right)
+            .child(icon(
+                include_bytes!("../../assets/icons/chevron-down.svg"),
+                12.0,
+                theme.muted,
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.session_menu_open = !this.session_menu_open;
+                cx.notify();
+            }))
     }
 
-    /// The footer session menu: switch sessions or start a fresh one.
+    /// The session menu: switch sessions or start a fresh one.
     ///
     /// A transparent catcher covers the content area so a click anywhere
     /// outside dismisses; the panel stops propagation so its own clicks land.
-    fn session_menu(&self, cx: &mut Context<Self>) -> Div {
+    /// It opens below the session picker in the top strip, offset by the same
+    /// sidebar/fullscreen-dependent left inset the strip uses.
+    fn session_menu(&self, cx: &mut Context<Self>, cell_width: f32, fullscreen: bool) -> Div {
         if !self.session_menu_open {
             return div();
         }
         let theme = self.theme;
+        let strip_left = f32::from(self.sidebar_cells()) * cell_width;
+        let pad = if self.sidebar_visible || fullscreen {
+            TAB_STRIP_EDGE
+        } else {
+            TRAFFIC_LIGHT_CLEARANCE
+        };
+        let menu_left = strip_left + pad + 28.0 + 4.0;
         let mut items = div().flex().flex_col().gap_1();
         for session in &self.sessions {
             let name = session.name.clone();
@@ -7673,8 +7517,8 @@ impl PilusView {
             .child(
                 div()
                     .absolute()
-                    .left(px(8.0))
-                    .bottom(px(FOOTER_HEIGHT + 8.0))
+                    .left(px(menu_left))
+                    .top(px(HEADER_HEIGHT))
                     .w(px(264.0))
                     .rounded_md()
                     .bg(theme.sidebar_bg)
@@ -7988,7 +7832,7 @@ impl PilusView {
         )
     }
 
-    /// Working directory for the footer: the active workspace's cwd.
+    /// Working directory for the tab label: the active workspace's cwd.
     fn crumb_path(&self) -> String {
         if let Some(active) = self.surface.workspaces().iter().find(|w| w.active) {
             return shorten_home(&active.cwd);
@@ -8901,8 +8745,8 @@ impl PilusView {
     /// Measure the inset card and the grid that fits inside it.
     ///
     /// The card floats below the tab strip with a gap on top, right, and
-    /// bottom, starting past the sidebar; the footer floats separately
-    /// beneath it. The grid keeps a border on every side.
+    /// bottom, starting past the sidebar. The grid keeps a border on every
+    /// side.
     fn card_layout(&mut self, window: &Window) -> CardLayout {
         let cell_w = self.cell_width(window);
         let cell_h = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
@@ -8911,12 +8755,7 @@ impl PilusView {
         // The card's inner box: inside the hairline border, before the grid's
         // own breathing room.
         let inner_w = f32::from(viewport.width) - card_x - CARD_GAP_RIGHT - 2.0;
-        let inner_h = f32::from(viewport.height)
-            - HEADER_HEIGHT
-            - FOOTER_HEIGHT
-            - CARD_GAP_TOP
-            - CARD_GAP
-            - 2.0;
+        let inner_h = f32::from(viewport.height) - HEADER_HEIGHT - CARD_GAP_TOP - CARD_GAP - 2.0;
         let cols = ((inner_w - 2.0 * TERMINAL_PAD) / cell_w).clamp(20.0, 500.0) as u16;
         let rows = ((inner_h - 2.0 * TERMINAL_PAD) / cell_h).clamp(5.0, 300.0) as u16;
         // Center the whole-cell grid in the inner box so opposite gaps match;
@@ -9091,11 +8930,8 @@ impl Render for PilusView {
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, _| {
                 this.scroll(event, window);
             }));
-        let sidebar = self.sidebar(
-            cx,
-            cell_width,
-            f32::from(window.viewport_size().height) - FOOTER_HEIGHT,
-        );
+        let sidebar = self.sidebar(cx, cell_width, f32::from(window.viewport_size().height));
+        let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
 
         // The unified top chrome paints over this row; the spacer only keeps
         // the grid and the pointer mapping anchored at HEADER_HEIGHT.
@@ -9202,7 +9038,7 @@ impl Render for PilusView {
                         .right(px(CARD_GAP_RIGHT))
                         // Fixed bottom: any floor slack stays inside the card
                         // on the grid's own background, invisible.
-                        .bottom(px(FOOTER_HEIGHT + CARD_GAP))
+                        .bottom(px(CARD_GAP))
                         .flex()
                         .flex_col()
                         .bg(terminal_bg)
@@ -9216,15 +9052,8 @@ impl Render for PilusView {
             // Chrome layers live at the root so they paint above the content
             // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
-            // The Home composer fills the card, so its tab strip stays hidden.
-            .child(if self.home.is_open() {
-                div()
-            } else {
-                let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
-                self.top_chrome(cx, cell_width, fullscreen)
-            })
-            .child(self.session_menu(cx))
-            .child(self.status_bar(cx))
+            .child(self.top_chrome(cx, cell_width, fullscreen))
+            .child(self.session_menu(cx, cell_width, fullscreen))
             .child(self.palette_overlay(cx))
             .child(self.picker_overlay(window, cx))
     }
@@ -9576,14 +9405,6 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// The footer status text, hidden when it repeats the session pill.
-fn session_status(status: String, session: &str, muted: gpui::Rgba) -> Div {
-    if status == session {
-        return div();
-    }
-    div().text_color(muted).child(status)
-}
-
 /// A baked lucide glyph at `size` logical pixels, tinted `color`.
 ///
 /// GPUI paints SVGs as an alpha mask tinted with the element's own text
@@ -9809,6 +9630,12 @@ fn truncate_label(label: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
+/// A tab's label: its workspace cwd plus the `⌘N` shortcut. The cwd is capped
+/// before the shortcut is appended, so `⌘N` is never truncated away.
+fn tab_label(cwd: &str, index: u16) -> String {
+    format!("{} ⌘{index}", truncate_label(cwd, 24))
+}
+
 /// A color for an agent status dot.
 fn status_color(status: &str, theme: Theme) -> gpui::Rgba {
     match status {
@@ -9924,6 +9751,13 @@ mod tests {
             mods,
             ..CellData::default()
         }
+    }
+
+    #[test]
+    fn tab_label_keeps_cwd_and_shortcut() {
+        assert_eq!(tab_label("~/work/pilus", 3), "~/work/pilus ⌘3");
+        let long = tab_label("~/work/a-directory-name-that-will-not-fit", 7);
+        assert!(long.ends_with("… ⌘7"));
     }
 
     #[test]

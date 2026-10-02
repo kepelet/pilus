@@ -5454,7 +5454,7 @@ impl PilusView {
                     .font_family(style::mono_family(&self.shared_settings))
                     .text_size(px(self.section_font()))
                     .text_color(theme.muted)
-                    .child(shorten_home(&project.location)),
+                    .child(self.shorten_cwd(project.endpoint_key(), &project.location)),
             )
             .child(self.project_members(project, cx))
             .child(
@@ -7281,7 +7281,7 @@ impl PilusView {
         let cwd = if tab.cwd.is_empty() {
             self.crumb_path()
         } else {
-            shorten_home(&tab.cwd)
+            self.shorten_cwd(&self.active.key(), &tab.cwd)
         };
         let label = tab_label(&cwd, index);
         let process = if tab.process.is_empty() {
@@ -7421,6 +7421,7 @@ impl PilusView {
         }
         content = content.child(
             div()
+                .text_size(px(self.footer_font()))
                 .font_family(style::mono_family(&self.shared_settings))
                 .child(label),
         );
@@ -7780,7 +7781,7 @@ impl PilusView {
         let active = self.endpoint_selected(endpoint) && workspace.active;
         let remote = endpoint.machine_id().is_some();
         let bg = if active { theme.panel } else { theme.window_bg };
-        let cwd = shorten_home(&workspace.cwd);
+        let cwd = self.shorten_cwd(&endpoint.key(), &workspace.cwd);
         let mut lines = vec![(format!("Directory: {cwd}"), theme.muted)];
         if let Some(branch) = workspace.branch.clone() {
             lines.push((format!("Branch: {branch}"), theme.branch));
@@ -7912,7 +7913,7 @@ impl PilusView {
     /// Working directory for the tab label: the active workspace's cwd.
     fn crumb_path(&self) -> String {
         if let Some(active) = self.surface.workspaces().iter().find(|w| w.active) {
-            return shorten_home(&active.cwd);
+            return self.shorten_cwd(&self.active.key(), &active.cwd);
         }
         self.connection.identity().session.clone()
     }
@@ -8203,7 +8204,7 @@ impl PilusView {
         let collapsed = self.project_collapsed.contains(&project.id);
         let active = self.project_active(project);
         let host = self.project_host_label(project);
-        let location = shorten_home(&project.location);
+        let location = self.shorten_cwd(project.endpoint_key(), &project.location);
         let grouped = self.project_workspaces(project);
         let project_id = project.id.clone();
         let project_for_open = project.clone();
@@ -8412,6 +8413,45 @@ impl PilusView {
         }
     }
 
+    /// Shorten an absolute cwd with `~` against the owning machine's home.
+    ///
+    /// Pane cwds arrive absolute, but a remote one needs that machine's home:
+    /// this machine's `$HOME` never matches it. When the home is not known yet,
+    /// fall back to the `~`-shorthand the daemon uses for workspace cwds.
+    fn shorten_cwd(&self, endpoint_key: &str, cwd: &str) -> String {
+        if let Some(home) = self.remote_home.get(endpoint_key) {
+            let shortened = shorten_against(cwd, home);
+            if shortened != cwd {
+                return shortened;
+            }
+        }
+        let shortened = shorten_home(cwd);
+        if shortened != cwd {
+            return shortened;
+        }
+        self.shorten_by_shorthand(endpoint_key, cwd)
+            .unwrap_or_else(|| cwd.to_string())
+    }
+
+    /// Recover a home prefix by aligning `cwd` with a workspace's `~`-shorthand.
+    ///
+    /// The daemon reports workspace cwds as `~`-shorthand but pane cwds
+    /// absolute, so a matching tail names the prefix the machine's `$HOME`
+    /// would, without probing it.
+    fn shorten_by_shorthand(&self, endpoint_key: &str, cwd: &str) -> Option<String> {
+        let endpoint = if endpoint_key == "local" {
+            EndpointId::Local
+        } else {
+            EndpointId::Machine(endpoint_key.to_string())
+        };
+        for workspace in self.endpoint_workspaces(&endpoint) {
+            if let Some(shortened) = shorten_like_shorthand(cwd, &workspace.cwd) {
+                return Some(shortened);
+            }
+        }
+        None
+    }
+
     /// The cached git common dir for a workspace, if it was resolved.
     fn workspace_common(&self, endpoint_key: &str, cwd: &str) -> Option<&str> {
         self.project_repo
@@ -8544,7 +8584,11 @@ impl PilusView {
                 }
             }
             for (endpoint_key, (target, locations)) in branch_remotes {
-                for (location, branch) in current_branches_remote(&target, &locations) {
+                let answers = current_branches_remote(&target, &locations);
+                if !answers.home.is_empty() {
+                    homes.push((endpoint_key.clone(), answers.home));
+                }
+                for (location, branch) in answers.branches {
                     branches.push(((endpoint_key.clone(), location), branch));
                 }
             }
@@ -8716,7 +8760,7 @@ impl PilusView {
         let dim = theme.muted;
         let status = status_color(&agent.status, theme);
         let branch = agent.branch.clone();
-        let cwd = shorten_home(&agent.cwd);
+        let cwd = self.shorten_cwd(&endpoint.key(), &agent.cwd);
         let label = agent.label().to_string();
         let mut lines = vec![
             (format!("Agent: {}", agent.agent), dim),
@@ -9688,14 +9732,50 @@ fn run_machine_cli(root: &Path, args: Vec<String>) -> Result<(), String> {
     }
 }
 
+/// Recover a `~`-shortened path by aligning `path` with a shorthand cwd.
+///
+/// The daemon reports workspace cwds as `~`-shorthand but pane cwds absolute,
+/// so a matching tail names the home prefix without probing it.
+fn shorten_like_shorthand(path: &str, shorthand: &str) -> Option<String> {
+    if path.starts_with('~') {
+        return None;
+    }
+    let rest = shorthand.strip_prefix("~/")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let needle = format!("/{rest}");
+    let index = path.find(&needle)?;
+    let after = index + needle.len();
+    // The match must start at a path boundary and end one, or `repo` would
+    // shorten a sibling named `repo2`.
+    if index == 0 || (after < path.len() && path.as_bytes()[after] != b'/') {
+        return None;
+    }
+    Some(format!("~{}", &path[index..]))
+}
+
+/// Shorten a path with `~` when it sits under `home`.
+fn shorten_against(path: &str, home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return path.to_string();
+    }
+    if path == home {
+        return "~".to_string();
+    }
+    match path.strip_prefix(&format!("{home}/")) {
+        Some(rest) => format!("~/{rest}"),
+        None => path.to_string(),
+    }
+}
+
 /// Shorten a workspace path with `~`, the way the mock's breadcrumb reads.
 fn shorten_home(path: &str) -> String {
-    if let Some(home) = std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
-        && let Some(rest) = path.strip_prefix(home.as_str())
-    {
-        return format!("~{rest}");
+    match std::env::var_os("HOME") {
+        Some(home) => shorten_against(path, &home.to_string_lossy()),
+        None => path.to_string(),
     }
-    path.to_string()
 }
 
 /// Cap a tab label at `max` chars so one long name cannot crowd the strip.
@@ -9828,6 +9908,38 @@ mod tests {
             mods,
             ..CellData::default()
         }
+    }
+
+    #[test]
+    fn shorthand_alignment_recovers_the_home_prefix() {
+        // A pane cwd under a `~`-shorthand workspace shortens without knowing
+        // the machine's `$HOME`.
+        assert_eq!(
+            shorten_like_shorthand("/home/deploy/repo/api", "~/repo"),
+            Some("~/repo/api".to_string())
+        );
+        // The shorthand itself is already short; nothing to align.
+        assert_eq!(shorten_like_shorthand("~/repo", "~/repo"), None);
+        // A tail that never appears leaves the path alone.
+        assert_eq!(shorten_like_shorthand("/home/deploy/other", "~/repo"), None);
+        // A sibling sharing the prefix must not align.
+        assert_eq!(shorten_like_shorthand("/home/deploy/repo2", "~/repo"), None);
+    }
+
+    #[test]
+    fn shorten_against_uses_the_given_home() {
+        assert_eq!(shorten_against("/home/deploy", "/home/deploy"), "~");
+        assert_eq!(
+            shorten_against("/home/deploy/repo/api", "/home/deploy"),
+            "~/repo/api"
+        );
+        // A sibling with the same prefix must not shorten.
+        assert_eq!(
+            shorten_against("/home/deployer/repo", "/home/deploy"),
+            "/home/deployer/repo"
+        );
+        // An unknown home leaves the path alone.
+        assert_eq!(shorten_against("/repo/api", ""), "/repo/api");
     }
 
     #[test]

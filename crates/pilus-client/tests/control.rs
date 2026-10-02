@@ -21,7 +21,7 @@ fn reads_and_commands_over_one_connection_per_request() {
 
     let listener = UnixListener::bind(&socket).expect("bind");
     let server = thread::spawn(move || {
-        for _ in 0..5 {
+        for _ in 0..6 {
             let (stream, _) = listener.accept().expect("accept");
             let mut reader = BufReader::new(stream.try_clone().expect("clone"));
             let mut writer = stream;
@@ -33,13 +33,13 @@ fn reads_and_commands_over_one_connection_per_request() {
                     "type": "agent_list",
                     "agents": [
                         {
-                            "pane": "2", "agent": "claude", "name": "auth-fix",
+                            "pane": "2", "tab": "1", "agent": "claude", "name": "auth-fix",
                             "status": "working", "workspace_id": "ws1",
                             "workspace_name": "api", "cwd": "/repo/api",
                             "branch": "main", "focused": true
                         },
                         {
-                            "pane": "4", "agent": "codex", "name": "",
+                            "pane": "4", "tab": "2", "agent": "codex", "name": "",
                             "status": "blocked", "workspace_id": "ws2",
                             "workspace_name": "web", "cwd": "/repo/web",
                             "branch": null, "focused": false
@@ -66,6 +66,26 @@ fn reads_and_commands_over_one_connection_per_request() {
                         { "tab": "2", "tab_id": "t2", "active": true, "name": "docs", "kind": "panes" }
                     ]
                 }),
+                "session.snapshot" => serde_json::json!({
+                    "type": "session_snapshot",
+                    "workspaces": [{
+                        "id": "ws1", "cwd": "/repo", "active": true,
+                        "tabs": [
+                            {
+                                "index": 1,
+                                "panes": [
+                                    { "kind": "terminal", "cwd": "/repo/api", "agent": "fish", "focused": false }
+                                ]
+                            },
+                            {
+                                "index": 2,
+                                "panes": [
+                                    { "kind": "terminal", "cwd": "/repo/docs", "agent": "devin", "focused": true }
+                                ]
+                            }
+                        ]
+                    }]
+                }),
                 "tab.focus" => {
                     assert_eq!(request["params"]["tab"], "1");
                     serde_json::json!({ "type": "ok" })
@@ -86,6 +106,8 @@ fn reads_and_commands_over_one_connection_per_request() {
     let agents = client.agents().expect("agents");
     assert_eq!(agents.len(), 2);
     assert_eq!(agents[0].agent, "claude");
+    assert_eq!(agents[0].tab, 1);
+    assert_eq!(agents[1].tab, 2);
     assert_eq!(agents[0].label(), "auth-fix");
     assert!(agents[0].focused);
     // An unnamed agent falls back to its directory name.
@@ -104,6 +126,11 @@ fn reads_and_commands_over_one_connection_per_request() {
     assert_eq!(tabs[0].label(), "1");
     assert_eq!(tabs[1].label(), "docs");
     assert!(tabs[1].active);
+    // session.snapshot enriched each tab's cwd and running process.
+    assert_eq!(tabs[0].cwd, "/repo/api");
+    assert_eq!(tabs[0].process, "fish");
+    assert_eq!(tabs[1].cwd, "/repo/docs");
+    assert_eq!(tabs[1].process, "devin");
     client.focus_tab(1).expect("focus tab");
 
     client.focus_pane("4").expect("focus pane");

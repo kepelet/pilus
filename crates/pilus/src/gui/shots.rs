@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use gpui::{App, AppContext as _, HeadlessAppContext, Render, Window, px, size};
+use gpui::{App, AppContext as _, HeadlessAppContext, Render, Window, point, px, size};
 
 use super::machines::MachineManagerView;
 use super::theme::Theme;
@@ -198,6 +198,69 @@ pub fn run_main() -> Result<()> {
     settle(&mut cx, 80);
     capture(&mut cx, window.into(), "main")?;
 
+    // A tab's hover card: full cwd plus the running process.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.simulate_mouse_move(point(px(370.0), px(24.0)), cx);
+    })
+    .ok();
+    settle(&mut cx, 30);
+    capture(&mut cx, window.into(), "main-tab-tooltip")?;
+    // Move the pointer off the tab strip so the card closes before the
+    // overlay captures.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.simulate_mouse_move(point(px(620.0), px(400.0)), cx);
+    })
+    .ok();
+
+    // A crowded tab strip: tabs overflow into the scroll viewport while the
+    // pinned `+` stays put, and tab 2 carries the branded agent icon. Only the
+    // view's in-memory lists are swapped; the daemon is untouched.
+    let saved_tabs: Rc<RefCell<Option<(Vec<pilus_client::Tab>, Vec<pilus_client::Agent>)>>> =
+        Rc::new(RefCell::new(None));
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            *saved_tabs.borrow_mut() = Some((view.tabs.clone(), view.agents.clone()));
+            let workspace_id = view
+                .surface
+                .workspaces()
+                .iter()
+                .find(|workspace| workspace.active)
+                .map(|workspace| workspace.id.clone())
+                .unwrap_or_default();
+            view.tabs = (1..=10)
+                .map(|index| pilus_client::Tab {
+                    index,
+                    active: index == 1,
+                    cwd: format!("~/Developer/project-{index}"),
+                    process: if index == 2 { "devin" } else { "fish" }.to_string(),
+                    kind: "panes".to_string(),
+                    ..pilus_client::Tab::default()
+                })
+                .collect();
+            view.agents = vec![pilus_client::Agent {
+                tab: 2,
+                agent: "devin".to_string(),
+                status: "working".to_string(),
+                workspace_id,
+                cwd: "~/Developer/project-2".to_string(),
+                ..pilus_client::Agent::default()
+            }];
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    capture(&mut cx, window.into(), "main-tabs-overflow")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            if let Some((tabs, agents)) = saved_tabs.borrow_mut().take() {
+                view.tabs = tabs;
+                view.agents = agents;
+            }
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+
     // The command palette over the frame.
     cx.update(|app| {
         view.update(app, |view, _| view.palette.open());
@@ -263,12 +326,18 @@ pub fn run_main() -> Result<()> {
     settle(&mut cx, 20);
     capture(&mut cx, window.into(), "main-picker")?;
     cx.update(|app| {
-        view.update(app, |view, _| view.close_picker());
+        view.update(app, |view, cx| {
+            view.close_picker();
+            cx.notify();
+        });
     });
 
-    // The footer session menu.
+    // The session menu.
     cx.update(|app| {
-        view.update(app, |view, _| view.session_menu_open = true);
+        view.update(app, |view, cx| {
+            view.session_menu_open = true;
+            cx.notify();
+        });
     });
     settle(&mut cx, 4);
     capture(&mut cx, window.into(), "main-session-menu")?;

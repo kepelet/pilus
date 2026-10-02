@@ -63,11 +63,6 @@ impl Updater {
         &self.status
     }
 
-    /// The release found by the last successful check, if newer.
-    pub fn available(&self) -> Option<&Release> {
-        self.available.as_ref()
-    }
-
     fn set_status(&mut self, status: UpdateStatus, cx: &mut Context<Self>) {
         self.status = status;
         cx.notify();

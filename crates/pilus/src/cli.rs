@@ -570,8 +570,8 @@ fn run_probe(target: ConnectTarget, workspaces: bool, open_menu: bool) -> Result
                                 layout,
                                 workspace_paths: sidebars.workspace_paths,
                             };
-                            let _ =
-                                connection.send(pilus_protocol::ClientMessage::ShellSidebars(taken));
+                            let _ = connection
+                                .send(pilus_protocol::ClientMessage::ShellSidebars(taken));
                             took_sidebars = true;
                             println!("-> sent sidebar takeover (agents dock removed)");
                         }

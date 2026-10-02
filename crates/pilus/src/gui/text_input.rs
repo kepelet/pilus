@@ -23,9 +23,9 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
-    Focusable, Font, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ShapedLine, SharedString, TextAlign, TextRun,
-    UTF16Selection, Window, canvas, div, fill, point, px, size,
+    Focusable, Font, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, Render, ShapedLine, SharedString, TextAlign, TextRun, UTF16Selection, Window,
+    canvas, div, fill, point, px, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -94,7 +94,8 @@ struct Snapshot {
 }
 
 impl Buffer {
-    fn new(text: String) -> Self {        let head = text.len();
+    fn new(text: String) -> Self {
+        let head = text.len();
         Self {
             text,
             anchor: head,
@@ -135,7 +136,11 @@ impl Buffer {
     fn move_by_grapheme(&mut self, forward: bool, extend: bool) {
         // A collapsed move collapses an existing selection to its edge.
         if !extend && self.has_selection() {
-            let edge = if forward { self.range().end } else { self.range().start };
+            let edge = if forward {
+                self.range().end
+            } else {
+                self.range().start
+            };
             self.move_to(edge, false);
             return;
         }
@@ -198,7 +203,9 @@ impl Buffer {
             text.replace('\n', "")
         };
         let start = self.clamp(self.text.floor_char_boundary(range.start));
-        let end = self.clamp(self.text.ceil_char_boundary(range.end)).max(start);
+        let end = self
+            .clamp(self.text.ceil_char_boundary(range.end))
+            .max(start);
         self.snapshot();
         self.text.replace_range(start..end, &inserted);
         let caret = start + inserted.len();
@@ -319,9 +326,7 @@ fn next_boundary(text: &str, byte: usize) -> usize {
 
 /// Whether a cluster counts as a word character for word-wise movement.
 fn is_word_char(cluster: &str) -> bool {
-    cluster
-        .chars()
-        .all(|ch| ch.is_alphanumeric() || ch == '_')
+    cluster.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
 }
 
 /// The start of the word before `byte`.
@@ -368,7 +373,10 @@ fn next_word(text: &str, byte: usize) -> usize {
 /// The first byte of the line containing `byte`.
 fn line_start(text: &str, byte: usize) -> usize {
     let at = grapheme_start(text, byte);
-    text[..at].rfind('\n').map(|newline| newline + 1).unwrap_or(0)
+    text[..at]
+        .rfind('\n')
+        .map(|newline| newline + 1)
+        .unwrap_or(0)
 }
 
 /// The byte of the newline that ends the line containing `byte`.
@@ -849,8 +857,7 @@ impl EntityInputHandler for TextInput {
         let buffer = self.buffer.borrow();
         let range = buffer.range();
         Some(UTF16Selection {
-            range: byte_to_utf16(&buffer.text, range.start)
-                ..byte_to_utf16(&buffer.text, range.end),
+            range: byte_to_utf16(&buffer.text, range.start)..byte_to_utf16(&buffer.text, range.end),
             reversed: buffer.reversed(),
         })
     }
@@ -880,7 +887,9 @@ impl EntityInputHandler for TextInput {
         cx: &mut Context<Self>,
     ) {
         let range = self.resolve_range(range_utf16);
-        self.buffer.borrow_mut().replace(range, text, self.multiline);
+        self.buffer
+            .borrow_mut()
+            .replace(range, text, self.multiline);
         self.marked = None;
         cx.notify();
     }
@@ -894,7 +903,10 @@ impl EntityInputHandler for TextInput {
         cx: &mut Context<Self>,
     ) {
         let range = self.resolve_range(range_utf16);
-        let inserted = self.buffer.borrow_mut().replace(range, new_text, self.multiline);
+        let inserted = self
+            .buffer
+            .borrow_mut()
+            .replace(range, new_text, self.multiline);
         if new_text.is_empty() {
             self.marked = None;
         } else {
@@ -956,10 +968,12 @@ impl TextInput {
         let buffer = self.buffer.borrow();
         match range_utf16 {
             Some(range) => {
-                let start =
-                    buffer.text.floor_char_boundary(utf16_to_byte(&buffer.text, range.start));
-                let end =
-                    buffer.text.ceil_char_boundary(utf16_to_byte(&buffer.text, range.end));
+                let start = buffer
+                    .text
+                    .floor_char_boundary(utf16_to_byte(&buffer.text, range.start));
+                let end = buffer
+                    .text
+                    .ceil_char_boundary(utf16_to_byte(&buffer.text, range.end));
                 start..end.max(start)
             }
             None => buffer.range(),
@@ -1042,9 +1056,10 @@ impl Render for TextInput {
                 run(high - low, selection_fg),
                 run(line_end - high, color),
             ];
-            let layout = window
-                .text_system()
-                .shape_line(SharedString::new(segment), font_size, &runs, None);
+            let layout =
+                window
+                    .text_system()
+                    .shape_line(SharedString::new(segment), font_size, &runs, None);
             layouts.push(layout);
             line_start = line_end + 1;
         }
@@ -1087,8 +1102,7 @@ impl Render for TextInput {
             .on_key_down({
                 let entity = entity.clone();
                 move |event, window, cx| {
-                    let handled =
-                        entity.update(cx, |this, cx| this.handle_key(event, window, cx));
+                    let handled = entity.update(cx, |this, cx| this.handle_key(event, window, cx));
                     if handled {
                         cx.stop_propagation();
                     }
@@ -1139,9 +1153,18 @@ impl Render for TextInput {
                         }
 
                         for (row, layout) in layouts.iter().enumerate() {
-                            let origin =
-                                point(bounds.origin.x, bounds.origin.y + px(line_height.as_f32() * row as f32));
-                            let _ = layout.paint(origin, line_height, TextAlign::Left, None, window, cx);
+                            let origin = point(
+                                bounds.origin.x,
+                                bounds.origin.y + px(line_height.as_f32() * row as f32),
+                            );
+                            let _ = layout.paint(
+                                origin,
+                                line_height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
                         }
 
                         if let Some(marked) = &marked {

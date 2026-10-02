@@ -410,7 +410,11 @@ impl MachineManagerView {
         let fonts = self.fonts();
         let entity = self.form.entity(field);
         entity.update(cx, |input, _| {
-            input.set_style(theme, style::chrome_font(&self.shared_settings), px(fonts.body));
+            input.set_style(
+                theme,
+                style::chrome_font(&self.shared_settings),
+                px(fonts.body),
+            );
         });
         let focused = entity.read(cx).is_focused(window);
         style::field(

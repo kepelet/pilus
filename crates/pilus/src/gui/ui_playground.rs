@@ -10,9 +10,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, Context, Div, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, Render,
-    Window, WindowBounds, WindowOptions, anchored, deferred, div, point, prelude::*, px, size,
-    Anchor,
+    Anchor, App, Bounds, Context, Div, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent,
+    Render, Window, WindowBounds, WindowOptions, anchored, deferred, div, point, prelude::*, px,
+    size,
 };
 
 use crate::settings::Settings;
@@ -27,7 +27,10 @@ const WINDOW_SIZE: (f32, f32) = (820.0, 740.0);
 
 /// Every icon the app vendors, so the gallery renders the real set.
 const ICONS: &[(&str, &[u8])] = &[
-    ("arrow-up", include_bytes!("../../assets/icons/arrow-up.svg")),
+    (
+        "arrow-up",
+        include_bytes!("../../assets/icons/arrow-up.svg"),
+    ),
     (
         "chevron-down",
         include_bytes!("../../assets/icons/chevron-down.svg"),
@@ -66,8 +69,14 @@ const ICONS: &[(&str, &[u8])] = &[
     ),
     ("plus", include_bytes!("../../assets/icons/plus.svg")),
     ("server", include_bytes!("../../assets/icons/server.svg")),
-    ("settings", include_bytes!("../../assets/icons/settings.svg")),
-    ("workflow", include_bytes!("../../assets/icons/workflow.svg")),
+    (
+        "settings",
+        include_bytes!("../../assets/icons/settings.svg"),
+    ),
+    (
+        "workflow",
+        include_bytes!("../../assets/icons/workflow.svg"),
+    ),
     ("x", include_bytes!("../../assets/icons/x.svg")),
     (
         "agent: claude",
@@ -511,7 +520,10 @@ impl UiPlaygroundView {
             .on_click(cx.listener(|this, _, _, cx| {
                 this.checked = !this.checked;
                 let checked = this.checked;
-                this.note(format!("Checkbox {}", if checked { "on" } else { "off" }), cx);
+                this.note(
+                    format!("Checkbox {}", if checked { "on" } else { "off" }),
+                    cx,
+                );
             }))
             .child(
                 div()
@@ -521,7 +533,11 @@ impl UiPlaygroundView {
                     .w(px(16.0))
                     .h(px(16.0))
                     .rounded_sm()
-                    .bg(if checked { theme.accent } else { theme.panel_dim })
+                    .bg(if checked {
+                        theme.accent
+                    } else {
+                        theme.panel_dim
+                    })
                     .border_1()
                     .border_color(if checked { theme.accent } else { theme.border })
                     .child(div().w(px(8.0)).h(px(8.0)).rounded_xs().bg(if checked {
@@ -992,9 +1008,9 @@ impl UiPlaygroundView {
                         11.0,
                         theme.muted,
                     ))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.note("Add workspace".to_string(), cx)
-                    })),
+                    .on_click(
+                        cx.listener(|this, _, _, cx| this.note("Add workspace".to_string(), cx)),
+                    ),
             )
     }
 
@@ -1151,9 +1167,25 @@ impl UiPlaygroundView {
                 .px_3()
                 .rounded_md()
                 .bg(bg)
-                .child(div().flex_1().text_size(px(self.fonts().body)).text_color(fg).child(title))
-                .child(div().text_size(px(self.fonts().label)).text_color(dim).child(group))
-                .child(div().text_size(px(self.fonts().label)).text_color(dim).child(shortcut))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(self.fonts().body))
+                        .text_color(fg)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(self.fonts().label))
+                        .text_color(dim)
+                        .child(group),
+                )
+                .child(
+                    div()
+                        .text_size(px(self.fonts().label))
+                        .text_color(dim)
+                        .child(shortcut),
+                )
         };
         div()
             .flex()
@@ -1528,65 +1560,66 @@ impl Render for UiPlaygroundView {
             .child(self.section("ANSI", self.ansi_colors()))
             .child(self.section("CONTAINERS", self.containers()))
             .child(self.section("DIVIDERS", self.divider_demos()))
-            .child(self.section(
-                "BUTTONS",
-                self.tray(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_3()
-                        .child(self.button("pg-primary", "Primary", ButtonKind::Primary, cx))
-                        .child(self.button(
-                            "pg-secondary",
-                            "Secondary",
-                            ButtonKind::Secondary,
-                            cx,
-                        ))
-                        .child(self.button("pg-ghost", "Ghost", ButtonKind::Ghost, cx))
-                        .child(self.button("pg-danger", "Danger", ButtonKind::Danger, cx))
-                        .child(self.circle_button(cx))
-                        .child(
-                            div()
-                                .text_size(px(self.fonts().label))
-                                .text_color(theme.muted)
-                                .child(format!("primary clicks: {clicks}")),
-                        ),
-                ),
-            ))
-            .child(self.section(
-                "INPUTS",
-                self.tray(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .items_start()
-                        .gap_4()
-                        .child(self.input_box(InputId::Single, "Single line", window, cx))
-                        .child(self.input_box(InputId::Multi, "Multi line", window, cx)),
-                ),
-            ))
-            .child(self.section(
-                "DROPDOWNS",
-                self.tray(
-                    div()
-                        .relative()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_3()
-                        .child(self.picker_chip(0, cx))
-                        .child(self.picker_chip(1, cx))
-                        .when(self.open_picker.is_some(), |row| {
-                            row.child(
+            .child(
+                self.section(
+                    "BUTTONS",
+                    self.tray(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_3()
+                            .child(self.button("pg-primary", "Primary", ButtonKind::Primary, cx))
+                            .child(self.button(
+                                "pg-secondary",
+                                "Secondary",
+                                ButtonKind::Secondary,
+                                cx,
+                            ))
+                            .child(self.button("pg-ghost", "Ghost", ButtonKind::Ghost, cx))
+                            .child(self.button("pg-danger", "Danger", ButtonKind::Danger, cx))
+                            .child(self.circle_button(cx))
+                            .child(
                                 div()
-                                    .absolute()
-                                    .top(px(0.0))
-                                    .left(px(0.0))
-                                    .child(
+                                    .text_size(px(self.fonts().label))
+                                    .text_color(theme.muted)
+                                    .child(format!("primary clicks: {clicks}")),
+                            ),
+                    ),
+                ),
+            )
+            .child(
+                self.section(
+                    "INPUTS",
+                    self.tray(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_start()
+                            .gap_4()
+                            .child(self.input_box(InputId::Single, "Single line", window, cx))
+                            .child(self.input_box(InputId::Multi, "Multi line", window, cx)),
+                    ),
+                ),
+            )
+            .child(
+                self.section(
+                    "DROPDOWNS",
+                    self.tray(
+                        div()
+                            .relative()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_3()
+                            .child(self.picker_chip(0, cx))
+                            .child(self.picker_chip(1, cx))
+                            .when(self.open_picker.is_some(), |row| {
+                                row.child(
+                                    div().absolute().top(px(0.0)).left(px(0.0)).child(
                                         deferred(
                                             anchored()
                                                 .anchor(Anchor::TopLeft)
@@ -1596,50 +1629,57 @@ impl Render for UiPlaygroundView {
                                         )
                                         .with_priority(1),
                                     ),
-                            )
-                        }),
+                                )
+                            }),
+                    ),
                 ),
-            ))
-            .child(self.section(
-                "TABS",
-                self.tray(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(self.tab(0, "Overview", cx))
-                        .child(self.tab(1, "Changes", cx)),
+            )
+            .child(
+                self.section(
+                    "TABS",
+                    self.tray(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(self.tab(0, "Overview", cx))
+                            .child(self.tab(1, "Changes", cx)),
+                    ),
                 ),
-            ))
-            .child(self.section(
-                "TOGGLES",
-                self.tray(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_6()
-                        .child(self.toggle_switch(cx))
-                        .child(self.checkbox(cx)),
+            )
+            .child(
+                self.section(
+                    "TOGGLES",
+                    self.tray(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_6()
+                            .child(self.toggle_switch(cx))
+                            .child(self.checkbox(cx)),
+                    ),
                 ),
-            ))
-            .child(self.section(
-                "SIDEBAR",
-                self.tray(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .w_full()
-                        .child(self.section_header(cx))
-                        .child(self.project_row_demo(true))
-                        .child(self.project_row_demo(false))
-                        .child(self.workspace_row_demo(true))
-                        .child(self.workspace_row_demo(false))
-                        .child(self.agent_row_demo()),
+            )
+            .child(
+                self.section(
+                    "SIDEBAR",
+                    self.tray(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .w_full()
+                            .child(self.section_header(cx))
+                            .child(self.project_row_demo(true))
+                            .child(self.project_row_demo(false))
+                            .child(self.workspace_row_demo(true))
+                            .child(self.workspace_row_demo(false))
+                            .child(self.agent_row_demo()),
+                    ),
                 ),
-            ))
+            )
             .child(self.section("COMMAND PALETTE", self.tray(self.palette_demo())))
             .child(self.section("WORKSPACE PICKER", self.tray(self.picker_demo())))
             .child(self.section("STATUS BAR", self.tray(self.status_bar_demo())))
@@ -1647,60 +1687,64 @@ impl Render for UiPlaygroundView {
             .child(self.section("FEEDBACK", self.tray(self.feedback_demos())))
             .child(self.section("SMALL BUTTONS", self.tray(self.small_buttons(cx))))
             .child(self.section("BADGES & DOTS", self.tray(self.badges())))
-            .child(self.section(
-                "ROWS",
-                self.tray(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .w_full()
-                        .child(self.machine_row())
-                        .child(self.nav_row("Mission Control", false))
-                        .child(self.nav_row("Orchestration", true)),
+            .child(
+                self.section(
+                    "ROWS",
+                    self.tray(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .w_full()
+                            .child(self.machine_row())
+                            .child(self.nav_row("Mission Control", false))
+                            .child(self.nav_row("Orchestration", true)),
+                    ),
                 ),
-            ))
-            .child(self.section(
-                "TYPOGRAPHY",
-                self.tray(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(self.fonts().label))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(theme.muted)
-                                .child("SECTION LABEL"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(self.fonts().body))
-                                .text_color(theme.panel_fg)
-                                .child("Body panel text"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(self.fonts().secondary))
-                                .text_color(theme.muted)
-                                .child("Muted secondary text"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(self.fonts().secondary))
-                                .text_color(theme.branch)
-                                .child("branch-name"),
-                        )
-                        .child(
-                            div()
-                                .font_family("Menlo")
-                                .text_size(px(self.settings.borrow().terminal_font_size))
-                                .text_color(theme.fg)
-                                .child("monospace 0123456789"),
-                        ),
+            )
+            .child(
+                self.section(
+                    "TYPOGRAPHY",
+                    self.tray(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(self.fonts().label))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme.muted)
+                                    .child("SECTION LABEL"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(self.fonts().body))
+                                    .text_color(theme.panel_fg)
+                                    .child("Body panel text"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(self.fonts().secondary))
+                                    .text_color(theme.muted)
+                                    .child("Muted secondary text"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(self.fonts().secondary))
+                                    .text_color(theme.branch)
+                                    .child("branch-name"),
+                            )
+                            .child(
+                                div()
+                                    .font_family("Menlo")
+                                    .text_size(px(self.settings.borrow().terminal_font_size))
+                                    .text_color(theme.fg)
+                                    .child("monospace 0123456789"),
+                            ),
+                    ),
                 ),
-            ))
+            )
             .child(self.section("ICONS", self.tray(self.icon_grid())));
 
         let root = div()

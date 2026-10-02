@@ -466,8 +466,12 @@ mod tests {
         let mut panel = ProjectsPanel::default();
         panel.open(&dir);
         panel.start_new();
-        panel.field_mut(ProjectField::Name).set_value("flo".to_string());
-        panel.field_mut(ProjectField::Location).set_value("/tmp/flo".to_string());
+        panel
+            .field_mut(ProjectField::Name)
+            .set_value("flo".to_string());
+        panel
+            .field_mut(ProjectField::Location)
+            .set_value("/tmp/flo".to_string());
         panel.submit(&dir, &[None]).expect("submit");
         assert_eq!(panel.projects().len(), 1);
         assert_eq!(panel.projects()[0].id, "flo");
@@ -480,7 +484,9 @@ mod tests {
         let mut panel = ProjectsPanel::default();
         panel.open(&dir);
         panel.start_new();
-        panel.field_mut(ProjectField::Location).set_value("/tmp/x".to_string());
+        panel
+            .field_mut(ProjectField::Location)
+            .set_value("/tmp/x".to_string());
         assert!(panel.submit(&dir, &[None]).is_err());
     }
 
@@ -501,8 +507,12 @@ mod tests {
         let mut panel = ProjectsPanel::default();
         panel.open(&dir);
         panel.start_new();
-        panel.field_mut(ProjectField::Name).set_value("flo".to_string());
-        panel.field_mut(ProjectField::Location).set_value("/tmp/flo".to_string());
+        panel
+            .field_mut(ProjectField::Name)
+            .set_value("flo".to_string());
+        panel
+            .field_mut(ProjectField::Location)
+            .set_value("/tmp/flo".to_string());
         panel.submit(&dir, &[None]).expect("submit");
         assert!(matches!(
             panel.request_delete(&dir),

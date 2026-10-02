@@ -147,7 +147,7 @@ fn control_dir() -> Option<PathBuf> {
     let root = "/private/tmp";
     #[cfg(not(target_os = "macos"))]
     let root = "/tmp";
-    let path = PathBuf::from(format!("{root}/l3s-{uid}"));
+    let path = PathBuf::from(format!("{root}/pilus-{uid}"));
     std::fs::create_dir_all(&path).ok()?;
 
     let metadata = std::fs::symlink_metadata(&path).ok()?;

@@ -41,32 +41,30 @@ use crossterm::event::{
     MouseEventKind,
 };
 use gpui::{
-    Action, Anchor, AnyElement, App, Bounds, ClipboardItem, Context, DisplayId, Div, Entity, FocusHandle,
-    FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent,
-    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    anchored, deferred, div, font, img, point, prelude::*, px, size, svg,
+    Action, Anchor, AnyElement, App, Bounds, ClipboardItem, Context, DisplayId, Div, Entity,
+    FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, TextRun, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, anchored, deferred, div, font, img, point, prelude::*, px, size,
+    svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
+use home::{BaseMode, HomeField, HomeFocus, HomePanel};
+use palette::{Command, Entry, Palette};
+use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use pilus_client::{
     Agent, AgentConfig, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent,
     ConnectTarget, Connection, ConnectorStatus, ControlClient, HOME_ENV, MachineInfo, Project,
     SessionInfo, SshTarget, Surface, SurfaceChange, Tab, TaskSummary, agent_binary, common_git_dir,
-    common_git_dirs_remote, config_dir,
-    connect_machine, current_branch, current_branches_remote, expand_project_local,
-    expand_project_remote, generate_session_name, install_agent, pilus_config_dir,
-    pilus_workspaces_dir,
+    common_git_dirs_remote, config_dir, connect_machine, current_branch, current_branches_remote,
+    expand_project_local, expand_project_remote, generate_session_name, install_agent,
     list_branches, list_branches_remote, list_machines, list_session_infos, luvus_binary,
-    refresh_machines,
-    split_client_socket,
+    pilus_config_dir, refresh_machines, split_client_socket,
 };
 use pilus_protocol::{
     CellData, ClientMessage, FrameData, ShellSidebars, ShellWorkspace, SurfaceInterest,
 };
-use home::{BaseMode, HomeField, HomeFocus, HomePanel};
-use palette::{Command, Entry, Palette};
-use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use projects::{ProjectField, ProjectsPanel};
 use selection::{Cell, Selection};
 use text_input::{TextField, TextInput};
@@ -94,12 +92,44 @@ const SKIPPED_DAEMON_BOTTOM_ROWS: u16 = 1;
 /// footer widgets. Assumes a single-row status line.
 /// Height of the native footer bar.
 const FOOTER_HEIGHT: f32 = 28.0;
-/// Gap around the floating terminal card, on every side.
+/// Gap around the floating terminal card: left, right, and bottom.
 const CARD_GAP: f32 = 8.0;
-/// Slides the sidebar's first row down so it lines up with the top of the
-/// inset terminal card. The list's own `gap_1` already covers the rest of the
-/// `CARD_GAP` between the header and the card.
-const SIDEBAR_TOP_INSET: f32 = 4.0;
+/// Gap between the tab strip and the card. The card hugs the header tighter
+/// than it does the other three sides, which stay at `CARD_GAP`.
+const CARD_GAP_TOP: f32 = 2.0;
+/// Slides the sidebar's first row down so it lands on the top edge of the
+/// inset terminal card: the header spacer ends at `HEADER_HEIGHT` and the
+/// card starts `CARD_GAP_TOP` below it.
+const SIDEBAR_TOP_INSET: f32 = CARD_GAP_TOP;
+/// Bottom padding of the sidebar list.
+const SIDEBAR_LIST_PAD: f32 = 12.0;
+/// Inset between the panel edge and a row's box, so a selection pill and a
+/// hover fill never kiss the window edge. The section header's chevron and
+/// add button are the two exceptions: they break the inset out to sit flush
+/// on the edge, one per side.
+const SIDEBAR_ROW_EDGE: f32 = 4.0;
+/// Inset of a row's content from its own box: before the leading glyph, and
+/// before a trailing badge, status dot, or branch.
+const SIDEBAR_ROW_PAD: f32 = 8.0;
+/// Extra inset for a row nested under another row.
+const SIDEBAR_NEST_INDENT: f32 = 16.0;
+/// Left inset for the children of a section, so rows sit under their section
+/// header's label instead of flush with its chevron.
+const SIDEBAR_CHILD_INDENT: f32 = 8.0;
+/// Box every leading sidebar glyph sits in, so labels share one column
+/// whatever the glyph is: chevron, folder, brand mark, or status dot.
+const SIDEBAR_GLYPH: f32 = 14.0;
+/// Gap between a row's leading glyph and its label.
+const SIDEBAR_GLYPH_GAP: f32 = 8.0;
+/// Height of a single-line sidebar row (nav, new workspace, project).
+const SIDEBAR_ROW_HEIGHT: f32 = 28.0;
+/// Height of a one-line band that carries no control: a section header, an
+/// endpoint group label, or an empty-state placeholder.
+const SIDEBAR_BAND_HEIGHT: f32 = 24.0;
+/// Height of a project directory, a sub-line under its project row.
+const SIDEBAR_SUBLINE_HEIGHT: f32 = 20.0;
+/// Space above a section header, on top of the list's row gap.
+const SIDEBAR_SECTION_GAP: f32 = 12.0;
 /// Breathing room between the terminal grid and the card's inset border.
 /// Opposite gaps stay equal because the whole-cell grid is centered.
 const TERMINAL_PAD: f32 = 6.0;
@@ -611,7 +641,9 @@ fn open_main_window(
         move |window, cx| {
             let signal = machine_signal.clone();
             let theme = shared_theme.clone();
-            cx.new(move |cx| PilusView::new(target, connection, settings, signal, theme, window, cx))
+            cx.new(move |cx| {
+                PilusView::new(target, connection, settings, signal, theme, window, cx)
+            })
         },
     );
     if let Err(error) = opened {
@@ -790,6 +822,25 @@ struct Endpoint {
     feed: AgentFeed,
 }
 
+/// A sidebar section header's click handler: collapse the section, or run
+/// its add action.
+type SectionAction = Box<dyn Fn(&mut PilusView, &mut Context<PilusView>)>;
+
+/// A sidebar section header's identity and its two actions. Bundling them
+/// lets every section share one header builder, so their labels stay in one
+/// column and their add buttons on one edge.
+struct SectionHeader {
+    /// Clickable chevron-and-label row.
+    id: &'static str,
+    label: &'static str,
+    collapsed: bool,
+    toggle: SectionAction,
+    /// The section's add button: its element id and its click action.
+    /// `None` when the section has nothing to add, so a control that does
+    /// nothing never shows.
+    add: Option<(&'static str, SectionAction)>,
+}
+
 /// A requested endpoint handoff waiting for its prepared frame.
 struct PendingSwitch {
     target: EndpointId,
@@ -893,10 +944,8 @@ struct PilusView {
     agent_feed: Option<AgentFeed>,
     /// State root the SESSIONS section lists, derived from the launch target.
     session_root: PathBuf,
-    /// pilus's own state directory: projects, settings, and personal workspaces.
+    /// pilus's own state directory: projects, settings, and personal sessions.
     pilus_root: PathBuf,
-    /// The directory holding personal (project-less) workspaces.
-    workspaces_root: PathBuf,
     /// Current session; `None` is the default session.
     session_name: Option<String>,
     /// Visible sessions under `session_root`.
@@ -1099,6 +1148,9 @@ struct PilusView {
     home_defaults_for: Option<String>,
     /// The model whose reasoning levels are currently in the effort picker.
     home_efforts_for: Option<String>,
+    /// A Home launch is in flight; the composer ignores a second send until it
+    /// settles, since Home stays open until the agent is ready.
+    home_launching: bool,
 }
 
 impl PilusView {
@@ -1135,7 +1187,6 @@ impl PilusView {
             None => (config_dir(), target.session.clone()),
         };
         let pilus_root = pilus_config_dir();
-        let workspaces_root = pilus_workspaces_dir();
         let agent_feed = Some(AgentFeed::spawn(api_socket_for(
             &session_root,
             session_name.as_deref(),
@@ -1200,10 +1251,42 @@ impl PilusView {
             )
         });
         let project_inputs = [
-            Self::build_project_input(cx, &projects, ProjectField::Name, "Name", &shared_settings, initial_theme, initial_fonts.body),
-            Self::build_project_input(cx, &projects, ProjectField::Repository, "Repository", &shared_settings, initial_theme, initial_fonts.body),
-            Self::build_project_input(cx, &projects, ProjectField::BranchPrefix, "Branch prefix", &shared_settings, initial_theme, initial_fonts.body),
-            Self::build_project_input(cx, &projects, ProjectField::Location, "Location", &shared_settings, initial_theme, initial_fonts.body),
+            Self::build_project_input(
+                cx,
+                &projects,
+                ProjectField::Name,
+                "Name",
+                &shared_settings,
+                initial_theme,
+                initial_fonts.body,
+            ),
+            Self::build_project_input(
+                cx,
+                &projects,
+                ProjectField::Repository,
+                "Repository",
+                &shared_settings,
+                initial_theme,
+                initial_fonts.body,
+            ),
+            Self::build_project_input(
+                cx,
+                &projects,
+                ProjectField::BranchPrefix,
+                "Branch prefix",
+                &shared_settings,
+                initial_theme,
+                initial_fonts.body,
+            ),
+            Self::build_project_input(
+                cx,
+                &projects,
+                ProjectField::Location,
+                "Location",
+                &shared_settings,
+                initial_theme,
+                initial_fonts.body,
+            ),
         ];
         let worktree_input = cx.new(|cx| {
             TextInput::from_shared(
@@ -1262,7 +1345,6 @@ impl PilusView {
             agent_feed,
             session_root,
             pilus_root,
-            workspaces_root,
             session_name,
             sessions,
             last_session_poll: Instant::now(),
@@ -1362,6 +1444,7 @@ impl PilusView {
             home_sync_key: String::new(),
             home_defaults_for: None,
             home_efforts_for: None,
+            home_launching: false,
         };
         // Seed the remembered frame from the one the window actually opened
         // with; moves and resizes update it from here on.
@@ -1695,10 +1778,19 @@ impl PilusView {
                 PickerEvent::HomeLaunched { machine, result } => {
                     match result {
                         Ok(message) => {
+                            // The agent is up and focused; only now leave the
+                            // composer, so no empty terminal flashes first.
+                            self.home_launching = false;
+                            self.home.close();
                             self.status = message;
                             self.activate_project_endpoint(machine, cx);
                         }
-                        Err(error) => self.status = format!("couldn't start the agent: {error}"),
+                        // Keep the composer up so the launch can be retried.
+                        Err(error) => {
+                            self.home_launching = false;
+                            self.home
+                                .set_status(format!("couldn't start the agent: {error}"))
+                        }
                     }
                     changed = true;
                 }
@@ -1826,11 +1918,13 @@ impl PilusView {
                         changed = true;
                     }
                     ClientEvent::Message(message) => {
-                        if let pilus_protocol::ServerMessage::MachineCatalogChanged { .. } = &message
+                        if let pilus_protocol::ServerMessage::MachineCatalogChanged { .. } =
+                            &message
                         {
                             catalog = true;
                         }
-                        if let pilus_protocol::ServerMessage::PreparedFrame { ticket, .. } = &message
+                        if let pilus_protocol::ServerMessage::PreparedFrame { ticket, .. } =
+                            &message
                             && pending.as_ref() == Some(&(id.clone(), *ticket))
                         {
                             prepared = Some(id.clone());
@@ -2819,12 +2913,7 @@ impl PilusView {
                 "Workspace",
                 Some("⌘⇧O"),
             ),
-            entry(
-                Command::OpenHome,
-                "New Agent",
-                "Application",
-                Some("⌘⇧N"),
-            ),
+            entry(Command::OpenHome, "New Agent", "Application", Some("⌘⇧N")),
             entry(
                 Command::OpenSettings,
                 "Settings",
@@ -3334,13 +3423,23 @@ impl PilusView {
         cx.notify();
     }
 
-    /// The live agent aliases, so a generated branch avoids a collision.
+    /// The live agent aliases and personal session directories, so a generated
+    /// name avoids a collision.
     fn session_names(&self) -> Vec<String> {
-        self.agents
+        let mut names: Vec<String> = self
+            .agents
             .iter()
             .map(|agent| agent.name.clone())
             .filter(|name| !name.is_empty())
-            .collect()
+            .collect();
+        names.extend(
+            std::fs::read_dir(self.pilus_root.join("sessions"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok()),
+        );
+        names
     }
 
     /// The projects the Home composer offers.
@@ -3364,12 +3463,21 @@ impl PilusView {
         }
     }
 
-    /// The installed agent the Home composer currently has highlighted.
+    /// The agent the Home composer launches.
+    ///
+    /// Home is Pi-first: when Pi is installed it is always chosen, so the
+    /// composer is a one-key launch for the one agent this client targets.
+    /// Otherwise it falls back to the highlighted catalog entry.
     fn home_agent(&self) -> Option<&AgentConfig> {
-        let label = self.home.choice(HomeField::Agent).selected()?;
         self.agent_configs
             .iter()
-            .find(|config| config.label == label)
+            .find(|config| config.kind == "pi")
+            .or_else(|| {
+                let label = self.home.choice(HomeField::Agent).selected()?;
+                self.agent_configs
+                    .iter()
+                    .find(|config| config.label == label)
+            })
     }
 
     /// The machine key backing the selected project, `local` when none.
@@ -3478,7 +3586,9 @@ impl PilusView {
         let kind = self.home_agent().map(|config| config.kind.clone());
         if kind != self.home_defaults_for {
             self.home_defaults_for = kind;
-            if let Some(default) = self.home_agent().and_then(|config| config.default_model.clone())
+            if let Some(default) = self
+                .home_agent()
+                .and_then(|config| config.default_model.clone())
                 && let Some(index) = self
                     .home
                     .choice(HomeField::Model)
@@ -3518,12 +3628,10 @@ impl PilusView {
             }
         }
 
-        let mut projects = vec!["a personal workspace".to_string()];
-        projects.extend(
-            self.home_projects()
-                .iter()
-                .map(|project| project.name.clone()),
-        );
+        let mut projects = vec!["No project".to_string()];
+        for project in self.home_projects() {
+            projects.push(project_choice_label(project, &self.machines));
+        }
         self.home.choice_mut(HomeField::Project).set(projects);
 
         self.home
@@ -3657,6 +3765,9 @@ impl PilusView {
     /// Workspace setup and the agent start share one background thread and
     /// report through the picker channel, like the project worktree action.
     fn home_send(&mut self, cx: &mut Context<Self>) {
+        if self.home_launching {
+            return;
+        }
         let prompt = self.home.prompt().value().trim().to_string();
         if prompt.is_empty() {
             self.home.set_status("Write a prompt to send.".to_string());
@@ -3686,12 +3797,19 @@ impl PilusView {
                 };
                 let location = project.location.clone();
                 let machine = project.machine.clone();
-                self.home.close();
-                self.status = format!("starting {agent}…");
+                self.home_launching = true;
+                self.home.set_status(format!("starting {agent}…"));
                 let tx = self.picker_tx.clone();
                 std::thread::spawn(move || {
-                    let result =
-                        launch_home_agent(&mut client, &location, base, &branch, &name, &agent, &prompt);
+                    let result = launch_home_agent(
+                        &mut client,
+                        &location,
+                        base,
+                        &branch,
+                        &name,
+                        &agent,
+                        &prompt,
+                    );
                     tx.send(PickerEvent::HomeLaunched { machine, result }).ok();
                 });
             }
@@ -3700,7 +3818,11 @@ impl PilusView {
         cx.notify();
     }
 
-    /// Open pilus's personal `workspaces` directory as the agent's workspace.
+    /// Create a fresh personal session directory and start the agent in it.
+    ///
+    /// With no project chosen, each session gets its own git repository under
+    /// `~/.pilus/sessions/<name>`, so the agent has an isolated tree to commit
+    /// into.
     fn launch_personal_workspace(
         &mut self,
         name: String,
@@ -3714,19 +3836,28 @@ impl PilusView {
             cx.notify();
             return;
         };
-        let dir = self.workspaces_root.clone();
-        self.home.close();
-        self.status = format!("starting {agent}…");
+        let dir = self.pilus_root.join("sessions").join(&name);
+        self.home_launching = true;
+        self.home.set_status(format!("starting {agent}…"));
         let tx = self.picker_tx.clone();
         std::thread::spawn(move || {
-            let result = std::fs::create_dir_all(&dir)
-                .map_err(|error| format!("couldn't create {}: {error}", dir.display()))
-                .and_then(|()| {
-                    let location = dir.to_string_lossy().into_owned();
-                    launch_home_agent(&mut client, &location, BaseMode::Checkout, "", &name, &agent, &prompt)
-                });
-            tx.send(PickerEvent::HomeLaunched { machine: None, result })
-                .ok();
+            let result = pilus_client::init_repository(&dir).and_then(|()| {
+                let location = dir.to_string_lossy().into_owned();
+                launch_home_agent(
+                    &mut client,
+                    &location,
+                    BaseMode::Checkout,
+                    "",
+                    &name,
+                    &agent,
+                    &prompt,
+                )
+            });
+            tx.send(PickerEvent::HomeLaunched {
+                machine: None,
+                result,
+            })
+            .ok();
         });
         cx.notify();
     }
@@ -3821,9 +3952,22 @@ impl PilusView {
     }
 
     /// The Home screen: the launch composer that fills the inset card.
+    ///
+    /// The app mark sits to the left of the card. With no project chosen the
+    /// base/branch footer is hidden, since neither applies to a fresh session
+    /// directory.
     fn home_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let status = self.home.status().to_string();
+        let mut composer = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .child(self.home_composer(cx));
+        if !self.home.project_is_none() {
+            composer = composer.child(self.home_footer(cx));
+        }
         let mut column = div()
             .flex()
             .flex_col()
@@ -3831,15 +3975,15 @@ impl PilusView {
             .gap_4()
             .w_full()
             .max_w(px(720.0))
-            .child(self.home_mark())
-            .child(self.home_headline(cx))
             .child(
                 div()
                     .flex()
-                    .flex_col()
+                    .flex_row()
+                    .items_start()
+                    .gap_3()
                     .w_full()
-                    .child(self.home_composer(cx))
-                    .child(self.home_footer(cx)),
+                    .child(self.home_mark())
+                    .child(composer),
             );
         if !status.is_empty() {
             column = column.child(
@@ -3863,56 +4007,6 @@ impl PilusView {
             .px_6()
             .py_8()
             .child(column)
-    }
-
-    /// The headline above the composer, naming the launch target inline.
-    fn home_headline(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .text_size(px(style::scaled(&self.shared_settings, 18.0)))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(theme.fg)
-            .child("What should we build next in")
-            .child(self.home_headline_project(cx))
-    }
-
-    /// The project picker embedded in the headline.
-    ///
-    /// A secondary button, so it reads as the one clickable target in the
-    /// sentence.
-    fn home_headline_project(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let open = self.home.dropdown() == Some(HomeField::Project);
-        let value = self
-            .home
-            .choice(HomeField::Project)
-            .selected()
-            .unwrap_or_default()
-            .to_string();
-        let mut picker = style::small_button(
-            "pilus-home-headline-project",
-            div().max_w(px(320.0)).truncate().child(value),
-            style::ButtonKind::Secondary,
-            theme,
-            self.footer_font(),
-        )
-        .relative()
-        .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(HomeField::Project, cx)))
-        .child(icon(
-            include_bytes!("../../assets/icons/chevron-down.svg"),
-            14.0,
-            theme.muted,
-        ));
-        if open {
-            picker = picker.child(self.home_dropdown_anchor(HomeField::Project, cx));
-        }
-        picker
     }
 
     /// The compact footer: the base picker on the left, the branch on the
@@ -3966,7 +4060,7 @@ impl PilusView {
         self.home_picker_face(HomeField::Branch, leading, value, cx)
     }
 
-    /// The app icon above the headline, falling back to the wordmark.
+    /// The app mark to the left of the composer, falling back to the wordmark.
     fn home_mark(&self) -> AnyElement {
         let theme = self.theme;
         match about::app_icon() {
@@ -3984,15 +4078,19 @@ impl PilusView {
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let entity = self.home_prompt.clone();
         entity.update(cx, |input, _| {
-            input.set_style(self.theme, style::chrome_font(&self.shared_settings), px(fonts.body));
+            input.set_style(
+                self.theme,
+                style::chrome_font(&self.shared_settings),
+                px(fonts.body),
+            );
         });
         div()
             .id("pilus-home-prompt")
             .flex()
             .flex_col()
-            .min_h(px(112.0))
+            .min_h(px(84.0))
             .px_4()
-            .pt_4()
+            .pt_3()
             .pb(px(0.0))
             .text_size(px(style::scaled(&self.shared_settings, 15.0)))
             .cursor_pointer()
@@ -4032,7 +4130,8 @@ impl PilusView {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .px_4()
+                    .pl_4()
+                    .pr_2()
                     .pt_2()
                     .pb_2()
                     .child(
@@ -4041,7 +4140,7 @@ impl PilusView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(self.home_chip(HomeField::Agent, cx))
+                            .child(self.home_chip(HomeField::Project, cx))
                             .child(self.home_chip(HomeField::Model, cx))
                             .child(self.home_chip(HomeField::Effort, cx)),
                     )
@@ -4064,28 +4163,25 @@ impl PilusView {
     /// The icon-only circular send button.
     fn home_send_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        div()
-            .pt_2()
-            .pb_2()
-            .child(
-                div()
-                    .id("pilus-home-send")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(30.0))
-                    .h(px(30.0))
-                    .rounded_full()
-                    .bg(theme.panel)
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(theme.border))
-                    .on_click(cx.listener(|this, _, _, cx| this.home_send(cx)))
-                    .child(icon(
-                        include_bytes!("../../assets/icons/arrow-up.svg"),
-                        15.0,
-                        theme.fg,
-                    )),
-            )
+        div().child(
+            div()
+                .id("pilus-home-send")
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(30.0))
+                .h(px(30.0))
+                .rounded_full()
+                .bg(theme.panel)
+                .cursor_pointer()
+                .hover(move |style| style.bg(theme.border))
+                .on_click(cx.listener(|this, _, _, cx| this.home_send(cx)))
+                .child(icon(
+                    include_bytes!("../../assets/icons/arrow-up.svg"),
+                    15.0,
+                    theme.fg,
+                )),
+        )
     }
 
     /// The fill color of a picker's leading glyph, brighter while its
@@ -4164,16 +4260,22 @@ impl PilusView {
             .cursor_pointer()
             .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(field, cx)));
+        let value_width = if field == HomeField::Project {
+            220.0
+        } else {
+            180.0
+        };
+        let mut value_div = div()
+            .max_w(px(value_width))
+            .truncate()
+            .text_size(px(self.footer_font()))
+            .text_color(fg);
+        if field == HomeField::Branch {
+            value_div = value_div.font_family(style::mono_family(&self.shared_settings));
+        }
         let mut face = face
             .child(leading)
-            .child(
-                div()
-                    .max_w(px(180.0))
-                    .truncate()
-                    .text_size(px(self.footer_font()))
-                    .text_color(fg)
-                    .child(value),
-            )
+            .child(value_div.child(value))
             .child(icon(
                 include_bytes!("../../assets/icons/chevron-down.svg"),
                 12.0,
@@ -4270,32 +4372,33 @@ impl PilusView {
         for index in matches.into_iter().take(MAX_ROWS) {
             let active = index == cursor;
             let option = options.get(index).cloned().unwrap_or_default();
-            list = list.child(
-                div()
-                    .id(format!("pilus-home-option-{index}"))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(px(30.0))
-                    .px_3()
-                    .rounded_md()
-                    .bg(if active { theme.panel } else { theme.bg })
-                    .text_color(theme.panel_fg)
-                    .font_weight(if active {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .text_size(px(self.chrome_font()))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(theme.panel))
-                    .child(option)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.home.choose_dropdown(index);
-                        this.home.close_dropdown();
-                        cx.notify();
-                    })),
-            );
+            let mut row = div()
+                .id(format!("pilus-home-option-{index}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(30.0))
+                .px_3()
+                .rounded_md()
+                .bg(if active { theme.panel } else { theme.bg })
+                .text_color(theme.panel_fg)
+                .font_weight(if active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_size(px(self.chrome_font()))
+                .cursor_pointer()
+                .hover(move |style| style.bg(theme.panel))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.home.choose_dropdown(index);
+                    this.home.close_dropdown();
+                    cx.notify();
+                }));
+            if field == HomeField::Branch {
+                row = row.font_family(style::mono_family(&self.shared_settings));
+            }
+            list = list.child(row.child(option));
         }
         if total > MAX_ROWS {
             list = list.child(
@@ -4664,9 +4767,7 @@ impl PilusView {
                     .items_center()
                     .justify_between()
                     .px_3()
-                    .child(
-                        style::section_label(theme, "PROJECTS", self.section_font()),
-                    )
+                    .child(style::section_label(theme, "PROJECTS", self.section_font()))
                     .child(new_button),
             )
             .child(self.projects_list(cx))
@@ -4685,9 +4786,11 @@ impl PilusView {
                 .items_center()
                 .justify_between()
                 .px_3()
-                .child(
-                    style::section_label(theme, "AGENT CONFIG", self.section_font()),
-                )
+                .child(style::section_label(
+                    theme,
+                    "AGENT CONFIG",
+                    self.section_font(),
+                ))
                 .child(
                     style::small_button(
                         "pilus-agents-refresh",
@@ -4711,7 +4814,11 @@ impl PilusView {
                 }
             }
             Some(_) | None if loading => {
-                section = section.child(agent_config_empty(theme, "Detecting agents…", self.footer_font()));
+                section = section.child(agent_config_empty(
+                    theme,
+                    "Detecting agents…",
+                    self.footer_font(),
+                ));
             }
             Some(_) | None => {
                 section = section.child(agent_config_empty(
@@ -4968,9 +5075,11 @@ impl PilusView {
                 .items_center()
                 .justify_between()
                 .px_3()
-                .child(
-                    style::section_label(theme, "REMOTE MACHINES", self.section_font()),
-                )
+                .child(style::section_label(
+                    theme,
+                    "REMOTE MACHINES",
+                    self.section_font(),
+                ))
                 .child(
                     style::small_button(
                         "pilus-machines-manage",
@@ -5177,7 +5286,12 @@ impl PilusView {
         if self.machine_busy.is_some() {
             return;
         }
-        let Some(machine) = self.machines.iter().find(|machine| machine.id == id).cloned() else {
+        let Some(machine) = self
+            .machines
+            .iter()
+            .find(|machine| machine.id == id)
+            .cloned()
+        else {
             return;
         };
         self.machine_pending_remove = None;
@@ -5339,6 +5453,7 @@ impl PilusView {
             )
             .child(
                 div()
+                    .font_family(style::mono_family(&self.shared_settings))
                     .text_size(px(self.section_font()))
                     .text_color(theme.muted)
                     .child(shorten_home(&project.location)),
@@ -5431,6 +5546,7 @@ impl PilusView {
             let branch = match branch {
                 Some(branch) => div()
                     .flex_shrink_0()
+                    .font_family(style::mono_family(&self.shared_settings))
                     .text_size(px(self.section_font()))
                     .text_color(theme.branch)
                     .child(branch),
@@ -5438,7 +5554,10 @@ impl PilusView {
             };
             list = list.child(
                 div()
-                    .id(format!("pilus-projects-member-{}-{workspace_id}", project.id))
+                    .id(format!(
+                        "pilus-projects-member-{}-{workspace_id}",
+                        project.id
+                    ))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -5761,9 +5880,7 @@ impl PilusView {
             .flex()
             .flex_col()
             .gap_3()
-            .child(
-                style::section_label(theme, "UPDATES", self.section_font()).px_3(),
-            )
+            .child(style::section_label(theme, "UPDATES", self.section_font()).px_3())
             .child(
                 div()
                     .flex()
@@ -5831,18 +5948,18 @@ impl PilusView {
                             )
                             .flex_shrink_0()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                    this.check_for_updates(cx);
-                                    // Surface the result live (progress, up-to-date,
-                                    // or retry) instead of only the footer badge.
-                                    if !update_window::is_open(cx) {
-                                        update_window::open(
-                                            this.updater.clone(),
-                                            this.theme,
-                                            this.shared_settings.clone(),
-                                            cx,
-                                        );
-                                    }
-                                })),
+                                this.check_for_updates(cx);
+                                // Surface the result live (progress, up-to-date,
+                                // or retry) instead of only the footer badge.
+                                if !update_window::is_open(cx) {
+                                    update_window::open(
+                                        this.updater.clone(),
+                                        this.theme,
+                                        this.shared_settings.clone(),
+                                        cx,
+                                    );
+                                }
+                            })),
                         ),
                     ),
             )
@@ -5902,13 +6019,25 @@ impl PilusView {
         let picker_path = self.picker_path.clone();
         picker_path.update(cx, |input, _| {
             let fonts = style::Fonts::resolve(&self.shared_settings);
-            input.set_style(self.theme, style::chrome_font(&self.shared_settings), px(fonts.body));
+            input.set_style(
+                self.theme,
+                style::chrome_font(&self.shared_settings),
+                px(fonts.body),
+            );
         });
-        let line = div().flex().flex_row().items_center().flex_1().child(if editing {
-            picker_path.into_any_element()
-        } else {
-            div().text_color(theme.fg).child(cwd.clone()).into_any_element()
-        });
+        let line = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_1()
+            .child(if editing {
+                picker_path.into_any_element()
+            } else {
+                div()
+                    .text_color(theme.fg)
+                    .child(cwd.clone())
+                    .into_any_element()
+            });
         let path_field = div()
             .id("pilus-picker-path")
             .flex()
@@ -6956,13 +7085,15 @@ impl PilusView {
         // The scroll container stays a plain block. Making it a flex column
         // lets its children shrink to fit, which squeezes the nav rows; the
         // inner content carries the flex layout so it overflows and scrolls.
+        // It insets by `SIDEBAR_ROW_EDGE` only, so every row is one hair off
+        // the panel edge and insets its own content from there.
         let mut content = div()
             .flex()
             .flex_col()
             .gap_1()
-            .px_3()
+            .px(px(SIDEBAR_ROW_EDGE))
             .pt(px(SIDEBAR_TOP_INSET))
-            .pb_3();
+            .pb(px(SIDEBAR_LIST_PAD));
 
         content = content.child(self.new_workspace_row(cx));
         for kind in NavKind::ALL {
@@ -7427,6 +7558,7 @@ impl PilusView {
                     )
                     .child(
                         div()
+                            .font_family(style::mono_family(&self.shared_settings))
                             .text_color(theme.muted)
                             .child(truncate_label(&self.crumb_path(), 48)),
                     )
@@ -7745,50 +7877,42 @@ impl PilusView {
             .min_w_0()
             .text_size(px(self.chrome_font()));
         if !compact {
+            // Every leading glyph wears the shared box, so the workspace name
+            // lands on the same column as the nav and agent labels.
+            let glyph = |bytes: &'static [u8], size: f32, color: gpui::Rgba| {
+                div()
+                    .w(px(SIDEBAR_GLYPH))
+                    .flex_shrink_0()
+                    .child(icon(bytes, size, color))
+            };
             head = head.child(if workspace.nested {
-                icon(
+                glyph(
                     include_bytes!("../../assets/icons/circle.svg"),
                     10.0,
                     theme.muted,
                 )
             } else if remote {
-                icon(
+                glyph(
                     include_bytes!("../../assets/icons/server.svg"),
-                    14.0,
+                    SIDEBAR_GLYPH,
                     theme.muted,
                 )
             } else {
-                icon(
+                glyph(
                     include_bytes!("../../assets/icons/folder.svg"),
-                    14.0,
+                    SIDEBAR_GLYPH,
                     theme.panel_fg,
                 )
             });
         }
-        let mut name = div()
+        // The name owns the first line. A badge here would have to take
+        // space away from it, and a label never loses to its own decoration.
+        let name = div()
             .flex_1()
             .min_w_0()
             .truncate()
             .text_color(theme.panel_fg);
-        if active {
-            name = name.font_weight(FontWeight::BOLD);
-        }
         head = head.child(name.child(workspace.name.clone()));
-        // The branch stays subtle here; the prompt line below carries the
-        // color. Compact (nested) rows skip the badge: the tooltip still
-        // names the branch.
-        if !compact
-            && !workspace.nested
-            && let Some(branch) = workspace.branch.clone()
-        {
-            head = head.child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(self.section_font()))
-                    .text_color(theme.branch)
-                    .child(branch),
-            );
-        }
         if let Some(host) = host {
             head = head.child(
                 div()
@@ -7799,6 +7923,36 @@ impl PilusView {
             );
         }
 
+        // Second line: the path grows and truncates; the branch rides at the
+        // far right, where it competes with the path instead of the name.
+        // A branch repeating the workspace's own name is dropped: it is the
+        // label twice, and the path would pay for it. Nested rows skip it as
+        // well — the tooltip still names it.
+        let mut sub = div().flex().flex_row().items_center().gap_2().min_w_0();
+        sub = sub.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family(style::mono_family(&self.shared_settings))
+                .text_size(px(self.section_font()))
+                .text_color(theme.muted)
+                .child(cwd),
+        );
+        if !compact
+            && !workspace.nested
+            && let Some(branch) = workspace.branch.clone()
+            && branch != workspace.name
+        {
+            sub = sub.child(
+                div()
+                    .flex_shrink_0()
+                    .font_family(style::mono_family(&self.shared_settings))
+                    .text_size(px(self.section_font()))
+                    .text_color(theme.branch)
+                    .child(branch),
+            );
+        }
         let mut row = div()
             .id(format!(
                 "pilus-workspace-{}-{}",
@@ -7809,7 +7963,9 @@ impl PilusView {
             .flex_col()
             .justify_center()
             .gap_1()
-            .px_2()
+            .pl(px(SIDEBAR_ROW_PAD))
+            // The branch and host badges keep the row's content inset.
+            .pr(px(SIDEBAR_ROW_PAD))
             .py_1()
             .rounded_md()
             .bg(bg)
@@ -7817,16 +7973,9 @@ impl PilusView {
             .hover(|style| style.bg(theme.panel))
             .tooltip(tip)
             .child(head)
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(self.section_font()))
-                    .text_color(theme.muted)
-                    .child(cwd),
-            );
+            .child(sub);
         if workspace.nested {
-            row = row.pl(px(18.0));
+            row = row.pl(px(SIDEBAR_ROW_PAD + SIDEBAR_NEST_INDENT));
         }
         let workspace_id = workspace.id.clone();
         let endpoint = endpoint.clone();
@@ -7901,11 +8050,10 @@ impl PilusView {
             .flex()
             .flex_row()
             .items_center()
-            .gap_3()
-            .h(px(28.0))
-            .pl_2()
-            // Match the nav rows: let the label reach the panel edge.
-            .mr(px(-12.0))
+            .gap(px(SIDEBAR_GLYPH_GAP))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .pl(px(SIDEBAR_ROW_PAD))
+            .pr(px(SIDEBAR_ROW_PAD))
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
@@ -7914,7 +8062,7 @@ impl PilusView {
             .hover(|style| style.bg(theme.panel))
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
-                15.0,
+                SIDEBAR_GLYPH,
                 theme.muted,
             ))
             .child(div().flex_1().child("New Workspace"))
@@ -7956,18 +8104,19 @@ impl PilusView {
             .flex()
             .flex_row()
             .items_center()
-            .gap_3()
-            .h(px(28.0))
-            .pl_2()
-            // Match the workspace add button: let the badge reach the panel edge.
-            .mr(px(-12.0))
+            .gap(px(SIDEBAR_GLYPH_GAP))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .pl(px(SIDEBAR_ROW_PAD))
+            // The badge keeps the row's content inset, so it reads as a
+            // column rather than a number touching the panel edge.
+            .pr(px(SIDEBAR_ROW_PAD))
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .bg(bg)
             .text_color(theme.panel_fg)
             .hover(|style| style.bg(theme.panel))
-            .child(icon(kind.icon(), 15.0, theme.muted))
+            .child(icon(kind.icon(), SIDEBAR_GLYPH, theme.muted))
             .child(label.child(kind.label().to_string()))
             .child(badge)
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -8001,83 +8150,130 @@ impl PilusView {
     /// instead of in WORKSPACES, so one project reads as one unit of work.
     fn projects_section(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .h(px(22.0))
-                .pl_2()
-                .mr(px(-12.0))
-                .child(
-                    div()
-                        .id("pilus-projects-toggle")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .flex_1()
-                        .cursor_pointer()
-                        .text_size(px(self.section_font()))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.muted)
-                        .hover(|style| style.text_color(theme.panel_fg))
-                        .child(icon(
-                            if self.projects_collapsed {
-                                include_bytes!("../../assets/icons/chevron-right.svg")
-                            } else {
-                                include_bytes!("../../assets/icons/chevron-down.svg")
-                            },
-                            12.0,
-                            theme.muted,
-                        ))
-                        .child("PROJECTS")
-                        .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border()))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.projects_collapsed = !this.projects_collapsed;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    div()
-                        .id("pilus-manage-projects")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(22.0))
-                        .w(px(22.0))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme.panel))
-                        .child(icon(
-                            include_bytes!("../../assets/icons/plus.svg"),
-                            11.0,
-                            theme.muted,
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.open_settings(cx);
-                        })),
-                ),
-        );
+        let section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pt(px(SIDEBAR_SECTION_GAP))
+            .child(self.section_header(
+                SectionHeader {
+                    id: "pilus-projects-toggle",
+                    label: "PROJECTS",
+                    collapsed: self.projects_collapsed,
+                    toggle: Box::new(|this, cx| {
+                        this.projects_collapsed = !this.projects_collapsed;
+                        cx.notify();
+                    }),
+                    add: Some((
+                        "pilus-manage-projects",
+                        Box::new(|this, cx| this.open_settings(cx)),
+                    )),
+                },
+                cx,
+            ));
         if self.projects_collapsed {
             return section;
         }
+        let mut children = div().flex().flex_col().gap_1().pl(px(SIDEBAR_CHILD_INDENT));
         if self.projects.projects().is_empty() {
-            section = section.child(
+            children = children.child(
                 div()
-                    .h(px(26.0))
-                    .px_2()
+                    .flex()
+                    .items_center()
+                    .h(px(SIDEBAR_BAND_HEIGHT))
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
                     .child("No projects yet"),
             );
         }
         for project in self.projects.projects() {
-            section = section.child(self.project_row(project, cx));
+            children = children.child(self.project_row(project, cx));
         }
-        section
+        section.child(children)
+    }
+
+    /// One sidebar section header: collapse chevron, label, hairline, and —
+    /// when the section has one — its add button.
+    ///
+    /// Every section draws through this, so their labels share one column and
+    /// their buttons one edge; the header is a band, not a control, so it
+    /// takes `SIDEBAR_BAND_HEIGHT`.
+    fn section_header(&self, spec: SectionHeader, cx: &mut Context<Self>) -> Div {
+        let SectionHeader {
+            id,
+            label,
+            collapsed,
+            toggle,
+            add,
+        } = spec;
+        let theme = self.theme;
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(SIDEBAR_BAND_HEIGHT))
+            // The add button is the one element that touches the panel edge,
+            // so it breaks out of the row inset; the toggle stays on the row
+            // glyph column, which keeps the chevron beside its label.
+            .mr(px(-SIDEBAR_ROW_EDGE))
+            .child(
+                div()
+                    .id(id)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(SIDEBAR_GLYPH_GAP))
+                    .pl(px(SIDEBAR_ROW_PAD))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .cursor_pointer()
+                    .text_size(px(self.section_font()))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.muted)
+                    .hover(|style| style.text_color(theme.panel_fg))
+                    // The chevron wears the shared glyph box, so it lines up
+                    // with the rows' leading icons.
+                    .child(div().w(px(SIDEBAR_GLYPH)).flex_shrink_0().child(icon(
+                        if collapsed {
+                            include_bytes!("../../assets/icons/chevron-right.svg")
+                        } else {
+                            include_bytes!("../../assets/icons/chevron-down.svg")
+                        },
+                        12.0,
+                        theme.muted,
+                    )))
+                    .child(label)
+                    .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border()))
+                    .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
+            );
+        // A section with nothing to add shows no button: a control that does
+        // nothing is worse than one that is missing.
+        let Some((add_id, add)) = add else {
+            return header;
+        };
+        header.child(
+            div()
+                .id(add_id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(SIDEBAR_BAND_HEIGHT))
+                .w(px(SIDEBAR_BAND_HEIGHT))
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.panel))
+                .child(icon(
+                    include_bytes!("../../assets/icons/plus.svg"),
+                    11.0,
+                    theme.muted,
+                ))
+                // The button sits beside the toggle, never inside it.
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    add(this, cx);
+                })),
+        )
     }
 
     /// One project row with its grouped workspaces nested beneath it.
@@ -8111,9 +8307,10 @@ impl PilusView {
             .flex()
             .flex_row()
             .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
+            .gap(px(SIDEBAR_GLYPH_GAP))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .pl(px(SIDEBAR_ROW_PAD))
+            .pr(px(SIDEBAR_ROW_PAD))
             .rounded_md()
             .bg(if active { theme.panel } else { theme.window_bg })
             .cursor_pointer()
@@ -8123,8 +8320,8 @@ impl PilusView {
             .child(
                 div()
                     .relative()
-                    .w(px(12.0))
-                    .h(px(12.0))
+                    .w(px(SIDEBAR_GLYPH))
+                    .h(px(SIDEBAR_GLYPH))
                     .flex_shrink_0()
                     .child(
                         div()
@@ -8162,11 +8359,6 @@ impl PilusView {
                     .truncate()
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.panel_fg)
-                    .font_weight(if active {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
                     .child(project.name.clone()),
             )
             .child(
@@ -8189,6 +8381,11 @@ impl PilusView {
         // marks it clickable. The project tip lives on the header above.
         let sub = div()
             .id(format!("pilus-project-open-{}", project.id))
+            .flex()
+            .items_center()
+            .h(px(SIDEBAR_SUBLINE_HEIGHT))
+            .pl(px(SIDEBAR_ROW_PAD))
+            .pr(px(SIDEBAR_ROW_PAD))
             .rounded_md()
             .cursor_pointer()
             .hover(|style| style.bg(theme.panel))
@@ -8196,8 +8393,7 @@ impl PilusView {
                 div()
                     .min_w_0()
                     .truncate()
-                    .pl(px(8.0))
-                    .py(px(2.0))
+                    .font_family(style::mono_family(&self.shared_settings))
                     .text_size(px(self.section_font()))
                     .text_color(theme.muted)
                     .child(location),
@@ -8224,12 +8420,21 @@ impl PilusView {
                         .flex()
                         .flex_row()
                         .items_start()
-                        .pl(px(8.0))
-                        .child(div().w(px(14.0)).flex_shrink_0().pt(px(7.0)).child(icon(
-                            include_bytes!("../../assets/icons/corner-down-right.svg"),
-                            12.0,
-                            theme.muted,
-                        )))
+                        // One indent step, the same one a daemon-marked
+                        // nested workspace takes, so both nesting styles land
+                        // their labels on the same column.
+                        .pl(px(SIDEBAR_ROW_PAD + SIDEBAR_NEST_INDENT))
+                        .child(
+                            div()
+                                .w(px(SIDEBAR_GLYPH))
+                                .flex_shrink_0()
+                                .pt(px(7.0))
+                                .child(icon(
+                                    include_bytes!("../../assets/icons/corner-down-right.svg"),
+                                    12.0,
+                                    theme.muted,
+                                )),
+                        )
                         .child(
                             div()
                                 .flex_1()
@@ -8434,72 +8639,34 @@ impl PilusView {
     /// WORKSPACES: every open workspace not grouped under a project.
     fn workspaces_section(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .h(px(22.0))
-                .pl_2()
-                // Cancel the sidebar list's right inset so the add button sits
-                // flush on the panel edge.
-                .mr(px(-12.0))
-                .child(
-                    div()
-                        .id("pilus-workspaces-toggle")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .flex_1()
-                        .cursor_pointer()
-                        .text_size(px(self.section_font()))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.muted)
-                        .hover(|style| style.text_color(theme.panel_fg))
-                        .child(icon(
-                            if self.workspaces_collapsed {
-                                include_bytes!("../../assets/icons/chevron-right.svg")
-                            } else {
-                                include_bytes!("../../assets/icons/chevron-down.svg")
-                            },
-                            12.0,
-                            theme.muted,
-                        ))
-                        .child("WORKSPACES")
-                        .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border()))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.workspaces_collapsed = !this.workspaces_collapsed;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    div()
-                        .id("pilus-add-workspace")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(22.0))
-                        .w(px(22.0))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme.panel))
-                        .child(icon(
-                            include_bytes!("../../assets/icons/plus.svg"),
-                            11.0,
-                            theme.muted,
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
+        let section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pt(px(SIDEBAR_SECTION_GAP))
+            .child(self.section_header(
+                SectionHeader {
+                    id: "pilus-workspaces-toggle",
+                    label: "WORKSPACES",
+                    collapsed: self.workspaces_collapsed,
+                    toggle: Box::new(|this, cx| {
+                        this.workspaces_collapsed = !this.workspaces_collapsed;
+                        cx.notify();
+                    }),
+                    add: Some((
+                        "pilus-add-workspace",
+                        Box::new(|this, cx| {
                             this.leave_settings_page();
                             this.open_picker(cx);
-                        })),
-                ),
-        );
+                        }),
+                    )),
+                },
+                cx,
+            ));
         if self.workspaces_collapsed {
             return section;
         }
+        let mut children = div().flex().flex_col().gap_1().pl(px(SIDEBAR_CHILD_INDENT));
         let mut any = false;
         for id in self.connected_endpoints() {
             let host = id.machine_id().map(|_| self.endpoint_label(&id));
@@ -8513,21 +8680,22 @@ impl PilusView {
                     continue;
                 }
                 any = true;
-                section =
-                    section.child(self.workspace_row(&id, workspace, host.as_deref(), false, cx));
+                children =
+                    children.child(self.workspace_row(&id, workspace, host.as_deref(), false, cx));
             }
         }
         if !any {
-            return section.child(
+            children = children.child(
                 div()
-                    .h(px(26.0))
-                    .px_2()
+                    .flex()
+                    .items_center()
+                    .h(px(SIDEBAR_BAND_HEIGHT))
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
                     .child("No workspaces yet"),
             );
         }
-        section
+        section.child(children)
     }
 
     /// The display label for an endpoint.
@@ -8547,70 +8715,29 @@ impl PilusView {
     /// its pane, activating the owning endpoint first when it is hidden.
     fn agents_section(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let mut section = div().flex().flex_col().gap_1().pt(px(12.0)).child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .h(px(22.0))
-                .pl_2()
-                .mr(px(-12.0))
-                .child(
-                    div()
-                        .id("pilus-agents-toggle")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .flex_1()
-                        .cursor_pointer()
-                        .text_size(px(self.section_font()))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.muted)
-                        .hover(|style| style.text_color(theme.panel_fg))
-                        .child(icon(
-                            if self.agents_collapsed {
-                                include_bytes!("../../assets/icons/chevron-right.svg")
-                            } else {
-                                include_bytes!("../../assets/icons/chevron-down.svg")
-                            },
-                            12.0,
-                            theme.muted,
-                        ))
-                        .child("AGENTS")
-                        .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border()))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.agents_collapsed = !this.agents_collapsed;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    div()
-                        .id("pilus-add-agent")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(22.0))
-                        .w(px(22.0))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme.panel))
-                        .child(icon(
-                            include_bytes!("../../assets/icons/plus.svg"),
-                            11.0,
-                            theme.muted,
-                        ))
-                        // Noop for now; a future section will start agents here.
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            cx.stop_propagation();
-                            cx.notify();
-                        })),
-                ),
-        );
+        let section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pt(px(SIDEBAR_SECTION_GAP))
+            .child(self.section_header(
+                SectionHeader {
+                    id: "pilus-agents-toggle",
+                    label: "AGENTS",
+                    collapsed: self.agents_collapsed,
+                    toggle: Box::new(|this, cx| {
+                        this.agents_collapsed = !this.agents_collapsed;
+                        cx.notify();
+                    }),
+                    // No add action yet; a future one starts agents here.
+                    add: None,
+                },
+                cx,
+            ));
         if self.agents_collapsed {
             return section;
         }
+        let mut children = div().flex().flex_col().gap_1().pl(px(SIDEBAR_CHILD_INDENT));
         let mut any = false;
         for id in self.connected_endpoints() {
             let agents = self.endpoint_agents(&id);
@@ -8618,37 +8745,36 @@ impl PilusView {
                 continue;
             }
             any = true;
-            section = section.child(
+            children = children.child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .h(px(22.0))
-                    .px_2()
-                    .pt(px(2.0))
+                    .h(px(SIDEBAR_BAND_HEIGHT))
                     .text_size(px(self.section_font()))
                     .text_color(theme.muted)
                     .child(self.endpoint_label(&id)),
             );
             for agent in agents {
-                section = section.child(self.agent_row(&id, agent, cx));
+                children = children.child(self.agent_row(&id, agent, cx));
             }
         }
-        if any {
-            return section;
+        if !any {
+            children = children.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(SIDEBAR_BAND_HEIGHT))
+                    .text_size(px(self.chrome_font()))
+                    .text_color(theme.muted)
+                    .child("No agents"),
+            );
         }
-        section.child(
-            div()
-                .h(px(26.0))
-                .px_2()
-                .text_size(px(self.chrome_font()))
-                .text_color(theme.muted)
-                .child("No agents"),
-        )
+        section.child(children)
     }
 
-    /// One agent row: the agent and its label on the first line, the workspace
-    /// and working directory on the second. The brand mark is tinted by status.
+    /// One agent row: the agent and its label on the first line, the working
+    /// directory and branch on the second. The brand mark is tinted by status.
     /// Clicking focuses its pane on its owning endpoint.
     fn agent_row(
         &self,
@@ -8660,7 +8786,11 @@ impl PilusView {
         let focused = self.agent_focused(endpoint, agent);
         // The focused row borrows the workspace/worktree pill, so a selected
         // agent reads like a selected workspace instead of a text selection.
-        let bg = if focused { theme.panel } else { theme.window_bg };
+        let bg = if focused {
+            theme.panel
+        } else {
+            theme.window_bg
+        };
         let fg = theme.panel_fg;
         let dim = theme.muted;
         let status = status_color(&agent.status, theme);
@@ -8688,7 +8818,9 @@ impl PilusView {
             .flex_col()
             .justify_center()
             .gap_1()
-            .px_2()
+            .pl(px(SIDEBAR_ROW_PAD))
+            // The status dot and branch keep the row's content inset.
+            .pr(px(SIDEBAR_ROW_PAD))
             .py_1()
             .rounded_md()
             .bg(bg)
@@ -8700,21 +8832,20 @@ impl PilusView {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
+                    .gap(px(SIDEBAR_GLYPH_GAP))
                     .min_w_0()
                     .text_size(px(self.chrome_font()))
-                    .child(icon(agent_icon(&agent.agent), 12.0, fg))
+                    .child(div().w(px(SIDEBAR_GLYPH)).flex_shrink_0().child(icon(
+                        agent_icon(&agent.agent),
+                        12.0,
+                        fg,
+                    )))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
                             .text_color(fg)
-                            .font_weight(if focused {
-                                FontWeight::BOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
                             .child(label),
                     )
                     .child(
@@ -8731,21 +8862,31 @@ impl PilusView {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
+                    .gap(px(SIDEBAR_GLYPH_GAP))
                     .min_w_0()
                     .text_size(px(self.section_font()))
                     .text_color(dim)
+                    // The path wins the line: workspace, path, and branch
+                    // never fit together, and a lone ellipsis in the middle
+                    // of the row reads as a glitch. The label above already
+                    // names the agent; the workspace stays in the tooltip.
                     .child(
                         div()
-                            .flex_shrink_1()
+                            .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(agent.workspace_name.clone()),
+                            .font_family(style::mono_family(&self.shared_settings))
+                            .child(cwd),
                     )
-                    .child(div().flex_1().min_w_0().truncate().child(cwd))
                     .child(match branch {
-                        Some(branch) => div().flex_shrink_0().text_color(theme.ok).child(branch),
-                        None => div(),
+                        // A branch repeating the label above is the label
+                        // twice; the path keeps the room instead.
+                        Some(branch) if branch != agent.label() => div()
+                            .flex_shrink_0()
+                            .font_family(style::mono_family(&self.shared_settings))
+                            .text_color(theme.ok)
+                            .child(branch),
+                        _ => div(),
                     }),
             )
             .on_mouse_down(
@@ -8770,8 +8911,12 @@ impl PilusView {
         // The card's inner box: inside the hairline border, before the grid's
         // own breathing room.
         let inner_w = f32::from(viewport.width) - card_x - CARD_GAP_RIGHT - 2.0;
-        let inner_h =
-            f32::from(viewport.height) - HEADER_HEIGHT - FOOTER_HEIGHT - CARD_GAP - CARD_GAP - 2.0;
+        let inner_h = f32::from(viewport.height)
+            - HEADER_HEIGHT
+            - FOOTER_HEIGHT
+            - CARD_GAP_TOP
+            - CARD_GAP
+            - 2.0;
         let cols = ((inner_w - 2.0 * TERMINAL_PAD) / cell_w).clamp(20.0, 500.0) as u16;
         let rows = ((inner_h - 2.0 * TERMINAL_PAD) / cell_h).clamp(5.0, 300.0) as u16;
         // Center the whole-cell grid in the inner box so opposite gaps match;
@@ -8784,7 +8929,7 @@ impl PilusView {
             pad_x,
             pad_y,
             origin_x: card_x + 1.0 + pad_x,
-            origin_y: HEADER_HEIGHT + CARD_GAP + 1.0 + pad_y,
+            origin_y: HEADER_HEIGHT + CARD_GAP_TOP + 1.0 + pad_y,
             cols,
             rows,
             cell_w,
@@ -8968,9 +9113,11 @@ impl Render for PilusView {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx);
             }))
-            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _window, _cx| {
-                this.control_held = event.modifiers.control;
-            }))
+            .on_modifiers_changed(cx.listener(
+                |this, event: &ModifiersChangedEvent, _window, _cx| {
+                    this.control_held = event.modifiers.control;
+                },
+            ))
             .on_action(cx.listener(|this, _: &CopySelection, _window, cx| {
                 this.copy_selection(cx);
             }))
@@ -9051,7 +9198,7 @@ impl Render for PilusView {
                         // Content already starts below the header spacer, so the
                         // top is just the gap (counting HEADER_HEIGHT twice
                         // pushes the whole grid down and clips its bottom).
-                        .top(px(CARD_GAP))
+                        .top(px(CARD_GAP_TOP))
                         .right(px(CARD_GAP_RIGHT))
                         // Fixed bottom: any floor slack stays inside the card
                         // on the grid's own background, invisible.
@@ -9712,6 +9859,19 @@ fn remove_dock(side: &mut pilus_protocol::SideConfig, name: &str) {
 /// land first; both run in one background thread in the caller. The model and
 /// effort pickers are captured in the UI but not forwarded yet: their flags
 /// differ per agent manifest, so forwarding them blindly would fail launches.
+/// The label a project reads as in the Home picker: its name, plus the
+/// machine's display name when the project lives on a saved machine.
+fn project_choice_label(project: &Project, machines: &[MachineInfo]) -> String {
+    match &project.machine {
+        Some(id) => machines
+            .iter()
+            .find(|machine| &machine.id == id)
+            .map(|machine| format!("{} ({})", project.name, machine.display()))
+            .unwrap_or_else(|| project.name.clone()),
+        None => project.name.clone(),
+    }
+}
+
 fn launch_home_agent(
     client: &mut ControlClient,
     location: &str,
@@ -9734,11 +9894,22 @@ fn launch_home_agent(
             .create_worktree(&branch)
             .map_err(|error| error.to_string())?;
     }
+    // A fresh workspace opens with one shell pane. Reuse it for the agent so
+    // the launch does not split a second, empty terminal beside Pi.
+    let pane = client.idle_pane().ok().flatten();
     client
-        .start_agent(name, agent, &[])
+        .start_agent(name, agent, pane.as_deref(), &[])
         .map_err(|error| error.to_string())?;
+    // Go straight into the agent's pane rather than whatever pane the daemon
+    // left focused, so the prompt lands in front of the user.
+    if let Some(pane) = pane.as_deref() {
+        client.focus_pane(pane).ok();
+    }
+    // Target the pane directly: a fresh agent's alias may not be registered
+    // yet, but the pane id always resolves.
+    let target = pane.as_deref().unwrap_or(name);
     client
-        .prompt_agent(name, prompt)
+        .prompt_agent(target, prompt)
         .map_err(|error| error.to_string())?;
     Ok(format!("started {agent} as {name}"))
 }
@@ -9860,6 +10031,32 @@ mod tests {
             Some(gpui::rgb(0x181825))
         );
         assert!(scheme::builtin("no-such-theme").is_none());
+    }
+
+    #[test]
+    fn project_choice_label_names_the_machine() {
+        let machine = MachineInfo {
+            id: "mac-mini".into(),
+            display: "Mac Mini".into(),
+            ..MachineInfo::default()
+        };
+        let remote = Project {
+            name: "flo".into(),
+            machine: Some("mac-mini".into()),
+            ..Project::default()
+        };
+        assert_eq!(
+            project_choice_label(&remote, std::slice::from_ref(&machine)),
+            "flo (Mac Mini)"
+        );
+        // A local project stays bare, and a machine that is gone falls back to
+        // the project name rather than a dangling id.
+        let local = Project {
+            name: "flo".into(),
+            ..Project::default()
+        };
+        assert_eq!(project_choice_label(&local, &[]), "flo");
+        assert_eq!(project_choice_label(&remote, &[]), "flo");
     }
 
     #[test]

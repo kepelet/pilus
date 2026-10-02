@@ -7349,57 +7349,60 @@ impl PilusView {
             .overflow_hidden()
             .whitespace_nowrap();
         if let Some(agent) = agent {
-            let status = status_color(&agent.status, theme);
-            let indicator = if agent.status == "working" {
-                svg()
-                    .data(include_bytes!("../../assets/icons/loader-circle.svg"))
-                    .w(px(7.0))
-                    .h(px(7.0))
-                    .flex_shrink_0()
-                    .text_color(status)
-                    .with_animation(
-                        format!("pilus-tab-agent-spinner-{index}"),
-                        Animation::new(Duration::from_millis(900))
-                            .repeat_synced()
-                            .with_max_fps(30.0),
-                        |svg, phase| {
-                            svg.with_transformation(Transformation::rotate(percentage(phase)))
-                        },
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .w(px(5.0))
-                    .h(px(5.0))
-                    .rounded_full()
-                    .bg(status)
-                    .into_any_element()
-            };
-            content = content.child(
-                div()
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(14.0))
-                    .h(px(14.0))
-                    .flex_shrink_0()
-                    .child(icon(agent_icon(&agent.agent), 12.0, fg))
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(-2.0))
-                            .right(px(-2.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(8.0))
-                            .h(px(8.0))
-                            .rounded_full()
-                            .bg(if active { theme.panel } else { theme.window_bg })
-                            .child(indicator),
-                    ),
-            );
+            let mut tile = div()
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(14.0))
+                .h(px(14.0))
+                .flex_shrink_0()
+                .child(icon(agent_icon(&agent.agent), 12.0, fg));
+            // An idle agent needs no badge; the icon alone is quieter and the
+            // tab reads the same as one with no agent.
+            if agent.status != "idle" {
+                let status = status_color(&agent.status, theme);
+                let indicator = if agent.status == "working" {
+                    svg()
+                        .data(include_bytes!("../../assets/icons/loader-circle.svg"))
+                        .w(px(7.0))
+                        .h(px(7.0))
+                        .flex_shrink_0()
+                        .text_color(status)
+                        .with_animation(
+                            format!("pilus-tab-agent-spinner-{index}"),
+                            Animation::new(Duration::from_millis(900))
+                                .repeat_synced()
+                                .with_max_fps(30.0),
+                            |svg, phase| {
+                                svg.with_transformation(Transformation::rotate(percentage(phase)))
+                            },
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .w(px(5.0))
+                        .h(px(5.0))
+                        .rounded_full()
+                        .bg(status)
+                        .into_any_element()
+                };
+                tile = tile.child(
+                    div()
+                        .absolute()
+                        .top(px(-2.0))
+                        .right(px(-2.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded_full()
+                        .bg(if active { theme.panel } else { theme.window_bg })
+                        .child(indicator),
+                );
+            }
+            content = content.child(tile);
         } else {
             content = content.child(
                 div()

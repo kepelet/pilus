@@ -10,6 +10,9 @@
 #
 # Environment:
 #   APPLE_DEVELOPER_IDENTITY  Developer ID used to sign (else ad-hoc).
+#   PILUS_BUNDLE_ID           Forwarded to bundle-macos.sh; defaults there to the
+#                             development identifier. Release and preview builds
+#                             set the production one (`pilus.kepelet.com`).
 #   NOTARY_PROFILE            notarytool keychain profile; when set, the DMG
 #                             is submitted for notarization and stapled.
 #   MINISIGN_SECRET_KEY       path to a minisign secret key; when set and the

@@ -1146,6 +1146,20 @@
     line-height: 0;
   }
 
+  .inventory-head-copy {
+    min-width: 0;
+  }
+
+  .inventory-head .inventory-sub {
+    margin: 14px 0 0;
+    justify-self: start;
+    line-height: 1.5;
+    color: var(--muted);
+    font-size: clamp(1.05rem, 1.7vw, 1.28rem);
+    letter-spacing: -0.02em;
+    text-wrap: pretty;
+  }
+
   .inventory-head .pilus-mark {
     width: clamp(140px, 18vw, 220px);
     height: auto;
@@ -2129,7 +2143,10 @@
   <section class="inventory" aria-labelledby="inventory-title">
     <div class="wrap">
       <div class="inventory-head">
-        <h2 class="section-heading" id="inventory-title">After all, pilus is a terminal client.</h2>
+        <div class="inventory-head-copy">
+          <h2 class="section-heading" id="inventory-title">After all, pilus is a terminal client.</h2>
+          <p class="inventory-sub">But why?</p>
+        </div>
         <p>
           <svg class="pilus-mark inventory-mark" viewBox="0 0 100 100" aria-hidden="true" focusable="false">
             <path fill="#061116" d="M81.28 50.19C81.28 69.32 70.37 79.47 49.82 79.47C29.27 79.47 18.36 69.32 18.36 50.19C18.36 31.07 29.27 20.92 49.82 20.92C70.37 20.92 81.28 31.07 81.28 50.19Z"/>
@@ -2201,10 +2218,6 @@
         <details>
           <summary>Where can I run pilus?</summary>
           <p>pilus is a native macOS app today. You can connect from your Mac to Luvus on saved remote machines over SSH.</p>
-        </details>
-        <details>
-          <summary>How can I try it?</summary>
-          <p>There is no public macOS binary yet. You can build the early v0.1 client from the <a href="https://github.com/kepelet/pilus">source repository</a>.</p>
         </details>
       </div>
     </div>

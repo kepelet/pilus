@@ -399,6 +399,43 @@ impl Agent {
     }
 }
 
+/// One worktree of a workspace's repo, from `worktree.list`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreeInfo {
+    /// Absolute checkout path.
+    pub path: String,
+    /// Whether this is the repo's main checkout (not deletable).
+    pub main: bool,
+}
+
+impl WorktreeInfo {
+    fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            path: value.get("path")?.as_str()?.to_string(),
+            main: value.get("main").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+}
+
+/// The blockers behind a `worktree_in_use` refusal of an unforced
+/// `worktree.remove`, in the daemon's own words, or `None` for any other error.
+///
+/// The daemon checks working or blocked agent panes, unfinished bound tasks
+/// and leases before deleting, and names them so the operator can finish that
+/// work or knowingly force past it.
+pub fn worktree_blockers(error: &Error) -> Option<String> {
+    let Error::Control(message) = error else {
+        return None;
+    };
+    let detail = message.strip_prefix("worktree_in_use")?;
+    let detail = detail.trim_start_matches(':').trim();
+    Some(if detail.is_empty() {
+        "it is still in use".to_string()
+    } else {
+        detail.to_string()
+    })
+}
+
 /// Where a control request is sent.
 ///
 /// The local API socket answers many connections on one process. A remote
@@ -544,6 +581,91 @@ impl ControlClient {
     /// Create a worktree (and its workspace) for `branch` in the active repo.
     pub fn create_worktree(&mut self, branch: &str) -> Result<()> {
         self.request("worktree.create", json!({ "branch": branch }))?;
+        Ok(())
+    }
+
+    /// Create a worktree of the workspace at `index`'s repo, not the active one.
+    ///
+    /// The right-click menu targets whichever WORKSPACES row was hit, which is
+    /// only the active workspace by coincidence; `workspace` names the repo.
+    pub fn create_worktree_for(&mut self, workspace: u16, branch: &str) -> Result<()> {
+        self.request(
+            "worktree.create",
+            json!({ "workspace": workspace, "branch": branch }),
+        )?;
+        Ok(())
+    }
+
+    /// Rename a workspace's display label. The daemon trims and caps the name.
+    pub fn rename_workspace(&mut self, workspace_id: &str, name: &str) -> Result<()> {
+        self.request(
+            "workspace.rename",
+            json!({ "workspace_id": workspace_id, "name": name }),
+        )?;
+        Ok(())
+    }
+
+    /// The worktrees of the workspace at `index`'s repo, per `worktree.list`.
+    ///
+    /// The right-click menu reads this to tell a linked worktree (deletable)
+    /// from a main checkout or a plain folder. An empty list on success means
+    /// the folder is not a git repo.
+    pub fn worktrees(&mut self, workspace: u16) -> Result<Vec<WorktreeInfo>> {
+        let result = self.request("worktree.list", json!({ "workspace": workspace }))?;
+        let worktrees = result.get("worktrees").and_then(Value::as_array);
+        Ok(worktrees
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(WorktreeInfo::from_json)
+            .collect())
+    }
+
+    /// Remove a linked worktree and (with `force`) its folder.
+    ///
+    /// `force` matches the daemon's own confirm path: it skips the in-use
+    /// guard and runs `git worktree remove --force`, so a dirty checkout does
+    /// not block the delete. Unforced, a busy worktree is refused with
+    /// `worktree_in_use` (see [`worktree_blockers`]). Daemon 0.14.2
+    /// nevertheless refuses a checkout holding modified or untracked files
+    /// whatever `force` says, so callers discard those first. The daemon
+    /// closes any workspace whose cwd was inside the removed path.
+    pub fn remove_worktree(&mut self, path: &str, force: bool) -> Result<()> {
+        self.request("worktree.remove", json!({ "path": path, "force": force }))?;
+        Ok(())
+    }
+
+    /// Pin or unpin a workspace, floating its group to the top of the dock.
+    pub fn pin_workspace(&mut self, workspace_id: &str, pinned: bool) -> Result<()> {
+        self.request(
+            "workspace.pin",
+            json!({ "workspace_id": workspace_id, "pinned": pinned }),
+        )?;
+        Ok(())
+    }
+
+    /// Close a workspace and the panes inside it.
+    pub fn close_workspace(&mut self, workspace_id: &str) -> Result<()> {
+        self.request("workspace.close", json!({ "workspace_id": workspace_id }))?;
+        Ok(())
+    }
+
+    /// Close one pane (a live agent's pane), wherever it sits in the session.
+    pub fn close_pane(&mut self, pane: &str) -> Result<()> {
+        self.request("pane.close", json!({ "pane": pane }))?;
+        Ok(())
+    }
+
+    /// Give a live pane an addressable alias, so `agent.send` and friends can
+    /// target it by name. The daemon enforces `[a-z][a-z0-9_-]{0,31}`.
+    pub fn name_agent(&mut self, pane: &str, name: &str) -> Result<()> {
+        self.request("agent.name", json!({ "pane": pane, "name": name }))?;
+        Ok(())
+    }
+
+    /// Clear a live pane's alias, returning it to its terminal-backend label.
+    pub fn clear_agent_name(&mut self, pane: &str) -> Result<()> {
+        self.request("agent.name", json!({ "pane": pane, "clear": true }))?;
         Ok(())
     }
 
@@ -1106,12 +1228,31 @@ fn is_structural(name: &str) -> bool {
 mod tests {
     use super::{
         AutomationSummary, Tab, TaskSummary, enrich_tab_runtime, is_structural, read_line_within,
+        worktree_blockers,
     };
+    use crate::error::Error;
     use crate::transport::Stream;
     use serde_json::json;
     use std::process::Command;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn busy_worktree_refusals_expose_their_blockers() {
+        let busy = Error::Control("worktree_in_use: agent pi is working in pane 7".to_string());
+        assert_eq!(
+            worktree_blockers(&busy),
+            Some("agent pi is working in pane 7".to_string())
+        );
+        let bare = Error::Control("worktree_in_use".to_string());
+        assert_eq!(
+            worktree_blockers(&bare),
+            Some("it is still in use".to_string())
+        );
+        let other = Error::Control("git_error: fatal: not a working tree".to_string());
+        assert_eq!(worktree_blockers(&other), None);
+        assert_eq!(worktree_blockers(&Error::Control("timed out".into())), None);
+    }
 
     #[test]
     fn tabs_enrich_from_the_active_workspace_snapshot() {

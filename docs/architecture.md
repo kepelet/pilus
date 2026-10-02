@@ -148,6 +148,48 @@ because one tab open emits several structural events. `--probe-feed` drives the
 same feed headlessly. Clicking an agent row focuses its pane; clicking a
 workspace row sends `ShellWorkspaceFocus`.
 
+**Right-click menus.** WORKSPACES and AGENTS rows carry the daemon's native
+context menus, drawn by a floating GPUI panel mirroring the daemon's own menu
+structure: close, rename, pin, path visibility, and copy path/branch for
+workspaces; rename, close, pin, path visibility, and the dock's workspace
+scope for agents. Destructive rows hang on the daemon's contract where one
+exists. Most items ride the control API — `workspace.close`/`rename`/`pin`,
+`pane.close`, `agent.name`, `worktree.create` (targeting the right-clicked
+workspace's repo via its index) — and run on a background thread reported
+through a menu-status channel, so a remote round trip never blocks the window.
+Boards (`Open Git Tab`, `Open Task Board`, `Open Mission Control`) first focus
+the workspace, then send the daemon's prefix chord (`Ctrl+Space` + `g`/`o`/`m`)
+like the Mission and Orchestration nav rows. The presentational rows are
+client state, exactly as they are in the daemon's own TUI: pins float the row
+to the top (the workspace pin is additionally pushed through `workspace.pin`,
+so the daemon's next projection reorders the catalog), path visibility drives
+the second line of every row in the section (workspace paths ride the existing
+`ShellDockLayout.workspace_paths` flag; agent paths are per-window state), and
+the agents scope filters the dock to the visible surface's active workspace.
+**Delete Worktree** is the one destructive row, so it is gated and confirmed:
+`worktree.list` is probed once per workspace when its menu opens (successful
+answers cached per endpoint + stable workspace id; the row is added only after
+a positive answer, and a failed probe is never cached so the next open
+retries), and choosing it swaps the prompt for a read-only confirm modal.
+Running it checks, like the daemon's own TUI, that no *other* open workspace or
+agent pane lives inside the checkout, then `worktree.remove { path, force }`
+removes the confirmed checkout root and folder; the daemon closes the workspace
+whose cwd was inside it, so the row disappears on the next projection. The first
+confirm never forces: it asks git (`status --porcelain`, locally or over SSH)
+whether the checkout holds modified or untracked files, then sends
+`worktree.remove` with `force: false`. The daemon answers `worktree_in_use`,
+naming working or blocked agent panes, unfinished bound tasks and leases, when
+the worktree is busy. Either finding holds the delete for a second, stronger
+confirm ("Delete Worktree Anyway") that lists the blockers and the lost
+changes. Only that answer discards work (`git reset --hard` and `clean`, since
+the daemon refuses a dirty checkout whatever `force` says) and retries with
+`force: true`, which stops the panes in the removed workspace. A clean, idle
+worktree deletes on one confirm; an unreadable git state aborts instead of
+being taken for clean.
+
+Renames and aliases also update their projected row optimistically, and the
+authoritative projection confirms them a tick later.
+
 **Last tab.** The daemon closes a workspace when its final tab closes, so the
 client holds back its own last-tab close (⌘W / the tab ×) with a status hint.
 Exiting the shell itself still closes the workspace; that is daemon behavior.

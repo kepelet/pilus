@@ -26,7 +26,7 @@ pub use connection::{ClientEvent, Connection, EndpointIdentity};
 pub use connector::{Connector, ConnectorOptions, ConnectorStatus, agent_binary};
 pub use control::{
     Agent, AgentFeed, Appearance, AutomationSummary, BarSegment, BarWidget, ControlClient,
-    FeedScope, FeedUpdate, Tab, TaskSummary, ThemeInfo,
+    FeedScope, FeedUpdate, Tab, TaskSummary, ThemeInfo, WorktreeInfo, worktree_blockers,
 };
 pub use discovery::{
     HOME_ENV, PILUS_HOME_ENV, SessionInfo, active_session, api_socket_path_for,
@@ -39,10 +39,10 @@ pub use machines::{MachineInfo, connect_machine, install_agent, list_machines, r
 pub use pilus_protocol as protocol;
 pub use projects::{
     Project, RemoteBranches, RemoteRepos, common_git_dir, common_git_dirs_remote, current_branch,
-    current_branches_remote, expand_local as expand_project_local,
+    current_branches_remote, discard_worktree_changes, expand_local as expand_project_local,
     expand_remote as expand_project_remote, id_for_name as project_id_for_name, init_repository,
     list_branches, list_branches_remote, load_projects, projects_file, save_projects,
-    validate as validate_project,
+    validate as validate_project, worktree_is_dirty,
 };
 pub use surface::{Surface, SurfaceChange};
 pub use transport::SshTarget;

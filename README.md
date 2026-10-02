@@ -33,6 +33,10 @@ Early. `pilus` today is a focused vertical slice:
 - forwards keys, mouse clicks and scroll, workspace/agent selection, and
   viewport resizes back to the daemon;
 - selects text over the grid natively and copies it with ⌘C;
+- right-clicks a WORKSPACES or AGENTS row for the daemon's own context menu
+  drawn natively: close/rename/pin/path toggle, copy path & branch, new git
+  worktree, delete worktree (confirm-gated on linked checkouts), the
+  git/task/mission boards, and the agents scope filter;
 - covers the daemon's tab bar with a native macOS-style bar (focus, new, and
   close) driven by the `tab.*` control API;
 - covers the daemon's bottom status line with a native bar whose right side

@@ -65,6 +65,14 @@ pub enum Error {
     /// The iroh transport could not start, or a peer could not be served.
     #[error("iroh transport error: {0}")]
     P2p(String),
+
+    /// The persisted device store could not be read or written.
+    #[error("device store error: {0}")]
+    DeviceStore(String),
+
+    /// A bounded wait on the gateway or iroh endpoint expired.
+    #[error("{0} timed out")]
+    Timeout(&'static str),
 }
 
 /// Result alias for this crate.
@@ -181,6 +189,19 @@ impl AccessOptions {
     }
 }
 
+/// The deadline for gateway startup output and pairing I/O.
+const GATEWAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Map a pairing I/O failure: expired deadlines are `Timeout`, the rest stay `Io`.
+fn pairing_io(error: std::io::Error) -> Error {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            Error::Timeout("gateway pairing")
+        }
+        _ => Error::Io(error),
+    }
+}
+
 /// A running `luvus uhp access` gateway plus its parsed descriptor.
 ///
 /// Dropping the gateway kills the child, which closes the loopback listener
@@ -191,7 +212,10 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    /// Launch the gateway and block until its descriptor line arrives.
+    /// Launch the gateway and wait up to ten seconds for its descriptor line.
+    ///
+    /// Any failure path kills and reaps the child so a broken gateway cannot
+    /// leak a process or leave its delegated authority dangling.
     pub fn start(binary: &Path, options: &AccessOptions) -> Result<Self> {
         let mut command = options.command(binary);
         command
@@ -199,22 +223,60 @@ impl Gateway {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         let mut child = command.spawn()?;
-        let stdout = child.stdout.take().ok_or(Error::NoDescriptor)?;
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line.trim().is_empty() {
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
             let _ = child.wait();
             return Err(Error::NoDescriptor);
+        };
+        let mut reader = BufReader::new(stdout);
+        let (descriptor_tx, descriptor_rx) = std::sync::mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("pilus-gateway-descriptor".to_string())
+            .spawn(move || {
+                let mut line = String::new();
+                let first = reader.read_line(&mut line).map(|_| line);
+                let _ = descriptor_tx.send(first);
+                // The descriptor is the only stdout the gateway writes; drain
+                // the rest so a chatty gateway cannot fill its pipe and stall.
+                let mut sink = std::io::sink();
+                let _ = std::io::copy(&mut reader, &mut sink);
+            });
+        if let Err(error) = spawned {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Io(error));
         }
-        let descriptor = Descriptor::parse(line.trim())?;
-        // The descriptor is the only stdout the gateway writes; drain the rest
-        // so a chatty gateway cannot fill its pipe and stall.
-        std::thread::spawn(move || {
-            let mut sink = std::io::sink();
-            let _ = std::io::copy(&mut reader, &mut sink);
-        });
-        Ok(Self { child, descriptor })
+        let line = match descriptor_rx.recv_timeout(GATEWAY_TIMEOUT) {
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Io(error));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Timeout("gateway descriptor"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::NoDescriptor);
+            }
+        };
+        let parsed = if line.trim().is_empty() {
+            Err(Error::NoDescriptor)
+        } else {
+            Descriptor::parse(line.trim())
+        };
+        match parsed {
+            Ok(descriptor) => Ok(Self { child, descriptor }),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(error)
+            }
+        }
     }
 
     /// The parsed descriptor.
@@ -244,17 +306,55 @@ impl Drop for Gateway {
 /// Pair with a gateway and return the delegated token.
 ///
 /// The pairing frame is the only UHP-adjacent message the connector decodes;
-/// after this it forwards bytes verbatim.
+/// after this it forwards bytes verbatim. Connect, write, and read each get
+/// ten seconds so a dead gateway cannot hang startup.
 pub fn pair(descriptor: &Descriptor) -> Result<String> {
-    let mut stream = TcpStream::connect(&descriptor.address)?;
+    use std::net::ToSocketAddrs;
+    use std::time::Instant;
+    let deadline = Instant::now() + GATEWAY_TIMEOUT;
+    let mut last_error: Option<std::io::Error> = None;
+    let mut stream = None;
+    for address in descriptor.address.to_socket_addrs()? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Timeout("gateway pairing"));
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let mut stream = match stream {
+        Some(stream) => stream,
+        None => match last_error {
+            Some(error) => return Err(pairing_io(error)),
+            None => {
+                return Err(Error::Gateway(format!(
+                    "`{}` resolves to nothing",
+                    descriptor.address
+                )));
+            }
+        },
+    };
+    stream
+        .set_read_timeout(Some(GATEWAY_TIMEOUT))
+        .map_err(pairing_io)?;
+    stream
+        .set_write_timeout(Some(GATEWAY_TIMEOUT))
+        .map_err(pairing_io)?;
     let frame = serde_json::json!({ "type": "pair", "code": descriptor.pairing_code });
-    stream.write_all(frame.to_string().as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
+    stream
+        .write_all(frame.to_string().as_bytes())
+        .map_err(pairing_io)?;
+    stream.write_all(b"\n").map_err(pairing_io)?;
+    stream.flush().map_err(pairing_io)?;
 
     let mut reader = BufReader::new(stream);
     let mut reply = String::new();
-    reader.read_line(&mut reply)?;
+    reader.read_line(&mut reply).map_err(pairing_io)?;
     let value: Value =
         serde_json::from_str(reply.trim()).map_err(|error| Error::Gateway(error.to_string()))?;
     if let Some(error) = value.get("error") {
@@ -395,6 +495,54 @@ mod tests {
             Descriptor::from_json(&json!({ "endpoint": { "port": 1 } })),
             Err(Error::MissingField("pairing.code"))
         ));
+    }
+
+    /// A fake gateway that records its PID, prints garbage, and sleeps, so the
+    /// descriptor error path must still kill and reap it.
+    #[cfg(unix)]
+    #[test]
+    fn malformed_descriptor_kills_the_child() {
+        let dir =
+            std::env::temp_dir().join(format!("pilus-agent-descriptor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let pid_file = dir.join("pid");
+        let script = dir.join("fake-gateway.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\necho 'not a descriptor'\nexec /bin/sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).expect("chmod");
+        }
+
+        let result = Gateway::start(&script, &AccessOptions::default());
+        assert!(
+            matches!(result, Err(Error::Descriptor(_))),
+            "expected a descriptor error, got {:?}",
+            result.err()
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("pid file")
+            .trim()
+            .to_string();
+        let alive = Command::new("/bin/kill")
+            .arg("-0")
+            .arg(&pid)
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill -0")
+            .success();
+        assert!(!alive, "the failed gateway child must be dead: pid {pid}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

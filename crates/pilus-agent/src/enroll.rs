@@ -8,19 +8,20 @@
 //! it survives restarts.
 //!
 //! The control protocol is one JSON request per bidirectional stream on
-//! [`CONTROL_ALPN`]: `{"type":"enroll","code":…}` adds the peer, and
-//! `{"type":"token"}` returns the cached token for an enrolled peer. UHP itself
-//! still flows verbatim on [`crate::p2p::ALPN`], authenticated by the token the
-//! device sends as `auth`.
+//! [`CONTROL_ALPN`]: `{"type":"enroll","code":…}` adds the peer and rotates the
+//! code, `{"type":"token"}` returns the cached token for an enrolled peer, and
+//! `devices`/`revoke` let an authorized peer list and remove enrollments. UHP
+//! itself still flows verbatim on [`crate::p2p::ALPN`], authenticated by the
+//! token the device sends as `auth`.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use iroh::SecretKey;
 use iroh::endpoint::{Connection, RecvStream};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use iroh::SecretKey;
 use serde_json::{Value, json};
 
 use crate::{Error, Result};
@@ -51,9 +52,13 @@ pub struct DeviceStore {
 
 impl DeviceStore {
     /// Load the store at `path`, or start empty when it does not exist.
+    ///
+    /// A file that exists but does not decode is a [`Error::DeviceStore`], not
+    /// an empty store: silently dropping enrolled devices would quietly reopen
+    /// enrollment for endpoints that were revoked.
     pub fn load(path: PathBuf) -> Result<Self> {
         let devices = match std::fs::read(&path) {
-            Ok(bytes) => parse_devices(&bytes),
+            Ok(bytes) => parse_devices(&bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(Error::Io(error)),
         };
@@ -65,6 +70,11 @@ impl DeviceStore {
         self.devices
             .iter()
             .any(|device| device.endpoint_id == endpoint_id)
+    }
+
+    /// The enrolled devices.
+    pub fn devices(&self) -> &[Device] {
+        &self.devices
     }
 
     /// Add a device without persisting, for a static `--allow` seed.
@@ -79,16 +89,37 @@ impl DeviceStore {
     }
 
     /// Persist an enrollment. Returns whether the device was newly added.
+    ///
+    /// The candidate list is saved before it is committed, so a failed write
+    /// leaves the in-memory authorization unchanged.
     pub fn enroll(&mut self, endpoint_id: &str, label: &str) -> Result<bool> {
         if self.is_allowed(endpoint_id) {
             return Ok(false);
         }
-        self.devices.push(Device {
+        let mut candidate = self.devices.clone();
+        candidate.push(Device {
             endpoint_id: endpoint_id.to_string(),
             label: label.to_string(),
             enrolled_at: now(),
         });
-        self.save()?;
+        save(&self.path, &candidate)?;
+        self.devices = candidate;
+        Ok(true)
+    }
+
+    /// Persist a revocation. Returns whether the device was present.
+    pub fn revoke(&mut self, endpoint_id: &str) -> Result<bool> {
+        if !self.is_allowed(endpoint_id) {
+            return Ok(false);
+        }
+        let candidate: Vec<Device> = self
+            .devices
+            .iter()
+            .filter(|device| device.endpoint_id != endpoint_id)
+            .cloned()
+            .collect();
+        save(&self.path, &candidate)?;
+        self.devices = candidate;
         Ok(true)
     }
 
@@ -101,37 +132,55 @@ impl DeviceStore {
     pub fn is_empty(&self) -> bool {
         self.devices.is_empty()
     }
+}
 
-    fn save(&self) -> Result<()> {
-        let devices: Vec<Value> = self
-            .devices
-            .iter()
-            .map(|device| {
-                json!({
-                    "endpoint_id": device.endpoint_id,
-                    "label": device.label,
-                    "enrolled_at": device.enrolled_at,
-                })
+/// Write `devices` to `path` atomically: a same-directory temporary file,
+/// fsynced and renamed over the destination, so a crash mid-write can never
+/// leave a truncated store that would re-open enrollment.
+fn save(path: &std::path::Path, devices: &[Device]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let entries: Vec<Value> = devices
+        .iter()
+        .map(|device| {
+            json!({
+                "endpoint_id": device.endpoint_id,
+                "label": device.label,
+                "enrolled_at": device.enrolled_at,
             })
-            .collect();
-        let payload = json!({ "devices": devices }).to_string();
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // The store is rewritten on every enrollment, so it truncates rather
-        // than refusing to overwrite the way the identity key does.
+        })
+        .collect();
+    let payload = json!({ "devices": entries }).to_string();
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "devices.json".to_string());
+    let temp = parent.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        SAVE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&self.path)?;
+        let mut file = options.open(&temp)?;
         file.write_all(payload.as_bytes())?;
-        file.flush()?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
         Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
+    result
 }
 
 /// The short-lived code that admits a new device.
@@ -171,34 +220,80 @@ impl Enrollment {
 pub struct AuthState {
     token: String,
     devices: Mutex<DeviceStore>,
-    enrollment: Mutex<Enrollment>,
+    enrollment: Mutex<Option<Enrollment>>,
+    enrollment_ttl: u64,
+    /// Non-empty `--allow` IDs; when this list is non-empty the run is in
+    /// strict mode and it is the whole authorization set.
+    allowed: Vec<String>,
+}
+
+/// The internal result of one enroll request.
+enum EnrollOutcome {
+    /// Strict `--allow` mode disabled enrollment entirely.
+    Disabled,
+    /// The code was wrong or out of its window.
+    Invalid,
+    /// The endpoint is already enrolled; nothing rotated.
+    AlreadyEnrolled,
+    /// A new device enrolled; carries the freshly minted replacement code for
+    /// the host to print — never for the control response.
+    Enrolled { code: String, expires_at: u64 },
 }
 
 impl AuthState {
     /// Build the state for one connector run.
     ///
-    /// `allow` seeds the in-memory allow-list without persisting.
+    /// A non-empty `allow` makes the run strict: the persisted store is never
+    /// read, only those IDs may reach the gateway, and enrollment is disabled.
+    /// An empty effective `allow` uses the persisted devices and enables
+    /// enrollment.
     pub fn load(token: String, devices_path: PathBuf, allow: &[String], ttl: u64) -> Result<Self> {
-        let mut devices = DeviceStore::load(devices_path)?;
-        for endpoint_id in allow {
+        let allowed: Vec<String> = allow
+            .iter()
+            .filter(|endpoint_id| !endpoint_id.is_empty())
+            .cloned()
+            .collect();
+        let strict = !allowed.is_empty();
+        let mut devices = if strict {
+            DeviceStore {
+                path: devices_path,
+                devices: Vec::new(),
+            }
+        } else {
+            DeviceStore::load(devices_path)?
+        };
+        for endpoint_id in &allowed {
             devices.allow(endpoint_id);
         }
         Ok(Self {
             token,
             devices: Mutex::new(devices),
-            enrollment: Mutex::new(Enrollment::generate(ttl)),
+            enrollment: Mutex::new((!strict).then(|| Enrollment::generate(ttl))),
+            enrollment_ttl: ttl,
+            allowed,
         })
     }
 
     /// Whether `endpoint_id` may reach the gateway.
     pub fn is_allowed(&self, endpoint_id: &str) -> bool {
-        lock(&self.devices).is_allowed(endpoint_id)
+        if self.strict() {
+            self.allowed.iter().any(|id| id == endpoint_id)
+        } else {
+            lock(&self.devices).is_allowed(endpoint_id)
+        }
     }
 
-    /// The enrollment code and its expiry.
-    pub fn enrollment(&self) -> (String, u64) {
-        let enrollment = lock(&self.enrollment);
-        (enrollment.code().to_string(), enrollment.expires_at())
+    /// The enrollment code and its expiry, or `None` when enrollment is
+    /// disabled by `--allow`.
+    pub fn enrollment(&self) -> Option<(String, u64)> {
+        lock(&self.enrollment)
+            .as_ref()
+            .map(|enrollment| (enrollment.code().to_string(), enrollment.expires_at()))
+    }
+
+    /// The devices this run considers authorized.
+    pub fn devices(&self) -> Vec<Device> {
+        lock(&self.devices).devices().to_vec()
     }
 
     /// The number of enrolled devices.
@@ -206,12 +301,43 @@ impl AuthState {
         lock(&self.devices).len()
     }
 
-    fn enroll(&self, endpoint_id: &str, label: &str) -> Result<bool> {
-        lock(&self.devices).enroll(endpoint_id, label)
+    /// Whether the `--allow` list pins the authorized set for this process.
+    fn strict(&self) -> bool {
+        !self.allowed.is_empty()
     }
 
-    fn accepts(&self, code: &str) -> bool {
-        lock(&self.enrollment).accepts(code, now())
+    /// Atomically validate `code`, persist a new device, and rotate the code.
+    ///
+    /// Holding the enrollment lock across validation, persistence, and
+    /// replacement keeps two racing enroll requests from spending one code or
+    /// invalidating a code a peer is mid-flight with.
+    fn try_enroll(&self, endpoint_id: &str, code: &str, label: &str) -> Result<EnrollOutcome> {
+        let mut enrollment = lock(&self.enrollment);
+        let Some(current) = enrollment.as_ref() else {
+            return Ok(EnrollOutcome::Disabled);
+        };
+        if self.is_allowed(endpoint_id) {
+            return Ok(EnrollOutcome::AlreadyEnrolled);
+        }
+        if !current.accepts(code, now()) {
+            return Ok(EnrollOutcome::Invalid);
+        }
+        if !lock(&self.devices).enroll(endpoint_id, label)? {
+            return Ok(EnrollOutcome::AlreadyEnrolled);
+        }
+        let next = Enrollment::generate(self.enrollment_ttl);
+        let outcome = EnrollOutcome::Enrolled {
+            code: next.code().to_string(),
+            expires_at: next.expires_at(),
+        };
+        *enrollment = Some(next);
+        Ok(outcome)
+    }
+
+    /// Persist the removal of `endpoint_id`. Callers must refuse this in
+    /// strict mode, where the authorized set is process configuration.
+    fn revoke(&self, endpoint_id: &str) -> Result<bool> {
+        lock(&self.devices).revoke(endpoint_id)
     }
 }
 
@@ -238,13 +364,19 @@ impl Control {
                     .get("label")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if !self.auth.accepts(code) {
-                    return error_json("the enrollment code is invalid or expired");
+                match self.auth.try_enroll(remote, code, label) {
+                    Ok(EnrollOutcome::Disabled) => error_json("enrollment is disabled by --allow"),
+                    Ok(EnrollOutcome::Invalid) => {
+                        error_json("the enrollment code is invalid or expired")
+                    }
+                    Ok(EnrollOutcome::AlreadyEnrolled) => enrolled_json(remote),
+                    Ok(EnrollOutcome::Enrolled { code, expires_at }) => {
+                        println!("enroll:      {code}");
+                        eprintln!("pilus-agent: the enrollment code expires at unix {expires_at}");
+                        enrolled_json(remote)
+                    }
+                    Err(error) => error_json(&error.to_string()),
                 }
-                if let Err(error) = self.auth.enroll(remote, label) {
-                    return error_json(&error.to_string());
-                }
-                json!({ "type": "enrolled", "endpoint_id": remote }).to_string()
             }
             Some("token") => {
                 if !self.auth.is_allowed(remote) {
@@ -252,11 +384,55 @@ impl Control {
                 }
                 json!({ "type": "token", "token": self.auth.token }).to_string()
             }
-            Some("status") => json!({
-                "type": "status",
-                "devices": self.auth.device_count(),
-            })
-            .to_string(),
+            Some("devices") => {
+                if !self.auth.is_allowed(remote) {
+                    return error_json("this device is not enrolled");
+                }
+                let devices: Vec<Value> = self
+                    .auth
+                    .devices()
+                    .iter()
+                    .map(|device| {
+                        json!({
+                            "endpoint_id": device.endpoint_id,
+                            "label": device.label,
+                            "enrolled_at": device.enrolled_at,
+                        })
+                    })
+                    .collect();
+                json!({ "type": "devices", "devices": devices }).to_string()
+            }
+            Some("revoke") => {
+                if !self.auth.is_allowed(remote) {
+                    return error_json("this device is not enrolled");
+                }
+                if self.auth.strict() {
+                    return error_json("revocation is disabled by --allow");
+                }
+                let target = request
+                    .get("endpoint_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match self.auth.revoke(target) {
+                    Ok(removed) => json!({
+                        "type": "revoked",
+                        "endpoint_id": target,
+                        "removed": removed,
+                    })
+                    .to_string(),
+                    Err(error) => error_json(&error.to_string()),
+                }
+            }
+            Some("status") => {
+                if self.auth.strict() && !self.auth.is_allowed(remote) {
+                    return error_json("this device is not enrolled");
+                }
+                json!({
+                    "type": "status",
+                    "devices": self.auth.device_count(),
+                })
+                .to_string()
+            }
             _ => error_json("unknown request"),
         }
     }
@@ -298,17 +474,24 @@ async fn read_line(recv: &mut RecvStream) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buffer).trim().to_string())
 }
 
-fn parse_devices(bytes: &[u8]) -> Vec<Device> {
-    let value: Value = serde_json::from_slice(bytes).unwrap_or(Value::Null);
-    value
+fn parse_devices(bytes: &[u8]) -> Result<Vec<Device>> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|error| Error::DeviceStore(error.to_string()))?;
+    let items = value
         .get("devices")
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+        .ok_or_else(|| Error::DeviceStore("the store has no `devices` array".to_string()))?;
+    items
         .iter()
-        .filter_map(|item| {
-            Some(Device {
-                endpoint_id: item.get("endpoint_id")?.as_str()?.to_string(),
+        .map(|item| {
+            let endpoint_id = item
+                .get("endpoint_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::DeviceStore("a device entry is missing `endpoint_id`".to_string())
+                })?;
+            Ok(Device {
+                endpoint_id: endpoint_id.to_string(),
                 label: item
                     .get("label")
                     .and_then(Value::as_str)
@@ -326,8 +509,21 @@ fn parse_devices(bytes: &[u8]) -> Vec<Device> {
 /// without adding a dependency; the key itself is discarded.
 fn enrollment_code() -> String {
     let bytes = SecretKey::generate().to_bytes();
-    let hex: String = bytes[..8].iter().map(|byte| format!("{byte:02X}")).collect();
-    format!("{}-{}-{}-{}", &hex[0..4], &hex[4..8], &hex[8..12], &hex[12..16])
+    let hex: String = bytes[..8]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect();
+    format!(
+        "{}-{}-{}-{}",
+        &hex[0..4],
+        &hex[4..8],
+        &hex[8..12],
+        &hex[12..16]
+    )
+}
+
+fn enrolled_json(endpoint_id: &str) -> String {
+    json!({ "type": "enrolled", "endpoint_id": endpoint_id }).to_string()
 }
 
 fn error_json(message: &str) -> String {
@@ -407,12 +603,211 @@ mod tests {
         let bad = control.dispatch("peer", &json!({ "type": "enroll", "code": "nope" }));
         assert!(bad.contains("invalid or expired"));
 
-        let (code, _) = auth.enrollment();
+        let (code, _) = auth.enrollment().expect("enrollment enabled");
         let enrolled = control.dispatch("peer", &json!({ "type": "enroll", "code": code }));
         assert!(enrolled.contains("enrolled"));
 
         let token = control.dispatch("peer", &json!({ "type": "token" }));
         assert!(token.contains("\"token\":\"tok\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enrollment_rotates_after_a_new_device() {
+        let dir = std::env::temp_dir().join(format!("pilus-agent-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let auth = Arc::new(
+            AuthState::load("tok".to_string(), dir.join("devices.json"), &[], 60).expect("state"),
+        );
+        let control = Control::new(Arc::clone(&auth));
+
+        let (first, _) = auth.enrollment().expect("enabled");
+        let enrolled = control.dispatch("phone", &json!({ "type": "enroll", "code": first }));
+        assert!(enrolled.contains("\"type\":\"enrolled\""));
+        assert!(
+            !enrolled.contains("code"),
+            "the replacement code must not reach the device: {enrolled}"
+        );
+
+        let (second, _) = auth.enrollment().expect("still enabled");
+        assert_ne!(first, second, "the code rotates after one new device");
+
+        let stale = control.dispatch("tablet", &json!({ "type": "enroll", "code": first }));
+        assert!(
+            stale.contains("invalid or expired"),
+            "old code spent: {stale}"
+        );
+
+        let retry = control.dispatch("phone", &json!({ "type": "enroll", "code": second }));
+        assert!(retry.contains("\"type\":\"enrolled\""));
+        let (third, _) = auth.enrollment().expect("still enabled");
+        assert_eq!(second, third, "an enrolled retry does not rotate");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_allow_ignores_persisted_devices() {
+        let dir = std::env::temp_dir().join(format!("pilus-agent-strict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("devices.json");
+        let mut store = DeviceStore::load(path.clone()).expect("load");
+        store
+            .enroll("persisted-device", "old phone")
+            .expect("enroll");
+        drop(store);
+
+        let auth = Arc::new(
+            AuthState::load("tok".to_string(), path, &["configured-id".to_string()], 60)
+                .expect("state"),
+        );
+        let control = Control::new(Arc::clone(&auth));
+
+        assert!(auth.is_allowed("configured-id"));
+        assert!(
+            !auth.is_allowed("persisted-device"),
+            "strict --allow ignores the persisted set"
+        );
+        assert!(auth.enrollment().is_none());
+
+        let enroll = control.dispatch("new-device", &json!({ "type": "enroll", "code": "any" }));
+        assert!(enroll.contains("disabled by --allow"), "{enroll}");
+
+        let denied = control.dispatch("persisted-device", &json!({ "type": "token" }));
+        assert!(denied.contains("not enrolled"), "{denied}");
+        let token = control.dispatch("configured-id", &json!({ "type": "token" }));
+        assert!(token.contains("\"token\":\"tok\""), "{token}");
+
+        let revoke = control.dispatch(
+            "configured-id",
+            &json!({ "type": "revoke", "endpoint_id": "configured-id" }),
+        );
+        assert!(revoke.contains("disabled by --allow"), "{revoke}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn devices_and_revoke_remove_an_endpoint() {
+        let dir = std::env::temp_dir().join(format!("pilus-agent-revoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("devices.json");
+        let auth =
+            Arc::new(AuthState::load("tok".to_string(), path.clone(), &[], 60).expect("state"));
+        let control = Control::new(Arc::clone(&auth));
+
+        let (code, _) = auth.enrollment().expect("enabled");
+        control.dispatch("admin", &json!({ "type": "enroll", "code": code }));
+        let (code, _) = auth.enrollment().expect("enabled");
+        control.dispatch("phone", &json!({ "type": "enroll", "code": code }));
+
+        let listed: Value =
+            serde_json::from_str(&control.dispatch("admin", &json!({ "type": "devices" })))
+                .expect("devices json");
+        assert_eq!(listed["type"], "devices");
+        let ids: Vec<&str> = listed["devices"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|device| device["endpoint_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"admin") && ids.contains(&"phone"), "{ids:?}");
+
+        let denied = control.dispatch(
+            "stranger",
+            &json!({ "type": "revoke", "endpoint_id": "phone" }),
+        );
+        assert!(denied.contains("not enrolled"), "{denied}");
+
+        let revoked: Value = serde_json::from_str(&control.dispatch(
+            "admin",
+            &json!({ "type": "revoke", "endpoint_id": "phone" }),
+        ))
+        .expect("revoked json");
+        assert_eq!(revoked["type"], "revoked");
+        assert_eq!(revoked["endpoint_id"], "phone");
+        assert_eq!(revoked["removed"], true);
+
+        let token = control.dispatch("phone", &json!({ "type": "token" }));
+        assert!(token.contains("not enrolled"), "{token}");
+
+        let reloaded = DeviceStore::load(path).expect("reload");
+        assert!(reloaded.is_allowed("admin"));
+        assert!(!reloaded.is_allowed("phone"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_save_leaves_authorization_unchanged() {
+        let dir = std::env::temp_dir().join(format!("pilus-agent-nosave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        // A regular file where the store's parent directory belongs makes the
+        // save fail on every platform.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"occupied").expect("blocker");
+        let path = blocker.join("devices.json");
+
+        let mut store = DeviceStore {
+            path,
+            devices: Vec::new(),
+        };
+        assert!(store.enroll("device-a", "phone").is_err());
+        assert!(
+            !store.is_allowed("device-a"),
+            "a failed save must not authorize the candidate"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_store_is_a_typed_error() {
+        let dir = std::env::temp_dir().join(format!("pilus-agent-badjson-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("devices.json");
+        std::fs::write(&path, b"not json").expect("write");
+        assert!(matches!(
+            DeviceStore::load(path.clone()),
+            Err(Error::DeviceStore(_))
+        ));
+
+        std::fs::write(&path, b"{\"devices\":{}}").expect("write");
+        assert!(matches!(
+            DeviceStore::load(path),
+            Err(Error::DeviceStore(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_allow_never_reads_the_store() {
+        let dir =
+            std::env::temp_dir().join(format!("pilus-agent-strict-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("devices.json");
+        std::fs::write(&path, b"not json").expect("write malformed");
+
+        let auth = AuthState::load(
+            "tok".to_string(),
+            path.clone(),
+            &["configured-id".to_string()],
+            60,
+        )
+        .expect("strict load ignores the persisted store");
+        assert!(auth.is_allowed("configured-id"));
+        assert!(!auth.is_allowed("anything-else"));
+        assert!(auth.enrollment().is_none());
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            b"not json",
+            "strict mode must leave the on-disk store untouched"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

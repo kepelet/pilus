@@ -272,11 +272,16 @@ fn parse_machines(bytes: &[u8]) -> Vec<MachineInfo> {
     machines
 }
 
-/// Copy this build's connector onto `machine` and start it.
+/// Copy this build's connector onto `machine`, atomically and without starting
+/// it.
 ///
 /// The agent is copied verbatim, so a remote platform that does not match this
 /// build is refused before any bytes move. The remote path mirrors the verified
-/// `luvus` binary's directory, so the two ship together.
+/// `luvus` binary's directory, so the two ship together. The binary lands under
+/// a temporary sibling and is renamed into place, so a half-copied agent is
+/// never executable. Install deliberately does not launch an unmanaged
+/// background process; the message tells the user what to run on the machine
+/// so the enrollment credentials it prints stay visible to them.
 pub fn install_agent(machine: &MachineInfo, agent: &Path) -> Result<String> {
     let target = machine.ssh_target().ok_or_else(|| {
         Error::Machine(format!(
@@ -299,18 +304,25 @@ pub fn install_agent(machine: &MachineInfo, agent: &Path) -> Result<String> {
         .map(|(dir, _)| dir)
         .unwrap_or(".");
     let remote_path = format!("{remote_dir}/pilus-agent");
-    copy_agent(agent, &machine.destination, &remote_path)?;
-    let start = format!(
-        "chmod +x {path} && (nohup {path} serve --iroh --control >/dev/null 2>&1 & echo $!)",
-        path = shell_quote(&remote_path)
-    );
-    let pid = run_ssh(&target, &start)?;
-    let pid = pid.trim();
-    Ok(if pid.is_empty() {
-        format!("Installed pilus-agent on `{}`.", machine.id)
-    } else {
-        format!("Installed and started pilus-agent on `{}` (pid {pid}).", machine.id)
-    })
+    let remote_temp = format!("{remote_path}.tmp-{}", std::process::id());
+    copy_agent(agent, &machine.destination, &remote_temp)?;
+    run_ssh(&target, &install_command(&remote_temp, &remote_path))?;
+    Ok(format!(
+        "Installed pilus-agent on `{}` at `{remote_path}`. \
+         Run `{remote_path} serve --iroh --control` on that machine to start remote access.",
+        machine.id
+    ))
+}
+
+/// The remote command that marks a staged binary executable and renames it
+/// into place in one step.
+fn install_command(remote_temp: &str, remote_path: &str) -> String {
+    format!(
+        "chmod 755 {} && mv -f {} {}",
+        shell_quote(remote_temp),
+        shell_quote(remote_temp),
+        shell_quote(remote_path)
+    )
 }
 
 /// Run one shell command on the machine and return its stdout.
@@ -404,8 +416,24 @@ mod tests {
 
     #[test]
     fn shell_quote_survives_spaces_and_quotes() {
-        assert_eq!(shell_quote("/opt/my agent/pilus-agent"), "'/opt/my agent/pilus-agent'");
+        assert_eq!(
+            shell_quote("/opt/my agent/pilus-agent"),
+            "'/opt/my agent/pilus-agent'"
+        );
         assert_eq!(shell_quote("/a'b"), "'/a'\\''b'");
+    }
+
+    #[test]
+    fn install_command_quotes_spaces_and_quotes() {
+        let command = install_command(
+            "/opt/my agent/pilus-agent.tmp-42",
+            "/opt/my agent's bin/pilus-agent",
+        );
+        assert_eq!(
+            command,
+            "chmod 755 '/opt/my agent/pilus-agent.tmp-42' \
+             && mv -f '/opt/my agent/pilus-agent.tmp-42' '/opt/my agent'\\''s bin/pilus-agent'"
+        );
     }
 
     #[test]

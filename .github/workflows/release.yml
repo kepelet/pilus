@@ -72,6 +72,9 @@ jobs:
           # packaging script skips notarization when this is unset.
           NOTARY_PROFILE: ${{ secrets.APPLE_ID != '' && 'pilus-notary' || '' }}
           MINISIGN_SECRET_KEY: minisign.key
+          # Released apps ship under the production identifier so Notification
+          # Center and TCC permissions survive OTA updates.
+          PILUS_BUNDLE_ID: pilus.kepelet.com
         run: |
           if [ -n "${{ secrets.MINISIGN_SECRET_KEY }}" ]; then
             printf '%s' "${{ secrets.MINISIGN_SECRET_KEY }}" > minisign.key

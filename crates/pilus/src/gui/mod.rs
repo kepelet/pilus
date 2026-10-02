@@ -45,9 +45,10 @@ use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context,
     DisplayId, Div, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent,
     Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Stateful,
-    TextRun, TitlebarOptions, Transformation, Window, WindowBounds, WindowOptions, anchored,
-    deferred, div, font, img, percentage, point, prelude::*, px, size, svg,
+    MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    Stateful, SystemNotification, TextRun, TitlebarOptions, Transformation, Window, WindowBounds,
+    WindowOptions, anchored, deferred, div, font, img, percentage, point, prelude::*, px, size,
+    svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
@@ -311,6 +312,18 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
 
     application().run(move |cx: &mut App| {
         app_icon::install();
+        // Name the process for notification and taskbar identity. Read the
+        // running bundle so a packaged app reports its `Info.plist` value;
+        // this is a no-op on macOS, where the bundle already carries it.
+        cx.set_app_identity(&app_icon::bundle_identifier(), "pilus");
+        // Clicking a notification brings the window forward instead of only
+        // activating the process.
+        cx.on_system_notification_response(|_, cx| {
+            cx.activate(true);
+            if let Some(window) = cx.windows().into_iter().next() {
+                let _ = window.update(cx, |_, window, _| window.activate_window());
+            }
+        });
         // A persisted "this node" choice starts the connector with the app, so
         // it survives closing the Remote Machines window. A failed start clears
         // the flag rather than failing on every launch.
@@ -672,6 +685,14 @@ fn bump_font(settings: &Rc<RefCell<Settings>>, root: &Path, delta: f32, cx: &mut
     cx.refresh_windows();
 }
 
+/// A process-unique tag so a native notification is not replaced by the next
+/// one the daemon pushes.
+fn notification_tag() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("pilus-notify-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 /// Move pilus's own stores out of the Luvus state root the first time the
 /// `~/.pilus` layout is used, so existing projects and settings are not lost.
 fn migrate_legacy_stores(luvus_root: &Path, pilus_root: &Path) {
@@ -1007,6 +1028,9 @@ struct PilusView {
     cols: u16,
     rows: u16,
     status: String,
+    /// Whether this window is frontmost, tracked each render so a daemon push
+    /// can skip a banner the user is already looking at.
+    window_active: bool,
     /// Measured monospace advance width, resolved once from the font.
     cell_width: Option<f32>,
     /// Last cell size pushed to the daemon, so a font change re-sends it even
@@ -1475,6 +1499,7 @@ impl PilusView {
             cols: 120,
             rows: 40,
             status: "connecting…".to_string(),
+            window_active: false,
             cell_width: None,
             sent_cell: (0, 0),
             selection: None,
@@ -2054,6 +2079,7 @@ impl PilusView {
                         changed = true;
                     }
                     if let Some(text) = self.surface.take_notify() {
+                        self.notify_desktop(&text, cx);
                         self.status = text;
                         changed = true;
                     }
@@ -2093,6 +2119,28 @@ impl PilusView {
         }
         self.catalog_dirty |= catalog;
         changed
+    }
+
+    /// Raise a native notification for a daemon push.
+    ///
+    /// Skipped when the user turned notifications off or is already looking at
+    /// this window, where the status line carries the same text. The tag is
+    /// unique so the Notification Center keeps every push rather than
+    /// replacing the last one.
+    fn notify_desktop(&self, text: &str, cx: &mut Context<Self>) {
+        if !self.settings.notifications || self.window_active {
+            return;
+        }
+        let title = match self.connection.identity().session.as_str() {
+            "" => "pilus".to_string(),
+            session => format!("pilus · {session}"),
+        };
+        cx.show_system_notification(SystemNotification {
+            tag: SharedString::from(notification_tag()),
+            title: SharedString::from(title),
+            body: SharedString::from(text.to_string()),
+            actions: Vec::new(),
+        });
     }
 
     /// Re-probe machine reachability off-thread, unless one already runs.
@@ -5007,6 +5055,7 @@ impl PilusView {
                 .child(self.remote_access_section_block(cx))
                 .child(self.machines_section_block(cx))
                 .child(self.agent_config_section_block(cx))
+                .child(self.notifications_section_block(cx))
                 .child(self.updates_section_block(cx))
         };
         let status = self.projects.status().to_string();
@@ -6067,6 +6116,48 @@ impl PilusView {
                 cx.notify();
             }),
         )
+    }
+
+    /// The NOTIFICATIONS section of the page: a single toggle for native
+    /// desktop notifications, persisted immediately.
+    fn notifications_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let on = self.settings.notifications;
+        let toggle = style::toggle("pilus-notifications-toggle", on, theme)
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_notifications(cx)));
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .child(style::section_label(
+                        theme,
+                        "NOTIFICATIONS",
+                        self.section_font(),
+                    ))
+                    .child(toggle),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .text_size(px(self.footer_font()))
+                    .text_color(theme.muted)
+                    .child("Show a desktop notification when the daemon pushes one"),
+            )
+    }
+
+    /// Toggle native notifications and persist the choice at once.
+    fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
+        self.settings.notifications = !self.settings.notifications;
+        self.settings.save(&self.pilus_root);
+        *self.shared_settings.borrow_mut() = self.settings.clone();
+        cx.notify();
     }
 
     /// The UPDATES section of the page: channel, feed override, auto-check,
@@ -10530,6 +10621,7 @@ fn tab_exists(tabs: &[Tab], index: u16) -> bool {
 
 impl Render for PilusView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.window_active = window.is_window_active();
         self.sync_metrics(window);
         self.sync_home();
         self.sync_focus(window, cx);

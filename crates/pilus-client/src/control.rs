@@ -707,7 +707,7 @@ fn read_line_within(stream: Arc<Stream>, deadline: Duration) -> Result<String> {
     let watchdog_stream = Arc::clone(&stream);
     let watchdog_timed_out = Arc::clone(&timed_out);
     thread::Builder::new()
-        .name("l3s-control-timeout".to_string())
+        .name("pilus-control-timeout".to_string())
         .spawn(move || {
             if matches!(
                 done_rx.recv_timeout(deadline),

@@ -385,7 +385,9 @@ fn parse_opencode_models(stdout: &str) -> Vec<AgentModel> {
     for line in stdout.lines() {
         let trimmed = line.trim();
         // A JSON body starts with `{`; a slug line is a bare `provider/model`.
-        if !trimmed.starts_with('{') && trimmed.contains('/') && !trimmed.contains(char::is_whitespace)
+        if !trimmed.starts_with('{')
+            && trimmed.contains('/')
+            && !trimmed.contains(char::is_whitespace)
         {
             flush(&slug, body.trim(), &mut models);
             slug = Some(trimmed.to_string());
@@ -499,9 +501,7 @@ fn parse_codex_models(result: &Value) -> Vec<AgentModel> {
                 .map(|options| {
                     options
                         .iter()
-                        .filter_map(|option| {
-                            option.get("reasoningEffort").and_then(Value::as_str)
-                        })
+                        .filter_map(|option| option.get("reasoningEffort").and_then(Value::as_str))
                         .map(effort_label)
                         .collect()
                 })
@@ -727,7 +727,10 @@ mod tests {
         assert_eq!(config.default_model.as_deref(), Some("B"));
         assert_eq!(config.models[0].efforts, Some(Vec::new()));
         let a = config.model("A").expect("model A");
-        assert_eq!(a.efforts.as_deref(), Some(&["Low".to_string(), "High".to_string()][..]));
+        assert_eq!(
+            a.efforts.as_deref(),
+            Some(&["Low".to_string(), "High".to_string()][..])
+        );
         assert_eq!(config.model("X").expect("model X").efforts, None);
     }
 
@@ -768,7 +771,10 @@ mod tests {
         let models = parse_codex_models(&result);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].name, "GPT X");
-        assert_eq!(models[0].efforts.as_deref(), Some(&["Low".to_string(), "High".to_string()][..]));
+        assert_eq!(
+            models[0].efforts.as_deref(),
+            Some(&["Low".to_string(), "High".to_string()][..])
+        );
         assert_eq!(models[0].default_effort.as_deref(), Some("High"));
         assert!(models[0].is_default);
     }

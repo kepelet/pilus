@@ -1,15 +1,22 @@
 # Architecture
 
-`l3s` is three crates with a one-way dependency chain:
+`pilus` is three crates with a one-way dependency chain, plus a fourth that
+shares the connection layer from the other side:
 
 ```
-l3s (GPUI window)
-  └── l3s-client (socket, handshake, event stream, Surface)
-        └── l3s-protocol (messages, frames, framing)
+pilus (GPUI window)
+  └── pilus-client (socket, handshake, event stream, Surface, UHP)
+        └── pilus-protocol (messages, frames, framing)
+
+pilus-agent (host connector) ──▶ pilus-client
 ```
 
-Nothing in `l3s-protocol` or `l3s-client` knows about GPUI, so the connection
-layer is testable headlessly (see `crates/l3s-client/tests/handshake.rs`).
+`pilus-agent` is the host-side connector described under “Host connector”
+below; it depends on `pilus-client`'s UHP surface and is never in the desktop
+window's dependency chain.
+
+Nothing in `pilus-protocol` or `pilus-client` knows about GPUI, so the connection
+layer is testable headlessly (see `crates/pilus-client/tests/handshake.rs`).
 
 ## Why the client is a thin painter
 
@@ -32,17 +39,17 @@ debug build). Sockets live there:
 <root>/sessions/<name>/luvus-client.sock named session render socket
 ```
 
-`l3s` attaches to the **render** socket (`luvus-client.sock`). `$LUVUS_SESSION`
+`pilus` attaches to the **render** socket (`luvus-client.sock`). `$LUVUS_SESSION`
 selects a session, matching the daemon's own environment convention; `--session`
 and `--socket` override it. When the derived path is too long for `sun_path`,
-both the daemon and `l3s` relocate it to a hashed, owner-scoped alias under the
+both the daemon and `pilus` relocate it to a hashed, owner-scoped alias under the
 temporary directory (`discovery::alias_for`).
 
-When nothing answers at the socket, the daemon isn't running, so `l3s` starts
+When nothing answers at the socket, the daemon isn't running, so `pilus` starts
 it with `luvus [--session NAME] server start` and waits for the socket
 (`autostart::ensure_server`, called from `connect`). The child gets
 `LUVUS_HOME` pinned to the target's state root, so it starts the same daemon
-`l3s` would have attached to. Liveness is checked by dialing, not by file
+`pilus` would have attached to. Liveness is checked by dialing, not by file
 existence, because a stopped server leaves its socket file behind.
 
 ## Handshake
@@ -58,7 +65,7 @@ client → TerminalColors(None)          // only when probe_terminal
 ```
 
 `Welcome` is decoded before the version check so a mismatch still produces a
-readable error. `l3s` paints its own surfaces and reports no terminal palette,
+readable error. `pilus` paints its own surfaces and reports no terminal palette,
 but it must still answer the color probe or the server will not stream frames.
 
 After the handshake the server streams `ServerMessage`s and the client may send
@@ -101,9 +108,9 @@ and never paints from a non-GUI thread.
 ## Client-owned sidebar
 
 By default the daemon renders the workspaces and agents docks into the grid
-like any other panel. `l3s` takes the whole left sidebar instead.
+like any other panel. `pilus` takes the whole left sidebar instead.
 
-**Workspaces.** After the handshake, `l3s` sends:
+**Workspaces.** After the handshake, `pilus` sends:
 
 ```text
 ShellDockLayout { owns_workspaces: true, owns_session_chrome: true, .. }
@@ -123,14 +130,14 @@ session-name slot (`session_button: None`) and exposes no hit target, so the
 native shell draws that top-row chrome itself.
 
 **The agents dock.** The protocol does not project agents, but the daemon sends
-its current layout as `ShellSidebars`. `l3s` drops the `agents` dock from that
+its current layout as `ShellSidebars`. `pilus` drops the `agents` dock from that
 layout, bumps the revision, and sends it back. The daemon then renders no
 agents dock, and the workspaces slot grows to fill the sidebar — the `ShellDock`
 rectangle gets taller, which is where the native panel is painted. This is
 per-connection state; the daemon's own config is untouched.
 
 **Agents.** The live agent list comes from a different surface: UHP on
-`luvus.sock`, method `agent.list`. `l3s-client`'s `ControlClient` speaks the
+`luvus.sock`, method `agent.list`. `pilus-client`'s `ControlClient` speaks the
 newline-delimited `{id, method, params}` protocol. Refreshes are event-driven:
 `AgentFeed` holds an `events.subscribe` stream and re-reads `agent.list`,
 `ui.bar.list`, and `tab.list` only when a structural event arrives, plus a
@@ -183,8 +190,8 @@ one. Only two regions are client-claimable:
 | --- | --- | --- |
 | Workspaces sidebar | yes | `ShellDockLayout.owns_workspaces` |
 | Session-name pill | yes | `ShellDockLayout.owns_session_chrome` |
-| Tab bar (1 row) | no | always drawn; `l3s` covers it |
-| Status line (1 row) | no | always drawn unless width-based mobile mode; `l3s` covers it |
+| Tab bar (1 row) | no | always drawn; `pilus` covers it |
+| Status line (1 row) | no | always drawn unless width-based mobile mode; `pilus` covers it |
 
 There is no `owns_tabs` or `owns_status` flag, no `show_tab_bar`/`hide_chrome`
 config, and no message that reclaims those rows for pane content. The tab bar
@@ -204,12 +211,12 @@ decides how to draw the rows.
 Saved SSH profiles turn one window into several endpoints. A profile is
 owner-local to the local named session (`machines.json` under the state root)
 and is read with `luvus machine list --json`; the CLI remains the authority for
-provisioning and reachability, so `l3s` never installs or replaces a remote
+provisioning and reachability, so `pilus` never installs or replaces a remote
 binary itself.
 
 Each enabled machine becomes one endpoint:
 
-- **Transport.** `l3s-client` spawns `ssh -T -o BatchMode=yes …
+- **Transport.** `pilus-client` spawns `ssh -T -o BatchMode=yes …
   <destination> <remote_binary> [--session NAME] remote-client-bridge` and
   treats the child's stdin/stdout as the same `Stream` a local socket uses
   (`transport::SshTarget`, `machines::connect_machine`). Stderr is drained on a
@@ -220,11 +227,13 @@ Each enabled machine becomes one endpoint:
   whole catalog comes up in parallel; an attempt is recorded, so the slow
   catalog poll never restarts a healthy host, retries a failed one, or probes
   over SSH while every enabled machine is already connected.
-- **Reconnect.** A dropped bridge is retried with bounded exponential backoff
-  and jitter (1 s doubling to a 30 s ceiling), one attempt per machine, and at
-  most three consecutive failures before the row shows `attention` and
-  automatic attempts pause. Clicking the machine resumes immediately and
-  resets the budget; the active machine's replacement bridge is swapped in
+- **Reconnect.** A dropped bridge is retried with capped exponential backoff
+  and jitter (1 s doubling to a 30 s ceiling), one attempt per endpoint and
+  none while one is in flight. Retries continue until a link sticks; a host
+  that answers its probe again has its backoff budget reset so recovery is
+  prompt. The owner-local daemon is an endpoint too: a stopped server is
+  re-attached with backoff and `ensure_server` restarts it, so Local recovers
+  on its own. A reconnect of the endpoint already on screen is swapped in
   place, so its surface is never blanked.
 - **Sidebar and manager.** Workspaces across Local and every connected machine
   render as one flat list (a remote row carries a small server glyph and the
@@ -299,7 +308,7 @@ joined by `\n`, colour expressed only through SGR, with no cursor addressing,
 no scrolling, and no `\r`. `terminal.backend.capture` returns the same text on
 demand, and `terminal.backend.control` sends input back.
 
-So `l3s-client` needs no VT emulator for this path — only an SGR parser. That
+So `pilus-client` needs no VT emulator for this path — only an SGR parser. That
 lives in `ansi.rs` (`ansi::parse(text, lines) -> Screen`), which folds a frame
 into rows of styled runs and which `--probe-uhp` uses to print frames.
 `uhp.rs` wraps the socket: one connection per ordinary request
@@ -320,6 +329,87 @@ event-driven chrome feed.
 
 The binary transport is what the window paints. The daemon emulates the
 terminal and projects finished cells; the client never parses VT output.
+
+## Host connector
+
+`pilus-agent` is the *transport provider* the UHP docs leave to the
+application. The daemon opens no TCP listener, and its access gateway binds
+loopback only, so a remote client needs a host-side process to launch the
+gateway, carry its bytes, and — later — authorize devices. That process is the
+connector.
+
+Its contract is narrow, and deliberately so:
+
+- `Gateway::start` launches `luvus [--session NAME] uhp access [--machines]
+  [--control] [--ttl N] [--no-expiry]`, reads the one-line descriptor, and
+  keeps the child alive. Dropping the gateway kills the child and revokes the
+delegated token.
+- `Descriptor::parse` reads that line against the installed
+  `access.descriptor` schema: `protocol` for the version, `endpoint.host/port`
+  for the address, `pairing.code`, `authority.{mode,scopes,expires_at}` for the
+  granted authority, and `features.machines`. Additive fields are ignored, so a
+  newer daemon does not need a new connector. `tests/live_gateway.rs` exercises
+  a real gateway when one is installed.
+- `proxy` is one transport: a TCP listener that forwards each accepted
+  connection to the gateway loopback, one upstream connection per client to
+  match UHP's one-request-per-connection contract. The connector never parses
+  or rewrites UHP frames past the pairing frame.
+- `p2p` is the other, and the one a phone uses: an iroh/QUIC endpoint
+  (`ALPN = b"luvus/uhp/1"`) whose identity is a persistent Ed25519 key under
+  the state root. Each accepted bidirectional stream is bridged to its own
+  gateway connection, so one QUIC stream is one UHP request. An `EndpointHooks`
+  allow-list rejects peers by `EndpointId` after the handshake, and `serve`
+  prints an `EndpointTicket` a device scans to enroll. Relays default to n0's
+  public servers unless `--relay` names a self-hosted one.
+
+`pilus-client` gained the seam this needs: `Stream::connect_tcp` and
+`ControlTransport::Tcp`, plus `UhpClient::{connect_tcp, with_auth,
+capabilities}`. `auth` rides every envelope when a token is set, and
+`Capabilities` parses the `access.mode`/`allowed_methods` projection a paired
+gateway adds. These are additive: the owner socket path is unchanged.
+
+`tests/live_gateway.rs` proves the descriptor, pairing, and capability
+projection against a real `luvus uhp access`, and `tests/iroh_bridge.rs` proves
+the whole broker: an unenrolled device is refused on the UHP ALPN, enrolls over
+the control ALPN with the printed code, receives the delegated token, and then
+calls `uhp.capabilities` with it. Both skip when no `luvus` binary is installed.
+
+A gateway's pairing code is one-use and short-lived, so a device cannot carry
+it. `enroll` takes over: the connector pairs once with the gateway, keeps the
+delegated token, and hands it to devices it has admitted. A device proves
+itself once with a short code shown on the host over the `luvus/agent/1`
+control ALPN (`{"type":"enroll","code":…}`), and its iroh `EndpointId` is
+persisted as the authorization from then on. Each successful new-device
+enrollment rotates the host-visible code, so the spent code is dead the moment
+one endpoint lands; the host prints the fresh code for the next device.
+`{"type":"token"}` returns the cached token for an enrolled peer; authorized
+peers can also list and remove enrollments with `{"type":"devices"}` and
+`{"type":"revoke"}`. Passing `--allow` with at least one device ID makes the
+run strict: only the configured IDs are authorized, the persisted store is
+never read, and enrollment is disabled. The UHP ALPN rejects unauthorized
+peers; when enrollment is enabled, the control ALPN stays open so a new device
+can present its code. The connector runs the gateway `--no-expiry`, because it
+pairs once and must hold that token for its whole run.
+
+The **Settings** page puts a **REMOTE ACCESS** section above **REMOTE MACHINES**,
+with a `style::toggle` switch backed by `Settings.connector`, **off by default**.
+Turning it on starts the connector and persists the choice; `gui::connector` owns
+one process-wide child so it keeps running after the page closes and starts again
+on the next launch. The instruction line stays put and the connection details
+(`endpoint id`, `enroll` code, `ticket`, each with a Copy button) appear below it
+only while the connector runs. Each machine row in that page gains an **Install
+agent** action that stages this build's `pilus-agent` under a temporary sibling
+beside the verified remote `luvus` binary and renames it into place over SSH;
+a remote platform that does not match this build is refused before any bytes
+move. The action intentionally does not launch an unmanaged background process:
+the UI reports the exact `serve --iroh --control` command to run on that
+machine, so the endpoint, ticket, and enrollment code the agent prints remain
+visible to the user. The separate Remote Machines window
+keeps add/enable/disable/remove.
+
+The connector must be found before any of this works: `scripts/bundle-macos.sh`
+builds and copies `pilus-agent` into `Contents/MacOS/` beside `pilus`, and
+`just build`/`just run` build it too, so the app can start it as a sibling.
 
 ## Mouse and selection
 
@@ -351,6 +441,6 @@ Selection lives in `gui/selection.rs`: it normalizes a reversed drag, answers
   so they are visible but not client-native.
 - Double-click to select a word, and triple-click to select a line.
 - Named-pipe transport on Windows.
-- Remote install/repair from the window: `l3s` connects with an already
+- Remote install/repair from the window: `pilus` connects with an already
   provisioned remote binary and tells you to run `luvus machine enable` when
   one is missing; the machine-create form is not drawn natively yet.

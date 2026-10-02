@@ -1,0 +1,73 @@
+/* Hallmark · Pilus marketing tokens */
+@font-face {
+  font-family: "Geist";
+  src: url("fonts/Geist-Variable.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("fonts/GeistMono-Variable.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: light;
+  --paper: #f7f6f2;
+  --white: #ffffff;
+  --ink: #10100f;
+  --night: #0c0c0b;
+  --night-raised: #171716;
+  --muted: #6f6b66;
+  --soft: #6f6b66;
+  --line: rgba(16, 16, 15, 0.13);
+  --line-dark: rgba(255, 255, 255, 0.12);
+  --amber: #e99a24;
+  --amber-pale: #f5dfb6;
+  --hero-grid: rgba(16, 16, 15, 0.055);
+  --hero-copy-wash: rgba(255, 255, 255, 0.22);
+  --hero-copy-fade: rgba(255, 255, 255, 0.72);
+  --mask-opaque: #000000;
+  --scroll-thumb: #c8c4bd;
+  --ink-subtle: #494744;
+  --paper-hover: #eeece7;
+  --line-strong: rgba(16, 16, 15, 0.24);
+  --night-hover: #292927;
+  --mark-shadow: rgba(16, 16, 15, 0.19);
+  --night-copy: #aaa8a3;
+  --night-dim: #7e7d79;
+  --night-rule-strong: #4e4e4a;
+  --factory-accent-line: rgba(233, 154, 36, 0.5);
+  --factory-accent-surface: #1f1b15;
+  --amber-ink: #9b5b08;
+  --card: #eceae5;
+  --card-copy: #5e5b56;
+  --card-copy-strong: #57544f;
+  --card-wide: #e4e1da;
+  --light-control-hover: #e9e7e2;
+  --dark-control-line: #444441;
+  --dark-control: #1c1c1a;
+  --dark-control-hover-line: #5d5d59;
+  --terminal-rule: #4b4b47;
+  --terminal-copy: #cfcdc8;
+  --terminal-prompt: #e9ad53;
+  --terminal-comment: #8f8d88;
+  --faq-icon: #5b5853;
+  --footer-surface: #efede8;
+  --footer-link: #4c4945;
+  --page: min(1180px, calc(100vw - 40px));
+  --font-sans: "Geist", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", monospace;
+
+  /* Blueprint inset: the explainer section drawn as a technical plan. */
+  --blueprint: var(--night);
+  --blueprint-line: rgba(255, 255, 255, 0.14);
+  --blueprint-grid: rgba(255, 255, 255, 0.028);
+  --blueprint-grid-strong: rgba(255, 255, 255, 0.035);
+  --blueprint-ink: #f2f7fd;
+  --blueprint-copy: rgba(255, 255, 255, 0.62);
+  --blueprint-accent: #79b8ff;
+  --blueprint-link: rgba(255, 255, 255, 0.18);
+}

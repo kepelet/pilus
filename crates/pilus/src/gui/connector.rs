@@ -30,9 +30,13 @@ pub fn default_options() -> ConnectorOptions {
 /// Start the connector for this node if it is not already running.
 pub fn start(options: &ConnectorOptions) -> Result<(), String> {
     let mut guard = lock();
-    if guard.is_some() {
+    if guard
+        .as_mut()
+        .is_some_and(|connector| connector.status().running)
+    {
         return Ok(());
     }
+    guard.take();
     let connector = Connector::start(options).map_err(|error| error.to_string())?;
     *guard = Some(connector);
     Ok(())
@@ -53,7 +57,9 @@ pub fn status() -> ConnectorStatus {
     }
 }
 
-/// Whether a connector child is present.
+/// Whether a connector child is present and still running.
 pub fn running() -> bool {
-    lock().is_some()
+    lock()
+        .as_mut()
+        .is_some_and(|connector| connector.status().running)
 }

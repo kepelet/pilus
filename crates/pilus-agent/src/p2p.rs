@@ -83,7 +83,9 @@ pub async fn bind(
         .bind()
         .await
         .map_err(|error| Error::P2p(error.to_string()))?;
-    endpoint.online().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.online())
+        .await
+        .map_err(|_| Error::Timeout("iroh endpoint startup"))?;
     Ok(endpoint)
 }
 
@@ -114,11 +116,15 @@ pub async fn serve(options: P2pOptions, key_path: &Path, descriptor: &Descriptor
     )?);
     let endpoint = bind(key_path, options.relay.clone(), Arc::clone(&auth)).await?;
     let ticket = EndpointTicket::new(endpoint.addr());
-    let (code, expires_at) = auth.enrollment();
     println!("endpoint id: {}", endpoint.id());
     println!("ticket:      {ticket}");
-    println!("enroll:      {code}");
-    eprintln!("pilus-agent: the enrollment code expires at unix {expires_at}");
+    match auth.enrollment() {
+        Some((code, expires_at)) => {
+            println!("enroll:      {code}");
+            eprintln!("pilus-agent: the enrollment code expires at unix {expires_at}");
+        }
+        None => eprintln!("pilus-agent: enrollment is disabled by --allow"),
+    }
     run(endpoint, options.gateway, auth).await
 }
 

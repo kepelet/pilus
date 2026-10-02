@@ -32,9 +32,10 @@ async fn enrolls_a_device_then_serves_uhp() {
     let _ = std::fs::remove_dir_all(&dir);
     let key_path = dir.join("identity.key");
     let auth = Arc::new(
-        AuthState::load(token.clone(), dir.join("devices.json"), &[], ENROLLMENT_TTL).expect("auth"),
+        AuthState::load(token.clone(), dir.join("devices.json"), &[], ENROLLMENT_TTL)
+            .expect("auth"),
     );
-    let (code, _) = auth.enrollment();
+    let (code, _) = auth.enrollment().expect("enrollment is enabled");
 
     let endpoint = p2p::bind(&key_path, None, Arc::clone(&auth))
         .await
@@ -64,7 +65,9 @@ async fn enrolls_a_device_then_serves_uhp() {
         .expect("control connect");
     let (mut send, mut recv) = control.open_bi().await.expect("open enroll");
     let frame = format!("{{\"type\":\"enroll\",\"code\":\"{code}\",\"label\":\"phone\"}}\n");
-    send.write_all(frame.as_bytes()).await.expect("write enroll");
+    send.write_all(frame.as_bytes())
+        .await
+        .expect("write enroll");
     send.finish().expect("finish enroll");
     let reply = recv.read_to_end(4096).await.expect("read enroll reply");
     let reply: serde_json::Value = serde_json::from_slice(&reply).expect("enroll json");
@@ -90,7 +93,9 @@ async fn enrolls_a_device_then_serves_uhp() {
     let request = format!(
         "{{\"id\":\"1\",\"method\":\"uhp.capabilities\",\"params\":{{}},\"auth\":\"{token}\"}}\n"
     );
-    send.write_all(request.as_bytes()).await.expect("write caps");
+    send.write_all(request.as_bytes())
+        .await
+        .expect("write caps");
     send.finish().expect("finish caps");
     let reply = recv.read_to_end(65536).await.expect("read caps");
     let value: serde_json::Value = serde_json::from_slice(&reply).expect("caps json");

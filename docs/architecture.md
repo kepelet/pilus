@@ -379,11 +379,17 @@ it. `enroll` takes over: the connector pairs once with the gateway, keeps the
 delegated token, and hands it to devices it has admitted. A device proves
 itself once with a short code shown on the host over the `luvus/agent/1`
 control ALPN (`{"type":"enroll","code":…}`), and its iroh `EndpointId` is
-persisted as the authorization from then on. `{"type":"token"}` returns the
-cached token for an enrolled peer; the UHP ALPN rejects any peer that is not
-enrolled while the control ALPN stays open so a new device can present its code.
-The connector runs the gateway `--no-expiry`, because it pairs once and must
-hold that token for its whole run.
+persisted as the authorization from then on. Each successful new-device
+enrollment rotates the host-visible code, so the spent code is dead the moment
+one endpoint lands; the host prints the fresh code for the next device.
+`{"type":"token"}` returns the cached token for an enrolled peer; authorized
+peers can also list and remove enrollments with `{"type":"devices"}` and
+`{"type":"revoke"}`. Passing `--allow` with at least one device ID makes the
+run strict: only the configured IDs are authorized, the persisted store is
+never read, and enrollment is disabled. The UHP ALPN rejects unauthorized
+peers; when enrollment is enabled, the control ALPN stays open so a new device
+can present its code. The connector runs the gateway `--no-expiry`, because it
+pairs once and must hold that token for its whole run.
 
 The **Settings** page puts a **REMOTE ACCESS** section above **REMOTE MACHINES**,
 with a `style::toggle` switch backed by `Settings.connector`, **off by default**.
@@ -392,9 +398,13 @@ one process-wide child so it keeps running after the page closes and starts agai
 on the next launch. The instruction line stays put and the connection details
 (`endpoint id`, `enroll` code, `ticket`, each with a Copy button) appear below it
 only while the connector runs. Each machine row in that page gains an **Install
-agent** action that copies this build's `pilus-agent` beside the verified remote
-`luvus` binary and starts it over SSH; a remote platform that does not match this
-build is refused before any bytes move. The separate Remote Machines window
+agent** action that stages this build's `pilus-agent` under a temporary sibling
+beside the verified remote `luvus` binary and renames it into place over SSH;
+a remote platform that does not match this build is refused before any bytes
+move. The action intentionally does not launch an unmanaged background process:
+the UI reports the exact `serve --iroh --control` command to run on that
+machine, so the endpoint, ticket, and enrollment code the agent prints remain
+visible to the user. The separate Remote Machines window
 keeps add/enable/disable/remove.
 
 The connector must be found before any of this works: `scripts/bundle-macos.sh`

@@ -345,7 +345,10 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                 );
             }
         });
-        cx.on_action(|_: &QuitApp, cx: &mut App| cx.quit());
+        cx.on_action(|_: &QuitApp, cx: &mut App| {
+            connector::stop();
+            cx.quit();
+        });
         cx.on_action(|_: &MinimizeWindow, cx: &mut App| {
             if let Some(window) = cx.active_window() {
                 window
@@ -1169,6 +1172,7 @@ impl PilusView {
         .detach();
         // A quit flushes the frame without waiting for the debounce.
         cx.on_app_quit(|view, _cx| {
+            connector::stop();
             view.settings.save(&view.pilus_root);
             async {}
         })
@@ -5275,7 +5279,7 @@ impl PilusView {
         });
     }
 
-    /// Install and start the connector on `machine` over SSH, off-thread.
+    /// Install the connector on `machine` over SSH, off-thread.
     fn install_machine_page(&mut self, id: String) {
         if self.machine_busy.is_some() {
             return;

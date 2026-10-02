@@ -3,6 +3,8 @@
 //! The server packs a color into a `u32` with a tag in the high byte:
 //! `0` is "use the client default", `1` is an ANSI palette index, and `2` is a
 //! 24-bit sRGB value. [`resolve`] turns any of those into a paintable color.
+//! The sixteen named ANSI slots come from the active theme, so terminal app
+//! output follows the appearance instead of the fixed xterm palette.
 //!
 //! The chrome palette is deliberately near-black with a lighter sidebar,
 //! matching the product mock: the terminal grid stays pure black while panels,
@@ -45,6 +47,8 @@ pub struct Theme {
     pub ok: Rgba,
     /// Error/blocked state.
     pub alert: Rgba,
+    /// The sixteen named ANSI terminal colors, indexed 0-15.
+    pub ansi: [Rgba; 16],
 }
 
 impl Default for Theme {
@@ -68,6 +72,7 @@ impl Default for Theme {
             selection_fg: rgb(0xffffff),
             ok: rgb(0x7fd88f),
             alert: rgb(0xf07178),
+            ansi: ansi_from(&default_palette()),
         }
     }
 }
@@ -95,6 +100,7 @@ impl Theme {
             selection_fg: p.text,
             ok: p.green,
             alert: p.coral,
+            ansi: ansi_from(&p),
         }
     }
 
@@ -103,7 +109,7 @@ impl Theme {
     /// keep the built-in default.
     pub fn from_chrome(chrome: pilus_protocol::MachineFormTheme) -> Self {
         let base = Self::default();
-        let c = |packed, fallback| resolve(packed, fallback);
+        let c = |packed, fallback| resolve(packed, fallback, &base.ansi);
         Self {
             window_bg: c(chrome.accent_text, base.window_bg), // crust
             bg: base.bg,
@@ -121,17 +127,131 @@ impl Theme {
             selection_fg: base.selection_fg,
             ok: base.ok,
             alert: c(chrome.error, base.alert), // coral
+            // The projection names too few roles to rebuild a terminal palette,
+            // so a projected theme keeps the client default's ANSI colors.
+            ansi: base.ansi,
         }
     }
 }
 
-/// Resolve a wire-packed color, falling back to `default` for `Reset`.
-pub fn resolve(packed: u32, default: Rgba) -> Rgba {
+/// The semantic palette behind [`Theme::default`], used to derive its ANSI
+/// colors the same way a vendored theme derives theirs.
+fn default_palette() -> super::scheme::Palette {
+    super::scheme::Palette {
+        crust: rgb(0x060608),
+        mantle: rgb(0x111116),
+        base: rgb(0x121215),
+        surface0: rgb(0x1e1e24),
+        surface1: rgb(0x26262e),
+        overlay0: rgb(0x8e8e9e),
+        overlay1: rgb(0xa0a0b0),
+        subtext0: rgb(0x8e8e9e),
+        subtext1: rgb(0xd8dde9),
+        text: rgb(0xd8dde9),
+        accent: rgb(0x7aa2f7),
+        sel_bg: rgb(0x2f4f7f),
+        border: rgb(0x26262e),
+        border_focus: rgb(0x8c8c96),
+        green: rgb(0x7fd88f),
+        mint: rgb(0x7dcfff),
+        amber: rgb(0xe0af68),
+        coral: rgb(0xf07178),
+    }
+}
+
+/// The sixteen named ANSI colors a Luvus semantic palette implies.
+///
+/// A Luvus theme names no terminal palette, so each slot reuses the role that
+/// already means it (`coral` is red, `mint` is cyan, ...). Blue and magenta are
+/// the two hues the roles never name; both are placed on the standard wheel at
+/// the theme's own chroma, so a light theme gets a light blue rather than the
+/// fixed xterm one. The greys follow the theme's dark or light cast.
+fn ansi_from(p: &super::scheme::Palette) -> [Rgba; 16] {
+    let dark = luminance(p.mantle) < luminance(p.text);
+    let (black, bright_black, white, bright_white) = if dark {
+        (p.crust, p.overlay0, p.subtext1, p.text)
+    } else {
+        (p.text, p.subtext0, p.base, p.crust)
+    };
+    let (sat, val) = chroma([p.coral, p.green, p.amber, p.mint]);
+    let blue = hsv_to_rgb(240.0, sat, val);
+    let magenta = hsv_to_rgb(300.0, sat, val);
+    [
+        black,
+        p.coral,
+        p.green,
+        p.amber,
+        blue,
+        magenta,
+        p.mint,
+        white,
+        bright_black,
+        p.coral,
+        p.green,
+        p.amber,
+        blue,
+        magenta,
+        p.mint,
+        bright_white,
+    ]
+}
+
+/// Rec. 709 relative luminance, for choosing a theme's dark or light greys.
+fn luminance(c: Rgba) -> f32 {
+    0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+}
+
+/// Average saturation and value of the theme's four named hues, so a derived
+/// hue matches the vividness of the colors the theme actually uses.
+fn chroma(colors: [Rgba; 4]) -> (f32, f32) {
+    let mut sat = 0.0;
+    let mut val = 0.0;
+    for c in colors {
+        let max = c.r.max(c.g).max(c.b);
+        let min = c.r.min(c.g).min(c.b);
+        sat += if max > 0.0 { (max - min) / max } else { 0.0 };
+        val += max;
+    }
+    (sat / 4.0, val / 4.0)
+}
+
+/// HSV to RGB; `hue` is degrees, `sat` and `val` are 0..=1.
+fn hsv_to_rgb(hue: f32, sat: f32, val: f32) -> Rgba {
+    let chroma = val * sat;
+    let second = chroma * (1.0 - ((hue / 60.0) % 2.0 - 1.0).abs());
+    let base = val - chroma;
+    let (r, g, b) = match hue {
+        h if h < 60.0 => (chroma, second, 0.0),
+        h if h < 120.0 => (second, chroma, 0.0),
+        h if h < 180.0 => (0.0, chroma, second),
+        h if h < 240.0 => (0.0, second, chroma),
+        h if h < 300.0 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+    Rgba {
+        r: r + base,
+        g: g + base,
+        b: b + base,
+        a: 1.0,
+    }
+}
+
+/// Resolve a wire-packed color.
+///
+/// `Reset` falls back to `default`. The sixteen named ANSI colors come from the
+/// theme's `ansi` palette, so terminal app output follows the appearance; the
+/// 6x6x6 cube and greys (16..=255) stay fixed, as themes do not restyle them.
+pub fn resolve(packed: u32, default: Rgba, ansi: &[Rgba; 16]) -> Rgba {
     match packed >> 24 {
         0 => default,
         1 => {
-            let (r, g, b) = indexed_rgb(packed as u8);
-            rgb(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b))
+            let index = packed as u8;
+            if index < 16 {
+                ansi[usize::from(index)]
+            } else {
+                let (r, g, b) = indexed_rgb(index);
+                rgb(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b))
+            }
         }
         _ => rgb(packed & 0x00ff_ffff),
     }
@@ -180,13 +300,18 @@ mod tests {
 
     #[test]
     fn reset_uses_default() {
+        let theme = Theme::default();
         let default = rgb(0x112233);
-        assert_eq!(resolve(0, default), default);
+        assert_eq!(resolve(0, default, &theme.ansi), default);
     }
 
     #[test]
     fn rgb_tag_round_trips() {
-        assert_eq!(resolve((2 << 24) | 0x00ff_8800, rgb(0)), rgb(0x00ff_8800));
+        let theme = Theme::default();
+        assert_eq!(
+            resolve((2 << 24) | 0x00ff_8800, rgb(0), &theme.ansi),
+            rgb(0x00ff_8800)
+        );
     }
 
     #[test]
@@ -194,5 +319,39 @@ mod tests {
         assert_eq!(indexed_rgb(0), (0, 0, 0));
         assert_eq!(indexed_rgb(231), (255, 255, 255));
         assert_eq!(indexed_rgb(255), (238, 238, 238));
+    }
+
+    #[test]
+    fn named_ansi_colors_follow_the_theme() {
+        let mocha =
+            Theme::from_palette(crate::gui::scheme::builtin("catppuccin-mocha").expect("vendored"));
+        // ANSI 1 (red) is Mocha's coral, not xterm's #cd0000.
+        assert_eq!(resolve(0x0100_0001, mocha.bg, &mocha.ansi), mocha.ansi[1]);
+        assert_ne!(mocha.ansi[1], rgb(0xcd_0000));
+        // The 6x6x6 cube and greys stay on the fixed xterm palette.
+        assert_eq!(resolve(0x0100_0010, mocha.bg, &mocha.ansi), rgb(0));
+    }
+
+    #[test]
+    fn light_themes_keep_dark_ansi_black() {
+        let latte =
+            Theme::from_palette(crate::gui::scheme::builtin("catppuccin-latte").expect("vendored"));
+        assert!(
+            luminance(latte.ansi[0]) < luminance(latte.ansi[7]),
+            "ANSI black must stay darker than ANSI white on a light theme"
+        );
+    }
+
+    #[test]
+    fn derived_blue_and_magenta_are_distinct() {
+        let theme = Theme::default();
+        assert_ne!(
+            theme.ansi[4], theme.ansi[1],
+            "blue must not collapse to red"
+        );
+        assert_ne!(
+            theme.ansi[5], theme.ansi[4],
+            "magenta must differ from blue"
+        );
     }
 }

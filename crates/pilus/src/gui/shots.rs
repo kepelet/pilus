@@ -88,7 +88,7 @@ pub fn run() -> Result<()> {
         &mut cx,
         "playground",
         820.0,
-        3400.0,
+        3600.0,
         Duration::ZERO,
         |window, cx| {
             cx.new(|cx| {

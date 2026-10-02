@@ -8867,6 +8867,7 @@ impl Render for PilusView {
                         layout.cols,
                         layout.rows,
                         theme.bg,
+                        &theme.ansi,
                     )
                 })
                 .unwrap_or(theme.bg)
@@ -9276,8 +9277,8 @@ fn style_of(
     cursor: bool,
     selected: bool,
 ) -> (gpui::Rgba, gpui::Rgba, u16) {
-    let mut fg = theme::resolve(cell.fg, theme.fg);
-    let mut bg = theme::resolve(cell.bg, theme.bg);
+    let mut fg = theme::resolve(cell.fg, theme.fg, &theme.ansi);
+    let mut bg = theme::resolve(cell.bg, theme.bg, &theme.ansi);
     let mut mods = cell.mods;
     if cursor {
         // A caret block is the cell's declared foreground painted as the
@@ -9337,6 +9338,7 @@ fn terminal_background(
     max_cols: u16,
     max_rows: u16,
     fallback: gpui::Rgba,
+    ansi: &[gpui::Rgba; 16],
 ) -> gpui::Rgba {
     use std::collections::HashMap;
     // TUI screens use a handful of backgrounds, so count the first few with a
@@ -9359,7 +9361,7 @@ fn terminal_background(
         let start = row * width + skip;
         let end = (start + usize::from(max_cols)).min((row + 1) * width);
         for cell in frame.cells.get(start..end).unwrap_or(&[]) {
-            let color = theme::resolve(cell.bg, fallback);
+            let color = theme::resolve(cell.bg, fallback, ansi);
             let key = color_key(color);
             if let Some(map) = wide.as_mut() {
                 map.entry(key).or_insert((0, color)).0 += 1;
@@ -9798,6 +9800,21 @@ mod tests {
     }
 
     #[test]
+    fn ansi_cells_resolve_through_the_active_theme() {
+        // The same ANSI red cell must paint differently under two themes, so
+        // terminal app output follows the appearance instead of fixed xterm.
+        let mocha = Theme::from_palette(scheme::builtin("catppuccin-mocha").expect("vendored"));
+        let latte = Theme::from_palette(scheme::builtin("catppuccin-latte").expect("vendored"));
+        let mut red = cell(0);
+        red.fg = 0x0100_0001; // ANSI 1
+        let (mocha_fg, _, _) = style_of(&red, mocha, false, false);
+        let (latte_fg, _, _) = style_of(&red, latte, false, false);
+        assert_eq!(mocha_fg, mocha.ansi[1]);
+        assert_eq!(latte_fg, latte.ansi[1]);
+        assert_ne!(mocha_fg, latte_fg);
+    }
+
+    #[test]
     fn terminal_background_takes_the_dominant_cell_color() {
         let theme = Theme::default();
         let mut frame = FrameData::blank(4, 4, 0, 0);
@@ -9806,14 +9823,16 @@ mod tests {
         }
         frame.cells[0].bg = 0;
         assert_eq!(
-            terminal_background(&frame, 0, 4, 2, theme.bg),
-            theme::resolve(0x0218_1825, theme.bg)
+            terminal_background(&frame, 0, 4, 2, theme.bg, &theme.ansi),
+            theme::resolve(0x0218_1825, theme.bg, &theme.ansi)
         );
     }
 
     #[test]
     fn terminal_background_merges_equivalent_encodings() {
-        let theme = Theme::default();
+        // Pin ANSI black to true black so all three encodings below agree.
+        let mut theme = Theme::default();
+        theme.ansi[0] = gpui::rgb(0);
         let mut frame = FrameData::blank(4, 4, 0, 0);
         for cell in &mut frame.cells {
             cell.bg = 0x021e_1e2e;
@@ -9825,8 +9844,8 @@ mod tests {
         frame.cells[2 * 4 + 1].bg = 0x0100_0010; // palette 16
         frame.cells[2 * 4 + 2].bg = 0x0200_0000; // sRGB black
         assert_eq!(
-            terminal_background(&frame, 0, 4, 2, theme.bg),
-            theme::resolve(0x0200_0000, theme.bg)
+            terminal_background(&frame, 0, 4, 2, theme.bg, &theme.ansi),
+            theme::resolve(0x0200_0000, theme.bg, &theme.ansi)
         );
     }
 

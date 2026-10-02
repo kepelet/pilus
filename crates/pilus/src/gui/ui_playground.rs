@@ -587,6 +587,55 @@ impl UiPlaygroundView {
         grid
     }
 
+    /// The sixteen named ANSI terminal colors the grid resolves against.
+    fn ansi_colors(&self) -> Div {
+        let theme = self.theme;
+        const NAMES: [&str; 16] = [
+            "black",
+            "red",
+            "green",
+            "yellow",
+            "blue",
+            "magenta",
+            "cyan",
+            "white",
+            "br black",
+            "br red",
+            "br green",
+            "br yellow",
+            "br blue",
+            "br magenta",
+            "br cyan",
+            "br white",
+        ];
+        let mut grid = div().flex().flex_row().flex_wrap().gap_3();
+        for (index, name) in NAMES.iter().enumerate() {
+            grid = grid.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .w(px(88.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(36.0))
+                            .rounded_md()
+                            .bg(theme.ansi[index])
+                            .border_1()
+                            .border_color(theme.border),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(style::scaled(&self.settings, 10.0)))
+                            .text_color(theme.muted)
+                            .child(*name),
+                    ),
+            );
+        }
+        grid
+    }
+
     /// A representative saved-machine row.
     fn machine_row(&self) -> Div {
         let theme = self.theme;
@@ -1476,6 +1525,7 @@ impl Render for UiPlaygroundView {
             .gap_6()
             .p_6()
             .child(self.section("COLORS", self.colors()))
+            .child(self.section("ANSI", self.ansi_colors()))
             .child(self.section("CONTAINERS", self.containers()))
             .child(self.section("DIVIDERS", self.divider_demos()))
             .child(self.section(

@@ -7,7 +7,10 @@
 
 use super::text_input::TextField;
 
-/// The pickers in the composer, in the order they read across it.
+/// The pickers in the composer.
+///
+/// `Agent` is state-only: the composer resolves it from the selected machine's
+/// installed agents and shows no chip for it, so it is not part of `ALL`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HomeField {
     Agent,
@@ -19,14 +22,17 @@ pub enum HomeField {
 }
 
 impl HomeField {
-    /// Every picker, left to right.
-    pub const ALL: [HomeField; 6] = [
-        HomeField::Agent,
+    /// Every picker the composer can focus, in chip order.
+    ///
+    /// `Agent` is state-only: the composer derives it from the selected
+    /// machine's installed agents, so it no longer has a chip or a stop in the
+    /// focus cycle.
+    pub const ALL: [HomeField; 5] = [
+        HomeField::Project,
         HomeField::Model,
         HomeField::Effort,
         HomeField::Base,
         HomeField::Branch,
-        HomeField::Project,
     ];
 
     /// The chip label.
@@ -57,9 +63,7 @@ impl HomeFocus {
     fn index(self) -> usize {
         match self {
             Self::Prompt => 0,
-            Self::Picker(field) => {
-                1 + HomeField::ALL.iter().position(|f| *f == field).unwrap_or(0)
-            }
+            Self::Picker(field) => 1 + HomeField::ALL.iter().position(|f| *f == field).unwrap_or(0),
         }
     }
 
@@ -170,7 +174,12 @@ pub struct HomePanel {
 impl Default for HomePanel {
     fn default() -> Self {
         let mut base = Choice::default();
-        base.set(BaseMode::ALL.iter().map(|mode| mode.label().to_string()).collect());
+        base.set(
+            BaseMode::ALL
+                .iter()
+                .map(|mode| mode.label().to_string())
+                .collect(),
+        );
         Self {
             open: false,
             prompt: TextField::default(),
@@ -445,11 +454,11 @@ mod tests {
         let mut home = HomePanel::default();
         assert_eq!(home.focus(), HomeFocus::Prompt);
         home.focus_prev();
-        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Project));
+        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Branch));
         home.focus_next();
         assert_eq!(home.focus(), HomeFocus::Prompt);
         home.focus_next();
-        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Agent));
+        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Project));
     }
 
     #[test]

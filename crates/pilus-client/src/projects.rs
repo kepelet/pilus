@@ -194,6 +194,30 @@ pub fn current_branch(cwd: &str) -> Option<String> {
     (!branch.is_empty()).then_some(branch)
 }
 
+/// Initialize a git repository at `path`, creating the directory if needed.
+///
+/// A project-less Home session gets its own repository so the agent has an
+/// isolated tree to commit into. Failures return the human error to show.
+pub fn init_repository(path: &Path) -> std::result::Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|error| format!("couldn't create {}: {error}", path.display()))?;
+    let output = std::process::Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .arg(path)
+        .output()
+        .map_err(|error| format!("couldn't run git: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        "git init failed".to_string()
+    } else {
+        stderr
+    })
+}
+
 /// List `cwd`'s local branch names on this machine, most recent first.
 ///
 /// Returns an empty list outside a git repository. The first entry is not

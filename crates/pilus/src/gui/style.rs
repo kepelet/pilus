@@ -63,6 +63,11 @@ pub(super) fn chrome_font(settings: &Rc<RefCell<Settings>>) -> Font {
     }
 }
 
+/// The monospace family for machine text: paths, branches, and cwds.
+pub(super) fn mono_family(settings: &Rc<RefCell<Settings>>) -> String {
+    settings.borrow().terminal_font.clone()
+}
+
 /// A section label: small, bold, and muted. Labels are uppercase by convention.
 pub(super) fn section_label(theme: Theme, text: impl IntoElement, size: f32) -> Div {
     div()

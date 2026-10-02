@@ -29,20 +29,20 @@ pub use control::{
     FeedScope, FeedUpdate, Tab, TaskSummary, ThemeInfo,
 };
 pub use discovery::{
-    HOME_ENV, PILUS_HOME_ENV, SessionInfo, active_session, api_socket_path_for, client_socket_path_for,
-    client_socket_path_under, config_dir, describe, generate_session_name, pilus_config_dir,
-    pilus_workspaces_dir, list_session_infos, list_sessions, luvus_binary, session_dir_for,
-    split_client_socket, validate_session,
+    HOME_ENV, PILUS_HOME_ENV, SessionInfo, active_session, api_socket_path_for,
+    client_socket_path_for, client_socket_path_under, config_dir, describe, generate_session_name,
+    list_session_infos, list_sessions, luvus_binary, pilus_config_dir, pilus_workspaces_dir,
+    session_dir_for, split_client_socket, validate_session,
 };
 pub use error::{Error, Result};
-pub use pilus_protocol as protocol;
 pub use machines::{MachineInfo, connect_machine, install_agent, list_machines, refresh_machines};
+pub use pilus_protocol as protocol;
 pub use projects::{
     Project, RemoteBranches, RemoteRepos, common_git_dir, common_git_dirs_remote, current_branch,
     current_branches_remote, expand_local as expand_project_local,
-    expand_remote as expand_project_remote, id_for_name as project_id_for_name, list_branches,
-    list_branches_remote,
-    load_projects, projects_file, save_projects, validate as validate_project,
+    expand_remote as expand_project_remote, id_for_name as project_id_for_name, init_repository,
+    list_branches, list_branches_remote, load_projects, projects_file, save_projects,
+    validate as validate_project,
 };
 pub use surface::{Surface, SurfaceChange};
 pub use transport::SshTarget;

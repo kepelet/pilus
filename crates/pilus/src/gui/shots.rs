@@ -286,6 +286,243 @@ pub fn run_main() -> Result<()> {
     settle(&mut cx, 4);
     capture(&mut cx, window.into(), "main-palette")?;
 
+    // The WORKSPACES row context menu, with the keyboard cursor on Close,
+    // and its Quick Actions submenu underneath.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.palette.close();
+            if let Some(workspace) = view.surface.workspaces().first() {
+                view.open_context_menu(
+                    super::sidebar_menu::MenuTarget::Workspace {
+                        endpoint: view.active.key(),
+                        workspace_id: workspace.id.clone(),
+                        index: workspace.index,
+                        name: workspace.name.clone(),
+                        cwd: workspace.cwd.clone(),
+                        branch: workspace.branch.clone(),
+                    },
+                    point(px(96.0), px(150.0)),
+                    cx,
+                );
+                if let Some(menu) = view.context_menu.as_mut() {
+                    menu.selected = Some(0);
+                }
+            }
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 4);
+    capture(&mut cx, window.into(), "main-workspace-menu")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            if let Some(menu) = view.context_menu.as_mut() {
+                menu.quick_open = true;
+                menu.selected = None;
+            }
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    capture(&mut cx, window.into(), "main-workspace-menu-copy")?;
+
+    // Walk every WORKSPACES row and capture the first menu whose linked-
+    // checkout probe confirms a worktree: the Delete Worktree row must render
+    // there. The probe runs on a background thread and is drained by the poll
+    // loop, so give it real time, then check through the view's own rows.
+    let rows: Vec<(String, String, u16, String, String, Option<String>)> = cx.update(|app| {
+        view.update(app, |view, _| {
+            view.endpoint_workspaces(&view.active)
+                .iter()
+                .map(|workspace| {
+                    (
+                        workspace.id.clone(),
+                        workspace.name.clone(),
+                        workspace.index,
+                        view.active.key(),
+                        workspace.cwd.clone(),
+                        workspace.branch.clone(),
+                    )
+                })
+                .collect()
+        })
+    });
+    let mut captured_delete = false;
+    for (id, name, index, endpoint, cwd, branch) in rows {
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.open_context_menu(
+                    super::sidebar_menu::MenuTarget::Workspace {
+                        endpoint: endpoint.clone(),
+                        workspace_id: id.clone(),
+                        index,
+                        name: name.clone(),
+                        cwd: cwd.clone(),
+                        branch: branch.clone(),
+                    },
+                    point(px(96.0), px(150.0)),
+                    cx,
+                );
+            });
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        settle(&mut cx, 10);
+        let shows_delete = cx.update(|app| {
+            view.update(app, |view, _| {
+                view.menu_rows()
+                    .contains(&super::SidebarItem::DeleteWorktree)
+            })
+        });
+        if shows_delete && !captured_delete {
+            capture(&mut cx, window.into(), "main-workspace-menu-delete")?;
+            captured_delete = true;
+        }
+        cx.update(|app| {
+            view.update(app, |view, _| view.close_context_menu());
+        });
+        if captured_delete {
+            break;
+        }
+    }
+
+    // The AGENTS row context menu. The dev daemon may have no live agent, so
+    // the row is injected like the crowded-tab capture does; the daemon is
+    // untouched and the real list comes back on the next feed.
+    let saved_agents: Rc<RefCell<Option<Vec<pilus_client::Agent>>>> = Rc::new(RefCell::new(None));
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            if view.agents.is_empty() {
+                let workspace_id = view
+                    .surface
+                    .workspaces()
+                    .iter()
+                    .find(|workspace| workspace.active)
+                    .map(|workspace| workspace.id.clone())
+                    .unwrap_or_default();
+                *saved_agents.borrow_mut() = Some(std::mem::replace(
+                    &mut view.agents,
+                    vec![pilus_client::Agent {
+                        agent: "claude".to_string(),
+                        status: "working".to_string(),
+                        workspace_id,
+                        cwd: "~/Developer/project-2".to_string(),
+                        ..pilus_client::Agent::default()
+                    }],
+                ));
+                cx.notify();
+            }
+        });
+    });
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            if let Some(agent) = view.agents.first() {
+                view.open_context_menu(
+                    super::sidebar_menu::MenuTarget::Agent {
+                        endpoint: view.active.key(),
+                        pane: agent.pane.clone(),
+                        name: agent.name.clone(),
+                    },
+                    point(px(96.0), px(280.0)),
+                    cx,
+                );
+            }
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 4);
+    capture(&mut cx, window.into(), "main-agent-menu")?;
+    cx.update(|app| {
+        view.update(app, |view, _| {
+            view.close_context_menu();
+            if let Some(agents) = saved_agents.borrow_mut().take() {
+                view.agents = agents;
+            }
+        });
+    });
+
+    // The Delete Worktree confirm. The row only appears on confirmed linked
+    // checkouts, so the cache is seeded for the first row and the confirm is
+    // opened directly; the daemon is never asked to remove anything.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            if let Some(workspace) = view.surface.workspaces().first() {
+                let endpoint = view.active.clone();
+                let path = view.expand_cwd(&endpoint.key(), &workspace.cwd);
+                view.worktree_linked
+                    .insert((endpoint.key(), workspace.id.clone()), Some(path.clone()));
+                view.open_menu_prompt(
+                    super::PromptAction::DeleteWorktree {
+                        endpoint,
+                        path,
+                        workspace_id: workspace.id.clone(),
+                        name: workspace.name.clone(),
+                        dirty: false,
+                        blockers: None,
+                    },
+                    "Delete Worktree",
+                    "",
+                    "",
+                    cx,
+                );
+            }
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 4);
+    capture(&mut cx, window.into(), "main-worktree-delete")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            if let Some(workspace) = view.surface.workspaces().first() {
+                let endpoint = view.active.clone();
+                let path = view.expand_cwd(&endpoint.key(), &workspace.cwd);
+                view.open_menu_prompt(
+                    super::PromptAction::DeleteWorktree {
+                        endpoint,
+                        path,
+                        workspace_id: workspace.id.clone(),
+                        name: workspace.name.clone(),
+                        dirty: true,
+                        blockers: None,
+                    },
+                    "Delete Worktree Anyway",
+                    "",
+                    "",
+                    cx,
+                );
+            }
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 4);
+    capture(&mut cx, window.into(), "main-worktree-delete-dirty")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            if let Some(workspace) = view.surface.workspaces().first() {
+                let endpoint = view.active.clone();
+                let path = view.expand_cwd(&endpoint.key(), &workspace.cwd);
+                view.open_menu_prompt(
+                    super::PromptAction::DeleteWorktree {
+                        endpoint,
+                        path,
+                        workspace_id: workspace.id.clone(),
+                        name: workspace.name.clone(),
+                        dirty: true,
+                        blockers: Some("agent claude is working in pane 7".to_string()),
+                    },
+                    "Delete Worktree Anyway",
+                    "",
+                    "",
+                    cx,
+                );
+            }
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 4);
+    capture(&mut cx, window.into(), "main-worktree-delete-busy")?;
+    cx.update(|app| {
+        view.update(app, |view, _| view.menu_prompt = None);
+    });
+
     // The Home composer.
     cx.update(|app| {
         view.update(app, |view, cx| {

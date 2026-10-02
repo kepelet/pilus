@@ -218,6 +218,64 @@ pub fn init_repository(path: &Path) -> std::result::Result<(), String> {
     })
 }
 
+/// Run `git -C <path> <args>` on this machine, or on `target`'s host.
+///
+/// Returns stdout; a failure carries git's own stderr so the window can show
+/// why. The remote path is quoted for the remote shell.
+fn git_in(
+    target: Option<&crate::transport::SshTarget>,
+    path: &str,
+    args: &[&str],
+) -> std::result::Result<String, String> {
+    let output = match target {
+        None => std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output(),
+        Some(target) => target
+            .shell(&format!("git -C {} {}", sh_quote(path), args.join(" ")))
+            .output(),
+    }
+    .map_err(|error| format!("couldn't run git: {error}"))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        format!("git {} failed", args.first().copied().unwrap_or(""))
+    } else {
+        stderr
+    })
+}
+
+/// Whether the checkout at `path` holds modified or untracked files.
+///
+/// The daemon refuses to remove such a worktree whatever `force` says, and
+/// its answer arrives only after deleting would have begun, so the window asks
+/// git first. An error means the state is unknown, which callers must treat
+/// as unsafe rather than as clean.
+pub fn worktree_is_dirty(
+    target: Option<&crate::transport::SshTarget>,
+    path: &str,
+) -> std::result::Result<bool, String> {
+    git_in(target, path, &["status", "--porcelain"]).map(|out| !out.trim().is_empty())
+}
+
+/// Throw away every uncommitted change in the checkout at `path`, tracked and
+/// untracked, so the daemon's own removal no longer refuses it.
+///
+/// Ignored files stay: git does not count them against a removal. Only call
+/// this after the user confirmed discarding the work.
+pub fn discard_worktree_changes(
+    target: Option<&crate::transport::SshTarget>,
+    path: &str,
+) -> std::result::Result<(), String> {
+    git_in(target, path, &["reset", "--hard", "--quiet"])?;
+    git_in(target, path, &["clean", "-ffdq"])?;
+    Ok(())
+}
+
 /// List `cwd`'s local branch names on this machine, most recent first.
 ///
 /// Returns an empty list outside a git repository. The first entry is not
@@ -551,6 +609,39 @@ mod tests {
             Some("/x/y/.git".to_string())
         );
         assert_eq!(normalize_common("/a/b", "  \n "), None);
+    }
+
+    #[test]
+    fn dirty_checkout_is_detected_and_discarded() {
+        let dir = std::env::temp_dir().join(format!("pilus-dirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        init_repository(&dir).expect("init");
+        let path = dir.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            git_in(None, &path, args).expect("git");
+        };
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("tracked.txt"), "one").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "init"]);
+        assert_eq!(worktree_is_dirty(None, &path), Ok(false));
+
+        std::fs::write(dir.join("tracked.txt"), "two").expect("edit");
+        std::fs::write(dir.join("untracked.txt"), "x").expect("write");
+        assert_eq!(worktree_is_dirty(None, &path), Ok(true));
+
+        discard_worktree_changes(None, &path).expect("discard");
+        assert_eq!(worktree_is_dirty(None, &path), Ok(false));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("tracked.txt")).expect("read"),
+            "one"
+        );
+        assert!(!dir.join("untracked.txt").exists());
+
+        let missing = dir.join("missing").to_string_lossy().into_owned();
+        assert!(worktree_is_dirty(None, &missing).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

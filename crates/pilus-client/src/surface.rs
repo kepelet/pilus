@@ -77,6 +77,20 @@ impl Surface {
         &self.workspaces
     }
 
+    /// Update a workspace's projected label in place.
+    ///
+    /// A rename reads immediately instead of waiting for the daemon's next
+    /// catalog projection; the authoritative refresh will confirm it.
+    pub fn rename_workspace(&mut self, workspace_id: &str, name: &str) {
+        if let Some(workspace) = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        {
+            workspace.name = name.to_string();
+        }
+    }
+
     /// The exact rectangle the daemon blanked for the client-owned workspaces
     /// dock, in cell coordinates.
     pub fn shell_dock(&self) -> Option<ShellDockRect> {
@@ -198,6 +212,29 @@ mod tests {
         );
         assert_eq!(surface.take_clipboard().as_deref(), Some("hi"));
         assert!(surface.take_clipboard().is_none());
+    }
+
+    #[test]
+    fn a_local_rename_updates_the_projected_label() {
+        let mut surface = Surface::new();
+        let workspace = ShellWorkspace {
+            dot: "●".into(),
+            dot_color: 0,
+            id: "ws1".into(),
+            index: 0,
+            name: "api".into(),
+            cwd: "/repo/api".into(),
+            branch: Some("main".into()),
+            active: true,
+            selected: false,
+            nested: false,
+        };
+        surface.apply(&ServerMessage::ShellWorkspaces(vec![workspace]));
+        surface.rename_workspace("ws1", "assets");
+        assert_eq!(surface.workspaces()[0].name, "assets");
+        // A rename for an id the catalog does not know is a no-op.
+        surface.rename_workspace("missing", "nope");
+        assert_eq!(surface.workspaces().len(), 1);
     }
 
     #[test]

@@ -21,7 +21,7 @@ fn reads_and_commands_over_one_connection_per_request() {
 
     let listener = UnixListener::bind(&socket).expect("bind");
     let server = thread::spawn(move || {
-        for _ in 0..6 {
+        for _ in 0..15 {
             let (stream, _) = listener.accept().expect("accept");
             let mut reader = BufReader::new(stream.try_clone().expect("clone"));
             let mut writer = stream;
@@ -94,6 +94,53 @@ fn reads_and_commands_over_one_connection_per_request() {
                     assert_eq!(request["params"]["pane"], "4");
                     serde_json::json!({ "type": "pane_focus", "pane": "4" })
                 }
+                "workspace.rename" => {
+                    assert_eq!(request["params"]["workspace_id"], "ws1");
+                    assert_eq!(request["params"]["name"], "assets");
+                    serde_json::json!({ "type": "ok" })
+                }
+                "workspace.pin" => {
+                    assert_eq!(request["params"]["workspace_id"], "ws1");
+                    assert_eq!(request["params"]["pinned"], true);
+                    serde_json::json!({ "type": "ok" })
+                }
+                "workspace.close" => {
+                    assert_eq!(request["params"]["workspace_id"], "ws2");
+                    serde_json::json!({ "type": "ok" })
+                }
+                "pane.close" => {
+                    assert_eq!(request["params"]["pane"], "4");
+                    serde_json::json!({ "type": "ok" })
+                }
+                "agent.name" if request["params"]["clear"] == true => {
+                    assert_eq!(request["params"]["pane"], "2");
+                    serde_json::json!({ "type": "agent_name", "pane": "2", "name": null })
+                }
+                "agent.name" => {
+                    assert_eq!(request["params"]["pane"], "2");
+                    assert_eq!(request["params"]["name"], "auth-fix");
+                    serde_json::json!({ "type": "agent_name", "pane": "2", "name": "auth-fix" })
+                }
+                "worktree.create" => {
+                    assert_eq!(request["params"]["workspace"], 3);
+                    assert_eq!(request["params"]["branch"], "fix-branch");
+                    serde_json::json!({ "type": "ok", "path": "/repo/fix-branch" })
+                }
+                "worktree.list" => {
+                    assert_eq!(request["params"]["workspace"], 0);
+                    serde_json::json!({
+                        "type": "worktree_list",
+                        "worktrees": [
+                            { "path": "/repo", "branch": "main", "head": "abc", "main": true },
+                            { "path": "/repo/fix-branch", "branch": "fix-branch", "head": "def", "main": false }
+                        ]
+                    })
+                }
+                "worktree.remove" => {
+                    assert_eq!(request["params"]["path"], "/repo/fix-branch");
+                    assert_eq!(request["params"]["force"], true);
+                    serde_json::json!({ "type": "ok" })
+                }
                 other => panic!("unexpected method: {other}"),
             };
             let response = serde_json::json!({ "id": request["id"], "result": result });
@@ -134,5 +181,26 @@ fn reads_and_commands_over_one_connection_per_request() {
     client.focus_tab(1).expect("focus tab");
 
     client.focus_pane("4").expect("focus pane");
+
+    client
+        .rename_workspace("ws1", "assets")
+        .expect("rename workspace");
+    client.pin_workspace("ws1", true).expect("pin workspace");
+    client.close_workspace("ws2").expect("close workspace");
+    client.close_pane("4").expect("close pane");
+    client.name_agent("2", "auth-fix").expect("name agent");
+    client.clear_agent_name("2").expect("clear agent name");
+    client
+        .create_worktree_for(3, "fix-branch")
+        .expect("worktree for workspace");
+
+    let worktrees = client.worktrees(0).expect("worktree list");
+    assert_eq!(worktrees.len(), 2);
+    assert!(worktrees[0].main);
+    assert_eq!(worktrees[1].path, "/repo/fix-branch");
+    assert!(!worktrees[1].main);
+    client
+        .remove_worktree("/repo/fix-branch", true)
+        .expect("remove worktree");
     server.join().expect("server thread");
 }

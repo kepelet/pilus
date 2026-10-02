@@ -19,6 +19,7 @@ mod scheme;
 mod selection;
 #[cfg(feature = "visual-test")]
 pub(crate) mod shots;
+mod sidebar_menu;
 pub(crate) mod sound;
 mod style;
 mod text_input;
@@ -56,17 +57,18 @@ use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use pilus_client::{
     Agent, AgentConfig, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent,
     ConnectTarget, Connection, ConnectorStatus, ControlClient, HOME_ENV, MachineInfo, Project,
-    SessionInfo, SshTarget, Surface, SurfaceChange, Tab, TaskSummary, agent_binary, common_git_dir,
-    common_git_dirs_remote, config_dir, connect_machine, current_branch, current_branches_remote,
-    expand_project_local, expand_project_remote, generate_session_name, install_agent,
-    list_branches, list_branches_remote, list_machines, list_session_infos, luvus_binary,
-    pilus_config_dir, refresh_machines, split_client_socket,
+    SessionInfo, SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary,
+    common_git_dir, common_git_dirs_remote, config_dir, connect_machine, current_branch,
+    current_branches_remote, expand_project_local, expand_project_remote, generate_session_name,
+    install_agent, list_branches, list_branches_remote, list_machines, list_session_infos,
+    luvus_binary, pilus_config_dir, refresh_machines, split_client_socket,
 };
 use pilus_protocol::{
     CellData, ClientMessage, FrameData, ShellSidebars, ShellWorkspace, SurfaceInterest,
 };
 use projects::{ProjectField, ProjectsPanel};
 use selection::{Cell, Selection};
+use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
 use text_input::{TextField, TextInput};
 use theme::Theme;
 use updater::Updater;
@@ -894,6 +896,91 @@ struct Reconnect {
     next_at: Instant,
 }
 
+/// What a context-menu prompt asks for; its answer runs on the same endpoint
+/// the right-clicked row lives on.
+#[derive(Clone, Debug)]
+enum PromptAction {
+    /// Rename a workspace's display label.
+    RenameWorkspace {
+        endpoint: EndpointId,
+        workspace_id: String,
+    },
+    /// Give a live agent's pane an addressable alias (`agent.name`).
+    RenameAgent { endpoint: EndpointId, pane: String },
+    /// Create a linked worktree of the right-clicked workspace's repo.
+    NewWorktree { endpoint: EndpointId, index: u16 },
+    /// Delete a linked worktree (and its files) after the confirm prompt.
+    DeleteWorktree {
+        endpoint: EndpointId,
+        /// Absolute checkout path; `worktree.remove` resolves it against git.
+        path: String,
+        /// The row's stable id, so the in-use guard can exempt the target.
+        workspace_id: String,
+        /// Display name for the confirmation and status line.
+        name: String,
+        /// The checkout holds uncommitted work, found on the first confirm;
+        /// the second, stronger confirm discards it.
+        dirty: bool,
+        /// What the daemon says still uses the worktree (working agent panes,
+        /// unfinished tasks, leases), found on the first confirm.
+        blockers: Option<String>,
+    },
+}
+
+impl PromptAction {
+    /// Whether this is the second, stronger delete confirm, the only one that
+    /// may discard work or stop what is still running.
+    fn escalated(&self) -> bool {
+        matches!(
+            self,
+            Self::DeleteWorktree { dirty, blockers, .. } if *dirty || blockers.is_some()
+        )
+    }
+}
+
+/// What the first delete confirm found that needs a second, explicit yes.
+struct DeleteEscalation {
+    endpoint: EndpointId,
+    path: String,
+    workspace_id: String,
+    name: String,
+    dirty: bool,
+    blockers: Option<String>,
+}
+
+/// One background context-menu operation's outcome, folded into the status
+/// line so a slow SSH round trip never blocks the window.
+struct MenuOpResult {
+    /// Status-line text when the operation finished.
+    ok: String,
+    /// Error text, or `None` when it succeeded.
+    error: Option<String>,
+    /// A workspace rename — `(workspace id, new label)` — so the projected
+    /// catalog updates without waiting for the next daemon projection.
+    renamed_workspace: Option<(String, String)>,
+    /// An agent alias change — `(endpoint key, pane, new alias)` — so the
+    /// AGENTS row updates immediately.
+    renamed_agent: Option<(String, String, String)>,
+    /// A `worktree.list` probe for `(endpoint key, workspace id)`. A successful
+    /// answer carries the linked checkout root, or `None` for a main/plain
+    /// workspace; an error is not cached so the next menu open retries it.
+    worktree_probe: Option<(String, String, Result<Option<String>, String>)>,
+    /// A deletion confirmed, so `(endpoint key, workspace id)` leaves the
+    /// linked-checkout cache that used to gate its menu.
+    worktree_cleared: Option<(String, String)>,
+    /// A removal held back for a second confirm because the checkout is dirty
+    /// or still in use, so the window can ask again before forcing.
+    worktree_escalated: Option<DeleteEscalation>,
+}
+
+/// The little modal a context-menu action opens: rename, alias, or branch.
+struct MenuPrompt {
+    /// Modal heading, e.g. `Rename workspace`.
+    title: &'static str,
+    placeholder: &'static str,
+    action: PromptAction,
+}
+
 /// First automatic reconnect delay.
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
 /// Ceiling for the exponential backoff.
@@ -1037,6 +1124,27 @@ struct PilusView {
     sidebar_layout: Option<pilus_protocol::SidebarsConfig>,
     /// Whether workspace paths are shown in that layout.
     sidebar_workspace_paths: bool,
+    /// Whether the AGENTS rows draw their path line. The daemon projects no
+    /// client flag for the agents list, so this mirrors `workspace_paths`
+    /// locally; both default to shown, as the daemon's own config does.
+    sidebar_agent_paths: bool,
+    /// Workspace ids pinned to the top of WORKSPACES, per endpoint. The
+    /// daemon's own dock tracks these client-side too, so the label and the
+    /// action pair without a protocol field.
+    pinned_workspaces: HashSet<(String, String)>,
+    /// Live agent panes pinned to the top of AGENTS, per endpoint.
+    pinned_agents: HashSet<(String, String)>,
+    /// Whether AGENTS shows only the active workspace's agents.
+    agents_this_workspace: bool,
+    /// The open right-click menu on a WORKSPACES or AGENTS row, if any.
+    context_menu: Option<SidebarMenu>,
+    /// The rename/alias/branch prompt a menu action opened, if any.
+    menu_prompt: Option<MenuPrompt>,
+    /// The prompt's buffer, shared with `menu_prompt_input` so edits stay in
+    /// one place and the entity keeps IME and selection.
+    menu_prompt_field: TextField,
+    /// The prompt's field, an IME-capable entity over `menu_prompt_field`.
+    menu_prompt_input: Entity<TextInput>,
     /// Revision we last sent, so the daemon accepts each update.
     sidebar_revision: u64,
     /// Whether the native sidebar is expanded.
@@ -1049,6 +1157,20 @@ struct PilusView {
     project_collapsed: HashSet<String>,
     /// Whether the AGENTS section is collapsed to its header.
     agents_collapsed: bool,
+    /// Successful `worktree.list` answers by `(endpoint key, workspace id)`.
+    /// The inner option is the linked checkout root; `None` means a main
+    /// checkout or plain folder. Missing keys are unknown and remain retryable.
+    /// Keyed by the stable workspace id, not the daemon's index: closing a
+    /// workspace renumbers the rows, and an index reuse would hide a fresh
+    /// worktree behind a stale answer.
+    worktree_linked: HashMap<(String, String), Option<String>>,
+    /// Workspaces whose worktree probe is still in flight, so it never
+    /// double-runs.
+    worktree_probing: HashSet<(String, String)>,
+    /// Results from background context-menu operations.
+    menu_rx: Receiver<MenuOpResult>,
+    /// Sender half, handed to each background menu operation.
+    menu_tx: Sender<MenuOpResult>,
     /// Keeps the sidebar's sections scrolled under the fixed top clearance.
     sidebar_scroll: ScrollHandle,
     /// The endpoint currently loaded into the active fields above.
@@ -1205,6 +1327,7 @@ impl PilusView {
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let (machine_connect_tx, machine_connect_rx) = std::sync::mpsc::channel();
         let (picker_tx, picker_rx) = std::sync::mpsc::channel();
+        let (menu_tx, menu_rx) = std::sync::mpsc::channel();
         let (theme_tx, theme_rx) = std::sync::mpsc::channel();
         let settings = shared_settings.borrow().clone();
         let update_request = UpdateRequest::from_settings(
@@ -1239,6 +1362,20 @@ impl PilusView {
                 initial_theme,
                 cx,
             )
+        });
+
+        let menu_prompt_field = TextField::default();
+        let menu_prompt_input = cx.new(|cx| {
+            TextInput::from_shared(
+                menu_prompt_field.shared(),
+                "",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+            .submit_on_enter()
         });
 
         let projects = ProjectsPanel::default();
@@ -1394,12 +1531,24 @@ impl PilusView {
             agent_sel_at: Instant::now(),
             sidebar_layout: None,
             sidebar_workspace_paths: false,
+            sidebar_agent_paths: true,
+            pinned_workspaces: HashSet::new(),
+            pinned_agents: HashSet::new(),
+            agents_this_workspace: false,
+            context_menu: None,
+            menu_prompt: None,
+            menu_prompt_field,
+            menu_prompt_input,
+            worktree_linked: HashMap::new(),
+            worktree_probing: HashSet::new(),
             sidebar_revision: 0,
             sidebar_visible: true,
             workspaces_collapsed: false,
             projects_collapsed: false,
             project_collapsed: HashSet::new(),
             agents_collapsed: false,
+            menu_rx,
+            menu_tx,
             sidebar_scroll: ScrollHandle::new(),
             active: EndpointId::Local,
             active_machine: None,
@@ -1799,6 +1948,72 @@ impl PilusView {
                     changed = true;
                 }
             }
+        }
+        while let Ok(op) = self.menu_rx.try_recv() {
+            match op.error {
+                Some(error) => self.status = error,
+                None => self.status = op.ok,
+            }
+            if let Some((workspace_id, name)) = op.renamed_workspace {
+                self.rename_local_workspace_label(&workspace_id, &name);
+            }
+            if let Some((endpoint, pane, alias)) = op.renamed_agent {
+                self.rename_local_agent(&endpoint, &pane, &alias);
+            }
+            // A probe answer updates the open menu's rows in place: a linked
+            // checkout adds the Delete Worktree row without another
+            // right-click. Errors are reported but not cached, so the next
+            // menu open retries the probe.
+            if let Some((endpoint, workspace_id, result)) = op.worktree_probe {
+                let key = (endpoint, workspace_id);
+                self.worktree_probing.remove(&key);
+                match result {
+                    Ok(path) => {
+                        // The inserted row shifts every row index below it, so
+                        // the keyboard cursor is dropped for that menu: Enter
+                        // must not retarget a different item than the one the
+                        // user highlighted.
+                        let open_target = self.context_menu.as_ref().is_some_and(|menu| {
+                            !menu.quick_open
+                                && matches!(
+                                    &menu.target,
+                                    SidebarMenuTarget::Workspace {
+                                        endpoint,
+                                        workspace_id,
+                                        ..
+                                    } if endpoint == &key.0 && workspace_id == &key.1
+                                )
+                        });
+                        self.worktree_linked.insert(key, path);
+                        if open_target && let Some(menu) = self.context_menu.as_mut() {
+                            menu.selected = None;
+                        }
+                    }
+                    Err(error) => {
+                        self.status = format!("couldn't check worktree: {error}");
+                    }
+                }
+            }
+            if let Some((endpoint, workspace_id)) = op.worktree_cleared {
+                self.worktree_linked.remove(&(endpoint, workspace_id));
+            }
+            if let Some(held) = op.worktree_escalated {
+                self.open_menu_prompt(
+                    PromptAction::DeleteWorktree {
+                        endpoint: held.endpoint,
+                        path: held.path,
+                        workspace_id: held.workspace_id,
+                        name: held.name,
+                        dirty: held.dirty,
+                        blockers: held.blockers,
+                    },
+                    "Delete Worktree Anyway",
+                    "",
+                    "",
+                    cx,
+                );
+            }
+            changed = true;
         }
         while let Ok((key, configs)) = self.agent_config_rx.try_recv() {
             self.agent_config_pending.remove(&key);
@@ -2815,6 +3030,16 @@ impl PilusView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // An open context menu owns up/down/enter/escape until one runs or it
+        // closes; an open prompt owns Enter (submit) and Escape (cancel).
+        if self.context_menu.is_some() {
+            self.context_menu_key(event, cx);
+            return;
+        }
+        if self.menu_prompt.is_some() {
+            self.menu_prompt_key(event, cx);
+            return;
+        }
         match self.input_layer() {
             InputLayer::Picker => self.picker_key(event, cx),
             InputLayer::Palette => self.palette_key(event, window, cx),
@@ -3982,6 +4207,19 @@ impl PilusView {
     }
 
     fn sync_focus(&self, window: &mut Window, cx: &mut App) {
+        // The prompt's field owns the keyboard while it is up; without this
+        // the layer routing would hand focus back to the window root. A
+        // destructive confirm has no field — keys stay on the root, which
+        // already routes Enter and Escape to it.
+        if let Some(prompt) = self.menu_prompt.as_ref()
+            && !matches!(prompt.action, PromptAction::DeleteWorktree { .. })
+        {
+            let handle = self.menu_prompt_input.focus_handle(cx);
+            if !handle.is_focused(window) {
+                window.focus(&handle, cx);
+            }
+            return;
+        }
         let target = match self.input_layer() {
             // The picker owns the keyboard; its path field only while editing,
             // otherwise the window root so list navigation keeps working.
@@ -6750,7 +6988,12 @@ impl PilusView {
     /// While the session menu is open the whole content area counts, since
     /// the overlay sits above the grid.
     fn hit_chrome(&mut self, window: &Window, position: Point<Pixels>) -> bool {
-        if self.session_menu_open || self.palette.is_open() || self.picker.is_open() {
+        if self.session_menu_open
+            || self.palette.is_open()
+            || self.picker.is_open()
+            || self.context_menu.is_some()
+            || self.menu_prompt.is_some()
+        {
             return true;
         }
         let x = f32::from(position.x);
@@ -7095,6 +7338,910 @@ impl PilusView {
             },
         });
         cx.notify();
+    }
+
+    /// Resolve a control client for any endpoint, active or stashed.
+    fn control_client_for_endpoint(&self, id: &EndpointId) -> Option<ControlClient> {
+        match id {
+            EndpointId::Local => ControlClient::connect(&self.api_socket()).ok(),
+            EndpointId::Machine(machine_id) => {
+                let target = self
+                    .machines
+                    .iter()
+                    .find(|machine| &machine.id == machine_id)?
+                    .ssh_target()?;
+                ControlClient::connect_ssh(target).ok()
+            }
+        }
+    }
+
+    /// The endpoint an endpoint-key string names.
+    fn endpoint_by_key(&self, key: &str) -> EndpointId {
+        if key == "local" {
+            EndpointId::Local
+        } else {
+            EndpointId::Machine(key.to_string())
+        }
+    }
+
+    /// Open the right-click menu for a WORKSPACES or AGENTS row at `position`.
+    fn open_context_menu(
+        &mut self,
+        target: SidebarMenuTarget,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu_prompt = None;
+        let workspace_probe = match &target {
+            SidebarMenuTarget::Workspace {
+                endpoint,
+                workspace_id,
+                index,
+                ..
+            } => Some((
+                endpoint.clone(),
+                workspace_id.clone(),
+                *index,
+                target.clone(),
+            )),
+            SidebarMenuTarget::Agent { .. } => None,
+        };
+        self.context_menu = Some(SidebarMenu::new(
+            target,
+            f32::from(position.x),
+            f32::from(position.y),
+        ));
+        if let Some((endpoint, workspace_id, index, target)) = workspace_probe {
+            self.probe_worktree(&endpoint, &workspace_id, index, &target);
+        }
+        cx.notify();
+    }
+
+    /// Ask the daemon whether the row's checkout is a linked worktree, once
+    /// per workspace. Until an answer lands the row is absent; a successful
+    /// probe inserts it a beat later. A failed probe is not cached, so the
+    /// next right-click retries.
+    fn probe_worktree(
+        &mut self,
+        endpoint_key: &str,
+        workspace_id: &str,
+        index: u16,
+        target: &SidebarMenuTarget,
+    ) {
+        let key = (endpoint_key.to_string(), workspace_id.to_string());
+        if self.worktree_linked.contains_key(&key) || self.worktree_probing.contains(&key) {
+            return;
+        }
+        let Some(mut client) =
+            self.control_client_for_endpoint(&self.endpoint_by_key(endpoint_key))
+        else {
+            return;
+        };
+        let expanded = match target {
+            SidebarMenuTarget::Workspace { cwd, .. } => self.expand_cwd(endpoint_key, cwd),
+            SidebarMenuTarget::Agent { .. } => return,
+        };
+        let workspace_id = workspace_id.to_string();
+        self.worktree_probing.insert(key.clone());
+        let tx = self.menu_tx.clone();
+        std::thread::spawn(move || {
+            let result = client
+                .worktrees(index)
+                .map(|worktrees| linked_worktree_path(&worktrees, &expanded))
+                .map_err(|error| error.to_string());
+            tx.send(MenuOpResult {
+                ok: String::new(),
+                error: None,
+                renamed_workspace: None,
+                renamed_agent: None,
+                worktree_probe: Some((key.0, workspace_id, result)),
+                worktree_cleared: None,
+                worktree_escalated: None,
+            })
+            .ok();
+        });
+    }
+
+    /// Close the context menu and any prompt it left behind.
+    fn close_context_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    /// The open menu's rows, resolved against the state they toggle.
+    fn menu_rows(&self) -> Vec<SidebarItem> {
+        let Some(menu) = self.context_menu.as_ref() else {
+            return Vec::new();
+        };
+        let (pinned, linked) = match &menu.target {
+            SidebarMenuTarget::Workspace {
+                endpoint,
+                workspace_id,
+                ..
+            } => (
+                self.pinned_workspaces
+                    .contains(&(endpoint.clone(), workspace_id.clone())),
+                // Only a confirmed linked checkout offers Delete Worktree;
+                // unknown and known-not-linked leave the row out.
+                self.worktree_linked
+                    .get(&(endpoint.clone(), workspace_id.clone()))
+                    .is_some_and(Option::is_some),
+            ),
+            SidebarMenuTarget::Agent { endpoint, pane, .. } => (
+                self.pinned_agents
+                    .contains(&(endpoint.clone(), pane.clone())),
+                false,
+            ),
+        };
+        menu.rows(pinned, linked)
+    }
+
+    /// Drive the open context menu from the keyboard.
+    fn context_menu_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let rows = self.menu_rows();
+        let quick_open = self
+            .context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.quick_open);
+        match keystroke.key.as_str() {
+            "escape" | "esc" => {
+                if quick_open {
+                    // Esc steps back out of the copy submenu before closing.
+                    if let Some(menu) = self.context_menu.as_mut() {
+                        menu.quick_open = false;
+                        menu.selected = None;
+                    }
+                } else {
+                    self.close_context_menu();
+                }
+                cx.notify();
+            }
+            "up" | "down" => {
+                let Some(menu) = self.context_menu.as_mut() else {
+                    return;
+                };
+                let dir: isize = if keystroke.key == "up" { -1 } else { 1 };
+                let from = menu
+                    .selected
+                    .unwrap_or(if dir < 0 { 0 } else { usize::MAX });
+                if let Some(next) = menu.next_selectable(&rows, from, dir) {
+                    menu.selected = Some(next);
+                }
+                cx.notify();
+            }
+            // A right arrow opens the copy submenu; a left arrow climbs back.
+            "right" => {
+                if !quick_open
+                    && rows.contains(&SidebarItem::QuickActions)
+                    && let Some(menu) = self.context_menu.as_mut()
+                {
+                    menu.quick_open = true;
+                    menu.selected = None;
+                    cx.notify();
+                }
+            }
+            "left" => {
+                if quick_open && let Some(menu) = self.context_menu.as_mut() {
+                    menu.quick_open = false;
+                    menu.selected = None;
+                    cx.notify();
+                }
+            }
+            "enter" => {
+                let row = self
+                    .context_menu
+                    .as_ref()
+                    .and_then(|menu| menu.selected)
+                    .filter(|index| rows.get(*index).is_some_and(|item| item.selectable()))
+                    .or_else(|| rows.iter().position(|item| item.selectable()));
+                if let Some(index) = row {
+                    self.run_context_item(rows[index], cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Run one hit context-menu row. The menu is cloned so the Quick Actions
+    /// parent row can swap the submenu open in place; everything else closes
+    /// it and runs the action.
+    fn run_context_item(&mut self, item: SidebarItem, cx: &mut Context<Self>) {
+        let Some(menu) = self.context_menu.as_ref() else {
+            return;
+        };
+        let target = menu.target.clone();
+        match (&target, item) {
+            (SidebarMenuTarget::Workspace { .. }, SidebarItem::QuickActions) => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.quick_open = true;
+                    menu.selected = None;
+                }
+                cx.notify();
+            }
+            (SidebarMenuTarget::Workspace { .. }, SidebarItem::Close) => {
+                self.close_context_menu();
+                self.menu_close_workspace(&target, cx);
+            }
+            (SidebarMenuTarget::Workspace { .. }, SidebarItem::Rename) => {
+                self.close_context_menu();
+                self.menu_open_rename(&target, cx);
+            }
+            (SidebarMenuTarget::Workspace { .. }, SidebarItem::Pin | SidebarItem::Unpin) => {
+                self.close_context_menu();
+                self.menu_pin_workspace(&target, item == SidebarItem::Pin, cx);
+            }
+            (SidebarMenuTarget::Workspace { .. }, SidebarItem::TogglePaths) => {
+                self.close_context_menu();
+                self.menu_toggle_workspace_paths(cx);
+            }
+            (SidebarMenuTarget::Workspace { cwd, .. }, SidebarItem::CopyPath) => {
+                self.close_context_menu();
+                self.menu_copy(cwd, cx);
+            }
+            (SidebarMenuTarget::Workspace { branch, .. }, SidebarItem::CopyBranch) => {
+                self.close_context_menu();
+                if let Some(branch) = branch {
+                    self.menu_copy(branch, cx);
+                }
+            }
+            (
+                SidebarMenuTarget::Workspace {
+                    endpoint, index, ..
+                },
+                SidebarItem::NewWorktree,
+            ) => {
+                self.close_context_menu();
+                self.menu_new_worktree(
+                    PromptAction::NewWorktree {
+                        endpoint: self.endpoint_by_key(endpoint),
+                        index: *index,
+                    },
+                    cx,
+                );
+            }
+            (
+                SidebarMenuTarget::Workspace {
+                    endpoint,
+                    workspace_id,
+                    name,
+                    ..
+                },
+                SidebarItem::DeleteWorktree,
+            ) => {
+                // Removal targets the root the probe confirmed, not the
+                // workspace cwd, which can sit anywhere inside the checkout.
+                let key = (endpoint.clone(), workspace_id.clone());
+                let Some(path) = self.worktree_linked.get(&key).and_then(|path| path.clone())
+                else {
+                    self.close_context_menu();
+                    self.status = "worktree status is still being checked".to_string();
+                    cx.notify();
+                    return;
+                };
+                self.close_context_menu();
+                self.open_menu_prompt(
+                    PromptAction::DeleteWorktree {
+                        endpoint: self.endpoint_by_key(endpoint),
+                        path,
+                        workspace_id: workspace_id.clone(),
+                        name: name.clone(),
+                        dirty: false,
+                        blockers: None,
+                    },
+                    "Delete Worktree",
+                    "",
+                    "",
+                    cx,
+                );
+            }
+            (
+                SidebarMenuTarget::Workspace { .. },
+                SidebarItem::OpenGit | SidebarItem::OpenBoard | SidebarItem::OpenMission,
+            ) => {
+                self.close_context_menu();
+                self.menu_open_board(&target, item, cx);
+            }
+            (SidebarMenuTarget::Agent { .. }, SidebarItem::Rename) => {
+                self.close_context_menu();
+                self.menu_open_agent_rename(&target, cx);
+            }
+            (SidebarMenuTarget::Agent { .. }, SidebarItem::Close) => {
+                self.close_context_menu();
+                self.menu_close_agent(&target, cx);
+            }
+            (SidebarMenuTarget::Agent { .. }, SidebarItem::Pin | SidebarItem::Unpin) => {
+                self.close_context_menu();
+                self.menu_pin_agent(&target, item == SidebarItem::Pin, cx);
+            }
+            (SidebarMenuTarget::Agent { .. }, SidebarItem::TogglePaths) => {
+                self.close_context_menu();
+                self.menu_toggle_agent_paths(cx);
+            }
+            (SidebarMenuTarget::Agent { .. }, SidebarItem::ToggleScope) => {
+                self.close_context_menu();
+                self.agents_this_workspace = !self.agents_this_workspace;
+                cx.notify();
+            }
+            (_, SidebarItem::Divider) => {}
+            // Copy rows only exist on a WORKSPACES target; the arms above
+            // cover every row the builders can emit.
+            _ => {}
+        }
+    }
+
+    /// Close a workspace from its context menu, reporting through the menu
+    /// channel so a remote round trip never blocks the window.
+    fn menu_close_workspace(&mut self, target: &SidebarMenuTarget, cx: &mut Context<Self>) {
+        let SidebarMenuTarget::Workspace {
+            endpoint,
+            workspace_id,
+            name,
+            ..
+        } = target
+        else {
+            return;
+        };
+        let Some(mut client) = self.control_client_for_endpoint(&self.endpoint_by_key(endpoint))
+        else {
+            self.status = "no control connection for the selected endpoint".to_string();
+            cx.notify();
+            return;
+        };
+        let workspace_id = workspace_id.clone();
+        let name = name.clone();
+        self.pinned_workspaces
+            .remove(&(endpoint.clone(), workspace_id.clone()));
+        let tx = self.menu_tx.clone();
+        std::thread::spawn(move || {
+            let error = client
+                .close_workspace(&workspace_id)
+                .err()
+                .map(|error| error.to_string());
+            tx.send(MenuOpResult {
+                ok: format!("closed {name}"),
+                error,
+                renamed_workspace: None,
+                renamed_agent: None,
+                worktree_probe: None,
+                worktree_cleared: None,
+                worktree_escalated: None,
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    /// Open the rename prompt for a workspace's label.
+    fn menu_open_rename(&mut self, target: &SidebarMenuTarget, cx: &mut Context<Self>) {
+        let SidebarMenuTarget::Workspace {
+            endpoint,
+            workspace_id,
+            name,
+            ..
+        } = target
+        else {
+            return;
+        };
+        self.open_menu_prompt(
+            PromptAction::RenameWorkspace {
+                endpoint: self.endpoint_by_key(endpoint),
+                workspace_id: workspace_id.clone(),
+            },
+            "Rename workspace",
+            "Name",
+            name,
+            cx,
+        );
+    }
+
+    /// Give a live agent's pane a new alias via its rename prompt.
+    fn menu_open_agent_rename(&mut self, target: &SidebarMenuTarget, cx: &mut Context<Self>) {
+        let SidebarMenuTarget::Agent {
+            endpoint,
+            pane,
+            name,
+            ..
+        } = target
+        else {
+            return;
+        };
+        self.open_menu_prompt(
+            PromptAction::RenameAgent {
+                endpoint: self.endpoint_by_key(endpoint),
+                pane: pane.clone(),
+            },
+            "Rename agent",
+            "Alias ([a-z][a-z0-9_-]{0,31})",
+            name,
+            cx,
+        );
+    }
+
+    /// Pin or unpin a workspace; the daemon floats its group first on the
+    /// next catalog projection.
+    fn menu_pin_workspace(
+        &mut self,
+        target: &SidebarMenuTarget,
+        pinned: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let SidebarMenuTarget::Workspace {
+            endpoint,
+            workspace_id,
+            name,
+            ..
+        } = target
+        else {
+            return;
+        };
+        let key = (endpoint.clone(), workspace_id.clone());
+        if pinned {
+            self.pinned_workspaces.insert(key.clone());
+        } else {
+            self.pinned_workspaces.remove(&key);
+        }
+        let Some(mut client) = self.control_client_for_endpoint(&self.endpoint_by_key(endpoint))
+        else {
+            self.status = "no control connection for the selected endpoint".to_string();
+            cx.notify();
+            return;
+        };
+        let workspace_id = workspace_id.clone();
+        let name = name.clone();
+        let tx = self.menu_tx.clone();
+        std::thread::spawn(move || {
+            let error = client
+                .pin_workspace(&workspace_id, pinned)
+                .err()
+                .map(|error| error.to_string());
+            tx.send(MenuOpResult {
+                ok: format!("{} {name}", if pinned { "pinned" } else { "unpinned" }),
+                error,
+                renamed_workspace: None,
+                renamed_agent: None,
+                worktree_probe: None,
+                worktree_cleared: None,
+                worktree_escalated: None,
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    /// Flip whether the WORKSPACES rows draw their path line.
+    fn menu_toggle_workspace_paths(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_workspace_paths = !self.sidebar_workspace_paths;
+        self.push_sidebar_layout();
+        cx.notify();
+    }
+
+    /// Flip whether the AGENTS rows draw their path line.
+    fn menu_toggle_agent_paths(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_agent_paths = !self.sidebar_agent_paths;
+        cx.notify();
+    }
+
+    /// Copy a context-menu value to the system clipboard.
+    fn menu_copy(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+        cx.notify();
+    }
+
+    /// Close a live agent's pane from its context menu.
+    fn menu_close_agent(&mut self, target: &SidebarMenuTarget, cx: &mut Context<Self>) {
+        let SidebarMenuTarget::Agent {
+            endpoint,
+            pane,
+            name,
+            ..
+        } = target
+        else {
+            return;
+        };
+        let Some(mut client) = self.control_client_for_endpoint(&self.endpoint_by_key(endpoint))
+        else {
+            self.status = "no control connection for the selected endpoint".to_string();
+            cx.notify();
+            return;
+        };
+        let pane = pane.clone();
+        let name = name.clone();
+        self.pinned_agents.remove(&(endpoint.clone(), pane.clone()));
+        self.agent_sel = None;
+        let tx = self.menu_tx.clone();
+        std::thread::spawn(move || {
+            let error = client
+                .close_pane(&pane)
+                .err()
+                .map(|error| error.to_string());
+            tx.send(MenuOpResult {
+                ok: format!("closed {name}"),
+                error,
+                renamed_workspace: None,
+                renamed_agent: None,
+                worktree_probe: None,
+                worktree_cleared: None,
+                worktree_escalated: None,
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    /// Pin or unpin a live agent; pinned rows float to the top of AGENTS.
+    fn menu_pin_agent(&mut self, target: &SidebarMenuTarget, pinned: bool, cx: &mut Context<Self>) {
+        let SidebarMenuTarget::Agent {
+            endpoint,
+            pane,
+            name,
+            ..
+        } = target
+        else {
+            return;
+        };
+        let key = (endpoint.clone(), pane.clone());
+        if pinned {
+            self.pinned_agents.insert(key);
+        } else {
+            self.pinned_agents.remove(&key);
+        }
+        self.status = format!("{} {}", if pinned { "pinned" } else { "unpinned" }, name);
+        cx.notify();
+    }
+
+    /// Open the branch prompt for a new worktree of the row's repo.
+    fn menu_new_worktree(&mut self, action: PromptAction, cx: &mut Context<Self>) {
+        self.open_menu_prompt(
+            action,
+            "New Git Worktree",
+            "Branch",
+            &generate_session_name(&[]),
+            cx,
+        );
+    }
+
+    /// Switch to the workspace and open the daemon board its menu row names.
+    fn menu_open_board(
+        &mut self,
+        target: &SidebarMenuTarget,
+        item: SidebarItem,
+        cx: &mut Context<Self>,
+    ) {
+        let SidebarMenuTarget::Workspace {
+            endpoint,
+            workspace_id,
+            name,
+            ..
+        } = target
+        else {
+            return;
+        };
+        let (bind, nav) = match item {
+            SidebarItem::OpenGit => ('g', None),
+            SidebarItem::OpenBoard => ('o', Some(NavKind::Orchestration)),
+            SidebarItem::OpenMission => ('m', Some(NavKind::Mission)),
+            _ => return,
+        };
+        if let Some(kind) = nav {
+            self.nav_sel = Some(kind);
+            self.nav_sel_at = Instant::now();
+        }
+        self.status = format!("opening {name}…");
+        self.activate_endpoint(
+            self.endpoint_by_key(endpoint),
+            Some(workspace_id.clone()),
+            None,
+            cx,
+        );
+        self.send_bind(bind);
+        cx.notify();
+    }
+
+    /// Open the little prompt modal; the menu itself closes first.
+    fn open_menu_prompt(
+        &mut self,
+        action: PromptAction,
+        title: &'static str,
+        placeholder: &'static str,
+        initial: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu_prompt_field.set_value(initial.to_string());
+        self.menu_prompt_input.update(cx, |input, cx| {
+            input.set_value(initial.to_string(), cx);
+        });
+        self.menu_prompt = Some(MenuPrompt {
+            title,
+            placeholder,
+            action,
+        });
+        cx.notify();
+    }
+
+    /// Route a keystroke while the menu prompt is open: Enter submits,
+    /// Escape cancels; everything else belongs to the field.
+    fn menu_prompt_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "escape" | "esc" => {
+                self.menu_prompt = None;
+                cx.notify();
+            }
+            "enter" => self.submit_menu_prompt(cx),
+            _ => {}
+        }
+    }
+
+    /// Run the prompt's action with whatever the field holds.
+    fn submit_menu_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.menu_prompt.take() else {
+            return;
+        };
+        let trimmed = self.menu_prompt_field.value().trim().to_string();
+        match prompt.action {
+            PromptAction::RenameWorkspace {
+                endpoint,
+                workspace_id,
+            } => {
+                if trimmed.is_empty() {
+                    self.status = "a workspace name is required".to_string();
+                    cx.notify();
+                    return;
+                }
+                if trimmed.chars().count() > 40 {
+                    self.status = "workspace names are capped at 40 characters".to_string();
+                    cx.notify();
+                    return;
+                }
+                let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
+                    self.status = "no control connection for the selected endpoint".to_string();
+                    cx.notify();
+                    return;
+                };
+                let ok = format!("renamed to {trimmed}");
+                let renamed_workspace = Some((workspace_id.clone(), trimmed.clone()));
+                let tx = self.menu_tx.clone();
+                std::thread::spawn(move || {
+                    let error = client
+                        .rename_workspace(&workspace_id, &trimmed)
+                        .err()
+                        .map(|error| error.to_string());
+                    tx.send(MenuOpResult {
+                        ok,
+                        error,
+                        renamed_workspace,
+                        renamed_agent: None,
+                        worktree_probe: None,
+                        worktree_cleared: None,
+                        worktree_escalated: None,
+                    })
+                    .ok();
+                });
+            }
+            PromptAction::RenameAgent { endpoint, pane } => {
+                let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
+                    self.status = "no control connection for the selected endpoint".to_string();
+                    cx.notify();
+                    return;
+                };
+                let endpoint_key = endpoint.key();
+                let alias = trimmed.clone();
+                let tx = self.menu_tx.clone();
+                std::thread::spawn(move || {
+                    let result = if trimmed.is_empty() {
+                        client.clear_agent_name(&pane)
+                    } else {
+                        client.name_agent(&pane, &trimmed)
+                    };
+                    let renamed_agent = match result.err().map(|error| error.to_string()) {
+                        Some(error) => {
+                            tx.send(MenuOpResult {
+                                ok: String::new(),
+                                error: Some(error),
+                                renamed_workspace: None,
+                                renamed_agent: None,
+                                worktree_probe: None,
+                                worktree_cleared: None,
+                                worktree_escalated: None,
+                            })
+                            .ok();
+                            None
+                        }
+                        None => Some((endpoint_key, pane, alias.clone())),
+                    };
+                    if renamed_agent.is_some() {
+                        tx.send(MenuOpResult {
+                            ok: format!("renamed to {alias}"),
+                            error: None,
+                            renamed_workspace: None,
+                            renamed_agent,
+                            worktree_probe: None,
+                            worktree_cleared: None,
+                            worktree_escalated: None,
+                        })
+                        .ok();
+                    }
+                });
+            }
+            PromptAction::DeleteWorktree {
+                endpoint,
+                path,
+                workspace_id,
+                name,
+                dirty,
+                blockers,
+            } => {
+                let escalated = dirty || blockers.is_some();
+                // The daemon's own TUI refuses when another open workspace or
+                // pane lives inside the checkout before it force-removes; the
+                // control API skips that guard under `force`, so this client
+                // runs it first from the rows it already sees.
+                let endpoint_key = endpoint.key();
+                let endpoint_id = self.endpoint_by_key(&endpoint_key);
+                // Both sides are canonicalized so a pane cwd spelled through a
+                // symlink (`/tmp/..`) still counts as inside the checkout git
+                // spells canonically (`/private/tmp/..`).
+                let target = trims(&canonical(&path)).to_string();
+                let mut blocker: Option<String> = None;
+                for workspace in self.endpoint_workspaces(&endpoint_id) {
+                    if workspace.id == workspace_id || blocker.is_some() {
+                        continue;
+                    }
+                    let expanded = self.expand_cwd(&endpoint_key, &workspace.cwd);
+                    let canonical_cwd = canonical(&expanded);
+                    let candidate = trims(&canonical_cwd);
+                    if inside(candidate, &target) {
+                        blocker = Some(workspace.name.clone());
+                    }
+                }
+                for agent in self.endpoint_agents(&endpoint_id) {
+                    if agent.workspace_id == workspace_id || blocker.is_some() {
+                        continue;
+                    }
+                    let expanded = self.expand_cwd(&endpoint_key, &agent.cwd);
+                    let canonical_cwd = canonical(&expanded);
+                    let candidate = trims(&canonical_cwd);
+                    if inside(candidate, &target) {
+                        blocker = Some(agent.name.clone());
+                    }
+                }
+                if let Some(name) = blocker {
+                    self.status =
+                        format!("close {name} first — it uses files inside this worktree");
+                    cx.notify();
+                    return;
+                }
+                let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
+                    self.status = "no control connection for the selected endpoint".to_string();
+                    cx.notify();
+                    return;
+                };
+                let cleared = Some((endpoint_key.clone(), workspace_id.clone()));
+                self.status = format!("deleting worktree {name}…");
+                let ssh = match &endpoint {
+                    EndpointId::Local => None,
+                    EndpointId::Machine(id) => self
+                        .machines
+                        .iter()
+                        .find(|machine| &machine.id == id)
+                        .and_then(MachineInfo::ssh_target),
+                };
+                let tx = self.menu_tx.clone();
+                std::thread::spawn(move || {
+                    // The first confirm never forces: git is asked about
+                    // uncommitted work (the daemon refuses a dirty checkout
+                    // whatever `force` says) and the daemon about what still
+                    // uses the worktree, and either finding holds the delete
+                    // for a second, explicit yes. Only that second confirm
+                    // discards work and forces past the guard. An unreadable
+                    // state aborts instead of being taken for clean.
+                    let outcome = (|| -> Result<Option<(bool, Option<String>)>, String> {
+                        if escalated {
+                            if dirty {
+                                pilus_client::discard_worktree_changes(ssh.as_ref(), &path)?;
+                            }
+                            client
+                                .remove_worktree(&path, true)
+                                .map_err(|error| error.to_string())?;
+                            return Ok(None);
+                        }
+                        let dirty_now = pilus_client::worktree_is_dirty(ssh.as_ref(), &path)?;
+                        match client.remove_worktree(&path, false) {
+                            Ok(()) => Ok(None),
+                            Err(error) => match pilus_client::worktree_blockers(&error) {
+                                Some(blockers) => Ok(Some((dirty_now, Some(blockers)))),
+                                None if dirty_now => Ok(Some((true, None))),
+                                None => Err(error.to_string()),
+                            },
+                        }
+                    })();
+                    let (held, error) = match outcome {
+                        Ok(held) => (held, None),
+                        Err(error) => (None, Some(error)),
+                    };
+                    let ok = match &held {
+                        Some((_, Some(_))) => format!("{name} is still in use"),
+                        Some((true, None)) => format!("{name} has uncommitted changes"),
+                        _ => format!("deleted worktree {name}"),
+                    };
+                    let finished = held.is_none();
+                    tx.send(MenuOpResult {
+                        ok,
+                        error,
+                        renamed_workspace: None,
+                        renamed_agent: None,
+                        worktree_probe: None,
+                        worktree_cleared: finished.then_some(cleared).flatten(),
+                        worktree_escalated: held.map(|(dirty, blockers)| DeleteEscalation {
+                            endpoint,
+                            path,
+                            workspace_id,
+                            name,
+                            dirty,
+                            blockers,
+                        }),
+                    })
+                    .ok();
+                });
+            }
+            PromptAction::NewWorktree { endpoint, index } => {
+                if trimmed.is_empty() {
+                    self.status = "a branch name is required".to_string();
+                    cx.notify();
+                    return;
+                }
+                let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
+                    self.status = "no control connection for the selected endpoint".to_string();
+                    cx.notify();
+                    return;
+                };
+                self.status = format!("creating worktree {trimmed}…");
+                let tx = self.menu_tx.clone();
+                std::thread::spawn(move || {
+                    let result = client.create_worktree_for(index, &trimmed);
+                    let error = result.err().map(|error| error.to_string());
+                    tx.send(MenuOpResult {
+                        ok: format!("created a new worktree {trimmed}"),
+                        error,
+                        renamed_workspace: None,
+                        renamed_agent: None,
+                        worktree_probe: None,
+                        worktree_cleared: None,
+                        worktree_escalated: None,
+                    })
+                    .ok();
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Reflect a confirmed workspace rename in the projected labels, wherever
+    /// the renamed endpoint's catalog lives (the active surface or a stashed
+    /// endpoint's).
+    fn rename_local_workspace_label(&mut self, workspace_id: &str, name: &str) {
+        self.surface.rename_workspace(workspace_id, name);
+        for endpoint in self.endpoints.values_mut() {
+            endpoint.surface.rename_workspace(workspace_id, name);
+        }
+    }
+
+    /// Reflect a confirmed agent alias in the AGENTS row, active or stashed.
+    fn rename_local_agent(&mut self, endpoint_key: &str, pane: &str, alias: &str) {
+        let endpoint = self.endpoint_by_key(endpoint_key);
+        if endpoint == self.active {
+            if let Some(agent) = self.agents.iter_mut().find(|agent| agent.pane == pane) {
+                agent.name = alias.to_string();
+            }
+            return;
+        }
+        if let Some(endpoint) = self.endpoints.get_mut(&endpoint)
+            && let Some(agent) = endpoint.agents.iter_mut().find(|agent| agent.pane == pane)
+        {
+            agent.name = alias.to_string();
+        }
     }
 
     /// Build the native sidebar: nav, sessions, and projects.
@@ -7720,6 +8867,264 @@ impl PilusView {
             )
     }
 
+    /// The right-click context menu for a WORKSPACES or AGENTS row.
+    ///
+    /// A full-window catcher occludes the grid and sidebar while the menu is
+    /// up; the panel stops propagation so its own rows land. The keyboard
+    /// cursor (`selected`) and mouse hover share the panel pill, and the
+    /// menu clamps to the viewport so a row opened at the window's edge never
+    /// draws off-screen.
+    fn context_menu_overlay(&self, cx: &mut Context<Self>, window: &Window) -> Div {
+        let Some(menu) = self.context_menu.as_ref() else {
+            return div();
+        };
+        let theme = self.theme;
+        let rows = self.menu_rows();
+        let (paths, scoped) = match &menu.target {
+            SidebarMenuTarget::Workspace { .. } => (self.sidebar_workspace_paths, false),
+            SidebarMenuTarget::Agent { .. } => {
+                (self.sidebar_agent_paths, self.agents_this_workspace)
+            }
+        };
+
+        let mut items = div().flex().flex_col().gap_0();
+        for (index, item) in rows.iter().copied().enumerate() {
+            if item == SidebarItem::Divider {
+                items = items.child(div().mx_2().my_1().h(px(1.0)).bg(theme.border.opacity(0.5)));
+                continue;
+            }
+            let active = menu.selected == Some(index);
+            let color = if item.destructive() {
+                theme.alert
+            } else {
+                theme.panel_fg
+            };
+            let label = item.label(paths, scoped).to_string();
+            items = items.child(
+                div()
+                    .id(format!("pilus-sidebar-menu-{index}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(26.0))
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if active {
+                        theme.panel
+                    } else {
+                        theme.window_bg.opacity(0.0)
+                    })
+                    .hover(|style| style.bg(theme.panel))
+                    .text_size(px(self.chrome_font()))
+                    .text_color(color)
+                    .child(icon(sidebar_menu_icon(item), 15.0, color))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.run_context_item(item, cx);
+                    })),
+            );
+        }
+
+        // Anchor at the cursor, flipping to the left and above when the panel
+        // would cross the opposite edges.
+        let width = 224.0f32;
+        let viewport_width = f32::from(window.viewport_size().width);
+        let viewport_height = f32::from(window.viewport_size().height);
+        let mut left = menu.column;
+        if left + width + 8.0 > viewport_width {
+            left = (viewport_width - width - 8.0).max(8.0);
+        }
+        let height = 8.0 + rows.len() as f32 * 30.0;
+        let mut top = menu.row + 6.0;
+        if top + height > viewport_height {
+            top = (menu.row - height - 6.0).max(8.0);
+        }
+
+        let panel = div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(width))
+            .rounded_md()
+            .bg(theme.sidebar_bg)
+            .border_1()
+            .border_color(terminal_inset_border())
+            .p_1()
+            .child(items)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            );
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .occlude()
+            .child(panel)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.close_context_menu();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.close_context_menu();
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// The rename/alias/branch prompt a context-menu action opened.
+    ///
+    /// Same shape as the palette: a dimmed catcher over everything and a
+    /// centered field panel that stops propagation so its own clicks land.
+    fn menu_prompt_overlay(&self, cx: &mut Context<Self>) -> Div {
+        let Some(prompt) = self.menu_prompt.as_ref() else {
+            return div();
+        };
+        let theme = self.theme;
+        // A destructive confirm swaps the field for the target path, a warning,
+        // and the Enter/Esc hint, so nobody deletes by typing past it.
+        let confirm = matches!(prompt.action, PromptAction::DeleteWorktree { .. });
+        let confirm_escalated = prompt.action.escalated();
+        let confirm_dirty = matches!(
+            prompt.action,
+            PromptAction::DeleteWorktree { dirty: true, .. }
+        );
+        let confirm_blockers = match &prompt.action {
+            PromptAction::DeleteWorktree { blockers, .. } => blockers.clone(),
+            _ => None,
+        };
+        let confirm_path = match &prompt.action {
+            PromptAction::DeleteWorktree { path, .. } => Some(path.clone()),
+            _ => None,
+        };
+        let input = self.menu_prompt_input.clone();
+        input.update(cx, |input, _| {
+            input.set_style(
+                theme,
+                style::chrome_font(&self.shared_settings),
+                px(self.chrome_font()),
+            );
+        });
+        let mut panel = div()
+            .w(px(380.0))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .rounded_md()
+            .bg(theme.sidebar_bg)
+            .border_1()
+            .border_color(terminal_inset_border())
+            .child(
+                div()
+                    .text_size(px(self.chrome_font()))
+                    .text_color(theme.panel_fg)
+                    .child(prompt.title),
+            )
+            .child(
+                div()
+                    .text_size(px(self.section_font()))
+                    .text_color(theme.muted)
+                    .child(prompt.placeholder),
+            );
+        if confirm {
+            panel = panel
+                .child(match confirm_path {
+                    Some(path) => div()
+                        .font_family(style::mono_family(&self.shared_settings))
+                        .text_size(px(self.section_font()))
+                        .text_color(theme.muted)
+                        .truncate()
+                        .child(path),
+                    None => div(),
+                })
+                .children(confirm_blockers.map(|blockers| {
+                    div()
+                        .text_size(px(self.chrome_font()))
+                        .text_color(theme.alert)
+                        .child(format!("Still in use: {blockers}. Deleting stops it."))
+                }))
+                .children(confirm_dirty.then(|| {
+                    div()
+                        .text_size(px(self.chrome_font()))
+                        .text_color(theme.alert)
+                        .child("It has uncommitted or untracked changes that will be lost.")
+                }))
+                .child(
+                    div()
+                        .text_size(px(self.chrome_font()))
+                        .text_color(theme.alert)
+                        .child(if confirm_escalated {
+                            "This can't be undone."
+                        } else {
+                            "Removes the checkout and its files. This can't be undone."
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(px(self.section_font()))
+                        .text_color(theme.muted)
+                        .child(if confirm_escalated {
+                            "⏎ Delete anyway · Esc Cancel"
+                        } else {
+                            "⏎ Delete · Esc Cancel"
+                        }),
+                );
+        } else {
+            panel = panel.child(input);
+        }
+        let panel = panel
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            );
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .occlude()
+            .bg(theme.window_bg.opacity(0.55))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(panel)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.menu_prompt = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.menu_prompt = None;
+                    cx.notify();
+                }),
+            )
+    }
+
     /// The ⌘⇧P overlay: a query field above a filtered command list.
     ///
     /// A transparent catcher covers the window so a click outside the panel
@@ -7996,18 +9401,52 @@ impl PilusView {
             .cursor_pointer()
             .hover(|style| style.bg(theme.panel))
             .tooltip(tip)
-            .child(head)
-            .child(sub);
+            .child(head);
+        // The path line follows the daemon's Show Path / Hide Path toggle.
+        if self.sidebar_workspace_paths {
+            row = row.child(sub);
+        }
         if workspace.nested {
             row = row.pl(px(SIDEBAR_ROW_PAD + SIDEBAR_NEST_INDENT));
         }
         let workspace_id = workspace.id.clone();
+        let workspace_name = workspace.name.clone();
+        let workspace_cwd = workspace.cwd.clone();
+        let workspace_branch = workspace.branch.clone();
+        let workspace_index = workspace.index;
         let endpoint = endpoint.clone();
+        let focus_endpoint = endpoint.clone();
+        let focus_workspace = workspace_id.clone();
+        let menu_endpoint = endpoint.clone();
+        let menu_workspace = workspace_id.clone();
         row.on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 this.leave_settings_page();
-                this.activate_endpoint(endpoint.clone(), Some(workspace_id.clone()), None, cx);
+                this.activate_endpoint(
+                    focus_endpoint.clone(),
+                    Some(focus_workspace.clone()),
+                    None,
+                    cx,
+                );
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.leave_settings_page();
+                this.open_context_menu(
+                    SidebarMenuTarget::Workspace {
+                        endpoint: menu_endpoint.key(),
+                        workspace_id: menu_workspace.clone(),
+                        index: workspace_index,
+                        name: workspace_name.clone(),
+                        cwd: workspace_cwd.clone(),
+                        branch: workspace_branch.clone(),
+                    },
+                    event.position,
+                    cx,
+                );
             }),
         )
     }
@@ -8806,11 +10245,28 @@ impl PilusView {
         }
         let mut children = div().flex().flex_col().gap_1().pl(px(SIDEBAR_CHILD_INDENT));
         let mut any = false;
+        // The AGENTS-scope menu row narrows the dock to the visible surface's
+        // active workspace, mirroring the daemon's own scope filter.
+        let scoped_workspace = if self.agents_this_workspace {
+            self.endpoint_workspaces(&self.active)
+                .iter()
+                .find(|workspace| workspace.active)
+                .map(|workspace| workspace.id.clone())
+        } else {
+            None
+        };
         for id in self.connected_endpoints() {
-            let agents = self.endpoint_agents(&id);
+            let mut agents: Vec<&Agent> = self.endpoint_agents(&id).iter().collect();
+            if let Some(workspace_id) = &scoped_workspace {
+                agents.retain(|agent| agent.workspace_id == *workspace_id);
+            }
             if agents.is_empty() {
                 continue;
             }
+            // Pinned agents float to the top; a stable sort keeps the pinned
+            // and unpinned blocks in the order the daemon reported them.
+            agents
+                .sort_by_key(|agent| !self.pinned_agents.contains(&(id.key(), agent.pane.clone())));
             any = true;
             children = children.child(
                 div()
@@ -8879,7 +10335,12 @@ impl PilusView {
 
         let pane = agent.pane.clone();
         let endpoint = endpoint.clone();
-        div()
+        let focus_endpoint = endpoint.clone();
+        let focus_pane = pane.clone();
+        let menu_endpoint = endpoint.clone();
+        let menu_pane = pane.clone();
+        let menu_alias = agent.name.clone();
+        let mut row = div()
             .id(format!("pilus-agent-{}-{}", endpoint.key(), agent.pane))
             .flex()
             .flex_col()
@@ -8923,8 +10384,10 @@ impl PilusView {
                             .rounded_full()
                             .bg(status),
                     ),
-            )
-            .child(
+            );
+        // The path line follows the daemon's Show Path / Hide Path toggle.
+        if self.sidebar_agent_paths {
+            row = row.child(
                 div()
                     .flex()
                     .flex_row()
@@ -8955,14 +10418,32 @@ impl PilusView {
                             .child(branch),
                         _ => div(),
                     }),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.leave_settings_page();
-                    this.activate_endpoint(endpoint.clone(), None, Some(pane.clone()), cx);
-                }),
-            )
+            );
+        }
+        row.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.leave_settings_page();
+                this.activate_endpoint(focus_endpoint.clone(), None, Some(focus_pane.clone()), cx);
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.leave_settings_page();
+                this.open_context_menu(
+                    SidebarMenuTarget::Agent {
+                        endpoint: menu_endpoint.key(),
+                        pane: menu_pane.clone(),
+                        // The daemon's rename modal pre-fills the current
+                        // alias, not the derived label.
+                        name: menu_alias.clone(),
+                    },
+                    event.position,
+                    cx,
+                );
+            }),
+        )
     }
 
     /// Measure the inset card and the grid that fits inside it.
@@ -9279,6 +10760,8 @@ impl Render for PilusView {
             .child(self.session_menu(cx, cell_width, fullscreen))
             .child(self.palette_overlay(cx))
             .child(self.picker_overlay(window, cx))
+            .child(self.context_menu_overlay(cx, window))
+            .child(self.menu_prompt_overlay(cx))
     }
 }
 
@@ -9641,6 +11124,110 @@ fn icon(bytes: &'static [u8], size: f32, color: gpui::Rgba) -> impl IntoElement 
         .text_color(color)
 }
 
+/// The leading glyph of one sidebar context-menu row.
+fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
+    match item {
+        SidebarItem::Close => include_bytes!("../../assets/icons/x.svg"),
+        SidebarItem::Rename => include_bytes!("../../assets/icons/pencil.svg"),
+        SidebarItem::Pin | SidebarItem::Unpin => include_bytes!("../../assets/icons/pin.svg"),
+        SidebarItem::TogglePaths => include_bytes!("../../assets/icons/folder.svg"),
+        SidebarItem::QuickActions => include_bytes!("../../assets/icons/chevron-right.svg"),
+        SidebarItem::CopyPath | SidebarItem::CopyBranch => {
+            include_bytes!("../../assets/icons/copy.svg")
+        }
+        SidebarItem::NewWorktree => include_bytes!("../../assets/icons/git-branch.svg"),
+        SidebarItem::DeleteWorktree => include_bytes!("../../assets/icons/trash-2.svg"),
+        SidebarItem::OpenGit => include_bytes!("../../assets/icons/folder-git.svg"),
+        SidebarItem::OpenBoard => include_bytes!("../../assets/icons/list-checks.svg"),
+        SidebarItem::OpenMission => include_bytes!("../../assets/icons/gauge.svg"),
+        SidebarItem::ToggleScope => include_bytes!("../../assets/icons/monitor.svg"),
+        SidebarItem::Divider => include_bytes!("../../assets/icons/plus.svg"),
+    }
+}
+
+/// Resolve a path's physical spelling, falling back to the given text when
+/// the path is not reachable from this machine.
+///
+/// Git canonicalizes the checkout paths `worktree.list` reports (`/tmp` is
+/// `/private/tmp` on macOS), while a workspace's projected cwd and panes can
+/// keep the symlink spelling. Matching one against the other by text alone
+/// fails, so both sides are canonicalized before comparing; a remote
+/// endpoint's path usually does not resolve locally, and the fallback keeps
+/// that comparison a plain string match.
+fn canonical(spelling: &str) -> String {
+    match std::fs::canonicalize(spelling) {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(_) => spelling.to_string(),
+    }
+}
+
+/// Trim trailing path separators (never the root), so `worktree.list`'s
+/// absolute paths compare against an expanded cwd spelled with or without a
+/// trailing slash.
+fn trims(mut path: &str) -> &str {
+    while path != "/" && path.ends_with('/') {
+        path = &path[..path.len() - 1];
+    }
+    path
+}
+
+/// Whether `candidate` is `target` or a directory inside it.
+fn inside(candidate: &str, target: &str) -> bool {
+    candidate == target
+        || (candidate.starts_with(target) && candidate[target.len()..].starts_with('/'))
+}
+
+/// The linked checkout root containing `cwd`, or `None` when the workspace
+/// sits on the main checkout or outside every worktree.
+///
+/// A workspace's projected cwd can name a subdirectory of the checkout, so
+/// matching by equality alone misses it and the Delete Worktree row never
+/// appears; matching by `inside` finds the root `worktree.remove` actually
+/// needs. The longest match wins so a worktree nested inside another binds
+/// to its own root.
+fn linked_worktree_path(worktrees: &[WorktreeInfo], cwd: &str) -> Option<String> {
+    if let Some(tail) = cwd.trim().strip_prefix("~/") {
+        return linked_worktree_by_tail(worktrees, trims(tail));
+    }
+    let cwd = trims(&canonical(cwd)).to_string();
+    worktrees
+        .iter()
+        .filter(|worktree| !worktree.main)
+        .filter_map(|worktree| {
+            let root = trims(&canonical(&worktree.path)).to_string();
+            inside(&cwd, &root).then(|| (root.len(), worktree.path.clone()))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, path)| path)
+}
+
+/// Match a `~`-shorthand cwd whose machine home is not known yet.
+///
+/// A remote endpoint's `$HOME` resolves asynchronously, so until it lands the
+/// cwd cannot be expanded and an absolute comparison finds nothing, which
+/// silently drops the Delete Worktree row. The home-relative tail is still
+/// enough: a worktree root matches when it ends with some leading part of
+/// that tail, and the longest such part wins.
+fn linked_worktree_by_tail(worktrees: &[WorktreeInfo], tail: &str) -> Option<String> {
+    let mut ends: Vec<usize> = tail.match_indices('/').map(|(at, _)| at).collect();
+    ends.push(tail.len());
+    worktrees
+        .iter()
+        .filter(|worktree| !worktree.main)
+        .filter_map(|worktree| {
+            let root = trims(&worktree.path);
+            ends.iter()
+                .rev()
+                .find(|end| {
+                    let part = &tail[..**end];
+                    !part.is_empty() && root.ends_with(&format!("/{part}"))
+                })
+                .map(|end| (*end, worktree.path.clone()))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, path)| path)
+}
+
 /// Vendored brand mark for the daemon's agent kind.
 ///
 /// The daemon's canonical ids are lowercase and stable, but aliases and
@@ -9930,7 +11517,10 @@ fn status_label(status: &str) -> String {
 
 /// Whether a daemon's reported sidebars match the window's layout, ignoring
 /// the `agents` dock the window strips before sending.
-fn adopts_layout(sidebars: &ShellSidebars, layout: Option<&pilus_protocol::SidebarsConfig>) -> bool {
+fn adopts_layout(
+    sidebars: &ShellSidebars,
+    layout: Option<&pilus_protocol::SidebarsConfig>,
+) -> bool {
     let mut reported = sidebars.layout.clone();
     remove_dock(&mut reported.left, "agents");
     remove_dock(&mut reported.right, "agents");
@@ -10019,6 +11609,116 @@ mod tests {
             mods,
             ..CellData::default()
         }
+    }
+
+    #[test]
+    fn canonical_matches_git_spelling_through_a_symlink() {
+        // git reports checkout paths canonicalized; a workspace cwd can keep
+        // the symlink spelling. macOS `/tmp` is `/private/tmp`; the same gap
+        // is reproduced with a link under the (already canonical) temp dir.
+        let root = std::env::temp_dir().join(format!("pilus-canon-{}", std::process::id()));
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).expect("real dir");
+        let link = root.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let spelled = link.to_string_lossy().into_owned();
+        let git_spelling = canonical(&real.to_string_lossy());
+        assert_eq!(canonical(&spelled), git_spelling);
+        assert_ne!(spelled, git_spelling);
+        // Unresolvable spellings fall back to their own text.
+        let missing = root.join("missing").to_string_lossy().into_owned();
+        assert_eq!(canonical(&missing), missing);
+    }
+
+    #[test]
+    fn linked_worktree_path_matches_the_exact_root() {
+        let worktrees = [
+            WorktreeInfo {
+                path: "/repo".to_string(),
+                main: true,
+            },
+            WorktreeInfo {
+                path: "/repo/feature".to_string(),
+                main: false,
+            },
+        ];
+        assert_eq!(
+            linked_worktree_path(&worktrees, "/repo/feature"),
+            Some("/repo/feature".to_string())
+        );
+    }
+
+    #[test]
+    fn linked_worktree_path_climbs_a_nested_cwd() {
+        // Workspaces can open inside a linked checkout rather than at its
+        // root; the root is still what `worktree.remove` must delete.
+        let worktrees = [
+            WorktreeInfo {
+                path: "/repo".to_string(),
+                main: true,
+            },
+            WorktreeInfo {
+                path: "/repo/feature".to_string(),
+                main: false,
+            },
+        ];
+        assert_eq!(
+            linked_worktree_path(&worktrees, "/repo/feature/crates/app"),
+            Some("/repo/feature".to_string())
+        );
+    }
+
+    #[test]
+    fn linked_worktree_path_never_returns_the_main_checkout() {
+        let worktrees = [WorktreeInfo {
+            path: "/repo".to_string(),
+            main: true,
+        }];
+        assert_eq!(linked_worktree_path(&worktrees, "/repo"), None);
+        assert_eq!(linked_worktree_path(&worktrees, "/repo/crates/app"), None);
+    }
+
+    #[test]
+    fn linked_worktree_path_matches_an_unexpanded_home_shorthand() {
+        let worktrees = [
+            WorktreeInfo {
+                path: "/home/deploy/repo".to_string(),
+                main: true,
+            },
+            WorktreeInfo {
+                path: "/home/deploy/.luvus/worktrees/repo/feature".to_string(),
+                main: false,
+            },
+        ];
+        assert_eq!(
+            linked_worktree_path(&worktrees, "~/.luvus/worktrees/repo/feature"),
+            Some("/home/deploy/.luvus/worktrees/repo/feature".to_string())
+        );
+        assert_eq!(
+            linked_worktree_path(&worktrees, "~/.luvus/worktrees/repo/feature/src"),
+            Some("/home/deploy/.luvus/worktrees/repo/feature".to_string())
+        );
+        assert_eq!(linked_worktree_path(&worktrees, "~/repo"), None);
+        assert_eq!(
+            linked_worktree_path(&worktrees, "~/.luvus/worktrees/repo/feature-two"),
+            None
+        );
+    }
+
+    #[test]
+    fn linked_worktree_path_ignores_sibling_prefixes() {
+        let worktrees = [
+            WorktreeInfo {
+                path: "/repo".to_string(),
+                main: true,
+            },
+            WorktreeInfo {
+                path: "/repo/feature".to_string(),
+                main: false,
+            },
+        ];
+        assert_eq!(linked_worktree_path(&worktrees, "/repo/feature-two"), None);
     }
 
     #[test]

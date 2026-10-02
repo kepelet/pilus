@@ -248,6 +248,17 @@ pub fn list_branches_remote(target: &crate::transport::SshTarget, cwd: &str) -> 
         .collect()
 }
 
+/// One remote batch's answers: the machine's `$HOME` plus the branch of each
+/// requested directory. The home lets the window shorten absolute pane cwds
+/// reported by the daemon, which this machine's own `$HOME` cannot match.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RemoteBranches {
+    /// The remote `$HOME`, empty when it could not be read.
+    pub home: String,
+    /// Branches in the order requested; `None` is not a repo or detached.
+    pub branches: Vec<(String, Option<String>)>,
+}
+
 /// Resolve many `cwds` to their current branch names on a remote machine.
 ///
 /// One SSH invocation carries the whole batch as NUL-separated answers.
@@ -256,11 +267,15 @@ pub fn list_branches_remote(target: &crate::transport::SshTarget, cwd: &str) -> 
 pub fn current_branches_remote(
     target: &crate::transport::SshTarget,
     cwds: &[String],
-) -> Vec<(String, Option<String>)> {
+) -> RemoteBranches {
+    let empty = || RemoteBranches {
+        branches: cwds.iter().map(|cwd| (cwd.clone(), None)).collect(),
+        ..RemoteBranches::default()
+    };
     if cwds.is_empty() {
-        return Vec::new();
+        return RemoteBranches::default();
     }
-    let mut script = String::from("for d in");
+    let mut script = String::from("printf '%s\\0' \"$HOME\"; for d in");
     for cwd in cwds {
         script.push(' ');
         script.push_str(&remote_dir_arg(cwd));
@@ -269,22 +284,28 @@ pub fn current_branches_remote(
         "; do git -C \"$d\" branch --show-current 2>/dev/null | tr -d '\\n'; printf '\\0'; done",
     );
     let Ok(output) = target.shell(&script).output() else {
-        return cwds.iter().map(|cwd| (cwd.clone(), None)).collect();
+        return empty();
     };
     if !output.status.success() {
-        return cwds.iter().map(|cwd| (cwd.clone(), None)).collect();
+        return empty();
     }
     let answers: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
-    cwds.iter()
+    let home = answers
+        .first()
+        .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
+        .unwrap_or_default();
+    let branches = cwds
+        .iter()
         .enumerate()
         .map(|(index, cwd)| {
             let branch = answers
-                .get(index)
+                .get(index + 1)
                 .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
                 .unwrap_or_default();
             (cwd.clone(), (!branch.is_empty()).then_some(branch))
         })
-        .collect()
+        .collect();
+    RemoteBranches { home, branches }
 }
 ///
 /// The home lets later comparisons expand the daemon's `~`-shorthand dirs

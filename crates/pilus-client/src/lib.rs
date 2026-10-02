@@ -38,7 +38,7 @@ pub use error::{Error, Result};
 pub use pilus_protocol as protocol;
 pub use machines::{MachineInfo, connect_machine, install_agent, list_machines, refresh_machines};
 pub use projects::{
-    Project, RemoteRepos, common_git_dir, common_git_dirs_remote, current_branch,
+    Project, RemoteBranches, RemoteRepos, common_git_dir, common_git_dirs_remote, current_branch,
     current_branches_remote, expand_local as expand_project_local,
     expand_remote as expand_project_remote, id_for_name as project_id_for_name, list_branches,
     list_branches_remote,

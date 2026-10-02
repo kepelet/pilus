@@ -22,6 +22,10 @@
 #                         Set it explicitly to publish a real version instead.
 #   PILUS_PREVIEW_NOTES     Manifest notes line; defaults to the git revision
 #                         and the client build version.
+#   PILUS_BUNDLE_ID         Bundle identifier baked into the preview app.
+#                           Defaults to the release identifier so a preview
+#                           install keeps the same Notification Center / TCC
+#                           identity as stable across an OTA update.
 #   SKIP_PACKAGE=1        Reuse the DMG in target/release instead of running
 #                         scripts/package-macos-dmg.sh first.
 #   MINISIGN_SECRET_KEY   Forwarded to the packaging script; a `.minisig`
@@ -67,7 +71,11 @@ esac
 
 if [ "${SKIP_PACKAGE:-}" != "1" ]; then
     # Stamp the synthetic version into the build so the bundled app reports it.
-    PILUS_BUILD_VERSION="$manifest_version" ./scripts/package-macos-dmg.sh
+    # A preview install shares the release identity, so switching channels does
+    # not reset notification or TCC permissions.
+    PILUS_BUILD_VERSION="$manifest_version" \
+        PILUS_BUNDLE_ID="${PILUS_BUNDLE_ID:-pilus.kepelet.com}" \
+        ./scripts/package-macos-dmg.sh
 else
     echo "note: reusing an existing DMG; its embedded build version may differ" >&2
 fi

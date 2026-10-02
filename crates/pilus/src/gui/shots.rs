@@ -22,7 +22,7 @@ use super::machines::MachineManagerView;
 use super::theme::Theme;
 use super::update_window::UpdateWindow;
 use super::updater::Updater;
-use super::{PilusView, MachineSignal};
+use super::{MachineSignal, PilusView};
 use crate::settings::Settings;
 
 /// Where the captured frames are written.
@@ -237,14 +237,32 @@ pub fn run_main() -> Result<()> {
                     ..pilus_client::Tab::default()
                 })
                 .collect();
-            view.agents = vec![pilus_client::Agent {
-                tab: 2,
-                agent: "devin".to_string(),
-                status: "working".to_string(),
-                workspace_id,
-                cwd: "~/Developer/project-2".to_string(),
-                ..pilus_client::Agent::default()
-            }];
+            view.agents = vec![
+                pilus_client::Agent {
+                    tab: 2,
+                    agent: "devin".to_string(),
+                    status: "working".to_string(),
+                    workspace_id: workspace_id.clone(),
+                    cwd: "~/Developer/project-2".to_string(),
+                    ..pilus_client::Agent::default()
+                },
+                pilus_client::Agent {
+                    tab: 3,
+                    agent: "claude".to_string(),
+                    status: "blocked".to_string(),
+                    workspace_id: workspace_id.clone(),
+                    cwd: "~/Developer/project-3".to_string(),
+                    ..pilus_client::Agent::default()
+                },
+                pilus_client::Agent {
+                    tab: 4,
+                    agent: "codex".to_string(),
+                    status: "done".to_string(),
+                    workspace_id,
+                    cwd: "~/Developer/project-4".to_string(),
+                    ..pilus_client::Agent::default()
+                },
+            ];
             cx.notify();
         });
     });

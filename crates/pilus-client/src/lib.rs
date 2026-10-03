@@ -15,8 +15,8 @@ mod connector;
 mod control;
 mod discovery;
 mod error;
+mod git;
 mod machines;
-mod projects;
 mod surface;
 mod transport;
 mod uhp;
@@ -35,15 +35,12 @@ pub use discovery::{
     session_dir_for, split_client_socket, validate_session,
 };
 pub use error::{Error, Result};
+pub use git::{
+    RemoteRepos, common_git_dirs_remote, discard_worktree_changes, expand_local, expand_remote,
+    init_repository, worktree_is_dirty,
+};
 pub use machines::{MachineInfo, connect_machine, install_agent, list_machines, refresh_machines};
 pub use pilus_protocol as protocol;
-pub use projects::{
-    Project, RemoteBranches, RemoteRepos, common_git_dir, common_git_dirs_remote, current_branch,
-    current_branches_remote, discard_worktree_changes, expand_local as expand_project_local,
-    expand_remote as expand_project_remote, id_for_name as project_id_for_name, init_repository,
-    list_branches, list_branches_remote, load_projects, projects_file, save_projects,
-    validate as validate_project, worktree_is_dirty,
-};
 pub use surface::{Surface, SurfaceChange};
 pub use transport::SshTarget;
 pub use uhp::{Capabilities, Event, EventStream, Frame, Observer, Terminal, UhpClient};

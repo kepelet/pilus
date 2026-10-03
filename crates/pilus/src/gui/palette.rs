@@ -37,8 +37,6 @@ pub enum Command {
     OpenSettings,
     OpenHome,
     OpenUiPlayground,
-    OpenProject(String),
-    NewProjectWorktree(String),
     Quit,
     FocusTab(u16),
     SwitchSession(String),

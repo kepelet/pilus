@@ -41,7 +41,7 @@ Early. `pilus` today is a focused vertical slice:
   close) driven by the `tab.*` control API;
 - covers the daemon's bottom status line with a native bar whose right side
   mirrors the daemon's own `ui.bar.list` widgets (mode, pane count, tab);
-- shows local and remote projects in one flat workspace list, bridges every
+- shows local and remote workspaces in one flat list, bridges every
   enabled SSH machine over `ssh -T` in parallel at startup, switches the
   visible surface between endpoints with a two-phase prepared frame, offers a
   native Open Workspace folder picker and a Remote Machines manager, and lists

@@ -58,10 +58,6 @@ pub enum Error {
     #[error("{0}")]
     Machine(String),
 
-    /// A project definition could not be saved or read.
-    #[error("projects error: {0}")]
-    Projects(String),
-
     /// The local "this node" connector could not start, stop, or be read.
     #[error("connector error: {0}")]
     Connector(String),

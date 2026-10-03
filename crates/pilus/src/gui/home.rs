@@ -1,49 +1,38 @@
 //! The Home screen's in-window state.
 //!
-//! Home is the new-agent composer: a prompt plus pickers for where and how to
-//! run. Like the Projects panel, this module holds only state; the window
-//! resolves the picker options from live daemon data, paints them, and routes
-//! keys, so the model stays unit-testable without GPUI or a daemon.
+//! Home is the new-agent composer: a prompt plus pickers for how to run. Like
+//! the Settings page, this module holds only state; the window resolves the
+//! picker options from live daemon data, paints them, and routes keys, so the
+//! model stays unit-testable without GPUI or a daemon.
 
 use super::text_input::TextField;
 
 /// The pickers in the composer.
 ///
-/// `Agent` is state-only: the composer resolves it from the selected machine's
+/// `Agent` is state-only: the composer resolves it from the machine's
 /// installed agents and shows no chip for it, so it is not part of `ALL`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HomeField {
     Agent,
+    Workspace,
     Model,
     Effort,
-    Base,
-    Branch,
-    Project,
 }
 
 impl HomeField {
     /// Every picker the composer can focus, in chip order.
     ///
-    /// `Agent` is state-only: the composer derives it from the selected
-    /// machine's installed agents, so it no longer has a chip or a stop in the
-    /// focus cycle.
-    pub const ALL: [HomeField; 5] = [
-        HomeField::Project,
-        HomeField::Model,
-        HomeField::Effort,
-        HomeField::Base,
-        HomeField::Branch,
-    ];
+    /// `Agent` is state-only: the composer derives it from the installed
+    /// agents, so it has no chip or stop in the focus cycle.
+    pub const ALL: [HomeField; 3] = [HomeField::Workspace, HomeField::Model, HomeField::Effort];
 
     /// The chip label.
     pub fn label(self) -> &'static str {
         match self {
             HomeField::Agent => "Agent",
+            HomeField::Workspace => "Workspace",
             HomeField::Model => "Model",
             HomeField::Effort => "Effort",
-            HomeField::Base => "Base",
-            HomeField::Branch => "Branch",
-            HomeField::Project => "Project",
         }
     }
 }
@@ -84,28 +73,6 @@ impl HomeFocus {
     pub fn prev(self) -> Self {
         let len = HomeField::ALL.len() + 1;
         Self::from_index((self.index() + len - 1) % len)
-    }
-}
-
-/// What a launch starts from.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BaseMode {
-    /// Run in the project's existing checkout.
-    Checkout,
-    /// Create a worktree from the base branch first.
-    NewWorktree,
-}
-
-impl BaseMode {
-    /// Both modes, in toggle order.
-    pub const ALL: [BaseMode; 2] = [BaseMode::Checkout, BaseMode::NewWorktree];
-
-    /// The segment label.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Checkout => "Current checkout",
-            Self::NewWorktree => "New worktree",
-        }
     }
 }
 
@@ -156,11 +123,9 @@ pub struct HomePanel {
     prompt: TextField,
     focus: HomeFocus,
     agent: Choice,
+    workspace: Choice,
     model: Choice,
     effort: Choice,
-    base: Choice,
-    branch: Choice,
-    project: Choice,
     /// Which picker's dropdown is showing, if any.
     dropdown: Option<HomeField>,
     /// The picker an outside press just dismissed, so the chip's own click can
@@ -173,23 +138,14 @@ pub struct HomePanel {
 
 impl Default for HomePanel {
     fn default() -> Self {
-        let mut base = Choice::default();
-        base.set(
-            BaseMode::ALL
-                .iter()
-                .map(|mode| mode.label().to_string())
-                .collect(),
-        );
         Self {
             open: false,
             prompt: TextField::default(),
             focus: HomeFocus::Prompt,
             agent: Choice::default(),
+            workspace: Choice::default(),
             model: Choice::default(),
             effort: Choice::default(),
-            base,
-            branch: Choice::default(),
-            project: Choice::default(),
             dropdown: None,
             dismissed: None,
             filter: String::new(),
@@ -260,11 +216,9 @@ impl HomePanel {
     pub fn choice(&self, field: HomeField) -> &Choice {
         match field {
             HomeField::Agent => &self.agent,
+            HomeField::Workspace => &self.workspace,
             HomeField::Model => &self.model,
             HomeField::Effort => &self.effort,
-            HomeField::Base => &self.base,
-            HomeField::Branch => &self.branch,
-            HomeField::Project => &self.project,
         }
     }
 
@@ -272,31 +226,16 @@ impl HomePanel {
     pub fn choice_mut(&mut self, field: HomeField) -> &mut Choice {
         match field {
             HomeField::Agent => &mut self.agent,
+            HomeField::Workspace => &mut self.workspace,
             HomeField::Model => &mut self.model,
             HomeField::Effort => &mut self.effort,
-            HomeField::Base => &mut self.base,
-            HomeField::Branch => &mut self.branch,
-            HomeField::Project => &mut self.project,
         }
     }
 
-    /// What a launch starts from.
-    pub fn base_mode(&self) -> BaseMode {
-        if self.base.cursor() == 1 {
-            BaseMode::NewWorktree
-        } else {
-            BaseMode::Checkout
-        }
-    }
-
-    /// Whether the selected project is the personal-workspace row.
-    pub fn project_is_none(&self) -> bool {
-        self.project.cursor() == 0
-    }
-
-    /// The selected project's index in the caller's project list.
-    pub fn project_index(&self) -> Option<usize> {
-        (!self.project_is_none()).then(|| self.project.cursor() - 1)
+    /// The selected workspace's index in the caller's workspace list, when a
+    /// workspace is offered at all.
+    pub fn workspace_index(&self) -> Option<usize> {
+        (!self.workspace.options().is_empty()).then_some(self.workspace.cursor())
     }
 
     /// Which picker's dropdown is showing, if any.
@@ -454,11 +393,11 @@ mod tests {
         let mut home = HomePanel::default();
         assert_eq!(home.focus(), HomeFocus::Prompt);
         home.focus_prev();
-        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Branch));
+        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Effort));
         home.focus_next();
         assert_eq!(home.focus(), HomeFocus::Prompt);
         home.focus_next();
-        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Project));
+        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Workspace));
     }
 
     #[test]
@@ -475,24 +414,5 @@ mod tests {
         assert_eq!(home.choice(HomeField::Model).cursor(), 2);
         home.filter_backspace();
         assert_eq!(home.dropdown_matches(), vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn project_none_maps_to_no_index() {
-        let mut home = HomePanel::default();
-        home.choice_mut(HomeField::Project)
-            .set(vec!["No project".into(), "flo".into()]);
-        assert!(home.project_is_none());
-        assert_eq!(home.project_index(), None);
-        home.choice_mut(HomeField::Project).choose(1);
-        assert_eq!(home.project_index(), Some(0));
-    }
-
-    #[test]
-    fn base_mode_reads_the_picker() {
-        let mut home = HomePanel::default();
-        assert_eq!(home.base_mode(), BaseMode::Checkout);
-        home.choice_mut(HomeField::Base).choose(1);
-        assert_eq!(home.base_mode(), BaseMode::NewWorktree);
     }
 }

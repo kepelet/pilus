@@ -47,8 +47,8 @@ pub fn config_dir() -> PathBuf {
 
 /// The directory pilus owns for its stores, independent of the Luvus state root.
 ///
-/// Projects, client settings, and personal workspaces live here so they
-/// survive Luvus session changes and never mix with the daemon's own files.
+/// Client settings and personal workspaces live here so they survive Luvus
+/// session changes and never mix with the daemon's own files.
 pub fn pilus_config_dir() -> PathBuf {
     if let Some(value) = std::env::var_os(PILUS_HOME_ENV)
         && !value.is_empty()
@@ -58,7 +58,7 @@ pub fn pilus_config_dir() -> PathBuf {
     home_dir().join(".pilus")
 }
 
-/// The directory holding personal (project-less) workspaces.
+/// The directory holding personal scratch workspaces.
 pub fn pilus_workspaces_dir() -> PathBuf {
     pilus_config_dir().join("workspaces")
 }

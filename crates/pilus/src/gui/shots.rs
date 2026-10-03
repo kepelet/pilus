@@ -537,17 +537,26 @@ pub fn run_main() -> Result<()> {
     // centered layout does not shift when it opens.
     cx.update(|app| {
         view.update(app, |view, cx| {
-            view.home.open_dropdown(super::HomeField::Project);
+            view.home.open_dropdown(super::HomeField::Model);
             cx.notify();
         });
     });
     settle(&mut cx, 4);
     capture(&mut cx, window.into(), "main-home-dropdown")?;
     cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.home.close_dropdown();
+            view.home.open_dropdown(super::HomeField::Workspace);
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 4);
+    capture(&mut cx, window.into(), "main-home-workspace-dropdown")?;
+    cx.update(|app| {
         view.update(app, |view, _| view.home.close_dropdown());
     });
 
-    // The Settings page: projects, machines, agent config, updates.
+    // The Settings page: machines, agent config, updates.
     cx.update(|app| {
         view.update(app, |view, cx| {
             view.open_settings(cx);
@@ -555,19 +564,6 @@ pub fn run_main() -> Result<()> {
     });
     settle(&mut cx, 12);
     capture(&mut cx, window.into(), "main-settings")?;
-
-    // The New Project form on the settings page.
-    cx.update(|app| {
-        view.update(app, |view, cx| {
-            view.projects.start_new();
-            cx.notify();
-        });
-    });
-    settle(&mut cx, 4);
-    capture(&mut cx, window.into(), "main-project-form")?;
-    cx.update(|app| {
-        view.update(app, |view, _| view.projects.cancel_form());
-    });
 
     // The Open Workspace folder picker. Its listing happens on a thread, so
     // give it real time before the simulated clock drains the result.

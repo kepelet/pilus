@@ -8242,13 +8242,12 @@ impl PilusView {
     }
 
     /// Daemon columns hidden beneath our sidebar: the dock the daemon blanks
-    /// for us. Zero when our sidebar is hidden (the daemon draws its own
-    /// there) or the dock sits elsewhere.
+    /// for us. Read from the dock that matches the current frame, not the live
+    /// `ShellDock` control message: the server updates the dock before sending
+    /// the matching frame, so jumping the skip on the control message paints
+    /// the old frame's blank dock cells as a black band mid-toggle.
     fn skipped_cols(&self) -> u16 {
-        if !self.sidebar_visible {
-            return 0;
-        }
-        match self.surface.shell_dock() {
+        match self.surface.frame_dock() {
             Some(dock) if dock.x == 0 => dock.width,
             _ => 0,
         }
@@ -9847,15 +9846,16 @@ impl Render for PilusView {
         // One glass layer exactly: full-bleed has no padding and its edge
         // fillers seal every pixel, so when the frame seals the card the
         // cells carry the opacity and the card stays clear — otherwise two
-        // stacked layers would read near-solid instead of the setting. A
-        // frame the daemon has not caught up with leaves holes, so the card
-        // backs those (and the framed card's pad ring) until the next frame
-        // seals them.
+        // stacked layers would read near-solid instead of the setting. Only
+        // the row count can leave a hole the fillers do not cover: a lagging
+        // frame's missing columns are padded by each row's right-edge filler,
+        // so requiring them here would flip the card opaque mid-resize and
+        // double-blend every cell for a frame (a visible blink). The card
+        // still backs the framed pad ring and any short frame.
         let sealed = match self.surface.frame() {
             Some(frame) => {
                 frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS)
                     >= SKIPPED_DAEMON_ROWS.saturating_add(layout.rows)
-                    && frame.width.saturating_sub(self.skipped_cols()) >= layout.cols
             }
             None => false,
         };
@@ -10134,8 +10134,10 @@ fn render_grid(
         ));
     }
     // Full-bleed pools the sub-cell remainder below the last row; extend
-    // that row's colors over it so no card-colored sliver shows.
-    if slack_y > 0.5 && end_row > SKIPPED_DAEMON_ROWS {
+    // that row's colors over it so no card-colored sliver shows. Always emit
+    // it when a row painted: a zero or sub-pixel remainder still has to keep
+    // the transparent card covered at fractional window heights.
+    if end_row > SKIPPED_DAEMON_ROWS {
         column = column.child(bottom_fill(
             frame,
             end_row - 1,
@@ -10267,9 +10269,11 @@ fn render_row(
         }
         element = element.child(span);
     }
-    // Full-bleed pools the sub-cell remainder at the row's right edge;
-    // extend the last background over it so no card-colored sliver shows.
-    if slack_x > 0.5 {
+    // Full-bleed pools the sub-cell remainder at the row's right edge, and a
+    // lagging daemon leaves whole columns of it: extend the last background
+    // over both, or the transparent card shows the backdrop as a black band
+    // while the sidebar resizes.
+    if slack_x > 0.5 || paint_w < usize::from(max_cols) {
         let edge_bg = match rendered.last() {
             Some((column, cell, cursor)) => {
                 let selected = selection.is_some_and(|s| s.contains(*column, row));

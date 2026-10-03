@@ -110,7 +110,7 @@ pub struct ShellResize {
 
 /// Theme projection the server sends so a thin client can paint the owner-local
 /// machine form without receiving any profile data.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MachineFormTheme {
     /// Base surface color.
     pub surface: u32,
@@ -135,7 +135,7 @@ pub struct MachineFormTheme {
 }
 
 /// Exact client-owned workspaces dock geometry for the current viewport.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ShellDockRect {
     /// Draggable edge, when the dock is resizable.
     pub resize: Option<ShellResize>,

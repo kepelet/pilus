@@ -29,6 +29,12 @@ pub struct Surface {
     open_url: Option<String>,
     workspaces: Vec<ShellWorkspace>,
     shell_dock: Option<ShellDockRect>,
+    /// The dock in effect when the current frame was produced. The server
+    /// sends `ShellDock` before the matching `Frame`, so the live rect can
+    /// update while the client still holds the previous frame; the skip that
+    /// lines the grid up with the dock must follow the frame, not the control
+    /// message, or a collapse paints the old dock's blank cells.
+    frame_dock: Option<ShellDockRect>,
     shell_sidebars: Option<ShellSidebars>,
 }
 
@@ -105,6 +111,12 @@ impl Surface {
         self.shell_dock
     }
 
+    /// The dock that matches the current frame, for deriving the columns a
+    /// client-owned sidebar covers. Updates only when a frame does.
+    pub fn frame_dock(&self) -> Option<ShellDockRect> {
+        self.frame_dock
+    }
+
     /// The daemon's current sidebar layout, which a client may supersede to
     /// own the whole sidebar rather than only the workspaces dock.
     pub fn shell_sidebars(&self) -> Option<&ShellSidebars> {
@@ -117,11 +129,13 @@ impl Surface {
             ServerMessage::Frame(frame) => {
                 self.needs_full_frame = false;
                 self.frame = Some(frame.clone());
+                self.frame_dock = self.shell_dock;
                 SurfaceChange::Resized
             }
             ServerMessage::PreparedFrame { frame, .. } => {
                 self.needs_full_frame = false;
                 self.frame = Some(frame.clone());
+                self.frame_dock = self.shell_dock;
                 SurfaceChange::Resized
             }
             ServerMessage::FrameDiff(diff) => {
@@ -212,6 +226,26 @@ mod tests {
         });
         assert_eq!(surface.apply(&diff), SurfaceChange::Repaint);
         assert_eq!(surface.frame().expect("frame").cells[0].symbol, "h");
+    }
+
+    #[test]
+    fn frame_dock_lags_the_control_message_to_match_the_frame() {
+        let mut surface = Surface::new();
+        let dock = ShellDockRect {
+            width: 36,
+            ..ShellDockRect::default()
+        };
+        surface.apply(&ServerMessage::ShellDock(Some(dock)));
+        surface.apply(&ServerMessage::Frame(full(2, 1)));
+        assert_eq!(surface.frame_dock(), Some(dock));
+
+        // The server drops the dock before the matching frame arrives; the
+        // frame on screen still carries the dock, so its skip must not jump.
+        surface.apply(&ServerMessage::ShellDock(None));
+        assert_eq!(surface.frame_dock(), Some(dock));
+
+        surface.apply(&ServerMessage::Frame(full(2, 1)));
+        assert!(surface.frame_dock().is_none());
     }
 
     #[test]

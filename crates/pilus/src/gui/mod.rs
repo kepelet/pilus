@@ -9,6 +9,7 @@ mod about;
 mod app_icon;
 mod appearances;
 mod connector;
+mod glass;
 mod home;
 mod keys;
 mod machines;
@@ -41,6 +42,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
     MouseEventKind,
 };
+use glass::Glass;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context,
     DisplayId, Div, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent,
@@ -48,7 +50,7 @@ use gpui::{
     MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
     Stateful, SystemNotification, TextRun, TitlebarOptions, Transformation, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, anchored, deferred, div, font, img,
-    percentage, point, prelude::*, px, size, svg,
+    linear_color_stop, linear_gradient, percentage, point, prelude::*, px, relative, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
@@ -149,12 +151,25 @@ struct SidebarAnim {
 
 /// Window surfaces read their opacity from `Settings::glass_opacity`, tuned
 /// in the Appearances window, so no constant lives here.
-/// Strongest frost veil over the system blur, reached as the blur slider
-/// approaches (but does not reach) zero. Full blur shows the OS blur
-/// untouched; an explicit zero drops the blur view instead of veiling it.
-/// The veil is flat like a gaussian blur would be: AppKit fixes the blur
-/// radius itself, so no gradient can come from the OS side.
-const FROST_MAX: f32 = 0.5;
+/// Tint always veiling the blurred backdrop: keeps grid text readable on
+/// any desktop. It deepens as the blur slider drops — a sharper backdrop
+/// fights the text more.
+const GLASS_TINT: f32 = 0.16;
+/// Deepest extra tint over the backdrop, reached as the blur slider
+/// approaches (but does not reach) zero.
+const FROST_MAX: f32 = 0.28;
+/// Share of the tint the top of the pane carries: light passes where the
+/// sheen sits, so the glass reads lit from above.
+const TINT_TOP: f32 = 0.55;
+/// Sheen alpha at the very top of the window and the height share it falls
+/// off across: the specular highlight a pane catches from light above.
+const SHEEN_MAX: f32 = 0.055;
+const SHEEN_HEIGHT: f32 = 0.32;
+/// Edge light around the pane: the top rim catches the most, the sides just
+/// outline it, and the bottom sits in shadow instead.
+const RIM_TOP: f32 = 0.16;
+const RIM_SIDE: f32 = 0.05;
+const RIM_BOTTOM: f32 = 0.22;
 /// Right margin on the card. Matches the other sides so the terminal sits
 /// centered between the sidebar and the window edge.
 const CARD_GAP_RIGHT: f32 = CARD_GAP;
@@ -179,6 +194,14 @@ const WINDOW_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Least amount of a restored frame that must land on a display for the frame
 /// to be usable: enough of the titlebar to grab and drag.
 const WINDOW_MIN_VISIBLE: (f32, f32) = (120.0, 40.0);
+
+/// The window's initial backdrop: `Transparent` on macOS, where `Glass`
+/// installs its own frosted effect view; `Blurred` elsewhere, where the
+/// platform's built-in blur is the only one available.
+#[cfg(target_os = "macos")]
+const WINDOW_BACKDROP: WindowBackgroundAppearance = WindowBackgroundAppearance::Transparent;
+#[cfg(not(target_os = "macos"))]
+const WINDOW_BACKDROP: WindowBackgroundAppearance = WindowBackgroundAppearance::Blurred;
 
 /// Native sidebar destinations: live daemon data and bound views.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -495,7 +518,7 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             WindowOptions {
                 window_bounds: Some(bounds),
                 display_id,
-                window_background: WindowBackgroundAppearance::Blurred,
+                window_background: WINDOW_BACKDROP,
                 window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("pilus".into()),
@@ -668,7 +691,7 @@ fn open_main_window(
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(bounds),
-            window_background: WindowBackgroundAppearance::Blurred,
+            window_background: WINDOW_BACKDROP,
             window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
             titlebar: Some(TitlebarOptions {
                 title: Some("pilus".into()),
@@ -1057,10 +1080,9 @@ struct PilusView {
     /// Font choices, shared with the Appearances window.
     settings: Settings,
     shared_settings: Rc<RefCell<Settings>>,
-    /// Whether the window currently drops its blur view (sharp desktop),
-    /// so `render` only reconfigures the window when the blur setting
-    /// crosses zero.
-    applied_sharp: Option<bool>,
+    /// The window's frosted backdrop view, reconfigured whenever the blur
+    /// setting (or the opaque frame) changes it.
+    glass: Glass,
     /// Collapse/expand tween in flight, if any; the panel, tab strip, and
     /// terminal read its openness so they glide together.
     sidebar_anim: Option<SidebarAnim>,
@@ -1550,7 +1572,7 @@ impl PilusView {
             focus_handle,
             settings,
             shared_settings,
-            applied_sharp: None,
+            glass: Glass::new(),
             sidebar_anim: None,
             last_sidebar_dock: None,
             sidebar_open: 1.0,
@@ -10888,29 +10910,19 @@ impl Render for PilusView {
         let theme = self.theme;
         let glass = self.settings.glass_opacity();
         let framed = self.framed();
-        // The OS blur radius is fixed; the slider veils it with frost, and
-        // an explicit zero drops the blur view so the desktop shows sharp.
-        // The appearance only flips when the setting crosses zero.
+        // The blur slider drives the frosted backdrop view itself: full blur
+        // is vibrant frost, weaker settings crossfade toward the sharp
+        // desktop, and an explicit zero drops the view entirely. A framed
+        // window is opaque — nothing would show — so it keeps it off.
         let blur = self.settings.blur.clamp(0.0, 1.0);
-        let sharp = blur <= 0.0;
-        if self.applied_sharp != Some(sharp) {
-            window.set_background_appearance(if sharp {
-                WindowBackgroundAppearance::Transparent
-            } else {
-                WindowBackgroundAppearance::Blurred
-            });
-            self.applied_sharp = Some(sharp);
-        }
-        // A handler-less veil behind everything: it never intercepts clicks.
+        self.glass.apply(window, if framed { 0.0 } else { blur });
+        // A handler-less coat behind everything: it never intercepts clicks.
         // The framed card floats with a gap on every side, and that gap must
         // read as window base — the root is transparent so a translucent
-        // window can show the blur, which would otherwise leak the desktop
-        // through the margins. Only the translucent window leans on the veil.
-        let backdrop = if framed { 1.0 } else { frost_opacity(blur) };
-        let frost = div()
-            .absolute()
-            .inset_0()
-            .bg(theme.window_bg.opacity(backdrop));
+        // window can show the backdrop, which would otherwise leak the
+        // desktop through the margins. Only the translucent window leans on
+        // the coat.
+        let coat = glass_coat(theme, blur, framed);
         let cell_height = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
         let cell_width = self.cell_width(window);
         let layout = self.card_layout(window, framed);
@@ -11112,7 +11124,7 @@ impl Render for PilusView {
         // both.
         root = apply_chrome_font(root, &self.shared_settings);
 
-        root.child(frost)
+        root.child(coat)
             .child(header)
             .child(div().relative().flex_1().child({
                 let mut card = div()
@@ -11145,6 +11157,9 @@ impl Render for PilusView {
             // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
             .child(self.top_chrome(cx, cell_width, fullscreen))
+            // The pane's edge light sits over the surfaces, which all run to
+            // the window edges, but under the floating overlays.
+            .children(glass_rim(theme, framed))
             .child(self.session_menu(cx, cell_width, fullscreen))
             .child(self.palette_overlay(cx))
             .child(self.picker_overlay(window, cx))
@@ -11528,15 +11543,94 @@ fn terminal_inset_border() -> gpui::Rgba {
     gpui::rgb(0x24242c)
 }
 
-/// Frost veil over the system blur for `blur` (0.0..=1.0): none at full
-/// blur, strengthening toward [`FROST_MAX`] as blur drops, and none again
-/// at an explicit zero where the window drops the blur view instead.
-fn frost_opacity(blur: f32) -> f32 {
-    if blur <= 0.0 {
-        0.0
-    } else {
-        (1.0 - blur.clamp(0.0, 1.0)) * FROST_MAX
+/// Tint alpha for `blur` (0.0..=1.0): the constant glass floor at full
+/// blur, deepening toward [`FROST_MAX`] more as the backdrop sharpens — a
+/// sharper desktop fights grid text more, so it asks for a deeper tint.
+fn coat_tint(blur: f32) -> f32 {
+    GLASS_TINT + (1.0 - blur.clamp(0.0, 1.0)) * FROST_MAX
+}
+
+/// The window's glass coat, painted behind every surface: a tint gradient
+/// deepening toward the bottom plus a sheen band under the top edge, which
+/// is what turns the frosted backdrop into a lit pane. The framed (opaque)
+/// window only needs its flat base under the card margins.
+fn glass_coat(theme: Theme, blur: f32, framed: bool) -> Div {
+    if framed {
+        return div().absolute().inset_0().bg(theme.window_bg);
     }
+    let tint = coat_tint(blur);
+    div()
+        .absolute()
+        .inset_0()
+        .child(div().absolute().inset_0().bg(linear_gradient(
+            180.0,
+            linear_color_stop(theme.window_bg.opacity(tint * TINT_TOP), 0.0),
+            linear_color_stop(theme.window_bg.opacity(tint), 1.0),
+        )))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(relative(SHEEN_HEIGHT))
+                .bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(theme.panel_fg.opacity(SHEEN_MAX), 0.0),
+                    linear_color_stop(theme.panel_fg.opacity(0.0), 1.0),
+                )),
+        )
+}
+
+/// The pane's edge light, painted over the surfaces since they all run to
+/// the window's edges: a bright hairline on top, faint ones down the sides,
+/// and a shadowed foot at the bottom. An opaque window keeps its plain
+/// frame instead.
+fn glass_rim(theme: Theme, framed: bool) -> Option<Div> {
+    if framed {
+        return None;
+    }
+    Some(
+        div()
+            .absolute()
+            .inset_0()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(1.0))
+                    .bg(theme.panel_fg.opacity(RIM_TOP)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .w(px(1.0))
+                    .bg(theme.panel_fg.opacity(RIM_SIDE)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(1.0))
+                    .bg(theme.panel_fg.opacity(RIM_SIDE)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(1.0))
+                    .bg(theme.window_bg.opacity(RIM_BOTTOM)),
+            ),
+    )
 }
 
 /// Apply the user's Interface font family and base size to a window root, so
@@ -12196,12 +12290,12 @@ mod tests {
     }
 
     #[test]
-    fn frost_opacity_veils_as_blur_drops() {
-        assert_eq!(frost_opacity(1.0), 0.0);
-        assert_eq!(frost_opacity(0.0), 0.0);
-        assert_eq!(frost_opacity(0.5), FROST_MAX / 2.0);
-        assert_eq!(frost_opacity(2.0), 0.0);
-        assert_eq!(frost_opacity(-1.0), 0.0);
+    fn coat_tint_deepens_as_blur_drops() {
+        assert_eq!(coat_tint(1.0), GLASS_TINT);
+        assert_eq!(coat_tint(0.0), GLASS_TINT + FROST_MAX);
+        assert_eq!(coat_tint(0.5), GLASS_TINT + FROST_MAX / 2.0);
+        assert_eq!(coat_tint(2.0), GLASS_TINT);
+        assert_eq!(coat_tint(-1.0), GLASS_TINT + FROST_MAX);
     }
 
     #[test]

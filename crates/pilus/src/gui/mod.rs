@@ -166,10 +166,10 @@ const TINT_TOP: f32 = 0.55;
 const SHEEN_MAX: f32 = 0.055;
 const SHEEN_HEIGHT: f32 = 0.32;
 /// Edge light around the pane: the top rim catches the most, the sides just
-/// outline it, and the bottom sits in shadow instead.
+/// outline it. The bottom is left bare so a full-bleed terminal reaches the
+/// window edge without a shadow line over its last row.
 const RIM_TOP: f32 = 0.16;
 const RIM_SIDE: f32 = 0.05;
-const RIM_BOTTOM: f32 = 0.22;
 /// Right margin on the card. Matches the other sides so the terminal sits
 /// centered between the sidebar and the window edge.
 const CARD_GAP_RIGHT: f32 = CARD_GAP;
@@ -7580,6 +7580,16 @@ impl PilusView {
         width
     }
 
+    /// The measured cell height in whole pixels. The daemon is told the
+    /// rounded value in `Resize`, so the client floors its own row, padding,
+    /// and pointer math to the same integer; a fractional height lets each
+    /// painted row snap to the device grid and drift out of the card's centering.
+    fn cell_height(&self) -> f32 {
+        (self.settings.terminal_font_size * LINE_HEIGHT_RATIO)
+            .round()
+            .max(1.0)
+    }
+
     /// The chrome/base text size, following the user's UI font size.
     fn chrome_font(&self) -> f32 {
         self.settings.ui_font_size
@@ -7918,7 +7928,7 @@ impl PilusView {
         let Some(cell) = self.cell_at(window, event.position) else {
             return;
         };
-        let cell_height = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
+        let cell_height = self.cell_height();
         let (delta, lines) = match event.delta {
             ScrollDelta::Lines(point) => (point.y, point.y.abs().round().max(1.0) as u16),
             ScrollDelta::Pixels(point) => {
@@ -11143,7 +11153,7 @@ impl PilusView {
     /// side.
     fn card_layout(&mut self, window: &Window, framed: bool) -> CardLayout {
         let cell_w = self.cell_width(window);
-        let cell_h = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
+        let cell_h = self.cell_height();
         let viewport = window.viewport_size();
         // A translucent terminal drops the inset card and runs to the window
         // edges; the opaque one keeps its gaps, hairline, and rounding.
@@ -11300,7 +11310,7 @@ impl Render for PilusView {
         // desktop through the margins. Only the translucent window leans on
         // the coat.
         let coat = glass_coat(theme, blur, framed);
-        let cell_height = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
+        let cell_height = self.cell_height();
         let cell_width = self.cell_width(window);
         let layout = self.card_layout(window, framed);
         let line_height = px(cell_height);
@@ -11645,13 +11655,15 @@ fn render_row(
     let end = (start + paint_w).min(frame.cells.len());
     let cells = frame.cells.get(start..end).unwrap_or(&[]);
 
+    // Shared row width: every run pins its right edge to the same boundary the
+    // next run starts on, so adjacent translucent backgrounds tile instead of
+    // leaving a sub-pixel gap for the backdrop to show through as a hairline.
+    let row_width = f32::from(frame.width.saturating_sub(skip_cols)) * cell_width;
     let mut element = div()
         .relative()
         .flex_shrink_0()
         .h(line_height)
-        .w(px(
-            f32::from(frame.width.saturating_sub(skip_cols)) * cell_width
-        ));
+        .w(px(row_width));
 
     // A double-width glyph covers two columns; the daemon blanks the trailing
     // continuation cell. Drop it here too so the run advances exactly one cell
@@ -11669,7 +11681,33 @@ fn render_row(
         };
     }
 
-    for (start_column, run_cells, text, (fg, bg, mods)) in
+    // Fill first, in color-only runs: a uniformly-filled row is then one rect
+    // instead of one per fallback glyph, so the device-snapped edges cannot
+    // leave backdrop-colored hairlines between them.
+    for (start_column, run_cells, bg) in
+        collect_background_runs(frame.width, &rendered, theme, row, selection)
+    {
+        element = element.child(
+            div()
+                .absolute()
+                .left(px(
+                    f32::from(start_column.saturating_sub(skip_cols)) * cell_width
+                ))
+                .top(px(0.0))
+                .right(px(
+                    row_width
+                        - f32::from(
+                            start_column
+                                .saturating_add(run_cells)
+                                .saturating_sub(skip_cols),
+                        ) * cell_width,
+                ))
+                .h(line_height)
+                .bg(bg.opacity(glass)),
+        );
+    }
+
+    for (start_column, run_cells, text, (fg, _bg, mods)) in
         collect_runs(frame.width, &rendered, theme, row, selection)
     {
         // Runs position relative to the painted slice: the container starts
@@ -11681,7 +11719,14 @@ fn render_row(
                 f32::from(start_column.saturating_sub(skip_cols)) * cell_width
             ))
             .top(px(0.0))
-            .w(px(f32::from(run_cells) * cell_width))
+            .right(px(
+                row_width
+                    - f32::from(
+                        start_column
+                            .saturating_add(run_cells)
+                            .saturating_sub(skip_cols),
+                    ) * cell_width,
+            ))
             .h(line_height)
             .flex()
             .items_center()
@@ -11689,7 +11734,6 @@ fn render_row(
             .font_family(font_family)
             .text_size(px(font_size))
             .line_height(line_height)
-            .bg(bg.opacity(glass))
             .text_color(fg)
             .child(text);
         if mods & M_BOLD != 0 {
@@ -11745,28 +11789,29 @@ fn bottom_fill(
     glass: f32,
 ) -> Div {
     let spans = bottom_fill_spans(frame, row, theme, selection, skip_cols, max_cols);
+    let strip_width = f32::from(max_cols) * cell_width + slack_x;
     let mut strip = div()
         .relative()
         .flex_shrink_0()
         .h(px(slack_y))
-        .w(px(f32::from(max_cols) * cell_width + slack_x));
+        .w(px(strip_width));
     for (index, (offset, run_cells, bg)) in spans.iter().enumerate() {
         // The last span absorbs the unpainted tail (a resize the daemon has
-        // not caught up with) plus the remainder, so the strip always
-        // reaches the container edge.
-        let extra = if index + 1 == spans.len() {
-            (f32::from(max_cols) - f32::from(offset.saturating_add(*run_cells))).max(0.0)
-                * cell_width
-                + slack_x
-        } else {
+        // not caught up with) plus the remainder, so the strip always reaches
+        // the container edge. Every other span pins its right edge to the next
+        // span's shared boundary, so the translucent backgrounds tile instead
+        // of leaving a backdrop-colored hairline between them.
+        let right = if index + 1 == spans.len() {
             0.0
+        } else {
+            strip_width - f32::from(offset.saturating_add(*run_cells)) * cell_width
         };
         strip = strip.child(
             div()
                 .absolute()
                 .left(px(f32::from(*offset) * cell_width))
                 .top(px(0.0))
-                .w(px(f32::from(*run_cells) * cell_width + extra))
+                .right(px(right))
                 .h_full()
                 .bg(bg.opacity(glass)),
         );
@@ -11798,18 +11843,15 @@ fn bottom_fill_spans(
     while index < cells.len() {
         let column = skip_cols.saturating_add(index as u16);
         let selected = selection.is_some_and(|s| s.contains(column, row));
-        let bg = style_of(
-            &cells[index],
-            theme,
-            cursor_at(frame, column, row),
-            selected,
-        )
-        .1;
+        // The filler continues the row's *backgrounds*, never the caret: a
+        // cursor cell's swapped color would otherwise stretch down the slack
+        // below the last row and read as an oversized block cursor.
+        let bg = style_of(&cells[index], theme, false, selected).1;
         let mut next = index + 1;
         while next < cells.len() {
             let column = skip_cols.saturating_add(next as u16);
             let selected = selection.is_some_and(|s| s.contains(column, row));
-            if style_of(&cells[next], theme, cursor_at(frame, column, row), selected).1 != bg {
+            if style_of(&cells[next], theme, false, selected).1 != bg {
                 break;
             }
             next += 1;
@@ -11900,6 +11942,55 @@ fn collect_runs(
     runs
 }
 
+/// One row's background fill, grouped only by color so a uniformly filled row
+/// paints as a single rect. [`collect_runs`] also splits on glyph flowability
+/// to keep fallback glyphs aligned, but each extra split becomes another
+/// translucent rect whose device-snapped edges can leave hairline gaps in a
+/// full-bleed window — exactly where the backdrop shows through.
+fn collect_background_runs(
+    frame_width: u16,
+    rendered: &[(u16, &CellData, bool)],
+    theme: Theme,
+    row: u16,
+    selection: Option<Selection>,
+) -> Vec<(u16, u16, gpui::Rgba)> {
+    let bg_at = |column: u16, cell: &CellData, cursor: bool| {
+        style_of(
+            cell,
+            theme,
+            cursor,
+            selection.is_some_and(|s| s.contains(column, row)),
+        )
+        .1
+    };
+    let mut runs = Vec::new();
+    let mut index = 0usize;
+    while index < rendered.len() {
+        let (start_column, cell, cursor) = rendered[index];
+        let bg = bg_at(start_column, cell, cursor);
+        let mut next = index + 1;
+        while next < rendered.len() {
+            let (column, cell, cursor) = rendered[next];
+            if bg_at(column, cell, cursor) != bg {
+                break;
+            }
+            next += 1;
+        }
+        let end_column = if next < rendered.len() {
+            rendered[next].0
+        } else {
+            frame_width
+        };
+        runs.push((
+            start_column,
+            end_column.saturating_sub(start_column).max(1),
+            bg,
+        ));
+        index = next;
+    }
+    runs
+}
+
 fn style_of(
     cell: &CellData,
     theme: Theme,
@@ -11979,9 +12070,10 @@ fn glass_coat(theme: Theme, blur: f32, framed: bool) -> Div {
 }
 
 /// The pane's edge light, painted over the surfaces since they all run to
-/// the window's edges: a bright hairline on top, faint ones down the sides,
-/// and a shadowed foot at the bottom. An opaque window keeps its plain
-/// frame instead.
+/// the window's edges: a bright hairline on top and faint ones down the sides.
+/// No foot is drawn: it would sit over the full-bleed terminal's last row and
+/// read as a gap, so the terminal keeps the window's bottom edge to itself. An
+/// opaque window keeps its plain frame instead.
 fn glass_rim(theme: Theme, framed: bool) -> Option<Div> {
     if framed {
         return None;
@@ -12017,15 +12109,6 @@ fn glass_rim(theme: Theme, framed: bool) -> Option<Div> {
                     .w(px(1.0))
                     .bg(theme.panel_fg.opacity(RIM_SIDE)),
             )
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .h(px(1.0))
-                    .bg(theme.window_bg.opacity(RIM_BOTTOM)),
-            ),
     )
 }
 
@@ -12754,6 +12837,42 @@ mod tests {
             spans[1].2,
             theme::resolve(0x0100_0001, theme.bg, &theme.ansi)
         );
+    }
+
+    #[test]
+    fn bottom_fill_spans_never_extend_the_caret() {
+        let theme = Theme::default();
+        let mut frame = FrameData::blank(4, 4, 0, 0);
+        // The cursor cell's swapped color would be `ansi[1]`; the filler must
+        // keep the row's plain background so the caret cannot grow tall.
+        frame.cells[2 * 4 + 1].fg = 0x0100_0001;
+        frame.cursor = Some((1, 2));
+        frame.cursor_visible = true;
+        let spans = bottom_fill_spans(&frame, 2, theme, None, 0, 4);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].2, theme.bg);
+    }
+
+    #[test]
+    fn background_runs_merge_across_fallback_glyphs() {
+        let theme = Theme::default();
+        let mut frame = FrameData::blank(4, 1, 0, 0);
+        // A box-drawing border: every cell shares one background but each glyph
+        // is non-flowable, so the text runs stay one-per-cell while the fill
+        // collapses to a single rect and cannot leave snapped hairline gaps.
+        for cell in frame.cells.iter_mut() {
+            cell.symbol = "\u{2500}".to_string();
+        }
+        let rendered: Vec<(u16, &CellData, bool)> = frame
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| (index as u16, cell, false))
+            .collect();
+        assert_eq!(collect_runs(frame.width, &rendered, theme, 0, None).len(), 4);
+        let background = collect_background_runs(frame.width, &rendered, theme, 0, None);
+        assert_eq!(background.len(), 1);
+        assert_eq!(background[0], (0, 4, theme.bg));
     }
 
     #[test]

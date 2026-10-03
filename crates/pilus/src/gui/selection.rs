@@ -119,6 +119,7 @@ mod tests {
                 cell(" "),
                 cell(" "),
             ],
+            hyperlinks: Vec::new(),
             cursor: None,
             cursor_visible: false,
         };

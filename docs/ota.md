@@ -167,8 +167,53 @@ Three layers, weakest first:
 
 ## Daemon compatibility
 
-The OTA feed carries no protocol gate by design. `PROTOCOL_VERSION` is pinned
-to the released daemon, and the handshake already rejects a mismatch with a
-readable error — a client that updated past its daemon simply fails to attach
-until `luvus` is updated too. Keep the two release notes in sync and say which
-daemon a client release needs.
+The OTA feed carries no protocol gate by design: `pilus` and `luvus` are
+released separately, and the manifest does not name the daemon a build needs.
+`PROTOCOL_VERSION` is pinned to the newest released daemon (20, Luvus 0.14.3),
+and `FALLBACK_PROTOCOL_VERSION` (18, Luvus 0.14.2) is decoded too. The handshake
+tries the newest revision first and, when the daemon rejects it, reconnects at
+the fallback; `FrameData` decodes either shape per connection. One build
+bridges both, which is what keeps the local terminal working while a fleet is
+mid-upgrade: a local or remote daemon still on 0.14.2 attaches normally, and a
+protocol error only surfaces when neither revision matches. The updater below
+still moves everything to the pinned release when you are ready.
+
+A protocol mismatch no longer strands the app. The main window opens before
+the daemon is attached, so a stopped or incompatible daemon cannot abort the
+launch: the empty grid shows the failure and the local reconnect loop keeps
+retrying with capped backoff, which keeps Settings, Updates, and the Remote
+Machines manager reachable. Remote machines already degrade per endpoint the
+same way, so a newer local `pilus` still opens even when every daemon is old.
+
+`pilus` updates itself through its OTA feed; the daemon gets a parallel path.
+**Settings → UPDATES → Luvus daemon** has three actions:
+
+- **Check Luvus** reads `https://luvus.dev/latest.json` and compares it to the
+  installed `luvus --version`, showing `installed X · latest Y`.
+- **Update Luvus** downloads the platform archive
+  (`luvus-v<version>-<triple>.tar.gz`), verifies its `.sha256` sidecar through
+  the same `gpui-updater-core` download/verify pipeline `pilus` uses, extracts
+  `luvus`, and atomically installs it. A Homebrew, Cargo, or Nix install is
+  refused so it keeps updating through its package manager; everything else
+  installs in place, or at `~/.local/bin/luvus` when the only `luvus` is the
+  remote-provisioning cache.
+- **Restart Luvus** runs `luvus [--session NAME] server restart` so the running
+  daemon loads the new binary. It is two-click because it stops every pane in
+  the session.
+
+`LUVUS_UPDATE_MANIFEST` and `LUVUS_UPDATE_RELEASE_BASE` override the manifest
+and download host, matching the `luvus` CLI's own variables.
+
+- **Saved machines.** A profile bridges the versioned binary its
+  `remote_binary` names, provisioned from the local install's
+  `~/.local/share/luvus/remote/<version>/…` cache. Each enabled row in
+  **Remote Machines** has an **Update** button that re-provisions it with
+  `luvus machine enable <id> --install`, and the row shows the remote daemon's
+  version from the last `machine status` probe.
+
+Every daemon action runs off the GUI thread and reports its result in place,
+so a slow download, an offline host, or a package-manager refusal never blocks
+the window.
+
+Keep the two release notes in sync and say which daemon a client release
+needs.

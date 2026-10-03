@@ -24,6 +24,8 @@ pub struct Surface {
     notify: Option<String>,
     sounds: Vec<SoundSignal>,
     clipboard: Option<String>,
+    /// Receipt to acknowledge once the pending clipboard text is installed.
+    clipboard_receipt: Option<u64>,
     open_url: Option<String>,
     workspaces: Vec<ShellWorkspace>,
     shell_dock: Option<ShellDockRect>,
@@ -64,6 +66,12 @@ impl Surface {
     /// Take a pending clipboard assignment.
     pub fn take_clipboard(&mut self) -> Option<String> {
         self.clipboard.take()
+    }
+
+    /// Take the receipt that must be acknowledged after the pending clipboard
+    /// text is installed. `None` for an untracked `Clipboard` assignment.
+    pub fn take_clipboard_receipt(&mut self) -> Option<u64> {
+        self.clipboard_receipt.take()
     }
 
     /// Take a pending URL open request.
@@ -140,6 +148,11 @@ impl Surface {
                 self.clipboard = Some(text.clone());
                 SurfaceChange::None
             }
+            ServerMessage::ClipboardTracked { text, receipt } => {
+                self.clipboard = Some(text.clone());
+                self.clipboard_receipt = Some(*receipt);
+                SurfaceChange::None
+            }
             ServerMessage::OpenUrl(url) => {
                 self.open_url = Some(url.clone());
                 SurfaceChange::None
@@ -171,6 +184,7 @@ mod tests {
             width,
             height,
             cells: vec![CellData::blank(0x00ff_ffff, 0); usize::from(width) * usize::from(height)],
+            hyperlinks: Vec::new(),
             cursor: None,
             cursor_visible: false,
         }
@@ -212,6 +226,20 @@ mod tests {
         );
         assert_eq!(surface.take_clipboard().as_deref(), Some("hi"));
         assert!(surface.take_clipboard().is_none());
+    }
+
+    #[test]
+    fn tracked_clipboard_keeps_its_receipt() {
+        // A protocol-20 foreground copy must be acknowledged after the window
+        // installs it, so the receipt rides beside the text and is taken once.
+        let mut surface = Surface::new();
+        surface.apply(&ServerMessage::ClipboardTracked {
+            text: "hi".into(),
+            receipt: 7,
+        });
+        assert_eq!(surface.take_clipboard().as_deref(), Some("hi"));
+        assert_eq!(surface.take_clipboard_receipt(), Some(7));
+        assert!(surface.take_clipboard_receipt().is_none());
     }
 
     #[test]

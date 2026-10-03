@@ -4,7 +4,26 @@
 //! [`FrameData`] on attach and resize, then [`FrameDiff`]s that touch only the
 //! cells that changed. A client applies diffs to its stored frame and repaints.
 
+use std::cell::Cell;
+
 use serde::{Deserialize, Serialize};
+
+thread_local! {
+    /// Protocol revision the current reader thread negotiated. `FrameData` is
+    /// positional, so the decoder must know whether the daemon sent the
+    /// protocol-20 `hyperlinks` field. One connection per reader thread keeps
+    /// this isolated even when endpoints on different revisions are bridged at
+    /// once.
+    static DECODE_VERSION: Cell<u32> = const { Cell::new(crate::PROTOCOL_VERSION) };
+}
+
+/// Set the protocol revision [`FrameData`]'s deserializer uses on this thread.
+///
+/// A connection's reader thread calls this once, right after the handshake
+/// agrees on a revision. Threads that never call it decode the newest shape.
+pub fn set_decode_version(version: u32) {
+    DECODE_VERSION.with(|cell| cell.set(version));
+}
 
 /// One rendered terminal cell.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -66,10 +85,12 @@ pub struct DiffRun {
 
 /// A complete `width * height` grid of cells plus the caret.
 ///
-/// Protocol 18 shape. Protocol 19 inserts a `Vec<FrameHyperlink>` between
-/// `cells` and `cursor`; adding that field here without bumping
-/// [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) would corrupt every frame.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+/// Protocol 20 shape. The `hyperlinks` field sits between `cells` and `cursor`,
+/// where the daemon sends it; its position is positional wire state, so it
+/// must stay there. The deserializer is hand-written so the same type can
+/// decode a protocol-18 daemon's frame (without `hyperlinks`) when a connection
+/// negotiates down; see [`set_decode_version`].
+#[derive(Serialize, Clone, PartialEq, Debug)]
 pub struct FrameData {
     /// Grid width in cells.
     pub width: u16,
@@ -77,11 +98,78 @@ pub struct FrameData {
     pub height: u16,
     /// Row-major cells, exactly `width * height` long.
     pub cells: Vec<CellData>,
+    /// Sparse `OSC 8` link spans, empty for most frames.
+    pub hyperlinks: Vec<FrameHyperlink>,
     /// Caret position as `(column, row)`, or `None` when hidden.
     pub cursor: Option<(u16, u16)>,
     /// When `cursor` is present, whether the host caret should be shown.
     #[serde(default)]
     pub cursor_visible: bool,
+}
+
+/// The protocol-20 field order, `hyperlinks` included.
+#[derive(Deserialize)]
+struct FrameDataV20 {
+    width: u16,
+    height: u16,
+    cells: Vec<CellData>,
+    hyperlinks: Vec<FrameHyperlink>,
+    cursor: Option<(u16, u16)>,
+    #[serde(default)]
+    cursor_visible: bool,
+}
+
+/// The protocol-18 field order, without `hyperlinks`.
+#[derive(Deserialize)]
+struct FrameDataV18 {
+    width: u16,
+    height: u16,
+    cells: Vec<CellData>,
+    cursor: Option<(u16, u16)>,
+    #[serde(default)]
+    cursor_visible: bool,
+}
+
+impl<'de> Deserialize<'de> for FrameData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if DECODE_VERSION.with(Cell::get) >= 19 {
+            let FrameDataV20 {
+                width,
+                height,
+                cells,
+                hyperlinks,
+                cursor,
+                cursor_visible,
+            } = FrameDataV20::deserialize(deserializer)?;
+            Ok(Self {
+                width,
+                height,
+                cells,
+                hyperlinks,
+                cursor,
+                cursor_visible,
+            })
+        } else {
+            let FrameDataV18 {
+                width,
+                height,
+                cells,
+                cursor,
+                cursor_visible,
+            } = FrameDataV18::deserialize(deserializer)?;
+            Ok(Self {
+                width,
+                height,
+                cells,
+                hyperlinks: Vec::new(),
+                cursor,
+                cursor_visible,
+            })
+        }
+    }
 }
 
 /// A sparse update to a [`FrameData`] of identical dimensions.
@@ -154,6 +242,7 @@ impl FrameData {
             width,
             height,
             cells: vec![CellData::blank(fg, bg); usize::from(width) * usize::from(height)],
+            hyperlinks: Vec::new(),
             cursor: None,
             cursor_visible: false,
         }
@@ -240,9 +329,58 @@ impl FrameData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FALLBACK_PROTOCOL_VERSION, PROTOCOL_VERSION};
 
     fn frame() -> FrameData {
         FrameData::blank(3, 2, 0x00ff_ffff, 0x0000_0000)
+    }
+
+    /// The protocol-18 shape, used to prove the fallback decode path.
+    #[derive(Serialize)]
+    struct FrameV18 {
+        width: u16,
+        height: u16,
+        cells: Vec<CellData>,
+        cursor: Option<(u16, u16)>,
+        cursor_visible: bool,
+    }
+
+    #[test]
+    fn decodes_both_frame_shapes_by_negotiated_revision() {
+        let config = bincode::config::standard();
+        let v18 = FrameV18 {
+            width: 2,
+            height: 1,
+            cells: vec![CellData::blank(1, 0), CellData::blank(2, 0)],
+            cursor: Some((1, 0)),
+            cursor_visible: true,
+        };
+        let bytes = bincode::serde::encode_to_vec(&v18, config).expect("encode v18");
+        set_decode_version(FALLBACK_PROTOCOL_VERSION);
+        let (decoded, _): (FrameData, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).expect("decode v18");
+        assert!(decoded.hyperlinks.is_empty());
+        assert_eq!(decoded.cursor, Some((1, 0)));
+        assert!(decoded.cursor_visible);
+
+        // The newest revision round-trips a non-empty span.
+        set_decode_version(PROTOCOL_VERSION);
+        let v20 = FrameData {
+            width: 1,
+            height: 1,
+            cells: vec![CellData::blank(1, 0)],
+            hyperlinks: vec![FrameHyperlink {
+                start: 0,
+                end: 1,
+                uri: "https://example.com".into(),
+            }],
+            cursor: None,
+            cursor_visible: false,
+        };
+        let bytes = bincode::serde::encode_to_vec(&v20, config).expect("encode v20");
+        let (decoded, _): (FrameData, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).expect("decode v20");
+        assert_eq!(decoded.hyperlinks.len(), 1);
     }
 
     #[test]

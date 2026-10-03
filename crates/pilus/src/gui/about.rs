@@ -49,6 +49,8 @@ pub struct AboutView {
     /// Version to show: the preview stamp when this build carries one, else
     /// the Cargo version.
     version: String,
+    /// The installed Luvus binary's version, resolved in the background.
+    luvus_version: Option<String>,
     focus_handle: FocusHandle,
 }
 
@@ -64,12 +66,28 @@ impl AboutView {
         // `preview-feed.sh` stamps the feed's synthetic version into the
         // build, so an installed preview names itself here.
         let version = crate::update::current_version().to_string();
-        Self {
+        let view = Self {
             theme,
             settings,
             version,
+            luvus_version: None,
             focus_handle,
-        }
+        };
+        // `luvus --version` shells out, so resolve it off the GUI thread and
+        // fill the line in when it lands.
+        cx.spawn(async move |this, cx| {
+            let version = cx
+                .background_executor()
+                .spawn(async { crate::luvus_update::installed_version().map(|v| v.to_string()) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.luvus_version = version;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        view
     }
 
     /// The window's type scale, resolved from the shared settings.
@@ -119,6 +137,12 @@ impl Render for AboutView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let version = format!("version {}", self.version);
+        // The daemon pilus attaches to; unknown until the background probe
+        // lands, and absent when no `luvus` binary is on `PATH`.
+        let luvus = self.luvus_version.as_ref().map_or_else(
+            || "luvus not found".to_string(),
+            |version| format!("luvus {version}"),
+        );
         let mut credits = div().flex().flex_col().gap_3();
         for credit in CREDITS {
             credits = credits.child(
@@ -188,6 +212,12 @@ impl Render for AboutView {
                                             .text_size(px(self.fonts().secondary))
                                             .text_color(theme.muted)
                                             .child(version),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(self.fonts().label))
+                                            .text_color(theme.muted)
+                                            .child(luvus),
                                     ),
                             )
                             .child(div().px_6().pt_2().pb_6().child(credits)),

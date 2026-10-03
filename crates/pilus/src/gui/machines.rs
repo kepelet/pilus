@@ -151,6 +151,11 @@ enum MachineOp {
     Remove {
         id: String,
     },
+    /// Re-provision the remote binary from this machine's local Luvus
+    /// install, which is how a remote daemon moves to a newer release.
+    Update {
+        id: String,
+    },
 }
 
 /// The outcome of one background CLI run.
@@ -582,6 +587,31 @@ impl MachineManagerView {
             cx.notify();
         }));
 
+        let update_id = id.clone();
+        let mut update_button = style::small_button(
+            format!("pilus-machine-update-{id}"),
+            "Update",
+            ButtonKind::Ghost,
+            theme,
+            self.fonts().label,
+        );
+        if busy {
+            update_button = update_button.text_color(theme.muted);
+        }
+        let update_button = update_button.on_click(cx.listener(move |this, _, _, cx| {
+            if this.busy.is_some() {
+                return;
+            }
+            this.pending_remove = None;
+            this.start_op(
+                MachineOp::Update {
+                    id: update_id.clone(),
+                },
+                &update_id,
+            );
+            cx.notify();
+        }));
+
         let remove_id = id.clone();
         let remove_button = style::small_button(
             format!("pilus-machine-remove-{id}"),
@@ -655,10 +685,17 @@ impl MachineManagerView {
                             .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
                             .child(machine.destination.clone())
+                            .children(
+                                machine
+                                    .version
+                                    .clone()
+                                    .map(|version| div().child(format!("v{version}"))),
+                            )
                             .child(div().text_color(status_color).child(status)),
                     ),
             )
             .child(toggle_button)
+            .children(machine.enabled.then_some(update_button))
             .child(remove_button)
     }
 
@@ -797,6 +834,7 @@ fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
         MachineOp::Enable { id, .. } => format!("Enabled `{id}`."),
         MachineOp::Disable { id } => format!("Disabled `{id}`."),
         MachineOp::Remove { id } => format!("Removed `{id}`."),
+        MachineOp::Update { id } => format!("Updated `{id}`."),
     };
     let mut args: Vec<String> = vec!["machine".to_string()];
     match op {
@@ -837,6 +875,14 @@ fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
         MachineOp::Remove { id } => {
             args.push("remove".to_string());
             args.push(id);
+        }
+        // `enable --install` re-copies the local release's binary and rewrites
+        // the profile's versioned `remote_binary`, so it is the CLI's own
+        // remote-update path rather than a second install mechanism.
+        MachineOp::Update { id } => {
+            args.push("enable".to_string());
+            args.push(id);
+            args.push("--install".to_string());
         }
     }
     match std::process::Command::new(binary)

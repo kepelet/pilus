@@ -15,7 +15,6 @@ mod keys;
 mod machines;
 mod palette;
 mod picker;
-mod projects;
 mod scheme;
 mod selection;
 #[cfg(feature = "visual-test")]
@@ -54,23 +53,21 @@ use gpui::{
 };
 use gpui_platform::application;
 use gpui_updater_core::{Release, UpdateStatus, Version};
-use home::{BaseMode, HomeField, HomeFocus, HomePanel};
+use home::{HomeField, HomeFocus, HomePanel};
 use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use pilus_client::{
     Agent, AgentConfig, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent,
-    ConnectTarget, Connection, ConnectorStatus, ControlClient, HOME_ENV, MachineInfo, Project,
-    SessionInfo, SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary,
-    common_git_dir, common_git_dirs_remote, config_dir, connect_machine, current_branch,
-    current_branches_remote, expand_project_local, expand_project_remote, generate_session_name,
-    install_agent, list_branches, list_branches_remote, list_machines, list_session_infos,
-    luvus_binary, pilus_config_dir, refresh_machines, split_client_socket,
+    ConnectTarget, Connection, ConnectorStatus, ControlClient, HOME_ENV, MachineInfo, SessionInfo,
+    SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary,
+    common_git_dirs_remote, config_dir, connect_machine, expand_local, expand_remote,
+    generate_session_name, install_agent, list_machines, list_session_infos, luvus_binary,
+    pilus_config_dir, refresh_machines, split_client_socket,
 };
 use pilus_protocol::{
     CellData, ClientMessage, FrameData, ShellDockRect, ShellSidebars, ShellWorkspace,
     SurfaceInterest,
 };
-use projects::{ProjectField, ProjectsPanel};
 use selection::{Cell, Selection};
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
 use text_input::{TextField, TextInput};
@@ -122,13 +119,11 @@ const SIDEBAR_CHILD_INDENT: f32 = 8.0;
 const SIDEBAR_GLYPH: f32 = 14.0;
 /// Gap between a row's leading glyph and its label.
 const SIDEBAR_GLYPH_GAP: f32 = 8.0;
-/// Height of a single-line sidebar row (nav, new workspace, project).
+/// Height of a single-line sidebar row (nav, new workspace, section header).
 const SIDEBAR_ROW_HEIGHT: f32 = 28.0;
 /// Height of a one-line band that carries no control: a section header, an
 /// endpoint group label, or an empty-state placeholder.
 const SIDEBAR_BAND_HEIGHT: f32 = 24.0;
-/// Height of a project directory, a sub-line under its project row.
-const SIDEBAR_SUBLINE_HEIGHT: f32 = 20.0;
 /// Space above a section header, on top of the list's row gap.
 const SIDEBAR_SECTION_GAP: f32 = 12.0;
 /// Breathing room between the terminal grid and the card's inset border.
@@ -181,7 +176,7 @@ const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
 /// Inset for the tab strip when nothing floats over its left edge: the sidebar
 /// is open, or fullscreen hides the traffic lights.
 const TAB_STRIP_EDGE: f32 = 12.0;
-/// Section label size (SESSIONS / PROJECTS).
+/// Section label size (SESSIONS / WORKSPACES).
 const SECTION_FONT: f32 = 11.0;
 /// Opening size of the main window when nothing is remembered.
 const WINDOW_SIZE: (f32, f32) = (1240.0, 780.0);
@@ -726,21 +721,15 @@ fn notification_tag() -> String {
 }
 
 /// Move pilus's own stores out of the Luvus state root the first time the
-/// `~/.pilus` layout is used, so existing projects and settings are not lost.
+/// `~/.pilus` layout is used, so existing settings are not lost.
 fn migrate_legacy_stores(luvus_root: &Path, pilus_root: &Path) {
     if std::fs::create_dir_all(pilus_root).is_err() {
         return;
     }
-    let pairs = [
-        (
-            luvus_root.join("pilus").join("projects.json"),
-            pilus_root.join("projects.json"),
-        ),
-        (
-            luvus_root.join("pilus-client.json"),
-            pilus_root.join("settings.json"),
-        ),
-    ];
+    let pairs = [(
+        luvus_root.join("pilus-client.json"),
+        pilus_root.join("settings.json"),
+    )];
     for (old, new) in pairs {
         if !new.exists() && old.exists() {
             let _ = std::fs::copy(&old, &new);
@@ -779,15 +768,6 @@ struct CardLayout {
     slack_y: f32,
 }
 
-/// What the folder picker is being used for.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PickerPurpose {
-    /// Open a folder as a workspace (or start a worktree there).
-    OpenWorkspace,
-    /// Choose the base directory for the project form's location field.
-    PickProjectDir,
-}
-
 /// Which surface owns the keyboard, in stacking order.
 ///
 /// Overlays sit above content; [`PilusView::input_layer`] is the single source of
@@ -800,7 +780,7 @@ enum InputLayer {
     Palette,
     /// The Home composer page.
     Home,
-    /// The Settings page (projects, machines, updates).
+    /// The Settings page (machines, updates).
     Settings,
     /// The live terminal grid.
     Terminal,
@@ -824,17 +804,10 @@ fn top_layer(picker: bool, palette: bool, home: bool, settings: bool) -> InputLa
     }
 }
 
-/// One background repo-resolution answer: git common dirs by workspace.
-type RepoFacts = Vec<((String, String), Option<String>)>;
-
-/// One background repo-resolution answer, plus the remote homes seen.
-struct RepoResolve {
-    /// Git common dirs by `(endpoint key, raw workspace cwd)`.
-    facts: RepoFacts,
+/// One background remote-home answer: the `$HOME` of each probed machine.
+struct HomeResolve {
     /// Remote `$HOME` by endpoint key, for expanding `~` cwds.
     homes: Vec<(String, String)>,
-    /// Current branches by `(endpoint key, project location)`.
-    branches: Vec<((String, String), Option<String>)>,
 }
 
 /// A stable endpoint identity: the local session or one saved machine.
@@ -1137,7 +1110,7 @@ struct PilusView {
     agent_feed: Option<AgentFeed>,
     /// State root the SESSIONS section lists, derived from the launch target.
     session_root: PathBuf,
-    /// pilus's own state directory: projects, settings, and personal sessions.
+    /// pilus's own state directory: settings and personal sessions.
     pilus_root: PathBuf,
     /// Current session; `None` is the default session.
     session_name: Option<String>,
@@ -1157,8 +1130,6 @@ struct PilusView {
     picker: WorkspacePicker,
     /// The picker's path field, an IME-capable field over `picker`'s buffer.
     picker_path: Entity<TextInput>,
-    /// What the picker is currently being used for.
-    picker_purpose: PickerPurpose,
     /// Keeps the highlighted picker row scrolled into view.
     picker_scroll: ScrollHandle,
     /// Results from background picker listings and opens.
@@ -1260,10 +1231,6 @@ struct PilusView {
     sidebar_visible: bool,
     /// Whether the WORKSPACES section is collapsed to its header.
     workspaces_collapsed: bool,
-    /// Whether the PROJECTS section is collapsed to its header.
-    projects_collapsed: bool,
-    /// Project ids whose workspace group is collapsed in the sidebar.
-    project_collapsed: HashSet<String>,
     /// Whether the AGENTS section is collapsed to its header.
     agents_collapsed: bool,
     /// Successful `worktree.list` answers by `(endpoint key, workspace id)`.
@@ -1340,43 +1307,19 @@ struct PilusView {
     machine_signal: Rc<RefCell<MachineSignal>>,
     /// Last revision this window applied, so a manager mutation reloads once.
     seen_machine_revision: u64,
-    /// Persistent projects and the in-window manager panel.
-    projects: ProjectsPanel,
-    /// The project form's four inputs, entities over the panel's buffers.
-    project_inputs: [Entity<TextInput>; 4],
-    /// The inline new-worktree name input.
-    worktree_input: Entity<TextInput>,
-    /// Git common dirs by `(endpoint key, cwd)`, resolving which repository
-    /// a workspace belongs to no matter where its worktree lives.
-    project_repo: HashMap<(String, String), Option<String>>,
-    /// Fresh repo facts from the background resolver.
-    project_repo_rx: Receiver<RepoResolve>,
-    /// Sender half for the background repo resolver.
-    project_repo_tx: Sender<RepoResolve>,
+    /// Fresh remote-home answers from the background resolver.
+    home_resolve_rx: Receiver<HomeResolve>,
+    /// Sender half for the background home resolver.
+    home_resolve_tx: Sender<HomeResolve>,
     /// Remote `$HOME` by endpoint key, for expanding `~` workspace dirs.
     remote_home: HashMap<String, String>,
-    /// The project whose directory was last opened, with an optimistic
-    /// highlight until the daemon confirms the focus (mirrors tab/agent).
-    project_sel: Option<String>,
-    /// When the optimistic project pick was made.
-    project_sel_at: Instant,
-    /// Current branches by `(endpoint key, project location)`.
-    project_branch: HashMap<(String, String), Option<String>>,
-    /// A repo resolution is running off-thread; no overlapping spawns.
-    project_repo_pending: bool,
+    /// A home resolution is running off-thread; no overlapping spawns.
+    home_resolve_pending: bool,
     /// The Home composer's state.
     home: HomePanel,
     /// The composer's prompt, an IME-capable field over `home`'s buffer.
     home_prompt: Entity<TextInput>,
-    /// Local branches of the Home composer's selected project.
-    home_branches: Vec<String>,
-    /// The project a branch listing belongs to, so a change reloads once.
-    home_branch_project: Option<String>,
-    /// Fresh branch listings from the background reader.
-    home_branch_rx: Receiver<(String, Vec<String>)>,
-    /// Sender half for the background branch reader.
-    home_branch_tx: Sender<(String, Vec<String>)>,
-    /// Agent availability and models for the Home composer's project.
+    /// Agent availability and models for the Home composer.
     agent_configs: Vec<AgentConfig>,
     /// Agent configs by machine key (`local` or a machine id), so switching
     /// back to a machine is instant.
@@ -1399,6 +1342,13 @@ struct PilusView {
     /// A Home launch is in flight; the composer ignores a second send until it
     /// settles, since Home stays open until the agent is ready.
     home_launching: bool,
+    /// A workspace opened from the composer's picker, awaiting its catalog row
+    /// so the Workspace picker can select it.
+    home_pending_open: Option<String>,
+    /// Whether the Settings page covers the terminal card.
+    settings_open: bool,
+    /// The Settings page's one-line status, above the page footer.
+    settings_status: String,
 }
 
 impl PilusView {
@@ -1446,8 +1396,7 @@ impl PilusView {
         let (machine_tx, machine_rx) = std::sync::mpsc::channel();
         let (machine_list_tx, machine_list_rx) = std::sync::mpsc::channel();
         let (machine_op_tx, machine_op_rx) = std::sync::mpsc::channel();
-        let (project_repo_tx, project_repo_rx) = std::sync::mpsc::channel();
-        let (home_branch_tx, home_branch_rx) = std::sync::mpsc::channel();
+        let (home_resolve_tx, home_resolve_rx) = std::sync::mpsc::channel();
         let (agent_config_tx, agent_config_rx) = std::sync::mpsc::channel();
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let (machine_connect_tx, machine_connect_rx) = std::sync::mpsc::channel();
@@ -1504,61 +1453,11 @@ impl PilusView {
             .submit_on_enter()
         });
 
-        let projects = ProjectsPanel::default();
         let update_feed = TextField::default();
         let update_feed_input = cx.new(|cx| {
             TextInput::from_shared(
                 update_feed.shared(),
                 "Feed URL",
-                style::chrome_font(&shared_settings),
-                px(initial_fonts.body),
-                false,
-                initial_theme,
-                cx,
-            )
-        });
-        let project_inputs = [
-            Self::build_project_input(
-                cx,
-                &projects,
-                ProjectField::Name,
-                "Name",
-                &shared_settings,
-                initial_theme,
-                initial_fonts.body,
-            ),
-            Self::build_project_input(
-                cx,
-                &projects,
-                ProjectField::Repository,
-                "Repository",
-                &shared_settings,
-                initial_theme,
-                initial_fonts.body,
-            ),
-            Self::build_project_input(
-                cx,
-                &projects,
-                ProjectField::BranchPrefix,
-                "Branch prefix",
-                &shared_settings,
-                initial_theme,
-                initial_fonts.body,
-            ),
-            Self::build_project_input(
-                cx,
-                &projects,
-                ProjectField::Location,
-                "Location",
-                &shared_settings,
-                initial_theme,
-                initial_fonts.body,
-            ),
-        ];
-        let worktree_input = cx.new(|cx| {
-            TextInput::from_shared(
-                projects.worktree_name().shared(),
-                "Worktree name",
                 style::chrome_font(&shared_settings),
                 px(initial_fonts.body),
                 false,
@@ -1628,7 +1527,6 @@ impl PilusView {
             palette_scroll: ScrollHandle::new(),
             picker: WorkspacePicker::default(),
             picker_path,
-            picker_purpose: PickerPurpose::OpenWorkspace,
             picker_scroll: ScrollHandle::new(),
             picker_rx,
             picker_tx,
@@ -1679,8 +1577,6 @@ impl PilusView {
             sidebar_revision: 0,
             sidebar_visible: true,
             workspaces_collapsed: false,
-            projects_collapsed: false,
-            project_collapsed: HashSet::new(),
             agents_collapsed: false,
             menu_rx,
             menu_tx,
@@ -1716,23 +1612,12 @@ impl PilusView {
             daemon_restart_pending: false,
             machine_signal,
             seen_machine_revision: 0,
-            projects,
-            project_inputs,
-            worktree_input,
-            project_repo: HashMap::new(),
-            project_repo_rx,
-            project_repo_tx,
-            project_repo_pending: false,
+            home_resolve_rx,
+            home_resolve_tx,
+            home_resolve_pending: false,
             remote_home: HashMap::new(),
-            project_branch: HashMap::new(),
-            project_sel: None,
-            project_sel_at: Instant::now(),
             home,
             home_prompt,
-            home_branches: Vec::new(),
-            home_branch_project: None,
-            home_branch_rx,
-            home_branch_tx,
             agent_configs: Vec::new(),
             agent_config_cache: HashMap::new(),
             agent_config_pending: HashSet::new(),
@@ -1743,11 +1628,13 @@ impl PilusView {
             home_defaults_for: None,
             home_efforts_for: None,
             home_launching: false,
+            home_pending_open: None,
+            settings_open: false,
+            settings_status: String::new(),
         };
         // Seed the remembered frame from the one the window actually opened
         // with; moves and resizes update it from here on.
         view.remember_window_bounds(window, cx);
-        view.projects.reload(&view.pilus_root);
 
         if auto_check {
             updater.update(cx, |updater, cx| updater.check(cx));
@@ -1990,34 +1877,22 @@ impl PilusView {
             self.machine_busy = None;
             // Tell every open main window and the manager to reload.
             self.machine_signal.borrow_mut().revision += 1;
-            if self.projects.is_open() {
-                self.projects.set_status(message);
+            if self.settings_open {
+                self.settings_status = message;
             } else {
                 self.status = message;
             }
             changed = true;
         }
-        while let Ok(resolved) = self.project_repo_rx.try_recv() {
-            self.project_repo_pending = false;
+        while let Ok(resolved) = self.home_resolve_rx.try_recv() {
+            self.home_resolve_pending = false;
             for (endpoint_key, home) in resolved.homes {
                 self.remote_home.insert(endpoint_key, home);
             }
-            for (key, common) in resolved.facts {
-                if self.project_repo.get(&key) != Some(&common) {
-                    self.project_repo.insert(key, common);
-                    changed = true;
-                }
-            }
-            for (key, branch) in resolved.branches {
-                if self.project_branch.get(&key) != Some(&branch) {
-                    self.project_branch.insert(key, branch);
-                    changed = true;
-                }
-            }
         }
-        // The workspace set outgrows the repo cache as work opens; resolve
-        // the newcomers so grouping follows without a rescan of the known.
-        self.resolve_project_repos();
+        // Remote workspaces need their machine's `$HOME` to shorten cwds;
+        // resolve the unknown endpoints off-thread.
+        self.resolve_remote_homes();
         // The theme registry changes only when the user selects one, and the
         // selection can also come from another window or the CLI, so a slow
         // poll keeps every pilus window on the same appearance.
@@ -2109,34 +1984,10 @@ impl PilusView {
                     match result {
                         Ok(()) => {
                             self.status = "opened a local terminal".to_string();
-                            self.activate_project_endpoint(None, cx);
+                            self.activate_opened_endpoint(None, cx);
                         }
                         Err(error) => {
                             self.status = format!("couldn't open a local terminal: {error}");
-                        }
-                    }
-                    changed = true;
-                }
-                PickerEvent::ProjectOpened { machine, result } => {
-                    match result {
-                        Ok(()) => {
-                            self.status = "opened the workspace".to_string();
-                            self.activate_project_endpoint(machine, cx);
-                        }
-                        Err(error) => {
-                            self.status = format!("couldn't open workspace: {error}");
-                        }
-                    }
-                    changed = true;
-                }
-                PickerEvent::ProjectWorktreeOpened { machine, result } => {
-                    match result {
-                        Ok(()) => {
-                            self.status = "created a new worktree".to_string();
-                            self.activate_project_endpoint(machine, cx);
-                        }
-                        Err(error) => {
-                            self.status = format!("couldn't create worktree: {error}");
                         }
                     }
                     changed = true;
@@ -2149,7 +2000,7 @@ impl PilusView {
                             self.home_launching = false;
                             self.home.close();
                             self.status = message;
-                            self.activate_project_endpoint(machine, cx);
+                            self.activate_opened_endpoint(machine, cx);
                         }
                         // Keep the composer up so the launch can be retried.
                         Err(error) => {
@@ -2238,12 +2089,6 @@ impl PilusView {
         }
         if self.home.is_open() {
             self.ensure_home_agent_configs();
-        }
-        if self.projects.is_open() {
-            self.ensure_agent_configs_for("local");
-        }
-        if self.load_home_branches() {
-            changed = true;
         }
         changed
     }
@@ -3382,7 +3227,7 @@ impl PilusView {
             self.picker.is_open(),
             self.palette.is_open(),
             self.home.is_open(),
-            self.projects.is_open(),
+            self.settings_open,
         )
     }
 
@@ -3553,20 +3398,6 @@ impl PilusView {
                 None,
             ),
         ];
-        for project in self.projects.projects().iter().cloned() {
-            entries.push(entry(
-                Command::OpenProject(project.id.clone()),
-                &format!("Open Project {}", project.name),
-                "Projects",
-                None,
-            ));
-            entries.push(entry(
-                Command::NewProjectWorktree(project.id.clone()),
-                &format!("New Worktree in {}", project.name),
-                "Projects",
-                None,
-            ));
-        }
         for tab in &self.tabs {
             entries.push(entry(
                 Command::FocusTab(tab.index),
@@ -3638,30 +3469,6 @@ impl PilusView {
             Command::OpenUiPlayground => {
                 ui_playground::open(self.theme, self.shared_settings.clone(), cx);
             }
-            Command::OpenProject(id) => {
-                if let Some(project) = self
-                    .projects
-                    .projects()
-                    .iter()
-                    .find(|project| project.id == id)
-                    .cloned()
-                {
-                    self.open_project_location(project, cx);
-                }
-            }
-            Command::NewProjectWorktree(id) => {
-                self.projects.open(&self.pilus_root);
-                if let Some(index) = self
-                    .projects
-                    .projects()
-                    .iter()
-                    .position(|project| project.id == id)
-                {
-                    self.projects.select(index);
-                    self.projects.start_worktree();
-                }
-                cx.notify();
-            }
             Command::FocusTab(index) => self.focus_tab(index, cx),
             Command::SwitchSession(name) => self.switch_session(&name),
             Command::NewSession => self.start_new_session(),
@@ -3714,7 +3521,7 @@ impl PilusView {
     /// Leave the full-card pages (Home and Settings): sidebar actions address
     /// the terminal surface they cover, so acting on one dismisses the other.
     fn leave_settings_page(&mut self) {
-        self.projects.close();
+        self.settings_open = false;
         self.home.close();
         self.update_url_editing = false;
     }
@@ -3731,16 +3538,14 @@ impl PilusView {
     fn open_picker(&mut self, cx: &mut Context<Self>) {
         let source = self.active_dir_source();
         let start = self.picker_start_dir();
-        self.picker_purpose = PickerPurpose::OpenWorkspace;
         self.picker.open(source, start);
         self.list_picker(cx);
         cx.notify();
     }
 
-    /// Close the folder picker, whatever it was being used for.
+    /// Close the folder picker.
     fn close_picker(&mut self) {
         self.picker.close();
-        self.picker_purpose = PickerPurpose::OpenWorkspace;
     }
 
     /// Where the picker starts: the active workspace's folder, else the home.
@@ -3773,6 +3578,11 @@ impl PilusView {
             return;
         };
         self.close_picker();
+        // Opening from the Home composer's picker should leave the composer
+        // targeting the workspace it just opened, once the catalog catches up.
+        if self.home.is_open() {
+            self.home_pending_open = Some(path.clone());
+        }
         self.status = format!("opening {path}…");
         let tx = self.picker_tx.clone();
         std::thread::spawn(move || {
@@ -3781,60 +3591,6 @@ impl PilusView {
                 .map_err(|error| error.to_string());
             tx.send(PickerEvent::Opened(result)).ok();
         });
-        cx.notify();
-    }
-
-    /// Browse for the project form's base directory on the form's machine.
-    ///
-    /// This reuses the Open Workspace folder picker in directory-pick mode:
-    /// it lists the same filesystem the project will live on, and confirming
-    /// writes the folder back into the location field instead of opening it.
-    fn browse_project_dir(&mut self, cx: &mut Context<Self>) {
-        let ids = self.project_machine_ids();
-        let machine = ids.get(self.projects.machine_cursor()).cloned().flatten();
-        let source = match &machine {
-            None => DirSource::Local,
-            Some(id) => match self
-                .machines
-                .iter()
-                .find(|candidate| &candidate.id == id)
-                .and_then(|candidate| candidate.ssh_target())
-            {
-                Some(target) => DirSource::Remote(target),
-                None => {
-                    self.projects.set_status(format!(
-                        "machine `{id}` has no verified remote binary; run `luvus machine enable {id}`"
-                    ));
-                    cx.notify();
-                    return;
-                }
-            },
-        };
-        let current = self
-            .projects
-            .field(ProjectField::Location)
-            .value()
-            .trim()
-            .to_string();
-        let start = if current.is_empty() {
-            match &source {
-                DirSource::Local => std::env::var("HOME").unwrap_or_else(|_| "/".to_string()),
-                DirSource::Remote(_) => "~".to_string(),
-            }
-        } else {
-            current
-        };
-        self.picker_purpose = PickerPurpose::PickProjectDir;
-        self.picker.open(source, start);
-        self.list_picker(cx);
-        cx.notify();
-    }
-
-    /// Confirm the picker's current folder as the project location.
-    fn use_picked_dir(&mut self, cx: &mut Context<Self>) {
-        let dir = self.picker.cwd().to_string();
-        self.close_picker();
-        self.projects.set_location(dir);
         cx.notify();
     }
 
@@ -3877,15 +3633,6 @@ impl PilusView {
                 _ => {}
             }
             cx.notify();
-            return;
-        }
-        // In directory-pick mode ⇧↵ confirms the current folder for the
-        // project form; plain ↵ keeps browsing.
-        if self.picker_purpose == PickerPurpose::PickProjectDir
-            && key == "enter"
-            && event.keystroke.modifiers.shift
-        {
-            self.use_picked_dir(cx);
             return;
         }
         if key == "escape" {
@@ -3974,20 +3721,6 @@ impl PilusView {
         choices
     }
 
-    /// The display label for the project form's selected machine.
-    fn project_form_machine_label(&self) -> String {
-        let ids = self.project_machine_ids();
-        match ids.get(self.projects.machine_cursor()).cloned().flatten() {
-            None => "Local".to_string(),
-            Some(id) => self
-                .machines
-                .iter()
-                .find(|machine| machine.id == id)
-                .map(|machine| machine.display().to_string())
-                .unwrap_or_else(|| id.clone()),
-        }
-    }
-
     /// The card's content: the Settings page while it is open, else the
     /// terminal grid. Sharing the card keeps the page inset exactly like
     /// the terminal, with the sidebar still showing beside it.
@@ -3999,7 +3732,7 @@ impl PilusView {
                 .overflow_hidden()
                 .child(self.home_page(cx));
         }
-        if self.projects.is_open() {
+        if self.settings_open {
             return self.settings_page(cx);
         }
         div()
@@ -4023,30 +3756,42 @@ impl PilusView {
         }
     }
 
-    /// Show the Settings page, reloading the project store first.
+    /// Show the Settings page.
     fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.home.close();
-        self.projects.open(&self.pilus_root);
+        self.settings_open = true;
+        self.settings_status.clear();
         self.probe_machines();
         self.ensure_agent_configs_for("local");
         cx.notify();
     }
 
-    /// Show the Home composer, reloading the project store first.
+    /// Show the Home composer.
     ///
-    /// The composer picks the project, machine, agent, and base for a launch,
-    /// so it reads the same stores the Settings page does and reuses the
-    /// project panel's loaded list.
+    /// The composer picks the machine, model, and effort for a launch, so it
+    /// probes the machine catalog and resolves the local agent list first.
     fn open_home(&mut self, cx: &mut Context<Self>) {
         self.leave_settings_page();
         self.picker.close();
-        self.projects.reload(&self.pilus_root);
         self.home.open();
         self.home_sync_key.clear();
         self.probe_machines();
         self.ensure_home_agent_configs();
         self.sync_home();
+        self.home_focus_active_workspace();
         cx.notify();
+    }
+
+    /// Point the composer's Workspace picker at the active workspace, so a
+    /// bare Enter launches into what the user is already looking at.
+    fn home_focus_active_workspace(&mut self) {
+        let active = self
+            .home_workspaces()
+            .iter()
+            .position(|(id, workspace)| *id == self.active && workspace.active);
+        if let Some(index) = active {
+            self.home.choice_mut(HomeField::Workspace).choose(index);
+        }
     }
 
     /// The live agent aliases and personal session directories, so a generated
@@ -4066,18 +3811,6 @@ impl PilusView {
                 .filter_map(|entry| entry.file_name().into_string().ok()),
         );
         names
-    }
-
-    /// The projects the Home composer offers.
-    fn home_projects(&self) -> Vec<&Project> {
-        self.projects.projects().iter().collect()
-    }
-
-    /// The project the Home composer currently has highlighted.
-    fn home_project(&self) -> Option<&Project> {
-        self.home
-            .project_index()
-            .and_then(|index| self.home_projects().get(index).copied())
     }
 
     /// Move Home focus by one field.
@@ -4106,11 +3839,38 @@ impl PilusView {
             })
     }
 
-    /// The machine key backing the selected project, `local` when none.
+    /// Every open workspace the Home composer can launch into, across the
+    /// connected endpoints, in picker order.
+    fn home_workspaces(&self) -> Vec<(EndpointId, &ShellWorkspace)> {
+        let mut rows = Vec::new();
+        for id in self.connected_endpoints() {
+            for workspace in self.endpoint_workspaces(&id) {
+                rows.push((id.clone(), workspace));
+            }
+        }
+        rows
+    }
+
+    /// The label a workspace reads as in the Home picker: its name, plus the
+    /// endpoint's label when it lives on a saved machine.
+    fn home_workspace_label(&self, id: &EndpointId, workspace: &ShellWorkspace) -> String {
+        match id {
+            EndpointId::Local => workspace.name.clone(),
+            EndpointId::Machine(_) => format!("{} ({})", workspace.name, self.endpoint_label(id)),
+        }
+    }
+
+    /// The workspace the Home composer currently targets, if any.
+    fn home_workspace(&self) -> Option<(EndpointId, ShellWorkspace)> {
+        let index = self.home.workspace_index()?;
+        let workspaces = self.home_workspaces();
+        let (id, workspace) = workspaces.get(index)?;
+        Some((id.clone(), (*workspace).clone()))
+    }
+
+    /// The machine key the Home composer's agents come from: always local.
     fn home_machine_key(&self) -> String {
-        self.home_project()
-            .and_then(|project| project.machine.clone())
-            .unwrap_or_else(|| "local".to_string())
+        "local".to_string()
     }
 
     /// The SSH target for a machine key, or `None` for the local machine.
@@ -4164,8 +3924,13 @@ impl PilusView {
         if !self.home.is_open() {
             return;
         }
+        let workspace_labels: Vec<String> = self
+            .home_workspaces()
+            .iter()
+            .map(|(id, workspace)| self.home_workspace_label(id, workspace))
+            .collect();
         let signature = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}",
             self.home
                 .choice(HomeField::Agent)
                 .selected()
@@ -4174,11 +3939,9 @@ impl PilusView {
                 .choice(HomeField::Model)
                 .selected()
                 .unwrap_or_default(),
-            self.home.choice(HomeField::Project).cursor(),
-            self.home_branches.len(),
-            self.projects.projects().len(),
             self.agent_configs.len(),
             self.agent_config_key.as_deref().unwrap_or_default(),
+            workspace_labels.join("\u{1f}"),
         );
         if signature == self.home_sync_key {
             return;
@@ -4200,6 +3963,24 @@ impl PilusView {
             );
         }
         self.home.choice_mut(HomeField::Agent).set(agents);
+
+        self.home
+            .choice_mut(HomeField::Workspace)
+            .set(workspace_labels);
+
+        // A workspace opened from the composer's own picker lands in the
+        // catalog a tick later; select it then so Send targets it.
+        let pending = self.home_pending_open.clone();
+        let pending_index = pending.as_deref().and_then(|pending| {
+            self.home_workspaces().iter().position(|(id, workspace)| {
+                let cwd = self.expand_cwd(&id.key(), &workspace.cwd);
+                cwd == pending || canonical(&cwd) == canonical(pending)
+            })
+        });
+        if let Some(index) = pending_index {
+            self.home.choice_mut(HomeField::Workspace).choose(index);
+            self.home_pending_open = None;
+        }
 
         let models = self
             .home_agent()
@@ -4253,65 +4034,6 @@ impl PilusView {
                 self.home.choice_mut(HomeField::Effort).choose(index);
             }
         }
-
-        let mut projects = vec!["No project".to_string()];
-        for project in self.home_projects() {
-            projects.push(project_choice_label(project, &self.machines));
-        }
-        self.home.choice_mut(HomeField::Project).set(projects);
-
-        self.home
-            .choice_mut(HomeField::Branch)
-            .set(self.home_branches.clone());
-    }
-
-    /// Load the selected project's local branches when the pick changes.
-    ///
-    /// Branch listing shells out to git, so it runs off-thread and reports
-    /// through a channel; remote projects keep the last listing until remote
-    /// listing lands.
-    fn load_home_branches(&mut self) -> bool {
-        let mut changed = false;
-        while let Ok((id, branches)) = self.home_branch_rx.try_recv() {
-            if self.home_branch_project.as_deref() == Some(id.as_str()) {
-                self.home_branches = branches;
-                changed = true;
-            }
-        }
-        if !self.home.is_open() {
-            return changed;
-        }
-        let selected = self.home_project().map(|project| project.id.clone());
-        if selected == self.home_branch_project {
-            return changed;
-        }
-        self.home_branch_project = selected.clone();
-        self.home_branches.clear();
-        let Some(project) = selected.and_then(|id| {
-            self.projects
-                .projects()
-                .iter()
-                .find(|project| project.id == id)
-                .cloned()
-        }) else {
-            return changed;
-        };
-        let target = project
-            .machine
-            .as_deref()
-            .and_then(|id| self.machines.iter().find(|machine| machine.id == id))
-            .and_then(MachineInfo::ssh_target);
-        let tx = self.home_branch_tx.clone();
-        let id = project.id;
-        let location = project.location;
-        std::thread::spawn(move || {
-            let branches = match target {
-                Some(target) => list_branches_remote(&target, &location),
-                None => list_branches(&location),
-            };
-            tx.send((id, branches)).ok();
-        });
-        changed
     }
 
     /// Route a keystroke to the Home composer.
@@ -4385,11 +4107,11 @@ impl PilusView {
         cx.notify();
     }
 
-    /// Launch the composer's agent on the selected project, or in a personal
-    /// workspace under pilus's own directory when no project is chosen.
+    /// Launch the composer's agent in a fresh personal workspace under
+    /// pilus's own directory.
     ///
     /// Workspace setup and the agent start share one background thread and
-    /// report through the picker channel, like the project worktree action.
+    /// report through the picker channel.
     fn home_send(&mut self, cx: &mut Context<Self>) {
         if self.home_launching {
             return;
@@ -4405,50 +4127,52 @@ impl PilusView {
             cx.notify();
             return;
         };
-        let base = self.home.base_mode();
-        let branch = self
-            .home
-            .choice(HomeField::Branch)
-            .selected()
-            .unwrap_or_default()
-            .to_string();
         let name = generate_session_name(&self.session_names());
-        match self.home_project().cloned() {
-            Some(project) => {
-                let Some(mut client) = self.control_client_for_project(&project) else {
-                    self.home
-                        .set_status(format!("No control connection for `{}`.", project.name));
-                    cx.notify();
-                    return;
-                };
-                let location = project.location.clone();
-                let machine = project.machine.clone();
-                self.home_launching = true;
-                self.home.set_status(format!("starting {agent}…"));
-                let tx = self.picker_tx.clone();
-                std::thread::spawn(move || {
-                    let result = launch_home_agent(
-                        &mut client,
-                        &location,
-                        base,
-                        &branch,
-                        &name,
-                        &agent,
-                        &prompt,
-                    );
-                    tx.send(PickerEvent::HomeLaunched { machine, result }).ok();
-                });
+        match self.home_workspace() {
+            Some((endpoint, workspace)) => {
+                self.launch_in_workspace(endpoint, workspace, name, agent, prompt, cx)
             }
             None => self.launch_personal_workspace(name, agent, prompt, cx),
         }
         cx.notify();
     }
 
+    /// Start the composer's agent in an already-open workspace.
+    ///
+    /// The workspace may live on a saved machine, so the launch resolves that
+    /// endpoint's own control connection and reports through the picker
+    /// channel so the surface can hand off to it.
+    fn launch_in_workspace(
+        &mut self,
+        endpoint: EndpointId,
+        workspace: ShellWorkspace,
+        name: String,
+        agent: String,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
+            self.home
+                .set_status(format!("No control connection for `{}`.", workspace.name));
+            cx.notify();
+            return;
+        };
+        let machine = endpoint.machine_id().map(str::to_string);
+        let location = workspace.cwd.clone();
+        self.home_launching = true;
+        self.home.set_status(format!("starting {agent}…"));
+        let tx = self.picker_tx.clone();
+        std::thread::spawn(move || {
+            let result = launch_home_agent(&mut client, &location, &name, &agent, &prompt);
+            tx.send(PickerEvent::HomeLaunched { machine, result }).ok();
+        });
+        cx.notify();
+    }
+
     /// Create a fresh personal session directory and start the agent in it.
     ///
-    /// With no project chosen, each session gets its own git repository under
-    /// `~/.pilus/sessions/<name>`, so the agent has an isolated tree to commit
-    /// into.
+    /// Each session gets its own git repository under `~/.pilus/sessions/<name>`,
+    /// so the agent has an isolated tree to commit into.
     fn launch_personal_workspace(
         &mut self,
         name: String,
@@ -4469,15 +4193,7 @@ impl PilusView {
         std::thread::spawn(move || {
             let result = pilus_client::init_repository(&dir).and_then(|()| {
                 let location = dir.to_string_lossy().into_owned();
-                launch_home_agent(
-                    &mut client,
-                    &location,
-                    BaseMode::Checkout,
-                    "",
-                    &name,
-                    &agent,
-                    &prompt,
-                )
+                launch_home_agent(&mut client, &location, &name, &agent, &prompt)
             });
             tx.send(PickerEvent::HomeLaunched {
                 machine: None,
@@ -4494,40 +4210,6 @@ impl PilusView {
     /// focus each frame; when the composer is on a picker (or closed) the root
     /// takes it back so chip navigation still works.
     /// The form input entity for `field`.
-    fn project_input(&self, field: ProjectField) -> Entity<TextInput> {
-        self.project_inputs[match field {
-            ProjectField::Name => 0,
-            ProjectField::Repository => 1,
-            ProjectField::BranchPrefix => 2,
-            ProjectField::Location => 3,
-        }]
-        .clone()
-    }
-
-    /// Build a form input over the panel's shared buffer.
-    #[allow(clippy::too_many_arguments)]
-    fn build_project_input(
-        cx: &mut Context<Self>,
-        projects: &ProjectsPanel,
-        field: ProjectField,
-        placeholder: &'static str,
-        settings: &Rc<RefCell<Settings>>,
-        theme: Theme,
-        font_size: f32,
-    ) -> Entity<TextInput> {
-        cx.new(|cx| {
-            TextInput::from_shared(
-                projects.field(field).shared(),
-                placeholder,
-                style::chrome_font(settings),
-                px(font_size),
-                false,
-                theme,
-                cx,
-            )
-        })
-    }
-
     fn sync_focus(&self, window: &mut Window, cx: &mut App) {
         // The prompt's field owns the keyboard while it is up; without this
         // the layer routing would hand focus back to the window root. A
@@ -4563,12 +4245,6 @@ impl PilusView {
             InputLayer::Settings => {
                 if self.update_url_editing {
                     Some(self.update_feed_input.focus_handle(cx))
-                } else if self.projects.worktree_target().is_some() {
-                    Some(self.worktree_input.focus_handle(cx))
-                } else if self.projects.in_form() {
-                    self.projects
-                        .focus()
-                        .map(|field| self.project_input(field).focus_handle(cx))
                 } else {
                     None
                 }
@@ -4592,21 +4268,16 @@ impl PilusView {
 
     /// The Home screen: the launch composer that fills the inset card.
     ///
-    /// The app mark sits to the left of the card. With no project chosen the
-    /// base/branch footer is hidden, since neither applies to a fresh session
-    /// directory.
+    /// The app mark sits to the left of the card.
     fn home_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let status = self.home.status().to_string();
-        let mut composer = div()
+        let composer = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w(px(0.0))
             .child(self.home_composer(cx));
-        if !self.home.project_is_none() {
-            composer = composer.child(self.home_footer(cx));
-        }
         let mut column = div()
             .flex()
             .flex_col()
@@ -4646,57 +4317,6 @@ impl PilusView {
             .px_6()
             .py_8()
             .child(column)
-    }
-
-    /// The compact footer: the base picker on the left, the branch on the
-    /// right. In new-worktree mode the branch reads as `origin/<branch>`.
-    fn home_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .w_full()
-            .px_3()
-            .py(px(2.0))
-            .bg(theme.composer_footer)
-            .border_l_1()
-            .border_r_1()
-            .border_b_1()
-            .border_color(terminal_inset_border())
-            .rounded_b_lg()
-            .child(self.home_base_picker(cx))
-            .child(self.home_branch_picker(cx));
-        div().w_full().px_4().child(row)
-    }
-
-    /// The base-mode picker on the footer's left.
-    fn home_base_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let value = self
-            .home
-            .choice(HomeField::Base)
-            .selected()
-            .unwrap_or_default()
-            .to_string();
-        let leading = self.home_picker_leading(HomeField::Base, &value);
-        self.home_picker_face(HomeField::Base, leading, value, cx)
-    }
-
-    /// The branch picker in the footer. Under New worktree it names the
-    /// upstream it will branch from, so it reads `origin/<branch>`.
-    fn home_branch_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self.home.choice(HomeField::Branch).selected();
-        let value = match selected {
-            Some(branch) if self.home.base_mode() == BaseMode::NewWorktree => {
-                format!("From: origin/{branch}")
-            }
-            Some(branch) => branch.to_string(),
-            None => "No branch".to_string(),
-        };
-        let leading = self.home_picker_leading(HomeField::Branch, &value);
-        self.home_picker_face(HomeField::Branch, leading, value, cx)
     }
 
     /// The app mark to the left of the composer, falling back to the wordmark.
@@ -4779,7 +4399,7 @@ impl PilusView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(self.home_chip(HomeField::Project, cx))
+                            .child(self.home_chip(HomeField::Workspace, cx))
                             .child(self.home_chip(HomeField::Model, cx))
                             .child(self.home_chip(HomeField::Effort, cx)),
                     )
@@ -4787,14 +4407,16 @@ impl PilusView {
             )
     }
 
-    /// One picker chip inside the composer, drawn like the footer pickers.
+    /// One picker chip inside the composer.
     fn home_chip(&self, field: HomeField, cx: &mut Context<Self>) -> impl IntoElement {
-        let value = self
-            .home
-            .choice(field)
-            .selected()
-            .unwrap_or_default()
-            .to_string();
+        let selected = self.home.choice(field).selected().unwrap_or_default();
+        // An empty Workspace list still needs a label; it reads as a prompt to
+        // open one, and sending falls back to a fresh scratch workspace.
+        let value = if field == HomeField::Workspace && selected.is_empty() {
+            "Open a workspace".to_string()
+        } else {
+            selected.to_string()
+        };
         let leading = self.home_picker_leading(field, &value);
         self.home_picker_face(field, leading, value, cx)
     }
@@ -4833,37 +4455,15 @@ impl PilusView {
         }
     }
 
-    /// The leading glyph shared by a composer chip and a footer picker.
+    /// The leading glyph shared by a composer chip and a picker.
     fn home_picker_leading(&self, field: HomeField, value: &str) -> AnyElement {
         let fg = self.home_picker_fg(field);
-        let theme = self.theme;
         let glyph = |bytes: &'static [u8]| icon(bytes, 14.0, fg).into_any_element();
         match field {
             HomeField::Agent => glyph(agent_icon(value)),
+            HomeField::Workspace => glyph(include_bytes!("../../assets/icons/folder.svg")),
             HomeField::Model => glyph(include_bytes!("../../assets/icons/cpu.svg")),
             HomeField::Effort => glyph(include_bytes!("../../assets/icons/gauge.svg")),
-            HomeField::Base => glyph(include_bytes!("../../assets/icons/git-fork.svg")),
-            HomeField::Branch => glyph(include_bytes!("../../assets/icons/git-branch.svg")),
-            HomeField::Project => match self
-                .home_project()
-                .and_then(|project| project.name.chars().next())
-                .map(|ch| ch.to_uppercase().to_string())
-            {
-                Some(letter) => div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(16.0))
-                    .h(px(16.0))
-                    .rounded_sm()
-                    .bg(theme.border)
-                    .text_size(px(self.section_font()))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.fg)
-                    .child(letter)
-                    .into_any_element(),
-                None => glyph(include_bytes!("../../assets/icons/folder.svg")),
-            },
         }
     }
 
@@ -4899,19 +4499,11 @@ impl PilusView {
             .cursor_pointer()
             .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(field, cx)));
-        let value_width = if field == HomeField::Project {
-            220.0
-        } else {
-            180.0
-        };
-        let mut value_div = div()
-            .max_w(px(value_width))
+        let value_div = div()
+            .max_w(px(180.0))
             .truncate()
             .text_size(px(self.footer_font()))
             .text_color(fg);
-        if field == HomeField::Branch {
-            value_div = value_div.font_family(style::mono_family(&self.shared_settings));
-        }
         let mut face = face
             .child(leading)
             .child(value_div.child(value))
@@ -4998,6 +4590,33 @@ impl PilusView {
                     .child(format!("Filter: {filter}")),
             );
         }
+        if field == HomeField::Workspace {
+            list = list.child(
+                div()
+                    .id("pilus-home-open-workspace")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(30.0))
+                    .px_3()
+                    .rounded_md()
+                    .text_size(px(self.chrome_font()))
+                    .text_color(theme.panel_fg)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.panel))
+                    .child(icon(
+                        include_bytes!("../../assets/icons/plus.svg"),
+                        13.0,
+                        theme.muted,
+                    ))
+                    .child("Open Workspace…")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.home.close_dropdown();
+                        this.open_picker(cx);
+                    })),
+            );
+        }
         if matches.is_empty() {
             list = list.child(
                 div()
@@ -5011,7 +4630,7 @@ impl PilusView {
         for index in matches.into_iter().take(MAX_ROWS) {
             let active = index == cursor;
             let option = options.get(index).cloned().unwrap_or_default();
-            let mut row = div()
+            let row = div()
                 .id(format!("pilus-home-option-{index}"))
                 .flex()
                 .flex_row()
@@ -5034,9 +4653,6 @@ impl PilusView {
                     this.home.close_dropdown();
                     cx.notify();
                 }));
-            if field == HomeField::Branch {
-                row = row.font_family(style::mono_family(&self.shared_settings));
-            }
             list = list.child(row.child(option));
         }
         if total > MAX_ROWS {
@@ -5060,143 +4676,12 @@ impl PilusView {
         .into_any_element()
     }
 
-    /// Machine choice rows for the project form: Local, then saved machines.
-    fn project_machine_ids(&self) -> Vec<Option<String>> {
-        ProjectsPanel::machine_ids(&self.machines)
-    }
-
-    /// The display label for a project's machine.
-    fn project_host_label(&self, project: &Project) -> String {
-        match &project.machine {
-            None => "Local".to_string(),
-            Some(id) => self
-                .machines
-                .iter()
-                .find(|machine| &machine.id == id)
-                .map(|machine| machine.display().to_string())
-                .unwrap_or_else(|| id.clone()),
-        }
-    }
-
-    /// A control client for the endpoint a project lives on.
-    fn control_client_for_project(&self, project: &Project) -> Option<ControlClient> {
-        match &project.machine {
-            None => ControlClient::connect(&self.api_socket()).ok(),
-            Some(id) => {
-                let target = self
-                    .machines
-                    .iter()
-                    .find(|machine| &machine.id == id)?
-                    .ssh_target()?;
-                ControlClient::connect_ssh(target).ok()
-            }
-        }
-    }
-
-    /// Open a project's base directory as a workspace on its own endpoint.
-    fn open_project_location(&mut self, project: Project, cx: &mut Context<Self>) {
-        let Some(mut client) = self.control_client_for_project(&project) else {
-            self.status = format!(
-                "no control connection for `{}`: check the machine profile",
-                project.name
-            );
-            return;
-        };
-        let location = project.location.clone();
-        let machine = project.machine.clone();
-        self.project_sel = Some(project.id.clone());
-        self.project_sel_at = Instant::now();
-        self.projects.close();
-        self.status = format!("opening {}…", location);
-        let tx = self.picker_tx.clone();
-        std::thread::spawn(move || {
-            let result = client
-                .open_workspace(&location)
-                .map_err(|error| error.to_string());
-            tx.send(PickerEvent::ProjectOpened { machine, result }).ok();
-        });
-        cx.notify();
-    }
-
-    /// Create a worktree for `branch` inside a project's repo.
+    /// Show the endpoint a launch just opened a workspace on.
     ///
-    /// `worktree.create` targets the daemon's active repo, so the project's
-    /// base directory is opened first; both requests share one background
-    /// thread and report through the picker channel.
-    fn create_project_worktree(
-        &mut self,
-        project: Project,
-        branch: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(mut client) = self.control_client_for_project(&project) else {
-            self.status = format!(
-                "no control connection for `{}`: check the machine profile",
-                project.name
-            );
-            return;
-        };
-        let location = project.location.clone();
-        let machine = project.machine.clone();
-        self.project_sel = Some(project.id.clone());
-        self.project_sel_at = Instant::now();
-        self.projects.close();
-        self.status = format!("creating worktree {branch}…");
-        let tx = self.picker_tx.clone();
-        std::thread::spawn(move || {
-            if let Err(error) = client.open_workspace(&location) {
-                tx.send(PickerEvent::ProjectWorktreeOpened {
-                    machine,
-                    result: Err(error.to_string()),
-                })
-                .ok();
-                return;
-            }
-            let result = client
-                .create_worktree(&branch)
-                .map_err(|error| error.to_string());
-            tx.send(PickerEvent::ProjectWorktreeOpened { machine, result })
-                .ok();
-        });
-        cx.notify();
-    }
-
-    /// Whether the project reads as active: an optimistic pick still
-    /// confirming, or its base directory active on the visible surface. A
-    /// nested worktree lights only its own row, never the project too.
-    fn project_active(&self, project: &Project) -> bool {
-        if self
-            .project_sel
-            .as_deref()
-            .is_some_and(|id| id == project.id)
-            && self.project_sel_at.elapsed() < Duration::from_secs(2)
-        {
-            return true;
-        }
-        let base = project.location.trim_end_matches('/');
-        for id in self.connected_endpoints() {
-            if id != self.active {
-                continue;
-            }
-            for workspace in self.endpoint_workspaces(&id) {
-                if !workspace.active {
-                    continue;
-                }
-                let cwd = self.expand_cwd(&id.key(), &workspace.cwd);
-                if cwd.trim_end_matches('/') == base {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Show the endpoint a project was just opened on.
-    ///
-    /// Opening happens on the project's own daemon, which may not own the
-    /// visible surface; without the handoff the click looks like a no-op
-    /// until the user manually switches to that machine.
-    fn activate_project_endpoint(&mut self, machine: Option<String>, cx: &mut Context<Self>) {
+    /// Opening happens on the owning daemon, which may not own the visible
+    /// surface; without the handoff the click looks like a no-op until the
+    /// user manually switches to that machine.
+    fn activate_opened_endpoint(&mut self, machine: Option<String>, cx: &mut Context<Self>) {
         let target = match machine {
             None => EndpointId::Local,
             Some(id) => EndpointId::Machine(id),
@@ -5207,8 +4692,8 @@ impl PilusView {
     }
 
     /// Route a keystroke to the open Settings page.
-    fn settings_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let key = event.keystroke.key.as_str();
+    fn settings_key(&mut self, _event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = _event.keystroke.key.as_str();
         // The feed-URL input owns the keyboard while it is being edited; only
         // the keys it declines reach here.
         if self.update_url_editing {
@@ -5221,87 +4706,12 @@ impl PilusView {
             return;
         }
         if key == "escape" {
-            if self.projects.worktree_target().is_some() {
-                self.projects.cancel_worktree();
-            } else if self.projects.in_form() {
-                self.projects.cancel_form();
-            } else if self.projects.pending_delete().is_some() {
-                self.projects.cancel_delete();
-            } else {
-                self.projects.close();
-            }
+            self.settings_open = false;
             cx.notify();
             return;
-        }
-        if self.projects.pending_delete().is_some() && key != "shift" {
-            self.projects.cancel_delete();
         }
         if self.machine_pending_remove.is_some() && key != "shift" {
             self.machine_pending_remove = None;
-        }
-        // The inline new-worktree input owns the keyboard while open; only a
-        // bare Enter (submit) reaches here.
-        if self.projects.worktree_target().is_some() {
-            if key == "enter"
-                && let Some((project, branch)) = self.projects.take_worktree()
-            {
-                self.create_project_worktree(project, branch, cx);
-            }
-            cx.notify();
-            return;
-        }
-        if self.projects.in_form() {
-            self.projects_form_key(event, cx);
-            return;
-        }
-        match key {
-            "up" => self.projects.move_selection(-1),
-            "down" => self.projects.move_selection(1),
-            "enter" => {
-                if let Some(project) = self.projects.highlighted().cloned() {
-                    self.open_project_location(project, cx);
-                    return;
-                }
-            }
-            "n" => self.projects.start_new(),
-            "e" => {
-                let ids = self.project_machine_ids();
-                self.projects.start_edit(&ids);
-            }
-            "d" => {
-                let root = self.pilus_root.clone();
-                let _ = self.projects.request_delete(&root);
-            }
-            "w" => self.projects.start_worktree(),
-            _ => {}
-        }
-        cx.notify();
-    }
-
-    /// Route a keystroke to the project create/edit form.
-    ///
-    /// The focused field entity handles editing; Tab, the machine chooser,
-    /// and submit are the only keys that reach here.
-    fn projects_form_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let key = event.keystroke.key.as_str();
-        match key {
-            "tab" => {
-                self.projects.cycle_focus(event.keystroke.modifiers.shift);
-            }
-            "up" => {
-                let choices = self.project_machine_ids().len();
-                self.projects.move_machine(-1, choices);
-            }
-            "down" => {
-                let choices = self.project_machine_ids().len();
-                self.projects.move_machine(1, choices);
-            }
-            "enter" => {
-                let root = self.pilus_root.clone();
-                let ids = self.project_machine_ids();
-                let _ = self.projects.submit(&root, &ids);
-            }
-            _ => {}
         }
         cx.notify();
     }
@@ -5310,29 +4720,22 @@ impl PilusView {
     ///
     /// It fills the same inset card the grid lives in — same gaps, border,
     /// and rounding — so it reads as a native surface with the sidebar still
-    /// showing. A Back button at the top left walks form → list → closed;
-    /// there is no close button by design.
+    /// showing. A Back button at the top left closes it; there is no close
+    /// button by design.
     fn settings_page(&self, cx: &mut Context<Self>) -> Div {
-        if !self.projects.is_open() {
+        if !self.settings_open {
             return div();
         }
         let theme = self.theme;
-        let in_form = self.projects.in_form();
-        let body = if in_form {
-            self.projects_form(cx)
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap_6()
-                .child(self.projects_section_block(cx))
-                .child(self.remote_access_section_block(cx))
-                .child(self.machines_section_block(cx))
-                .child(self.agent_config_section_block(cx))
-                .child(self.notifications_section_block(cx))
-                .child(self.updates_section_block(cx))
-        };
-        let status = self.projects.status().to_string();
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .child(self.remote_access_section_block(cx))
+            .child(self.machines_section_block(cx))
+            .child(self.agent_config_section_block(cx))
+            .child(self.notifications_section_block(cx))
+            .child(self.updates_section_block(cx));
         div()
             .flex()
             .flex_col()
@@ -5341,7 +4744,7 @@ impl PilusView {
             .child(
                 div().flex().flex_row().flex_shrink_0().px_4().pt_3().child(
                     style::small_button(
-                        "pilus-projects-back",
+                        "pilus-settings-back",
                         "‹ Back",
                         style::ButtonKind::Secondary,
                         theme,
@@ -5349,24 +4752,20 @@ impl PilusView {
                     )
                     .text_color(theme.muted)
                     .on_click(cx.listener(|this, _, _, cx| {
-                        if this.projects.in_form() {
-                            this.projects.cancel_form();
-                        } else {
-                            this.projects.close();
-                        }
+                        this.settings_open = false;
                         cx.notify();
                     })),
                 ),
             )
             .child(
                 div()
-                    .id("pilus-projects-page")
+                    .id("pilus-settings-page")
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
                     .child(div().flex().flex_col().py_3().child(body)),
             )
-            .child(if status.is_empty() {
+            .child(if self.settings_status.is_empty() {
                 div()
             } else {
                 div()
@@ -5377,40 +4776,8 @@ impl PilusView {
                     .border_color(theme.border)
                     .text_size(px(self.section_font()))
                     .text_color(theme.muted)
-                    .child(status)
+                    .child(self.settings_status.clone())
             })
-    }
-
-    /// The PROJECTS section of the page: header, rows, empty state, and the
-    /// New Project CTA. Future page sections will stack below this one.
-    fn projects_section_block(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let new_button = style::small_button(
-            "pilus-projects-new",
-            "New Project",
-            style::ButtonKind::Primary,
-            theme,
-            self.footer_font(),
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.projects.start_new();
-            cx.notify();
-        }));
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .child(style::section_label(theme, "PROJECTS", self.section_font()))
-                    .child(new_button),
-            )
-            .child(self.projects_list(cx))
     }
 
     /// The AGENT CONFIG section of the page: the coding agents installed on
@@ -5664,7 +5031,7 @@ impl PilusView {
         let button = style::small_button(id, "Copy", style::ButtonKind::Ghost, theme, size)
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
-                this.projects.set_status(format!("Copied {label}."));
+                this.settings_status = format!("Copied {label}.");
                 cx.notify();
             }));
         div()
@@ -5690,12 +5057,11 @@ impl PilusView {
             connector::stop();
             self.connector_status = ConnectorStatus::default();
             self.set_connector(false);
-            self.projects
-                .set_status("Remote access disabled.".to_string());
+            self.settings_status = "Remote access disabled.".to_string();
         } else {
             match connector::start(&connector::default_options()) {
                 Ok(()) => self.set_connector(true),
-                Err(error) => self.projects.set_status(error),
+                Err(error) => self.settings_status = error,
             }
         }
     }
@@ -5891,9 +5257,7 @@ impl PilusView {
         }
         if self.machine_pending_remove.as_deref() != Some(id.as_str()) {
             self.machine_pending_remove = Some(id.clone());
-            self.projects.set_status(format!(
-                "Remove `{id}`? Click Confirm to delete the profile."
-            ));
+            self.settings_status = format!("Remove `{id}`? Click Confirm to delete the profile.");
             return;
         }
         self.machine_pending_remove = None;
@@ -5907,7 +5271,7 @@ impl PilusView {
     /// like the manager window's own mutations do.
     fn run_machine_page_op(&mut self, id: &str, args: Vec<String>, success: String) {
         self.machine_busy = Some(id.to_string());
-        self.projects.set_status("Running…".to_string());
+        self.settings_status = "Running…".to_string();
         let root = self.session_root.clone();
         let op_tx = self.machine_op_tx.clone();
         let machine_tx = self.machine_tx.clone();
@@ -5936,13 +5300,12 @@ impl PilusView {
         };
         self.machine_pending_remove = None;
         let Some(agent) = agent_binary() else {
-            self.projects.set_status(
-                "pilus-agent not found; set PILUS_AGENT_BIN or install it beside pilus".to_string(),
-            );
+            self.settings_status =
+                "pilus-agent not found; set PILUS_AGENT_BIN or install it beside pilus".to_string();
             return;
         };
         self.machine_busy = Some(id);
-        self.projects.set_status("Installing agent…".to_string());
+        self.settings_status = "Installing agent…".to_string();
         let op_tx = self.machine_op_tx.clone();
         let machine_tx = self.machine_tx.clone();
         let root = self.session_root.clone();
@@ -5954,442 +5317,6 @@ impl PilusView {
             op_tx.send(message).ok();
             machine_tx.send(list_machines(&root)).ok();
         });
-    }
-
-    /// The project list with its row actions and inline worktree input.
-    fn projects_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let mut list = div().flex().flex_col().gap_1().px_3().py_1();
-        if self.projects.projects().is_empty() {
-            list = list.child(
-                div()
-                    .py_4()
-                    .text_size(px(self.footer_font()))
-                    .text_color(theme.muted)
-                    .child("No projects yet. Create one to group worktrees that live together."),
-            );
-        }
-        for (index, project) in self.projects.projects().iter().cloned().enumerate() {
-            list = list.child(self.projects_row(&project, index, cx));
-        }
-        if let Some(target) = self.projects.worktree_target().map(str::to_string) {
-            let name = self
-                .projects
-                .projects()
-                .iter()
-                .find(|project| project.id == target)
-                .map(|project| project.name.clone())
-                .unwrap_or_default();
-            let branch = self
-                .projects
-                .projects()
-                .iter()
-                .find(|project| project.id == target)
-                .map(|project| project.branch_for(&self.projects.worktree_name().value()))
-                .unwrap_or_default();
-            let worktree_input = self.worktree_input.clone();
-            worktree_input.update(cx, |input, _| {
-                input.set_style(
-                    theme,
-                    style::chrome_font(&self.shared_settings),
-                    px(self.footer_font()),
-                );
-            });
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px_2()
-                    .py_2()
-                    .rounded_md()
-                    .bg(theme.panel_dim)
-                    .child(
-                        div()
-                            .text_size(px(self.footer_font()))
-                            .text_color(theme.fg)
-                            .child(format!("New worktree in {name} → {branch}")),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .h(px(28.0))
-                            .px_2()
-                            .rounded_md()
-                            .bg(theme.window_bg)
-                            .border_1()
-                            .border_color(theme.accent)
-                            .cursor_pointer()
-                            .child(worktree_input),
-                    ),
-            );
-        }
-        list
-    }
-
-    /// One project row with Open / Worktree / Edit / Delete actions.
-    fn projects_row(
-        &self,
-        project: &Project,
-        index: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = self.theme;
-        // The highlight follows the keyboard cursor only; mouse users get
-        // no selection affordance, like the machine rows.
-        let selected = self.projects.cursor_visible() && self.projects.selected() == index;
-        let host = self.project_host_label(project);
-        let confirming = self.projects.pending_delete() == Some(project.id.as_str());
-        let open_project = project.clone();
-        // Live workspaces owned by this project, so the card shows what is
-        // open on it — the same grouping the sidebar nests.
-        let action = |id: &str, label: &str| {
-            style::small_button(
-                format!("pilus-projects-{id}-{}", project.id),
-                label.to_string(),
-                style::ButtonKind::Ghost,
-                theme,
-                self.section_font(),
-            )
-        };
-        div()
-            .id(format!("pilus-projects-row-{}", project.id))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .px_2()
-            .py_2()
-            .rounded_md()
-            .bg(if selected {
-                theme.panel_dim
-            } else {
-                theme.panel
-            })
-            .border_1()
-            .border_color(if selected { theme.accent } else { theme.border })
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(self.chrome_font()))
-                            .text_color(theme.fg)
-                            .child(project.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(self.section_font()))
-                            .text_color(theme.muted)
-                            .child(host),
-                    ),
-            )
-            .child(
-                div()
-                    .font_family(style::mono_family(&self.shared_settings))
-                    .text_size(px(self.section_font()))
-                    .text_color(theme.muted)
-                    .child(self.shorten_cwd(project.endpoint_key(), &project.location)),
-            )
-            .child(self.project_members(project, cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .text_color(theme.muted)
-                    .child(
-                        action("open", "Open")
-                            .text_color(theme.fg)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.open_project_location(open_project.clone(), cx);
-                            })),
-                    )
-                    .child(
-                        action("worktree", "New worktree")
-                            .text_color(theme.fg)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.projects.select(index);
-                                this.projects.start_worktree();
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        action("edit", "Edit").on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.projects.select(index);
-                            let ids = this.project_machine_ids();
-                            this.projects.start_edit(&ids);
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        action("delete", if confirming { "Confirm" } else { "Delete" })
-                            .text_color(if confirming { theme.alert } else { theme.muted })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.projects.select(index);
-                                let root = this.pilus_root.clone();
-                                let _ = this.projects.request_delete(&root);
-                                cx.notify();
-                            })),
-                    ),
-            )
-    }
-
-    /// The open workspaces owned by `project`, drawn on its card.
-    ///
-    /// Clicking one leaves the page and hands the surface to the owning
-    /// endpoint, focused on that workspace — the same jump as the sidebar.
-    fn project_members(&self, project: &Project, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let members: Vec<(EndpointId, String, String, Option<String>)> = self
-            .project_workspaces(project)
-            .into_iter()
-            .map(|(endpoint, workspace)| {
-                (
-                    endpoint.clone(),
-                    workspace.id.clone(),
-                    workspace.name.clone(),
-                    workspace.branch.clone(),
-                )
-            })
-            .collect();
-        let mut list = div().flex().flex_col().gap_1();
-        if members.is_empty() {
-            return list.child(
-                div()
-                    .px_2()
-                    .text_size(px(self.section_font()))
-                    .text_color(theme.muted)
-                    .child("No open worktrees"),
-            );
-        }
-        for (endpoint, workspace_id, name, branch) in members {
-            let label = div()
-                .flex_1()
-                .min_w(px(0.0))
-                .truncate()
-                .text_size(px(self.footer_font()))
-                .text_color(theme.fg)
-                .child(name);
-            let branch = match branch {
-                Some(branch) => div()
-                    .flex_shrink_0()
-                    .font_family(style::mono_family(&self.shared_settings))
-                    .text_size(px(self.section_font()))
-                    .text_color(theme.branch)
-                    .child(branch),
-                None => div(),
-            };
-            list = list.child(
-                div()
-                    .id(format!(
-                        "pilus-projects-member-{}-{workspace_id}",
-                        project.id
-                    ))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme.panel_dim))
-                    .child(icon(
-                        include_bytes!("../../assets/icons/folder.svg"),
-                        12.0,
-                        theme.muted,
-                    ))
-                    .child(label)
-                    .child(branch)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.leave_settings_page();
-                        this.activate_endpoint(
-                            endpoint.clone(),
-                            Some(workspace_id.clone()),
-                            None,
-                            cx,
-                        );
-                    })),
-            );
-        }
-        list
-    }
-
-    /// The create/edit form.
-    fn projects_form(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let ids = self.project_machine_ids();
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .px_3()
-            .py_1()
-            .child(self.project_field_box(ProjectField::Name, "Name", cx))
-            .child(self.project_field_box(ProjectField::Repository, "Repository URL", cx))
-            .child(self.project_field_box(
-                ProjectField::BranchPrefix,
-                "Branch prefix (optional)",
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_end()
-                    .gap_2()
-                    .child(div().flex_1().min_w(px(0.0)).child(self.project_field_box(
-                        ProjectField::Location,
-                        "Base directory",
-                        cx,
-                    )))
-                    .child(
-                        style::button(
-                            "pilus-projects-browse",
-                            "Browse…",
-                            style::ButtonKind::Secondary,
-                            theme,
-                            self.footer_font(),
-                        )
-                        .flex_shrink_0()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.browse_project_dir(cx);
-                        })),
-                    ),
-            );
-        let mut machine_list = div().flex().flex_col().gap_1();
-        machine_list = machine_list.child(
-            div()
-                .text_size(px(self.section_font()))
-                .text_color(theme.muted)
-                .child("Machine"),
-        );
-        for (index, id) in ids.iter().enumerate() {
-            let label = match id {
-                None => "Local".to_string(),
-                Some(machine_id) => self
-                    .machines
-                    .iter()
-                    .find(|machine| &machine.id == machine_id)
-                    .map(|machine| format!("{} ({})", machine.display(), machine_id))
-                    .unwrap_or_else(|| machine_id.clone()),
-            };
-            let picked = self.projects.machine_cursor() == index;
-            machine_list = machine_list.child(
-                div()
-                    .id(format!("pilus-projects-machine-{index}"))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .bg(if picked { theme.panel_dim } else { theme.panel })
-                    .border_1()
-                    .border_color(if picked { theme.accent } else { theme.border })
-                    .text_size(px(self.footer_font()))
-                    .text_color(theme.fg)
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let choices = this.project_machine_ids().len();
-                        let current = this.projects.machine_cursor();
-                        let delta = index as isize - current as isize;
-                        this.projects.move_machine(delta, choices);
-                        cx.notify();
-                    })),
-            );
-        }
-        body = body.child(machine_list);
-        let save = style::button(
-            "pilus-projects-save",
-            "Save",
-            style::ButtonKind::Primary,
-            theme,
-            self.footer_font(),
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            let root = this.pilus_root.clone();
-            let ids = this.project_machine_ids();
-            let _ = this.projects.submit(&root, &ids);
-            cx.notify();
-        }));
-        let cancel = style::button(
-            "pilus-projects-cancel",
-            "Cancel",
-            style::ButtonKind::Ghost,
-            theme,
-            self.footer_font(),
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.projects.cancel_form();
-            cx.notify();
-        }));
-        div().flex().flex_col().child(body).child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_end()
-                .gap_2()
-                .px_3()
-                .pb_2()
-                .child(cancel)
-                .child(save),
-        )
-    }
-
-    /// One labelled single-line field in the project form.
-    fn project_field_box(
-        &self,
-        field: ProjectField,
-        label: &str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = self.theme;
-        let focused = self.projects.focus() == Some(field);
-        let entity = self.project_input(field);
-        entity.update(cx, |input, _| {
-            input.set_style(
-                theme,
-                style::chrome_font(&self.shared_settings),
-                px(self.section_font()),
-            );
-        });
-        style::field(
-            format!("pilus-project-field-{label}"),
-            label,
-            focused,
-            theme,
-            28.0,
-            self.section_font(),
-            entity,
-        )
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                // Focus the field; Tab cycles from here.
-                this.projects.cancel_delete();
-                while this.projects.focus() != Some(field) {
-                    this.projects.cycle_focus(false);
-                }
-                cx.notify();
-            }),
-        )
     }
 
     /// The NOTIFICATIONS section of the page: a single toggle for native
@@ -6838,7 +5765,6 @@ impl PilusView {
                 cx.notify();
             }));
 
-        let picking_dir = self.picker_purpose == PickerPurpose::PickProjectDir;
         let source_label = self.picker_source_label();
         let menu_button = div()
             .id("pilus-picker-endpoint")
@@ -6884,36 +5810,9 @@ impl PilusView {
                     .text_size(px(style::scaled(&self.shared_settings, 14.0)))
                     .font_weight(FontWeight::BOLD)
                     .text_color(theme.fg)
-                    .child(if picking_dir {
-                        "Choose Directory"
-                    } else {
-                        "Open Workspace"
-                    }),
+                    .child("Open Workspace"),
             )
-            // Directory-pick mode browses the project form's machine, so the
-            // endpoint switcher is replaced by a static label.
-            .child(if picking_dir {
-                div()
-                    .id("pilus-picker-endpoint-label")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .h(px(26.0))
-                    .px_2()
-                    .rounded_md()
-                    .bg(theme.panel)
-                    .text_size(px(self.footer_font()))
-                    .text_color(theme.muted)
-                    .child(icon(
-                        include_bytes!("../../assets/icons/monitor.svg"),
-                        13.0,
-                        theme.muted,
-                    ))
-                    .child(self.project_form_machine_label())
-            } else {
-                menu_button
-            });
+            .child(menu_button);
         let menu = if self.picker.menu_open() {
             let choices = self.picker.menu_choices();
             let highlighted = self.picker.menu_selected();
@@ -7138,17 +6037,6 @@ impl PilusView {
         .on_click(cx.listener(|this, _, _, cx| {
             this.open_new_worktree(cx);
         }));
-        let use_dir = style::button(
-            "pilus-picker-use-dir",
-            "Use this folder",
-            style::ButtonKind::Primary,
-            theme,
-            self.footer_font(),
-        )
-        .flex_shrink_0()
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.use_picked_dir(cx);
-        }));
         let mut footer = div()
             .flex()
             .flex_row()
@@ -7167,17 +6055,9 @@ impl PilusView {
                     .overflow_hidden()
                     .text_size(px(self.section_font()))
                     .text_color(theme.muted)
-                    .child(if picking_dir {
-                        "↑↓ · ↵ browse · ⇧↵ use this folder · esc cancels"
-                    } else {
-                        "↑↓ · ↵ open · ← up · → back · ⇧. hidden"
-                    }),
+                    .child("↑↓ · ↵ open · ← up · → back · ⇧. hidden"),
             );
-        if picking_dir {
-            footer = footer.child(use_dir);
-        } else {
-            footer = footer.child(worktree).child(open);
-        }
+        footer = footer.child(worktree).child(open);
 
         div()
             .absolute()
@@ -8883,7 +7763,7 @@ impl PilusView {
         }
     }
 
-    /// Build the native sidebar: nav, sessions, and projects.
+    /// Build the native sidebar: nav, sessions, and workspaces.
     ///
     /// The daemon leaves the dock cells blank and reports their exact rectangle
     /// in `ShellDock`; this paints the same region from the `ShellWorkspaces`
@@ -8920,7 +7800,6 @@ impl PilusView {
             content = content.child(self.nav_row(kind, cx));
         }
 
-        content = content.child(self.projects_section(cx));
         content = content.child(self.workspaces_section(cx));
         content = content.child(self.agents_section(cx));
 
@@ -9170,7 +8049,7 @@ impl PilusView {
         // Tabs belong to the terminal surface, so they hide with it while a
         // page owns the card; the session picker stays on every page. The plus
         // follows the tabs until overflow makes the scroll viewport shrink.
-        if !self.projects.is_open() && !self.home.is_open() {
+        if !self.settings_open && !self.home.is_open() {
             let separator = div()
                 .mx_1()
                 .h(px(14.0))
@@ -9956,12 +8835,12 @@ impl PilusView {
             )
     }
 
-    /// One project or nested workspace row: the name on the first line, the
-    /// working directory on the second. The active workspace gets the pill.
+    /// One workspace row: the name on the first line, the working directory on
+    /// the second. The active workspace gets the pill.
     ///
     /// `host` is the machine name for a remote row, shown muted so a flat list
-    /// still says where the project lives. `compact` drops the leading icon
-    /// for rows nested under a project header, which already carries one.
+    /// still says where the workspace lives. `compact` drops the leading icon
+    /// for rows nested under another row, which already carries one.
     fn workspace_row(
         &self,
         endpoint: &EndpointId,
@@ -10300,54 +9179,6 @@ impl PilusView {
         self.send_active(press(KeyCode::Char(key), KeyModifiers::NONE));
     }
 
-    /// PROJECTS: persistent project records with their live workspaces
-    /// grouped beneath them. A workspace whose directory falls under a
-    /// project's base directory on the same endpoint renders nested here
-    /// instead of in WORKSPACES, so one project reads as one unit of work.
-    fn projects_section(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let section = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .pt(px(SIDEBAR_SECTION_GAP))
-            .child(self.section_header(
-                SectionHeader {
-                    id: "pilus-projects-toggle",
-                    label: "PROJECTS",
-                    collapsed: self.projects_collapsed,
-                    toggle: Box::new(|this, cx| {
-                        this.projects_collapsed = !this.projects_collapsed;
-                        cx.notify();
-                    }),
-                    add: Some((
-                        "pilus-manage-projects",
-                        Box::new(|this, cx| this.open_settings(cx)),
-                    )),
-                },
-                cx,
-            ));
-        if self.projects_collapsed {
-            return section;
-        }
-        let mut children = div().flex().flex_col().gap_1().pl(px(SIDEBAR_CHILD_INDENT));
-        if self.projects.projects().is_empty() {
-            children = children.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .h(px(SIDEBAR_BAND_HEIGHT))
-                    .text_size(px(self.chrome_font()))
-                    .text_color(theme.muted)
-                    .child("No projects yet"),
-            );
-        }
-        for project in self.projects.projects() {
-            children = children.child(self.project_row(project, cx));
-        }
-        section.child(children)
-    }
-
     /// One sidebar section header: collapse chevron, label, hairline, and —
     /// when the section has one — its add button.
     ///
@@ -10433,222 +9264,13 @@ impl PilusView {
         )
     }
 
-    /// One project row with its grouped workspaces nested beneath it.
-    fn project_row(&self, project: &Project, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let glass = self.settings.glass_opacity();
-        let collapsed = self.project_collapsed.contains(&project.id);
-        let active = self.project_active(project);
-        let host = self.project_host_label(project);
-        let location = self.shorten_cwd(project.endpoint_key(), &project.location);
-        let grouped = self.project_workspaces(project);
-        let project_id = project.id.clone();
-        let project_for_open = project.clone();
-        let group = format!("pilus-projectg-{}", project.id);
-        let mut row = div().flex().flex_col().gap_1();
-        let mut tip_lines = vec![
-            (format!("Directory: {location}"), theme.muted),
-            (format!("Host: {host}"), theme.muted),
-        ];
-        // The base directory's own live branch, resolved with the repo
-        // facts; absent outside a git repository.
-        if let Some(Some(branch)) = self
-            .project_branch
-            .get(&(project.endpoint_key().to_string(), project.location.clone()))
-        {
-            tip_lines.push((format!("Branch: {branch}"), theme.branch));
-        }
-        let tip = row_tooltip(project.name.clone(), theme.panel_fg, tip_lines, theme);
-        let header = div()
-            .id(format!("pilus-project-{}", project.id))
-            .group(group.clone())
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(SIDEBAR_GLYPH_GAP))
-            .h(px(SIDEBAR_ROW_HEIGHT))
-            .pl(px(SIDEBAR_ROW_PAD))
-            .pr(px(SIDEBAR_ROW_PAD))
-            .rounded_md()
-            .bg(if active {
-                theme.panel.opacity(glass)
-            } else {
-                theme.panel.opacity(0.0)
-            })
-            .cursor_pointer()
-            .hover(move |style| style.bg(theme.panel.opacity(glass)))
-            // A plain square marks the project; hovering the row swaps in
-            // the collapse chevron, so the affordance appears on demand.
-            .child(
-                div()
-                    .relative()
-                    .w(px(SIDEBAR_GLYPH))
-                    .h(px(SIDEBAR_GLYPH))
-                    .flex_shrink_0()
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .child(icon(
-                                include_bytes!("../../assets/icons/folder-git.svg"),
-                                12.0,
-                                theme.muted,
-                            ))
-                            .opacity(1.0)
-                            .group_hover(group.clone(), |style| style.opacity(0.0)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .child(icon(
-                                if collapsed {
-                                    include_bytes!("../../assets/icons/chevron-right.svg")
-                                } else {
-                                    include_bytes!("../../assets/icons/chevron-down.svg")
-                                },
-                                12.0,
-                                theme.muted,
-                            ))
-                            .opacity(0.0)
-                            .group_hover(group.clone(), |style| style.opacity(1.0)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(self.chrome_font()))
-                    .text_color(theme.panel_fg)
-                    .child(project.name.clone()),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(self.section_font()))
-                    .text_color(theme.muted)
-                    .child(host),
-            )
-            .tooltip(tip)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.project_collapsed.contains(&project_id) {
-                    this.project_collapsed.remove(&project_id);
-                } else {
-                    this.project_collapsed.insert(project_id.clone());
-                }
-                cx.notify();
-            }));
-        // The directory sub-line carries the open affordance: a hover fill
-        // marks it clickable. The project tip lives on the header above.
-        let sub = div()
-            .id(format!("pilus-project-open-{}", project.id))
-            .flex()
-            .items_center()
-            .h(px(SIDEBAR_SUBLINE_HEIGHT))
-            .pl(px(SIDEBAR_ROW_PAD))
-            .pr(px(SIDEBAR_ROW_PAD))
-            .rounded_md()
-            .cursor_pointer()
-            .hover(move |style| style.bg(theme.panel.opacity(glass)))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .font_family(style::mono_family(&self.shared_settings))
-                    .text_size(px(self.section_font()))
-                    .text_color(theme.muted)
-                    .child(location),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.open_project_location(project_for_open.clone(), cx);
-            }));
-        // A collapsed project is one header row; the directory and the
-        // workspaces show only expanded.
-        row = row.child(header);
-        if !collapsed {
-            row = row.child(sub);
-            for (endpoint, workspace) in grouped {
-                // Nested rows drop the host badge (the header names the
-                // machine), the daemon's circle, and the wide indent: a
-                // tight corner marks the child instead.
-                let child = ShellWorkspace {
-                    nested: false,
-                    ..workspace.clone()
-                };
-                row = row.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_start()
-                        // One indent step, the same one a daemon-marked
-                        // nested workspace takes, so both nesting styles land
-                        // their labels on the same column.
-                        .pl(px(SIDEBAR_ROW_PAD + SIDEBAR_NEST_INDENT))
-                        .child(
-                            div()
-                                .w(px(SIDEBAR_GLYPH))
-                                .flex_shrink_0()
-                                .pt(px(7.0))
-                                .child(icon(
-                                    include_bytes!("../../assets/icons/corner-down-right.svg"),
-                                    12.0,
-                                    theme.muted,
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .child(self.workspace_row(&endpoint, &child, None, true, cx)),
-                        ),
-                );
-            }
-        }
-        row
-    }
-
-    /// Every live workspace owned by `project`, across endpoints.
-    ///
-    /// The base directory itself is the project header, so only worktrees
-    /// nest — a workspace sitting exactly on the location stays hidden.
-    fn project_workspaces(&self, project: &Project) -> Vec<(EndpointId, &ShellWorkspace)> {
-        let mut grouped = Vec::new();
-        let base = project.location.trim_end_matches('/');
-        for id in self.connected_endpoints() {
-            for workspace in self.endpoint_workspaces(&id) {
-                let cwd = self.expand_cwd(&id.key(), &workspace.cwd);
-                let common = self.workspace_common(&id.key(), &workspace.cwd);
-                if !project.owns_workspace_repo(&id.key(), &cwd, common) {
-                    continue;
-                }
-                if cwd.trim_end_matches('/') == base {
-                    continue;
-                }
-                grouped.push((id.clone(), workspace));
-            }
-        }
-        grouped
-    }
-
-    /// The project owning `cwd` on `endpoint_key`, if any.
-    fn project_for_workspace(&self, endpoint_key: &str, cwd: &str) -> Option<&Project> {
-        let expanded = self.expand_cwd(endpoint_key, cwd);
-        let common = self.workspace_common(endpoint_key, cwd);
-        self.projects
-            .projects()
-            .iter()
-            .find(|project| project.owns_workspace_repo(endpoint_key, &expanded, common))
-    }
-
     /// Expand the daemon's `~`-shorthand dirs against the owning machine.
     fn expand_cwd(&self, endpoint_key: &str, cwd: &str) -> String {
         if endpoint_key == "local" {
-            return expand_project_local(cwd);
+            return expand_local(cwd);
         }
         match self.remote_home.get(endpoint_key) {
-            Some(home) => expand_project_remote(cwd, home),
+            Some(home) => expand_remote(cwd, home),
             None => cwd.to_string(),
         }
     }
@@ -10692,156 +9314,61 @@ impl PilusView {
         None
     }
 
-    /// The cached git common dir for a workspace, if it was resolved.
-    fn workspace_common(&self, endpoint_key: &str, cwd: &str) -> Option<&str> {
-        self.project_repo
-            .get(&(endpoint_key.to_string(), cwd.to_string()))
-            .and_then(|common| common.as_deref())
-    }
-
-    /// Resolve the repositories of ungrouped workspaces off-thread.
+    /// Resolve the `$HOME` of remote endpoints whose workspaces are shown.
     ///
-    /// Directory-owned workspaces need no help, so only the rest go through
-    /// `git rev-parse`: locals one by one, remotes one SSH batch per
-    /// machine. Facts arrive on `project_repo_rx` and regroup the sidebar.
-    fn resolve_project_repos(&mut self) {
-        if self.project_repo_pending {
+    /// A remote machine's home lets the sidebar shorten absolute pane cwds;
+    /// this machine's own `$HOME` never matches it. Homes arrive on
+    /// `home_resolve_rx`.
+    fn resolve_remote_homes(&mut self) {
+        if self.home_resolve_pending {
             return;
         }
-        let rows: Vec<(EndpointId, String)> = self
-            .connected_endpoints()
-            .into_iter()
-            .flat_map(|id| {
-                self.endpoint_workspaces(&id)
-                    .iter()
-                    .map(|workspace| (id.clone(), workspace.cwd.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let mut live = HashSet::new();
-        let mut missing: Vec<(String, Option<SshTarget>, String)> = Vec::new();
-        for (id, cwd) in &rows {
-            if cwd.is_empty() {
+        let mut probes: Vec<(String, SshTarget, Vec<String>)> = Vec::new();
+        for id in self.connected_endpoints() {
+            let Some(machine_id) = id.machine_id() else {
+                continue;
+            };
+            let key = id.key();
+            if self.remote_home.contains_key(&key) {
                 continue;
             }
-            let key = (id.key(), cwd.clone());
-            live.insert(key.clone());
-            if self.project_repo.contains_key(&key) {
-                continue;
-            }
-            if self
-                .projects
-                .projects()
+            let Some(target) = self
+                .machines
                 .iter()
-                .any(|project| project.owns_workspace(&key.0, &self.expand_cwd(&key.0, &key.1)))
-            {
-                self.project_repo.insert(key, None);
+                .find(|machine| machine.id == machine_id)
+                .and_then(|machine| machine.ssh_target())
+            else {
                 continue;
-            }
-            let target = match id {
-                EndpointId::Local => None,
-                EndpointId::Machine(machine_id) => self
-                    .machines
-                    .iter()
-                    .find(|machine| &machine.id == machine_id)
-                    .and_then(|machine| machine.ssh_target()),
             };
-            // Without a bridge there is nothing to ask; retry later.
-            if id.machine_id().is_some() && target.is_none() {
+            let cwds: Vec<String> = self
+                .endpoint_workspaces(&id)
+                .iter()
+                .map(|workspace| workspace.cwd.clone())
+                .filter(|cwd| !cwd.is_empty())
+                .collect();
+            if cwds.is_empty() {
                 continue;
             }
-            missing.push((key.0, target, key.1));
+            probes.push((key, target, cwds));
         }
-        self.project_repo.retain(|key, _| live.contains(key));
-        // Project base branches resolve on the same tick, keyed by raw
-        // location so the tip can show the live branch.
-        let mut live_bases = HashSet::new();
-        let mut bases: Vec<(String, Option<SshTarget>, String)> = Vec::new();
-        for project in self.projects.projects() {
-            if project.location.trim().is_empty() {
-                continue;
-            }
-            let key = (project.endpoint_key().to_string(), project.location.clone());
-            live_bases.insert(key.clone());
-            if self.project_branch.contains_key(&key) {
-                continue;
-            }
-            let target = match &project.machine {
-                None => None,
-                Some(id) => self
-                    .machines
-                    .iter()
-                    .find(|machine| &machine.id == id)
-                    .and_then(|machine| machine.ssh_target()),
-            };
-            if key.0 != "local" && target.is_none() {
-                continue;
-            }
-            bases.push((key.0, target, key.1));
-        }
-        self.project_branch
-            .retain(|key, _| live_bases.contains(key));
-        if missing.is_empty() && bases.is_empty() {
+        if probes.is_empty() {
             return;
         }
-        self.project_repo_pending = true;
-        let tx = self.project_repo_tx.clone();
+        self.home_resolve_pending = true;
+        let tx = self.home_resolve_tx.clone();
         std::thread::spawn(move || {
-            let mut facts = Vec::with_capacity(missing.len());
             let mut homes = Vec::new();
-            let mut remotes: HashMap<String, (SshTarget, Vec<String>)> = HashMap::new();
-            for (endpoint_key, target, cwd) in missing {
-                match target {
-                    None => facts.push(((endpoint_key, cwd.clone()), common_git_dir(&cwd))),
-                    Some(target) => remotes
-                        .entry(endpoint_key)
-                        .or_insert_with(|| (target, Vec::new()))
-                        .1
-                        .push(cwd),
+            for (endpoint_key, target, cwds) in probes {
+                let home = common_git_dirs_remote(&target, &cwds).home;
+                if !home.is_empty() {
+                    homes.push((endpoint_key, home));
                 }
             }
-            for (endpoint_key, (target, cwds)) in remotes {
-                let probed = common_git_dirs_remote(&target, &cwds);
-                if !probed.home.is_empty() {
-                    homes.push((endpoint_key.clone(), probed.home));
-                }
-                for (cwd, common) in probed.facts {
-                    facts.push(((endpoint_key.clone(), cwd), common));
-                }
-            }
-            let mut branches = Vec::with_capacity(bases.len());
-            let mut branch_remotes: HashMap<String, (SshTarget, Vec<String>)> = HashMap::new();
-            for (endpoint_key, target, location) in bases {
-                match target {
-                    None => {
-                        branches.push(((endpoint_key, location.clone()), current_branch(&location)))
-                    }
-                    Some(target) => branch_remotes
-                        .entry(endpoint_key)
-                        .or_insert_with(|| (target, Vec::new()))
-                        .1
-                        .push(location),
-                }
-            }
-            for (endpoint_key, (target, locations)) in branch_remotes {
-                let answers = current_branches_remote(&target, &locations);
-                if !answers.home.is_empty() {
-                    homes.push((endpoint_key.clone(), answers.home));
-                }
-                for (location, branch) in answers.branches {
-                    branches.push(((endpoint_key.clone(), location), branch));
-                }
-            }
-            tx.send(RepoResolve {
-                facts,
-                homes,
-                branches,
-            })
-            .ok();
+            tx.send(HomeResolve { homes }).ok();
         });
     }
 
-    /// WORKSPACES: every open workspace not grouped under a project.
+    /// WORKSPACES: every open workspace on every connected endpoint.
     fn workspaces_section(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let section = div()
@@ -10877,13 +9404,6 @@ impl PilusView {
             let host = id.machine_id().map(|_| self.endpoint_label(&id));
             let workspaces = self.endpoint_workspaces(&id);
             for workspace in workspaces {
-                // Project-grouped workspaces render nested under PROJECTS.
-                if self
-                    .project_for_workspace(&id.key(), &workspace.cwd)
-                    .is_some()
-                {
-                    continue;
-                }
                 any = true;
                 children =
                     children.child(self.workspace_row(&id, workspace, host.as_deref(), false, cx));
@@ -12631,31 +11151,16 @@ fn remove_dock(side: &mut pilus_protocol::SideConfig, name: &str) {
     }
 }
 
-/// Open the project's workspace (or a new worktree), then start and prompt
-/// the chosen agent there.
+/// Open the workspace at `location`, then start and prompt the chosen agent
+/// there.
 ///
 /// `agent.start` spawns beside the focused pane, so the workspace open must
 /// land first; both run in one background thread in the caller. The model and
 /// effort pickers are captured in the UI but not forwarded yet: their flags
 /// differ per agent manifest, so forwarding them blindly would fail launches.
-/// The label a project reads as in the Home picker: its name, plus the
-/// machine's display name when the project lives on a saved machine.
-fn project_choice_label(project: &Project, machines: &[MachineInfo]) -> String {
-    match &project.machine {
-        Some(id) => machines
-            .iter()
-            .find(|machine| &machine.id == id)
-            .map(|machine| format!("{} ({})", project.name, machine.display()))
-            .unwrap_or_else(|| project.name.clone()),
-        None => project.name.clone(),
-    }
-}
-
 fn launch_home_agent(
     client: &mut ControlClient,
     location: &str,
-    base: BaseMode,
-    branch: &str,
     name: &str,
     agent: &str,
     prompt: &str,
@@ -12663,16 +11168,6 @@ fn launch_home_agent(
     client
         .open_workspace(location)
         .map_err(|error| error.to_string())?;
-    if base == BaseMode::NewWorktree {
-        let branch = if branch.trim().is_empty() {
-            generate_session_name(&[])
-        } else {
-            branch.to_string()
-        };
-        client
-            .create_worktree(&branch)
-            .map_err(|error| error.to_string())?;
-    }
     // A fresh workspace opens with one shell pane. Reuse it for the agent so
     // the launch does not split a second, empty terminal beside Pi.
     let pane = client.idle_pane().ok().flatten();
@@ -12999,32 +11494,6 @@ mod tests {
             Some(gpui::rgb(0x181825))
         );
         assert!(scheme::builtin("no-such-theme").is_none());
-    }
-
-    #[test]
-    fn project_choice_label_names_the_machine() {
-        let machine = MachineInfo {
-            id: "mac-mini".into(),
-            display: "Mac Mini".into(),
-            ..MachineInfo::default()
-        };
-        let remote = Project {
-            name: "flo".into(),
-            machine: Some("mac-mini".into()),
-            ..Project::default()
-        };
-        assert_eq!(
-            project_choice_label(&remote, std::slice::from_ref(&machine)),
-            "flo (Mac Mini)"
-        );
-        // A local project stays bare, and a machine that is gone falls back to
-        // the project name rather than a dangling id.
-        let local = Project {
-            name: "flo".into(),
-            ..Project::default()
-        };
-        assert_eq!(project_choice_label(&local, &[]), "flo");
-        assert_eq!(project_choice_label(&remote, &[]), "flo");
     }
 
     #[test]

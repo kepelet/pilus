@@ -1045,43 +1045,6 @@ impl UiPlaygroundView {
             )
     }
 
-    /// A project row, active or not.
-    fn project_row_demo(&self, active: bool) -> Div {
-        let theme = self.theme;
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .w_full()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(if active {
-                theme.panel
-            } else {
-                theme.window_bg.opacity(0.0)
-            })
-            .child(icon(
-                include_bytes!("../../assets/icons/folder-git.svg"),
-                12.0,
-                theme.muted,
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .truncate()
-                    .text_size(px(self.fonts().body))
-                    .text_color(theme.panel_fg)
-                    .font_weight(if active {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .child("pilus"),
-            )
-    }
-
     /// A workspace row with its branch badge and cwd line.
     fn workspace_row_demo(&self, active: bool) -> Div {
         let theme = self.theme;
@@ -1476,7 +1439,7 @@ impl UiPlaygroundView {
                 div()
                     .text_size(px(self.fonts().secondary))
                     .text_color(theme.muted)
-                    .child("No projects yet."),
+                    .child("No workspaces yet."),
             )
             .child(
                 div()
@@ -1520,7 +1483,7 @@ impl UiPlaygroundView {
             .gap_3()
             .child(style::small_button(
                 "pg-small-primary",
-                "New Project",
+                "New Widget",
                 ButtonKind::Primary,
                 theme,
                 fonts.secondary,
@@ -1704,8 +1667,6 @@ impl Render for UiPlaygroundView {
                             .gap_2()
                             .w_full()
                             .child(self.section_header(cx))
-                            .child(self.project_row_demo(true))
-                            .child(self.project_row_demo(false))
                             .child(self.workspace_row_demo(true))
                             .child(self.workspace_row_demo(false))
                             .child(self.agent_row_demo()),

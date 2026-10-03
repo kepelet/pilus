@@ -70,24 +70,9 @@ pub enum PickerEvent {
     WorktreeOpened(Result<(), String>),
     /// A local terminal's `tab.new` finished.
     LocalTerminalOpened(Result<(), String>),
-    /// A project's `workspace.open` finished; `machine` owns the project
-    /// (`None` is local), so the surface can hand off to its endpoint.
-    ProjectOpened {
-        /// The project's machine profile id, or `None` for local.
-        machine: Option<String>,
-        /// The open outcome.
-        result: Result<(), String>,
-    },
-    /// A project's worktree finished; `machine` owns the project.
-    ProjectWorktreeOpened {
-        /// The project's machine profile id, or `None` for local.
-        machine: Option<String>,
-        /// The create outcome.
-        result: Result<(), String>,
-    },
-    /// A Home composer launch finished; `machine` owns the project.
+    /// A Home composer launch finished; `machine` owns the workspace.
     HomeLaunched {
-        /// The project's machine profile id, or `None` for local.
+        /// The machine profile id that owns the workspace, or `None` for local.
         machine: Option<String>,
         /// A success line, or the error that stopped the launch.
         result: Result<String, String>,

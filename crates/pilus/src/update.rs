@@ -200,10 +200,10 @@ pub fn engine(request: &UpdateRequest) -> UpdateEngine<Box<dyn UpdateSource>> {
 
 /// One-line policy note shown in the update UI.
 ///
-/// The daemon handshake already rejects a protocol mismatch with a readable
-/// error, so OTA needs no separate protocol gate: a client that updated past
-/// its daemon simply fails to attach until `luvus` is updated too.
-pub const PROTOCOL_NOTE: &str = "If the update needs a newer daemon, update `luvus` as well.";
+/// The daemon handshake rejects a protocol mismatch with a readable error, and
+/// the window now opens regardless, so OTA needs no separate protocol gate.
+/// The note points at the one thing the user must do outside `pilus`.
+pub const PROTOCOL_NOTE: &str = "Luvus updates separately: run `luvus update` and `luvus server restart` for the local daemon, and re-run `luvus machine enable <id> --install` for saved machines.";
 
 #[cfg(test)]
 mod tests {

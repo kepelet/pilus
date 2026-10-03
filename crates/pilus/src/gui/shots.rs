@@ -179,7 +179,7 @@ pub fn run_main() -> Result<()> {
             let view = cx.new(|cx| {
                 PilusView::new(
                     target.clone(),
-                    connection,
+                    Some(connection),
                     settings(),
                     Rc::new(RefCell::new(MachineSignal::default())),
                     Rc::new(RefCell::new(Theme::default())),

@@ -188,9 +188,53 @@ impl AppearancesView {
 
     /// Publish a font change to the main window and to disk.
     fn publish(&mut self, cx: &mut Context<Self>) {
-        *self.shared_settings.borrow_mut() = self.settings.clone();
+        self.stage(cx);
         self.settings.save(&self.config_root);
+    }
+
+    /// Share a change with the main window without touching disk. Dragging
+    /// the opacity slider stages every step live and commits on mouse-up,
+    /// so a sweep does not rewrite the settings file on every tick.
+    fn stage(&mut self, cx: &mut Context<Self>) {
+        *self.shared_settings.borrow_mut() = self.settings.clone();
         cx.notify();
+    }
+
+    /// Stage an opacity step from the slider; the mouse-up commit persists it.
+    fn set_opacity(&mut self, value: f32, cx: &mut Context<Self>) {
+        // The top zone stops at 97.5%; snapping it restores fully opaque so
+        // the inset card can come back.
+        self.settings.opacity = if value >= 0.975 {
+            1.0
+        } else {
+            value.clamp(0.1, 1.0)
+        };
+        self.stage(cx);
+    }
+
+    /// Step the opacity by `delta`, reaching both ends exactly so 100% is
+    /// always one tap away no matter where the slider zones land.
+    fn adjust_opacity(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.settings.opacity = (self.settings.glass_opacity() + delta).clamp(0.1, 1.0);
+        self.publish(cx);
+    }
+
+    /// Stage a blur step from the slider; the mouse-up commit persists it.
+    /// The top zone stops at 97.5%, so it snaps to full blur like opacity.
+    fn set_blur(&mut self, value: f32, cx: &mut Context<Self>) {
+        self.settings.blur = if value >= 0.975 {
+            1.0
+        } else {
+            value.clamp(0.0, 1.0)
+        };
+        self.stage(cx);
+    }
+
+    /// Step the blur by `delta`, reaching both ends exactly: 0% drops the
+    /// blur view so the desktop shows sharp.
+    fn adjust_blur(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.settings.blur = (self.settings.blur.clamp(0.0, 1.0) + delta).clamp(0.0, 1.0);
+        self.publish(cx);
     }
 
     fn families(&self, field: FontField) -> &[String] {
@@ -423,6 +467,113 @@ impl AppearancesView {
         }
     }
 
+    /// The window-opacity row: a slider with steppers and a live percentage.
+    fn opacity_row(&self, cx: &mut Context<Self>) -> Div {
+        let value = self.settings.glass_opacity();
+        let smaller = self.step_button(
+            "pilus-opacity-smaller".to_string(),
+            "−".to_string(),
+            cx,
+            |this, cx| this.adjust_opacity(-0.05, cx),
+        );
+        let larger = self.step_button(
+            "pilus-opacity-larger".to_string(),
+            "+".to_string(),
+            cx,
+            |this, cx| this.adjust_opacity(0.05, cx),
+        );
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .text_size(px(self.fonts().secondary))
+            .text_color(self.theme.fg)
+            .child(
+                div()
+                    .w(px(84.0))
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .text_color(self.theme.muted)
+                    .child("Opacity".to_string()),
+            )
+            .child(
+                div().flex_1().child(
+                    style::slider("pilus-opacity", value, self.theme, cx, |this, step, cx| {
+                        this.set_opacity(step, cx);
+                    })
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.publish(cx)),
+                    ),
+                ),
+            )
+            .child(smaller)
+            .child(
+                div()
+                    .w(px(44.0))
+                    .text_center()
+                    .child(format!("{:.0}%", value * 100.0)),
+            )
+            .child(larger)
+    }
+
+    /// The blur-strength row: a slider with steppers and a live percentage.
+    /// Zero drops the blur view so the desktop shows sharp.
+    fn blur_row(&self, cx: &mut Context<Self>) -> Div {
+        let value = self.settings.blur.clamp(0.0, 1.0);
+        let smaller = self.step_button(
+            "pilus-blur-smaller".to_string(),
+            "−".to_string(),
+            cx,
+            |this, cx| this.adjust_blur(-0.05, cx),
+        );
+        let larger = self.step_button(
+            "pilus-blur-larger".to_string(),
+            "+".to_string(),
+            cx,
+            |this, cx| this.adjust_blur(0.05, cx),
+        );
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .text_size(px(self.fonts().secondary))
+            .text_color(self.theme.fg)
+            .child(
+                div()
+                    .w(px(84.0))
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .text_color(self.theme.muted)
+                    .child("Blur".to_string()),
+            )
+            .child(
+                div().flex_1().child(
+                    style::slider("pilus-blur", value, self.theme, cx, |this, step, cx| {
+                        this.set_blur(step, cx);
+                    })
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.publish(cx)),
+                    ),
+                ),
+            )
+            .child(smaller)
+            .child(
+                div()
+                    .w(px(44.0))
+                    .text_center()
+                    .child(format!("{:.0}%", value * 100.0)),
+            )
+            .child(larger)
+    }
+
     /// A section title, matching the weight of the list headings below.
     fn section_heading(&self, label: &str) -> Div {
         style::section_label(self.theme, label.to_string(), self.fonts().label)
@@ -604,6 +755,11 @@ impl Render for AppearancesView {
             .child(self.section_heading("FONTS"))
             .child(self.font_row(FontField::Ui, "Interface", cx))
             .child(self.font_row(FontField::Terminal, "Terminal", cx));
+
+        list = list
+            .child(self.section_heading("TRANSPARENCY"))
+            .child(self.opacity_row(cx))
+            .child(self.blur_row(cx));
 
         let root = div()
             .id("pilus-appearances")

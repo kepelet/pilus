@@ -138,6 +138,7 @@ pub struct UiPlaygroundView {
     tab: usize,
     toggle: bool,
     checked: bool,
+    slider: f32,
     collapsed: bool,
     confirm: bool,
     clicks: u32,
@@ -202,6 +203,7 @@ impl UiPlaygroundView {
             tab: 0,
             toggle: true,
             checked: false,
+            slider: 0.85,
             collapsed: false,
             confirm: false,
             clicks: 0,
@@ -504,6 +506,35 @@ impl UiPlaygroundView {
                 this.note(format!("Switch {}", if on { "on" } else { "off" }), cx);
             },
         ))
+    }
+
+    /// A working amount slider.
+    fn slider_demo(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let value = self.slider;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .w_full()
+            .child(div().flex_1().child(style::slider(
+                "pg-slider",
+                value,
+                self.theme,
+                cx,
+                |this, step, cx| {
+                    this.slider = step;
+                    this.note(format!("Slider {:.0}%", step * 100.0), cx);
+                },
+            )))
+            .child(
+                div()
+                    .w(px(44.0))
+                    .text_right()
+                    .text_size(px(self.fonts().body))
+                    .text_color(self.theme.fg)
+                    .child(format!("{:.0}%", value * 100.0)),
+            )
     }
 
     /// A working checkbox.
@@ -840,7 +871,7 @@ impl UiPlaygroundView {
                             .h(px(64.0))
                             .w_full()
                             .rounded_md()
-                            .bg(theme.bg)
+                            .bg(theme.window_bg)
                             .border_1()
                             .border_color(terminal_inset_border()),
                     ),
@@ -1662,6 +1693,7 @@ impl Render for UiPlaygroundView {
                     ),
                 ),
             )
+            .child(self.section("SLIDER", self.tray(self.slider_demo(cx))))
             .child(
                 self.section(
                     "SIDEBAR",

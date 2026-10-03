@@ -15,6 +15,10 @@ pub const FONT_FAMILY: &str = "Menlo";
 pub const FONT_SIZE: f32 = 13.0;
 /// Default chrome text size in logical pixels.
 pub const CHROME_FONT: f32 = 13.0;
+/// Default window opacity for glass surfaces (terminal, sidebar, tab strip).
+pub const OPACITY: f32 = 0.85;
+/// Default blur strength over the desktop: full system blur.
+pub const BLUR: f32 = 1.0;
 
 /// The main window's frame when it was last seen, so the next launch reopens
 /// it where the user left it.
@@ -64,6 +68,16 @@ pub struct Settings {
     /// Raise a native desktop notification when the daemon pushes one, unless
     /// this window is already in front. On by default.
     pub notifications: bool,
+    /// Window opacity for glass surfaces (terminal, sidebar, tab strip);
+    /// 1.0 is opaque. Files written before the control existed stay
+    /// translucent via the default.
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
+    /// Blur strength over the desktop; 1.0 is the full system blur and 0.0
+    /// drops the blur view so the desktop shows sharp. Files written before
+    /// the control existed keep full blur via the default.
+    #[serde(default = "default_blur")]
+    pub blur: f32,
 }
 
 impl Default for Settings {
@@ -79,8 +93,20 @@ impl Default for Settings {
             window: None,
             connector: false,
             notifications: true,
+            opacity: OPACITY,
+            blur: BLUR,
         }
     }
+}
+
+/// The opacity files written before the control existed get.
+fn default_opacity() -> f32 {
+    OPACITY
+}
+
+/// The blur strength files written before the control existed get.
+fn default_blur() -> f32 {
+    BLUR
 }
 
 impl Settings {
@@ -94,7 +120,6 @@ impl Settings {
 
     /// Persist to `<root>/settings.json`, best-effort like the daemon's own
     /// state writes.
-    ///
     /// Only the window writes settings; `--check-updates` reads them without
     /// the GUI feature, where this method is unused.
     #[cfg_attr(not(feature = "gui"), allow(dead_code))]
@@ -103,6 +128,12 @@ impl Settings {
             let _ = std::fs::create_dir_all(root);
             let _ = std::fs::write(path(root), text);
         }
+    }
+
+    /// Glass-surface opacity, clamped to a usable range so a stray value in
+    /// the file cannot turn the window invisible.
+    pub fn glass_opacity(&self) -> f32 {
+        self.opacity.clamp(0.1, 1.0)
     }
 }
 
@@ -125,6 +156,7 @@ mod tests {
         assert!(settings.update_feed_url.is_none());
         assert!(settings.window.is_none());
         assert!(settings.notifications);
+        assert_eq!(settings.opacity, OPACITY);
     }
 
     #[test]
@@ -133,6 +165,32 @@ mod tests {
         let back: Settings =
             serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
         assert!(back.notifications);
+    }
+
+    #[test]
+    fn missing_opacity_stays_translucent() {
+        // Files written before the control existed have no opacity key.
+        let back: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert_eq!(back.opacity, OPACITY);
+    }
+
+    #[test]
+    fn missing_blur_keeps_full_blur() {
+        // Files written before the control existed have no blur key.
+        let back: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert_eq!(back.blur, BLUR);
+    }
+
+    #[test]
+    fn glass_opacity_clamps_to_a_usable_range() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.glass_opacity(), OPACITY);
+        settings.opacity = 0.0;
+        assert_eq!(settings.glass_opacity(), 0.1);
+        settings.opacity = 2.0;
+        assert_eq!(settings.glass_opacity(), 1.0);
     }
 
     #[test]
@@ -163,6 +221,8 @@ mod tests {
             }),
             connector: true,
             notifications: false,
+            opacity: 0.7,
+            blur: 0.5,
         };
         let text = serde_json::to_string(&settings).expect("serialize");
         let back: Settings = serde_json::from_str(&text).expect("deserialize");

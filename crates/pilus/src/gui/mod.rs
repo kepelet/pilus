@@ -46,9 +46,9 @@ use gpui::{
     DisplayId, Div, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent,
     Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    Stateful, SystemNotification, TextRun, TitlebarOptions, Transformation, Window, WindowBounds,
-    WindowOptions, anchored, deferred, div, font, img, percentage, point, prelude::*, px, size,
-    svg,
+    Stateful, SystemNotification, TextRun, TitlebarOptions, Transformation, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, anchored, deferred, div, font, img,
+    percentage, point, prelude::*, px, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::UpdateStatus;
@@ -65,7 +65,8 @@ use pilus_client::{
     luvus_binary, pilus_config_dir, refresh_machines, split_client_socket,
 };
 use pilus_protocol::{
-    CellData, ClientMessage, FrameData, ShellSidebars, ShellWorkspace, SurfaceInterest,
+    CellData, ClientMessage, FrameData, ShellDockRect, ShellSidebars, ShellWorkspace,
+    SurfaceInterest,
 };
 use projects::{ProjectField, ProjectsPanel};
 use selection::{Cell, Selection};
@@ -131,6 +132,29 @@ const SIDEBAR_SECTION_GAP: f32 = 12.0;
 /// Breathing room between the terminal grid and the card's inset border.
 /// Opposite gaps stay equal because the whole-cell grid is centered.
 const TERMINAL_PAD: f32 = 6.0;
+/// How long the sidebar takes to collapse or expand: long enough to read
+/// as a glide, short enough to stay out of the way.
+const SIDEBAR_ANIM_DURATION: Duration = Duration::from_millis(300);
+/// Slowest daemon resize cadence while the sidebar tweens: the flight
+/// tracks live without a per-frame storm.
+const SIDEBAR_RESIZE_THROTTLE: Duration = Duration::from_millis(50);
+
+/// One sidebar collapse/expand tween, from the current openness to the target
+/// so a mid-slide reversal glides instead of jumping.
+struct SidebarAnim {
+    started: Instant,
+    from: f32,
+    to: f32,
+}
+
+/// Window surfaces read their opacity from `Settings::glass_opacity`, tuned
+/// in the Appearances window, so no constant lives here.
+/// Strongest frost veil over the system blur, reached as the blur slider
+/// approaches (but does not reach) zero. Full blur shows the OS blur
+/// untouched; an explicit zero drops the blur view instead of veiling it.
+/// The veil is flat like a gaussian blur would be: AppKit fixes the blur
+/// radius itself, so no gradient can come from the OS side.
+const FROST_MAX: f32 = 0.5;
 /// Right margin on the card. Matches the other sides so the terminal sits
 /// centered between the sidebar and the window edge.
 const CARD_GAP_RIGHT: f32 = CARD_GAP;
@@ -471,6 +495,7 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             WindowOptions {
                 window_bounds: Some(bounds),
                 display_id,
+                window_background: WindowBackgroundAppearance::Blurred,
                 window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("pilus".into()),
@@ -478,7 +503,7 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                     // Centred on the sidebar toggle icon box (22px from the
                     // window top) and left-aligned with the sidebar nav glyphs
                     // (12px panel padding + 8px row padding).
-                    traffic_light_position: Some(point(px(20.0), px(15.0))),
+                    traffic_light_position: Some(point(px(12.0), px(15.0))),
                 }),
                 ..Default::default()
             },
@@ -643,11 +668,12 @@ fn open_main_window(
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(bounds),
+            window_background: WindowBackgroundAppearance::Blurred,
             window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
             titlebar: Some(TitlebarOptions {
                 title: Some("pilus".into()),
                 appears_transparent: true,
-                traffic_light_position: Some(point(px(20.0), px(15.0))),
+                traffic_light_position: Some(point(px(12.0), px(15.0))),
             }),
             ..Default::default()
         },
@@ -722,6 +748,11 @@ fn migrate_legacy_stores(luvus_root: &Path, pilus_root: &Path) {
 struct CardLayout {
     /// Card's left edge in window pixels (sidebar plus gap, or just gap).
     card_x: f32,
+    /// Card's top, right, and bottom offsets: the inset gaps when framed,
+    /// zero when the terminal runs full-bleed.
+    card_top: f32,
+    card_right: f32,
+    card_bottom: f32,
     /// Inset of the first cell from the border, after centering the
     /// whole-cell grid in the card's inner box.
     pad_x: f32,
@@ -735,6 +766,11 @@ struct CardLayout {
     /// Measured cell size in pixels.
     cell_w: f32,
     cell_h: f32,
+    /// Sub-cell remainder pooled at the right and bottom edges in full-bleed
+    /// (zero when framed, where centering absorbs it). The grid paints its
+    /// edge colors over this strip so no card-colored sliver shows.
+    slack_x: f32,
+    slack_y: f32,
 }
 
 /// What the folder picker is being used for.
@@ -1021,6 +1057,26 @@ struct PilusView {
     /// Font choices, shared with the Appearances window.
     settings: Settings,
     shared_settings: Rc<RefCell<Settings>>,
+    /// Whether the window currently drops its blur view (sharp desktop),
+    /// so `render` only reconfigures the window when the blur setting
+    /// crosses zero.
+    applied_sharp: Option<bool>,
+    /// Collapse/expand tween in flight, if any; the panel, tab strip, and
+    /// terminal read its openness so they glide together.
+    sidebar_anim: Option<SidebarAnim>,
+    /// Last dock rectangle seen while the sidebar was open. Hiding the sidebar
+    /// makes the daemon drop its `ShellDock`, so a live-only width would snap
+    /// to zero the instant it answers; the collapse tween folds this one away
+    /// instead.
+    last_sidebar_dock: Option<ShellDockRect>,
+    /// Sidebar openness sampled once at the top of `render`. Every surface in
+    /// one frame reads this instead of re-sampling the clock, so the panel,
+    /// tab strip, and terminal cannot land on edges from different tween
+    /// instants — which leaves an unpainted seam between them.
+    sidebar_open: f32,
+    /// Last daemon resize sent; the tween flight throttles resizes to this
+    /// cadence instead of storming once per frame.
+    last_resize_sent: Instant,
     /// Whether the remembered frame changed since the last settings write.
     window_dirty: bool,
     /// When the frame last changed, so a drag settles before the write.
@@ -1494,6 +1550,11 @@ impl PilusView {
             focus_handle,
             settings,
             shared_settings,
+            applied_sharp: None,
+            sidebar_anim: None,
+            last_sidebar_dock: None,
+            sidebar_open: 1.0,
+            last_resize_sent: Instant::now(),
             window_dirty: false,
             window_moved_at: Instant::now(),
             cols: 120,
@@ -1642,7 +1703,14 @@ impl PilusView {
                 let updated = this.update(cx, |view, cx| {
                     view.persist_window_bounds();
                     let changed = view.sync_settings(cx);
-                    if view.poll(cx) || changed {
+                    // The sidebar tween rides this loop: it ticks and
+                    // repaints here, so no second driver can stall unseen.
+                    // A settling tween repaints once more so a trailing
+                    // resize still lands when the daemon is otherwise idle:
+                    // `was_animating` covers the tick that returns settled.
+                    let was_animating = view.sidebar_anim.is_some();
+                    let settled = view.tick_sidebar_anim();
+                    if view.poll(cx) || changed || !settled || was_animating {
                         cx.notify();
                     }
                 });
@@ -2549,6 +2617,9 @@ impl PilusView {
             feed: _incoming_feed,
         } = endpoint;
         let outgoing_id = std::mem::replace(&mut self.active, target.clone());
+        // The incoming machine owns its own sidebar width; drop the old
+        // geometry so a stale rectangle cannot size the new panel.
+        self.last_sidebar_dock = None;
         let outgoing = Endpoint {
             machine: self.active_machine.take(),
             connection: std::mem::replace(&mut self.connection, connection),
@@ -6870,6 +6941,7 @@ impl PilusView {
                 self.active = EndpointId::Local;
                 self.active_machine = None;
                 self.surface = Surface::new();
+                self.last_sidebar_dock = None;
                 self.selection = None;
                 self.hover_cell = None;
                 self.press_anchor = None;
@@ -7016,12 +7088,76 @@ impl PilusView {
     }
 
     /// Collapse or expand the native sidebar, reclaiming the columns for panes.
-    fn toggle_sidebar(&mut self) {
+    /// The daemon hears the handoff immediately (optimistic final state) and
+    /// tracks the flight with throttled resizes, so it has converged by the
+    /// time the panel lands and nothing pops at settle.
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        // Capture the current openness before flipping the flag: with no
+        // tween in flight `sidebar_factor` reads `sidebar_visible`, so
+        // sampling after the flip would pin `from` to the new target and
+        // the tween would run from `to` to `to` (no motion at all).
+        let from = self.sidebar_factor();
         self.sidebar_visible = !self.sidebar_visible;
         if let Some(layout) = self.sidebar_layout.as_mut() {
             layout.left.visible = self.sidebar_visible;
         }
         self.push_sidebar_layout();
+        let to = if self.sidebar_visible { 1.0 } else { 0.0 };
+        self.sidebar_anim = Some(SidebarAnim {
+            started: Instant::now(),
+            from,
+            to,
+        });
+        cx.notify();
+    }
+
+    /// Advance the sidebar tween; true once it settles at its target.
+    fn tick_sidebar_anim(&mut self) -> bool {
+        let settled = match &self.sidebar_anim {
+            Some(anim) => anim.started.elapsed() >= SIDEBAR_ANIM_DURATION,
+            None => true,
+        };
+        if settled {
+            self.sidebar_anim = None;
+        }
+        settled
+    }
+
+    /// Sidebar openness, easing toward its target while a tween flies so the
+    /// panel, tab strip, and terminal glide together.
+    fn sidebar_factor(&self) -> f32 {
+        match &self.sidebar_anim {
+            Some(anim) => {
+                let elapsed = anim.started.elapsed().as_secs_f32();
+                let total = SIDEBAR_ANIM_DURATION.as_secs_f32();
+                let step = (elapsed / total).clamp(0.0, 1.0);
+                anim.from + (anim.to - anim.from) * ease_in_out_cubic(step)
+            }
+            None => {
+                if self.sidebar_visible {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
+    /// Sidebar width in pixels, animated while collapsing or expanding, so
+    /// every surface that abuts it stays glued to its edge.
+    fn sidebar_px(&self, cell_width: f32) -> f32 {
+        f32::from(self.sidebar_cells()) * cell_width * self.sidebar_open
+    }
+
+    /// Left inset of the tab strip and its menus: clears the traffic lights
+    /// when the sidebar is gone, hugs the edge otherwise, gliding between
+    /// the two while the panel tweens.
+    fn strip_pad(&self, fullscreen: bool) -> f32 {
+        if fullscreen {
+            TAB_STRIP_EDGE
+        } else {
+            TRAFFIC_LIGHT_CLEARANCE + (TAB_STRIP_EDGE - TRAFFIC_LIGHT_CLEARANCE) * self.sidebar_open
+        }
     }
 
     /// The measured cell advance in pixels, resolved from the font once.
@@ -7093,7 +7229,7 @@ impl PilusView {
             return true;
         }
         if self.sidebar_visible
-            && let Some(dock) = self.surface.shell_dock()
+            && let Some(dock) = self.sidebar_dock()
         {
             let cell_width = self.cell_width(window);
             let left = f32::from(dock.x) * cell_width;
@@ -7104,7 +7240,8 @@ impl PilusView {
             }
         }
         // The gap ring around the floating card belongs to no pane.
-        let layout = self.card_layout(window);
+        // Full-bleed has no ring: every point in the card is grid.
+        let layout = self.card_layout(window, self.framed());
         let grid_right = layout.origin_x + f32::from(layout.cols) * layout.cell_w;
         let grid_bottom = layout.origin_y + f32::from(layout.rows) * layout.cell_h;
         if x < layout.origin_x || y < layout.origin_y || x >= grid_right || y >= grid_bottom {
@@ -7118,7 +7255,7 @@ impl PilusView {
             Some(frame) if frame.width > 0 && frame.height > 0 => (frame.width, frame.height),
             _ => return None,
         };
-        let layout = self.card_layout(window);
+        let layout = self.card_layout(window, self.framed());
         let skip = u32::from(self.skipped_cols());
         let paint_w = u32::from(layout.cols).min(u32::from(width).saturating_sub(skip));
         let paint_h = u32::from(layout.rows).min(u32::from(height).saturating_sub(
@@ -7414,7 +7551,7 @@ impl PilusView {
 
     /// Select the whole visible grid, so Cmd+A followed by Cmd+C copies it.
     fn select_all(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let layout = self.card_layout(window);
+        let layout = self.card_layout(window, self.framed());
         let skip = self.skipped_cols();
         self.selection = Some(Selection {
             anchor: Cell {
@@ -8342,23 +8479,27 @@ impl PilusView {
     /// catalog, so the panel is native while staying column-aligned with the
     /// terminal grid behind it.
     fn sidebar(&self, cx: &mut Context<Self>, cell_width: f32, bottom: f32) -> Div {
-        if !self.sidebar_visible {
+        if !self.sidebar_visible && self.sidebar_anim.is_none() {
             return div();
         }
-        let Some(dock) = self.surface.shell_dock() else {
+        let Some(dock) = self.sidebar_dock() else {
             return div();
         };
         let theme = self.theme;
+        let panel_w = f32::from(dock.width) * cell_width;
 
         // The scroll container stays a plain block. Making it a flex column
         // lets its children shrink to fit, which squeezes the nav rows; the
         // inner content carries the flex layout so it overflows and scrolls.
         // It insets by `SIDEBAR_ROW_EDGE` only, so every row is one hair off
-        // the panel edge and insets its own content from there.
+        // the panel edge and insets its own content from there. It keeps the
+        // full panel width while the panel tweens, so rows clip instead of
+        // reflowing mid-slide.
         let mut content = div()
             .flex()
             .flex_col()
             .gap_1()
+            .w(px(panel_w))
             .px(px(SIDEBAR_ROW_EDGE))
             .pt(px(SIDEBAR_TOP_INSET))
             .pb(px(SIDEBAR_LIST_PAD));
@@ -8385,20 +8526,37 @@ impl PilusView {
         // The panel starts on row 0, covering the daemon's `« session Menu`
         // chrome so the sidebar shows only native sections, and runs the
         // full viewport height.
-        div()
+        let mut panel = div()
             .absolute()
             .left(px(f32::from(dock.x) * cell_width))
             .top(px(0.0))
-            .w(px(f32::from(dock.width) * cell_width))
+            .w(px(panel_w * self.sidebar_open))
             .h(px(bottom))
             .flex()
             .flex_col()
-            .bg(theme.window_bg)
+            .bg(theme.window_bg.opacity(self.settings.glass_opacity()))
             .overflow_hidden()
             // Fixed clearance for the floating traffic lights; the sections
             // scroll under it instead of disappearing beneath the titlebar.
-            .child(div().h(px(40.0)).flex_shrink_0())
-            .child(list)
+            // The collapse toggle pins to its right edge, clear of the lights.
+            .child(
+                div()
+                    .h(px(40.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .pr(px(8.0))
+                    .child(self.sidebar_toggle(cx)),
+            )
+            .child(list);
+        // A translucent sidebar parts from the terminal with the inset
+        // hairline; the opaque one meets it seamlessly.
+        if !self.framed() {
+            panel = panel.border_r_1().border_color(terminal_inset_border());
+        }
+        panel
     }
 
     /// Focus a workspace tab.
@@ -8509,19 +8667,44 @@ impl PilusView {
         }
     }
 
-    /// The native tab strip, full window width: sidebar toggle, session picker,
-    /// terminal tabs, and the new-tab action.
+    /// The native tab strip: session picker, terminal tabs, and the new-tab
+    /// action, with the sidebar toggle parked at its head while the sidebar
+    /// is hidden.
+    /// The sidebar collapse/expand button: pinned to the sidebar's top
+    /// clearance while it is open, floating at the strip's head while it is
+    /// hidden so the sidebar can always come back.
+    fn sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let glass = self.settings.glass_opacity();
+        div()
+            .id("pilus-sidebar-toggle")
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .h(px(TAB_HEIGHT))
+            .w(px(28.0))
+            .rounded_md()
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.panel.opacity(glass)))
+            .child(icon(
+                include_bytes!("../../assets/icons/panel-left.svg"),
+                14.0,
+                theme.muted,
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_sidebar(cx);
+            }))
+    }
+
     fn top_chrome(&self, cx: &mut Context<Self>, cell_width: f32, fullscreen: bool) -> Div {
         let theme = self.theme;
+        let glass = self.settings.glass_opacity();
         // Beside the sidebar when it is open; full width when it is hidden.
         // The left inset only clears the floating traffic lights, which
         // fullscreen hides, so the strip runs to the edge there.
-        let left = f32::from(self.sidebar_cells()) * cell_width;
-        let pad = if self.sidebar_visible || fullscreen {
-            TAB_STRIP_EDGE
-        } else {
-            TRAFFIC_LIGHT_CLEARANCE
-        };
+        let left = self.sidebar_px(cell_width);
+        let pad = self.strip_pad(fullscreen);
         let mut tabs = div()
             .id("pilus-tabs-scroll")
             .flex()
@@ -8548,33 +8731,17 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.muted)
-            .hover(|style| style.text_color(theme.panel_fg).bg(theme.panel))
+            .hover(move |style| {
+                style
+                    .text_color(theme.panel_fg)
+                    .bg(theme.panel.opacity(glass))
+            })
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
                 13.0,
                 theme.muted,
             ))
             .on_click(cx.listener(|this, _, _, _| this.new_tab()));
-        let toggle = div()
-            .id("pilus-sidebar-toggle")
-            .flex()
-            .items_center()
-            .justify_center()
-            .flex_shrink_0()
-            .h(px(TAB_HEIGHT))
-            .w(px(28.0))
-            .rounded_md()
-            .cursor_pointer()
-            .hover(|style| style.bg(theme.panel))
-            .child(icon(
-                include_bytes!("../../assets/icons/panel-left.svg"),
-                14.0,
-                theme.muted,
-            ))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.toggle_sidebar();
-                cx.notify();
-            }));
         let mut tab_strip = div()
             .flex()
             .flex_row()
@@ -8582,9 +8749,13 @@ impl PilusView {
             .gap_1()
             .h(px(TAB_STRIP_HEIGHT))
             .pl(px(pad))
-            .pr(px(8.0))
-            .child(toggle)
-            .child(self.session_picker(cx).flex_shrink_0());
+            .pr(px(8.0));
+        // The toggle lives in the sidebar while it is open; only a settled
+        // hidden sidebar parks it at the strip's head.
+        if !self.sidebar_visible && self.sidebar_anim.is_none() {
+            tab_strip = tab_strip.child(self.sidebar_toggle(cx));
+        }
+        tab_strip = tab_strip.child(self.session_picker(cx).flex_shrink_0());
         // Tabs belong to the terminal surface, so they hide with it while a
         // page owns the card; the session picker stays on every page. The plus
         // follows the tabs until overflow makes the scroll viewport shrink.
@@ -8601,17 +8772,19 @@ impl PilusView {
             .absolute()
             .left(px(left))
             .right(px(0.0))
-            .top(px(4.0))
-            .h(px(TAB_STRIP_HEIGHT))
+            .top(px(0.0))
+            .h(px(HEADER_HEIGHT))
             .flex()
             .flex_col()
-            .bg(theme.window_bg)
+            .justify_center()
+            .bg(theme.window_bg.opacity(glass))
             .border_color(theme.border)
             .child(tab_strip)
     }
 
     fn tab_item(&self, tab: &Tab, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let glass = self.settings.glass_opacity();
         let active = self.tab_active(tab);
         let index = tab.index;
         let close_index = tab.index;
@@ -8676,9 +8849,17 @@ impl PilusView {
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            .bg(if active { theme.panel } else { theme.window_bg })
+            .bg(if active {
+                theme.panel.opacity(glass)
+            } else {
+                theme.panel.opacity(0.0)
+            })
             .text_color(fg)
-            .hover(|style| style.bg(theme.panel).text_color(theme.panel_fg))
+            .hover(move |style| {
+                style
+                    .bg(theme.panel.opacity(glass))
+                    .text_color(theme.panel_fg)
+            })
             .tooltip(tip);
         let mut content = div()
             .flex_1()
@@ -8738,7 +8919,7 @@ impl PilusView {
                         .w(px(8.0))
                         .h(px(8.0))
                         .rounded_full()
-                        .bg(if active { theme.panel } else { theme.window_bg })
+                        .bg(theme.panel.opacity(0.0))
                         .child(indicator),
                 );
             }
@@ -8783,19 +8964,26 @@ impl PilusView {
         }
     }
 
+    /// The dock the sidebar paints against: the live one while the daemon
+    /// reports it, otherwise the last one it reported. Hiding the sidebar
+    /// makes the daemon drop the dock, so a live-only rectangle would vanish
+    /// mid-collapse and snap the panel and terminal shut.
+    fn sidebar_dock(&self) -> Option<ShellDockRect> {
+        self.surface.shell_dock().or(self.last_sidebar_dock)
+    }
+
     /// The sidebar's width in cells, or zero when it is hidden.
     fn sidebar_cells(&self) -> u16 {
-        if self.sidebar_visible {
-            self.surface.shell_dock().map_or(0, |dock| dock.width)
-        } else {
-            0
-        }
+        // Full width regardless of visibility: `sidebar_factor` folds the
+        // collapse tween in at each surface, so all of them glide together.
+        self.sidebar_dock().map_or(0, |dock| dock.width)
     }
 
     /// The session picker in the top tab strip: current session name plus a
     /// chevron, opening the session menu below it.
     fn session_picker(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
+        let glass = self.settings.glass_opacity();
         div()
             .id("pilus-session-button")
             .flex()
@@ -8807,7 +8995,7 @@ impl PilusView {
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            .hover(|style| style.bg(theme.panel))
+            .hover(move |style| style.bg(theme.panel.opacity(glass)))
             .child(
                 div()
                     .text_color(theme.panel_fg)
@@ -8835,12 +9023,8 @@ impl PilusView {
             return div();
         }
         let theme = self.theme;
-        let strip_left = f32::from(self.sidebar_cells()) * cell_width;
-        let pad = if self.sidebar_visible || fullscreen {
-            TAB_STRIP_EDGE
-        } else {
-            TRAFFIC_LIGHT_CLEARANCE
-        };
+        let strip_left = self.sidebar_px(cell_width);
+        let pad = self.strip_pad(fullscreen);
         let menu_left = strip_left + pad + 28.0 + 4.0;
         let mut items = div().flex().flex_col().gap_1();
         for session in &self.sessions {
@@ -9376,9 +9560,14 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
+        let glass = self.settings.glass_opacity();
         let active = self.endpoint_selected(endpoint) && workspace.active;
         let remote = endpoint.machine_id().is_some();
-        let bg = if active { theme.panel } else { theme.window_bg };
+        let bg = if active {
+            theme.panel.opacity(glass)
+        } else {
+            theme.panel.opacity(0.0)
+        };
         let cwd = self.shorten_cwd(&endpoint.key(), &workspace.cwd);
         let mut lines = vec![(format!("Directory: {cwd}"), theme.muted)];
         if let Some(branch) = workspace.branch.clone() {
@@ -9490,7 +9679,7 @@ impl PilusView {
             .rounded_md()
             .bg(bg)
             .cursor_pointer()
-            .hover(|style| style.bg(theme.panel))
+            .hover(move |style| style.bg(theme.panel.opacity(glass)))
             .tooltip(tip)
             .child(head);
         // The path line follows the daemon's Show Path / Hide Path toggle.
@@ -9594,10 +9783,11 @@ impl PilusView {
     /// chosen, so this row toggles the same composer as the Cmd+Shift+N chord.
     fn new_workspace_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let glass = self.settings.glass_opacity();
         let bg = if self.home.is_open() {
-            theme.panel
+            theme.panel.opacity(glass)
         } else {
-            theme.window_bg
+            theme.panel.opacity(0.0)
         };
         div()
             .id("pilus-new-workspace")
@@ -9613,7 +9803,7 @@ impl PilusView {
             .text_size(px(self.chrome_font()))
             .bg(bg)
             .text_color(theme.panel_fg)
-            .hover(|style| style.bg(theme.panel))
+            .hover(move |style| style.bg(theme.panel.opacity(glass)))
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
                 SIDEBAR_GLYPH,
@@ -9637,8 +9827,13 @@ impl PilusView {
     /// One sidebar destination: lucide glyph, label, live badge, chord click.
     fn nav_row(&self, kind: NavKind, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let glass = self.settings.glass_opacity();
         let active = self.nav_active(kind);
-        let bg = if active { theme.panel } else { theme.window_bg };
+        let bg = if active {
+            theme.panel.opacity(glass)
+        } else {
+            theme.panel.opacity(0.0)
+        };
         let badge = match kind {
             NavKind::Automations => Some(self.automations.enabled.to_string()),
             NavKind::Tasks => Some(self.tasks.open.to_string()),
@@ -9669,7 +9864,7 @@ impl PilusView {
             .text_size(px(self.chrome_font()))
             .bg(bg)
             .text_color(theme.panel_fg)
-            .hover(|style| style.bg(theme.panel))
+            .hover(move |style| style.bg(theme.panel.opacity(glass)))
             .child(icon(kind.icon(), SIDEBAR_GLYPH, theme.muted))
             .child(label.child(kind.label().to_string()))
             .child(badge)
@@ -9761,6 +9956,7 @@ impl PilusView {
             add,
         } = spec;
         let theme = self.theme;
+        let glass = self.settings.glass_opacity();
         let header = div()
             .flex()
             .flex_row()
@@ -9816,7 +10012,7 @@ impl PilusView {
                 .w(px(SIDEBAR_BAND_HEIGHT))
                 .rounded_md()
                 .cursor_pointer()
-                .hover(|style| style.bg(theme.panel))
+                .hover(move |style| style.bg(theme.panel.opacity(glass)))
                 .child(icon(
                     include_bytes!("../../assets/icons/plus.svg"),
                     11.0,
@@ -9833,6 +10029,7 @@ impl PilusView {
     /// One project row with its grouped workspaces nested beneath it.
     fn project_row(&self, project: &Project, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
+        let glass = self.settings.glass_opacity();
         let collapsed = self.project_collapsed.contains(&project.id);
         let active = self.project_active(project);
         let host = self.project_host_label(project);
@@ -9866,9 +10063,13 @@ impl PilusView {
             .pl(px(SIDEBAR_ROW_PAD))
             .pr(px(SIDEBAR_ROW_PAD))
             .rounded_md()
-            .bg(if active { theme.panel } else { theme.window_bg })
+            .bg(if active {
+                theme.panel.opacity(glass)
+            } else {
+                theme.panel.opacity(0.0)
+            })
             .cursor_pointer()
-            .hover(|style| style.bg(theme.panel))
+            .hover(move |style| style.bg(theme.panel.opacity(glass)))
             // A plain square marks the project; hovering the row swaps in
             // the collapse chevron, so the affordance appears on demand.
             .child(
@@ -9942,7 +10143,7 @@ impl PilusView {
             .pr(px(SIDEBAR_ROW_PAD))
             .rounded_md()
             .cursor_pointer()
-            .hover(|style| style.bg(theme.panel))
+            .hover(move |style| style.bg(theme.panel.opacity(glass)))
             .child(
                 div()
                     .min_w_0()
@@ -10397,13 +10598,14 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
+        let glass = self.settings.glass_opacity();
         let focused = self.agent_focused(endpoint, agent);
         // The focused row borrows the workspace/worktree pill, so a selected
         // agent reads like a selected workspace instead of a text selection.
         let bg = if focused {
-            theme.panel
+            theme.panel.opacity(glass)
         } else {
-            theme.window_bg
+            theme.panel.opacity(0.0)
         };
         let fg = theme.panel_fg;
         let dim = theme.muted;
@@ -10444,7 +10646,7 @@ impl PilusView {
             .rounded_md()
             .bg(bg)
             .cursor_pointer()
-            .hover(|style| style.bg(theme.panel))
+            .hover(move |style| style.bg(theme.panel.opacity(glass)))
             .tooltip(tip)
             .child(
                 div()
@@ -10542,41 +10744,89 @@ impl PilusView {
     /// The card floats below the tab strip with a gap on top, right, and
     /// bottom, starting past the sidebar. The grid keeps a border on every
     /// side.
-    fn card_layout(&mut self, window: &Window) -> CardLayout {
+    fn card_layout(&mut self, window: &Window, framed: bool) -> CardLayout {
         let cell_w = self.cell_width(window);
         let cell_h = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
         let viewport = window.viewport_size();
-        let card_x = f32::from(self.sidebar_cells()) * cell_w + CARD_GAP;
+        // A translucent terminal drops the inset card and runs to the window
+        // edges; the opaque one keeps its gaps, hairline, and rounding.
+        let gap_left = if framed { CARD_GAP } else { 0.0 };
+        let gap_top = if framed { CARD_GAP_TOP } else { 0.0 };
+        let gap_right = if framed { CARD_GAP_RIGHT } else { 0.0 };
+        let gap_bottom = if framed { CARD_GAP } else { 0.0 };
+        let border = if framed { 1.0 } else { 0.0 };
+        let card_x = self.sidebar_px(cell_w) + gap_left;
         // The card's inner box: inside the hairline border, before the grid's
         // own breathing room.
-        let inner_w = f32::from(viewport.width) - card_x - CARD_GAP_RIGHT - 2.0;
-        let inner_h = f32::from(viewport.height) - HEADER_HEIGHT - CARD_GAP_TOP - CARD_GAP - 2.0;
-        let cols = ((inner_w - 2.0 * TERMINAL_PAD) / cell_w).clamp(20.0, 500.0) as u16;
-        let rows = ((inner_h - 2.0 * TERMINAL_PAD) / cell_h).clamp(5.0, 300.0) as u16;
-        // Center the whole-cell grid in the inner box so opposite gaps match;
-        // the sub-cell remainder splits instead of pooling on the right and
-        // bottom. Every gap is at least `TERMINAL_PAD` by construction.
-        let pad_x = ((inner_w - f32::from(cols) * cell_w) / 2.0).max(0.0);
-        let pad_y = ((inner_h - f32::from(rows) * cell_h) / 2.0).max(0.0);
+        let inner_w = f32::from(viewport.width) - card_x - gap_right - 2.0 * border;
+        let inner_h =
+            f32::from(viewport.height) - HEADER_HEIGHT - gap_top - gap_bottom - 2.0 * border;
+        // The framed card reserves breathing room around the grid; full-bleed
+        // spends every pixel on cells instead.
+        let breathing = if framed { TERMINAL_PAD } else { 0.0 };
+        let cols = ((inner_w - 2.0 * breathing) / cell_w).clamp(20.0, 500.0) as u16;
+        let rows = ((inner_h - 2.0 * breathing) / cell_h).clamp(5.0, 300.0) as u16;
+        // The framed card centers the whole-cell grid so opposite gaps match
+        // and every gap is at least `TERMINAL_PAD`; full-bleed pins the grid
+        // to the top-left instead, so the terminal truly reaches the edges.
+        let pad_x = if framed {
+            ((inner_w - f32::from(cols) * cell_w) / 2.0).max(0.0)
+        } else {
+            0.0
+        };
+        let pad_y = if framed {
+            ((inner_h - f32::from(rows) * cell_h) / 2.0).max(0.0)
+        } else {
+            0.0
+        };
+        // Full-bleed pools the leftover fraction at the far edges; the grid
+        // extends its edge colors over it below.
+        let slack_x = if framed {
+            0.0
+        } else {
+            (inner_w - f32::from(cols) * cell_w).max(0.0)
+        };
+        let slack_y = if framed {
+            0.0
+        } else {
+            (inner_h - f32::from(rows) * cell_h).max(0.0)
+        };
         CardLayout {
             card_x,
+            card_top: gap_top,
+            card_right: gap_right,
+            card_bottom: gap_bottom,
             pad_x,
             pad_y,
-            origin_x: card_x + 1.0 + pad_x,
-            origin_y: HEADER_HEIGHT + CARD_GAP_TOP + 1.0 + pad_y,
+            origin_x: card_x + border + pad_x,
+            origin_y: HEADER_HEIGHT + gap_top + border + pad_y,
             cols,
             rows,
             cell_w,
             cell_h,
+            slack_x,
+            slack_y,
         }
+    }
+
+    /// Whether the terminal keeps its floating inset card: only the opaque
+    /// window frames the grid, so any translucency runs full-bleed.
+    fn framed(&self) -> bool {
+        self.settings.glass_opacity() >= 1.0
     }
 
     /// Recompute the cell grid size and tell the daemon when it changes.
     ///
-    /// The viewport is whatever fits inside the floating card; planning with
-    /// anything else lays out columns the card clips off.
+    /// The viewport is whatever fits inside the card (or the full-bleed
+    /// terminal); planning with anything else lays out columns the card
+    /// clips off. While the sidebar tweens, resizes throttle to a gentle
+    /// cadence so the daemon tracks the flight without a per-frame storm.
     fn sync_metrics(&mut self, window: &Window) {
-        let layout = self.card_layout(window);
+        if self.sidebar_anim.is_some() && self.last_resize_sent.elapsed() < SIDEBAR_RESIZE_THROTTLE
+        {
+            return;
+        }
+        let layout = self.card_layout(window, self.framed());
         // The daemon lays out its whole chrome (docks included); we only show
         // the pane area, so the skipped rows and columns ride along.
         let cols = layout.cols.saturating_add(self.skipped_cols());
@@ -10594,6 +10844,7 @@ impl PilusView {
         self.cols = cols;
         self.rows = rows;
         self.sent_cell = cell;
+        self.last_resize_sent = Instant::now();
         let resize = ClientMessage::Resize {
             cols,
             rows,
@@ -10622,39 +10873,77 @@ fn tab_exists(tabs: &[Tab], index: u16) -> bool {
 impl Render for PilusView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window_active = window.is_window_active();
+        // Remember the open dock so the collapse tween still has a width to
+        // fold from once the daemon drops it in response to our hide message.
+        if let Some(dock) = self.surface.shell_dock() {
+            self.last_sidebar_dock = Some(dock);
+        }
+        // One tween sample per frame: every edge below reads `sidebar_open`,
+        // so the panel, tab strip, and card stay flush while the sidebar flies.
+        self.sidebar_open = self.sidebar_factor();
         self.sync_metrics(window);
         self.sync_home();
         self.sync_focus(window, cx);
 
         let theme = self.theme;
+        let glass = self.settings.glass_opacity();
+        let framed = self.framed();
+        // The OS blur radius is fixed; the slider veils it with frost, and
+        // an explicit zero drops the blur view so the desktop shows sharp.
+        // The appearance only flips when the setting crosses zero.
+        let blur = self.settings.blur.clamp(0.0, 1.0);
+        let sharp = blur <= 0.0;
+        if self.applied_sharp != Some(sharp) {
+            window.set_background_appearance(if sharp {
+                WindowBackgroundAppearance::Transparent
+            } else {
+                WindowBackgroundAppearance::Blurred
+            });
+            self.applied_sharp = Some(sharp);
+        }
+        // A handler-less veil behind everything: it never intercepts clicks.
+        // The framed card floats with a gap on every side, and that gap must
+        // read as window base — the root is transparent so a translucent
+        // window can show the blur, which would otherwise leak the desktop
+        // through the margins. Only the translucent window leans on the veil.
+        let backdrop = if framed { 1.0 } else { frost_opacity(blur) };
+        let frost = div()
+            .absolute()
+            .inset_0()
+            .bg(theme.window_bg.opacity(backdrop));
         let cell_height = self.settings.terminal_font_size * LINE_HEIGHT_RATIO;
         let cell_width = self.cell_width(window);
-        let layout = self.card_layout(window);
+        let layout = self.card_layout(window, framed);
         let line_height = px(cell_height);
         let selection = self.selection;
-        // A vendored theme names the pane background directly, so the card's
-        // padding matches the grid by construction. Otherwise fall back to the
-        // dominant cell color the running app paints over the daemon base.
-        let terminal_bg = if scheme::builtin(&self.appearance.active).is_some() {
-            theme.bg
-        } else {
-            self.surface
-                .frame()
-                .map(|frame| {
-                    terminal_background(
-                        frame,
-                        self.skipped_cols(),
-                        layout.cols,
-                        layout.rows,
-                        theme.bg,
-                        &theme.ansi,
-                    )
-                })
-                .unwrap_or(theme.bg)
-        };
+        // The terminal shares the sidebar's background: one uniform base
+        // under the grid, the card, and the chrome, whatever the running app
+        // paints. Voting the dominant cell color made the padding track the
+        // app instead, so a green TUI left a green frame around an ink grid.
+        let terminal_bg = theme.window_bg;
         let grid_theme = Theme {
             bg: terminal_bg,
             ..theme
+        };
+        // One glass layer exactly: full-bleed has no padding and its edge
+        // fillers seal every pixel, so when the frame seals the card the
+        // cells carry the opacity and the card stays clear — otherwise two
+        // stacked layers would read near-solid instead of the setting. A
+        // frame the daemon has not caught up with leaves holes, so the card
+        // backs those (and the framed card's pad ring) until the next frame
+        // seals them.
+        let sealed = match self.surface.frame() {
+            Some(frame) => {
+                frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS)
+                    >= SKIPPED_DAEMON_ROWS.saturating_add(layout.rows)
+                    && frame.width.saturating_sub(self.skipped_cols()) >= layout.cols
+            }
+            None => false,
+        };
+        let card_bg = if sealed && !framed {
+            terminal_bg.opacity(0.0)
+        } else {
+            terminal_bg.opacity(glass)
         };
         let grid = match self.surface.frame() {
             Some(frame) => render_grid(
@@ -10668,6 +10957,9 @@ impl Render for PilusView {
                 self.skipped_cols(),
                 layout.cols,
                 layout.rows,
+                glass,
+                layout.slack_x,
+                layout.slack_y,
             ),
             None => div()
                 .flex()
@@ -10729,8 +11021,9 @@ impl Render for PilusView {
         let sidebar = self.sidebar(cx, cell_width, f32::from(window.viewport_size().height));
         let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
 
-        // The unified top chrome paints over this row; the spacer only keeps
-        // the grid and the pointer mapping anchored at HEADER_HEIGHT.
+        // A bare spacer: the sidebar, tab strip, and card each paint their
+        // own background, so the root stays transparent and no chrome layer
+        // ever double-darkens another.
         let header = div().h(px(HEADER_HEIGHT)).flex_shrink_0();
 
         let mut root = div()
@@ -10739,7 +11032,6 @@ impl Render for PilusView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(theme.window_bg)
             .text_color(theme.fg)
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -10770,8 +11062,7 @@ impl Render for PilusView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
-                this.toggle_sidebar();
-                cx.notify();
+                this.toggle_sidebar(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
                 // The chord toggles, so pressing it again dismisses.
@@ -10821,30 +11112,35 @@ impl Render for PilusView {
         // both.
         root = apply_chrome_font(root, &self.shared_settings);
 
-        root.child(header)
-            .child(
-                div().relative().flex_1().child(
-                    div()
-                        .absolute()
-                        .left(px(layout.card_x))
-                        // Content already starts below the header spacer, so the
-                        // top is just the gap (counting HEADER_HEIGHT twice
-                        // pushes the whole grid down and clips its bottom).
-                        .top(px(CARD_GAP_TOP))
-                        .right(px(CARD_GAP_RIGHT))
-                        // Fixed bottom: any floor slack stays inside the card
-                        // on the grid's own background, invisible.
-                        .bottom(px(CARD_GAP))
-                        .flex()
-                        .flex_col()
-                        .bg(terminal_bg)
+        root.child(frost)
+            .child(header)
+            .child(div().relative().flex_1().child({
+                let mut card = div()
+                    .absolute()
+                    .left(px(layout.card_x))
+                    // Content already starts below the header spacer, so the
+                    // top is just the gap (counting HEADER_HEIGHT twice
+                    // pushes the whole grid down and clips its bottom).
+                    .top(px(layout.card_top))
+                    .right(px(layout.card_right))
+                    // Fixed bottom: any floor slack stays inside the card
+                    // on the grid's own background, invisible.
+                    .bottom(px(layout.card_bottom))
+                    .flex()
+                    .flex_col()
+                    .bg(card_bg)
+                    .overflow_hidden();
+                // The opaque window keeps the floating card's hairline
+                // and rounding; a translucent terminal runs frameless to
+                // the window edges.
+                if framed {
+                    card = card
                         .border_1()
                         .border_color(terminal_inset_border())
-                        .rounded_md()
-                        .overflow_hidden()
-                        .child(self.card_content(cx, grid, layout.pad_x, layout.pad_y)),
-                ),
-            )
+                        .rounded_md();
+                }
+                card.child(self.card_content(cx, grid, layout.pad_x, layout.pad_y))
+            }))
             // Chrome layers live at the root so they paint above the content
             // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
@@ -10872,6 +11168,9 @@ fn render_grid(
     skip_cols: u16,
     max_cols: u16,
     max_rows: u16,
+    glass: f32,
+    slack_x: f32,
+    slack_y: f32,
 ) -> Div {
     let end_row = SKIPPED_DAEMON_ROWS
         .saturating_add(max_rows)
@@ -10889,6 +11188,24 @@ fn render_grid(
             cell_width,
             skip_cols,
             max_cols,
+            glass,
+            slack_x,
+        ));
+    }
+    // Full-bleed pools the sub-cell remainder below the last row; extend
+    // that row's colors over it so no card-colored sliver shows.
+    if slack_y > 0.5 && end_row > SKIPPED_DAEMON_ROWS {
+        column = column.child(bottom_fill(
+            frame,
+            end_row - 1,
+            theme,
+            selection,
+            cell_width,
+            skip_cols,
+            max_cols,
+            slack_x,
+            slack_y,
+            glass,
         ));
     }
     column
@@ -10907,6 +11224,8 @@ fn render_row(
     cell_width: f32,
     skip_cols: u16,
     max_cols: u16,
+    glass: f32,
+    slack_x: f32,
 ) -> Div {
     let width = usize::from(frame.width);
     let skip = usize::from(skip_cols).min(width);
@@ -10959,7 +11278,7 @@ fn render_row(
             .font_family(font_family)
             .text_size(px(font_size))
             .line_height(line_height)
-            .bg(bg)
+            .bg(bg.opacity(glass))
             .text_color(fg)
             .child(text);
         if mods & M_BOLD != 0 {
@@ -10973,7 +11292,132 @@ fn render_row(
         }
         element = element.child(span);
     }
+    // Full-bleed pools the sub-cell remainder at the row's right edge;
+    // extend the last background over it so no card-colored sliver shows.
+    if slack_x > 0.5 {
+        let edge_bg = match rendered.last() {
+            Some((column, cell, cursor)) => {
+                let selected = selection.is_some_and(|s| s.contains(*column, row));
+                style_of(cell, theme, *cursor, selected).1
+            }
+            None => theme::resolve(0, theme.bg, &theme.ansi),
+        };
+        element = element.child(
+            div()
+                .absolute()
+                .left(px(paint_w as f32 * cell_width))
+                .top(px(0.0))
+                .w(px((f32::from(max_cols) - paint_w as f32).max(0.0)
+                    * cell_width
+                    + slack_x))
+                .h(line_height)
+                .bg(edge_bg.opacity(glass)),
+        );
+    }
     element
+}
+
+/// A background-only strip continuing one row's colors to the container's
+/// bottom edge: that row's background runs, the last stretched over the
+/// sub-cell remainder. No text paints: glyphs would clip mid-cell.
+#[allow(clippy::too_many_arguments)]
+fn bottom_fill(
+    frame: &FrameData,
+    row: u16,
+    theme: Theme,
+    selection: Option<Selection>,
+    cell_width: f32,
+    skip_cols: u16,
+    max_cols: u16,
+    slack_x: f32,
+    slack_y: f32,
+    glass: f32,
+) -> Div {
+    let spans = bottom_fill_spans(frame, row, theme, selection, skip_cols, max_cols);
+    let mut strip = div()
+        .relative()
+        .flex_shrink_0()
+        .h(px(slack_y))
+        .w(px(f32::from(max_cols) * cell_width + slack_x));
+    for (index, (offset, run_cells, bg)) in spans.iter().enumerate() {
+        // The last span absorbs the unpainted tail (a resize the daemon has
+        // not caught up with) plus the remainder, so the strip always
+        // reaches the container edge.
+        let extra = if index + 1 == spans.len() {
+            (f32::from(max_cols) - f32::from(offset.saturating_add(*run_cells))).max(0.0)
+                * cell_width
+                + slack_x
+        } else {
+            0.0
+        };
+        strip = strip.child(
+            div()
+                .absolute()
+                .left(px(f32::from(*offset) * cell_width))
+                .top(px(0.0))
+                .w(px(f32::from(*run_cells) * cell_width + extra))
+                .h_full()
+                .bg(bg.opacity(glass)),
+        );
+    }
+    strip
+}
+
+/// Group one row's painted cells into `(offset, width, background)` runs for
+/// the bottom filler strip. Like [`collect_runs`] but background-only: glyph
+/// flow is irrelevant when no text paints.
+fn bottom_fill_spans(
+    frame: &FrameData,
+    row: u16,
+    theme: Theme,
+    selection: Option<Selection>,
+    skip_cols: u16,
+    max_cols: u16,
+) -> Vec<(u16, u16, gpui::Rgba)> {
+    let width = usize::from(frame.width);
+    let skip = usize::from(skip_cols).min(width);
+    let paint_w = (width.saturating_sub(skip)).min(usize::from(max_cols));
+    let start = usize::from(row) * width + skip;
+    let cells = frame
+        .cells
+        .get(start..start.saturating_add(paint_w))
+        .unwrap_or(&[]);
+    let mut spans = Vec::new();
+    let mut index = 0usize;
+    while index < cells.len() {
+        let column = skip_cols.saturating_add(index as u16);
+        let selected = selection.is_some_and(|s| s.contains(column, row));
+        let bg = style_of(
+            &cells[index],
+            theme,
+            cursor_at(frame, column, row),
+            selected,
+        )
+        .1;
+        let mut next = index + 1;
+        while next < cells.len() {
+            let column = skip_cols.saturating_add(next as u16);
+            let selected = selection.is_some_and(|s| s.contains(column, row));
+            if style_of(&cells[next], theme, cursor_at(frame, column, row), selected).1 != bg {
+                break;
+            }
+            next += 1;
+        }
+        spans.push((index as u16, (next - index) as u16, bg));
+        index = next;
+    }
+    spans
+}
+
+/// Ease-in-out cubic for the sidebar tween: gentle departure and landing
+/// with peak velocity mid-flight, so the glide reads as smooth motion
+/// instead of a snap.
+fn ease_in_out_cubic(step: f32) -> f32 {
+    if step < 0.5 {
+        4.0 * step.powi(3)
+    } else {
+        1.0 - (-2.0 * step + 2.0).powi(3) / 2.0
+    }
 }
 
 /// Whether `symbol` can safely flow inside a multi-cell shaped run.
@@ -11084,6 +11528,17 @@ fn terminal_inset_border() -> gpui::Rgba {
     gpui::rgb(0x24242c)
 }
 
+/// Frost veil over the system blur for `blur` (0.0..=1.0): none at full
+/// blur, strengthening toward [`FROST_MAX`] as blur drops, and none again
+/// at an explicit zero where the window drops the blur view instead.
+fn frost_opacity(blur: f32) -> f32 {
+    if blur <= 0.0 {
+        0.0
+    } else {
+        (1.0 - blur.clamp(0.0, 1.0)) * FROST_MAX
+    }
+}
+
 /// Apply the user's Interface font family and base size to a window root, so
 /// every native surface starts from the same chrome type.
 fn apply_chrome_font<T: Styled>(root: T, settings: &Rc<RefCell<Settings>>) -> T {
@@ -11101,74 +11556,6 @@ fn symbol(cell: &CellData) -> &str {
     } else {
         cell.symbol.as_str()
     }
-}
-
-/// The terminal's own background: the most common resolved cell color over
-/// the visible pane. The card's padding uses it so the blank frame blends with
-/// the running app's surface instead of the daemon's base color.
-fn terminal_background(
-    frame: &FrameData,
-    skip_cols: u16,
-    max_cols: u16,
-    max_rows: u16,
-    fallback: gpui::Rgba,
-    ansi: &[gpui::Rgba; 16],
-) -> gpui::Rgba {
-    use std::collections::HashMap;
-    // TUI screens use a handful of backgrounds, so count the first few with a
-    // cheap linear scan and only fall back to a map for truecolor-heavy ones.
-    const DISTINCT_LIMIT: usize = 32;
-    let width = usize::from(frame.width);
-    let skip = usize::from(skip_cols).min(width);
-    let first_row = usize::from(SKIPPED_DAEMON_ROWS);
-    let last_row = first_row
-        .saturating_add(usize::from(max_rows))
-        .min(usize::from(frame.height).saturating_sub(usize::from(SKIPPED_DAEMON_BOTTOM_ROWS)));
-
-    // Vote on *resolved* colors, not packed wire values: the same visible
-    // color arrives as a palette index in one cell and an sRGB triple in
-    // another, and splitting those votes is what lets the gap pick a wrong
-    // winner when the surface is black.
-    let mut small: Vec<(u32, usize, gpui::Rgba)> = Vec::new();
-    let mut wide: Option<HashMap<u32, (usize, gpui::Rgba)>> = None;
-    for row in first_row..last_row {
-        let start = row * width + skip;
-        let end = (start + usize::from(max_cols)).min((row + 1) * width);
-        for cell in frame.cells.get(start..end).unwrap_or(&[]) {
-            let color = theme::resolve(cell.bg, fallback, ansi);
-            let key = color_key(color);
-            if let Some(map) = wide.as_mut() {
-                map.entry(key).or_insert((0, color)).0 += 1;
-            } else if let Some(entry) = small.iter_mut().find(|(k, _, _)| *k == key) {
-                entry.1 += 1;
-            } else if small.len() < DISTINCT_LIMIT {
-                small.push((key, 1, color));
-            } else {
-                let mut map: HashMap<u32, (usize, gpui::Rgba)> = small
-                    .drain(..)
-                    .map(|(k, count, color)| (k, (count, color)))
-                    .collect();
-                map.entry(key).or_insert((0, color)).0 += 1;
-                wide = Some(map);
-            }
-        }
-    }
-
-    let winner = match wide {
-        Some(map) => map.into_values().max_by_key(|(count, _)| *count),
-        None => small
-            .into_iter()
-            .map(|(_, count, color)| (count, color))
-            .max_by_key(|(count, _)| *count),
-    };
-    winner.map(|(_, color)| color).unwrap_or(fallback)
-}
-
-/// Canonical sRGB key for a resolved color, so equal colors that arrive under
-/// different wire encodings (palette index, sRGB, reset) vote as one.
-fn color_key(color: gpui::Rgba) -> u32 {
-    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
-    (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b)
 }
 
 /// Bounded exponential backoff with jitter for a machine reconnect.
@@ -11799,6 +12186,45 @@ mod tests {
     }
 
     #[test]
+    fn ease_in_out_cubic_glides_through_the_middle() {
+        assert_eq!(ease_in_out_cubic(0.0), 0.0);
+        assert_eq!(ease_in_out_cubic(1.0), 1.0);
+        // Symmetric: halfway through time means halfway through travel,
+        // unlike an ease-out that spends itself up front.
+        assert!((ease_in_out_cubic(0.5) - 0.5).abs() < 0.01);
+        assert!(ease_in_out_cubic(0.25) < 0.25);
+    }
+
+    #[test]
+    fn frost_opacity_veils_as_blur_drops() {
+        assert_eq!(frost_opacity(1.0), 0.0);
+        assert_eq!(frost_opacity(0.0), 0.0);
+        assert_eq!(frost_opacity(0.5), FROST_MAX / 2.0);
+        assert_eq!(frost_opacity(2.0), 0.0);
+        assert_eq!(frost_opacity(-1.0), 0.0);
+    }
+
+    #[test]
+    fn bottom_fill_spans_group_by_background() {
+        let theme = Theme::default();
+        let mut frame = FrameData::blank(4, 4, 0, 0);
+        // First visible row: two default cells, then two red ones.
+        frame.cells[2 * 4 + 2].bg = 0x0100_0001;
+        frame.cells[2 * 4 + 3].bg = 0x0100_0001;
+        let spans = bottom_fill_spans(&frame, 2, theme, None, 0, 4);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].0, 0);
+        assert_eq!(spans[0].1, 2);
+        assert_eq!(spans[0].2, theme.bg);
+        assert_eq!(spans[1].0, 2);
+        assert_eq!(spans[1].1, 2);
+        assert_eq!(
+            spans[1].2,
+            theme::resolve(0x0100_0001, theme.bg, &theme.ansi)
+        );
+    }
+
+    #[test]
     fn linked_worktree_path_ignores_sibling_prefixes() {
         let worktrees = [
             WorktreeInfo {
@@ -11909,41 +12335,6 @@ mod tests {
         assert_eq!(mocha_fg, mocha.ansi[1]);
         assert_eq!(latte_fg, latte.ansi[1]);
         assert_ne!(mocha_fg, latte_fg);
-    }
-
-    #[test]
-    fn terminal_background_takes_the_dominant_cell_color() {
-        let theme = Theme::default();
-        let mut frame = FrameData::blank(4, 4, 0, 0);
-        for cell in &mut frame.cells {
-            cell.bg = 0x0218_1825;
-        }
-        frame.cells[0].bg = 0;
-        assert_eq!(
-            terminal_background(&frame, 0, 4, 2, theme.bg, &theme.ansi),
-            theme::resolve(0x0218_1825, theme.bg, &theme.ansi)
-        );
-    }
-
-    #[test]
-    fn terminal_background_merges_equivalent_encodings() {
-        // Pin ANSI black to true black so all three encodings below agree.
-        let mut theme = Theme::default();
-        theme.ansi[0] = gpui::rgb(0);
-        let mut frame = FrameData::blank(4, 4, 0, 0);
-        for cell in &mut frame.cells {
-            cell.bg = 0x021e_1e2e;
-        }
-        // On the visible row, black arrives under three different encodings.
-        // Each bucket is a minority on its own, so only a resolved vote lets
-        // black beat the surface color.
-        frame.cells[2 * 4].bg = 0x0100_0000; // palette 0
-        frame.cells[2 * 4 + 1].bg = 0x0100_0010; // palette 16
-        frame.cells[2 * 4 + 2].bg = 0x0200_0000; // sRGB black
-        assert_eq!(
-            terminal_background(&frame, 0, 4, 2, theme.bg, &theme.ansi),
-            theme::resolve(0x0200_0000, theme.bg, &theme.ansi)
-        );
     }
 
     #[test]

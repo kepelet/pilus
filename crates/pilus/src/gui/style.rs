@@ -8,7 +8,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui::{Div, ElementId, Font, FontWeight, IntoElement, Stateful, div, font, prelude::*, px};
+use gpui::{
+    Context, Div, ElementId, Font, FontWeight, IntoElement, MouseMoveEvent, Render, Stateful, div,
+    font, prelude::*, px,
+};
 
 use crate::settings::{CHROME_FONT, Settings};
 
@@ -24,6 +27,9 @@ pub(super) const TEXT_LABEL: f32 = 11.0;
 pub(super) const CONTROL_HEIGHT: f32 = 28.0;
 /// Compact control height: dense rows and section-header actions.
 pub(super) const CONTROL_HEIGHT_SMALL: f32 = 24.0;
+/// Click/drag zones splitting a slider track, so a press lands on 5% steps
+/// without any coordinate math.
+const SLIDER_SEGMENTS: usize = 20;
 
 /// Scale a design-space chrome size to the user's Interface size.
 pub(super) fn scaled(settings: &Rc<RefCell<Settings>>, design: f32) -> f32 {
@@ -140,6 +146,78 @@ pub(super) fn toggle(id: impl Into<ElementId>, on: bool, theme: Theme) -> Statef
                 .bg(if on { theme.window_bg } else { theme.muted })
                 .ml(px(if on { 18.0 } else { 0.0 })),
         )
+}
+
+/// A horizontal amount slider: a filled track with a knob, reporting 5%
+/// steps. Zones cover the track so both a click and a press-drag land
+/// without coordinate math; `set` stages the value and the caller commits
+/// (e.g. persists) on mouse-up, which it chains onto the returned element.
+pub(super) fn slider<V: Render>(
+    id: &str,
+    value: f32,
+    theme: Theme,
+    cx: &mut Context<V>,
+    set: impl Fn(&mut V, f32, &mut Context<V>) + Clone + 'static,
+) -> Stateful<Div> {
+    let value = value.clamp(0.0, 1.0);
+    // The fill and the remainder split the track by grow factor, so no
+    // percentage widths are needed.
+    let track = div()
+        .relative()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_1()
+        .h(px(6.0))
+        .rounded_full()
+        .bg(theme.panel_dim)
+        .child(
+            div()
+                .h_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .rounded_full()
+                .bg(theme.accent)
+                .flex_grow(value)
+                .child(
+                    div()
+                        .w(px(10.0))
+                        .h(px(10.0))
+                        .rounded_full()
+                        .bg(theme.panel_fg)
+                        .mr(px(2.0)),
+                ),
+        )
+        .child(div().h_full().flex_grow(1.0 - value));
+    let mut zones = div().absolute().inset_0().flex().flex_row();
+    for index in 0..SLIDER_SEGMENTS {
+        let step = (index as f32 + 0.5) / SLIDER_SEGMENTS as f32;
+        let set = set.clone();
+        let drag = set.clone();
+        zones = zones.child(
+            div()
+                .id(format!("{id}-zone-{index}"))
+                .flex_1()
+                .h_full()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| set(this, step, cx)))
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    if event.dragging() {
+                        drag(this, step, cx);
+                    }
+                })),
+        );
+    }
+    div()
+        .id(id.to_string())
+        .flex()
+        .flex_row()
+        .items_center()
+        .h(px(CONTROL_HEIGHT_SMALL))
+        .w_full()
+        .child(track.child(zones))
 }
 
 /// One button at an explicit height and horizontal padding.

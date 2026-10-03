@@ -5,6 +5,8 @@
 mod cli;
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(feature = "gui")]
+mod luvus_update;
 mod settings;
 mod update;
 

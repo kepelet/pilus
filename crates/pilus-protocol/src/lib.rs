@@ -16,7 +16,7 @@ mod frame;
 mod message;
 mod theme;
 
-pub use frame::{CellData, DiffRun, FrameData, FrameDiff, FrameHyperlink};
+pub use frame::{CellData, DiffRun, FrameData, FrameDiff, FrameHyperlink, set_decode_version};
 pub use message::{ClientMessage, ServerMessage, SurfaceInterest};
 pub use theme::{
     MachineFormTheme, ShellDockBlock, ShellDockLayout, ShellDockRect, ShellResize, ShellSidebars,
@@ -31,16 +31,27 @@ use serde::de::DeserializeOwned;
 
 /// The binary client/server protocol revision `pilus` speaks.
 ///
-/// This tracks the **released** daemon: Luvus `v0.14.2` ships protocol 18.
-/// Protocol 19 (on `main`) adds a `FrameData.hyperlinks` field, which is
-/// positional and therefore not wire-compatible with 18. When attaching to a
-/// newer daemon, bump this and add the field back to `FrameData` in the same
-/// position the daemon sends it.
+/// This tracks the **released** daemon: Luvus `v0.14.3` ships protocol 20.
+/// The jump from the previous pin (18, Luvus `v0.14.2`) is exactly:
+///
+/// - `FrameData.hyperlinks: Vec<FrameHyperlink>` inserted between `cells` and
+///   `cursor` (positional, so it breaks the 18 layout);
+/// - `ClientMessage::ClipboardSucceeded { receipt }` appended;
+/// - `ServerMessage::ClipboardTracked { text, receipt }` appended.
 ///
 /// The server decodes `ClientMessage::Hello` before any version check and
 /// answers a mismatch with a `Welcome` carrying an error, so this value is the
-/// single place a client declares its compatibility.
-pub const PROTOCOL_VERSION: u32 = 18;
+/// single place a client declares its compatibility. The handshake tries it
+/// first and reconnects at [`FALLBACK_PROTOCOL_VERSION`] when the daemon
+/// rejects it, so one build attaches to a 0.14.2 or a 0.14.3 daemon.
+pub const PROTOCOL_VERSION: u32 = 20;
+
+/// The previous released protocol revision (Luvus `v0.14.2`), still decoded so
+/// a client can attach to a daemon that has not been updated yet. The wire
+/// difference from [`PROTOCOL_VERSION`] is only the inserted
+/// `FrameData.hyperlinks` field and two appended enum variants, so one build
+/// bridges both revisions by negotiating at the handshake.
+pub const FALLBACK_PROTOCOL_VERSION: u32 = 18;
 
 /// Hard ceiling on a single framed message. A peer that announces a larger
 /// frame is rejected before any allocation proportional to it happens.

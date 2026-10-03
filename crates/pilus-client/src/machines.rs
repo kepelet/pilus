@@ -27,6 +27,8 @@ pub struct MachineInfo {
     pub online: Option<bool>,
     /// Probe round-trip in milliseconds, when measured.
     pub latency_ms: Option<u64>,
+    /// The daemon's reported version from the last probe.
+    pub version: Option<String>,
     /// Verified absolute path to the remote `luvus` binary.
     pub remote_binary: String,
     /// Preferred remote named session; `None` is the remote default.
@@ -88,6 +90,7 @@ impl MachineInfo {
                 .unwrap_or(false),
             online: None,
             latency_ms: None,
+            version: None,
             remote_binary: value
                 .get("remote_binary")
                 .and_then(Value::as_str)
@@ -111,6 +114,8 @@ impl MachineInfo {
 /// This mirrors the reference client: one `ssh -T` process per enabled
 /// machine, carrying the ordinary binary render protocol. The bridge starts
 /// the selected remote session when it is absent and never installs software.
+/// A protocol mismatch rebuilds the SSH bridge at the other supported
+/// revision, so an older remote daemon still attaches.
 pub fn connect_machine(machine: &MachineInfo, cols: u16, rows: u16) -> Result<Connection> {
     let target = machine.ssh_target().ok_or_else(|| {
         Error::Machine(format!(
@@ -118,11 +123,13 @@ pub fn connect_machine(machine: &MachineInfo, cols: u16, rows: u16) -> Result<Co
             machine.id, machine.id
         ))
     })?;
-    let mut command = target.command(&["remote-client-bridge"]);
-    let stream = Stream::spawn(&mut command).map_err(|error| {
-        Error::Machine(format!("could not launch ssh for {}: {error}", machine.id))
-    })?;
-    Connection::open_stream(stream, machine.display().to_string(), cols, rows)
+    let label = machine.display().to_string();
+    Connection::attach_negotiated(&label, cols, rows, || {
+        let mut command = target.command(&["remote-client-bridge"]);
+        Stream::spawn(&mut command).map_err(|error| {
+            Error::Machine(format!("could not launch ssh for {}: {error}", machine.id))
+        })
+    })
 }
 
 /// List profiles under `root` and probe each one's reachability.
@@ -141,12 +148,12 @@ pub fn refresh_machines(root: &Path) -> Vec<MachineInfo> {
         let id = machine.id.clone();
         let local = index == 0;
         std::thread::spawn(move || {
-            let (online, latency_ms) = if local {
+            let (online, latency_ms, version) = if local {
                 probe_local(&root)
             } else {
                 probe_remote(&root, &id)
             };
-            tx.send((index, online, latency_ms)).ok();
+            tx.send((index, online, latency_ms, version)).ok();
         });
     }
     drop(tx);
@@ -156,10 +163,11 @@ pub fn refresh_machines(root: &Path) -> Vec<MachineInfo> {
             break;
         }
         match rx.recv_timeout(remaining) {
-            Ok((index, online, latency_ms)) => {
+            Ok((index, online, latency_ms, version)) => {
                 if let Some(machine) = machines.get_mut(index) {
                     machine.online = Some(online);
                     machine.latency_ms = latency_ms;
+                    machine.version = version;
                 }
             }
             Err(_) => break,
@@ -177,6 +185,7 @@ fn local_machine() -> MachineInfo {
         enabled: true,
         online: None,
         latency_ms: None,
+        version: None,
         remote_binary: String::new(),
         preferred_session: None,
         automatic_provisioning: false,
@@ -199,20 +208,30 @@ fn local_hostname() -> String {
         .unwrap_or_else(|| "this machine".to_string())
 }
 
-/// Time a control round trip on the root's own socket.
-fn probe_local(root: &Path) -> (bool, Option<u64>) {
+/// Time a control round trip on the root's own socket and read its version.
+fn probe_local(root: &Path) -> (bool, Option<u64>, Option<String>) {
     let socket = root.join("luvus.sock");
     let start = std::time::Instant::now();
-    let online = crate::control::ControlClient::connect(&socket)
-        .and_then(|mut client| client.request("tab.list", serde_json::json!({})))
-        .is_ok();
-    (online, online.then(|| start.elapsed().as_millis() as u64))
+    let ping = crate::control::ControlClient::connect(&socket)
+        .and_then(|mut client| client.request("ping", serde_json::json!({})));
+    let online = ping.is_ok();
+    let version = ping.ok().and_then(|value| {
+        value
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    (
+        online,
+        online.then(|| start.elapsed().as_millis() as u64),
+        version,
+    )
 }
 
-/// Time a bounded `machine status` probe over SSH.
-fn probe_remote(root: &Path, id: &str) -> (bool, Option<u64>) {
+/// Time a bounded `machine status` probe over SSH and read its version.
+fn probe_remote(root: &Path, id: &str) -> (bool, Option<u64>, Option<String>) {
     let Some(binary) = crate::discovery::luvus_binary() else {
-        return (false, None);
+        return (false, None, None);
     };
     let start = std::time::Instant::now();
     let output = std::process::Command::new(binary)
@@ -221,19 +240,30 @@ fn probe_remote(root: &Path, id: &str) -> (bool, Option<u64>) {
         .arg(id)
         .env(crate::discovery::HOME_ENV, root)
         .output();
-    let online = match output {
-        Ok(output) if output.status.success() => serde_json::from_slice::<Value>(&output.stdout)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("state")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .is_none_or(|state| state == "online"),
-        _ => false,
+    let value = match output {
+        Ok(output) if output.status.success() => {
+            serde_json::from_slice::<Value>(&output.stdout).ok()
+        }
+        _ => None,
     };
-    (online, online.then(|| start.elapsed().as_millis() as u64))
+    let online = match &value {
+        Some(value) => value
+            .get("state")
+            .and_then(Value::as_str)
+            .is_none_or(|state| state == "online"),
+        None => false,
+    };
+    let version = value
+        .as_ref()
+        .and_then(|value| value.get("probe"))
+        .and_then(|probe| probe.get("version"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (
+        online,
+        online.then(|| start.elapsed().as_millis() as u64),
+        version,
+    )
 }
 
 /// List machine profiles under `root` via the CLI, without probing.

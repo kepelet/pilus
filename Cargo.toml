@@ -36,6 +36,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSB
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Reads the public Luvus release manifest for the daemon update check.
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "json"] }
 tracing = "0.1"
 unicode-segmentation = "1"
 unicode-width = "0.2"

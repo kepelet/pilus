@@ -483,6 +483,9 @@ Selection lives in `gui/selection.rs`: it normalizes a reversed drag, answers
   so they are visible but not client-native.
 - Double-click to select a word, and triple-click to select a line.
 - Named-pipe transport on Windows.
-- Remote install/repair from the window: `pilus` connects with an already
-  provisioned remote binary and tells you to run `luvus machine enable` when
-  one is missing; the machine-create form is not drawn natively yet.
+- Daemon upgrades: **Settings → UPDATES → Luvus daemon** checks
+  `luvus.dev/latest.json` and installs the verified platform archive itself
+  (refusing a package-manager install), then restarts through
+  `luvus server restart`. The Remote Machines window's **Update** button
+  re-provisions a host with `luvus machine enable <id> --install`, and its rows
+  show the remote daemon version from the last probe.

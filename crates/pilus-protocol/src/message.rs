@@ -92,6 +92,12 @@ pub enum ClientMessage {
         /// Nonce echoed in the reply.
         nonce: u64,
     },
+    /// The client installed the clipboard text a `ClipboardTracked` carried.
+    /// The server uses it to confirm the foreground copy with a success toast.
+    ClipboardSucceeded {
+        /// Receipt echoed from the `ClipboardTracked` message.
+        receipt: u64,
+    },
 }
 
 /// How much of a visible surface a display client wants.
@@ -182,5 +188,13 @@ pub enum ServerMessage {
     MachineCatalogChanged {
         /// New revision.
         revision: u64,
+    },
+    /// A foreground clipboard copy that may earn a success toast. The client
+    /// installs `text` and acknowledges with `ClipboardSucceeded { receipt }`.
+    ClipboardTracked {
+        /// Text to install on the client's clipboard.
+        text: String,
+        /// Opaque token echoed in the acknowledgement.
+        receipt: u64,
     },
 }

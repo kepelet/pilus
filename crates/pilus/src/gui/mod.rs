@@ -10402,8 +10402,19 @@ fn ease_in_out_cubic(step: f32) -> f32 {
 /// and clips the tail (a starship prompt loses its branch's last letter and
 /// the version's last digit). Isolate those cells in their own fixed-width
 /// spans so the error cannot accumulate past one glyph.
+///
+/// Box-drawing and block glyphs are the exception: the monospace font carries
+/// them at the base advance, and a border or bar must shape as one run so its
+/// strokes tile across cells instead of being clipped one span at a time.
 fn is_flowable(symbol: &str) -> bool {
-    symbol.is_ascii() && pilus_protocol::symbol_width(symbol) <= 1
+    if pilus_protocol::symbol_width(symbol) > 1 {
+        return false;
+    }
+    symbol.is_ascii()
+        || symbol
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, '\u{2500}'..='\u{259f}'))
 }
 
 /// Group one row's cells into pinned runs sharing one style.
@@ -11352,11 +11363,11 @@ mod tests {
     fn background_runs_merge_across_fallback_glyphs() {
         let theme = Theme::default();
         let mut frame = FrameData::blank(4, 1, 0, 0);
-        // A box-drawing border: every cell shares one background but each glyph
-        // is non-flowable, so the text runs stay one-per-cell while the fill
-        // collapses to a single rect and cannot leave snapped hairline gaps.
+        // A Nerd-Font private-use glyph: each cell stays its own text span for
+        // advance pinning, so the fill must collapse them on its own or its
+        // snapped edges leave hairline gaps.
         for cell in frame.cells.iter_mut() {
-            cell.symbol = "\u{2500}".to_string();
+            cell.symbol = "\u{e0b0}".to_string();
         }
         let rendered: Vec<(u16, &CellData, bool)> = frame
             .cells
@@ -11368,6 +11379,24 @@ mod tests {
         let background = collect_background_runs(frame.width, &rendered, theme, 0, None);
         assert_eq!(background.len(), 1);
         assert_eq!(background[0], (0, 4, theme.bg));
+    }
+
+    #[test]
+    fn box_drawing_glyphs_flow_as_one_run() {
+        let theme = Theme::default();
+        let mut frame = FrameData::blank(4, 1, 0, 0);
+        for cell in frame.cells.iter_mut() {
+            cell.symbol = "\u{2500}".to_string();
+        }
+        let rendered: Vec<(u16, &CellData, bool)> = frame
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| (index as u16, cell, false))
+            .collect();
+        // A border must shape as one run so its strokes tile across cells
+        // instead of being clipped span by span.
+        assert_eq!(collect_runs(frame.width, &rendered, theme, 0, None).len(), 1);
     }
 
     #[test]

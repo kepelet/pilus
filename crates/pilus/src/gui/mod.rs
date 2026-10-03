@@ -53,7 +53,7 @@ use gpui::{
     linear_color_stop, linear_gradient, percentage, point, prelude::*, px, relative, size, svg,
 };
 use gpui_platform::application;
-use gpui_updater_core::UpdateStatus;
+use gpui_updater_core::{Release, UpdateStatus, Version};
 use home::{BaseMode, HomeField, HomeFocus, HomePanel};
 use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
@@ -342,12 +342,12 @@ pub(crate) struct MachineSignal {
 
 /// Open the desktop window and attach to `target`.
 pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
-    // The real viewport is not known until a window exists; the first resize
-    // after the window opens corrects these provisional dimensions.
-    let connection = pilus_client::connect(&target, 120, 40)?;
-    // Claim the workspaces dock before the window paints, so the daemon blanks
-    // its own copy and starts projecting the catalog to us.
-    connection.request_workspace_dock()?;
+    // The window opens before the daemon is attached, so a stopped or
+    // protocol-incompatible daemon cannot stop `pilus` from launching. The
+    // view's local reconnect loop owns the first attach and every retry, and
+    // the empty grid area names the failure. The real viewport is not known
+    // until a window exists; the first resize after the window opens corrects
+    // the provisional dimensions.
     let appearances_socket = api_socket_for_target(&target);
     let config_root = config_dir();
     let pilus_root = pilus_config_dir();
@@ -534,15 +534,7 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                 let signal = machine_signal.clone();
                 let theme = shared_theme.clone();
                 cx.new(move |cx| {
-                    PilusView::new(
-                        target,
-                        connection,
-                        settings.clone(),
-                        signal,
-                        theme,
-                        window,
-                        cx,
-                    )
+                    PilusView::new(target, None, settings.clone(), signal, theme, window, cx)
                 })
             },
         );
@@ -670,8 +662,9 @@ fn frame_reachable(bounds: &Bounds<Pixels>, visible: Bounds<Pixels>) -> bool {
 
 /// Open another pilus window on the same target.
 ///
-/// Connection setup includes a handshake, so it briefly blocks; this only runs
-/// on an explicit File → New Window.
+/// The new window attaches in the background like the first one, so a daemon
+/// that is down or speaks a different protocol still opens a window that
+/// explains the problem and retries.
 fn open_main_window(
     target: ConnectTarget,
     settings: Rc<RefCell<Settings>>,
@@ -679,14 +672,6 @@ fn open_main_window(
     shared_theme: Rc<RefCell<Theme>>,
     cx: &mut App,
 ) {
-    let connection = match pilus_client::connect(&target, 120, 40) {
-        Ok(connection) => connection,
-        Err(error) => {
-            eprintln!("pilus: could not open another window: {error}");
-            return;
-        }
-    };
-    let _ = connection.request_workspace_dock();
     let bounds = WindowBounds::centered(size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
     let opened = cx.open_window(
         WindowOptions {
@@ -703,9 +688,7 @@ fn open_main_window(
         move |window, cx| {
             let signal = machine_signal.clone();
             let theme = shared_theme.clone();
-            cx.new(move |cx| {
-                PilusView::new(target, connection, settings, signal, theme, window, cx)
-            })
+            cx.new(move |cx| PilusView::new(target, None, settings, signal, theme, window, cx))
         },
     );
     if let Err(error) = opened {
@@ -889,7 +872,9 @@ impl EndpointId {
 /// rows render, but they stream no frames and own no input.
 struct Endpoint {
     machine: Option<MachineInfo>,
-    connection: Connection,
+    /// The bridge, or `None` for an endpoint whose link dropped and whose
+    /// reconnect loop has not produced a new one yet.
+    connection: Option<Connection>,
     surface: Surface,
     last_rx: Instant,
     probe_sent: Option<Instant>,
@@ -1053,6 +1038,20 @@ struct MenuOpResult {
     worktree_escalated: Option<DeleteEscalation>,
 }
 
+/// The outcome of one background Luvus daemon operation.
+enum DaemonOutcome {
+    /// A release check finished. `installed` is the binary's version and
+    /// `result` is the newer release, `None` when current, or an error string.
+    Checked {
+        installed: Option<Version>,
+        result: Result<Option<Release>, String>,
+    },
+    /// An install finished; carries the new version and where it landed.
+    Installed { version: Version, path: PathBuf },
+    /// A restart or a failure finished; carries a message for the status line.
+    Message(Result<String, String>),
+}
+
 /// The little modal a context-menu action opens: rename, alias, or branch.
 struct MenuPrompt {
     /// Modal heading, e.g. `Rename workspace`.
@@ -1071,7 +1070,11 @@ const RECONNECT_ATTEMPTS: u32 = 3;
 
 struct PilusView {
     target: ConnectTarget,
-    connection: Connection,
+    /// The active endpoint's bridge, or `None` while the local daemon is
+    /// unreachable. The window opens and keeps rendering without a bridge so
+    /// a stopped or protocol-incompatible daemon cannot abort the launch; the
+    /// reconnect loop owns the first attach and every retry.
+    connection: Option<Connection>,
     surface: Surface,
     theme: Theme,
     /// The app's live palette, shared with the Remote Machines window.
@@ -1185,6 +1188,10 @@ struct PilusView {
     machine_rx: Receiver<Vec<MachineInfo>>,
     /// Sender half for the background machine refresh.
     machine_tx: Sender<Vec<MachineInfo>>,
+    /// Cheap catalog reloads (no probe) from the background `list_machines`.
+    machine_list_rx: Receiver<Vec<MachineInfo>>,
+    /// Sender half for the cheap catalog reload.
+    machine_list_tx: Sender<Vec<MachineInfo>>,
     /// Status lines from background machine mutations (enable/disable/remove).
     machine_op_rx: Receiver<String>,
     /// Sender half for background machine mutation outcomes.
@@ -1315,6 +1322,20 @@ struct PilusView {
     update_feed_input: Entity<TextInput>,
     /// Whether the update feed URL field owns the keyboard.
     update_url_editing: bool,
+    /// Results from background `luvus update` / `server restart` runs.
+    daemon_rx: Receiver<DaemonOutcome>,
+    /// Sender half, handed to each background daemon command.
+    daemon_tx: Sender<DaemonOutcome>,
+    /// Whether a daemon check, update, or restart is running.
+    daemon_busy: bool,
+    /// Result text shown under the daemon controls.
+    daemon_status: String,
+    /// The installed `luvus` binary's version from the last check.
+    daemon_installed: Option<Version>,
+    /// The latest published Luvus version from the last check.
+    daemon_latest: Option<Version>,
+    /// A restart awaiting its second click, because it stops every pane.
+    daemon_restart_pending: bool,
     /// Machine-manager revision signal, shared with the manager window.
     machine_signal: Rc<RefCell<MachineSignal>>,
     /// Last revision this window applied, so a manager mutation reloads once.
@@ -1383,7 +1404,7 @@ struct PilusView {
 impl PilusView {
     fn new(
         target: ConnectTarget,
-        connection: Connection,
+        connection: Option<Connection>,
         shared_settings: Rc<RefCell<Settings>>,
         machine_signal: Rc<RefCell<MachineSignal>>,
         shared_theme: Rc<RefCell<Theme>>,
@@ -1420,8 +1441,10 @@ impl PilusView {
             session_name.as_deref(),
         )));
         let sessions = list_session_infos(&session_root);
-        let machines = list_machines(&session_root);
+        // The machine catalog is loaded off-thread below, so a slow `luvus`
+        // CLI never delays the window opening.
         let (machine_tx, machine_rx) = std::sync::mpsc::channel();
+        let (machine_list_tx, machine_list_rx) = std::sync::mpsc::channel();
         let (machine_op_tx, machine_op_rx) = std::sync::mpsc::channel();
         let (project_repo_tx, project_repo_rx) = std::sync::mpsc::channel();
         let (home_branch_tx, home_branch_rx) = std::sync::mpsc::channel();
@@ -1431,6 +1454,7 @@ impl PilusView {
         let (picker_tx, picker_rx) = std::sync::mpsc::channel();
         let (menu_tx, menu_rx) = std::sync::mpsc::channel();
         let (theme_tx, theme_rx) = std::sync::mpsc::channel();
+        let (daemon_tx, daemon_rx) = std::sync::mpsc::channel();
         let settings = shared_settings.borrow().clone();
         let update_request = UpdateRequest::from_settings(
             &settings.update_channel,
@@ -1563,6 +1587,7 @@ impl PilusView {
         })
         .detach();
 
+        let active_live = connection.is_some();
         let mut view = Self {
             target,
             connection,
@@ -1614,12 +1639,14 @@ impl PilusView {
             agents: Vec::new(),
             automations: AutomationSummary::default(),
             tasks: TaskSummary::default(),
-            machines,
+            machines: Vec::new(),
             last_machine_poll: Instant::now() - Duration::from_secs(11),
             machine_refreshing: false,
             machine_rx,
-            machine_op_rx,
+            machine_list_rx,
             machine_tx,
+            machine_list_tx,
+            machine_op_rx,
             machine_op_tx,
             machine_busy: None,
             connector_status: ConnectorStatus::default(),
@@ -1671,13 +1698,22 @@ impl PilusView {
             auto_connected: HashSet::new(),
             reconnects: HashMap::new(),
             local_reconnect: None,
-            active_live: true,
-            catalog_dirty: false,
+            active_live,
+            // Force the first probe, which also seeds the Local row; the cheap
+            // reload only supplies the saved profiles.
+            catalog_dirty: true,
             updater: updater.clone(),
             last_update_status: UpdateStatus::Idle,
             update_feed,
             update_feed_input,
             update_url_editing: false,
+            daemon_rx,
+            daemon_tx,
+            daemon_busy: false,
+            daemon_status: String::new(),
+            daemon_installed: None,
+            daemon_latest: None,
+            daemon_restart_pending: false,
             machine_signal,
             seen_machine_revision: 0,
             projects,
@@ -1717,6 +1753,14 @@ impl PilusView {
             updater.update(cx, |updater, cx| updater.check(cx));
         }
 
+        // Attach the owner-local daemon in the background, exactly like a
+        // machine bridge, so a handshake rejection lands in the empty-grid
+        // message instead of aborting the launch.
+        if view.connection.is_none() {
+            view.spawn_local_connect();
+        }
+        // Seed the catalog off-thread; the first probe follows once it lands.
+        view.reload_machines();
         // Bridge every enabled machine up front so their workspaces are ready.
         view.auto_connect_machines();
 
@@ -1747,6 +1791,32 @@ impl PilusView {
         .detach();
 
         view
+    }
+
+    /// The active bridge's session name, or an empty label while none is
+    /// attached. The status line and notification title read this, so a
+    /// missing bridge degrades to a bare name instead of failing.
+    fn active_session(&self) -> String {
+        self.connection
+            .as_ref()
+            .map(|connection| connection.identity().session.clone())
+            .unwrap_or_default()
+    }
+
+    /// Send a message to the active bridge when one exists. A missing bridge
+    /// is a no-op: the reconnect loop owns recovery, and every caller already
+    /// ignores send failures.
+    fn send_active(&self, message: ClientMessage) {
+        if let Some(connection) = self.connection.as_ref() {
+            let _ = connection.send(message);
+        }
+    }
+
+    /// Tell the active bridge how much surface we want, when one exists.
+    fn set_active_interest(&self, interest: SurfaceInterest) {
+        if let Some(connection) = self.connection.as_ref() {
+            let _ = connection.set_interest(interest);
+        }
     }
 
     /// Drain pending connection events. Returns whether a repaint is needed.
@@ -1894,42 +1964,27 @@ impl PilusView {
         }
         while let Ok(machines) = self.machine_rx.try_recv() {
             self.machine_refreshing = false;
-            if machines != self.machines {
-                self.machines = machines;
-                // A machine removed from the catalog keeps its connection only
-                // while it is the one on screen; every other bridge closes now.
-                let known: Vec<String> = self.machines.iter().map(|m| m.id.clone()).collect();
-                let active = self.active_machine.as_ref().map(|m| m.id.clone());
-                self.endpoints.retain(|id, _| match id {
-                    EndpointId::Local => true,
-                    EndpointId::Machine(machine) => {
-                        known.iter().any(|known| known == machine)
-                            || active.as_deref() == Some(machine.as_str())
-                    }
-                });
-                // Forget attempts for hosts that are gone or disabled, so
-                // re-enabling one auto-connects again without retrying the rest.
-                let enabled: HashSet<String> = self
-                    .machines
-                    .iter()
-                    .filter(|machine| machine.enabled)
-                    .map(|machine| machine.id.clone())
-                    .collect();
-                self.auto_connected.retain(|id| enabled.contains(id));
-                self.reconnects.retain(|id, _| enabled.contains(id));
-                // A host that answers its probe again can retry at once instead
-                // of waiting out the backoff its last failure earned.
-                for machine in self.machines.iter().filter(|m| m.online == Some(true)) {
-                    if let Some(entry) = self.reconnects.get_mut(&machine.id)
-                        && entry.failures > 0
-                    {
-                        entry.failures = 0;
-                        entry.next_at = Instant::now();
-                    }
-                }
-                self.auto_connect_machines();
-                changed = true;
+            changed |= self.apply_machine_catalog(machines);
+        }
+        while let Ok(mut machines) = self.machine_list_rx.try_recv() {
+            // `list_machines` omits the Local row and reachability; keep both
+            // from the last probe so the section never flickers.
+            if !machines.iter().any(|machine| machine.id == "local")
+                && let Some(local) = self.machines.iter().find(|machine| machine.id == "local")
+            {
+                machines.insert(0, local.clone());
             }
+            for machine in &mut machines {
+                if machine.online.is_none()
+                    && let Some(existing) =
+                        self.machines.iter().find(|known| known.id == machine.id)
+                {
+                    machine.online = existing.online;
+                    machine.latency_ms = existing.latency_ms;
+                    machine.version.clone_from(&existing.version);
+                }
+            }
+            changed |= self.apply_machine_catalog(machines);
         }
         while let Ok(message) = self.machine_op_rx.try_recv() {
             self.machine_busy = None;
@@ -1986,6 +2041,49 @@ impl PilusView {
                 self.apply_appearance();
                 changed = true;
             }
+        }
+        while let Ok(outcome) = self.daemon_rx.try_recv() {
+            self.daemon_busy = false;
+            self.daemon_restart_pending = false;
+            match outcome {
+                DaemonOutcome::Checked { installed, result } => {
+                    let installed_label = installed
+                        .as_ref()
+                        .map_or_else(|| "unknown".to_string(), |version| version.to_string());
+                    self.daemon_installed = installed;
+                    match result {
+                        Ok(Some(release)) => {
+                            self.daemon_status = format!(
+                                "Luvus {} is available (installed {installed_label}).",
+                                release.version
+                            );
+                            self.daemon_latest = Some(release.version);
+                        }
+                        Ok(None) => {
+                            self.daemon_latest = None;
+                            self.daemon_status =
+                                format!("Luvus is up to date ({installed_label}).");
+                        }
+                        Err(error) => {
+                            self.daemon_status = format!("could not check Luvus: {error}");
+                        }
+                    }
+                }
+                DaemonOutcome::Installed { version, path } => {
+                    self.daemon_installed = Some(version.clone());
+                    self.daemon_latest = None;
+                    self.daemon_status = format!(
+                        "Installed Luvus {version} at {}. Restart the daemon to load it.",
+                        path.display()
+                    );
+                }
+                DaemonOutcome::Message(result) => {
+                    self.daemon_status = match result {
+                        Ok(text) | Err(text) => text,
+                    };
+                }
+            }
+            changed = true;
         }
         while let Ok(event) = self.picker_rx.try_recv() {
             match event {
@@ -2154,7 +2252,14 @@ impl PilusView {
     fn poll_active(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         let mut catalog = false;
-        while let Some(event) = self.connection.try_recv() {
+        // Drain into an owned list first: the loop below mutates `self`, so it
+        // must not hold a borrow of `self.connection`.
+        let events: Vec<ClientEvent> = self
+            .connection
+            .as_ref()
+            .map(|connection| std::iter::from_fn(|| connection.try_recv()).collect())
+            .unwrap_or_default();
+        for event in events {
             match event {
                 ClientEvent::Ready { identity, .. } => {
                     self.status = identity.session;
@@ -2178,6 +2283,11 @@ impl PilusView {
                     // ships the text and expects the window to install it.
                     if let Some(text) = self.surface.take_clipboard() {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        // A tracked foreground copy expects an acknowledgement
+                        // so the daemon can confirm it with a success toast.
+                        if let Some(receipt) = self.surface.take_clipboard_receipt() {
+                            self.send_active(ClientMessage::ClipboardSucceeded { receipt });
+                        }
                     }
                     if let Some(url) = self.surface.take_open_url() {
                         cx.open_url(&url);
@@ -2221,7 +2331,8 @@ impl PilusView {
         if !self.settings.notifications || self.window_active {
             return;
         }
-        let title = match self.connection.identity().session.as_str() {
+        let session = self.active_session();
+        let title = match session.as_str() {
             "" => "pilus".to_string(),
             session => format!("pilus · {session}"),
         };
@@ -2231,6 +2342,63 @@ impl PilusView {
             body: SharedString::from(text.to_string()),
             actions: Vec::new(),
         });
+    }
+
+    /// Re-read the machine catalog without probing, off the GUI thread.
+    ///
+    /// `list_machines` shells out to the `luvus` CLI, so it must never run on
+    /// the GUI thread. The result lands through the same channel the probe
+    /// uses, and the next probe tick fills in reachability.
+    fn reload_machines(&mut self) {
+        let root = self.session_root.clone();
+        let tx = self.machine_list_tx.clone();
+        std::thread::spawn(move || {
+            tx.send(list_machines(&root)).ok();
+        });
+    }
+
+    /// Apply a machine catalog and reconcile endpoints, retries, and bridges.
+    ///
+    /// Returns whether anything changed. Shared by the reachability probe and
+    /// the cheap off-thread list so both keep the sidebar consistent.
+    fn apply_machine_catalog(&mut self, machines: Vec<MachineInfo>) -> bool {
+        if machines == self.machines {
+            return false;
+        }
+        self.machines = machines;
+        // A machine removed from the catalog keeps its connection only while it
+        // is the one on screen; every other bridge closes now.
+        let known: Vec<String> = self.machines.iter().map(|m| m.id.clone()).collect();
+        let active = self.active_machine.as_ref().map(|m| m.id.clone());
+        self.endpoints.retain(|id, _| match id {
+            EndpointId::Local => true,
+            EndpointId::Machine(machine) => {
+                known.iter().any(|known| known == machine)
+                    || active.as_deref() == Some(machine.as_str())
+            }
+        });
+        // Forget attempts for hosts that are gone or disabled, so re-enabling
+        // one auto-connects again without retrying the rest.
+        let enabled: HashSet<String> = self
+            .machines
+            .iter()
+            .filter(|machine| machine.enabled)
+            .map(|machine| machine.id.clone())
+            .collect();
+        self.auto_connected.retain(|id| enabled.contains(id));
+        self.reconnects.retain(|id, _| enabled.contains(id));
+        // A host that answers its probe again can retry at once instead of
+        // waiting out the backoff its last failure earned.
+        for machine in self.machines.iter().filter(|m| m.online == Some(true)) {
+            if let Some(entry) = self.reconnects.get_mut(&machine.id)
+                && entry.failures > 0
+            {
+                entry.failures = 0;
+                entry.next_at = Instant::now();
+            }
+        }
+        self.auto_connect_machines();
+        true
     }
 
     /// Re-probe machine reachability off-thread, unless one already runs.
@@ -2276,7 +2444,12 @@ impl PilusView {
                 continue;
             };
             let mut disconnected = None;
-            while let Some(event) = endpoint.connection.try_recv() {
+            let events: Vec<ClientEvent> = endpoint
+                .connection
+                .as_ref()
+                .map(|connection| std::iter::from_fn(|| connection.try_recv()).collect())
+                .unwrap_or_default();
+            for event in events {
                 endpoint.last_rx = Instant::now();
                 endpoint.probe_sent = None;
                 match event {
@@ -2336,7 +2509,9 @@ impl PilusView {
                     && endpoint.last_rx.elapsed() >= Duration::from_secs(5)
                 {
                     self.health_nonce = self.health_nonce.wrapping_add(1);
-                    let _ = endpoint.connection.health_check(self.health_nonce);
+                    if let Some(connection) = endpoint.connection.as_ref() {
+                        let _ = connection.health_check(self.health_nonce);
+                    }
                     endpoint.probe_sent = Some(Instant::now());
                 }
             }
@@ -2360,10 +2535,7 @@ impl PilusView {
             let endpoint = self.endpoints.remove(&id);
             if pending_switch {
                 self.pending_switch = None;
-                self.status = format!(
-                    "{} · lost connection to {label}",
-                    self.connection.identity().session
-                );
+                self.status = format!("{} · lost connection to {label}", self.active_session());
             }
             match &id {
                 EndpointId::Machine(machine_id) => {
@@ -2504,16 +2676,16 @@ impl PilusView {
         let target = pending.target.clone();
         let ticket = pending.ticket;
         let (cols, rows) = (self.cols, self.rows);
-        if let Some(endpoint) = self.endpoints.get(&target) {
+        if let Some(endpoint) = self.endpoints.get(&target)
+            && let Some(connection) = endpoint.connection.as_ref()
+        {
             if let Some(workspace_id) = pending.focus.as_ref() {
-                let _ = endpoint
-                    .connection
-                    .send(ClientMessage::ShellWorkspaceFocus {
-                        workspace_id: workspace_id.clone(),
-                    });
+                let _ = connection.send(ClientMessage::ShellWorkspaceFocus {
+                    workspace_id: workspace_id.clone(),
+                });
             }
-            let _ = endpoint.connection.set_interest(SurfaceInterest::Prepared);
-            let _ = endpoint.connection.prepare_surface(ticket, cols, rows);
+            let _ = connection.set_interest(SurfaceInterest::Prepared);
+            let _ = connection.prepare_surface(ticket, cols, rows);
             if let Some(pending) = self.pending_switch.as_mut() {
                 pending.prepared = true;
             }
@@ -2558,14 +2730,16 @@ impl PilusView {
         let Some(pending) = self.pending_switch.take() else {
             return;
         };
-        if let Some(endpoint) = self.endpoints.get(&pending.target) {
-            let _ = endpoint.connection.set_interest(SurfaceInterest::Suspended);
+        if let Some(endpoint) = self.endpoints.get(&pending.target)
+            && let Some(connection) = endpoint.connection.as_ref()
+        {
+            let _ = connection.set_interest(SurfaceInterest::Suspended);
         }
         // The visible surface keeps the window, so its session name is the
         // honest status again; the "switching…" hint belongs to the handoff
         // that just died. A superseding `begin_switch` or the timeout report
         // overwrites this immediately.
-        self.status = self.connection.identity().session.clone();
+        self.status = self.active_session();
     }
 
     /// Give up on a handoff whose target never produced a frame.
@@ -2612,7 +2786,7 @@ impl PilusView {
             return;
         }
         // The outgoing endpoint stops streaming but keeps its panes and size.
-        let _ = self.connection.set_interest(SurfaceInterest::Suspended);
+        self.set_active_interest(SurfaceInterest::Suspended);
         // Give the outgoing endpoint a hidden-endpoint feed so its agents
         // stay in the list, and its cached chrome stays current, while hidden.
         let outgoing_feed = self.spawn_agents_feed(self.active_machine.as_ref());
@@ -2660,8 +2834,8 @@ impl PilusView {
         self.endpoints.insert(outgoing_id, outgoing);
         self.active_machine = machine;
 
-        let _ = self.connection.set_interest(SurfaceInterest::Active);
-        let _ = self.connection.send(ClientMessage::Resize {
+        self.set_active_interest(SurfaceInterest::Active);
+        self.send_active(ClientMessage::Resize {
             cols: self.cols,
             rows: self.rows,
             cell_width_px: self.sent_cell.0,
@@ -2680,7 +2854,7 @@ impl PilusView {
         // nav rows highlight the surface that just took the window.
         self.reconcile_nav();
         self.active_live = true;
-        self.status = self.connection.identity().session.clone();
+        self.status = self.active_session();
         let adopted = self
             .surface
             .shell_sidebars()
@@ -2739,7 +2913,14 @@ impl PilusView {
             cx.notify();
             return;
         }
-        if self.endpoints.contains_key(&id) {
+        // A stashed endpoint without a bridge is a dead link, not a switch
+        // target: fall through and reconnect it instead of stalling on a
+        // handoff that can never produce a prepared frame.
+        if self
+            .endpoints
+            .get(&id)
+            .is_some_and(|endpoint| endpoint.connection.is_some())
+        {
             self.begin_switch(id, focus, pane);
             cx.notify();
             return;
@@ -2941,14 +3122,14 @@ impl PilusView {
     /// Swap a reconnected bridge into the active slots without a handoff.
     fn replace_active_connection(&mut self, machine: MachineInfo, connection: Connection) {
         let machine_id = machine.id.clone();
-        self.connection = connection;
+        let _ = connection.request_workspace_dock();
+        self.connection = Some(connection);
         self.active_live = true;
         self.active_machine = Some(machine);
         self.endpoints
             .remove(&EndpointId::Machine(machine_id.clone()));
-        let _ = self.connection.request_workspace_dock();
-        let _ = self.connection.set_interest(SurfaceInterest::Active);
-        let _ = self.connection.send(ClientMessage::Resize {
+        self.set_active_interest(SurfaceInterest::Active);
+        self.send_active(ClientMessage::Resize {
             cols: self.cols,
             rows: self.rows,
             cell_width_px: self.sent_cell.0,
@@ -2985,7 +3166,7 @@ impl PilusView {
             id,
             Endpoint {
                 machine,
-                connection,
+                connection: Some(connection),
                 surface: Surface::new(),
                 last_rx: Instant::now(),
                 probe_sent: None,
@@ -3003,14 +3184,14 @@ impl PilusView {
 
     /// Swap a reconnected local bridge into the active slots without a handoff.
     fn replace_active_local(&mut self, connection: Connection) {
-        self.connection = connection;
+        let _ = connection.request_workspace_dock();
+        self.connection = Some(connection);
         self.active = EndpointId::Local;
         self.active_machine = None;
         self.active_live = true;
         self.endpoints.remove(&EndpointId::Local);
-        let _ = self.connection.request_workspace_dock();
-        let _ = self.connection.set_interest(SurfaceInterest::Active);
-        let _ = self.connection.send(ClientMessage::Resize {
+        self.set_active_interest(SurfaceInterest::Active);
+        self.send_active(ClientMessage::Resize {
             cols: self.cols,
             rows: self.rows,
             cell_width_px: self.sent_cell.0,
@@ -3250,7 +3431,7 @@ impl PilusView {
             return;
         }
         if let Some(key) = keys::to_wire(keystroke, KeyEventKind::Press) {
-            let _ = self.connection.send(ClientMessage::Key(key));
+            self.send_active(ClientMessage::Key(key));
         }
     }
 
@@ -3496,7 +3677,7 @@ impl PilusView {
             return;
         };
         if !text.is_empty() {
-            let _ = self.connection.send(ClientMessage::Paste(text));
+            self.send_active(ClientMessage::Paste(text));
         }
     }
 
@@ -3525,7 +3706,7 @@ impl PilusView {
 
     /// Focus a workspace by id, switching the daemon's active workspace.
     fn focus_workspace(&mut self, workspace_id: &str) {
-        let _ = self.connection.send(ClientMessage::ShellWorkspaceFocus {
+        self.send_active(ClientMessage::ShellWorkspaceFocus {
             workspace_id: workspace_id.to_string(),
         });
     }
@@ -6377,6 +6558,83 @@ impl PilusView {
             )
             .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_check(cx)));
 
+        // `pilus` checks the public manifest and installs the daemon archive
+        // itself; only the restart goes through the CLI, which knows the
+        // selected session. A restart is two-click because it stops every pane.
+        let daemon_busy = self.daemon_busy;
+        let mut check_daemon = style::small_button(
+            "pilus-check-daemon",
+            "Check Luvus",
+            style::ButtonKind::Ghost,
+            theme,
+            self.section_font(),
+        )
+        .flex_shrink_0();
+        if daemon_busy {
+            check_daemon = check_daemon.text_color(theme.muted);
+        }
+        let check_daemon = check_daemon.on_click(cx.listener(|this, _, _, cx| {
+            this.check_luvus_daemon(cx);
+        }));
+        let mut update_daemon = style::small_button(
+            "pilus-update-daemon",
+            "Update Luvus",
+            style::ButtonKind::Secondary,
+            theme,
+            self.section_font(),
+        )
+        .flex_shrink_0();
+        if daemon_busy {
+            update_daemon = update_daemon.text_color(theme.muted);
+        }
+        let update_daemon = update_daemon.on_click(cx.listener(|this, _, _, cx| {
+            this.update_luvus_daemon(cx);
+        }));
+        let restart_pending = self.daemon_restart_pending;
+        let mut restart_daemon = style::small_button(
+            "pilus-restart-daemon",
+            if restart_pending {
+                "Confirm Restart"
+            } else {
+                "Restart Luvus"
+            },
+            style::ButtonKind::Ghost,
+            theme,
+            self.section_font(),
+        )
+        .flex_shrink_0()
+        .text_color(if restart_pending {
+            theme.alert
+        } else {
+            theme.muted
+        });
+        if daemon_busy {
+            restart_daemon = restart_daemon.text_color(theme.muted);
+        }
+        let restart_daemon = restart_daemon.on_click(cx.listener(|this, _, _, cx| {
+            if this.daemon_busy {
+                return;
+            }
+            if this.daemon_restart_pending {
+                this.restart_luvus_daemon(cx);
+            } else {
+                this.daemon_restart_pending = true;
+                this.daemon_status =
+                    "Restarting Luvus stops every pane in this session. Click Confirm Restart."
+                        .to_string();
+                cx.notify();
+            }
+        }));
+        let daemon_status = self.daemon_status.clone();
+        let daemon_version = match (&self.daemon_installed, &self.daemon_latest) {
+            (Some(installed), Some(latest)) => {
+                Some(format!("installed {installed} · latest {latest}"))
+            }
+            (Some(installed), None) => Some(format!("installed {installed}")),
+            (None, Some(latest)) => Some(format!("latest {latest}")),
+            (None, None) => None,
+        };
+
         div()
             .flex()
             .flex_col()
@@ -6438,6 +6696,41 @@ impl PilusView {
                             ),
                     )
                     .child(checkbox)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(self.section_font()))
+                                    .text_color(theme.muted)
+                                    .child("Luvus daemon"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(check_daemon)
+                                    .child(update_daemon)
+                                    .child(restart_daemon),
+                            ),
+                    )
+                    .children(daemon_version.map(|version| {
+                        div()
+                            .text_size(px(self.footer_font()))
+                            .text_color(theme.muted)
+                            .child(version)
+                    }))
+                    .children((!daemon_status.is_empty()).then(|| {
+                        div()
+                            .text_size(px(self.footer_font()))
+                            .text_color(theme.muted)
+                            .child(daemon_status)
+                    }))
                     .child(
                         div().flex().flex_row().items_center().justify_end().child(
                             style::small_button(
@@ -6952,8 +7245,8 @@ impl PilusView {
         self.target = ConnectTarget::socket(dir.join("luvus-client.sock"));
         match pilus_client::connect(&self.target, self.cols, self.rows) {
             Ok(connection) => {
-                self.connection = connection;
-                let _ = self.connection.request_workspace_dock();
+                let _ = connection.request_workspace_dock();
+                self.connection = Some(connection);
                 // Machine profiles are owner-local to a named session, so a
                 // session switch drops every remote endpoint and its SSH link.
                 self.endpoints.clear();
@@ -6982,13 +7275,15 @@ impl PilusView {
                 self.tasks = TaskSummary::default();
                 self.agent_feed = Some(AgentFeed::spawn(self.api_socket()));
                 self.sessions = list_session_infos(&self.session_root);
-                self.machines = list_machines(&self.session_root);
+                self.machines.clear();
                 self.auto_connected.clear();
                 self.reconnects.clear();
                 self.local_reconnect = None;
                 self.active_live = true;
                 self.catalog_dirty = true;
-                self.auto_connect_machines();
+                // The new session's catalog loads off-thread; the poll
+                // auto-connects it once it lands.
+                self.reload_machines();
                 self.status = format!("connecting to {name}…");
             }
             Err(error) => {
@@ -7011,6 +7306,79 @@ impl PilusView {
         std::thread::spawn(move || {
             tx.send(start_session_blocking(&root, &name)).ok();
         });
+    }
+
+    /// Check the public Luvus release manifest off the GUI thread.
+    fn check_luvus_daemon(&mut self, cx: &mut Context<Self>) {
+        if self.daemon_busy {
+            return;
+        }
+        self.daemon_busy = true;
+        self.daemon_restart_pending = false;
+        self.daemon_status = "Checking Luvus releases…".to_string();
+        let tx = self.daemon_tx.clone();
+        std::thread::spawn(move || {
+            let engine = crate::luvus_update::engine();
+            let installed = crate::luvus_update::installed_version();
+            let result = crate::luvus_update::check(&engine).map_err(|error| error.to_string());
+            tx.send(DaemonOutcome::Checked { installed, result }).ok();
+        });
+        cx.notify();
+    }
+
+    /// Download, verify, and install the latest Luvus release off the GUI
+    /// thread. The running daemon keeps its current binary until a restart.
+    fn update_luvus_daemon(&mut self, cx: &mut Context<Self>) {
+        if self.daemon_busy {
+            return;
+        }
+        self.daemon_busy = true;
+        self.daemon_restart_pending = false;
+        self.daemon_status = "Updating Luvus…".to_string();
+        let tx = self.daemon_tx.clone();
+        std::thread::spawn(move || {
+            let engine = crate::luvus_update::engine();
+            let outcome = match crate::luvus_update::check(&engine) {
+                Ok(Some(release)) => {
+                    let version = release.version.clone();
+                    match crate::luvus_update::install(&engine, &release, |_, _| {}) {
+                        Ok(path) => DaemonOutcome::Installed { version, path },
+                        Err(error) => {
+                            DaemonOutcome::Message(Err(format!("install failed: {error}")))
+                        }
+                    }
+                }
+                Ok(None) => DaemonOutcome::Message(Ok("Luvus is already up to date.".to_string())),
+                Err(error) => DaemonOutcome::Message(Err(format!("update failed: {error}"))),
+            };
+            tx.send(outcome).ok();
+        });
+        cx.notify();
+    }
+
+    /// Restart the local daemon so it loads a newly installed binary.
+    ///
+    /// The caller confirms first: a restart stops every pane in the session,
+    /// so it is never a side effect of the update click.
+    fn restart_luvus_daemon(&mut self, cx: &mut Context<Self>) {
+        if self.daemon_busy {
+            return;
+        }
+        self.daemon_busy = true;
+        self.daemon_restart_pending = false;
+        self.daemon_status = "Restarting Luvus…".to_string();
+        let root = self.session_root.clone();
+        let session = self.session_name.clone();
+        let tx = self.daemon_tx.clone();
+        std::thread::spawn(move || {
+            tx.send(run_luvus_command(
+                &root,
+                session.as_deref(),
+                &["server", "restart"],
+            ))
+            .ok();
+        });
+        cx.notify();
     }
 
     /// Manual check from the menu bar or Settings: run the check and
@@ -7095,9 +7463,11 @@ impl PilusView {
         let Some(message) = self.sidebar_message() else {
             return;
         };
-        let _ = self.connection.send(message.clone());
+        self.send_active(message.clone());
         for endpoint in self.endpoints.values() {
-            let _ = endpoint.connection.send(message.clone());
+            if let Some(connection) = endpoint.connection.as_ref() {
+                let _ = connection.send(message.clone());
+            }
         }
     }
 
@@ -7299,9 +7669,10 @@ impl PilusView {
 
     /// Whether the pointer is over something the daemon opens as a link.
     ///
-    /// Protocol 18 carries no hyperlink targets in the frame, so the markers
-    /// are the underline the daemon paints on a link and an obvious URL token
-    /// (which most agents underline anyway). Drives the pointer cursor.
+    /// Protocol 20 projects link spans directly; when a cell is not covered by
+    /// one, fall back to the underline the daemon paints on a link and an
+    /// obvious URL token (which most agents underline anyway). Drives the
+    /// pointer cursor.
     fn hovered_link(&self) -> bool {
         let Some(hover) = self.hover_cell else {
             return false;
@@ -7311,6 +7682,14 @@ impl PilusView {
         };
         if hover.row >= frame.height || hover.column >= frame.width {
             return false;
+        }
+        let index = u32::from(hover.row) * u32::from(frame.width) + u32::from(hover.column);
+        if frame
+            .hyperlinks
+            .iter()
+            .any(|link| link.start <= index && index < link.end)
+        {
+            return true;
         }
         let width = usize::from(frame.width);
         let row_start = usize::from(hover.row) * width;
@@ -7352,7 +7731,7 @@ impl PilusView {
 
     /// Send one mouse event with wire modifiers already resolved.
     fn forward_mouse_with(&self, kind: MouseEventKind, cell: Cell, modifiers: KeyModifiers) {
-        let _ = self.connection.send(ClientMessage::Mouse(MouseEvent {
+        self.send_active(ClientMessage::Mouse(MouseEvent {
             kind,
             column: cell.column,
             row: cell.row,
@@ -9758,7 +10137,7 @@ impl PilusView {
         if let Some(active) = self.surface.workspaces().iter().find(|w| w.active) {
             return self.shorten_cwd(&self.active.key(), &active.cwd);
         }
-        self.connection.identity().session.clone()
+        self.active_session()
     }
 
     /// The bound view holding focus, if any, from the daemon's tab kinds.
@@ -9907,12 +10286,8 @@ impl PilusView {
         let press = |code: KeyCode, mods: KeyModifiers| {
             ClientMessage::Key(KeyEvent::new_with_kind(code, mods, KeyEventKind::Press))
         };
-        let _ = self
-            .connection
-            .send(press(KeyCode::Char(' '), KeyModifiers::CONTROL));
-        let _ = self
-            .connection
-            .send(press(KeyCode::Char(key), KeyModifiers::NONE));
+        self.send_active(press(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        self.send_active(press(KeyCode::Char(key), KeyModifiers::NONE));
     }
 
     /// PROJECTS: persistent project records with their live workspaces
@@ -10873,14 +11248,16 @@ impl PilusView {
             cell_width_px: cell.0,
             cell_height_px: cell.1,
         };
-        let _ = self.connection.send(resize.clone());
+        self.send_active(resize.clone());
         // Suspended endpoints keep their panes and PTY sizes, so a window
         // resized while they are hidden would leave them reflowing content
         // the moment they are switched to. Push the new size down every
         // bridge; the prepare handoff then renders a candidate that already
         // matches, and committing it never visibly resizes the terminal.
         for endpoint in self.endpoints.values() {
-            let _ = endpoint.connection.send(resize.clone());
+            if let Some(connection) = endpoint.connection.as_ref() {
+                let _ = connection.send(resize.clone());
+            }
         }
     }
 }
@@ -10973,13 +11350,32 @@ impl Render for PilusView {
                 layout.slack_x,
                 layout.slack_y,
             ),
-            None => div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size_full()
-                .text_color(theme.muted)
-                .child("Waiting for the daemon's first frame…"),
+            None => {
+                let mut empty = div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .size_full()
+                    .px_6()
+                    .text_center()
+                    .text_color(theme.muted);
+                if self.active_live {
+                    empty = empty.child("Waiting for the daemon's first frame…");
+                } else {
+                    // No bridge: a stopped or protocol-incompatible daemon
+                    // explains itself here while the reconnect loop retries,
+                    // and the hint points at the one place that can update it.
+                    empty = empty.child(self.status.clone()).child(
+                        div()
+                            .text_size(px(style::scaled(&self.shared_settings, 11.0)))
+                            .text_color(theme.muted)
+                            .child("Settings → Updates can update the Luvus daemon."),
+                    );
+                }
+                empty
+            }
         };
         // A link under the pointer reads as clickable.
         let grid = if self.hovered_link() {
@@ -11649,6 +12045,48 @@ fn symbol(cell: &CellData) -> &str {
         " "
     } else {
         cell.symbol.as_str()
+    }
+}
+
+/// Run one `luvus` command for the Settings page and fold its combined
+/// output into an outcome.
+///
+/// The daemon is restarted through its own CLI, which knows the selected
+/// session; install is handled by [`crate::luvus_update`] instead.
+fn run_luvus_command(root: &Path, session: Option<&str>, args: &[&str]) -> DaemonOutcome {
+    let Some(binary) = luvus_binary() else {
+        return DaemonOutcome::Message(Err("luvus binary not found on PATH".to_string()));
+    };
+    let mut command = std::process::Command::new(binary);
+    if let Some(name) = session {
+        command.arg("--session").arg(name);
+    }
+    let output = command.args(args).env(HOME_ENV, root).output();
+    match output {
+        Ok(output) => {
+            let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if !stderr.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&stderr);
+            }
+            if output.status.success() {
+                DaemonOutcome::Message(Ok(if text.is_empty() {
+                    "Done.".to_string()
+                } else {
+                    text
+                }))
+            } else {
+                DaemonOutcome::Message(Err(if text.is_empty() {
+                    "The command failed.".to_string()
+                } else {
+                    text
+                }))
+            }
+        }
+        Err(error) => DaemonOutcome::Message(Err(error.to_string())),
     }
 }
 

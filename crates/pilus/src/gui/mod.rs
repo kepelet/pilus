@@ -160,11 +160,6 @@ const TINT_TOP: f32 = 0.55;
 /// off across: the specular highlight a pane catches from light above.
 const SHEEN_MAX: f32 = 0.055;
 const SHEEN_HEIGHT: f32 = 0.32;
-/// Edge light around the pane: the top rim catches the most, the sides just
-/// outline it. The bottom is left bare so a full-bleed terminal reaches the
-/// window edge without a shadow line over its last row.
-const RIM_TOP: f32 = 0.16;
-const RIM_SIDE: f32 = 0.05;
 /// Right margin on the card. Matches the other sides so the terminal sits
 /// centered between the sidebar and the window edge.
 const CARD_GAP_RIGHT: f32 = CARD_GAP;
@@ -10083,9 +10078,6 @@ impl Render for PilusView {
             // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
             .child(self.top_chrome(cx, cell_width, fullscreen))
-            // The pane's edge light sits over the surfaces, which all run to
-            // the window edges, but under the floating overlays.
-            .children(glass_rim(theme, framed))
             .child(self.session_menu(cx, cell_width, fullscreen))
             .child(self.palette_overlay(cx))
             .child(self.picker_overlay(window, cx))
@@ -10602,49 +10594,6 @@ fn glass_coat(theme: Theme, blur: f32, framed: bool) -> Div {
                     linear_color_stop(theme.panel_fg.opacity(0.0), 1.0),
                 )),
         )
-}
-
-/// The pane's edge light, painted over the surfaces since they all run to
-/// the window's edges: a bright hairline on top and faint ones down the sides.
-/// No foot is drawn: it would sit over the full-bleed terminal's last row and
-/// read as a gap, so the terminal keeps the window's bottom edge to itself. An
-/// opaque window keeps its plain frame instead.
-fn glass_rim(theme: Theme, framed: bool) -> Option<Div> {
-    if framed {
-        return None;
-    }
-    Some(
-        div()
-            .absolute()
-            .inset_0()
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(1.0))
-                    .bg(theme.panel_fg.opacity(RIM_TOP)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left_0()
-                    .w(px(1.0))
-                    .bg(theme.panel_fg.opacity(RIM_SIDE)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right_0()
-                    .w(px(1.0))
-                    .bg(theme.panel_fg.opacity(RIM_SIDE)),
-            )
-    )
 }
 
 /// Apply the user's Interface font family and base size to a window root, so

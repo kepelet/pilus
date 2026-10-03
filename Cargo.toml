@@ -31,7 +31,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = ["font-kit", "runtime_shaders"] }
 interprocess = "2"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage", "NSImageRep", "std"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSGraphics", "NSImage", "NSImageRep", "NSResponder", "NSView", "NSVisualEffectView", "NSWindow", "std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSBundle", "NSData", "NSProcessInfo", "NSString", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

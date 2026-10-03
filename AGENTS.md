@@ -33,6 +33,9 @@ with only the command-line tools can build the app.
   `ServerMessage`s into `Surface`; the window decides how to draw.
 - The GUI thread never blocks on socket IO. Reads happen on a background reader
   thread; writes go through an unbounded channel to a writer thread.
+- The macOS backdrop is `gui/glass.rs`'s own `NSVisualEffectView`, not GPUI's
+  `Blurred` appearance (a weak, desaturated material by design). The window
+  stays `Transparent`; the blur slider drives the view's `alphaValue`.
 
 ## UI
 

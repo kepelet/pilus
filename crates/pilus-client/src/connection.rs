@@ -13,7 +13,8 @@ use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pilus_protocol::{
-    ClientMessage, PROTOCOL_VERSION, ServerMessage, ShellDockLayout, SurfaceInterest,
+    ClientMessage, FALLBACK_PROTOCOL_VERSION, PROTOCOL_VERSION, ServerMessage, ShellDockLayout,
+    SurfaceInterest, set_decode_version,
 };
 
 use crate::ConnectTarget;
@@ -68,13 +69,44 @@ impl Drop for Connection {
 
 impl Connection {
     /// Attach to `target`, announcing an initial `cols` by `rows` viewport.
+    ///
+    /// The pinned revision is tried first, then [`FALLBACK_PROTOCOL_VERSION`],
+    /// so one build attaches to a daemon that has not been updated yet. The
+    /// daemon closes the link when it rejects a revision, so each attempt dials
+    /// a fresh socket.
     pub fn open(target: &ConnectTarget, cols: u16, rows: u16) -> Result<Self> {
         let socket = target.resolve();
-        let stream = Stream::connect(&socket)?;
-        Self::open_stream(stream, socket.display().to_string(), cols, rows)
+        let label = socket.display().to_string();
+        Self::attach_negotiated(&label, cols, rows, || Stream::connect(&socket))
     }
 
-    /// Attach over an already-connected stream.
+    /// Attach by trying each supported protocol revision against a freshly
+    /// built stream. Shared by the local socket and the SSH bridge, which both
+    /// can rebuild their transport cheaply.
+    pub fn attach_negotiated(
+        label: &str,
+        cols: u16,
+        rows: u16,
+        mut connect: impl FnMut() -> Result<Stream>,
+    ) -> Result<Self> {
+        let mut last_server = None;
+        for version in candidate_versions() {
+            let stream = connect()?;
+            match Self::attach(stream, label, cols, rows, version) {
+                Ok(connection) => return Ok(connection),
+                Err(Error::VersionMismatch { server, .. }) => last_server = Some(server),
+                Err(error) => return Err(error),
+            }
+        }
+        // Neither supported revision matched. Report it against the newest one
+        // so the message names what this build speaks, not the last attempt.
+        Err(Error::VersionMismatch {
+            client: PROTOCOL_VERSION,
+            server: last_server.unwrap_or_default(),
+        })
+    }
+
+    /// Attach over an already-connected stream at the pinned revision.
     ///
     /// `label` is a human-readable endpoint name used in errors and status
     /// text. A remote SSH bridge hands its child pipes in here; the handshake
@@ -85,18 +117,26 @@ impl Connection {
         cols: u16,
         rows: u16,
     ) -> Result<Self> {
+        let label = label.into();
+        Self::attach(stream, &label, cols, rows, PROTOCOL_VERSION)
+    }
+
+    /// Handshake at `version` and spawn the reader/writer threads.
+    fn attach(stream: Stream, label: &str, cols: u16, rows: u16, version: u32) -> Result<Self> {
         let stream = Arc::new(stream);
         let (probe_terminal, identity) =
-            handshake(&stream, cols, rows).map_err(|error| match stream.stderr_tail() {
-                Some(tail) => Error::Machine(format!("{error}: {tail}")),
-                None => error,
+            handshake(&stream, cols, rows, version).map_err(|error| {
+                match stream.stderr_tail() {
+                    Some(tail) => Error::Machine(format!("{error}: {tail}")),
+                    None => error,
+                }
             })?;
 
         let (outbound_tx, outbound_rx) = unbounded::<ClientMessage>();
         let (inbound_tx, inbound_rx) = unbounded::<ClientEvent>();
 
         spawn_writer(Arc::clone(&stream), outbound_rx);
-        spawn_reader(Arc::clone(&stream), inbound_tx.clone());
+        spawn_reader(Arc::clone(&stream), inbound_tx.clone(), version);
 
         inbound_tx
             .send(ClientEvent::Ready {
@@ -109,7 +149,7 @@ impl Connection {
             outbound: outbound_tx,
             inbound: inbound_rx,
             stream,
-            label: label.into(),
+            label: label.to_string(),
             identity,
         })
     }
@@ -190,28 +230,50 @@ impl Connection {
     }
 }
 
-fn handshake(stream: &Stream, cols: u16, rows: u16) -> Result<(bool, EndpointIdentity)> {
+/// Protocol revisions to try, newest first.
+fn candidate_versions() -> [u32; 2] {
+    [PROTOCOL_VERSION, FALLBACK_PROTOCOL_VERSION]
+}
+
+fn handshake(
+    stream: &Stream,
+    cols: u16,
+    rows: u16,
+    version: u32,
+) -> Result<(bool, EndpointIdentity)> {
     let mut reader = stream;
     let mut writer = stream;
 
     pilus_protocol::write_message(
         &mut writer,
         &ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
+            version,
             cols,
             rows,
         },
     )?;
 
     match pilus_protocol::read_message::<_, ServerMessage>(&mut reader)? {
-        ServerMessage::Welcome { version, error } => {
+        ServerMessage::Welcome {
+            version: server,
+            error,
+        } => {
             if let Some(reason) = error {
+                // The server reports its revision even when it rejects. A
+                // mismatch is retryable at another revision, so surface it as
+                // one; any other rejection is final.
+                if reason.contains("protocol version mismatch") {
+                    return Err(Error::VersionMismatch {
+                        client: version,
+                        server,
+                    });
+                }
                 return Err(Error::Rejected(reason));
             }
-            if version != PROTOCOL_VERSION {
+            if server != version {
                 return Err(Error::VersionMismatch {
-                    client: PROTOCOL_VERSION,
-                    server: version,
+                    client: version,
+                    server,
                 });
             }
         }
@@ -254,10 +316,13 @@ fn spawn_writer(stream: Arc<Stream>, outbound: Receiver<ClientMessage>) {
         .ok();
 }
 
-fn spawn_reader(stream: Arc<Stream>, inbound: Sender<ClientEvent>) {
+fn spawn_reader(stream: Arc<Stream>, inbound: Sender<ClientEvent>, version: u32) {
     thread::Builder::new()
         .name("pilus-reader".into())
         .spawn(move || {
+            // Frames are positional; tell this thread's decoder which shape the
+            // negotiated daemon sends.
+            set_decode_version(version);
             let mut reader = &*stream;
             loop {
                 match pilus_protocol::read_message::<_, ServerMessage>(&mut reader) {
@@ -291,7 +356,9 @@ mod tests {
     /// with `printf` so the test needs no helper binary.
     #[test]
     fn handshakes_over_a_spawned_child_stream() {
-        let script = r"head -c 8 >/dev/null; printf '\003\000\000\000\000\022\000'; printf '\002\000\000\000\013\000'; printf '\012\000\000\000\022\001\007default'; sleep 1";
+        // Welcome carries the protocol revision as a bincode varint; `\024` is
+        // 20, matching [`PROTOCOL_VERSION`].
+        let script = r"head -c 8 >/dev/null; printf '\003\000\000\000\000\024\000'; printf '\002\000\000\000\013\000'; printf '\012\000\000\000\022\001\007default'; sleep 1";
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(script);
         let stream = Stream::spawn(&mut command).expect("spawn the scripted peer");

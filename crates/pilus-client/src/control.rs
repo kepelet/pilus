@@ -764,6 +764,16 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Interrupt a running agent the way its own Escape key does: inject the
+    /// key so pi's `app.interrupt` aborts the current run.
+    pub fn interrupt_agent(&mut self, target: &str) -> Result<()> {
+        self.request(
+            "agent.keys",
+            json!({ "target": target, "keys": ["escape"] }),
+        )?;
+        Ok(())
+    }
+
     /// The current status-bar widgets.
     pub fn bar_widgets(&mut self) -> Result<Vec<BarWidget>> {
         let result = self.request("ui.bar.list", json!({}))?;

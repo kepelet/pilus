@@ -87,15 +87,27 @@ composer. Sending is optimistic: the prompt appears as a bubble and the
 indicator shows at once, and both persist until pi's first responding content
 (an assistant message or anything it produced) lands — not just the echoed
 user message. A prompt sent while pi is already working reads `Steering…`
-instead, until that same first response.
+instead, until that same first response. `Steering…` is optimistic too: it is
+shown from the moment you send, so nothing waits on the file. A send while one
+is in flight queues instead of vanishing, and the round button becomes a stop
+square that interrupts the run through `agent.keys` (an injected Escape, what
+pi's own `app.interrupt` does). The send status line is gone, so sending never
+shifts the layout; only failures report.
 
 Floating above the composer's right side are two jump buttons: the prompts
 button opens a menu of every user prompt (one truncated row each) that
-scrolls to the chosen message, and the arrow-down button jumps to the tail.
-The arrow appears only while the tail is unpinned. The tail pin is sticky
+scrolls to the chosen message, and shows whenever a prompt exists. The
+arrow-down button jumps to the tail and appears only while the tail is
+unpinned. The tail pin is sticky
 state, not a raw offset comparison (scroll offsets run negative downward): it
 sets at the bottom and clears the moment the viewport moves without growth,
 so background fill can never hijack a programmatic jump.
+
+The composer field soft-wraps: each logical line is shaped into display
+pieces that fit the field's width, breaking at spaces and mid-word for
+overlong words, and caret/selection/IME map through those pieces
+(`gui/text_input.rs`). A draft taller than the panel's half-height cap
+scrolls inside the field.
 
 ### Sending a prompt
 

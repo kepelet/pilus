@@ -14,13 +14,13 @@
 //! so the GUI thread only ever clones an already-folded [`Transcript`].
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     Anchor, AnyElement, Context, Div, ElementId, Entity, ScrollHandle, Stateful, anchored,
@@ -76,7 +76,11 @@ enum PickerKind {
 
 /// Thinking levels pi accepts for `/thinking`, from its settings reference.
 const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-/// Items rendered on first paint; the rest fills in behind the scenes, so a
+/// How long after the last file growth the session still counts as active.
+/// Past this, a trailing work item is a stale tail (interrupted session),
+/// not live work. Generous: quiet stretches (a long generation writes
+/// nothing until it completes) must not flip a live turn to idle.
+const ACTIVE_WINDOW: Duration = Duration::from_secs(90);
 /// Items rendered on first paint; the rest fills in behind the scenes,
 /// so a huge session opens fast.
 const TAIL_WINDOW: usize = 50;
@@ -163,12 +167,22 @@ pub struct SessionPanel {
     /// The optimistic indicator reads `Steering…`: the prompt went out while
     /// pi was already working.
     pending_steering: bool,
+    /// When the session file last grew. Delivery implies growth (the reader
+    /// only forwards new bytes), so recency here means live work — unlike a
+    /// trailing work item, which may be a stale interrupted tail.
+    last_growth: Option<Instant>,
     /// Item count at the last frame, so the view follows the tail.
     last_seen: usize,
     rx: Receiver<Update>,
     tx: Sender<Update>,
     send_rx: Receiver<Result<(), String>>,
     send_tx: Sender<Result<(), String>>,
+    stop_rx: Receiver<Result<(), String>>,
+    stop_tx: Sender<Result<(), String>>,
+    /// Prompts waiting for the in-flight send to land, oldest first, each
+    /// with whether it clears the composer. A second send queues instead of
+    /// vanishing behind the `sending` guard.
+    outbox: VecDeque<(String, bool)>,
     stop: Arc<AtomicBool>,
 }
 
@@ -176,6 +190,7 @@ impl Default for SessionPanel {
     fn default() -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let (send_tx, send_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         Self {
             open: false,
             title: String::new(),
@@ -200,6 +215,7 @@ impl Default for SessionPanel {
             following: true,
             awaiting_response: false,
             pending_steering: false,
+            last_growth: None,
             expanded: HashSet::new(),
             groups: HashSet::new(),
             work_open: HashSet::new(),
@@ -208,6 +224,9 @@ impl Default for SessionPanel {
             tx,
             send_rx,
             send_tx,
+            stop_rx,
+            stop_tx,
+            outbox: VecDeque::new(),
             stop: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -292,9 +311,11 @@ impl SessionPanel {
         self.pending_from = 0;
         self.prompts_open = false;
         self.prompts_dismissed = false;
+        self.outbox.clear();
         self.following = true;
         self.awaiting_response = false;
         self.pending_steering = false;
+        self.last_growth = None;
         self.last_seen = 0;
         self.target = target;
         self.endpoint = Some(endpoint.clone());
@@ -334,6 +355,11 @@ impl SessionPanel {
         while let Ok(update) = self.rx.try_recv() {
             match update {
                 Update::Transcript(transcript) => {
+                    // Past the initial delivery, anything arriving is file
+                    // growth: the session is alive right now.
+                    if self.last_seen > 0 {
+                        self.last_growth = Some(Instant::now());
+                    }
                     self.transcript = *transcript;
                     self.error.clear();
                 }
@@ -360,6 +386,16 @@ impl SessionPanel {
                     self.awaiting_response = false;
                     self.pending_steering = false;
                 }
+            }
+            // A queued prompt goes out on the freed channel, oldest first.
+            if let Some((text, clear)) = self.outbox.pop_front() {
+                self.send_text(text, clear, cx);
+            }
+            changed = true;
+        }
+        while let Ok(result) = self.stop_rx.try_recv() {
+            if let Err(error) = result {
+                self.status = format!("couldn't stop: {error}");
             }
             changed = true;
         }
@@ -416,7 +452,18 @@ impl SessionPanel {
     /// Send `text` through the endpoint's control surface.
     fn send_text(&mut self, text: String, clear_input: bool, cx: &mut Context<PilusView>) {
         let text = text.trim().to_string();
-        if text.is_empty() || self.sending {
+        if text.is_empty() {
+            return;
+        }
+        if self.sending {
+            // A send is already in flight; queue behind it instead of
+            // dropping the prompt. A composer prompt shows optimistically
+            // at once; picker commands stay invisible as usual.
+            if clear_input {
+                self.set_optimistic(&text);
+            }
+            self.outbox.push_back((text, clear_input));
+            cx.notify();
             return;
         }
         let Some(endpoint) = self.endpoint.clone() else {
@@ -430,20 +477,10 @@ impl SessionPanel {
         self.sending = true;
         self.send_clears_input = clear_input;
         if clear_input {
-            // Show the prompt and the indicator at once; both persist until
-            // pi responds. A prompt sent while pi is already working steers
-            // it instead.
-            self.pending_steering = self.is_working();
-            self.pending_prompt = Some(text.clone());
-            self.awaiting_response = true;
+            self.set_optimistic(&text);
             self.pending_from = self.transcript.items.len();
             self.scroll.scroll_to_bottom();
         }
-        self.status = if clear_input {
-            "sending…".to_string()
-        } else {
-            format!("sending {text}…")
-        };
         let tx = self.send_tx.clone();
         std::thread::spawn(move || {
             let client = match &endpoint {
@@ -452,6 +489,46 @@ impl SessionPanel {
             };
             let result = client
                 .and_then(|mut client| client.prompt_agent(&target, &text))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+        cx.notify();
+    }
+
+    /// Show a composer send optimistically: the bubble, the indicator, and
+    /// `Steering…` when pi is genuinely already working.
+    fn set_optimistic(&mut self, text: &str) {
+        // Only steer when pi is genuinely already working: our own
+        // unanswered prompt, or file growth right now. A stale trailing work
+        // item alone means `Working`, not `Steering…`.
+        self.pending_steering =
+            self.pending_prompt.is_some() || self.awaiting_response || self.recently_active();
+        self.pending_prompt = Some(text.to_string());
+        self.awaiting_response = true;
+    }
+
+    /// Interrupt the live agent the way its own Escape key does. The
+    /// optimistic state clears at once; the transcript catches up.
+    fn stop(&mut self, cx: &mut Context<PilusView>) {
+        let Some(endpoint) = self.endpoint.clone() else {
+            return;
+        };
+        let Some(target) = self.target.clone() else {
+            self.status = "no live pi agent in this workspace to stop".to_string();
+            cx.notify();
+            return;
+        };
+        self.pending_prompt = None;
+        self.awaiting_response = false;
+        self.pending_steering = false;
+        let tx = self.stop_tx.clone();
+        std::thread::spawn(move || {
+            let client = match &endpoint {
+                Endpoint::Local { api_socket, .. } => ControlClient::connect(api_socket),
+                Endpoint::Remote { target: ssh, .. } => ControlClient::connect_ssh(ssh.clone()),
+            };
+            let result = client
+                .and_then(|mut client| client.interrupt_agent(&target))
                 .map_err(|error| error.to_string());
             let _ = tx.send(result);
         });
@@ -670,6 +747,11 @@ impl SessionPanel {
                 )
             }
             ItemKind::Note { title, text } => {
+                // The thinking level lives in the composer's picker, and the
+                // model in its own chip, so those notes add nothing here.
+                if title == "thinking" {
+                    return div().into_any_element();
+                }
                 // A model change is one line, no chevron: the picker already
                 // shows the current model.
                 if title == "model" {
@@ -1228,7 +1310,14 @@ impl SessionPanel {
             column = column.child(self.working_row(fonts));
         }
         column = column.child(bar);
-        if self.prompts_open || self.needs_jump_button() {
+        // The prompts jumper shows whenever there is a prompt to jump to;
+        // the tail arrow only while unpinned.
+        let has_prompts = self
+            .transcript
+            .items
+            .iter()
+            .any(|item| matches!(item.kind, ItemKind::User { .. }));
+        if has_prompts || self.prompts_open {
             column = column.child(self.jump_cluster(fonts, cx));
         }
         column
@@ -1240,10 +1329,16 @@ impl SessionPanel {
         self.scroll.max_offset().y > px(0.0) && !self.following
     }
 
-    /// The circular arrow Home sends with; a send in flight is ignored by
-    /// `submit`, and the `Working` spinner covers the wait.
+    /// The composer's round button: a stop square while pi is working (it
+    /// interrupts the run like pi's own Escape), the send arrow otherwise.
     fn send_button(&self, cx: &mut Context<PilusView>) -> Stateful<Div> {
         let theme = self.theme;
+        let stopping = self.is_working();
+        let glyph: &'static [u8] = if stopping {
+            include_bytes!("../../assets/icons/square.svg")
+        } else {
+            include_bytes!("../../assets/icons/arrow-up.svg")
+        };
         div()
             .id("session-send")
             .flex()
@@ -1256,14 +1351,14 @@ impl SessionPanel {
             .bg(theme.bg)
             .cursor_pointer()
             .hover(move |style| style.bg(theme.border))
-            .child(super::icon(
-                include_bytes!("../../assets/icons/arrow-up.svg"),
-                15.0,
-                theme.panel_fg,
-            ))
-            .on_click(cx.listener(|this: &mut PilusView, _, _, cx| {
-                let input = this.session_prompt.clone();
-                this.session.submit(&input, cx);
+            .child(super::icon(glyph, 15.0, theme.panel_fg))
+            .on_click(cx.listener(move |this: &mut PilusView, _, _, cx| {
+                if stopping {
+                    this.session.stop(cx);
+                } else {
+                    let input = this.session_prompt.clone();
+                    this.session.submit(&input, cx);
+                }
             }))
     }
 
@@ -1397,6 +1492,13 @@ impl SessionPanel {
     fn dismiss_prompts(&mut self) {
         self.prompts_dismissed = self.prompts_open;
         self.prompts_open = false;
+    }
+
+    /// Whether the session file has grown recently: live work, not a stale
+    /// interrupted tail.
+    fn recently_active(&self) -> bool {
+        self.last_growth
+            .is_some_and(|at| at.elapsed() < ACTIVE_WINDOW)
     }
 
     /// Whether pi is still working: a prompt is in flight, optimistically

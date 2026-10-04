@@ -39,12 +39,20 @@ const CARET_WIDTH: f32 = 1.5;
 /// Half of the on/off caret blink cycle, in milliseconds.
 const CARET_BLINK: Duration = Duration::from_millis(530);
 
+/// One shaped display row: part (or all) of one logical line. Wrapping a
+/// long line yields several pieces; an unwrapped line is exactly one.
+#[derive(Clone)]
+struct Piece {
+    /// Absolute byte offset where this piece starts.
+    byte_start: usize,
+    layout: ShapedLine,
+}
+
 /// The last shaped frame, kept so pointer hit-testing can map a window point to
 /// a byte offset without re-shaping on every mouse move.
 struct LastLayout {
     bounds: Bounds<Pixels>,
-    offsets: Vec<usize>,
-    layouts: Vec<ShapedLine>,
+    pieces: Vec<Piece>,
     line_height: Pixels,
 }
 
@@ -55,19 +63,100 @@ impl LastLayout {
         let row = (local_y / self.line_height.as_f32())
             .floor()
             .max(0.0)
-            .min(self.layouts.len().saturating_sub(1) as f32) as usize;
+            .min(self.pieces.len().saturating_sub(1) as f32) as usize;
         let local_x = (position.x - self.bounds.origin.x).as_f32().max(0.0);
-        let within = self.layouts[row].closest_index_for_x(px(local_x));
-        self.offsets.get(row).copied().unwrap_or(0) + within
+        let piece = &self.pieces[row];
+        let within = piece.layout.closest_index_for_x(px(local_x));
+        piece.byte_start + within
     }
 
-    /// The x offset and row of `byte`, for caret and IME bounds.
+    /// The x offset and display row of `byte`, for caret and IME bounds.
     fn caret(&self, byte: usize) -> Option<(Pixels, usize)> {
-        let row = row_for_offset(&self.offsets, byte);
-        let line = self.layouts.get(row)?;
-        let offset = byte.saturating_sub(*self.offsets.get(row)?);
-        Some((line.x_for_index(offset), row))
+        let row = self
+            .pieces
+            .iter()
+            .rposition(|piece| piece.byte_start <= byte)?;
+        let piece = &self.pieces[row];
+        Some((
+            piece
+                .layout
+                .x_for_index(byte.saturating_sub(piece.byte_start)),
+            row,
+        ))
     }
+}
+
+/// Split one logical line (no `\n`) into display pieces that fit `max_width`,
+/// breaking at spaces and, for overlong words, mid-word. Returns absolute
+/// byte ranges tiling `[line_start, line_end)` contiguously.
+fn wrap_pieces(
+    line: &str,
+    line_start: usize,
+    max_width: Pixels,
+    measure: &dyn Fn(&str) -> Pixels,
+) -> Vec<(usize, usize)> {
+    // Words tile the line; each keeps its absolute start for byte math.
+    let mut words: Vec<(usize, &str)> = Vec::new();
+    let mut cursor = line_start;
+    for word in line.split_inclusive(' ') {
+        words.push((cursor, word));
+        cursor += word.len();
+    }
+    let mut pieces = Vec::new();
+    let mut index = 0;
+    while index < words.len() {
+        let (start, _) = words[index];
+        let mut end = start;
+        let mut width = px(0.0);
+        while index < words.len() {
+            let (word_start, word) = words[index];
+            let word_width = measure(word);
+            if word_width > max_width {
+                break; // overlong word: split below
+            }
+            if end > start && width + word_width > max_width {
+                break; // full: start a fresh piece at this word
+            }
+            width += word_width;
+            end = word_start + word.len();
+            index += 1;
+        }
+        if end == start {
+            // The next word alone overflows: split it mid-word.
+            let (word_start, word) = words[index];
+            pieces.extend(split_long_word(word, word_start, max_width, measure));
+            index += 1;
+        } else {
+            pieces.push((start, end));
+        }
+    }
+    if pieces.is_empty() {
+        // Empty line: one empty piece so the row still paints.
+        pieces.push((line_start, line_start));
+    }
+    pieces
+}
+
+/// Split an overlong word into pieces that fit, near the middle.
+fn split_long_word(
+    word: &str,
+    word_start: usize,
+    max_width: Pixels,
+    measure: &dyn Fn(&str) -> Pixels,
+) -> Vec<(usize, usize)> {
+    if measure(word) <= max_width || word.chars().count() <= 1 {
+        return vec![(word_start, word_start + word.len())];
+    }
+    // Mid byte index, snapped to a char boundary; a degenerate split emits
+    // the word whole (overflowing slightly) rather than recursing forever.
+    let at = word.floor_char_boundary(word.len() / 2);
+    if at == 0 || at >= word.len() {
+        return vec![(word_start, word_start + word.len())];
+    }
+    let (head, tail) = word.split_at(at);
+    let mut pieces = split_long_word(head, word_start, max_width, measure);
+    pieces.extend(split_long_word(tail, word_start + at, max_width, measure));
+    pieces
 }
 
 /// An editable field's buffer: text plus a selection, in byte offsets.
@@ -386,25 +475,6 @@ fn line_end(text: &str, byte: usize) -> usize {
         .find('\n')
         .map(|newline| at + newline)
         .unwrap_or(text.len())
-}
-
-/// The first byte of each line of `text`.
-fn line_offsets(text: &str) -> Vec<usize> {
-    let mut offsets = vec![0];
-    for (index, ch) in text.char_indices() {
-        if ch == '\n' {
-            offsets.push(index + 1);
-        }
-    }
-    offsets
-}
-
-/// The row containing `byte`.
-fn row_for_offset(offsets: &[usize], byte: usize) -> usize {
-    offsets
-        .iter()
-        .rposition(|start| *start <= byte)
-        .unwrap_or(0)
 }
 
 /// The UTF-16 length of `text` up to `byte`.
@@ -1037,37 +1107,80 @@ impl Render for TextInput {
         let selection_color: Hsla = theme.selection_bg.into();
         let selection_fg: Hsla = theme.selection_fg.into();
 
-        let mut layouts = Vec::new();
+        let mut pieces: Vec<Piece> = Vec::new();
+        // Multiline fields soft-wrap to the last laid-out width (unknown on
+        // the first frame, so it paints unwrapped once). Single-line fields
+        // never wrap: their content is one row by construction.
+        let wrap_width: Option<Pixels> = if self.multiline {
+            let last = self.last.borrow();
+            let width = last
+                .as_ref()
+                .map(|last| last.bounds.size.width)
+                .unwrap_or(px(0.0));
+            (width > px(0.0)).then_some(width)
+        } else {
+            None
+        };
+        let font = self.font.clone();
+        let measure = |text: &str| {
+            window
+                .text_system()
+                .shape_line(
+                    SharedString::new(text),
+                    font_size,
+                    &[TextRun {
+                        len: text.len(),
+                        font: font.clone(),
+                        color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                )
+                .width
+        };
         let mut line_start = 0usize;
         for segment in display.split('\n') {
             let line_end = line_start + segment.len();
-            let low = selection.start.max(line_start).min(line_end);
-            let high = selection.end.max(line_start).min(line_end);
-            let run = |len: usize, run_color: Hsla| TextRun {
-                len,
-                font: self.font.clone(),
-                color: run_color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
+            let ranges: Vec<(usize, usize)> = match wrap_width {
+                Some(max) => wrap_pieces(segment, line_start, max, &measure),
+                None => vec![(line_start, line_end)],
             };
-            let runs = [
-                run(low - line_start, color),
-                run(high - low, selection_fg),
-                run(line_end - high, color),
-            ];
-            let layout =
-                window
-                    .text_system()
-                    .shape_line(SharedString::new(segment), font_size, &runs, None);
-            layouts.push(layout);
+            for (piece_start, piece_end) in ranges {
+                let low = selection.start.max(piece_start).min(piece_end);
+                let high = selection.end.max(piece_start).min(piece_end);
+                let run = |len: usize, run_color: Hsla| TextRun {
+                    len,
+                    font: self.font.clone(),
+                    color: run_color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let runs = [
+                    run(low - piece_start, color),
+                    run(high - low, selection_fg),
+                    run(piece_end - high, color),
+                ];
+                let relative = &segment[piece_start - line_start..piece_end - line_start];
+                let layout = window.text_system().shape_line(
+                    SharedString::new(relative),
+                    font_size,
+                    &runs,
+                    None,
+                );
+                pieces.push(Piece {
+                    byte_start: piece_start,
+                    layout,
+                });
+            }
             line_start = line_end + 1;
         }
 
-        let offsets = line_offsets(&text);
         let marked = self.marked.clone();
         let caret_visible = focused && self.caret_on;
-        let row_count = layouts.len();
+        let row_count = pieces.len();
         let height = self.height(row_count);
 
         // Store the shaped frame for pointer hit-testing and IME bounds.
@@ -1078,8 +1191,7 @@ impl Render for TextInput {
                     origin: point(px(0.0), px(0.0)),
                     size: size(px(0.0), height),
                 },
-                offsets: offsets.clone(),
-                layouts: layouts.clone(),
+                pieces: pieces.clone(),
                 line_height,
             });
         }
@@ -1142,8 +1254,7 @@ impl Render for TextInput {
                             paint_range(
                                 window,
                                 bounds,
-                                &layouts,
-                                &offsets,
+                                &pieces,
                                 selection.clone(),
                                 line_height,
                                 selection_color,
@@ -1152,12 +1263,12 @@ impl Render for TextInput {
                             );
                         }
 
-                        for (row, layout) in layouts.iter().enumerate() {
+                        for (row, piece) in pieces.iter().enumerate() {
                             let origin = point(
                                 bounds.origin.x,
                                 bounds.origin.y + px(line_height.as_f32() * row as f32),
                             );
-                            let _ = layout.paint(
+                            let _ = piece.layout.paint(
                                 origin,
                                 line_height,
                                 TextAlign::Left,
@@ -1171,8 +1282,7 @@ impl Render for TextInput {
                             paint_range(
                                 window,
                                 bounds,
-                                &layouts,
-                                &offsets,
+                                &pieces,
                                 marked.clone(),
                                 line_height,
                                 accent,
@@ -1182,11 +1292,13 @@ impl Render for TextInput {
                         }
 
                         if caret_visible {
-                            let row = row_for_offset(&offsets, head);
-                            if let (Some(layout), Some(offset)) =
-                                (layouts.get(row), offsets.get(row))
-                            {
-                                let x = layout.x_for_index(head.saturating_sub(*offset));
+                            let piece_at =
+                                pieces.iter().rposition(|piece| piece.byte_start <= head);
+                            if let Some(row) = piece_at {
+                                let piece = &pieces[row];
+                                let x = piece
+                                    .layout
+                                    .x_for_index(head.saturating_sub(piece.byte_start));
                                 window.paint_quad(fill(
                                     Bounds {
                                         origin: point(
@@ -1212,32 +1324,31 @@ impl Render for TextInput {
     }
 }
 
-/// Paint a selection or composition range, clipped per line.
+/// Paint a selection or composition range, clipped per display row.
 #[allow(clippy::too_many_arguments)]
 fn paint_range(
     window: &mut Window,
     bounds: Bounds<Pixels>,
-    layouts: &[ShapedLine],
-    offsets: &[usize],
+    pieces: &[Piece],
     range: Range<usize>,
     line_height: Pixels,
     color: Hsla,
     y_offset: Pixels,
     height: Pixels,
 ) {
-    for (row, layout) in layouts.iter().enumerate() {
-        let start = offsets.get(row).copied().unwrap_or(0);
-        let end = offsets
+    for (row, piece) in pieces.iter().enumerate() {
+        let start = piece.byte_start;
+        let end = pieces
             .get(row + 1)
-            .map(|next| next.saturating_sub(1))
+            .map(|next| next.byte_start)
             .unwrap_or(usize::MAX);
         let low = range.start.max(start).min(end);
         let high = range.end.max(start).min(end);
         if low >= high {
             continue;
         }
-        let x0 = layout.x_for_index(low.saturating_sub(start));
-        let x1 = layout.x_for_index(high.saturating_sub(start));
+        let x0 = piece.layout.x_for_index(low.saturating_sub(start));
+        let x1 = piece.layout.x_for_index(high.saturating_sub(start));
         let y = bounds.origin.y + px(line_height.as_f32() * row as f32) + y_offset;
         window.paint_quad(fill(
             Bounds {
@@ -1252,6 +1363,40 @@ fn paint_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_pieces_break_at_spaces_first() {
+        // Widths in columns through a counting measure.
+        let measure = |text: &str| px(text.len() as f32);
+        assert_eq!(
+            wrap_pieces("aa bb cc", 0, px(5.0), &measure),
+            vec![(0, 3), (3, 8)]
+        );
+        // One line, no breaks needed.
+        assert_eq!(wrap_pieces("hi", 10, px(10.0), &measure), vec![(10, 12)]);
+        // Empty lines still paint one row.
+        assert_eq!(wrap_pieces("", 4, px(10.0), &measure), vec![(4, 4)]);
+    }
+
+    #[test]
+    fn wrap_pieces_splits_overlong_words_mid_word() {
+        let measure = |text: &str| px(text.len() as f32);
+        assert_eq!(
+            wrap_pieces("abcdef", 0, px(3.0), &measure),
+            vec![(0, 3), (3, 6)]
+        );
+        // Ranges tile contiguously, so display rows map back to bytes. A
+        // word wider than the field splits mid-word: `aa | bcdef | gh`
+        // becomes `aa | bcd | ef | gh`.
+        let pieces = wrap_pieces("aa bcdef gh", 0, px(4.0), &measure);
+        assert_eq!(pieces, vec![(0, 3), (3, 6), (6, 9), (9, 11)]);
+        let mut cursor = 0;
+        for (start, end) in &pieces {
+            assert_eq!(*start, cursor);
+            cursor = *end;
+        }
+        assert_eq!(cursor, 11);
+    }
 
     #[test]
     fn backspace_keeps_grapheme_clusters_whole() {

@@ -492,7 +492,14 @@ fn inline(
         for atom in atoms {
             match atom {
                 Atom::Prose { text, runs } => {
-                    row = row.child(StyledText::new(text).with_runs(runs));
+                    // `min_w(0)` lets a prose run shrink below its natural
+                    // width so it wraps; a flex item's default `min-width:
+                    // auto` would hold it at full width and overflow.
+                    row = row.child(
+                        div()
+                            .min_w(px(0.0))
+                            .child(StyledText::new(text).with_runs(runs)),
+                    );
                 }
                 Atom::Code { value, trailing } => {
                     let chip = div()

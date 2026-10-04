@@ -77,7 +77,15 @@ shown.
 The model picker offers every model in pi's catalog for the endpoint (loaded
 once in the background from the agent's models-store, locally or over SSH),
 plus any session model the catalog does not know; choosing one sends `/model`
-to the live agent. Picker chips and dropdowns are the shared composer
+to the live agent. pi's catalog runs to hundreds of models, so the list is
+virtualized and bounded to the shared menu height: it scrolls, and once it
+outgrows the rows that fit it grows a type-to-filter field (the composer
+prompt keeps the keyboard otherwise, so a query never lands in the draft).
+The query matches a display name or a `provider/id` slug, which is also the
+dim hint beside each row — names repeat across providers. Opening scrolls
+the live model into view, and up/down plus Enter walk and take the rows, so
+the picker is usable without a mouse. Picker chips and dropdowns are the
+shared composer
 components Home uses (`picker_face`, `picker_menu`, `picker_row`): the same
 chip face, leading glyphs, and floated option list, opening upward in the
 session composer. Picker lists dismiss on an outside press or Escape. A successful send clears the draft silently; only

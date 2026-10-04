@@ -26,8 +26,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Anchor, AnyElement, Context, Div, ElementId, Entity, FollowMode, Keystroke, ListAlignment,
-    ListOffset, ListState, Stateful, anchored, deferred, div, list, point, prelude::*, px, relative,
+    Anchor, AnyElement, App, Context, Div, ElementId, Entity, FollowMode, Keystroke, ListAlignment,
+    ListOffset, ListState, ScrollStrategy, Stateful, UniformListScrollHandle, anchored, deferred,
+    div, list, point, prelude::*, px, relative, uniform_list,
 };
 use pilus_client::{AgentModel, ControlClient, SshTarget};
 use pilus_session::{
@@ -100,21 +101,121 @@ fn dock_slot(content: impl IntoElement) -> Div {
 
 /// Which composer picker is open, if any.
 #[derive(Clone, Copy, PartialEq)]
-enum PickerKind {
+pub(super) enum PickerKind {
     Model,
     Thinking,
 }
 
 /// Thinking levels pi accepts for `/thinking`, from its settings reference.
 const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// One composer picker row: what it shows, what choosing it sends, and
+/// whether the live session is already on it.
+struct PickerOption {
+    /// The row's label: the catalog's display name, the model's slug when
+    /// the catalog has no name for it, or the thinking level.
+    label: String,
+    /// What choosing the row sends: a `provider/id` slug, or a level.
+    value: String,
+    /// The provider a model belongs to, dimmed beside its label. Models
+    /// repeat their display names across providers, so the slug is what
+    /// tells two rows of a long catalog apart.
+    hint: Option<String>,
+    /// Whether the live agent is on this value.
+    current: bool,
+}
+
+/// Every row a composer picker offers.
+///
+/// The catalog comes first, in its own order (pi's default provider and
+/// model on top), then any model this session used that the catalog does
+/// not know — a spelling the agent accepted once is still a valid choice.
+fn picker_options(
+    catalog: &[AgentModel],
+    session_models: &[String],
+    current: &str,
+) -> Vec<PickerOption> {
+    let mut options: Vec<PickerOption> = Vec::new();
+    for model in catalog {
+        let value = if model.provider.is_empty() {
+            model.id.clone()
+        } else {
+            format!("{}/{}", model.provider, model.id)
+        };
+        if value.is_empty() || options.iter().any(|known| known.value == value) {
+            continue;
+        }
+        let current = value == current;
+        options.push(PickerOption {
+            label: if model.name.is_empty() {
+                value.clone()
+            } else {
+                model.name.clone()
+            },
+            value,
+            hint: (!model.provider.is_empty()).then(|| model.provider.clone()),
+            current,
+        });
+    }
+    for value in session_models {
+        if options.iter().any(|known| known.value == *value) {
+            continue;
+        }
+        options.push(PickerOption {
+            label: value.clone(),
+            value: value.clone(),
+            hint: None,
+            current: *value == current,
+        });
+    }
+    options
+}
+
+/// The rows a picker's filter keeps, as indices into `options`.
+///
+/// The query matches the label or the slug, so both `gpt` and
+/// `openrouter/gpt` find the row.
+fn picker_matches(options: &[PickerOption], filter: &str) -> Vec<usize> {
+    let needle = filter.trim().to_lowercase();
+    options
+        .iter()
+        .enumerate()
+        .filter(|(_, option)| {
+            needle.is_empty()
+                || option.label.to_lowercase().contains(&needle)
+                || option.value.to_lowercase().contains(&needle)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Where a picker's highlight lands after moving `delta` rows, wrapping.
+/// The cursor is an index into the matches, so a filter that drops the
+/// highlighted row re-homes it on the first one left.
+fn picker_cursor_after(cursor: usize, count: usize, delta: isize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    (cursor as isize + delta).rem_euclid(count as isize) as usize
+}
+
 /// How long after the last file growth the session still counts as active.
 /// Past this, a trailing work item is a stale tail (interrupted session),
 /// not live work. Generous: quiet stretches (a long generation writes
 /// nothing until it completes) must not flip a live turn to idle.
 const ACTIVE_WINDOW: Duration = Duration::from_secs(90);
-/// Visible rows in a composer picker; longer lists scroll. Row metrics come
-/// from the shared composer picker menu.
-const PICKER_MAX_ROWS: usize = 8;
+/// Rows the prompts menu shows before it scrolls. It stacks its rows with
+/// a gap, so fewer of them fit than the picker’s packed list holds.
+const PROMPTS_MAX_ROWS: usize = 7;
+
+/// How many option rows the composer picker shows: the menu's shared
+/// height budget, less its padding and, when the list is long enough to
+/// need one, its filter field.
+fn picker_visible_rows(filtered: bool) -> usize {
+    let chrome = super::picker_menu_h(1, filtered) - super::PICKER_ROW_H;
+    let budget = (super::PICKER_MENU_MAX_H - chrome).max(super::PICKER_ROW_H);
+    (budget / super::PICKER_ROW_H) as usize
+}
 
 /// Where a session's bytes live, and how to reach its daemon.
 #[derive(Clone)]
@@ -420,6 +521,18 @@ pub struct SessionPanel {
     /// The picker an outside press just dismissed, so the following click on
     /// its own chip stays closed instead of reopening it.
     picker_dismissed: Option<PickerKind>,
+    /// The open picker's type-to-filter field. It is the focused element
+    /// while the picker is open, so a query never lands in the prompt
+    /// draft the user is about to send.
+    picker_field: Option<Entity<TextInput>>,
+    /// The open picker's highlighted row, as an index into its matches.
+    picker_cursor: usize,
+    /// The query the highlight was last reconciled against, so a frame
+    /// that only repaints does not rebuild the option list.
+    picker_query: String,
+    /// Scroll position for the picker's virtualized option list, which is
+    /// how a catalog of hundreds of models stays browsable.
+    picker_scroll: UniformListScrollHandle,
     /// Whether the in-flight send clears the composer on success; picker
     /// commands (`/model`, `/thinking`) leave the draft alone.
     send_clears_input: bool,
@@ -504,6 +617,10 @@ impl Default for SessionPanel {
             catalog: Vec::new(),
             picker: None,
             picker_dismissed: None,
+            picker_field: None,
+            picker_cursor: 0,
+            picker_query: String::new(),
+            picker_scroll: UniformListScrollHandle::default(),
             send_clears_input: true,
             pending_prompt: None,
             pending_from: 0,
@@ -699,6 +816,8 @@ impl SessionPanel {
         self.catalog.clear();
         self.picker = None;
         self.picker_dismissed = None;
+        self.picker_cursor = 0;
+        self.picker_query.clear();
         self.pending_prompt = None;
         self.pending_from = 0;
         self.prompts_open = false;
@@ -872,6 +991,9 @@ impl SessionPanel {
             }
             changed = true;
         }
+        // Typing in the filter field lands through the input method, so the
+        // query is reconciled here rather than in a keystroke.
+        self.sync_picker(cx);
         changed
     }
 
@@ -953,14 +1075,26 @@ impl SessionPanel {
         input: &Entity<TextInput>,
         cx: &mut Context<PilusView>,
     ) -> bool {
+        // An open picker owns the keyboard while it lasts: arrows walk its
+        // rows, Enter takes the highlighted one. Everything else belongs to
+        // the filter field, or to the draft when the list is short enough
+        // to need no field.
+        if self.picker.is_some() {
+            match keystroke.key.as_str() {
+                "escape" => self.close_picker(cx),
+                "up" => self.move_picker(-1, cx),
+                "down" => self.move_picker(1, cx),
+                "enter" | "tab" => self.choose_picker_cursor(cx),
+                _ => return false,
+            }
+            return true;
+        }
         match keystroke.key.as_str() {
             "escape" => {
                 // Open menus eat the first Escape in topmost order; the next
                 // one closes the panel — unless it is pinned, where Escape
                 // does nothing so the pane's terminal stays replaced.
-                if self.picker.take().is_some() {
-                    self.picker_dismissed = None;
-                } else if self.prompts_open {
+                if self.prompts_open {
                     self.prompts_open = false;
                     self.prompts_dismissed = false;
                 } else if !self.pinned {
@@ -1019,8 +1153,7 @@ impl SessionPanel {
     /// composer's draft. The socket takes the typed command; the terminal
     /// path only remains for when it is down.
     fn send_command(&mut self, command: String, cx: &mut Context<PilusView>) {
-        self.picker = None;
-        self.picker_dismissed = None;
+        self.close_picker(cx);
         if self.rpc_up {
             if let Some(argument) = command.strip_prefix("/model ") {
                 let (provider, model) = argument.split_once('/').unwrap_or(("", argument));
@@ -1137,23 +1270,209 @@ impl SessionPanel {
         cx.notify();
     }
 
+    /// Give the panel the field its open picker filters through. The view
+    /// owns the entity, like the composer prompt; the panel only reads the
+    /// query and clears it when a picker opens.
+    pub(super) fn set_picker_field(&mut self, field: Entity<TextInput>) {
+        self.picker_field = Some(field);
+    }
+
+    /// Whether a composer picker is open, so the view hands the keyboard to
+    /// its filter field instead of the prompt.
+    pub(super) fn picker_open(&self) -> bool {
+        self.picker.is_some()
+    }
+
+    /// Whether the open picker draws its filter field: only a model list that
+    /// outgrows the rows that fit is worth filtering.
+    fn picker_filtered(&self) -> bool {
+        self.picker == Some(PickerKind::Model)
+            && self.picker_list_options().len() > picker_visible_rows(false)
+    }
+
+    /// The filter field, while the open picker has one. The view focuses
+    /// this instead of the prompt, so a query never lands in the draft the
+    /// user is about to send.
+    pub(super) fn picker_filter_field(&self) -> Option<Entity<TextInput>> {
+        if self.picker_filtered() {
+            self.picker_field.clone()
+        } else {
+            None
+        }
+    }
+
     /// Toggle a composer picker from its chip.
     ///
     /// A press outside the picker already closed it in the capture phase; in
     /// that case this click is a toggle-off and must not reopen it. A click
     /// on the *other* chip still opens it directly.
-    fn toggle_picker(&mut self, kind: PickerKind) {
+    fn toggle_picker(&mut self, kind: PickerKind, cx: &mut Context<PilusView>) {
         if self.picker_dismissed.take() == Some(kind) || self.picker == Some(kind) {
-            self.picker = None;
+            self.close_picker(cx);
+            return;
+        }
+        self.picker = Some(kind);
+        self.open_picker(cx);
+    }
+
+    /// Open a picker for the shot harness, which paints a long catalog
+    /// without a live agent behind it.
+    #[cfg(feature = "visual-test")]
+    pub(super) fn open_picker_shot(&mut self, kind: PickerKind) {
+        self.picker = Some(kind);
+        self.picker_cursor = self.current_row("");
+        self.picker_scroll
+            .scroll_to_item(self.picker_cursor, ScrollStrategy::Center);
+    }
+
+    /// The catalog the model picker offers, `pub(super)` for the same
+    /// reason as [`Self::open_picker_shot`].
+    #[cfg(feature = "visual-test")]
+    pub(super) fn set_catalog(&mut self, catalog: Vec<AgentModel>) {
+        self.catalog = catalog;
+    }
+
+    /// A freshly opened picker: an empty query, and the highlight on the
+    /// value the session is already using — in a catalog of hundreds of
+    /// models, row zero is rarely it.
+    fn open_picker(&mut self, cx: &mut Context<PilusView>) {
+        self.clear_picker_field(cx);
+        self.picker_cursor = self.current_row("");
+        self.picker_scroll
+            .scroll_to_item(self.picker_cursor, ScrollStrategy::Center);
+    }
+
+    /// The row a picker opens its highlight on: the live value when the
+    /// query keeps it, the first row left otherwise.
+    fn current_row(&self, filter: &str) -> usize {
+        let (options, matches) = self.picker_rows(filter);
+        if filter.trim().is_empty()
+            && let Some(row) = matches.iter().position(|index| options[*index].current)
+        {
+            return row;
+        }
+        0
+    }
+
+    /// Close the open picker, forgetting its query and highlight.
+    fn close_picker(&mut self, cx: &mut Context<PilusView>) {
+        self.picker = None;
+        self.picker_dismissed = None;
+        self.picker_cursor = 0;
+        self.clear_picker_field(cx);
+    }
+
+    /// Empty the filter field, so a reopened picker never starts on the
+    /// previous query.
+    fn clear_picker_field(&mut self, cx: &mut Context<PilusView>) {
+        self.picker_query.clear();
+        if let Some(field) = &self.picker_field {
+            field.update(cx, |field, cx| field.clear(cx));
+        }
+    }
+
+    /// Keep the open picker's highlight honest as its query narrows the
+    /// list: a query that drops the highlighted row re-homes it, and the
+    /// list scrolls the highlight back into view. Only a changed query
+    /// does any of this, so wheel-scrolling the list is never undone by a
+    /// repaint.
+    fn sync_picker(&mut self, cx: &mut Context<PilusView>) {
+        if self.picker.is_none() {
+            return;
+        }
+        let query = self.picker_filter(cx);
+        if query == self.picker_query {
+            return;
+        }
+        self.picker_query = query;
+        let (_, matches) = self.picker_rows(&self.picker_query);
+        // A query picks for the user: the first row it keeps. An empty one
+        // leaves the highlight where it is, clamped into range.
+        let cursor = if self.picker_query.trim().is_empty() {
+            self.picker_cursor.min(matches.len().saturating_sub(1))
         } else {
-            self.picker = Some(kind);
+            0
+        };
+        if cursor != self.picker_cursor {
+            self.picker_cursor = cursor;
+            self.picker_scroll
+                .scroll_to_item(cursor, ScrollStrategy::Center);
         }
     }
 
     /// Close the open picker from an outside press, remembering which one so
     /// its own chip's click stays closed.
-    fn dismiss_picker(&mut self) {
-        self.picker_dismissed = self.picker.take();
+    fn dismiss_picker(&mut self, cx: &mut Context<PilusView>) {
+        if self.picker.is_some() {
+            self.picker_dismissed = self.picker;
+        }
+        self.close_picker(cx);
+    }
+
+    /// The open picker's query, read from its filter field.
+    fn picker_filter(&self, cx: &App) -> String {
+        self.picker_field
+            .as_ref()
+            .map(|field| field.read(cx).value())
+            .unwrap_or_default()
+    }
+
+    /// The open picker's options and the rows `filter` keeps.
+    fn picker_rows(&self, filter: &str) -> (Vec<PickerOption>, Vec<usize>) {
+        let options = self.picker_list_options();
+        let matches = picker_matches(&options, filter);
+        (options, matches)
+    }
+
+    /// Every row the open picker offers, current value marked.
+    fn picker_list_options(&self) -> Vec<PickerOption> {
+        match self.picker {
+            Some(PickerKind::Thinking) => THINKING_LEVELS
+                .iter()
+                .map(|level| PickerOption {
+                    label: level.to_string(),
+                    value: level.to_string(),
+                    hint: None,
+                    current: *level == self.current_thinking().unwrap_or_default(),
+                })
+                .collect(),
+            _ => picker_options(
+                &self.catalog,
+                &self.transcript.models,
+                &self.current_model_slug(),
+            ),
+        }
+    }
+
+    /// Move the open picker's highlight, keeping it in view.
+    fn move_picker(&mut self, delta: isize, cx: &mut Context<PilusView>) {
+        let (_, matches) = self.picker_rows(&self.picker_filter(cx));
+        self.picker_cursor = picker_cursor_after(self.picker_cursor, matches.len(), delta);
+        self.picker_scroll
+            .scroll_to_item(self.picker_cursor, ScrollStrategy::Center);
+    }
+
+    /// Take the picker's highlighted row, as the live agent would.
+    fn choose_picker_cursor(&mut self, cx: &mut Context<PilusView>) {
+        let Some(kind) = self.picker else {
+            return;
+        };
+        let (options, matches) = self.picker_rows(&self.picker_filter(cx));
+        if let Some(value) = matches
+            .get(self.picker_cursor)
+            .map(|index| options[*index].value.clone())
+        {
+            self.choose_picker(kind, value, cx);
+        }
+    }
+
+    /// Send a picker's choice to the live agent as its slash command.
+    fn choose_picker(&mut self, kind: PickerKind, value: String, cx: &mut Context<PilusView>) {
+        let command = match kind {
+            PickerKind::Model => format!("/model {value}"),
+            PickerKind::Thinking => format!("/thinking {value}"),
+        };
+        self.send_command(command, cx);
     }
 
     /// Toggle one card between collapsed and expanded.
@@ -2214,7 +2533,7 @@ impl SessionPanel {
                 _ => None,
             })
             .collect();
-        let rows = prompts.len().clamp(1, PICKER_MAX_ROWS);
+        let rows = prompts.len().clamp(1, PROMPTS_MAX_ROWS);
         let list_h = super::picker_rows_h(rows).min(super::PICKER_MENU_MAX_H);
         let mut list = super::picker_menu("pilus-session-prompts", theme)
             .max_h(px(list_h))
@@ -2507,7 +2826,7 @@ impl SessionPanel {
             theme,
             fonts.secondary,
             cx.listener(move |this: &mut PilusView, _, _, cx| {
-                this.session.toggle_picker(kind);
+                this.session.toggle_picker(kind, cx);
                 cx.notify();
             }),
         );
@@ -2525,7 +2844,9 @@ impl SessionPanel {
 
     /// The open picker's options, floated above its chip.
     ///
-    /// Rows are a fixed height and the list an exact pixel height, so the
+    /// The list is virtualized: pi's catalog runs to hundreds of models,
+    /// so painting every row would cost more than the transcript does. Rows
+    /// are a fixed height and the menu an exact pixel height, so the
     /// anchored offset opens it upward without shifting the composer.
     fn picker_list(
         &self,
@@ -2534,97 +2855,109 @@ impl SessionPanel {
         cx: &mut Context<PilusView>,
     ) -> AnyElement {
         let theme = self.theme;
-        let current_model = self.current_model_slug();
-        let current_thinking = self.current_thinking().unwrap_or_default();
-        // One option per model: the catalog's `provider/id` value under its
-        // display name, then any session model the catalog does not know.
-        // Each entry is `(label, /model argument, is-current)`.
-        let options: Vec<(String, String, bool)> = match kind {
-            PickerKind::Model => {
-                let mut options = Vec::new();
-                for model in &self.catalog {
-                    let value = if model.provider.is_empty() {
-                        model.id.clone()
-                    } else {
-                        format!("{}/{}", model.provider, model.id)
-                    };
-                    if value.is_empty() || options.iter().any(|(_, known, _)| *known == value) {
-                        continue;
-                    }
-                    let label = if model.name.is_empty() {
-                        value.clone()
-                    } else {
-                        model.name.clone()
-                    };
-                    options.push((label, value.clone(), value == current_model));
-                }
-                for model in &self.transcript.models {
-                    if options.iter().any(|(_, known, _)| *known == *model) {
-                        continue;
-                    }
-                    options.push((model.clone(), model.clone(), *model == current_model));
-                }
-                options
-            }
-            PickerKind::Thinking => THINKING_LEVELS
-                .iter()
-                .map(|level| {
-                    (
-                        level.to_string(),
-                        level.to_string(),
-                        *level == current_thinking,
-                    )
-                })
-                .collect(),
-        };
-        // One row even when empty, so the placeholder still measures right.
-        let rows = options.len().clamp(1, PICKER_MAX_ROWS);
-        let list_h = super::picker_rows_h(rows).min(super::PICKER_MENU_MAX_H);
+        let (options, matches) = self.picker_rows(&self.picker_filter(cx));
+        let cursor = self.picker_cursor.min(matches.len().saturating_sub(1));
+        let filtered = self.picker_filtered();
+        // One row even when the filter keeps nothing, so the placeholder
+        // still measures right.
+        let rows = matches.len().clamp(1, picker_visible_rows(filtered));
+        let list_h = super::picker_menu_h(rows, filtered);
         let mut list = super::picker_menu("pilus-session-picker", theme)
             .max_h(px(list_h))
             .on_mouse_down_out(cx.listener(|this: &mut PilusView, _, _, cx| {
-                this.session.dismiss_picker();
+                this.session.dismiss_picker(cx);
                 cx.notify();
             }));
-        if options.is_empty() {
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(px(super::PICKER_ROW_H))
-                    .px_3()
-                    .text_size(px(fonts.body))
-                    .text_color(theme.muted)
-                    .child("No models available"),
+        if filtered {
+            let count = format!("{} of {}", matches.len(), options.len());
+            let Some(field) = self.picker_field.clone() else {
+                return self.anchored_picker(list, list_h);
+            };
+            field.update(cx, |field, _| {
+                field.set_style(
+                    theme,
+                    style::chrome_font(&self.settings),
+                    px(fonts.secondary),
+                );
+            });
+            list = list.child(super::picker_filter_field(theme, fonts.label, count, field));
+        }
+        if matches.is_empty() {
+            let empty = if options.is_empty() {
+                "No models available"
+            } else {
+                "No models match"
+            };
+            return self.anchored_picker(
+                list.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .h(px(super::PICKER_ROW_H))
+                        .px_3()
+                        .text_size(px(fonts.body))
+                        .text_color(theme.muted)
+                        .child(empty),
+                ),
+                list_h,
             );
         }
-        for (index, (label, value, current)) in options.iter().enumerate().take(PICKER_MAX_ROWS) {
-            let argument = value.clone();
-            list = list.child(super::picker_row(
-                ("session-picker-option", index),
-                label.clone(),
-                *current,
-                theme,
-                fonts.body,
-                // A choice goes to the live agent as a slash command and
-                // surfaces in the transcript when pi records the change.
-                cx.listener(move |this: &mut PilusView, _, _, cx| {
-                    let command = match kind {
-                        PickerKind::Model => format!("/model {argument}"),
-                        PickerKind::Thinking => format!("/thinking {argument}"),
-                    };
-                    this.session.send_command(command, cx);
-                    cx.notify();
-                }),
-            ));
-        }
+        let view = cx.weak_entity();
+        let body_h = super::picker_body_h(rows);
+        list = list.child(
+            uniform_list(
+                "session-picker-list",
+                matches.len(),
+                move |range, _window, _cx| {
+                    range
+                        .map(|row| {
+                            let option = &options[matches[row]];
+                            let argument = option.value.clone();
+                            let hint = option.hint.clone();
+                            let label = option.label.clone();
+                            let active = row == cursor;
+                            let view = view.clone();
+                            super::picker_option_row(
+                                ("session-picker-option", row),
+                                label,
+                                hint,
+                                active || option.current,
+                                theme,
+                                fonts.body,
+                                // A choice goes to the live agent as a
+                                // slash command and surfaces in the
+                                // transcript when pi records the change.
+                                move |_, _, cx| {
+                                    // A dropped view means the window is
+                                    // closing under the overlay.
+                                    let _ = view.update(cx, |this: &mut PilusView, cx| {
+                                        this.session.choose_picker(kind, argument.clone(), cx);
+                                        cx.notify();
+                                    });
+                                },
+                            )
+                            .into_any_element()
+                        })
+                        .collect()
+                },
+            )
+            .h(px(body_h))
+            .w_full()
+            .track_scroll(&self.picker_scroll),
+        );
+        self.anchored_picker(list, list_h)
+    }
+
+    /// Float a picker menu above its chip: the anchored overlay offsets by
+    /// the menu's exact height so opening it never moves the composer.
+    fn anchored_picker(&self, menu: Stateful<Div>, height: f32) -> AnyElement {
         deferred(
             anchored()
                 .anchor(Anchor::TopLeft)
-                .offset(point(px(0.0), px(-(list_h + 6.0))))
+                .offset(point(px(0.0), px(-(height + 6.0))))
                 .snap_to_window_with_margin(px(8.0))
-                .child(list),
+                .child(menu),
         )
         .with_priority(1)
         .into_any_element()
@@ -3628,6 +3961,64 @@ mod tests {
         let text = "a\nb\nc\nd";
         assert_eq!(clip_lines(text, 10), text);
         assert_eq!(clip_lines(text, 2), "a\nb\n… (truncated)");
+    }
+
+    fn model(provider: &str, id: &str, name: &str) -> AgentModel {
+        AgentModel {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            name: name.to_string(),
+            ..AgentModel::default()
+        }
+    }
+
+    #[test]
+    fn picker_options_keep_every_catalog_model() {
+        let catalog: Vec<AgentModel> = (0..50)
+            .map(|ix| model("openrouter", &format!("m{ix}"), &format!("Model {ix}")))
+            .collect();
+        let options = picker_options(&catalog, &[], "openrouter/m7");
+        // The picker truncates no longer: every catalog model is a row.
+        assert_eq!(options.len(), 50);
+        assert_eq!(options[7].value, "openrouter/m7");
+        assert!(options[7].current);
+        assert_eq!(options[7].hint.as_deref(), Some("openrouter"));
+        assert_eq!(options[8].label, "Model 8");
+    }
+
+    #[test]
+    fn picker_options_add_unknown_session_models_once() {
+        let catalog = vec![model("pi", "known", "Known")];
+        let session = vec!["pi/known".to_string(), "other/model".to_string()];
+        let options = picker_options(&catalog, &session, "");
+        // A model the catalog dropped stays selectable, and the one it
+        // knows does not appear twice.
+        assert_eq!(
+            options.iter().map(|o| o.value.as_str()).collect::<Vec<_>>(),
+            vec!["pi/known", "other/model"]
+        );
+        assert_eq!(options[1].hint, None);
+    }
+
+    #[test]
+    fn picker_filter_matches_label_and_slug() {
+        let catalog = vec![
+            model("openrouter", "gpt-5", "GPT 5"),
+            model("pi", "muse", "Muse Spark"),
+        ];
+        let options = picker_options(&catalog, &[], "");
+        assert_eq!(picker_matches(&options, ""), vec![0, 1]);
+        assert_eq!(picker_matches(&options, "muse"), vec![1]);
+        assert_eq!(picker_matches(&options, "openrouter/gpt"), vec![0]);
+        assert!(picker_matches(&options, "nope").is_empty());
+    }
+
+    #[test]
+    fn picker_cursor_wraps_in_both_directions() {
+        assert_eq!(picker_cursor_after(0, 3, 1), 1);
+        assert_eq!(picker_cursor_after(2, 3, 1), 0);
+        assert_eq!(picker_cursor_after(0, 3, -1), 2);
+        assert_eq!(picker_cursor_after(4, 0, 1), 0);
     }
 
     fn push(panel: &mut SessionPanel, kind: ItemKind) {

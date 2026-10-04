@@ -89,6 +89,14 @@ const PICKER_CHIP_H: f32 = 24.0;
 const PICKER_MENU_W: f32 = 260.0;
 const PICKER_MENU_MAX_H: f32 = 240.0;
 const PICKER_ROW_H: f32 = 30.0;
+/// A menu's own padding (`p_1`) and the gap between its rows (`gap_1`). The
+/// menus know their exact height from these, so an anchored overlay can
+/// offset by it and open without shifting the composer.
+const PICKER_PAD: f32 = 4.0;
+const PICKER_GAP: f32 = 4.0;
+/// A picker's type-to-filter field, drawn once a list outgrows the rows
+/// that fit.
+const PICKER_FIELD_H: f32 = 28.0;
 /// Grid offset from the window top: tab strip plus its top spacing.
 const HEADER_HEIGHT: f32 = 40.0;
 /// Daemon rows skipped at the top of the grid. The daemon draws its own tab
@@ -1504,6 +1512,17 @@ impl PilusView {
             )
             .submit_on_enter()
         });
+        let session_filter = cx.new(|cx| {
+            TextInput::new(
+                String::new(),
+                "Filter models",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.label),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
         let picker = WorkspacePicker::default();
         let picker_path = cx.new(|cx| {
             TextInput::from_shared(
@@ -1714,6 +1733,10 @@ impl PilusView {
             settings_open: false,
             settings_status: String::new(),
         };
+        // The session panel filters its model picker through this field; it
+        // owns the entity the way the view owns the composer prompt, so a
+        // query never lands in the draft the user is about to send.
+        view.session.set_picker_field(session_filter);
         // Seed the remembered frame from the one the window actually opened
         // with; moves and resizes update it from here on.
         view.remember_window_bounds(window, cx);
@@ -3875,6 +3898,11 @@ impl PilusView {
         let theme = self.theme;
         let settings = self.shared_settings.clone();
         let input = self.session_prompt.clone();
+        // While a picker is open, up and down walk its rows rather than
+        // moving the draft's caret; every other editing key still belongs
+        // to the prompt.
+        let picker_open = self.session.picker_open();
+        input.update(cx, |input, _| input.surrender_vertical_keys(picker_open));
         self.session.render(theme, &settings, &input, cx)
     }
 
@@ -4550,7 +4578,14 @@ impl PilusView {
                     None
                 }
             }
-            InputLayer::Session => Some(self.session_prompt.focus_handle(cx)),
+            // An open session picker takes the keyboard, so a query reaches
+            // its filter field instead of the prompt the user is typing.
+            InputLayer::Session => Some(
+                self.session
+                    .picker_filter_field()
+                    .unwrap_or_else(|| self.session_prompt.clone())
+                    .focus_handle(cx),
+            ),
             InputLayer::Terminal => None,
         };
         match target {
@@ -11127,11 +11162,28 @@ fn picker_row(
     font_size: f32,
     on_choose: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    picker_option_row(id, label, None, active, theme, font_size, on_choose)
+}
+
+/// [`picker_row`] with a dim hint at the trailing edge — the provider that
+/// owns a model, say. Display names repeat across providers, so the hint is
+/// what tells two rows of a long catalog apart.
+fn picker_option_row(
+    id: impl Into<ElementId>,
+    label: String,
+    hint: Option<String>,
+    active: bool,
+    theme: Theme,
+    font_size: f32,
+    on_choose: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let hint_font = font_size;
     div()
         .id(id)
         .flex()
         .flex_row()
         .items_center()
+        .w_full()
         .h(px(PICKER_ROW_H))
         .px_3()
         .rounded_md()
@@ -11147,14 +11199,75 @@ fn picker_row(
         .hover(move |style| style.bg(theme.panel))
         // Long values (session prompts) truncate to one row.
         .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
+        .when_some(hint, |row, hint| {
+            row.child(
+                div()
+                    .flex_shrink_0()
+                    .pl_2()
+                    .truncate()
+                    .text_size(px(hint_font))
+                    .text_color(theme.muted)
+                    .child(hint),
+            )
+        })
         .on_click(on_choose)
+}
+
+/// A picker's type-to-filter field: the query input beside the count of
+/// what it keeps. The field is interactive content, so it takes
+/// `theme.border` rather than the floating panel's hairline.
+fn picker_filter_field(
+    theme: Theme,
+    font_size: f32,
+    count: String,
+    input: Entity<TextInput>,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .h(px(PICKER_FIELD_H))
+        .px_2()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .child(input)
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(font_size))
+                .text_color(theme.muted)
+                .child(count),
+        )
 }
 
 /// The exact pixel height of `rows` menu rows, so a menu that opens upward
 /// can offset by its full height.
 fn picker_rows_h(rows: usize) -> f32 {
     // `p_1` top and bottom, `PICKER_ROW_H` rows, `gap_1` between them.
-    8.0 + rows as f32 * PICKER_ROW_H + rows.saturating_sub(1) as f32 * 4.0
+    PICKER_PAD * 2.0 + rows as f32 * PICKER_ROW_H + rows.saturating_sub(1) as f32 * PICKER_GAP
+}
+
+/// The exact pixel height of a picker's virtualized option list.
+///
+/// Its rows pack without the gap a stacked menu puts between them — a
+/// virtualized list has no stacking to gap — which buys back the space a
+/// menu spends on the rows above.
+fn picker_body_h(rows: usize) -> f32 {
+    rows as f32 * PICKER_ROW_H
+}
+
+/// The exact pixel height of a composer picker menu: its padding, the
+/// filter field when the list is long enough to need one, and `rows`
+/// option rows.
+fn picker_menu_h(rows: usize, filtered: bool) -> f32 {
+    let field = if filtered {
+        PICKER_FIELD_H + PICKER_GAP
+    } else {
+        0.0
+    };
+    PICKER_PAD * 2.0 + field + picker_body_h(rows)
 }
 
 /// The leading glyph of one sidebar context-menu row.

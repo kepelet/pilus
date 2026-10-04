@@ -399,6 +399,36 @@ impl Agent {
     }
 }
 
+/// One resumable agent session found on disk, from `agent.sessions`.
+///
+/// The daemon scans each supported agent's own store, so this is the exact
+/// conversation a live agent is in — including for a remote machine, whose
+/// file the client then reads over its own transport. The list is not filtered
+/// by pane: callers match the `cwd` they already know.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSession {
+    /// The agent kind, e.g. `pi`.
+    pub agent: String,
+    /// The absolute working directory the session was recorded in.
+    pub cwd: String,
+    /// The agent's own session id, used to find its file on disk.
+    pub session_id: String,
+}
+
+impl AgentSession {
+    fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            agent: value.get("agent")?.as_str()?.to_string(),
+            cwd: value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            session_id: value.get("session_id")?.as_str()?.to_string(),
+        })
+    }
+}
+
 /// One worktree of a workspace's repo, from `worktree.list`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorktreeInfo {
@@ -564,6 +594,25 @@ impl ControlClient {
             .map(Vec::as_slice)
             .unwrap_or_default();
         Ok(agents.iter().filter_map(Agent::from_json).collect())
+    }
+
+    /// Every resumable agent session the daemon finds on disk.
+    ///
+    /// Unlike [`Self::agents`], which lists live panes, this is the daemon's
+    /// own scan of each agent's session store (for pi, the JSONL under
+    /// `~/.pi/agent/sessions`). It works over the remote proxy too, so a
+    /// client can locate the exact session a remote agent is in.
+    pub fn agent_sessions(&mut self) -> Result<Vec<AgentSession>> {
+        let result = self.request("agent.sessions", json!({}))?;
+        let sessions = result
+            .get("sessions")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        Ok(sessions
+            .iter()
+            .filter_map(AgentSession::from_json)
+            .collect())
     }
 
     /// Focus the pane an agent runs in, jumping to its workspace and tab.

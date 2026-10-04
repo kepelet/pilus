@@ -108,12 +108,16 @@ impl SshTarget {
 
     /// Build an SSH invocation that runs one shell command on the host.
     ///
-    /// `remote_command` is a complete shell string, already quoted for the
-    /// remote shell; this is used for host operations the Luvus binary does not
-    /// expose, such as listing a directory for the native picker.
+    /// `remote_command` is a complete POSIX shell string; it is quoted for the
+    /// host's login shell and handed to `/bin/sh -c`, so it runs the same
+    /// whatever that login shell is. The server runs the remote command
+    /// through the user's login shell, and fish (a common default) rejects
+    /// POSIX expansions like `${VAR:-default}`; pinning `/bin/sh` keeps host
+    /// operations such as listing a directory or reading a session file
+    /// working on every host.
     pub fn shell(&self, remote_command: &str) -> Command {
         let mut command = self.base();
-        command.arg(remote_command);
+        command.arg(posix_command(remote_command));
         command
     }
 
@@ -406,6 +410,20 @@ fn is_socket(path: &Path) -> Result<bool> {
     }
 }
 
+/// Wrap a host script so it runs under `/bin/sh`, not the login shell.
+fn posix_command(remote_command: &str) -> String {
+    format!("/bin/sh -c {}", quote_for_login_shell(remote_command))
+}
+
+/// Single-quote `value` for the host's login shell.
+///
+/// Both `sh` and `fish` treat a single-quoted run literally and both accept
+/// `'\''` to embed a quote, so the server's login shell reconstructs `value`
+/// as one argument and passes it to `/bin/sh -c`.
+fn quote_for_login_shell(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,23 +517,34 @@ mod tests {
     }
 
     #[test]
-    fn shell_command_runs_a_host_shell_command() {
+    fn shell_runs_the_command_under_a_posix_shell() {
         let target = SshTarget {
             destination: "buildbox".to_string(),
             binary: "/usr/local/bin/luvus".to_string(),
             session: None,
         };
-        let command = target.shell("find '/tmp' -maxdepth 1 -print0");
+        // A fish login shell rejects `${VAR:-default}`; the wrapper keeps the
+        // script for `/bin/sh`, which accepts it.
+        let command = target.shell("printf %s \"${PI_DIR:-$HOME/.pi}\"");
         let args: Vec<String> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert_eq!(
             args.last().expect("remote command"),
-            "find '/tmp' -maxdepth 1 -print0"
+            "/bin/sh -c 'printf %s \"${PI_DIR:-$HOME/.pi}\"'"
         );
         // The binary path belongs to `command`, not to a raw shell invocation.
         assert!(!args.contains(&"/usr/local/bin/luvus".to_string()));
+    }
+
+    #[test]
+    fn login_shell_quoting_round_trips_a_quoted_path() {
+        // A script that already quotes its path must survive the outer quote.
+        assert_eq!(
+            posix_command("find '/tmp/a b' -print0"),
+            "/bin/sh -c 'find '\\''/tmp/a b'\\'' -print0'"
+        );
     }
 
     #[test]

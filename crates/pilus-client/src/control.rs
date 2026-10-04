@@ -750,8 +750,8 @@ impl ControlClient {
     /// Spawn a built-in agent, waiting until its pane is ready.
     ///
     /// `pane` reuses that pane instead of splitting beside the focused one;
-    /// `args` are passed through to the agent's own command line after `--`
-    /// (an empty slice launches with the manifest defaults).
+    /// `args` are shell-quoted onto the agent's own command line (an empty
+    /// slice launches with the manifest defaults).
     pub fn start_agent(
         &mut self,
         name: &str,

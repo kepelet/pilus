@@ -1825,8 +1825,7 @@ impl PilusView {
         // for the palette's Open Pi Session.
         if let Some(spec) = initial_session {
             let api_socket = view.api_socket();
-            view.session
-                .open_local(api_socket, spec, String::new(), None, cx);
+            view.session.open_local(api_socket, spec, None, cx);
         }
 
         view
@@ -4126,7 +4125,6 @@ impl PilusView {
         }
         match desired {
             Some((view, agent)) => {
-                let title = agent.label().to_string();
                 let same_pane = self
                     .pi_view
                     .as_ref()
@@ -4145,7 +4143,6 @@ impl PilusView {
                             self.api_socket(),
                             expand_local(&agent.cwd),
                             want.clone(),
-                            title,
                             view.pane.clone(),
                             cx,
                         ),
@@ -4164,7 +4161,6 @@ impl PilusView {
                                 target,
                                 self.expand_cwd(id, &agent.cwd),
                                 want.clone(),
-                                title,
                                 view.pane.clone(),
                                 cx,
                             );
@@ -4241,7 +4237,6 @@ impl PilusView {
                     self.api_socket(),
                     expand_local(&agent.cwd),
                     Some(session_id),
-                    agent.label().to_string(),
                     agent.pane.clone(),
                     cx,
                 );
@@ -4257,7 +4252,6 @@ impl PilusView {
                     target,
                     cwd,
                     Some(session_id),
-                    agent.label().to_string(),
                     agent.pane.clone(),
                     cx,
                 );
@@ -4378,9 +4372,14 @@ impl PilusView {
         Some((id.clone(), (*workspace).clone()))
     }
 
-    /// The machine key the Home composer's agents come from: always local.
+    /// The machine key the Home composer's agents come from: the target
+    /// workspace's own machine, because that is the one whose pi will run
+    /// and whose catalog its flags must name. A personal launch has no
+    /// workspace and stays local.
     fn home_machine_key(&self) -> String {
-        "local".to_string()
+        self.home_workspace()
+            .and_then(|(id, _)| id.machine_id().map(str::to_string))
+            .unwrap_or_else(|| "local".to_string())
     }
 
     /// The SSH target for a machine key, or `None` for the local machine.
@@ -4422,6 +4421,10 @@ impl PilusView {
                 .cloned()
                 .unwrap_or_default();
             self.agent_config_key = Some(key.clone());
+            // Another machine is another catalog: drop the picks so the new
+            // one's defaults are applied rather than a model it never had.
+            self.home_defaults_for = None;
+            self.home_efforts_for = None;
         }
         self.ensure_agent_configs_for(&key);
     }
@@ -4434,6 +4437,9 @@ impl PilusView {
         if !self.home.is_open() {
             return;
         }
+        // The composer follows the target workspace's machine, so a
+        // workspace switch has to re-point the catalog before it paints.
+        self.ensure_home_agent_configs();
         let workspace_labels: Vec<String> = self
             .home_workspaces()
             .iter()
@@ -4647,6 +4653,21 @@ impl PilusView {
         cx.notify();
     }
 
+    /// The launch flags for the agent, model, and effort the composer names.
+    fn home_launch_args(&self) -> Vec<String> {
+        let Some(config) = self.home_agent() else {
+            return Vec::new();
+        };
+        let pick = |field| {
+            self.home
+                .choice(field)
+                .selected()
+                .unwrap_or("Default")
+                .to_string()
+        };
+        config.launch_args(&pick(HomeField::Model), &pick(HomeField::Effort))
+    }
+
     /// Start the composer's agent in an already-open workspace.
     ///
     /// The workspace may live on a saved machine, so the launch resolves that
@@ -4669,11 +4690,12 @@ impl PilusView {
         };
         let machine = endpoint.machine_id().map(str::to_string);
         let location = workspace.cwd.clone();
+        let args = self.home_launch_args();
         self.home_launching = true;
         self.home.set_status(format!("starting {agent}…"));
         let tx = self.picker_tx.clone();
         std::thread::spawn(move || {
-            let result = launch_home_agent(&mut client, &location, &name, &agent, &prompt);
+            let result = launch_home_agent(&mut client, &location, &name, &agent, &args, &prompt);
             tx.send(PickerEvent::HomeLaunched { machine, result }).ok();
         });
         cx.notify();
@@ -4697,13 +4719,14 @@ impl PilusView {
             return;
         };
         let dir = self.pilus_root.join("sessions").join(&name);
+        let args = self.home_launch_args();
         self.home_launching = true;
         self.home.set_status(format!("starting {agent}…"));
         let tx = self.picker_tx.clone();
         std::thread::spawn(move || {
             let result = pilus_client::init_repository(&dir).and_then(|()| {
                 let location = dir.to_string_lossy().into_owned();
-                launch_home_agent(&mut client, &location, &name, &agent, &prompt)
+                launch_home_agent(&mut client, &location, &name, &agent, &args, &prompt)
             });
             tx.send(PickerEvent::HomeLaunched {
                 machine: None,
@@ -11967,14 +11990,15 @@ fn remove_dock(side: &mut pilus_protocol::SideConfig, name: &str) {
 /// there.
 ///
 /// `agent.start` spawns beside the focused pane, so the workspace open must
-/// land first; both run in one background thread in the caller. The model and
-/// effort pickers are captured in the UI but not forwarded yet: their flags
-/// differ per agent manifest, so forwarding them blindly would fail launches.
+/// land first; both run in one background thread in the caller. `args` are the
+/// agent's own launch flags — pi's model and thinking level, which the catalog
+/// marks default — so a fresh session opens where the user left off.
 fn launch_home_agent(
     client: &mut ControlClient,
     location: &str,
     name: &str,
     agent: &str,
+    args: &[String],
     prompt: &str,
 ) -> Result<(String, Option<Agent>), String> {
     client
@@ -11984,7 +12008,7 @@ fn launch_home_agent(
     // the launch does not split a second, empty terminal beside Pi.
     let pane = client.idle_pane().ok().flatten();
     client
-        .start_agent(name, agent, pane.as_deref(), &[])
+        .start_agent(name, agent, pane.as_deref(), args)
         .map_err(|error| error.to_string())?;
     // Go straight into the agent's pane rather than whatever pane the daemon
     // left focused, so the prompt lands in front of the user.

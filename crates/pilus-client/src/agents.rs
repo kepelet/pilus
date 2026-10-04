@@ -100,6 +100,38 @@ impl AgentConfig {
         self.model(name)
             .and_then(|model| model.default_effort.clone())
     }
+
+    /// The flags that open a fresh session of this agent on `model` at
+    /// `effort`, both display names from this catalog.
+    ///
+    /// Only Pi's pair is forwarded: its catalog *is* its flag vocabulary, so a
+    /// fresh session starts on the model and thinking level the catalog
+    /// marks default. Every other agent spells its own, and a flag it does
+    /// not know aborts the launch, so those keep the manifest defaults.
+    #[must_use]
+    pub fn launch_args(&self, model: &str, effort: &str) -> Vec<String> {
+        if self.kind != "pi" {
+            return Vec::new();
+        }
+        let Some(model) = self.model(model) else {
+            return Vec::new();
+        };
+        let mut args = Vec::new();
+        if !model.provider.is_empty() {
+            args.push("--model".to_string());
+            args.push(format!("{}/{}", model.provider, model.id));
+        }
+        // A level the model does not list is left to pi: the generic fallback
+        // set offers levels this model would reject.
+        if effort != "Default"
+            && let Some(levels) = model.efforts.as_ref()
+            && levels.iter().any(|level| level == effort)
+        {
+            args.push("--thinking".to_string());
+            args.push(thinking_flag(effort));
+        }
+        args
+    }
 }
 
 /// A built-in agent's on-disk fingerprints and discovery method.
@@ -695,6 +727,15 @@ fn sort_efforts(levels: &mut Vec<String>) {
     levels.dedup();
 }
 
+/// The flag value for a reasoning level label, the inverse of `effort_label`.
+fn thinking_flag(label: &str) -> String {
+    match label.to_ascii_lowercase().as_str() {
+        "extra high" | "extra-high" | "extra_high" | "xhigh" => "xhigh".to_string(),
+        "none" | "off" => "off".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Display label for a pi thinking level (`high` to `High`).
 pub fn effort_label(level: &str) -> String {
     match level.to_ascii_lowercase().as_str() {
@@ -759,6 +800,50 @@ mod tests {
         assert_eq!(config.efforts_for("A"), vec!["Default", "Low", "High"]);
         assert_eq!(config.default_effort_for("A").as_deref(), Some("High"));
         assert_eq!(config.efforts_for("missing")[0], "Default");
+    }
+
+    #[test]
+    fn pi_launch_args_carry_the_model_and_a_listed_level() {
+        let store = json!({
+            "main": { "models": [
+                { "id": "a", "name": "A", "reasoning": true,
+                  "thinkingLevelMap": { "low": "l", "xhigh": "x" } },
+                { "id": "b", "name": "B", "reasoning": false }
+            ] }
+        });
+        let settings = json!({ "defaultProvider": "main", "defaultModel": "a", "defaultThinkingLevel": "low" });
+        let mut config = AgentConfig {
+            kind: "pi".to_string(),
+            ..AgentConfig::default()
+        };
+        apply_pi(&mut config, Some(&store), Some(&settings));
+        assert_eq!(
+            config.launch_args("A", "Low"),
+            ["--model", "main/a", "--thinking", "low"]
+        );
+        assert_eq!(
+            config.launch_args("A", "Extra High"),
+            ["--model", "main/a", "--thinking", "xhigh"]
+        );
+        // B has no reasoning mode, and `Default` is pi's own choice.
+        assert_eq!(config.launch_args("B", "Default"), ["--model", "main/b"]);
+        assert!(config.launch_args("missing", "Low").is_empty());
+    }
+
+    #[test]
+    fn only_pi_forwards_launch_flags() {
+        let mut config = AgentConfig {
+            kind: "codex".to_string(),
+            ..AgentConfig::default()
+        };
+        config.models.push(AgentModel {
+            provider: "openai".into(),
+            id: "gpt-x".into(),
+            name: "GPT X".into(),
+            efforts: Some(vec!["High".into()]),
+            ..AgentModel::default()
+        });
+        assert!(config.launch_args("GPT X", "High").is_empty());
     }
 
     #[test]

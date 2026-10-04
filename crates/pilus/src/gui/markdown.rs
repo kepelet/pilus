@@ -309,6 +309,7 @@ fn block(
                 .flex()
                 .flex_col()
                 .gap_1()
+                .mx_1()
                 .rounded_md()
                 .bg(theme.panel_dim)
                 .px_3()

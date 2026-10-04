@@ -232,6 +232,10 @@ enum Endpoint {
 /// transcript clone per tick. Boxed through [`Update`] because `meta`
 /// dwarfs the other variants.
 struct Delta {
+    /// The session generation the fold belongs to: the reader lives
+    /// across a `/new` switch, so a delta produced before the switch must
+    /// not land in the new transcript. Bumped on every open and follow.
+    epoch: u64,
     /// The lowest item index the update replaces.
     from: usize,
     /// The replacement items: `items[from..]` on the reader's fold.
@@ -246,6 +250,7 @@ struct Delta {
 enum RequestKind {
     Prompt,
     Abort,
+    New,
     SetModel,
     SetThinking,
     Models,
@@ -275,6 +280,12 @@ enum Update {
     RpcResult {
         kind: RequestKind,
         result: Result<Option<Value>, String>,
+    },
+    /// The extension socket says this pane moved to another session — the
+    /// `/new`, `/resume`, or `/fork` that swapped the socket. The panel
+    /// retargets its reader without waiting on the daemon's re-report.
+    SessionFollow {
+        session_id: String,
     },
 }
 
@@ -567,11 +578,26 @@ pub struct SessionPanel {
     /// The key the current transcript's expansion saves under: the reported
     /// session id, else the explicit path, else the endpoint cwd.
     expand_key: Option<String>,
-    /// Commands for the extension's socket; `Some` whenever a session id was
-    /// reported, even while the channel itself is reconnecting.
+    /// Commands for the extension's socket; `Some` whenever a pane is
+    /// known, even while the channel itself is reconnecting or no session
+    /// id has been reported yet — the socket can be discovered by pane.
     rpc_tx: Option<Sender<RpcCommand>>,
     /// Whether the socket is live right now; state pushes only count then.
     rpc_up: bool,
+    /// The session the panel is on: the id the daemon seeded it with, or
+    /// the newer one the extension socket followed. `None` while the pane
+    /// has not reported and no socket has been discovered.
+    reported: Option<String>,
+    /// Open before any session is known: the auto pin covered the pane but
+    /// neither a report nor a socket has produced an id yet, so the body
+    /// waits instead of tailing a guessed file.
+    waiting: bool,
+    /// The session generation: bumped on every open and follow so a delta
+    /// produced before a `/new` switch cannot land in the new transcript.
+    epoch: u64,
+    /// Session follows pushed to the reader thread, tagged with the epoch
+    /// the panel applied them under.
+    switch_tx: Option<Sender<(u64, String)>>,
     /// pi's last reported state; `None` while RPC is down, so every
     /// consumer's `Option` check is the fallback switch. `pub(super)` so
     /// the shot harness can paint the context chip deterministically.
@@ -639,6 +665,10 @@ impl Default for SessionPanel {
             expand_key: None,
             rpc_tx: None,
             rpc_up: false,
+            reported: None,
+            waiting: false,
+            epoch: 0,
+            switch_tx: None,
             pi_state: None,
             live: None,
             list_live: false,
@@ -688,70 +718,72 @@ impl SessionPanel {
         };
         self.open_with(
             endpoint,
-            explicit.is_file().then_some(explicit),
-            None,
+            ReadSpec {
+                explicit: explicit.is_file().then_some(explicit),
+                session_id: None,
+                resolve_latest: true,
+            },
             title,
             target,
             cx,
         );
     }
 
-    /// Open the panel for a local pane whose session id the pi extension
-    /// reported to the daemon.
+    /// Open the panel for a local pane. `session_id` is the daemon's
+    /// latest report — the extension socket may already know a newer one
+    /// and will retarget the reader itself; `None` opens a waiting panel
+    /// that fills once either produces an id.
     pub fn open_local_session(
         &mut self,
         api_socket: PathBuf,
         cwd: String,
-        session_id: String,
+        session_id: Option<String>,
         title: String,
         pane: String,
         cx: &mut Context<PilusView>,
     ) {
         self.open_with(
             Endpoint::Local { api_socket, cwd },
-            None,
-            Some(session_id),
+            ReadSpec {
+                explicit: None,
+                session_id,
+                resolve_latest: false,
+            },
             title,
             Some(pane),
             cx,
         );
     }
 
-    /// Open the panel for a remote pane whose session id the pi extension
-    /// reported to that machine's daemon.
+    /// Open the panel for a remote pane; `session_id` has the same
+    /// seed-or-wait meaning as [`Self::open_local_session`].
     pub fn open_remote_session(
         &mut self,
         target: SshTarget,
         cwd: String,
-        session_id: String,
+        session_id: Option<String>,
         title: String,
         pane: String,
         cx: &mut Context<PilusView>,
     ) {
         self.open_with(
             Endpoint::Remote { target, cwd },
-            None,
-            Some(session_id),
+            ReadSpec {
+                explicit: None,
+                session_id,
+                resolve_latest: false,
+            },
             title,
             Some(pane),
             cx,
         );
     }
 
-    /// Start a reader thread for `endpoint` and reset the panel's state.
-    fn open_with(
-        &mut self,
-        endpoint: Endpoint,
-        explicit: Option<PathBuf>,
-        session_id: Option<String>,
-        title: String,
-        target: Option<String>,
-        cx: &mut Context<PilusView>,
-    ) {
-        // Park the outgoing session's expansion under its key so a switch
-        // back lands on the same open rows. `mem::take` clears the sets; the
-        // generic clears below then cover a first open, where nothing was
-        // parked.
+    /// Park the outgoing session's expansion under its key so a switch
+    /// back lands on the same open rows. `mem::take` clears the sets; the
+    /// caller's generic clears then cover a first open, where nothing was
+    /// parked.
+    fn park_expansion(&mut self) {
         if let Some(key) = self.expand_key.take() {
             self.expand_cache.insert(
                 key,
@@ -768,6 +800,18 @@ impl SessionPanel {
                 self.expand_cache.remove(&stale);
             }
         }
+    }
+
+    /// Start a reader thread for `endpoint` and reset the panel's state.
+    fn open_with(
+        &mut self,
+        endpoint: Endpoint,
+        spec: ReadSpec,
+        title: String,
+        target: Option<String>,
+        cx: &mut Context<PilusView>,
+    ) {
+        self.park_expansion();
         self.close();
         self.rotate_channels();
         self.open = true;
@@ -781,10 +825,11 @@ impl SessionPanel {
         self.work_open.clear();
         // A session id identifies its expansion; a standalone file its path,
         // and a bare cwd spec (`--session-ui`) the cwd itself.
-        let expand_key = session_id
+        let expand_key = spec
+            .session_id
             .clone()
             .or_else(|| {
-                explicit
+                spec.explicit
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned())
             })
@@ -829,25 +874,31 @@ impl SessionPanel {
         self.last_seen = 0;
         self.target = target;
         self.endpoint = Some(endpoint.clone());
+        self.reported = spec.session_id.clone();
+        self.waiting = spec.session_id.is_none() && !spec.resolve_latest;
+        self.epoch += 1;
         self.stop = Arc::new(AtomicBool::new(false));
         let stop = self.stop.clone();
         let tx = self.tx.clone();
         let cache = self.cache.clone();
         let catalog_endpoint = endpoint.clone();
-        let reader_session_id = session_id.clone();
-        std::thread::spawn(move || {
-            reader_loop(endpoint, explicit, reader_session_id, cache, tx, stop)
-        });
-        // A reported session id also gets the extension's RPC channel when
-        // it can be reached; `--session-ui` has no id and stays file-only.
-        if let Some(id) = session_id {
+        let (switch_tx, switch_rx) = std::sync::mpsc::channel();
+        self.switch_tx = Some(switch_tx);
+        let tag = self.epoch;
+        std::thread::spawn(move || reader_loop(endpoint, spec, tag, cache, tx, switch_rx, stop));
+        // A pane always gets the RPC channel: with no reported id the loop
+        // discovers the socket by its sidecar's `pane` key, and either way
+        // it follows the pane across `/new` switches on its own.
+        // `--session-ui` has no pane and stays file-only.
+        if let Some(pane) = self.target.clone() {
             let (command_tx, command_rx) = std::sync::mpsc::channel();
             self.rpc_tx = Some(command_tx);
             let rpc_endpoint = catalog_endpoint.clone();
             let rpc_tx = self.tx.clone();
             let rpc_stop = self.stop.clone();
+            let seed = self.reported.clone();
             std::thread::spawn(move || {
-                rpc_loop(rpc_endpoint, id, rpc_tx, command_rx, rpc_stop);
+                rpc_loop(rpc_endpoint, pane, seed, rpc_tx, command_rx, rpc_stop);
             });
         }
         // The model catalog (pi's models-store, locally or over SSH) arrives
@@ -869,6 +920,21 @@ impl SessionPanel {
     /// Escape is swallowed instead of closing it.
     pub fn set_pinned(&mut self, pinned: bool) {
         self.pinned = pinned;
+    }
+
+    /// The session the panel is on, while it is open: the daemon's report,
+    /// or the newer one the extension socket followed ahead of it. A stale
+    /// id can linger behind a `/new`; callers compare it against the
+    /// daemon's word and trust this one while [`Self::rpc_live`] holds.
+    pub fn live_session(&self) -> Option<String> {
+        self.open.then(|| self.reported.clone()).flatten()
+    }
+
+    /// Whether the extension socket is connected right now; while it is,
+    /// [`Self::live_session`] is the pane's true session even when the
+    /// daemon has not caught up.
+    pub fn rpc_live(&self) -> bool {
+        self.open && self.rpc_up
     }
 
     /// Swap every channel the panel drains for fresh ones. Dropping the old
@@ -895,6 +961,55 @@ impl SessionPanel {
         self.last_seen = 0;
     }
 
+    /// Take the session the extension socket says this pane moved to — a
+    /// `/new`, `/resume`, or `/fork` inside pi. The socket is the authority:
+    /// it is the same extension that reports to the daemon, just faster, so
+    /// a follow retargets the reader without a panel reopen (which would
+    /// blank the transcript mid-switch).
+    fn follow_session(&mut self, session_id: String) {
+        if !safe_session_id(&session_id) || self.reported.as_deref() == Some(&session_id) {
+            return;
+        }
+        // The outgoing session's expansion parks under its own key; the new
+        // id then claims the slot and restores whatever it had saved.
+        self.park_expansion();
+        self.reported = Some(session_id.clone());
+        self.expand_key = Some(session_id.clone());
+        if let Some(state) = self.expand_cache.get(&session_id).cloned() {
+            self.expanded = state.expanded;
+            self.groups = state.groups;
+            self.work_open = state.work_open;
+        } else {
+            self.expanded.clear();
+            self.groups.clear();
+            self.work_open.clear();
+        }
+        self.transcript = Transcript::default();
+        self.list = new_list_state();
+        self.rows.clear();
+        self.list_pending = false;
+        self.list_live = false;
+        self.rows_dirty = true;
+        self.changed_from = None;
+        self.live = None;
+        self.pending_prompt = None;
+        self.pending_from = 0;
+        self.awaiting_response = false;
+        self.pending_steering = false;
+        self.outbox.clear();
+        self.picker = None;
+        self.prompts_open = false;
+        self.last_growth = None;
+        self.last_seen = 0;
+        self.waiting = false;
+        self.error.clear();
+        self.status.clear();
+        self.epoch += 1;
+        if let Some(tx) = &self.switch_tx {
+            let _ = tx.send((self.epoch, session_id));
+        }
+    }
+
     /// Drain the reader thread and any prompt result.
     ///
     /// Returns whether a repaint is warranted. Clears the composer on a
@@ -904,7 +1019,12 @@ impl SessionPanel {
         while let Ok(update) = self.rx.try_recv() {
             match update {
                 Update::Delta(delta) => {
-                    self.apply_delta(delta.from, delta.items, delta.meta);
+                    // A delta produced before a session follow belongs to
+                    // the outgoing transcript; the new fold lands under
+                    // the new epoch.
+                    if delta.epoch == self.epoch {
+                        self.apply_delta(delta.from, delta.items, delta.meta);
+                    }
                 }
                 Update::Catalog(catalog) => {
                     self.catalog = catalog;
@@ -952,13 +1072,32 @@ impl SessionPanel {
                     self.bump_live();
                 }
                 Update::RpcResult { kind, result } => {
-                    self.rpc_result(kind, result);
+                    let stale_extension = matches!(
+                        &result,
+                        Err(error)
+                            if kind == RequestKind::New && error.contains("unknown command")
+                    );
+                    if stale_extension {
+                        // An extension too old to answer `new` gets the
+                        // command typed into the TUI — the same fallback
+                        // an offline socket takes.
+                        self.send_text("/new".to_string(), false, cx);
+                    } else {
+                        self.rpc_result(kind, result);
+                    }
+                }
+                Update::SessionFollow { session_id } => {
+                    self.follow_session(session_id);
                 }
             }
             changed = true;
         }
         // A finished live turn waits on the file; past the linger it is stale.
-        if self.live.as_ref().is_some_and(|live| live_expired(live, Instant::now())) {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live_expired(live, Instant::now()))
+        {
             self.live = None;
             changed = true;
         }
@@ -1009,7 +1148,11 @@ impl SessionPanel {
         self.transcript.items.truncate(from);
         self.transcript.items.extend(items);
         // The file caught up with a finished live turn; the overlay is stale.
-        if self.live.as_ref().is_some_and(|live| live.ended_at.is_some()) {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.ended_at.is_some())
+        {
             self.live = None;
         }
         self.transcript.set_meta(meta);
@@ -1119,8 +1262,25 @@ impl SessionPanel {
     /// held on Enter queues a follow-up behind a busy turn.
     fn submit(&mut self, input: &Entity<TextInput>, cx: &mut Context<PilusView>, alt: bool) {
         let text = input.read(cx).value().trim().to_string();
+        // `/new` is the one slash command with a native path: the socket
+        // asks pi for a fresh session and the panel follows the new file
+        // itself. With no socket it falls back to typing in the TUI.
+        if text == "/new" && self.rpc_up {
+            input.update(cx, |input, cx| input.clear(cx));
+            self.status = "starting a new session…".to_string();
+            self.send_rpc_command(RpcCommand::New);
+            cx.notify();
+            return;
+        }
         match route(&text, self.rpc_up, self.is_working(), alt) {
             Route::Rpc(deliver_as) => self.send_rpc(text, deliver_as, input, cx),
+            // Slash commands reach pi's editor through the terminal and
+            // leave no user bubble for the transcript to echo, so the
+            // composer shows nothing instead of a fake prompt.
+            Route::Terminal if text.starts_with('/') => {
+                input.update(cx, |input, cx| input.clear(cx));
+                self.send_text(text, false, cx);
+            }
             Route::Terminal => self.send_text(text, true, cx),
         }
     }
@@ -1142,10 +1302,7 @@ impl SessionPanel {
         self.pending_steering = deliver_as.is_some();
         self.follow_tail();
         input.update(cx, |input, cx| input.clear(cx));
-        self.send_rpc_command(RpcCommand::Prompt {
-            text,
-            deliver_as,
-        });
+        self.send_rpc_command(RpcCommand::Prompt { text, deliver_as });
         cx.notify();
     }
 
@@ -1524,8 +1681,7 @@ impl SessionPanel {
         let live = self.live.is_some();
         if self.rows_dirty {
             let new = build_rows(&self.transcript.items);
-            let old_count =
-                self.rows.len() + self.list_pending as usize + self.list_live as usize;
+            let old_count = self.rows.len() + self.list_pending as usize + self.list_live as usize;
             let new_count = new.len() + pending as usize + live as usize;
             let old_coverage = self.rows.last().map_or(0, |row| row.end);
             let new_coverage = new.last().map_or(0, |row| row.end);
@@ -1544,10 +1700,8 @@ impl SessionPanel {
             let old_tail = self.list_pending as usize + self.list_live as usize;
             let new_tail = pending as usize + live as usize;
             if pending != self.list_pending || live != self.list_live {
-                self.list.splice(
-                    self.rows.len()..self.rows.len() + old_tail,
-                    new_tail,
-                );
+                self.list
+                    .splice(self.rows.len()..self.rows.len() + old_tail, new_tail);
             }
         }
         self.list_pending = pending;
@@ -2169,7 +2323,11 @@ impl SessionPanel {
                 .text_center()
                 .text_size(px(fonts.body))
                 .text_color(theme.muted)
-                .child("Waiting for the first message…")
+                .child(if self.waiting {
+                    "Waiting for pi to report its session…"
+                } else {
+                    "Waiting for the first message…"
+                })
                 .into_any_element();
         }
         // The virtualized list is a flex sibling of the composer, so the
@@ -2203,13 +2361,12 @@ impl SessionPanel {
             RowKind::Thinking => {
                 let mut column = div().flex().flex_col().gap_4();
                 for (offset, item) in items[row.start..row.end].iter().enumerate() {
-                    column = column
-                        .child(div().flex_shrink_0().child(self.item(
-                            row.start + offset,
-                            item,
-                            fonts,
-                            cx,
-                        )));
+                    column = column.child(div().flex_shrink_0().child(self.item(
+                        row.start + offset,
+                        item,
+                        fonts,
+                        cx,
+                    )));
                 }
                 column.into_any_element()
             }
@@ -2228,12 +2385,7 @@ impl SessionPanel {
             .justify_center()
             .px_6()
             .pb_4()
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(TRANSCRIPT_MAX_W))
-                    .child(content),
-            )
+            .child(div().w_full().max_w(px(TRANSCRIPT_MAX_W)).child(content))
             .into_any_element()
     }
 
@@ -2248,12 +2400,7 @@ impl SessionPanel {
                 .justify_center()
                 .px_6()
                 .pb_4()
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(TRANSCRIPT_MAX_W))
-                        .child(content),
-                )
+                .child(div().w_full().max_w(px(TRANSCRIPT_MAX_W)).child(content))
                 .into_any_element()
         };
         let extra = ix.saturating_sub(self.rows.len());
@@ -2278,11 +2425,12 @@ impl SessionPanel {
         };
         let mut column = div().flex().flex_col().gap_4();
         for (offset, item) in live.items.iter().enumerate() {
-            column = column.child(
-                div()
-                    .flex_shrink_0()
-                    .child(self.item(LIVE_BASE + offset, item, fonts, cx)),
-            );
+            column = column.child(div().flex_shrink_0().child(self.item(
+                LIVE_BASE + offset,
+                item,
+                fonts,
+                cx,
+            )));
         }
         if let Some((name, output)) = &live.tool {
             // The last few lines of a running tool, tail-style, in the
@@ -3031,80 +3179,171 @@ impl SessionPanel {
     }
 }
 
-/// The background reader: resolve the session, then tail it until stopped.
+/// What the reader should tail: an explicit file (`--session-ui` only), a
+/// reported session id, or nothing yet — a pane open then idles on the
+/// switch channel until a follow lands instead of guessing a file.
+struct ReadSpec {
+    /// An explicit session file; bypasses discovery entirely.
+    explicit: Option<PathBuf>,
+    /// The daemon's seed for which session this pane is in; the socket
+    /// may follow onto a newer one.
+    session_id: Option<String>,
+    /// `--session-ui` only: no id resolves the cwd's newest session file.
+    /// Pane opens never guess.
+    resolve_latest: bool,
+}
+
+/// The background reader: resolve the session, then tail it until stopped
+/// or retargeted.
 ///
 /// A reported session id can precede its file — pi creates the file lazily,
 /// at the first user message — so a resolution miss is retried on the poll
 /// interval rather than raised as an error. Only real IO and SSH failures
 /// surface.
+///
+/// `switch_rx` retargets the tail when the extension socket reports the
+/// pane moved to another session ("/new", "/resume"): the old tail parks
+/// under its cache key and the new id resolves through the same "not yet"
+/// retry, since its file may not exist either.
+/// A tail the reader just opened.
+///
+/// `hint` is the cached remote path the source was opened with: a guess
+/// that skips the resolve round-trip. If the source behind it fails, the
+/// reader drops the hint file and resolves for real rather than erroring
+/// on a stale cache entry.
+struct OpenedTail {
+    tail: Tail,
+    /// The parked-tail cache key, the source's label.
+    key: String,
+    hint: Option<PathBuf>,
+}
+
 fn reader_loop(
     endpoint: Endpoint,
-    explicit: Option<PathBuf>,
-    session_id: Option<String>,
+    spec: ReadSpec,
+    tag: u64,
     cache: SessionCache,
     tx: Sender<Update>,
+    switch_rx: Receiver<(u64, String)>,
     stop: Arc<AtomicBool>,
 ) {
     let interval = match endpoint {
         Endpoint::Local { .. } => LOCAL_POLL,
         Endpoint::Remote { .. } => REMOTE_POLL,
     };
-    let (mut tail, key) = loop {
-        match open_tail(&endpoint, explicit.clone(), session_id.as_deref(), &cache) {
-            Ok(Some(opened)) => break opened,
-            Ok(None) => {
-                if sleep_sliced(interval, &stop) {
-                    return;
+    let mut wanted = spec.session_id;
+    let mut tag = tag;
+    let mut opened: Option<OpenedTail> = None;
+    // A `false` send means the window went away: exit and park. An error
+    // exits directly with nothing parked — a tail that failed is not to
+    // be trusted again.
+    let mut park_and_exit = false;
+    loop {
+        // Take the newest retarget queued since the last pass; the tail it
+        // replaces parks under its own key so a switch back catches up.
+        while let Ok((next_tag, next_id)) = switch_rx.try_recv() {
+            if wanted.as_deref() != Some(next_id.as_str()) {
+                if let Some(opened) = opened.take() {
+                    cache.put(&opened.key, opened.tail);
                 }
-            }
-            Err(error) => {
-                let _ = tx.send(Update::Error(error.to_string()));
-                return;
+                wanted = Some(next_id);
+                tag = next_tag;
             }
         }
-    };
-    // Send the initial fold immediately so the panel is not blank for a tick.
-    if !send_delta(&tx, &tail, 0) {
-        cache.put(&key, tail);
-        return;
-    }
-    // A reused tail's catch-up poll may have marked an index that the full
-    // snapshot already covers; drain it so the next delta is not inflated.
-    tail.take_changed_from();
-    while !stop.load(Ordering::Relaxed) {
-        if sleep_sliced(interval, &stop) {
+        if stop.load(Ordering::Relaxed) {
+            park_and_exit = true;
+        }
+        if park_and_exit {
             break;
         }
-        match tail.poll() {
-            Ok(true) => {
-                // A metadata-only fold marks nothing, so `from` lands at the
-                // end and the delta carries `meta` alone.
-                let from = tail
-                    .take_changed_from()
-                    .unwrap_or_else(|| tail.transcript().items.len());
-                if !send_delta(&tx, &tail, from) {
-                    break;
+        let mut stale_hint = false;
+        match &mut opened {
+            Some(opened) => {
+                match opened.tail.poll() {
+                    Ok(true) => {
+                        // A metadata-only fold marks nothing, so `from`
+                        // lands at the end and the delta carries `meta`
+                        // alone.
+                        let from = opened
+                            .tail
+                            .take_changed_from()
+                            .unwrap_or_else(|| opened.tail.transcript().items.len());
+                        if !send_delta(&tx, &opened.tail, from, tag) {
+                            park_and_exit = true;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        // A tail opened from a cached path failed on a
+                        // stale guess, not a real error: forget the hint,
+                        // drop the tail, and let the next pass resolve
+                        // for real.
+                        if let Some(hint) = opened.hint.take() {
+                            let _ = std::fs::remove_file(hint);
+                            stale_hint = true;
+                        } else {
+                            let _ = tx.send(Update::Error(error.to_string()));
+                            return;
+                        }
+                    }
+                }
+                if !park_and_exit && sleep_sliced(interval, &stop) {
+                    continue;
                 }
             }
-            Ok(false) => {}
-            Err(error) => {
-                let _ = tx.send(Update::Error(error.to_string()));
-                return;
+            None => {
+                if wanted.is_none() && !spec.resolve_latest {
+                    // No session yet and guessing is off the table: wait
+                    // for a follow or the stop flag.
+                    if sleep_sliced(interval, &stop) {
+                        continue;
+                    }
+                    continue;
+                }
+                match open_tail(&endpoint, spec.explicit.clone(), wanted.as_deref(), &cache) {
+                    Ok(Some(mut fresh)) => {
+                        // Send the initial fold immediately so the panel is
+                        // not blank for a tick.
+                        if !send_delta(&tx, &fresh.tail, 0, tag) {
+                            cache.put(&fresh.key, fresh.tail);
+                            return;
+                        }
+                        // A reused tail's catch-up poll may have marked an
+                        // index that the full snapshot already covers.
+                        fresh.tail.take_changed_from();
+                        opened = Some(fresh);
+                    }
+                    Ok(None) => {
+                        if sleep_sliced(interval, &stop) {
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Update::Error(error.to_string()));
+                        return;
+                    }
+                }
             }
+        }
+        if stale_hint {
+            opened = None;
+            continue;
         }
     }
     // The panel moved on; park the tail so a switch back reads only the
-    // bytes appended in between. An error exit above parks nothing: the
-    // tail can no longer be trusted.
-    cache.put(&key, tail);
+    // bytes appended in between.
+    if let Some(opened) = opened.take() {
+        cache.put(&opened.key, opened.tail);
+    }
 }
 
 /// Push one delta: every item at or after `from`, plus the fold's metadata.
 /// Returns false when the window has gone away.
-fn send_delta(tx: &Sender<Update>, tail: &Tail, from: usize) -> bool {
+fn send_delta(tx: &Sender<Update>, tail: &Tail, from: usize, tag: u64) -> bool {
     let transcript = tail.transcript();
     let from = from.min(transcript.items.len());
     tx.send(Update::Delta(Box::new(Delta {
+        epoch: tag,
         from,
         items: transcript.items[from..].to_vec(),
         meta: transcript.meta(),
@@ -3147,6 +3386,7 @@ fn request_kind(command: &RpcCommand) -> RequestKind {
     match command {
         RpcCommand::Prompt { .. } => RequestKind::Prompt,
         RpcCommand::Abort => RequestKind::Abort,
+        RpcCommand::New => RequestKind::New,
         RpcCommand::SetModel { .. } => RequestKind::SetModel,
         RpcCommand::SetThinking { .. } => RequestKind::SetThinking,
         RpcCommand::Models => RequestKind::Models,
@@ -3155,11 +3395,9 @@ fn request_kind(command: &RpcCommand) -> RequestKind {
 }
 
 /// Connect to the extension socket at `path` (a temp path in tests).
-fn connect_local(path: &Path) -> Result<RpcConn, String> {
+fn connect_path(path: &Path) -> Result<RpcConn, String> {
     let stream = UnixStream::connect(path).map_err(|error| error.to_string())?;
-    let reader = stream
-        .try_clone()
-        .map_err(|error| error.to_string())?;
+    let reader = stream.try_clone().map_err(|error| error.to_string())?;
     Ok(RpcConn {
         lines: BufReader::new(Box::new(reader)),
         writer: Box::new(stream),
@@ -3167,15 +3405,76 @@ fn connect_local(path: &Path) -> Result<RpcConn, String> {
     })
 }
 
-/// Reach the extension socket on a machine: read the sidecar pi wrote for
-/// the socket's path and its node binary, then relay stdio onto the socket.
-fn connect_remote(target: &SshTarget, session_id: &str) -> Result<RpcConn, String> {
-    if !safe_session_id(session_id) {
-        return Err(format!("pi reported an unusable session id `{session_id}`"));
+/// The sockets this pane might answer on: sidecars naming the pane first
+/// — the newest wins a `/new` race, since a crashed pi can leave its
+/// sidecar behind — then the last-known session's socket for extensions
+/// old enough to write no `pane` key.
+fn socket_candidates(agent_dir: &Path, pane: &str, current: &str) -> Vec<PathBuf> {
+    let mut keyed: Vec<(Option<std::time::SystemTime>, PathBuf)> = Vec::new();
+    if safe_session_id(pane)
+        && let Ok(entries) = std::fs::read_dir(agent_dir.join("pilus"))
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(sidecar) = Sidecar::parse(&text) else {
+                continue;
+            };
+            if sidecar.pane.as_deref() != Some(pane) {
+                continue;
+            }
+            let modified = entry.metadata().and_then(|meta| meta.modified()).ok();
+            keyed.push((modified, PathBuf::from(sidecar.socket)));
+        }
     }
+    keyed.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+    let mut paths: Vec<PathBuf> = keyed.into_iter().map(|(_, path)| path).collect();
+    if !current.is_empty() {
+        paths.push(socket_path(agent_dir, current));
+    }
+    paths
+}
+
+/// Connect to the pane's extension socket: every candidate gets a try
+/// before the loop backs off, so one stale sidecar cannot hide a live one.
+fn connect_local(agent_dir: &Path, pane: &str, current: &str) -> Result<RpcConn, String> {
+    for path in socket_candidates(agent_dir, pane, current) {
+        if let Ok(conn) = connect_path(&path) {
+            return Ok(conn);
+        }
+    }
+    Err("no extension socket".to_string())
+}
+
+/// Reach the extension socket on a machine: the sidecar naming this pane
+/// wins, then the last-known session id's file — the same pane-keyed
+/// discovery as the local loop, folded into one SSH round trip.
+fn connect_remote(target: &SshTarget, pane: &str, current: &str) -> Result<RpcConn, String> {
+    // Interpolation is only safe inside the daemon's id alphabet; a
+    // stranger pane or id simply runs no keyed scan.
+    let keyed = if safe_session_id(pane) {
+        format!(
+            "for f in $(ls -t \"$dir\"/*.json 2>/dev/null); do \
+             grep -Fq '\"pane\":\"{pane}\"' \"$f\" && {{ cat \"$f\"; exit 0; }}; \
+             done"
+        )
+    } else {
+        String::new()
+    };
+    let fallback = if !current.is_empty() && safe_session_id(current) {
+        format!("cat \"$dir/{current}.json\" 2>/dev/null")
+    } else {
+        String::new()
+    };
     let output = target
         .shell(&format!(
-            "cat \"${{PI_CODING_AGENT_DIR:-$HOME/.pi/agent}}/pilus/{session_id}.json\""
+            "dir=\"${{PI_CODING_AGENT_DIR:-$HOME/.pi/agent}}/pilus\"; \
+             [ -d \"$dir\" ] || exit 1; {keyed} {fallback}"
         ))
         .output()
         .map_err(|error| error.to_string())?;
@@ -3211,12 +3510,16 @@ fn connect_remote(target: &SshTarget, session_id: &str) -> Result<RpcConn, Strin
     })
 }
 
-/// The extension channel's owner: connect, run one session, and reconnect
-/// on failure. A missing socket just means pi has not loaded the extension
-/// yet — the file tail keeps the panel honest meanwhile.
+/// The extension channel's owner: find this pane's socket, run one
+/// session, and rediscover on failure. The daemon's report is only the
+/// seed — the sidecar's `pane` key lets the loop follow the pane onto a
+/// new session ("/new", "/resume") without waiting on a re-report, and a
+/// missing socket just means pi has not loaded the extension yet — the
+/// file tail keeps the panel honest meanwhile.
 fn rpc_loop(
     endpoint: Endpoint,
-    session_id: String,
+    pane: String,
+    session_id: Option<String>,
     update: Sender<Update>,
     commands: Receiver<RpcCommand>,
     stop: Arc<AtomicBool>,
@@ -3224,15 +3527,16 @@ fn rpc_loop(
     // One receiver survives every reconnect; the Mutex only exists because
     // `Receiver` is not `Sync`, never because two threads compete for it.
     let commands = Mutex::new(commands);
+    // The last session the socket hello'd; empty until one is known. The
+    // un-keyed fallback path still needs somewhere plausible to point.
+    let mut current = session_id.unwrap_or_default();
     while !stop.load(Ordering::Relaxed) {
         let conn = match &endpoint {
-            Endpoint::Local { .. } => {
-                connect_local(&socket_path(&agent_dir(), &session_id))
-            }
-            Endpoint::Remote { target, .. } => connect_remote(target, &session_id),
+            Endpoint::Local { .. } => connect_local(&agent_dir(), &pane, &current),
+            Endpoint::Remote { target, .. } => connect_remote(target, &pane, &current),
         };
         match conn {
-            Ok(conn) => rpc_session(conn, &update, &commands, &stop),
+            Ok(conn) => rpc_session(conn, &update, &commands, &stop, &mut current),
             Err(_) => {
                 if sleep_sliced(RPC_BACKOFF, &stop) {
                     return;
@@ -3246,12 +3550,14 @@ fn rpc_loop(
 ///
 /// A reader thread folds socket lines into [`Incoming`]; this loop drains
 /// them between 50ms command waits so events and replies interleave the
-/// way pi sends them.
+/// way pi sends them. `current` is the last session the hello named — the
+/// loop mutates it so the next reconnect keeps pointing where pi is.
 fn rpc_session(
     conn: RpcConn,
     update: &Sender<Update>,
     commands: &Mutex<Receiver<RpcCommand>>,
     stop: &AtomicBool,
+    current: &mut String,
 ) {
     let RpcConn {
         lines,
@@ -3304,8 +3610,17 @@ fn rpc_session(
                         break 'session;
                     }
                 }
-                Incoming::Event(RpcEvent::Hello { .. }) => {
+                Incoming::Event(RpcEvent::Hello { session_id, .. }) => {
                     up = true;
+                    // The pane moved sessions while we were away; the
+                    // socket is the authority, so the reader retargets
+                    // without a panel reopen.
+                    if *current != session_id {
+                        *current = session_id.clone();
+                        if update.send(Update::SessionFollow { session_id }).is_err() {
+                            break 'session;
+                        }
+                    }
                     if update.send(Update::RpcUp).is_err() {
                         break 'session;
                     }
@@ -3399,7 +3714,7 @@ fn open_tail(
     explicit: Option<PathBuf>,
     session_id: Option<&str>,
     cache: &SessionCache,
-) -> Result<Option<(Tail, String)>, SessionError> {
+) -> Result<Option<OpenedTail>, SessionError> {
     fn open_or_reuse(
         cache: &SessionCache,
         key: String,
@@ -3422,25 +3737,55 @@ fn open_tail(
                 Some(path) => open_or_reuse(cache, path.to_string_lossy().into_owned(), || {
                     Tail::open(&path)
                 })
-                .map(Some),
+                .map(|(tail, key)| {
+                    Some(OpenedTail {
+                        tail,
+                        key,
+                        hint: None,
+                    })
+                }),
                 None => Ok(None),
             }
         }
         Endpoint::Remote { target, .. } => {
-            let Some(path) = resolve_remote(target, session_id)? else {
-                return Ok(None);
+            let dir = remote_cache_dir(target);
+            // A session id also names the mirror, so a re-open folds the
+            // cached copy before any SSH call — and the cached path skips
+            // the resolve glob too.
+            let hinted = session_id.and_then(|id| remote_path_hint(&dir, id));
+            let (path, hint) = match hinted {
+                Some((path, hint)) => (path, Some(hint)),
+                None => {
+                    let Some(path) = resolve_remote(target, session_id)? else {
+                        return Ok(None);
+                    };
+                    let id = session_id
+                        .map(str::to_string)
+                        .or_else(|| session_id_from_path(&path));
+                    if let Some(id) = id.as_deref() {
+                        write_remote_path_hint(&dir, id, &path);
+                    }
+                    (path, None)
+                }
             };
-            open_or_reuse(
-                cache,
-                format!("{}:{path}", target.destination),
-                || {
-                    Tail::with_source(Box::new(SshSource {
-                        target: target.clone(),
-                        path,
-                    }))
-                },
-            )
-            .map(Some)
+            // The mirror is keyed by the session id — resolved or the one
+            // the file's own name carries — never by its path.
+            let mirror = session_id
+                .map(str::to_string)
+                .or_else(|| session_id_from_path(&path))
+                .and_then(|id| remote_mirror(&dir, &id));
+            let tail_key = format!("{}:{path}", target.destination);
+            open_or_reuse(cache, tail_key, || {
+                let source: Box<dyn Source> = Box::new(SshSource {
+                    target: target.clone(),
+                    path: path.clone(),
+                });
+                match mirror {
+                    Some(mirror) => Tail::with_source_and_mirror(source, mirror),
+                    None => Tail::with_source(source),
+                }
+            })
+            .map(|(tail, key)| Some(OpenedTail { tail, key, hint }))
         }
     }
 }
@@ -3506,6 +3851,63 @@ fn resolve_remote(
         return Ok(None);
     }
     Ok(Some(path))
+}
+
+/// The local mirror of a remote endpoint's sessions: one directory per
+/// destination, so a re-opened session folds from disk before the first
+/// SSH call instead of waiting on the whole file to cross the network.
+fn remote_cache_dir(target: &SshTarget) -> PathBuf {
+    let key: String = target
+        .destination
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    pilus_client::pilus_config_dir()
+        .join("session-cache")
+        .join(key)
+}
+
+/// The mirror file for a session id, when the id is safe as a filename.
+fn remote_mirror(dir: &Path, id: &str) -> Option<PathBuf> {
+    safe_session_id(id).then(|| dir.join(format!("{id}.jsonl")))
+}
+
+/// The cached remote path for `id` and the file it came from, when one
+/// was written by an earlier resolve. The file rides along so a stale
+/// guess can be dropped by whoever trusted it.
+fn remote_path_hint(dir: &Path, id: &str) -> Option<(String, PathBuf)> {
+    let file = dir.join(format!("{}.path", sanitize_id(id)?));
+    let path = std::fs::read_to_string(&file).ok()?.trim().to_string();
+    (!path.is_empty()).then_some((path, file))
+}
+
+/// Record where `id` resolves on the remote, so the next open skips the
+/// directory glob.
+fn write_remote_path_hint(dir: &Path, id: &str, path: &str) {
+    let Some(id) = sanitize_id(id) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(dir.join(format!("{id}.path")), path));
+}
+
+/// `id` when it is safe as a cache filename — the same charset pi's own
+/// session ids use.
+fn sanitize_id(id: &str) -> Option<String> {
+    safe_session_id(id).then(|| id.to_string())
+}
+
+/// The session id a pi session file's name carries: `<timestamp>_<id>`,
+/// so the id is everything after the first `_`.
+fn session_id_from_path(path: &str) -> Option<String> {
+    let stem = Path::new(path).file_stem()?.to_str()?;
+    sanitize_id(stem.split_once('_')?.1)
 }
 
 /// A session file on another machine, read through one SSH command per poll.
@@ -3961,6 +4363,47 @@ mod tests {
         let text = "a\nb\nc\nd";
         assert_eq!(clip_lines(text, 10), text);
         assert_eq!(clip_lines(text, 2), "a\nb\n… (truncated)");
+    }
+
+    #[test]
+    fn session_id_from_path_reads_the_name_suffix() {
+        assert_eq!(
+            session_id_from_path(
+                "/home/u/.pi/agent/sessions/--repo--/2026-08-26T18-07-57-407Z_01a03f41-e1df-7a41-b4a8-81033186eeda.jsonl"
+            ),
+            Some("01a03f41-e1df-7a41-b4a8-81033186eeda".to_string())
+        );
+        // An id holding `_` keeps its whole suffix.
+        assert_eq!(
+            session_id_from_path("/tmp/2026_t_a-b-c.jsonl"),
+            Some("t_a-b-c".to_string())
+        );
+        assert_eq!(session_id_from_path("/tmp/nounderscore.jsonl"), None);
+        assert_eq!(session_id_from_path("/tmp/dir/"), None);
+    }
+
+    #[test]
+    fn remote_path_hints_round_trip_and_reject_unsafe_ids() {
+        let dir = std::env::temp_dir().join(format!("pilus-hints-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(remote_path_hint(&dir, "abc-123"), None);
+        write_remote_path_hint(
+            &dir,
+            "abc-123",
+            "/home/u/.pi/agent/sessions/--w--/t_abc-123.jsonl",
+        );
+        let Some((path, file)) = remote_path_hint(&dir, "abc-123") else {
+            panic!("the written hint must read back");
+        };
+        assert_eq!(path, "/home/u/.pi/agent/sessions/--w--/t_abc-123.jsonl");
+        assert!(file.exists());
+        // An id that is not filename-safe never becomes a hint.
+        write_remote_path_hint(&dir, "../escape", "/tmp/x.jsonl");
+        assert_eq!(remote_path_hint(&dir, "../escape"), None);
+        // The directory still holds only the one real hint.
+        let files = std::fs::read_dir(&dir).expect("dir").count();
+        assert_eq!(files, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn model(provider: &str, id: &str, name: &str) -> AgentModel {
@@ -4758,14 +5201,15 @@ mod tests {
         });
 
         let (update_tx, update_rx) = std::sync::mpsc::channel::<Update>();
-        let (_command_tx, command_rx) =
-            std::sync::mpsc::channel::<RpcCommand>();
+        let (_command_tx, command_rx) = std::sync::mpsc::channel::<RpcCommand>();
         let commands = Mutex::new(command_rx);
         let stop = Arc::new(AtomicBool::new(false));
+        // No session is known yet, so the hello's id lands as a follow.
+        let mut current = String::new();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let conn = connect_local(&path).expect("connect");
-                rpc_session(conn, &update_tx, &commands, &stop);
+                let conn = connect_path(&path).expect("connect");
+                rpc_session(conn, &update_tx, &commands, &stop, &mut current);
             });
         });
         server.join().expect("server");
@@ -4774,17 +5218,22 @@ mod tests {
         while let Ok(update) = update_rx.try_recv() {
             updates.push(update);
         }
-        assert_eq!(updates.len(), 4);
-        assert!(matches!(updates[0], Update::RpcUp));
-        assert!(matches!(updates[1], Update::RpcState(_)));
-        match &updates[2] {
+        assert_eq!(updates.len(), 5);
+        assert!(matches!(
+            &updates[0],
+            Update::SessionFollow { session_id } if session_id == "s"
+        ));
+        assert!(matches!(updates[1], Update::RpcUp));
+        assert!(matches!(updates[2], Update::RpcState(_)));
+        match &updates[3] {
             Update::RpcResult {
                 kind: RequestKind::Models,
                 result: Ok(Some(_)),
             } => {}
             _ => panic!("expected a models result"),
         }
-        assert!(matches!(updates[3], Update::RpcDown));
+        assert!(matches!(updates[4], Update::RpcDown));
+        assert_eq!(current, "s");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4801,6 +5250,7 @@ mod tests {
 
         let delta = || {
             Update::Delta(Box::new(Delta {
+                epoch: 0,
                 from: 0,
                 items: vec![user(0, "stale")],
                 meta: TranscriptMeta::default(),
@@ -4815,5 +5265,130 @@ mod tests {
         panel.tx.send(delta()).expect("fresh channel");
         assert!(matches!(panel.rx.try_recv(), Ok(Update::Delta(_))));
         assert!(panel.rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn socket_candidates_prefers_the_panes_newest_sidecar() {
+        let root = std::env::temp_dir().join(format!("pilus-candidates-{}", std::process::id()));
+        let dir = root.join("pilus");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let write = |name: &str, pane: Option<&str>, socket: &str| {
+            let keyed = pane
+                .map(|p| format!("\"pane\":\"{p}\","))
+                .unwrap_or_default();
+            let path = dir.join(format!("{name}.json"));
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"protocol\":1,\"pid\":1,\"socket\":\"{socket}\",\"execPath\":\"/n\",{keyed}\"sessionId\":\"{name}\"}}"
+                ),
+            )
+            .expect("sidecar");
+            path
+        };
+        write("other", Some("9"), "/tmp/other.sock");
+        write("unkeyed", None, "/tmp/unkeyed.sock");
+        let older = write("ours", Some("86"), "/tmp/ours.sock");
+        let newer = write("ours-new", Some("86"), "/tmp/ours-new.sock");
+        // Force the mtime race a `/new` creates: the newest sidecar wins.
+        let old = std::time::SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .expect("open older")
+            .set_modified(old)
+            .expect("mtime");
+
+        let paths = socket_candidates(&root, "86", "stale-id");
+        assert_eq!(paths[0], PathBuf::from("/tmp/ours-new.sock"));
+        assert_eq!(paths[1], PathBuf::from("/tmp/ours.sock"));
+        // The last-known session's socket is the un-keyed last resort.
+        assert_eq!(
+            paths.last(),
+            Some(&PathBuf::from(root.join("pilus/stale-id.sock")))
+        );
+        // Another pane's socket and an un-keyed sidecar never leak in.
+        assert!(!paths.iter().any(|p| p.ends_with("other.sock")));
+        assert!(!paths.iter().any(|p| p.ends_with("unkeyed.sock")));
+
+        // With nothing keyed to the pane, the seed id still resolves.
+        let paths = socket_candidates(&root, "404", "seed");
+        assert_eq!(paths, vec![root.join("pilus/seed.sock")]);
+        // And an unsafe pane runs no scan at all.
+        let paths = socket_candidates(&root, "../x", "seed");
+        assert_eq!(paths, vec![root.join("pilus/seed.sock")]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_session_follow_swaps_transcripts_and_tells_the_reader() {
+        let mut panel = SessionPanel::default();
+        panel.open = true;
+        panel.reported = Some("s1".to_string());
+        panel.expand_key = Some("s1".to_string());
+        panel.expanded.insert(0);
+        push(
+            &mut panel,
+            ItemKind::User {
+                text: "old".to_string(),
+                images: 0,
+            },
+        );
+        let (switch_tx, switch_rx) = std::sync::mpsc::channel::<(u64, String)>();
+        panel.switch_tx = Some(switch_tx);
+        let epoch = panel.epoch;
+
+        panel.follow_session("s2".to_string());
+
+        assert_eq!(panel.reported.as_deref(), Some("s2"));
+        assert_eq!(panel.epoch, epoch + 1);
+        assert!(panel.transcript.items.is_empty());
+        assert!(panel.expanded.is_empty());
+        assert_eq!(panel.expand_key.as_deref(), Some("s2"));
+        // The outgoing expansion parked under its own id.
+        assert!(
+            panel
+                .expand_cache
+                .get("s1")
+                .is_some_and(|state| state.expanded.contains(&0))
+        );
+        assert_eq!(switch_rx.try_recv(), Ok((panel.epoch, "s2".to_string())));
+
+        // A repeat hello or a malformed id is ignored.
+        panel.follow_session("s2".to_string());
+        panel.follow_session("../evil".to_string());
+        assert_eq!(panel.reported.as_deref(), Some("s2"));
+        assert!(switch_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_session_follow_fills_a_waiting_panel() {
+        let mut panel = SessionPanel::default();
+        panel.open = true;
+        panel.waiting = true;
+        let (switch_tx, switch_rx) = std::sync::mpsc::channel::<(u64, String)>();
+        panel.switch_tx = Some(switch_tx);
+
+        panel.follow_session("s9".to_string());
+
+        assert!(!panel.waiting);
+        assert_eq!(panel.reported.as_deref(), Some("s9"));
+        assert!(matches!(switch_rx.try_recv(), Ok((_, id)) if id == "s9"));
+    }
+
+    #[test]
+    fn live_session_and_rpc_live_gate_on_open() {
+        let mut panel = SessionPanel::default();
+        assert_eq!(panel.live_session(), None);
+        panel.open = true;
+        panel.reported = Some("s1".to_string());
+        assert_eq!(panel.live_session().as_deref(), Some("s1"));
+        assert!(!panel.rpc_live());
+        panel.rpc_up = true;
+        assert!(panel.rpc_live());
+        panel.close();
+        assert_eq!(panel.live_session(), None);
+        assert!(!panel.rpc_live());
     }
 }

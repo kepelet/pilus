@@ -55,6 +55,12 @@ pub struct Sidecar {
     pub socket: String,
     /// pi's node binary, which can relay stdio onto the socket.
     pub exec_path: String,
+    /// The pane this pi runs in; `None` on extensions older than the pane
+    /// field, or a pi outside the daemon's panes.
+    pub pane: Option<String>,
+    /// The session the socket streams; the file name says it too, but a
+    /// scanned sidecar needs it without trusting the name.
+    pub session_id: Option<String>,
 }
 
 impl Sidecar {
@@ -138,7 +144,11 @@ pub struct ToolEvent {
 /// private so the public [`RpcEvent`] does not inherit serde quirks like
 /// `stream`'s nested payload.
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 enum Wire {
     Hello {
         #[allow(dead_code)]
@@ -240,6 +250,8 @@ pub enum RpcCommand {
         deliver_as: Option<DeliverAs>,
     },
     Abort,
+    /// Ask pi to open a fresh session, like typing `/new` in the editor.
+    New,
     SetModel {
         provider: String,
         model: String,
@@ -273,6 +285,9 @@ impl RpcCommand {
             }
             RpcCommand::Abort => {
                 object.insert("cmd".to_string(), json!("abort"));
+            }
+            RpcCommand::New => {
+                object.insert("cmd".to_string(), json!("new"));
             }
             RpcCommand::SetModel { provider, model } => {
                 object.insert("cmd".to_string(), json!("set_model"));
@@ -329,7 +344,8 @@ mod tests {
     const TOOL_START: &str = "{\"type\":\"tool\",\"phase\":\"start\",\"toolCallId\":\"call_01a1063e009976799781a6b7\",\"toolName\":\"bash\",\"output\":\"\",\"isError\":false}";
     const TOOL_END: &str = "{\"type\":\"tool\",\"phase\":\"end\",\"toolCallId\":\"call_01a1063e009976799781a6b7\",\"toolName\":\"bash\",\"output\":\"tool-ok\\n\",\"isError\":false}";
     const MODELS_REPLY: &str = "{\"type\":\"response\",\"id\":\"2\",\"ok\":true,\"data\":{\"models\":[{\"provider\":\"minimax\",\"id\":\"MiniMax-M2.7\",\"name\":\"MiniMax-M2.7\",\"contextWindow\":204800,\"reasoning\":true}]}}";
-    const ERROR_REPLY: &str = "{\"type\":\"response\",\"id\":\"5\",\"ok\":false,\"error\":\"unknown command bogus\"}";
+    const ERROR_REPLY: &str =
+        "{\"type\":\"response\",\"id\":\"5\",\"ok\":false,\"error\":\"unknown command bogus\"}";
 
     #[test]
     fn the_fixture_lines_parse() {
@@ -372,7 +388,10 @@ mod tests {
         assert_eq!(tool.phase, ToolPhase::End);
         assert_eq!(tool.output, "tool-ok\n");
 
-        assert_eq!(parse_event("{\"type\":\"stream_end\"}"), Some(RpcEvent::StreamEnd));
+        assert_eq!(
+            parse_event("{\"type\":\"stream_end\"}"),
+            Some(RpcEvent::StreamEnd)
+        );
 
         let Some(RpcEvent::Response { id, ok, data, .. }) = parse_event(MODELS_REPLY) else {
             panic!("models reply");
@@ -394,9 +413,9 @@ mod tests {
     #[test]
     fn sparse_state_and_unknown_lines_are_safe() {
         // `model` and `context.tokens` may be null right after a compaction.
-        let Some(RpcEvent::State(state)) =
-            parse_event("{\"type\":\"state\",\"busy\":true,\"model\":null,\"context\":{\"tokens\":null}}")
-        else {
+        let Some(RpcEvent::State(state)) = parse_event(
+            "{\"type\":\"state\",\"busy\":true,\"model\":null,\"context\":{\"tokens\":null}}",
+        ) else {
             panic!("sparse state");
         };
         assert!(state.busy);
@@ -475,6 +494,10 @@ mod tests {
             as_json(&RpcCommand::State, "8"),
             json!({"id": "8", "cmd": "state"}),
         );
+        assert_eq!(
+            as_json(&RpcCommand::New, "9"),
+            json!({"id": "9", "cmd": "new"}),
+        );
     }
 
     #[test]
@@ -496,13 +519,31 @@ mod tests {
     #[test]
     fn a_sidecar_parses() {
         let sidecar = Sidecar::parse(
-            "{\"protocol\":1,\"pid\":31755,\"socket\":\"/tmp/x.sock\",\"execPath\":\"/usr/bin/node\"}",
+            "{\"protocol\":1,\"pid\":31755,\"socket\":\"/tmp/x.sock\",\"execPath\":\"/usr/bin/node\",\"pane\":\"86\",\"sessionId\":\"abc-123\"}",
         )
         .expect("sidecar");
         assert_eq!(sidecar.protocol, 1);
         assert_eq!(sidecar.pid, 31755);
         assert_eq!(sidecar.socket, "/tmp/x.sock");
         assert_eq!(sidecar.exec_path, "/usr/bin/node");
+        assert_eq!(sidecar.pane.as_deref(), Some("86"));
+        assert_eq!(sidecar.session_id.as_deref(), Some("abc-123"));
+
+        // Older extensions write no pane or session id; both stay `None`.
+        let old = Sidecar::parse(
+            "{\"protocol\":1,\"pid\":31755,\"socket\":\"/tmp/x.sock\",\"execPath\":\"/usr/bin/node\"}",
+        )
+        .expect("old sidecar");
+        assert!(old.pane.is_none());
+        assert!(old.session_id.is_none());
+
+        // A pi outside the daemon's panes reports a null pane.
+        let free = Sidecar::parse(
+            "{\"protocol\":1,\"pid\":31755,\"socket\":\"/tmp/x.sock\",\"execPath\":\"/usr/bin/node\",\"pane\":null,\"sessionId\":\"abc-123\"}",
+        )
+        .expect("free sidecar");
+        assert!(free.pane.is_none());
+
         assert!(Sidecar::parse("{}").is_none());
     }
 }

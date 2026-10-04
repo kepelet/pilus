@@ -25,7 +25,7 @@ pub use discover::{
 };
 pub use entry::{Header, Item, ItemKind, ToolOutcome, Transcript, TranscriptMeta, Usage};
 pub use rpc::{
-    ContextUsage, DeliverAs, PiModel, PiState, PROTOCOL, RpcCommand, RpcEvent, Sidecar, ToolEvent,
+    ContextUsage, DeliverAs, PROTOCOL, PiModel, PiState, RpcCommand, RpcEvent, Sidecar, ToolEvent,
     ToolPhase, agent_dir, live_items, models_from, parse_event, sidecar_path, socket_path,
 };
 pub use tail::{Error, FileSource, Result, Source, Tail};

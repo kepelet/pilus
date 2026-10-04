@@ -8,7 +8,7 @@
 //! The bytes come from a [`Source`], so the same fold works for a local file
 //! and a session on another machine read over SSH.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -94,6 +94,58 @@ impl Source for FileSource {
     }
 }
 
+/// A local copy of a source's bytes, kept current as the tail reads.
+///
+/// Writes land at their source offset rather than the end, so two tails
+/// mirroring the same source write identical bytes to identical places —
+/// concurrent writers converge instead of interleaving. A torn tail from
+/// a killed process seeds a partial line the next source read completes,
+/// because the mirror is only ever a prefix of the source.
+struct Mirror {
+    file: File,
+}
+
+impl Mirror {
+    /// Open (creating) `path` and read the bytes already mirrored.
+    fn open(path: &Path) -> Result<(Self, Vec<u8>)> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| Error::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            // Keep what is already mirrored — the seed below folds it.
+            .truncate(false)
+            .open(path)
+            .map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let mut seed = Vec::new();
+        file.read_to_end(&mut seed).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok((Self { file }, seed))
+    }
+
+    /// Copy `bytes`, which came from the source at `offset`, into the mirror.
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) {
+        use std::os::unix::fs::FileExt;
+        // A cache write never fails the read it shadows.
+        let _ = self.file.write_at(bytes, offset);
+    }
+
+    /// The source shrank or was replaced: the mirror starts over too.
+    fn reset(&mut self) {
+        let _ = self.file.set_len(0);
+    }
+}
+
 /// A session and the transcript folded from it.
 pub struct Tail {
     source: Box<dyn Source>,
@@ -102,6 +154,8 @@ pub struct Tail {
     /// Bytes after the last newline, waiting for more.
     partial: Vec<u8>,
     transcript: Transcript,
+    /// The on-disk copy appended to on every read, when one is kept.
+    mirror: Option<Mirror>,
 }
 
 impl Tail {
@@ -117,8 +171,39 @@ impl Tail {
             offset: 0,
             partial: Vec::new(),
             transcript: Transcript::default(),
+            mirror: None,
         };
         tail.poll()?;
+        Ok(tail)
+    }
+
+    /// Fold from `source`, keeping a copy of its bytes under `path`.
+    ///
+    /// The mirror seeds the fold itself: bytes copied in an earlier
+    /// session paint immediately, before the first — possibly remote —
+    /// source call. The first live read is left to `poll`, so what a
+    /// caller sends as the opening delta is the cached transcript, not a
+    /// blank wait on the network.
+    ///
+    /// The mirror is best-effort: a source that shrank below it rewinds
+    /// and truncates it, and failures reading or writing it degrade to
+    /// the un-mirrored tail rather than failing the session.
+    pub fn with_source_and_mirror(
+        source: Box<dyn Source>,
+        path: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let (mirror, seed) = match Mirror::open(&path.into()) {
+            Ok((mirror, seed)) => (Some(mirror), seed),
+            Err(_) => (None, Vec::new()),
+        };
+        let mut tail = Self {
+            source,
+            offset: seed.len() as u64,
+            partial: seed,
+            transcript: Transcript::default(),
+            mirror,
+        };
+        tail.drain_lines();
         Ok(tail)
     }
 
@@ -157,6 +242,9 @@ impl Tail {
         if appended.is_empty() {
             return Ok(false);
         }
+        if let Some(mirror) = self.mirror.as_mut() {
+            mirror.write_at(self.offset, &appended);
+        }
         self.offset += appended.len() as u64;
         self.partial.extend_from_slice(&appended);
         Ok(self.drain_lines())
@@ -169,6 +257,9 @@ impl Tail {
         self.transcript.mark_changed(0);
         self.offset = 0;
         self.partial.clear();
+        if let Some(mirror) = self.mirror.as_mut() {
+            mirror.reset();
+        }
     }
 
     /// Fold every complete line in `partial`, keeping any trailing fragment.
@@ -215,10 +306,7 @@ mod tests {
         assert!(!tail.poll().expect("poll idle"));
 
         // A partial line is held back until its newline lands.
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("reopen");
+        let mut file = OpenOptions::new().append(true).open(&path).expect("reopen");
         file.write_all(b"{\"type\":\"message\",\"id\":\"b\"")
             .expect("partial write");
         assert!(!tail.poll().expect("poll partial"));
@@ -300,11 +388,9 @@ mod tests {
 
     #[test]
     fn a_custom_source_drives_the_same_fold() {
-        let tail = Tail::with_source(Box::new(Memory(
-            std::sync::Arc::new(std::sync::Mutex::new(
-                message("a", "user", "hi").into_bytes(),
-            )),
-        )))
+        let tail = Tail::with_source(Box::new(Memory(std::sync::Arc::new(
+            std::sync::Mutex::new(message("a", "user", "hi").into_bytes()),
+        ))))
         .expect("tail");
         assert_eq!(tail.transcript().items.len(), 1);
         assert_eq!(tail.label(), "memory");
@@ -366,5 +452,71 @@ mod tests {
         }
         assert!(tail.poll().expect("poll"));
         assert_eq!(tail.take_changed_from(), Some(0));
+    }
+
+    /// A temp path unique to a test.
+    fn mirror_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("pilus-mirror-{name}-{}.jsonl", std::process::id()))
+    }
+
+    #[test]
+    fn a_mirror_seeds_the_fold_before_any_source_read() {
+        let path = mirror_path("seed");
+        let _ = std::fs::remove_file(&path);
+        // The mirror holds the source's own first bytes, mirrored last
+        // session: the fold paints them before the first live poll.
+        let seed = message("a", "user", "cached");
+        std::fs::write(&path, &seed).expect("seed");
+        let (_bytes, memory) = Memory::with(seed);
+        let mut tail = Tail::with_source_and_mirror(Box::new(memory), &path).expect("tail");
+        assert_eq!(tail.transcript().items.len(), 1);
+
+        // Live bytes join the seed: the mirror grows to match the source.
+        grow(&mut tail, &_bytes, &message("b", "assistant", "fresh"));
+        assert_eq!(tail.transcript().items.len(), 2);
+        let mirrored = std::fs::read_to_string(&path).expect("mirror");
+        assert!(mirrored.contains("cached"));
+        assert!(mirrored.contains("fresh"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_torn_mirror_tail_joins_the_next_source_bytes() {
+        let path = mirror_path("torn");
+        let _ = std::fs::remove_file(&path);
+        let line = message("a", "user", "split line");
+        // A writer killed mid-append leaves a fragment of a real line.
+        let tear = line.len() / 2;
+        std::fs::write(&path, &line[..tear]).expect("seed");
+        // The source holds the whole line: the fragment plus the rest of
+        // the source's bytes folds to exactly one item.
+        let (_bytes, memory) = Memory::with(line);
+        let mut tail = Tail::with_source_and_mirror(Box::new(memory), &path).expect("tail");
+        assert_eq!(tail.transcript().items.len(), 0);
+        assert!(tail.poll().expect("poll"));
+        assert_eq!(tail.transcript().items.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_shrinking_source_resets_the_mirror() {
+        let path = mirror_path("shrink");
+        let _ = std::fs::remove_file(&path);
+        let stale = message("a", "user", "from an older, longer file");
+        let (bytes, memory) = Memory::with(stale.clone());
+        let mut tail = Tail::with_source_and_mirror(Box::new(memory), &path).expect("tail");
+        tail.poll().expect("poll");
+        // The source is replaced by a shorter file: the rewind must not
+        // leave the longer mirrored bytes ahead of the fresh read.
+        if let Ok(mut buffer) = bytes.lock() {
+            buffer.clear();
+            buffer.extend_from_slice(message("b", "user", "hi").as_bytes());
+        }
+        assert!(tail.poll().expect("poll"));
+        assert_eq!(tail.transcript().items.len(), 1);
+        let mirrored = std::fs::read_to_string(&path).expect("mirror");
+        assert!(!mirrored.contains("older"));
+        assert!(mirrored.contains("hi"));
+        let _ = std::fs::remove_file(&path);
     }
 }

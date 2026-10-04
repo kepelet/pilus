@@ -1,6 +1,6 @@
 // installed by pilus; reinstalling or updating pilus overwrites this file.
 // add custom extensions beside this file instead of editing it.
-// PILUS_INTEGRATION_VERSION=2
+// PILUS_INTEGRATION_VERSION=3
 // @ts-nocheck
 //
 // Two jobs, both keyed by the session this pi process is in:
@@ -24,9 +24,22 @@
 //      "output","isError"}
 //   client -> server: {"id","cmd",...}; answered by
 //     {"type":"response","id","ok","error"?,"data"?}
-//     cmd: "prompt" {text, deliverAs?: "steer"|"followUp"} | "abort"
+//     cmd: "prompt" {text, deliverAs?: "steer"|"followUp"} | "abort" | "new"
 //          | "set_model" {provider, model} | "set_thinking" {level}
 //          | "models" | "state"
+//
+// The sidecar records the pane and session id alongside the socket path so
+// a reader can find this socket on its own when the session changes
+// underneath it ("/new", "/resume"): the old socket dies, a fresh sidecar
+// appears under the same pane name, and the hello on the new socket
+// carries the new session id. The daemon's report is only a hint; the
+// socket is the authority on which session the pane is in.
+//
+// "new" is a little unusual: `newSession` only exists on a command
+// context, so the handler detours through a `pilus:new` command
+// registered at load and dispatches it the way the editor would. On
+// success the switch tears the answering socket down, so a missing reply
+// simply means session_start landed first.
 
 import { createConnection, createServer } from "node:net";
 import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -103,6 +116,27 @@ export default function (pi) {
   let pendingStream;
   let streamTimer;
   const toolTimers = new Map();
+
+  // `ctx.newSession` only exists on a command context, so the socket's
+  // "new" detours through this registered command to reach it. The outcome
+  // lands here for the handler to reply with; a session switch tears the
+  // socket down anyway, so a lost reply is the success case.
+  const NEW_COMMAND = "pilus:new";
+  let newOutcome: { cancelled?: boolean; error?: string } | undefined;
+  pi.registerCommand(NEW_COMMAND, {
+    description: "Start a new session",
+    handler: async (_args, cmdCtx) => {
+      if (typeof cmdCtx?.newSession !== "function") {
+        newOutcome = { error: "this pi cannot start a session from a command" };
+        return;
+      }
+      try {
+        newOutcome = (await cmdCtx.newSession()) ?? {};
+      } catch (error) {
+        newOutcome = { error: String(error?.message ?? error) };
+      }
+    },
+  });
 
   const remember = (eventCtx) => {
     if (eventCtx) ctx = eventCtx;
@@ -202,6 +236,28 @@ export default function (pi) {
         case "abort":
           ctx?.abort?.();
           return respond(client, id, true);
+        case "new": {
+          const commands = pi.getCommands?.() ?? [];
+          if (!commands.some((command) => command?.name === NEW_COMMAND)) {
+            return respond(client, id, false, { error: "new session is not available" });
+          }
+          newOutcome = undefined;
+          // The declared `void` return hides the real promise in current
+          // builds; await it, then wait out the command either way.
+          await Promise.resolve(
+            pi.sendUserMessage(`/${NEW_COMMAND}`, { expandPromptTemplates: true }),
+          );
+          for (let waited = 0; newOutcome === undefined && waited < 4000; waited += 50) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          if (newOutcome?.error) {
+            return respond(client, id, false, { error: newOutcome.error });
+          }
+          if (newOutcome?.cancelled) {
+            return respond(client, id, false, { error: "new session was cancelled" });
+          }
+          return respond(client, id, true);
+        }
         case "set_model": {
           const model = ctx?.modelRegistry?.find?.(request.provider, request.model);
           if (!model) return respond(client, id, false, { error: "unknown model" });
@@ -299,7 +355,14 @@ export default function (pi) {
       try {
         writeFileSync(
           sidecarPath,
-          JSON.stringify({ protocol: PROTOCOL, pid: process.pid, socket: path, execPath: process.execPath }),
+          JSON.stringify({
+            protocol: PROTOCOL,
+            pid: process.pid,
+            socket: path,
+            execPath: process.execPath,
+            pane: pane ?? null,
+            sessionId,
+          }),
           { mode: 0o600 },
         );
       } catch {}

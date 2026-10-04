@@ -170,7 +170,10 @@ mod tests {
         std::fs::create_dir_all(&other).expect("session dir");
         let found = other.join("2024-01-01T00-00-00-000Z_reported.jsonl");
         std::fs::write(&found, "{}\n").expect("write session");
-        assert_eq!(find_any_by_id(&root, "reported").as_deref(), Some(found.as_path()));
+        assert_eq!(
+            find_any_by_id(&root, "reported").as_deref(),
+            Some(found.as_path())
+        );
         assert_eq!(find_any_by_id(&root, "absent"), None);
         let _ = std::fs::remove_dir_all(&root);
     }

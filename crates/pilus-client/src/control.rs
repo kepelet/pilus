@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, bounded, select, tick, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, never, select, tick, unbounded};
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
@@ -997,6 +997,12 @@ const RECONCILE_REMOTE: Duration = Duration::from_secs(5);
 /// Reconciliation cadence for a hidden local endpoint's feed.
 const RECONCILE_AGENTS: Duration = Duration::from_secs(3);
 
+/// The agents-only lane an active feed gets beside its snapshot tick. The
+/// pin that replaces a pane's terminal rides `agent.list`; over SSH a full
+/// refresh is five proxied requests — too heavy at a focus-chasing cadence —
+/// but `agent.list` alone is one, and locally it is a trivial socket read.
+const RECONCILE_AGENTS_FAST: Duration = Duration::from_millis(1200);
+
 /// How long to wait before resubscribing after the event stream ends.
 const RESUBSCRIBE: Duration = Duration::from_millis(500);
 
@@ -1155,6 +1161,16 @@ fn run_reconcile(
         return;
     }
     let ticker = tick(interval);
+    // An active feed gets an agents-only lane beside the snapshot tick: a
+    // focused pi's pin rides `agent.list`. Remote feeds have no event stream
+    // at all, and a local focus change may not emit one either — five
+    // proxied requests are too heavy at the cadence a pane switch needs,
+    // but one cheap `agent.list` is not. Hidden feeds keep their own
+    // cadence: nobody is looking at them.
+    let agents_ticker = match &scope {
+        FeedScope::Full => tick(RECONCILE_AGENTS_FAST),
+        _ => never(),
+    };
     loop {
         select! {
             // A dead poke channel means the command thread — and with it the
@@ -1166,11 +1182,45 @@ fn run_reconcile(
                 }
             }
             recv(ticker) -> _ => {},
+            recv(agents_ticker) -> _ => {
+                if !refresh_agents(&transport, &updates, &last) {
+                    break;
+                }
+                continue;
+            }
         }
         if !refresh(&transport, scope, &updates, &last) {
             break;
         }
     }
+}
+
+/// Refresh only the agent list and merge it into the held snapshot, so the
+/// update stays whole for the GUI. One proxied request where a full pass is
+/// five; a failed read keeps the last good snapshot, same as [`refresh`].
+fn refresh_agents(
+    transport: &ControlTransport,
+    updates: &Sender<FeedUpdate>,
+    last: &Mutex<Option<FeedUpdate>>,
+) -> bool {
+    let Some(agents) = ControlClient::from_transport(transport.clone())
+        .agents()
+        .ok()
+    else {
+        return true;
+    };
+    let Ok(mut guard) = last.lock() else {
+        return true;
+    };
+    let Some(snapshot) = guard.as_mut() else {
+        // Nothing published yet; the opening refresh lands one momentarily.
+        return true;
+    };
+    if snapshot.agents == agents {
+        return true;
+    }
+    snapshot.agents = agents;
+    updates.send(snapshot.clone()).is_ok()
 }
 
 /// Hold an event subscription, refreshing the snapshot on structural changes.
@@ -1327,8 +1377,8 @@ mod tests {
         // An agent that never reports omits the key or sends an empty one.
         let missing = Agent::from_json(&json!({"pane": "7", "agent": "pi"})).expect("agent");
         assert_eq!(missing.session, None);
-        let empty = Agent::from_json(&json!({"pane": "7", "agent": "pi", "session": ""}))
-            .expect("agent");
+        let empty =
+            Agent::from_json(&json!({"pane": "7", "agent": "pi", "session": ""})).expect("agent");
         assert_eq!(empty.session, None);
     }
 

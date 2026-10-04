@@ -11674,6 +11674,16 @@ fn agent_icon(kind: &str) -> &'static [u8] {
             include_bytes!("../../assets/icons/agents/gemini.svg"),
         ),
         ("qwen", include_bytes!("../../assets/icons/agents/qwen.svg")),
+        // Devin's daemon id is the agent name; `cognition` is its vendor, which
+        // manifests spell out instead.
+        (
+            "cognition",
+            include_bytes!("../../assets/icons/agents/devin.svg"),
+        ),
+        (
+            "devin",
+            include_bytes!("../../assets/icons/agents/devin.svg"),
+        ),
         ("amp", include_bytes!("../../assets/icons/agents/amp.svg")),
         ("arc", include_bytes!("../../assets/icons/agents/arc.svg")),
         ("omp", include_bytes!("../../assets/icons/agents/pi.svg")),

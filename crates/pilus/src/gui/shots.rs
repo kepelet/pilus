@@ -390,7 +390,6 @@ pub fn run() -> Result<()> {
                         PathBuf::from("/tmp/pilus-shot-api.sock"),
                         "~/work/repo".to_string(),
                         None,
-                        "pi".to_string(),
                         "shot-pane".to_string(),
                         cx,
                     );

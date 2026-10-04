@@ -487,7 +487,6 @@ pub struct SessionPanel {
     /// The panel stands in for a pi pane's terminal: Escape does not close
     /// it, so there is no way to strand the pane behind the card.
     pinned: bool,
-    title: String,
     error: String,
     /// The endpoint the session lives on, reused to prompt the live agent.
     endpoint: Option<Endpoint>,
@@ -582,10 +581,6 @@ pub struct SessionPanel {
     /// the newer one the extension socket followed. `None` while the pane
     /// has not reported and no socket has been discovered.
     reported: Option<String>,
-    /// Open before any session is known: the auto pin covered the pane but
-    /// neither a report nor a socket has produced an id yet, so the body
-    /// waits instead of tailing a guessed file.
-    waiting: bool,
     /// The session generation: bumped on every open and follow so a delta
     /// produced before a `/new` switch cannot land in the new transcript.
     epoch: u64,
@@ -621,7 +616,6 @@ impl Default for SessionPanel {
         Self {
             open: false,
             pinned: false,
-            title: String::new(),
             error: String::new(),
             endpoint: None,
             target: None,
@@ -660,7 +654,6 @@ impl Default for SessionPanel {
             rpc_tx: None,
             rpc_up: false,
             reported: None,
-            waiting: false,
             epoch: 0,
             switch_tx: None,
             pi_state: None,
@@ -693,7 +686,6 @@ impl SessionPanel {
         &mut self,
         api_socket: PathBuf,
         spec: String,
-        title: String,
         target: Option<String>,
         cx: &mut Context<PilusView>,
     ) {
@@ -717,7 +709,6 @@ impl SessionPanel {
                 session_id: None,
                 resolve_latest: true,
             },
-            title,
             target,
             cx,
         );
@@ -725,14 +716,13 @@ impl SessionPanel {
 
     /// Open the panel for a local pane. `session_id` is the daemon's
     /// latest report — the extension socket may already know a newer one
-    /// and will retarget the reader itself; `None` opens a waiting panel
+    /// and will retarget the reader itself; `None` opens an empty panel
     /// that fills once either produces an id.
     pub fn open_local_session(
         &mut self,
         api_socket: PathBuf,
         cwd: String,
         session_id: Option<String>,
-        title: String,
         pane: String,
         cx: &mut Context<PilusView>,
     ) {
@@ -743,7 +733,6 @@ impl SessionPanel {
                 session_id,
                 resolve_latest: false,
             },
-            title,
             Some(pane),
             cx,
         );
@@ -756,7 +745,6 @@ impl SessionPanel {
         target: SshTarget,
         cwd: String,
         session_id: Option<String>,
-        title: String,
         pane: String,
         cx: &mut Context<PilusView>,
     ) {
@@ -767,7 +755,6 @@ impl SessionPanel {
                 session_id,
                 resolve_latest: false,
             },
-            title,
             Some(pane),
             cx,
         );
@@ -801,7 +788,6 @@ impl SessionPanel {
         &mut self,
         endpoint: Endpoint,
         spec: ReadSpec,
-        title: String,
         target: Option<String>,
         cx: &mut Context<PilusView>,
     ) {
@@ -809,7 +795,6 @@ impl SessionPanel {
         self.close();
         self.rotate_channels();
         self.open = true;
-        self.title = title.clone();
         self.error.clear();
         self.status.clear();
         self.sending = false;
@@ -869,7 +854,6 @@ impl SessionPanel {
         self.target = target;
         self.endpoint = Some(endpoint.clone());
         self.reported = spec.session_id.clone();
-        self.waiting = spec.session_id.is_none() && !spec.resolve_latest;
         self.epoch += 1;
         self.stop = Arc::new(AtomicBool::new(false));
         let stop = self.stop.clone();
@@ -995,7 +979,6 @@ impl SessionPanel {
         self.prompts_open = false;
         self.last_growth = None;
         self.last_seen = 0;
-        self.waiting = false;
         self.error.clear();
         self.status.clear();
         self.epoch += 1;
@@ -2203,82 +2186,49 @@ impl SessionPanel {
         column.into_any_element()
     }
 
-    /// The header strip: identity on the left, live counters on the right.
-    /// One row: the first prompt on the left, the host and cwd on the right.
-    /// Model, cost, and usage live in the composer now.
+    /// The header strip: the session's first prompt, once it has one.
+    /// Until then a skeleton bar holds its place; a fallback label here
+    /// would name a session that does not exist yet. Model, cost, and usage
+    /// live in the composer now.
     fn header(&self, fonts: Fonts) -> Div {
         let theme = self.theme;
+        let title = match self.first_prompt() {
+            Some(prompt) => div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_size(px(fonts.body))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(theme.fg)
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(prompt)
+                .into_any_element(),
+            None => style::skeleton("pilus-session-title-skeleton", theme, px(280.0), fonts.body)
+                .into_any_element(),
+        };
         div()
             .flex()
             .flex_shrink_0()
-            .flex_row()
             .items_center()
-            .gap_3()
             .h(px(40.0))
             .px_4()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .text_size(px(fonts.body))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(theme.fg)
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(self.first_prompt()),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .max_w(relative(0.4))
-                    .overflow_hidden()
-                    .font_family(style::mono_family(&self.settings))
-                    .text_size(px(fonts.label))
-                    .text_color(theme.muted)
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(self.host_cwd()),
-            )
+            .child(title)
     }
 
-    /// The session's first prompt as one line, or the pane title when the
+    /// The session's first prompt as one line, or `None` while the
     /// transcript has no user message yet.
-    fn first_prompt(&self) -> String {
-        let prompt = self
+    fn first_prompt(&self) -> Option<String> {
+        let text = self
             .transcript
             .items
             .iter()
             .find_map(|item| match &item.kind {
-                ItemKind::User { text, .. } => Some(text.clone()),
+                ItemKind::User { text, .. } => Some(text.as_str()),
                 _ => None,
-            });
-        match prompt {
-            Some(text) => {
-                let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                truncate(&one_line, 240)
-            }
-            None if self.title.is_empty() => self.transcript.header.id.clone(),
-            None => self.title.clone(),
-        }
-    }
-
-    /// `host · cwd` for the header's right column.
-    fn host_cwd(&self) -> String {
-        match &self.endpoint {
-            Some(Endpoint::Local { cwd, .. }) => {
-                let cwd = if cwd.is_empty() {
-                    self.transcript.header.cwd.clone()
-                } else {
-                    cwd.clone()
-                };
-                format!("local · {cwd}")
-            }
-            Some(Endpoint::Remote { target, cwd }) => {
-                format!("{} · {cwd}", target.destination)
-            }
-            None => String::new(),
-        }
+            })?;
+        let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        Some(truncate(&one_line, 240))
     }
 
     /// The scrollable transcript, or the empty/error placeholder.
@@ -2307,22 +2257,9 @@ impl SessionPanel {
                 .into_any_element();
         }
         if self.transcript.items.is_empty() {
-            return div()
-                .flex_1()
-                .min_h(px(0.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .px_6()
-                .text_center()
-                .text_size(px(fonts.body))
-                .text_color(theme.muted)
-                .child(if self.waiting {
-                    "Waiting for pi to report its session…"
-                } else {
-                    "Waiting for the first message…"
-                })
-                .into_any_element();
+            // An empty transcript is the normal first paint of a fresh
+            // session: pi writes its first line once it has one to write.
+            return div().flex_1().min_h(px(0.0)).into_any_element();
         }
         // The virtualized list is a flex sibling of the composer, so the
         // composer can never cover the last message.
@@ -5394,16 +5331,16 @@ mod tests {
     }
 
     #[test]
-    fn a_session_follow_fills_a_waiting_panel() {
-        let mut panel = SessionPanel::default();
-        panel.open = true;
-        panel.waiting = true;
+    fn a_session_follow_fills_an_unreported_panel() {
+        let mut panel = SessionPanel {
+            open: true,
+            ..SessionPanel::default()
+        };
         let (switch_tx, switch_rx) = std::sync::mpsc::channel::<(u64, String)>();
         panel.switch_tx = Some(switch_tx);
 
         panel.follow_session("s9".to_string());
 
-        assert!(!panel.waiting);
         assert_eq!(panel.reported.as_deref(), Some("s9"));
         assert!(matches!(switch_rx.try_recv(), Ok((_, id)) if id == "s9"));
     }

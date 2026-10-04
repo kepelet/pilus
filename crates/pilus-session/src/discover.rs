@@ -73,6 +73,42 @@ pub fn find_by_id(root: &Path, cwd: &str, session_id: &str) -> Option<PathBuf> {
         .find(|path| path.to_string_lossy().ends_with(&suffix))
 }
 
+/// The session file carrying `session_id`, wherever under `root` it sits.
+///
+/// A pane reports its session id, not its cwd dir, and an agent can record
+/// a session under a different cwd than the pane reports; scanning every
+/// subdirectory finds it anyway. The newest mtime wins on a collision.
+pub fn find_any_by_id(root: &Path, session_id: &str) -> Option<PathBuf> {
+    let suffix = format!("_{session_id}.{EXTENSION}");
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let dir = entry.path();
+            dir.is_dir().then_some(dir)
+        })
+        .flat_map(|dir| {
+            std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if !path.to_string_lossy().ends_with(&suffix) {
+                        return None;
+                    }
+                    let modified = entry
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    Some((modified, path))
+                })
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+        .map(|(_, path)| path)
+}
+
 /// Resolve a `--session-ui` argument to a session file.
 ///
 /// An existing file is used as-is; anything else is treated as a working
@@ -124,6 +160,18 @@ mod tests {
         // even when both writes land in the same mtime tick.
         let files = list(&root, "/tmp/app");
         assert_eq!(files.first().map(PathBuf::as_path), Some(newer.as_path()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_any_by_id_crosses_cwd_dirs() {
+        let root = std::env::temp_dir().join(format!("pilus-session-any-{}", std::process::id()));
+        let other = sessions_dir(&root, "/elsewhere");
+        std::fs::create_dir_all(&other).expect("session dir");
+        let found = other.join("2024-01-01T00-00-00-000Z_reported.jsonl");
+        std::fs::write(&found, "{}\n").expect("write session");
+        assert_eq!(find_any_by_id(&root, "reported").as_deref(), Some(found.as_path()));
+        assert_eq!(find_any_by_id(&root, "absent"), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

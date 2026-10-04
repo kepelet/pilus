@@ -78,6 +78,9 @@ pub struct Settings {
     /// the control existed keep full blur via the default.
     #[serde(default = "default_blur")]
     pub blur: f32,
+    /// Replace a focused pi pane's terminal with the native conversation
+    /// view. On by default.
+    pub pi_gui_auto: bool,
 }
 
 impl Default for Settings {
@@ -95,6 +98,7 @@ impl Default for Settings {
             notifications: true,
             opacity: OPACITY,
             blur: BLUR,
+            pi_gui_auto: true,
         }
     }
 }
@@ -223,6 +227,7 @@ mod tests {
             notifications: false,
             opacity: 0.7,
             blur: 0.5,
+            pi_gui_auto: true,
         };
         let text = serde_json::to_string(&settings).expect("serialize");
         let back: Settings = serde_json::from_str(&text).expect("deserialize");

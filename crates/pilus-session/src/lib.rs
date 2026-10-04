@@ -17,8 +17,15 @@
 
 mod discover;
 mod entry;
+mod rpc;
 mod tail;
 
-pub use discover::{dir_name_for, find_by_id, latest, list, resolve, sessions_dir, sessions_root};
-pub use entry::{Header, Item, ItemKind, ToolOutcome, Transcript, Usage};
+pub use discover::{
+    dir_name_for, find_any_by_id, find_by_id, latest, list, resolve, sessions_dir, sessions_root,
+};
+pub use entry::{Header, Item, ItemKind, ToolOutcome, Transcript, TranscriptMeta, Usage};
+pub use rpc::{
+    ContextUsage, DeliverAs, PiModel, PiState, PROTOCOL, RpcCommand, RpcEvent, Sidecar, ToolEvent,
+    ToolPhase, agent_dir, live_items, models_from, parse_event, sidecar_path, socket_path,
+};
 pub use tail::{Error, FileSource, Result, Source, Tail};

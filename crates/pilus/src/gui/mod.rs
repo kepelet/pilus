@@ -15,6 +15,7 @@ mod keys;
 mod machines;
 mod markdown;
 mod palette;
+mod pi_extension;
 mod picker;
 mod scheme;
 mod selection;
@@ -930,6 +931,15 @@ struct SectionHeader {
     add: Option<(&'static str, SectionAction)>,
 }
 
+/// The focused pi pane the session panel currently stands in for, when
+/// `pi_gui_auto` replaced its terminal with the native conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PiView {
+    endpoint: EndpointId,
+    pane: String,
+    session: String,
+}
+
 /// A requested endpoint handoff waiting for its prepared frame.
 struct PendingSwitch {
     target: EndpointId,
@@ -1367,6 +1377,12 @@ struct PilusView {
     home: HomePanel,
     /// The native Pi Session panel, read live from a session file.
     session: SessionPanel,
+    /// The pi pane the session panel is pinned to, if auto-switch put one
+    /// up. `None` means the card shows the terminal again.
+    pi_view: Option<PiView>,
+    /// Machine ids whose pi extension install already ran this window, so
+    /// the SSH write happens once per machine per launch.
+    pi_ext_machines: HashSet<String>,
     /// The composer's prompt, an IME-capable field over `home`'s buffer.
     home_prompt: Entity<TextInput>,
     /// The Pi Session composer's field.
@@ -1685,6 +1701,8 @@ impl PilusView {
             remote_home: HashMap::new(),
             home,
             session,
+            pi_view: None,
+            pi_ext_machines: HashSet::new(),
             home_prompt,
             session_prompt,
             agent_configs: Vec::new(),
@@ -1719,6 +1737,11 @@ impl PilusView {
         view.reload_machines();
         // Bridge every enabled machine up front so their workspaces are ready.
         view.auto_connect_machines();
+        // Drop the pi session-report extension into this machine's agent
+        // dir; remote machines get it when they become the active endpoint.
+        std::thread::spawn(|| {
+            let _ = pi_extension::install_local();
+        });
 
         cx.spawn(async move |this, cx| {
             loop {
@@ -1844,6 +1867,7 @@ impl PilusView {
         if tabs_changed {
             self.reconcile_nav();
         }
+        changed |= self.sync_pi_view(cx);
         // Drop the optimistic endpoint pick once the handoff commits (the
         // committed highlight needs no pick) or every stage of the switch has
         // ended without one (the highlight must revert to the real surface).
@@ -3295,7 +3319,7 @@ impl PilusView {
             InputLayer::Settings => self.settings_key(event, cx),
             InputLayer::Session => {
                 let input = self.session_prompt.clone();
-                if self.session.key(&event.keystroke.key, &input, cx) {
+                if self.session.key(&event.keystroke, &input, cx) {
                     cx.notify();
                 }
             }
@@ -3487,8 +3511,10 @@ impl PilusView {
             ),
         ];
         // The native Pi Session panel reads whichever agent the active
-        // workspace is running, on any endpoint.
-        if self.surface.workspaces().iter().any(|w| w.active) {
+        // workspace is running, on any endpoint. Auto mode keeps pi panes
+        // covered itself, so the command only exists while the setting
+        // is off.
+        if !self.settings.pi_gui_auto && self.surface.workspaces().iter().any(|w| w.active) {
             entries.push(entry(
                 Command::OpenSession,
                 "Open Pi Session",
@@ -3870,11 +3896,101 @@ impl PilusView {
         }
     }
 
+    /// The pi pane the session panel should stand in for right now.
+    ///
+    /// Auto mode only: the focused agent, when it is pi and its extension
+    /// has reported a session. A pane without a report stays on the
+    /// terminal — there is no safe guess for which file it is writing.
+    /// Pure so tests can drive it with fabricated agents.
+    fn pi_view_for(agents: &[Agent], auto: bool, endpoint: &EndpointId) -> Option<(PiView, Agent)> {
+        if !auto {
+            return None;
+        }
+        let agent = agents.iter().find(|agent| agent.focused)?;
+        if agent.agent != "pi" {
+            return None;
+        }
+        let session = agent.session.clone()?;
+        Some((
+            PiView {
+                endpoint: endpoint.clone(),
+                pane: agent.pane.clone(),
+                session,
+            },
+            agent.clone(),
+        ))
+    }
+
+    /// Follow the focused pi pane: pin its conversation over the terminal,
+    /// or close the panel when nothing pi-shaped holds focus.
+    ///
+    /// Also installs the session-report extension on a machine the first
+    /// time it becomes the active endpoint — the daemon's `session` field
+    /// only appears once the extension is running.
+    fn sync_pi_view(&mut self, cx: &mut Context<Self>) -> bool {
+        if let EndpointId::Machine(id) = &self.active
+            && self.pi_ext_machines.insert(id.clone())
+            && let Some(target) = self.machine_target_by_key(id)
+        {
+            std::thread::spawn(move || {
+                let _ = pi_extension::install_remote(&target);
+            });
+        }
+        let desired = Self::pi_view_for(&self.agents, self.settings.pi_gui_auto, &self.active);
+        let view = desired.as_ref().map(|(view, _)| view.clone());
+        if view == self.pi_view {
+            return false;
+        }
+        match desired {
+            Some((view, agent)) => {
+                let title = agent.label().to_string();
+                match &self.active {
+                    EndpointId::Local => self.session.open_local_session(
+                        self.api_socket(),
+                        expand_local(&agent.cwd),
+                        view.session.clone(),
+                        title,
+                        view.pane.clone(),
+                        cx,
+                    ),
+                    EndpointId::Machine(id) => {
+                        let Some(target) = self.machine_target_by_key(id) else {
+                            // The pane is real but the machine has no SSH
+                            // profile: nothing can read its session, so the
+                            // terminal stays up.
+                            let was_open = self.pi_view.take().is_some();
+                            if was_open {
+                                self.session.close();
+                            }
+                            return was_open;
+                        };
+                        self.session.open_remote_session(
+                            target,
+                            self.expand_cwd(id, &agent.cwd),
+                            view.session.clone(),
+                            title,
+                            view.pane.clone(),
+                            cx,
+                        );
+                    }
+                }
+                self.session.set_pinned(true);
+            }
+            None => {
+                self.session.close();
+                self.session.set_pinned(false);
+            }
+        }
+        self.pi_view = view;
+        true
+    }
+
     /// Open the Pi Session panel for the active workspace's agent.
     ///
-    /// The session is located through the endpoint's own daemon
-    /// (`agent.sessions`), and its bytes are read from that endpoint's
-    /// filesystem — local, or over the machine's SSH transport.
+    /// Manual open, used when `pi_gui_auto` is off. Only the pane's own
+    /// reported session id resolves — without the extension's report there
+    /// is no reliable link from a pane to a file, so we ask the user to get
+    /// one rather than paint the wrong conversation.
     fn open_session(&mut self, cx: &mut Context<Self>) {
         let Some(active) = self
             .surface
@@ -3887,26 +4003,44 @@ impl PilusView {
             cx.notify();
             return;
         };
-        self.home.close();
-        self.settings_open = false;
-        let title = active.name.clone();
-        // The composer prompts the live agent, so it needs the pane `agent.prompt`
-        // resolves. The feed can lag a fresh pane; the cwd is a fallback.
-        let pane = self
+        let Some(agent) = self
             .agents
             .iter()
-            .find(|agent| agent.agent == "pi" && agent.workspace_id == active.id)
+            .find(|agent| agent.agent == "pi" && agent.focused)
+            .or_else(|| {
+                self.agents
+                    .iter()
+                    .find(|agent| agent.agent == "pi" && agent.workspace_id == active.id)
+            })
             .or_else(|| {
                 self.agents
                     .iter()
                     .find(|agent| agent.agent == "pi" && agent.cwd == active.cwd)
             })
-            .map(|agent| agent.pane.clone());
+            .cloned()
+        else {
+            self.status = "no pi agent in this workspace to read a session from".to_string();
+            cx.notify();
+            return;
+        };
+        let Some(session_id) = agent.session.clone() else {
+            self.status =
+                "pi hasn't reported its session yet — restart pi or run /reload in it".to_string();
+            cx.notify();
+            return;
+        };
+        self.home.close();
+        self.settings_open = false;
         match self.active.clone() {
             EndpointId::Local => {
-                let cwd = expand_local(&active.cwd);
-                self.session
-                    .open_local(self.api_socket(), cwd, title, pane, cx);
+                self.session.open_local_session(
+                    self.api_socket(),
+                    expand_local(&agent.cwd),
+                    session_id,
+                    agent.label().to_string(),
+                    agent.pane.clone(),
+                    cx,
+                );
             }
             EndpointId::Machine(id) => {
                 let Some(target) = self.machine_target_by_key(&id) else {
@@ -3914,8 +4048,15 @@ impl PilusView {
                     cx.notify();
                     return;
                 };
-                let cwd = self.expand_cwd(&id, &active.cwd);
-                self.session.open_remote(target, cwd, title, pane, cx);
+                let cwd = self.expand_cwd(&id, &agent.cwd);
+                self.session.open_remote_session(
+                    target,
+                    cwd,
+                    session_id,
+                    agent.label().to_string(),
+                    agent.pane.clone(),
+                    cx,
+                );
             }
         }
         cx.notify();
@@ -4856,6 +4997,7 @@ impl PilusView {
             .child(self.machines_section_block(cx))
             .child(self.agent_config_section_block(cx))
             .child(self.notifications_section_block(cx))
+            .child(self.pi_gui_section_block(cx))
             .child(self.updates_section_block(cx));
         div()
             .flex()
@@ -5477,6 +5619,44 @@ impl PilusView {
     /// Toggle native notifications and persist the choice at once.
     fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
         self.settings.notifications = !self.settings.notifications;
+        self.settings.save(&self.pilus_root);
+        *self.shared_settings.borrow_mut() = self.settings.clone();
+        cx.notify();
+    }
+
+    /// The PI SESSIONS section of the page: whether a focused pi pane is
+    /// painted as the native conversation instead of its terminal.
+    fn pi_gui_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let on = self.settings.pi_gui_auto;
+        let toggle = style::toggle("pilus-pi-gui-toggle", on, theme)
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_pi_gui(cx)));
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .child(style::section_label(theme, "PI SESSIONS", self.section_font()))
+                    .child(toggle),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .text_size(px(self.footer_font()))
+                    .text_color(theme.muted)
+                    .child("Show pi panes as a native conversation instead of the terminal"),
+            )
+    }
+
+    /// Toggle the native pi view and persist the choice at once.
+    fn toggle_pi_gui(&mut self, cx: &mut Context<Self>) {
+        self.settings.pi_gui_auto = !self.settings.pi_gui_auto;
         self.settings.save(&self.pilus_root);
         *self.shared_settings.borrow_mut() = self.settings.clone();
         cx.notify();
@@ -7917,7 +8097,11 @@ impl PilusView {
             .pb(px(SIDEBAR_LIST_PAD));
 
         content = content.child(self.new_workspace_row(cx));
-        content = content.child(self.session_row(cx));
+        // Auto mode replaces focused pi panes itself, so the manual toggle
+        // row only exists while the setting is off.
+        if !self.settings.pi_gui_auto {
+            content = content.child(self.session_row(cx));
+        }
         for kind in NavKind::ALL {
             content = content.child(self.nav_row(kind, cx));
         }
@@ -11480,6 +11664,44 @@ mod tests {
             mods,
             ..CellData::default()
         }
+    }
+
+    fn agent(agent: &str, focused: bool, session: Option<&str>) -> Agent {
+        Agent {
+            pane: "7".to_string(),
+            agent: agent.to_string(),
+            focused,
+            session: session.map(str::to_string),
+            ..Agent::default()
+        }
+    }
+
+    #[test]
+    fn pi_view_needs_auto_mode_and_a_reported_session() {
+        let endpoint = EndpointId::Local;
+        let focused = vec![agent("pi", true, Some("s1"))];
+        // Auto off always declines, even with a live report in front.
+        assert_eq!(PilusView::pi_view_for(&focused, false, &endpoint), None);
+        // A non-pi pane or a pi pane that has not reported stays terminal.
+        let non_pi = vec![agent("claude", true, Some("s1"))];
+        assert_eq!(PilusView::pi_view_for(&non_pi, true, &endpoint), None);
+        let unreported = vec![agent("pi", true, None)];
+        assert_eq!(PilusView::pi_view_for(&unreported, true, &endpoint), None);
+        // An unfocused pi is nobody's foreground.
+        let background = vec![agent("pi", false, Some("s1"))];
+        assert_eq!(PilusView::pi_view_for(&background, true, &endpoint), None);
+    }
+
+    #[test]
+    fn pi_view_reports_the_focused_pane() {
+        let endpoint = EndpointId::Local;
+        let agents = vec![agent("pi", true, Some("s1"))];
+        let Some((view, _)) = PilusView::pi_view_for(&agents, true, &endpoint) else {
+            panic!("a focused, reporting pi must be chosen");
+        };
+        assert_eq!(view.pane, "7");
+        assert_eq!(view.session, "s1");
+        assert_eq!(view.endpoint, endpoint);
     }
 
     #[test]

@@ -339,6 +339,9 @@ pub struct Agent {
     pub branch: Option<String>,
     /// Whether this agent's pane holds focus.
     pub focused: bool,
+    /// The session id the pane's agent reported via `pane.report_session`,
+    /// if it runs an integration that reports one (pi's extension does).
+    pub session: Option<String>,
 }
 
 impl Agent {
@@ -384,6 +387,11 @@ impl Agent {
                 .get("focused")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            session: value
+                .get("session")
+                .and_then(Value::as_str)
+                .filter(|session| !session.is_empty())
+                .map(str::to_string),
         })
     }
 
@@ -396,6 +404,37 @@ impl Agent {
             .rsplit('/')
             .find(|segment| !segment.is_empty())
             .unwrap_or(&self.agent)
+    }
+}
+
+/// One resumable agent session found on disk, from `agent.sessions`.
+///
+/// The daemon scans each supported agent's own store, so this lists sessions
+/// that *could* be resumed — it says nothing about which session a live pane
+/// is in. That link only exists when the pane's agent reports it, surfacing
+/// as [`Agent::session`]. The list is not filtered by pane: callers match
+/// the `cwd` they already know.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSession {
+    /// The agent kind, e.g. `pi`.
+    pub agent: String,
+    /// The absolute working directory the session was recorded in.
+    pub cwd: String,
+    /// The agent's own session id, used to find its file on disk.
+    pub session_id: String,
+}
+
+impl AgentSession {
+    fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            agent: value.get("agent")?.as_str()?.to_string(),
+            cwd: value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            session_id: value.get("session_id")?.as_str()?.to_string(),
+        })
     }
 }
 
@@ -566,6 +605,25 @@ impl ControlClient {
         Ok(agents.iter().filter_map(Agent::from_json).collect())
     }
 
+    /// Every resumable agent session the daemon finds on disk.
+    ///
+    /// Unlike [`Self::agents`], which lists live panes, this is the daemon's
+    /// own scan of each agent's session store (for pi, the JSONL under
+    /// `~/.pi/agent/sessions`). It works over the remote proxy too, so a
+    /// client can locate the exact session a remote agent is in.
+    pub fn agent_sessions(&mut self) -> Result<Vec<AgentSession>> {
+        let result = self.request("agent.sessions", json!({}))?;
+        let sessions = result
+            .get("sessions")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        Ok(sessions
+            .iter()
+            .filter_map(AgentSession::from_json)
+            .collect())
+    }
+
     /// Focus the pane an agent runs in, jumping to its workspace and tab.
     pub fn focus_pane(&mut self, pane: &str) -> Result<()> {
         self.request("pane.focus", json!({ "pane": pane }))?;
@@ -712,6 +770,16 @@ impl ControlClient {
     /// Type `text` into a running agent and submit it as one prompt.
     pub fn prompt_agent(&mut self, target: &str, text: &str) -> Result<()> {
         self.request("agent.prompt", json!({ "target": target, "text": text }))?;
+        Ok(())
+    }
+
+    /// Interrupt a running agent the way its own Escape key does: inject the
+    /// key so pi's `app.interrupt` aborts the current run.
+    pub fn interrupt_agent(&mut self, target: &str) -> Result<()> {
+        self.request(
+            "agent.keys",
+            json!({ "target": target, "keys": ["escape"] }),
+        )?;
         Ok(())
     }
 
@@ -1227,8 +1295,8 @@ fn is_structural(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutomationSummary, Tab, TaskSummary, enrich_tab_runtime, is_structural, read_line_within,
-        worktree_blockers,
+        Agent, AutomationSummary, Tab, TaskSummary, enrich_tab_runtime, is_structural,
+        read_line_within, worktree_blockers,
     };
     use crate::error::Error;
     use crate::transport::Stream;
@@ -1236,6 +1304,33 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn agent_parses_the_reported_session() {
+        let reported = Agent::from_json(&json!({
+            "pane": "7",
+            "agent": "pi",
+            "session": "c97a2b18-3c8d-4e2f-9a1b-0d2f4a6b8c10",
+        }))
+        .expect("agent");
+        assert_eq!(
+            reported.session.as_deref(),
+            Some("c97a2b18-3c8d-4e2f-9a1b-0d2f4a6b8c10")
+        );
+        let silent = Agent::from_json(&json!({
+            "pane": "7",
+            "agent": "pi",
+            "session": null,
+        }))
+        .expect("agent");
+        assert_eq!(silent.session, None);
+        // An agent that never reports omits the key or sends an empty one.
+        let missing = Agent::from_json(&json!({"pane": "7", "agent": "pi"})).expect("agent");
+        assert_eq!(missing.session, None);
+        let empty = Agent::from_json(&json!({"pane": "7", "agent": "pi", "session": ""}))
+            .expect("agent");
+        assert_eq!(empty.session, None);
+    }
 
     #[test]
     fn busy_worktree_refusals_expose_their_blockers() {

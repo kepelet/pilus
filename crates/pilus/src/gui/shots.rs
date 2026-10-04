@@ -28,6 +28,21 @@ use crate::settings::Settings;
 /// Where the captured frames are written.
 const OUT: &str = "/tmp/pilus-shots";
 
+/// A deterministic session for the transcript shot, covering every item kind
+/// the native window draws.
+const SAMPLE_SESSION: &str = r#"{"type":"session","version":3,"id":"shot-0001","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/Users/dev/projects/api"}
+{"type":"session_info","id":"n0","parentId":null,"timestamp":"2024-12-03T14:00:00.500Z","name":"Refactor auth module"}
+{"type":"model_change","id":"m0","parentId":"n0","timestamp":"2024-12-03T14:00:01.000Z","provider":"anthropic","modelId":"claude-sonnet-4-5"}
+{"type":"thinking_level_change","id":"t0","parentId":"m0","timestamp":"2024-12-03T14:00:01.500Z","thinkingLevel":"high"}
+{"type":"message","id":"u1","parentId":"m0","timestamp":"2024-12-03T14:00:02.000Z","message":{"role":"user","content":"Add a token refresh to the auth module and cover it with a test.","timestamp":1733234402000}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2024-12-03T14:00:04.000Z","message":{"role":"assistant","api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":1200,"output":210,"cacheRead":800,"cacheWrite":0,"totalTokens":2210,"cost":{"input":0.0036,"output":0.0031,"cacheRead":0.0002,"cacheWrite":0,"total":0.0069}},"stopReason":"toolUse","timestamp":1733234404000,"content":[{"type":"thinking","thinking":"Read the auth module first, then add refresh."},{"type":"text","text":"I'll read the auth module before changing it."},{"type":"toolCall","id":"c1","name":"read","arguments":{"path":"src/auth.rs","offset":0,"limit":120}},{"type":"toolCall","id":"c3","name":"bash","arguments":{"command":"cargo test auth","timeout":30}}]}}
+{"type":"message","id":"r1","parentId":"a1","timestamp":"2024-12-03T14:00:05.000Z","message":{"role":"toolResult","toolCallId":"c1","toolName":"read","content":[{"type":"text","text":"pub struct Session {\n    token: String,\n    expires_at: i64,\n}\n\npub fn refresh(session: &mut Session) -> Result<(), Error> {\n    // TODO: implement\n    Ok(())\n}"}],"isError":false,"timestamp":1733234405000}}
+{"type":"message","id":"r3","parentId":"r1","timestamp":"2024-12-03T14:00:05.500Z","message":{"role":"toolResult","toolCallId":"c3","toolName":"bash","content":[{"type":"text","text":"running 4 tests\ntest auth::refresh ... ok\ntest result: ok. 4 passed"}],"isError":false,"timestamp":1733234405500}}
+{"type":"message","id":"b1","parentId":"r1","timestamp":"2024-12-03T14:00:06.000Z","message":{"role":"bashExecution","command":"cargo test auth","output":"running 4 tests\ntest auth::refresh ... ok\ntest result: ok. 4 passed","exitCode":0,"cancelled":false,"truncated":false,"timestamp":1733234406000}}
+{"type":"message","id":"a2","parentId":"b1","timestamp":"2024-12-03T14:00:08.000Z","message":{"role":"assistant","api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":2400,"output":180,"cacheRead":0,"cacheWrite":0,"totalTokens":2580,"cost":{"input":0.0072,"output":0.0027,"cacheRead":0,"cacheWrite":0,"total":0.0099}},"stopReason":"toolUse","timestamp":1733234408000,"content":[{"type":"text","text":"**Plan**\n\n1. Implement `refresh`.\n2. Cover it with a test.\n\n```rust\npub fn refresh(s: &mut Session) -> Result<(), Error> {\n    s.token = request_refresh(&s.token)?;\n    Ok(())\n}\n```\n\nSee [the docs](https://example.com) for details, or the **bold** note below.\n\n> Refreshing must be idempotent."},{"type":"toolCall","id":"c2","name":"edit","arguments":{"path":"src/auth.rs","edits":[{"oldText":"// TODO: implement","newText":"self.token = request_refresh(&self.token)?;"}]}}]}}
+{"type":"compaction","id":"k1","parentId":"a2","timestamp":"2024-12-03T14:01:00.000Z","summary":"Implemented token refresh and its regression test.","firstKeptEntryId":"a2","tokensBefore":42000}
+"#;
+
 /// Fresh settings for one captured window. `PILUS_SHOT_FONT_SIZE` overrides the
 /// Interface size so scaling can be reviewed without editing the app.
 fn settings() -> Rc<RefCell<Settings>> {
@@ -161,6 +176,82 @@ pub fn run() -> Result<()> {
             cx.new(|cx| UpdateWindow::new(updater, Theme::default(), settings(), window, cx))
         },
     )?;
+    // The native Pi Session panel, inside the main window. Written to a temp
+    // file so the shot is deterministic and independent of the machine's own
+    // pi sessions; no daemon is needed because the spec is an explicit file.
+    let sample = std::env::temp_dir().join("pilus-shot-session.jsonl");
+    std::fs::write(&sample, SAMPLE_SESSION).context("write sample session")?;
+    let spec = sample.to_string_lossy().into_owned();
+    shoot(
+        &mut cx,
+        "session",
+        1240.0,
+        780.0,
+        Duration::from_millis(400),
+        move |window, cx| {
+            let spec = spec.clone();
+            cx.new(move |cx| {
+                PilusView::new(
+                    pilus_client::ConnectTarget::local(),
+                    None,
+                    settings(),
+                    Rc::new(RefCell::new(MachineSignal::default())),
+                    Rc::new(RefCell::new(Theme::default())),
+                    Some(spec),
+                    window,
+                    cx,
+                )
+            })
+        },
+    )?;
+    // The same panel with a few cards expanded, to review the body layout and
+    // the Markdown rendering.
+    {
+        let cell: Rc<RefCell<Option<gpui::Entity<PilusView>>>> = Rc::new(RefCell::new(None));
+        let slot = cell.clone();
+        let spec = sample.to_string_lossy().into_owned();
+        let window = cx
+            .open_window(size(px(1240.0), px(780.0)), move |window, cx| {
+                let view = cx.new(move |cx| {
+                    PilusView::new(
+                        pilus_client::ConnectTarget::local(),
+                        None,
+                        settings(),
+                        Rc::new(RefCell::new(MachineSignal::default())),
+                        Rc::new(RefCell::new(Theme::default())),
+                        Some(spec),
+                        window,
+                        cx,
+                    )
+                });
+                *slot.borrow_mut() = Some(view.clone());
+                view
+            })
+            .context("open session-expanded")?;
+        std::thread::sleep(Duration::from_millis(400));
+        cx.run_until_parked();
+        if let Some(view) = cell.borrow().clone() {
+            cx.update(|app| {
+                view.update(app, |view, cx| {
+                    view.session.toggle(4);
+                    view.session.toggle_work(6);
+                    view.session.toggle_group(6);
+                    view.session.toggle(6);
+                    cx.notify();
+                });
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+        let image = cx
+            .capture_screenshot(window.into())
+            .context("capture session-expanded")?;
+        std::fs::create_dir_all(OUT).context("create shots dir")?;
+        image
+            .save(format!("{OUT}/session-expanded.png"))
+            .context("save session-expanded")?;
+        println!("shot: {OUT}/session-expanded.png");
+    }
     Ok(())
 }
 
@@ -183,6 +274,7 @@ pub fn run_main() -> Result<()> {
                     settings(),
                     Rc::new(RefCell::new(MachineSignal::default())),
                     Rc::new(RefCell::new(Theme::default())),
+                    None,
                     window,
                     cx,
                 )

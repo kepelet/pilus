@@ -29,6 +29,9 @@ const EFFORT_ORDER: [&str; 5] = ["minimal", "low", "medium", "high", "max"];
 /// One model an agent can run, with the reasoning levels it accepts.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AgentModel {
+    /// Provider key from the agent's catalog (`anthropic`), empty when the
+    /// catalog does not name one; `/model` wants `provider/id`.
+    pub provider: String,
     /// Stable id passed back to the agent; empty when the name is the id.
     pub id: String,
     /// Display name.
@@ -300,6 +303,7 @@ fn apply_pi(config: &mut AgentConfig, store: Option<&Value>, settings: Option<&V
                     .filter(|name| !name.is_empty())
                     .unwrap_or(id);
                 bucket.push(AgentModel {
+                    provider: provider.to_string(),
                     id: id.to_string(),
                     name: name.to_string(),
                     efforts: pi_efforts(model),
@@ -361,6 +365,10 @@ fn parse_opencode_models(stdout: &str) -> Vec<AgentModel> {
             return;
         };
         let id = slug.rsplit('/').next().unwrap_or(slug).to_string();
+        let provider = slug
+            .rsplit_once('/')
+            .map(|(provider, _)| provider.to_string())
+            .unwrap_or_default();
         let name = serde_json::from_str::<Value>(body)
             .ok()
             .and_then(|value| {
@@ -375,6 +383,7 @@ fn parse_opencode_models(stdout: &str) -> Vec<AgentModel> {
             return;
         }
         models.push(AgentModel {
+            provider,
             id,
             name,
             efforts: None,
@@ -512,6 +521,7 @@ fn parse_codex_models(result: &Value) -> Vec<AgentModel> {
                 .and_then(Value::as_str)
                 .map(effort_label);
             Some(AgentModel {
+                provider: String::new(),
                 id: id.to_string(),
                 name: name.to_string(),
                 efforts: Some(efforts),
@@ -685,7 +695,8 @@ fn sort_efforts(levels: &mut Vec<String>) {
     levels.dedup();
 }
 
-fn effort_label(level: &str) -> String {
+/// Display label for a pi thinking level (`high` to `High`).
+pub fn effort_label(level: &str) -> String {
     match level.to_ascii_lowercase().as_str() {
         "xhigh" | "extra-high" | "extra_high" => "Extra High".to_string(),
         "none" => "None".to_string(),
@@ -738,6 +749,7 @@ mod tests {
     fn efforts_always_start_with_default() {
         let mut config = AgentConfig::default();
         config.models.push(AgentModel {
+            provider: String::new(),
             id: "a".into(),
             name: "A".into(),
             efforts: Some(vec!["Low".into(), "High".into()]),

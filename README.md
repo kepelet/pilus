@@ -48,7 +48,10 @@ Early. `pilus` today is a focused vertical slice:
   live agents from every connected endpoint in the AGENTS dock;
 - remembers the main window's size, position, and display across launches,
   falling back to a centered window when the display is gone;
-- paints the grid in a GPUI window with the ANSI palette resolved natively.
+- paints the grid in a GPUI window with the ANSI palette resolved natively;
+- opens a Pi session's conversation as a native panel inside the main window —
+  user turns, assistant prose, thinking, tool calls and results, and shell runs
+  — folded live from the session JSONL, without a terminal.
 
 Client-native chrome that the daemon does not project (file tree, Git
 dashboard, agents dock) is still painted from the daemon's cells — see
@@ -78,6 +81,12 @@ cargo run -p pilus --no-default-features -- --probe-workspaces
 
 # Attach to one saved machine over SSH and print its workspace catalog.
 cargo run -p pilus --no-default-features -- --probe-machine mac-mini
+
+# Open the main window with the Pi Session panel on a working directory or file.
+cargo run -p pilus -- --session-ui ~/projects/api
+
+# Print that transcript headlessly instead.
+cargo run -p pilus --no-default-features -- --probe-session ~/projects/api
 ```
 
 ### macOS app bundle
@@ -119,6 +128,7 @@ just serve-preview  # serve that payload on 127.0.0.1:8000
 | --- | --- |
 | `crates/pilus-protocol` | The wire vocabulary: client/server messages, cell frames, framing. |
 | `crates/pilus-client` | Socket discovery, transport, handshake, the event stream, and the folded `Surface`. |
+| `crates/pilus-session` | The Pi session reader: parse, discover, and tail session JSONL. |
 | `crates/pilus` | The GPUI window, key mapping, and native painting. |
 
 The protocol crate is the only place that knows the wire format, and its

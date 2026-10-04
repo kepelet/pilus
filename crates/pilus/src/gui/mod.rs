@@ -13,10 +13,12 @@ mod glass;
 mod home;
 mod keys;
 mod machines;
+mod markdown;
 mod palette;
 mod picker;
 mod scheme;
 mod selection;
+mod session;
 #[cfg(feature = "visual-test")]
 pub(crate) mod shots;
 mod sidebar_menu;
@@ -43,13 +45,14 @@ use crossterm::event::{
 };
 use glass::Glass;
 use gpui::{
-    Action, Anchor, Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context,
-    DisplayId, Div, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent,
-    Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    Stateful, SystemNotification, TextRun, TitlebarOptions, Transformation, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, anchored, deferred, div, font, img,
-    linear_color_stop, linear_gradient, percentage, point, prelude::*, px, relative, size, svg,
+    Action, Anchor, Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, ClipboardItem,
+    Context, DisplayId, Div, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla,
+    KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, SharedString, Stateful, SystemNotification, TextRun, TitlebarOptions,
+    Transformation, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, anchored,
+    deferred, div, font, img, linear_color_stop, linear_gradient, percentage, point, prelude::*,
+    px, relative, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::{Release, UpdateStatus, Version};
@@ -69,6 +72,7 @@ use pilus_protocol::{
     SurfaceInterest,
 };
 use selection::{Cell, Selection};
+use session::SessionPanel;
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
 use text_input::{TextField, TextInput};
 use theme::Theme;
@@ -78,8 +82,12 @@ use updater::Updater;
 const LINE_HEIGHT_RATIO: f32 = 1.3;
 /// Height of our native tab strip; the grid starts below it.
 const TAB_STRIP_HEIGHT: f32 = 36.0;
-/// Height of a compact composer picker, above or inside the footer.
-const HOME_PICKER_HEIGHT: f32 = 24.0;
+/// Metrics shared by composer picker chips and dropdowns (Home + session).
+const PICKER_CHIP_H: f32 = 24.0;
+/// Dropdown rows, gaps, and width: Home and session menus read as one.
+const PICKER_MENU_W: f32 = 260.0;
+const PICKER_MENU_MAX_H: f32 = 240.0;
+const PICKER_ROW_H: f32 = 30.0;
 /// Grid offset from the window top: tab strip plus its top spacing.
 const HEADER_HEIGHT: f32 = 40.0;
 /// Daemon rows skipped at the top of the grid. The daemon draws its own tab
@@ -337,6 +345,19 @@ pub(crate) struct MachineSignal {
 
 /// Open the desktop window and attach to `target`.
 pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
+    run_inner(target, None)
+}
+
+/// Launch the main window with the Pi Session panel already open for `spec`.
+///
+/// The CLI entry for `--session-ui`; the session is read inside the main
+/// window, never a separate one.
+pub fn run_session(spec: String) -> anyhow::Result<()> {
+    run_inner(ConnectTarget::local(), Some(spec))
+}
+
+/// Open the desktop window, optionally opening the Pi Session panel at launch.
+fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::Result<()> {
     // The window opens before the daemon is attached, so a stopped or
     // protocol-incompatible daemon cannot stop `pilus` from launching. The
     // view's local reconnect loop owns the first attach and every retry, and
@@ -436,6 +457,7 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                     settings.clone(),
                     signal.clone(),
                     theme.clone(),
+                    None,
                     cx,
                 )
             }
@@ -528,8 +550,18 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             move |window, cx| {
                 let signal = machine_signal.clone();
                 let theme = shared_theme.clone();
+                let initial_session = initial_session.clone();
                 cx.new(move |cx| {
-                    PilusView::new(target, None, settings.clone(), signal, theme, window, cx)
+                    PilusView::new(
+                        target,
+                        None,
+                        settings.clone(),
+                        signal,
+                        theme,
+                        initial_session,
+                        window,
+                        cx,
+                    )
                 })
             },
         );
@@ -665,6 +697,7 @@ fn open_main_window(
     settings: Rc<RefCell<Settings>>,
     machine_signal: Rc<RefCell<MachineSignal>>,
     shared_theme: Rc<RefCell<Theme>>,
+    initial_session: Option<String>,
     cx: &mut App,
 ) {
     let bounds = WindowBounds::centered(size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
@@ -683,7 +716,18 @@ fn open_main_window(
         move |window, cx| {
             let signal = machine_signal.clone();
             let theme = shared_theme.clone();
-            cx.new(move |cx| PilusView::new(target, None, settings, signal, theme, window, cx))
+            cx.new(move |cx| {
+                PilusView::new(
+                    target,
+                    None,
+                    settings,
+                    signal,
+                    theme,
+                    initial_session,
+                    window,
+                    cx,
+                )
+            })
         },
     );
     if let Err(error) = opened {
@@ -782,6 +826,8 @@ enum InputLayer {
     Home,
     /// The Settings page (machines, updates).
     Settings,
+    /// The native Pi Session page.
+    Session,
     /// The live terminal grid.
     Terminal,
 }
@@ -789,8 +835,8 @@ enum InputLayer {
 /// Resolve the keyboard owner from which surfaces are open.
 ///
 /// Overlays sit above content, so the picker beats the palette and both beat
-/// the Home composer and Settings page.
-fn top_layer(picker: bool, palette: bool, home: bool, settings: bool) -> InputLayer {
+/// the Home composer, Settings, and the session page.
+fn top_layer(picker: bool, palette: bool, home: bool, settings: bool, session: bool) -> InputLayer {
     if picker {
         InputLayer::Picker
     } else if palette {
@@ -799,6 +845,8 @@ fn top_layer(picker: bool, palette: bool, home: bool, settings: bool) -> InputLa
         InputLayer::Home
     } else if settings {
         InputLayer::Settings
+    } else if session {
+        InputLayer::Session
     } else {
         InputLayer::Terminal
     }
@@ -1317,8 +1365,12 @@ struct PilusView {
     home_resolve_pending: bool,
     /// The Home composer's state.
     home: HomePanel,
+    /// The native Pi Session panel, read live from a session file.
+    session: SessionPanel,
     /// The composer's prompt, an IME-capable field over `home`'s buffer.
     home_prompt: Entity<TextInput>,
+    /// The Pi Session composer's field.
+    session_prompt: Entity<TextInput>,
     /// Agent availability and models for the Home composer.
     agent_configs: Vec<AgentConfig>,
     /// Agent configs by machine key (`local` or a machine id), so switching
@@ -1352,12 +1404,14 @@ struct PilusView {
 }
 
 impl PilusView {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         target: ConnectTarget,
         connection: Option<Connection>,
         shared_settings: Rc<RefCell<Settings>>,
         machine_signal: Rc<RefCell<MachineSignal>>,
         shared_theme: Rc<RefCell<Theme>>,
+        initial_session: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1414,10 +1468,23 @@ impl PilusView {
         let initial_theme = *shared_theme.borrow();
         let initial_fonts = style::Fonts::resolve(&shared_settings);
         let home = HomePanel::default();
+        let session = SessionPanel::default();
         let home_prompt = cx.new(|cx| {
             TextInput::from_shared(
                 home.prompt().shared(),
                 "Describe the work…",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                true,
+                initial_theme,
+                cx,
+            )
+            .submit_on_enter()
+        });
+        let session_prompt = cx.new(|cx| {
+            TextInput::new(
+                String::new(),
+                "Message pi…",
                 style::chrome_font(&shared_settings),
                 px(initial_fonts.body),
                 true,
@@ -1617,7 +1684,9 @@ impl PilusView {
             home_resolve_pending: false,
             remote_home: HashMap::new(),
             home,
+            session,
             home_prompt,
+            session_prompt,
             agent_configs: Vec::new(),
             agent_config_cache: HashMap::new(),
             agent_config_pending: HashSet::new(),
@@ -1677,6 +1746,14 @@ impl PilusView {
         })
         .detach();
 
+        // `--session-ui` opens the panel immediately; a bare `pilus` waits
+        // for the palette's Open Pi Session.
+        if let Some(spec) = initial_session {
+            let api_socket = view.api_socket();
+            view.session
+                .open_local(api_socket, spec, String::new(), None, cx);
+        }
+
         view
     }
 
@@ -1709,6 +1786,10 @@ impl PilusView {
     /// Drain pending connection events. Returns whether a repaint is needed.
     fn poll(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
+        // The session panel owns a background reader, so this only ever
+        // clones an already-folded transcript.
+        let session_prompt = self.session_prompt.clone();
+        changed |= self.session.poll(&session_prompt, cx);
         // Track updater transitions here so a failure from an automatic check
         // can open the Update window once.
         let update_status = self.updater.read(cx).status().clone();
@@ -3212,6 +3293,12 @@ impl PilusView {
             InputLayer::Palette => self.palette_key(event, window, cx),
             InputLayer::Home => self.home_key(event, cx),
             InputLayer::Settings => self.settings_key(event, cx),
+            InputLayer::Session => {
+                let input = self.session_prompt.clone();
+                if self.session.key(&event.keystroke.key, &input, cx) {
+                    cx.notify();
+                }
+            }
             InputLayer::Terminal => self.terminal_key(event, cx),
         }
     }
@@ -3228,6 +3315,7 @@ impl PilusView {
             self.palette.is_open(),
             self.home.is_open(),
             self.settings_open,
+            self.session.is_open(),
         )
     }
 
@@ -3398,6 +3486,16 @@ impl PilusView {
                 None,
             ),
         ];
+        // The native Pi Session panel reads whichever agent the active
+        // workspace is running, on any endpoint.
+        if self.surface.workspaces().iter().any(|w| w.active) {
+            entries.push(entry(
+                Command::OpenSession,
+                "Open Pi Session",
+                "Workspace",
+                None,
+            ));
+        }
         for tab in &self.tabs {
             entries.push(entry(
                 Command::FocusTab(tab.index),
@@ -3469,6 +3567,7 @@ impl PilusView {
             Command::OpenUiPlayground => {
                 ui_playground::open(self.theme, self.shared_settings.clone(), cx);
             }
+            Command::OpenSession => self.open_session(cx),
             Command::FocusTab(index) => self.focus_tab(index, cx),
             Command::SwitchSession(name) => self.switch_session(&name),
             Command::NewSession => self.start_new_session(),
@@ -3724,7 +3823,7 @@ impl PilusView {
     /// The card's content: the Settings page while it is open, else the
     /// terminal grid. Sharing the card keeps the page inset exactly like
     /// the terminal, with the sidebar still showing beside it.
-    fn card_content(&self, cx: &mut Context<Self>, grid: Div, pad_x: f32, pad_y: f32) -> Div {
+    fn card_content(&mut self, cx: &mut Context<Self>, grid: Div, pad_x: f32, pad_y: f32) -> Div {
         if self.home.is_open() {
             return div()
                 .flex_1()
@@ -3735,12 +3834,27 @@ impl PilusView {
         if self.settings_open {
             return self.settings_page(cx);
         }
+        if self.session.is_open() {
+            return div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.session_render(cx));
+        }
         div()
             .flex_1()
             .overflow_hidden()
             .pl(px(pad_x))
             .pt(px(pad_y))
             .child(grid)
+    }
+
+    /// Paint the Pi Session panel for the active workspace.
+    fn session_render(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let settings = self.shared_settings.clone();
+        let input = self.session_prompt.clone();
+        self.session.render(theme, &settings, &input, cx)
     }
 
     /// The label for the picker's current endpoint.
@@ -3754,6 +3868,57 @@ impl PilusView {
                 .map(|machine| machine.display().to_string())
                 .unwrap_or_else(|| target.destination.clone()),
         }
+    }
+
+    /// Open the Pi Session panel for the active workspace's agent.
+    ///
+    /// The session is located through the endpoint's own daemon
+    /// (`agent.sessions`), and its bytes are read from that endpoint's
+    /// filesystem — local, or over the machine's SSH transport.
+    fn open_session(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self
+            .surface
+            .workspaces()
+            .iter()
+            .find(|workspace| workspace.active)
+            .cloned()
+        else {
+            self.status = "no active workspace to read a session from".to_string();
+            cx.notify();
+            return;
+        };
+        self.home.close();
+        self.settings_open = false;
+        let title = active.name.clone();
+        // The composer prompts the live agent, so it needs the pane `agent.prompt`
+        // resolves. The feed can lag a fresh pane; the cwd is a fallback.
+        let pane = self
+            .agents
+            .iter()
+            .find(|agent| agent.agent == "pi" && agent.workspace_id == active.id)
+            .or_else(|| {
+                self.agents
+                    .iter()
+                    .find(|agent| agent.agent == "pi" && agent.cwd == active.cwd)
+            })
+            .map(|agent| agent.pane.clone());
+        match self.active.clone() {
+            EndpointId::Local => {
+                let cwd = expand_local(&active.cwd);
+                self.session
+                    .open_local(self.api_socket(), cwd, title, pane, cx);
+            }
+            EndpointId::Machine(id) => {
+                let Some(target) = self.machine_target_by_key(&id) else {
+                    self.status = format!("no SSH target for `{id}`");
+                    cx.notify();
+                    return;
+                };
+                let cwd = self.expand_cwd(&id, &active.cwd);
+                self.session.open_remote(target, cwd, title, pane, cx);
+            }
+        }
+        cx.notify();
     }
 
     /// Show the Settings page.
@@ -4249,6 +4414,7 @@ impl PilusView {
                     None
                 }
             }
+            InputLayer::Session => Some(self.session_prompt.focus_handle(cx)),
             InputLayer::Terminal => None,
         };
         match target {
@@ -4480,38 +4646,17 @@ impl PilusView {
     ) -> AnyElement {
         let theme = self.theme;
         let open = self.home.dropdown() == Some(field);
-        let fg = if open { theme.panel_fg } else { theme.muted };
-        let face = div()
-            .id(format!("pilus-home-picker-{}", field.label()))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .h(px(HOME_PICKER_HEIGHT))
-            .px_2()
-            .rounded_md()
-            .bg(if open {
-                theme.panel
-            } else {
-                theme.panel.opacity(0.0)
-            })
-            .text_color(fg)
-            .cursor_pointer()
-            .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(field, cx)));
-        let value_div = div()
-            .max_w(px(180.0))
-            .truncate()
-            .text_size(px(self.footer_font()))
-            .text_color(fg);
-        let mut face = face
-            .child(leading)
-            .child(value_div.child(value))
-            .child(icon(
-                include_bytes!("../../assets/icons/chevron-down.svg"),
-                12.0,
-                theme.muted,
-            ));
+        let mut face = picker_face(
+            format!("pilus-home-picker-{}", field.label()),
+            leading,
+            value,
+            180.0,
+            open,
+            theme.panel,
+            theme,
+            self.footer_font(),
+            cx.listener(move |this, _, _, cx| this.toggle_home_dropdown(field, cx)),
+        );
         if self.home.dropdown() == Some(field) {
             face = face.relative().child(self.home_dropdown_anchor(field, cx));
         }
@@ -4562,24 +4707,12 @@ impl PilusView {
         let matches = self.home.dropdown_matches();
         let total = matches.len();
         let filter = self.home.filter().to_string();
-        let mut list = div()
-            .id("pilus-home-dropdown")
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_1()
-            .w(px(260.0))
-            .max_h(px(240.0))
-            .overflow_y_scroll()
-            .occlude()
+        let mut list = picker_menu("pilus-home-dropdown", theme)
+            .max_h(px(PICKER_MENU_MAX_H))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.home.dismiss_dropdown();
                 cx.notify();
-            }))
-            .rounded_lg()
-            .bg(theme.bg)
-            .border_1()
-            .border_color(terminal_inset_border());
+            }));
         if !filter.is_empty() {
             list = list.child(
                 div()
@@ -4630,30 +4763,18 @@ impl PilusView {
         for index in matches.into_iter().take(MAX_ROWS) {
             let active = index == cursor;
             let option = options.get(index).cloned().unwrap_or_default();
-            let row = div()
-                .id(format!("pilus-home-option-{index}"))
-                .flex()
-                .flex_row()
-                .items_center()
-                .h(px(30.0))
-                .px_3()
-                .rounded_md()
-                .bg(if active { theme.panel } else { theme.bg })
-                .text_color(theme.panel_fg)
-                .font_weight(if active {
-                    FontWeight::BOLD
-                } else {
-                    FontWeight::NORMAL
-                })
-                .text_size(px(self.chrome_font()))
-                .cursor_pointer()
-                .hover(move |style| style.bg(theme.panel))
-                .on_click(cx.listener(move |this, _, _, cx| {
+            list = list.child(picker_row(
+                format!("pilus-home-option-{index}"),
+                option,
+                active,
+                theme,
+                self.chrome_font(),
+                cx.listener(move |this, _, _, cx| {
                     this.home.choose_dropdown(index);
                     this.home.close_dropdown();
                     cx.notify();
-                }));
-            list = list.child(row.child(option));
+                }),
+            ));
         }
         if total > MAX_ROWS {
             list = list.child(
@@ -4668,7 +4789,7 @@ impl PilusView {
         deferred(
             anchored()
                 .anchor(Anchor::TopLeft)
-                .offset(point(px(0.0), px(HOME_PICKER_HEIGHT + 4.0)))
+                .offset(point(px(0.0), px(PICKER_CHIP_H + 4.0)))
                 .snap_to_window_with_margin(px(8.0))
                 .child(list),
         )
@@ -7796,6 +7917,7 @@ impl PilusView {
             .pb(px(SIDEBAR_LIST_PAD));
 
         content = content.child(self.new_workspace_row(cx));
+        content = content.child(self.session_row(cx));
         for kind in NavKind::ALL {
             content = content.child(self.nav_row(kind, cx));
         }
@@ -9103,6 +9225,47 @@ impl PilusView {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_home(cx)))
     }
 
+    /// A "Pi Session" row: toggles the native session panel for the active
+    /// workspace.
+    fn session_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let glass = self.settings.glass_opacity();
+        let bg = if self.session.is_open() {
+            theme.panel.opacity(glass)
+        } else {
+            theme.panel.opacity(0.0)
+        };
+        div()
+            .id("pilus-pi-session")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(SIDEBAR_GLYPH_GAP))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .pl(px(SIDEBAR_ROW_PAD))
+            .pr(px(SIDEBAR_ROW_PAD))
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(self.chrome_font()))
+            .bg(bg)
+            .text_color(theme.panel_fg)
+            .hover(move |style| style.bg(theme.panel.opacity(glass)))
+            .child(icon(
+                include_bytes!("../../assets/icons/agents/pi.svg"),
+                SIDEBAR_GLYPH,
+                theme.muted,
+            ))
+            .child(div().flex_1().child("Pi Session"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.session.is_open() {
+                    this.session.close();
+                    cx.notify();
+                } else {
+                    this.open_session(cx);
+                }
+            }))
+    }
+
     /// Toggle the Home composer, shared by the Cmd+Shift+N chord and the
     /// sidebar's New Workspace row.
     fn toggle_home(&mut self, cx: &mut Context<Self>) {
@@ -10214,14 +10377,12 @@ fn render_row(
                     f32::from(start_column.saturating_sub(skip_cols)) * cell_width
                 ))
                 .top(px(0.0))
-                .right(px(
-                    row_width
-                        - f32::from(
-                            start_column
-                                .saturating_add(run_cells)
-                                .saturating_sub(skip_cols),
-                        ) * cell_width,
-                ))
+                .right(px(row_width
+                    - f32::from(
+                        start_column
+                            .saturating_add(run_cells)
+                            .saturating_sub(skip_cols),
+                    ) * cell_width))
                 .h(line_height)
                 .bg(bg.opacity(glass)),
         );
@@ -10239,14 +10400,12 @@ fn render_row(
                 f32::from(start_column.saturating_sub(skip_cols)) * cell_width
             ))
             .top(px(0.0))
-            .right(px(
-                row_width
-                    - f32::from(
-                        start_column
-                            .saturating_add(run_cells)
-                            .saturating_sub(skip_cols),
-                    ) * cell_width,
-            ))
+            .right(px(row_width
+                - f32::from(
+                    start_column
+                        .saturating_add(run_cells)
+                        .saturating_sub(skip_cols),
+                ) * cell_width))
             .h(line_height)
             .flex()
             .items_center()
@@ -10639,7 +10798,7 @@ fn glass_rim(theme: Theme, framed: bool) -> Option<Div> {
                     .right_0()
                     .w(px(1.0))
                     .bg(theme.panel_fg.opacity(RIM_SIDE)),
-            )
+            ),
     )
 }
 
@@ -10747,6 +10906,118 @@ fn icon(bytes: &'static [u8], size: f32, color: gpui::Rgba) -> impl IntoElement 
         .h(px(size))
         .flex_shrink_0()
         .text_color(color)
+}
+
+/// The compact face shared by composer picker chips: a leading glyph, the
+/// value, and a chevron, highlighting while its dropdown is open.
+///
+/// `highlight` is the fill the chip takes while open or hovered: the panel
+/// on Home (whose composer is transparent), the window background in the
+/// session composer (whose panel already carries the fill).
+#[allow(clippy::too_many_arguments)]
+fn picker_face(
+    id: impl Into<ElementId>,
+    leading: AnyElement,
+    value: String,
+    value_max_w: f32,
+    open: bool,
+    highlight: gpui::Rgba,
+    theme: Theme,
+    font_size: f32,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let fg = if open { theme.panel_fg } else { theme.muted };
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .h(px(PICKER_CHIP_H))
+        .px_2()
+        .rounded_md()
+        .bg(if open {
+            highlight
+        } else {
+            theme.panel.opacity(0.0)
+        })
+        .text_color(fg)
+        .cursor_pointer()
+        .hover(move |style| style.bg(highlight).text_color(theme.panel_fg))
+        .on_click(on_toggle)
+        .child(leading)
+        .child(
+            div()
+                .max_w(px(value_max_w))
+                .truncate()
+                .text_size(px(font_size))
+                .text_color(fg)
+                .child(value),
+        )
+        .child(icon(
+            include_bytes!("../../assets/icons/chevron-down.svg"),
+            12.0,
+            theme.muted,
+        ))
+}
+
+/// The floated option list shared by composer pickers. The caller adds its
+/// rows, a max height, and the deferred/anchored wrapper — below the chip on
+/// Home, above it in the session composer.
+fn picker_menu(id: impl Into<ElementId>, theme: Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_1()
+        .w(px(PICKER_MENU_W))
+        .overflow_y_scroll()
+        .occlude()
+        .rounded_lg()
+        .bg(theme.bg)
+        .border_1()
+        .border_color(terminal_inset_border())
+}
+
+/// One option row in a composer picker menu. The active row (Home's cursor,
+/// or the session's current value) takes the panel fill and a bold label.
+fn picker_row(
+    id: impl Into<ElementId>,
+    label: String,
+    active: bool,
+    theme: Theme,
+    font_size: f32,
+    on_choose: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .h(px(PICKER_ROW_H))
+        .px_3()
+        .rounded_md()
+        .bg(if active { theme.panel } else { theme.bg })
+        .text_color(theme.panel_fg)
+        .font_weight(if active {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        })
+        .text_size(px(font_size))
+        .cursor_pointer()
+        .hover(move |style| style.bg(theme.panel))
+        // Long values (session prompts) truncate to one row.
+        .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
+        .on_click(on_choose)
+}
+
+/// The exact pixel height of `rows` menu rows, so a menu that opens upward
+/// can offset by its full height.
+fn picker_rows_h(rows: usize) -> f32 {
+    // `p_1` top and bottom, `PICKER_ROW_H` rows, `gap_1` between them.
+    8.0 + rows as f32 * PICKER_ROW_H + rows.saturating_sub(1) as f32 * 4.0
 }
 
 /// The leading glyph of one sidebar context-menu row.
@@ -11375,7 +11646,10 @@ mod tests {
             .enumerate()
             .map(|(index, cell)| (index as u16, cell, false))
             .collect();
-        assert_eq!(collect_runs(frame.width, &rendered, theme, 0, None).len(), 4);
+        assert_eq!(
+            collect_runs(frame.width, &rendered, theme, 0, None).len(),
+            4
+        );
         let background = collect_background_runs(frame.width, &rendered, theme, 0, None);
         assert_eq!(background.len(), 1);
         assert_eq!(background[0], (0, 4, theme.bg));
@@ -11396,7 +11670,10 @@ mod tests {
             .collect();
         // A border must shape as one run so its strokes tile across cells
         // instead of being clipped span by span.
-        assert_eq!(collect_runs(frame.width, &rendered, theme, 0, None).len(), 1);
+        assert_eq!(
+            collect_runs(frame.width, &rendered, theme, 0, None).len(),
+            1
+        );
     }
 
     #[test]
@@ -11467,15 +11744,34 @@ mod tests {
     #[test]
     fn overlays_own_the_keyboard_over_content() {
         // Each content page owns the keyboard on its own...
-        assert_eq!(top_layer(false, false, true, false), InputLayer::Home);
-        assert_eq!(top_layer(false, false, false, true), InputLayer::Settings);
+        assert_eq!(
+            top_layer(false, false, true, false, false),
+            InputLayer::Home
+        );
+        assert_eq!(
+            top_layer(false, false, false, true, false),
+            InputLayer::Settings
+        );
+        assert_eq!(
+            top_layer(false, false, false, false, true),
+            InputLayer::Session
+        );
         // ...but an overlay opened above one takes over.
-        assert_eq!(top_layer(false, true, true, false), InputLayer::Palette);
-        assert_eq!(top_layer(false, true, false, true), InputLayer::Palette);
+        assert_eq!(
+            top_layer(false, true, true, false, false),
+            InputLayer::Palette
+        );
+        assert_eq!(
+            top_layer(false, true, false, true, false),
+            InputLayer::Palette
+        );
         // The folder picker is the topmost overlay.
-        assert_eq!(top_layer(true, true, true, true), InputLayer::Picker);
+        assert_eq!(top_layer(true, true, true, true, true), InputLayer::Picker);
         // With nothing open, the grid has it.
-        assert_eq!(top_layer(false, false, false, false), InputLayer::Terminal);
+        assert_eq!(
+            top_layer(false, false, false, false, false),
+            InputLayer::Terminal
+        );
     }
 
     #[test]

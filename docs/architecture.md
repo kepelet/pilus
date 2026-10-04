@@ -15,8 +15,122 @@ pilus-agent (host connector) ──▶ pilus-client
 below; it depends on `pilus-client`'s UHP surface and is never in the desktop
 window's dependency chain.
 
+`pilus-session` is the one crate outside that chain that has nothing to do with
+the daemon: it reads pi's session JSONL — parse, discover by working directory,
+and tail — so the window can paint a Pi conversation natively. It depends only
+on `serde_json`.
+
 Nothing in `pilus-protocol` or `pilus-client` knows about GPUI, so the connection
-layer is testable headlessly (see `crates/pilus-client/tests/handshake.rs`).
+layer is testable headlessly (see `crates/pilus-client/tests/handshake.rs`);
+`pilus-session` is likewise testable without a window
+(`crates/pilus-session/tests/`).
+
+## The native Pi Session panel
+
+Pi renders its conversation in a terminal, but it also persists it as JSONL
+under `~/.pi/agent/sessions/--<cwd>--/`. `pilus` paints that conversation as a
+native panel inside the main window instead: `pilus-session` folds each line
+into an ordered `Transcript` (a `message` entry's content blocks become prose,
+thinking, and tool calls; tool results, shell runs, compactions, and model
+changes become their own items), and `gui/session.rs` draws it, following
+appended bytes on a background reader.
+
+The reader is tolerant by design: unknown entry types and message roles are
+counted and dropped rather than failing the file, so a newer pi still renders.
+User turns sit on the right, assistant turns on the left, and thinking, tool
+calls, and shell runs are borderless muted rows with a chevron that opens their
+body (collapsed by default; no line counts). Thinking labels as `Thinking` and
+renders at a smaller Markdown size. A model change is one plain muted line
+(`Model changed to …`); thinking-level changes, compactions, and other
+structural notes render as the same muted collapsible rows.
+
+A tool result is paired with its call by `call_id` (in `pilus-session`). Each
+stretch of thinking and tool calls between assistant replies collapses into one
+`Working for 10m 3s` row (or `Working…` while it is the last thing in the
+transcript, or when the entry timestamps give no span); a stretch that is only
+thinking skips the wrapper and shows the `Thinking` row directly. Opening a
+work row lists the thinking and the calls, and a run of consecutive calls
+groups further under a prose summary (`Read 3 files, ran 1 search, ran 1
+command`). Calls themselves label as verb phrases (`Read src/auth.rs`,
+`Edited src/auth.rs`, `Ran cargo test`, `Searched foo`), with arguments and
+result in the muted monospace family when opened.
+Assistant prose is rendered as Markdown (`markdown-rs` via `gui/markdown.rs`):
+headings, bold/italic/inline code, links, fenced code blocks, lists, block
+quotes, tables, and rules.
+
+The header is one borderless row: the session's first prompt on the left
+(truncated with an ellipsis), `host · cwd` on the right. Only the tail window
+(the last 50 items) renders on first paint, so a huge session opens fast;
+the rest fills in behind the scenes a chunk per frame — pinned to the bottom
+while you follow the tail, or holding position when you park at the top, so
+scrolling up lazy-loads history with no button in the way. Mid-viewport stays
+frozen so reading never shifts. Expansion keys are absolute transcript
+indices, so growing the window never misaligns them.
+The composer is one
+rounded panel holding the input and, below it, the meta row: a model picker
+showing the catalog display name (`Muse Spark 1.3 Contributor`, falling back
+to the `provider/id` slug), a thinking-level picker showing just the level
+(`High`, via the shared `effort_label`), the token breakdown (`in • out •
+cache-hit % (cost)`), and, on the right side only, the circular arrow send
+button (Home's arrow style). The file records no context window, so none is
+shown.
+The model picker offers every model in pi's catalog for the endpoint (loaded
+once in the background from the agent's models-store, locally or over SSH),
+plus any session model the catalog does not know; choosing one sends `/model`
+to the live agent. Picker chips and dropdowns are the shared composer
+components Home uses (`picker_face`, `picker_menu`, `picker_row`): the same
+chip face, leading glyphs, and floated option list, opening upward in the
+session composer. Picker lists dismiss on an outside press or Escape. A successful send clears the draft silently; only
+failures report a status. While pi is still working — the transcript ends
+mid-work with no reply yet — a spinner `Working` line sits above the
+composer. Sending is optimistic: the prompt appears as a bubble and the
+indicator shows at once, and both persist until pi's first responding content
+(an assistant message or anything it produced) lands — not just the echoed
+user message. A prompt sent while pi is already working reads `Steering…`
+instead, until that same first response.
+
+Floating above the composer's right side are two jump buttons: the prompts
+button opens a menu of every user prompt (one truncated row each) that
+scrolls to the chosen message, and the arrow-down button jumps to the tail.
+The arrow appears only while the tail is unpinned. The tail pin is sticky
+state, not a raw offset comparison (scroll offsets run negative downward): it
+sets at the bottom and clears the moment the viewport moves without growth,
+so background fill can never hijack a programmatic jump.
+
+### Sending a prompt
+
+A sticky composer sits below the transcript as a flex sibling, so it can never
+cover the last message (a draft is capped at half the panel and scrolls inside
+its field). Enter (the field declines it; `submit_on_enter`) sends its text
+through the endpoint's control surface as `agent.prompt`, targeting the pane
+the panel found for the active workspace; a prompt is sent on a background
+thread and the field clears only when the daemon accepts it. The panel is still
+a view of the file pi writes — the prompt's effect appears when pi appends the
+next turn.
+
+### One path, local and remote
+
+The panel is opened by the command palette's **Open Pi Session** or the
+sidebar's **Pi Session** row for the active workspace, and it works across
+every connected endpoint:
+
+- **Locate.** The endpoint's own daemon is asked `agent.sessions` (UHP), which
+  scans each supported agent's store and returns the exact `cwd` and session id
+  a live agent is in. This is the same call local and remote — a machine
+  reaches it through `luvus uhp proxy` over SSH — so the panel does not guess
+  by newest-file.
+- **Read.** UHP exposes agent session *ids*, not session file contents
+  (`agent.read` returns the rendered screen). So the bytes come through
+  `pilus-session`'s `Source` trait: a local `FileSource`, or an SSH `tail` for a
+  machine, using the same `SshTarget` options the render bridge and folder
+  picker use. Every host shell command is quoted for the machine's login shell
+  and run through `/bin/sh -c`, so a host whose default shell is fish (which
+  rejects `${VAR:-default}`) still lists and reads sessions. The headless
+  `--probe-session [CWD|FILE]` folds the same file.
+
+All lookups and reads run on one background thread per open panel, so the GUI
+thread only ever clones an already-folded `Transcript`. If Luvus later exposes
+a `agent.session.read` UHP method, only `Source` needs to change.
 
 ## Why the client is a thin painter
 

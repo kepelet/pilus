@@ -241,7 +241,7 @@ pub fn run() -> Result<()> {
                         context: Some(pilus_session::ContextUsage {
                             tokens: Some(655_360),
                             context_window: 1_048_576,
-                            percent: Some(0.625),
+                            percent: Some(62.5),
                         }),
                         model: Some(pilus_session::PiModel {
                             provider: "opencode-go".to_string(),

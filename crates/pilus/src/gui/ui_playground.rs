@@ -537,6 +537,59 @@ impl UiPlaygroundView {
             )
     }
 
+    /// The context gauge and its companion token counts across states:
+    /// unknown, empty, partial, warning, and full occupancy.
+    fn context_gauge_demo(&self) -> Div {
+        let theme = self.theme;
+        let size = style::scaled(&self.settings, style::GAUGE_SIZE);
+        let cases: [(&str, Option<f32>, bool, &str); 5] = [
+            ("unknown", None, false, "–/1M"),
+            ("empty", Some(0.0), false, "0/1M"),
+            ("partial", Some(42.0), false, "421k/1M"),
+            ("warning", Some(82.0), true, "860k/1M"),
+            ("full", Some(100.0), true, "1M/1M"),
+        ];
+        let mut row = div().flex().flex_row().items_end().gap_4();
+        for (name, percent, warns, counts) in cases {
+            let color = if warns { theme.alert } else { theme.muted };
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(style::context_gauge(
+                                format!("pg-gauge-{name}"),
+                                percent,
+                                warns,
+                                theme,
+                                size,
+                            ))
+                            .child(
+                                div()
+                                    .text_size(px(self.fonts().label))
+                                    .text_color(color)
+                                    .whitespace_nowrap()
+                                    .child(counts.to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(self.fonts().label))
+                            .text_color(theme.muted)
+                            .child(name.to_string()),
+                    ),
+            );
+        }
+        row
+    }
+
     /// A working checkbox.
     fn checkbox(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -1456,6 +1509,25 @@ impl UiPlaygroundView {
             .child(
                 div()
                     .flex()
+                    .flex_col()
+                    .gap_2()
+                    .w(px(220.0))
+                    .child(style::skeleton(
+                        "playground-skeleton-title",
+                        theme,
+                        px(180.0),
+                        self.fonts().body,
+                    ))
+                    .child(style::skeleton(
+                        "playground-skeleton-line",
+                        theme,
+                        px(120.0),
+                        self.fonts().secondary,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
                     .items_center()
                     .justify_center()
                     .h(px(20.0))
@@ -1657,6 +1729,7 @@ impl Render for UiPlaygroundView {
                 ),
             )
             .child(self.section("SLIDER", self.tray(self.slider_demo(cx))))
+            .child(self.section("CONTEXT GAUGE", self.tray(self.context_gauge_demo())))
             .child(
                 self.section(
                     "SIDEBAR",

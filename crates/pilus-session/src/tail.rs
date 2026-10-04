@@ -132,6 +132,14 @@ impl Tail {
         &self.transcript
     }
 
+    /// The lowest item index changed since the last call, or `None` when
+    /// only metadata moved. A caller sends `items[from..]` as the delta;
+    /// `None` means `from = items.len()` — no item moved, but metadata may
+    /// still need delivery. Taking the mark resets it.
+    pub fn take_changed_from(&mut self) -> Option<usize> {
+        self.transcript.take_changed_from()
+    }
+
     /// Read bytes appended since the last call.
     ///
     /// Returns whether the transcript changed. A source that shrank (rotation
@@ -157,6 +165,8 @@ impl Tail {
     /// Reset to an empty transcript and re-read from the start.
     fn rewind(&mut self) {
         self.transcript = Transcript::default();
+        // Everything downstream of item 0 changes, so the delta spans all.
+        self.transcript.mark_changed(0);
         self.offset = 0;
         self.partial.clear();
     }
@@ -253,24 +263,108 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A source over a shared in-memory buffer, like a remote read would be.
+    /// The caller keeps the `Arc` so it can append after boxing.
+    struct Memory(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Memory {
+        fn with(text: String) -> (std::sync::Arc<std::sync::Mutex<Vec<u8>>>, Self) {
+            let bytes = std::sync::Arc::new(std::sync::Mutex::new(text.into_bytes()));
+            (bytes.clone(), Self(bytes))
+        }
+    }
+
+    impl Source for Memory {
+        fn byte_len(&mut self) -> Result<u64> {
+            Ok(self.0.lock().map_or(0, |bytes| bytes.len() as u64))
+        }
+        fn read_from(&mut self, offset: u64) -> Result<Vec<u8>> {
+            Ok(self
+                .0
+                .lock()
+                .map(|bytes| bytes[offset as usize..].to_vec())
+                .unwrap_or_default())
+        }
+        fn label(&self) -> String {
+            "memory".to_string()
+        }
+    }
+
+    /// Append `line` to the shared buffer and poll, asserting a change.
+    fn grow(tail: &mut Tail, bytes: &std::sync::Mutex<Vec<u8>>, line: &str) {
+        if let Ok(mut buffer) = bytes.lock() {
+            buffer.extend_from_slice(line.as_bytes());
+        }
+        assert!(tail.poll().expect("poll"));
+    }
+
     #[test]
     fn a_custom_source_drives_the_same_fold() {
-        /// A source over an in-memory buffer, like a remote read would be.
-        struct Memory(Vec<u8>);
-        impl Source for Memory {
-            fn byte_len(&mut self) -> Result<u64> {
-                Ok(self.0.len() as u64)
-            }
-            fn read_from(&mut self, offset: u64) -> Result<Vec<u8>> {
-                Ok(self.0[offset as usize..].to_vec())
-            }
-            fn label(&self) -> String {
-                "memory".to_string()
-            }
-        }
-        let tail = Tail::with_source(Box::new(Memory(message("a", "user", "hi").into_bytes())))
-            .expect("tail");
+        let tail = Tail::with_source(Box::new(Memory(
+            std::sync::Arc::new(std::sync::Mutex::new(
+                message("a", "user", "hi").into_bytes(),
+            )),
+        )))
+        .expect("tail");
         assert_eq!(tail.transcript().items.len(), 1);
         assert_eq!(tail.label(), "memory");
+    }
+
+    #[test]
+    fn appended_lines_mark_the_first_new_index() {
+        let (bytes, memory) = Memory::with(message("a", "user", "hi"));
+        let mut tail = Tail::with_source(Box::new(memory)).expect("tail");
+        // The initial fold already marked every item; drain it first.
+        tail.take_changed_from();
+
+        grow(&mut tail, &bytes, &message("b", "user", "one"));
+        grow(&mut tail, &bytes, &message("c", "assistant", "two"));
+        assert_eq!(tail.take_changed_from(), Some(1));
+    }
+
+    #[test]
+    fn an_outcome_attaching_to_an_earlier_call_marks_its_index() {
+        let call = "{\"type\":\"message\",\"id\":\"c\",\"timestamp\":\"t\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"id\":\"t1\",\"name\":\"read\",\"arguments\":{}}],\"timestamp\":0}}\n";
+        let (bytes, memory) = Memory::with(format!("{}{}", message("a", "user", "go"), call));
+        let mut tail = Tail::with_source(Box::new(memory)).expect("tail");
+        tail.take_changed_from();
+
+        grow(
+            &mut tail,
+            &bytes,
+            "{\"type\":\"message\",\"id\":\"r\",\"timestamp\":\"t\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"t1\",\"content\":\"done\",\"timestamp\":0}}\n",
+        );
+        // The result rewrote the call at index 1, not the tail.
+        assert_eq!(tail.take_changed_from(), Some(1));
+    }
+
+    #[test]
+    fn a_usage_only_line_changes_no_item() {
+        let (bytes, memory) = Memory::with(message("a", "user", "hi"));
+        let mut tail = Tail::with_source(Box::new(memory)).expect("tail");
+        tail.take_changed_from();
+
+        grow(
+            &mut tail,
+            &bytes,
+            "{\"type\":\"usage\",\"id\":\"u\",\"timestamp\":\"t\",\"usage\":{\"input\":5}}\n",
+        );
+        assert_eq!(tail.take_changed_from(), None);
+        assert_eq!(tail.transcript().usage.input, 5);
+    }
+
+    #[test]
+    fn a_rewind_marks_the_whole_transcript() {
+        let (bytes, memory) = Memory::with(message("a", "user", "a long first line"));
+        let mut tail = Tail::with_source(Box::new(memory)).expect("tail");
+        tail.take_changed_from();
+
+        // A shorter replacement forces a rewind and a from-0 delta.
+        if let Ok(mut buffer) = bytes.lock() {
+            buffer.clear();
+            buffer.extend_from_slice(message("b", "assistant", "hi").as_bytes());
+        }
+        assert!(tail.poll().expect("poll"));
+        assert_eq!(tail.take_changed_from(), Some(0));
     }
 }

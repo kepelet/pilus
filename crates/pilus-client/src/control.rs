@@ -339,6 +339,9 @@ pub struct Agent {
     pub branch: Option<String>,
     /// Whether this agent's pane holds focus.
     pub focused: bool,
+    /// The session id the pane's agent reported via `pane.report_session`,
+    /// if it runs an integration that reports one (pi's extension does).
+    pub session: Option<String>,
 }
 
 impl Agent {
@@ -384,6 +387,11 @@ impl Agent {
                 .get("focused")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            session: value
+                .get("session")
+                .and_then(Value::as_str)
+                .filter(|session| !session.is_empty())
+                .map(str::to_string),
         })
     }
 
@@ -401,10 +409,11 @@ impl Agent {
 
 /// One resumable agent session found on disk, from `agent.sessions`.
 ///
-/// The daemon scans each supported agent's own store, so this is the exact
-/// conversation a live agent is in — including for a remote machine, whose
-/// file the client then reads over its own transport. The list is not filtered
-/// by pane: callers match the `cwd` they already know.
+/// The daemon scans each supported agent's own store, so this lists sessions
+/// that *could* be resumed — it says nothing about which session a live pane
+/// is in. That link only exists when the pane's agent reports it, surfacing
+/// as [`Agent::session`]. The list is not filtered by pane: callers match
+/// the `cwd` they already know.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentSession {
     /// The agent kind, e.g. `pi`.
@@ -1286,8 +1295,8 @@ fn is_structural(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutomationSummary, Tab, TaskSummary, enrich_tab_runtime, is_structural, read_line_within,
-        worktree_blockers,
+        Agent, AutomationSummary, Tab, TaskSummary, enrich_tab_runtime, is_structural,
+        read_line_within, worktree_blockers,
     };
     use crate::error::Error;
     use crate::transport::Stream;
@@ -1295,6 +1304,33 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn agent_parses_the_reported_session() {
+        let reported = Agent::from_json(&json!({
+            "pane": "7",
+            "agent": "pi",
+            "session": "c97a2b18-3c8d-4e2f-9a1b-0d2f4a6b8c10",
+        }))
+        .expect("agent");
+        assert_eq!(
+            reported.session.as_deref(),
+            Some("c97a2b18-3c8d-4e2f-9a1b-0d2f4a6b8c10")
+        );
+        let silent = Agent::from_json(&json!({
+            "pane": "7",
+            "agent": "pi",
+            "session": null,
+        }))
+        .expect("agent");
+        assert_eq!(silent.session, None);
+        // An agent that never reports omits the key or sends an empty one.
+        let missing = Agent::from_json(&json!({"pane": "7", "agent": "pi"})).expect("agent");
+        assert_eq!(missing.session, None);
+        let empty = Agent::from_json(&json!({"pane": "7", "agent": "pi", "session": ""}))
+            .expect("agent");
+        assert_eq!(empty.session, None);
+    }
 
     #[test]
     fn busy_worktree_refusals_expose_their_blockers() {

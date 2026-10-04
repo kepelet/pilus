@@ -7,28 +7,33 @@
 //! `pilus-session` and following it live. A floating composer sends prompts
 //! back to the live agent through the endpoint's control surface.
 //!
-//! The session is located through the daemon's UHP `agent.sessions` (which
-//! knows the exact conversation a live agent is in, on any endpoint), then its
-//! bytes are read through a [`Source`]: a local file, or an SSH `tail` for a
-//! machine. All reads, lookups, and prompt sends happen on background threads,
-//! so the GUI thread only ever clones an already-folded [`Transcript`].
+//! The session comes from the id the pane's pi extension reported to the
+//! daemon, then its bytes are read through a [`Source`]: a local file, or an
+//! SSH `tail` for a machine. All reads, lookups, and prompt sends happen on
+//! background threads, so the GUI thread only ever applies item deltas to a
+//! folded [`Transcript`].
 
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Anchor, AnyElement, Context, Div, ElementId, Entity, ScrollHandle, Stateful, anchored,
-    deferred, div, point, prelude::*, px, relative,
+    Anchor, AnyElement, Context, Div, ElementId, Entity, FollowMode, Keystroke, ListAlignment,
+    ListOffset, ListState, Stateful, anchored, deferred, div, list, point, prelude::*, px, relative,
 };
 use pilus_client::{AgentModel, ControlClient, SshTarget};
 use pilus_session::{
-    Error as SessionError, Item, ItemKind, Source, Tail, ToolOutcome, Transcript, Usage,
+    ContextUsage, DeliverAs, Error as SessionError, Item, ItemKind, PiState, RpcCommand, RpcEvent,
+    Sidecar, Source, Tail, ToolEvent, ToolOutcome, ToolPhase, Transcript, TranscriptMeta, Usage,
+    agent_dir, live_items, models_from, parse_event, socket_path,
 };
 use serde_json::Value;
 
@@ -107,11 +112,6 @@ const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "
 /// not live work. Generous: quiet stretches (a long generation writes
 /// nothing until it completes) must not flip a live turn to idle.
 const ACTIVE_WINDOW: Duration = Duration::from_secs(90);
-/// Items rendered on first paint; the rest fills in behind the scenes,
-/// so a huge session opens fast.
-const TAIL_WINDOW: usize = 50;
-/// How many earlier items each background fill step reveals.
-const FILL_CHUNK: usize = 200;
 /// Visible rows in a composer picker; longer lists scroll. Row metrics come
 /// from the shared composer picker menu.
 const PICKER_MAX_ROWS: usize = 8;
@@ -125,19 +125,262 @@ enum Endpoint {
     Remote { target: SshTarget, cwd: String },
 }
 
+/// A changed span of the transcript plus the fold's other state. A
+/// metadata-only change carries an empty `items` at `items.len()`, so the
+/// window still refreshes its usage and model readouts without a full
+/// transcript clone per tick. Boxed through [`Update`] because `meta`
+/// dwarfs the other variants.
+struct Delta {
+    /// The lowest item index the update replaces.
+    from: usize,
+    /// The replacement items: `items[from..]` on the reader's fold.
+    items: Vec<Item>,
+    /// Every non-item field of the fold.
+    meta: TranscriptMeta,
+}
+
+/// Which request an RPC `response` answers, so the panel can route the
+/// result without re-parsing the command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestKind {
+    Prompt,
+    Abort,
+    SetModel,
+    SetThinking,
+    Models,
+    State,
+}
+
 /// What the reader thread sends back to the window.
 enum Update {
-    /// A freshly folded transcript.
-    Transcript(Box<Transcript>),
+    Delta(Box<Delta>),
     /// The pi model catalog for the endpoint, for the model picker.
     Catalog(Vec<AgentModel>),
     /// A read or lookup failure, shown in place of the transcript.
     Error(String),
+    /// The extension's RPC socket answered a hello.
+    RpcUp,
+    /// The RPC channel dropped; the file tail is the source of truth again.
+    RpcDown,
+    /// pi pushed a state snapshot.
+    RpcState(Box<PiState>),
+    /// pi's streaming partial message, already folded into items.
+    RpcStream(Vec<Item>),
+    /// The streaming turn ended; the file is about to hold it.
+    RpcStreamEnd,
+    /// A tool run started, produced output, or finished.
+    RpcTool(ToolEvent),
+    /// The reply to a command this window sent.
+    RpcResult {
+        kind: RequestKind,
+        result: Result<Option<Value>, String>,
+    },
+}
+
+/// Reader tails parked across panel switches, so returning to a session
+/// reads only the bytes appended while it was away. Held in an `Arc` because
+/// the reader thread takes a clone when it spawns; the key is the source
+/// label — a local path, or `destination:path` for a remote file.
+#[derive(Clone, Default)]
+struct SessionCache {
+    inner: Arc<Mutex<VecDeque<(String, Tail)>>>,
+}
+
+/// Tails kept open at once; switching further evicts the least recent.
+const CACHED_TAILS: usize = 4;
+
+impl SessionCache {
+    /// Take the tail parked under `key`.
+    fn take(&self, key: &str) -> Option<Tail> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let index = inner.iter().position(|(name, _)| name == key)?;
+        inner.remove(index).map(|(_, tail)| tail)
+    }
+
+    /// Park a tail under `key`, most recent first, evicting the oldest when
+    /// the cache is full.
+    fn put(&self, key: &str, tail: Tail) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.retain(|(name, _)| name != key);
+        inner.push_front((key.to_string(), tail));
+        while inner.len() > CACHED_TAILS {
+            inner.pop_back();
+        }
+    }
+}
+
+/// Which transcript rows were open in one session, restored when the panel
+/// returns to it after looking at another.
+#[derive(Clone, Default)]
+struct ExpandState {
+    expanded: HashSet<usize>,
+    groups: HashSet<usize>,
+    work_open: HashSet<usize>,
+}
+
+/// Expansion states remembered at once: enough to flip between panes without
+/// keeping one entry for every session ever opened.
+const EXPAND_STATE_CAP: usize = 16;
+
+/// The turn pi is streaming right now, overlaid on the transcript until the
+/// file catches up. `ended_at` marks `stream_end`: the file tail lags a
+/// beat, so the overlay lingers until a delta lands or the linger expires.
+#[derive(Default)]
+struct LiveTurn {
+    items: Vec<Item>,
+    /// A running tool's `(name, output)`; absent between runs.
+    tool: Option<(String, String)>,
+    ended_at: Option<Instant>,
+}
+
+/// How long a finished live turn waits for the file to land before it is
+/// dropped as stale.
+const LIVE_LINGER: Duration = Duration::from_secs(3);
+
+/// Item-index base for the live overlay, far past any real index, so expand
+/// keys on the overlay never collide with the transcript's.
+const LIVE_BASE: usize = 1_000_000;
+
+/// Output lines a running tool shows, newest last.
+const LIVE_TOOL_LINES: usize = 12;
+
+/// Whether a live turn has outlived its welcome: the stream ended more than
+/// `LIVE_LINGER` ago and no tool is still running.
+fn live_expired(live: &LiveTurn, now: Instant) -> bool {
+    live.tool.is_none()
+        && live
+            .ended_at
+            .is_some_and(|at| now.duration_since(at) > LIVE_LINGER)
+}
+
+/// Where a composer submit goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// Over the extension socket, with the delivery pi wants for a busy turn.
+    Rpc(Option<DeliverAs>),
+    /// Through the pane's terminal prompt (`agent.prompt`).
+    Terminal,
+}
+
+/// Route a submit: slash commands only exist in pi's TUI editor, and a
+/// socket that is down leaves the terminal path as the only channel. Enter
+/// steers a busy turn; Alt+Enter queues behind it.
+fn route(text: &str, rpc_up: bool, busy: bool, alt: bool) -> Route {
+    if text.starts_with('/') || !rpc_up {
+        return Route::Terminal;
+    }
+    Route::Rpc(if busy {
+        Some(if alt {
+            DeliverAs::FollowUp
+        } else {
+            DeliverAs::Steer
+        })
+    } else {
+        None
+    })
+}
+
+/// The context chip's text: `ctx 42% · 84k/1M`, or `ctx –/1M` while pi has
+/// not re-counted after a compaction.
+fn ctx_label(usage: &ContextUsage) -> String {
+    match usage.tokens {
+        Some(tokens) => {
+            let percent = usage
+                .percent
+                .map_or_else(
+                    || {
+                        let window = usage.context_window.max(1) as f64;
+                        tokens as f64 / window * 100.0
+                    },
+                    |percent| percent * 100.0,
+                )
+                .round();
+            format!(
+                "ctx {percent:.0}% · {}/{}",
+                fmt_count(tokens),
+                fmt_count(usage.context_window)
+            )
+        }
+        None => format!("ctx –/{}", fmt_count(usage.context_window)),
+    }
+}
+
+/// Whether the context chip warns: at or above 80% full.
+fn ctx_warns(usage: &ContextUsage) -> bool {
+    usage.percent.unwrap_or(0.0) >= 0.8
+}
+
+/// What a transcript row is, for [`build_rows`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowKind {
+    /// One item rendered on its own.
+    Item,
+    /// A run of thinking items, each collapsed on its own row.
+    Thinking,
+    /// A stretch of work collapsed under a `Working for …` header.
+    Work,
+}
+
+/// One list entry: a contiguous range of transcript items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Row {
+    start: usize,
+    end: usize,
+    kind: RowKind,
+}
+
+/// Fold the transcript into list rows: a maximal run of `is_work` items is
+/// one row (`Thinking` when it is only thinking, `Work` otherwise); every
+/// other item is a row of its own.
+fn build_rows(items: &[Item]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut index = 0;
+    while index < items.len() {
+        let start = index;
+        if is_work(&items[index].kind) {
+            while index < items.len() && is_work(&items[index].kind) {
+                index += 1;
+            }
+            let run = &items[start..index];
+            let kind = if run
+                .iter()
+                .all(|item| matches!(item.kind, ItemKind::Thinking { .. }))
+            {
+                RowKind::Thinking
+            } else {
+                RowKind::Work
+            };
+            rows.push(Row {
+                start,
+                end: index,
+                kind,
+            });
+        } else {
+            index += 1;
+            rows.push(Row {
+                start,
+                end: index,
+                kind: RowKind::Item,
+            });
+        }
+    }
+    rows
+}
+
+/// A fresh list state anchored at the tail: the first layout walks up from
+/// the end and only measures what is visible.
+fn new_list_state() -> ListState {
+    let list = ListState::new(0, ListAlignment::Top, px(600.0));
+    list.set_follow_mode(FollowMode::Tail);
+    list
 }
 
 /// The Pi Session panel's state, embedded in [`PilusView`].
 pub struct SessionPanel {
     open: bool,
+    /// The panel stands in for a pi pane's terminal: Escape does not close
+    /// it, so there is no way to strand the pane behind the card.
+    pinned: bool,
     title: String,
     error: String,
     /// The endpoint the session lives on, reused to prompt the live agent.
@@ -153,9 +396,15 @@ pub struct SessionPanel {
     /// Shared settings, for the Interface family and size.
     settings: Rc<RefCell<Settings>>,
     transcript: Transcript,
-    scroll: ScrollHandle,
-    /// How many tail items to render; older ones lazy-load on demand.
-    visible: usize,
+    /// The virtualized transcript: only the rows near the viewport are in
+    /// the element tree.
+    list: ListState,
+    /// The rows the list was last told about.
+    rows: Vec<Row>,
+    /// Whether the list's last entry is the optimistic-prompt bubble.
+    list_pending: bool,
+    /// The transcript changed since the last [`SessionPanel::sync_list`].
+    rows_dirty: bool,
     /// The pi model catalog for this endpoint, loaded once in the
     /// background; the picker falls back to session models until it lands.
     catalog: Vec<AgentModel>,
@@ -183,10 +432,6 @@ pub struct SessionPanel {
     /// press just dismissed it (so its own button's click stays closed).
     prompts_open: bool,
     prompts_dismissed: bool,
-    /// The tail is pinned: follow it on growth. Set when the viewport sits
-    /// at the bottom; cleared the moment it moves without growth, which can
-    /// only be the user scrolling or jumping away.
-    following: bool,
     /// A sent prompt is still waiting for pi's first responding content.
     /// The optimistic indicator persists through this, not just the send.
     awaiting_response: bool,
@@ -197,8 +442,31 @@ pub struct SessionPanel {
     /// only forwards new bytes), so recency here means live work — unlike a
     /// trailing work item, which may be a stale interrupted tail.
     last_growth: Option<Instant>,
-    /// Item count at the last frame, so the view follows the tail.
+    /// Item count at the last delivery, so growth marks the session active.
     last_seen: usize,
+    /// Earliest item index pending deltas rewrote, so `sync_list` remeasures
+    /// a row an in-place change does not move the prefix diff to.
+    changed_from: Option<usize>,
+    /// Tails parked between switches, shared with the reader thread.
+    cache: SessionCache,
+    /// Expansion states saved under `expand_key` across switches.
+    expand_cache: HashMap<String, ExpandState>,
+    /// The key the current transcript's expansion saves under: the reported
+    /// session id, else the explicit path, else the endpoint cwd.
+    expand_key: Option<String>,
+    /// Commands for the extension's socket; `Some` whenever a session id was
+    /// reported, even while the channel itself is reconnecting.
+    rpc_tx: Option<Sender<RpcCommand>>,
+    /// Whether the socket is live right now; state pushes only count then.
+    rpc_up: bool,
+    /// pi's last reported state; `None` while RPC is down, so every
+    /// consumer's `Option` check is the fallback switch. `pub(super)` so
+    /// the shot harness can paint the context chip deterministically.
+    pub(super) pi_state: Option<PiState>,
+    /// The streaming turn overlaid on the transcript while the file lags.
+    live: Option<LiveTurn>,
+    /// Whether the list's last entry is the live overlay.
+    list_live: bool,
     rx: Receiver<Update>,
     tx: Sender<Update>,
     send_rx: Receiver<Result<(), String>>,
@@ -219,6 +487,7 @@ impl Default for SessionPanel {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         Self {
             open: false,
+            pinned: false,
             title: String::new(),
             error: String::new(),
             endpoint: None,
@@ -228,8 +497,10 @@ impl Default for SessionPanel {
             theme: Theme::default(),
             settings: Rc::new(RefCell::new(Settings::default())),
             transcript: Transcript::default(),
-            scroll: ScrollHandle::new(),
-            visible: TAIL_WINDOW,
+            list: new_list_state(),
+            rows: Vec::new(),
+            list_pending: false,
+            rows_dirty: false,
             catalog: Vec::new(),
             picker: None,
             picker_dismissed: None,
@@ -238,7 +509,6 @@ impl Default for SessionPanel {
             pending_from: 0,
             prompts_open: false,
             prompts_dismissed: false,
-            following: true,
             awaiting_response: false,
             pending_steering: false,
             last_growth: None,
@@ -246,6 +516,15 @@ impl Default for SessionPanel {
             groups: HashSet::new(),
             work_open: HashSet::new(),
             last_seen: 0,
+            changed_from: None,
+            cache: SessionCache::default(),
+            expand_cache: HashMap::new(),
+            expand_key: None,
+            rpc_tx: None,
+            rpc_up: false,
+            pi_state: None,
+            live: None,
+            list_live: false,
             rx,
             tx,
             send_rx,
@@ -266,8 +545,9 @@ impl SessionPanel {
 
     /// Open the panel for a local cwd (or an explicit session file).
     ///
-    /// The control socket is used only to find the exact session the live
-    /// agent is in; a failure falls back to the newest file for the cwd.
+    /// `--session-ui` only: an explicit file is read as-is, a cwd resolves
+    /// to its newest session. Live panes go through [`Self::open_local_session`]
+    /// with the id the extension reported.
     pub fn open_local(
         &mut self,
         api_socket: PathBuf,
@@ -292,22 +572,53 @@ impl SessionPanel {
         self.open_with(
             endpoint,
             explicit.is_file().then_some(explicit),
+            None,
             title,
             target,
             cx,
         );
     }
 
-    /// Open the panel for a session on `target`, read over SSH.
-    pub fn open_remote(
+    /// Open the panel for a local pane whose session id the pi extension
+    /// reported to the daemon.
+    pub fn open_local_session(
+        &mut self,
+        api_socket: PathBuf,
+        cwd: String,
+        session_id: String,
+        title: String,
+        pane: String,
+        cx: &mut Context<PilusView>,
+    ) {
+        self.open_with(
+            Endpoint::Local { api_socket, cwd },
+            None,
+            Some(session_id),
+            title,
+            Some(pane),
+            cx,
+        );
+    }
+
+    /// Open the panel for a remote pane whose session id the pi extension
+    /// reported to that machine's daemon.
+    pub fn open_remote_session(
         &mut self,
         target: SshTarget,
         cwd: String,
+        session_id: String,
         title: String,
-        pane: Option<String>,
+        pane: String,
         cx: &mut Context<PilusView>,
     ) {
-        self.open_with(Endpoint::Remote { target, cwd }, None, title, pane, cx);
+        self.open_with(
+            Endpoint::Remote { target, cwd },
+            None,
+            Some(session_id),
+            title,
+            Some(pane),
+            cx,
+        );
     }
 
     /// Start a reader thread for `endpoint` and reset the panel's state.
@@ -315,11 +626,33 @@ impl SessionPanel {
         &mut self,
         endpoint: Endpoint,
         explicit: Option<PathBuf>,
+        session_id: Option<String>,
         title: String,
         target: Option<String>,
         cx: &mut Context<PilusView>,
     ) {
+        // Park the outgoing session's expansion under its key so a switch
+        // back lands on the same open rows. `mem::take` clears the sets; the
+        // generic clears below then cover a first open, where nothing was
+        // parked.
+        if let Some(key) = self.expand_key.take() {
+            self.expand_cache.insert(
+                key,
+                ExpandState {
+                    expanded: std::mem::take(&mut self.expanded),
+                    groups: std::mem::take(&mut self.groups),
+                    work_open: std::mem::take(&mut self.work_open),
+                },
+            );
+            // Bound the map: an arbitrary entry goes once it is full.
+            if self.expand_cache.len() > EXPAND_STATE_CAP
+                && let Some(stale) = self.expand_cache.keys().next().cloned()
+            {
+                self.expand_cache.remove(&stale);
+            }
+        }
         self.close();
+        self.rotate_channels();
         self.open = true;
         self.title = title.clone();
         self.error.clear();
@@ -329,7 +662,40 @@ impl SessionPanel {
         self.expanded.clear();
         self.groups.clear();
         self.work_open.clear();
-        self.visible = TAIL_WINDOW;
+        // A session id identifies its expansion; a standalone file its path,
+        // and a bare cwd spec (`--session-ui`) the cwd itself.
+        let expand_key = session_id
+            .clone()
+            .or_else(|| {
+                explicit
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .or_else(|| match &endpoint {
+                Endpoint::Local { cwd, .. } | Endpoint::Remote { cwd, .. } => {
+                    (!cwd.is_empty()).then(|| cwd.clone())
+                }
+            });
+        if let Some(state) = expand_key
+            .as_ref()
+            .and_then(|key| self.expand_cache.get(key))
+            .cloned()
+        {
+            self.expanded = state.expanded;
+            self.groups = state.groups;
+            self.work_open = state.work_open;
+        }
+        self.expand_key = expand_key;
+        self.list = new_list_state();
+        self.rows.clear();
+        self.list_pending = false;
+        self.list_live = false;
+        self.rows_dirty = false;
+        self.changed_from = None;
+        self.rpc_tx = None;
+        self.rpc_up = false;
+        self.pi_state = None;
+        self.live = None;
         self.catalog.clear();
         self.picker = None;
         self.picker_dismissed = None;
@@ -338,7 +704,6 @@ impl SessionPanel {
         self.prompts_open = false;
         self.prompts_dismissed = false;
         self.outbox.clear();
-        self.following = true;
         self.awaiting_response = false;
         self.pending_steering = false;
         self.last_growth = None;
@@ -348,8 +713,24 @@ impl SessionPanel {
         self.stop = Arc::new(AtomicBool::new(false));
         let stop = self.stop.clone();
         let tx = self.tx.clone();
+        let cache = self.cache.clone();
         let catalog_endpoint = endpoint.clone();
-        std::thread::spawn(move || reader_loop(endpoint, explicit, tx, stop));
+        let reader_session_id = session_id.clone();
+        std::thread::spawn(move || {
+            reader_loop(endpoint, explicit, reader_session_id, cache, tx, stop)
+        });
+        // A reported session id also gets the extension's RPC channel when
+        // it can be reached; `--session-ui` has no id and stays file-only.
+        if let Some(id) = session_id {
+            let (command_tx, command_rx) = std::sync::mpsc::channel();
+            self.rpc_tx = Some(command_tx);
+            let rpc_endpoint = catalog_endpoint.clone();
+            let rpc_tx = self.tx.clone();
+            let rpc_stop = self.stop.clone();
+            std::thread::spawn(move || {
+                rpc_loop(rpc_endpoint, id, rpc_tx, command_rx, rpc_stop);
+            });
+        }
         // The model catalog (pi's models-store, locally or over SSH) arrives
         // separately; the picker uses session models until it lands.
         let catalog_tx = self.tx.clone();
@@ -365,10 +746,33 @@ impl SessionPanel {
         cx.notify();
     }
 
+    /// Pin or unpin the panel. Pinned, it replaces a pi pane's terminal:
+    /// Escape is swallowed instead of closing it.
+    pub fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
+    }
+
+    /// Swap every channel the panel drains for fresh ones. Dropping the old
+    /// receivers makes the previous session's threads fail their next send —
+    /// a stale delta, RPC event, catalog, or prompt/interrupt result can
+    /// never land in the new session's transcript or status.
+    fn rotate_channels(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx = tx;
+        self.rx = rx;
+        let (send_tx, send_rx) = std::sync::mpsc::channel();
+        self.send_tx = send_tx;
+        self.send_rx = send_rx;
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        self.stop_tx = stop_tx;
+        self.stop_rx = stop_rx;
+    }
+
     /// Close the panel and stop its reader thread.
     pub fn close(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.open = false;
+        self.pinned = false;
         self.last_seen = 0;
     }
 
@@ -380,20 +784,63 @@ impl SessionPanel {
         let mut changed = false;
         while let Ok(update) = self.rx.try_recv() {
             match update {
-                Update::Transcript(transcript) => {
-                    // Past the initial delivery, anything arriving is file
-                    // growth: the session is alive right now.
-                    if self.last_seen > 0 {
-                        self.last_growth = Some(Instant::now());
-                    }
-                    self.transcript = *transcript;
-                    self.error.clear();
+                Update::Delta(delta) => {
+                    self.apply_delta(delta.from, delta.items, delta.meta);
                 }
                 Update::Catalog(catalog) => {
                     self.catalog = catalog;
                 }
                 Update::Error(error) => self.error = error,
+                Update::RpcUp => {
+                    self.rpc_up = true;
+                }
+                Update::RpcDown => {
+                    // State and live data came from the socket; with it gone
+                    // the file tail's heuristics take over again.
+                    self.rpc_up = false;
+                    self.pi_state = None;
+                    self.live = None;
+                }
+                Update::RpcState(state) => {
+                    self.pi_state = Some(*state);
+                }
+                Update::RpcStream(items) => {
+                    let live = self.live.get_or_insert_with(LiveTurn::default);
+                    live.items = items;
+                    live.ended_at = None;
+                    self.bump_live();
+                }
+                Update::RpcStreamEnd => {
+                    if let Some(live) = &mut self.live {
+                        live.ended_at = Some(Instant::now());
+                    }
+                    self.bump_live();
+                }
+                Update::RpcTool(event) => {
+                    let name = event.tool_name.clone();
+                    let output = event.output.clone();
+                    match event.phase {
+                        ToolPhase::End => {
+                            if let Some(live) = &mut self.live {
+                                live.tool = None;
+                            }
+                        }
+                        ToolPhase::Start | ToolPhase::Update => {
+                            let live = self.live.get_or_insert_with(LiveTurn::default);
+                            live.tool = Some((name, output));
+                        }
+                    }
+                    self.bump_live();
+                }
+                Update::RpcResult { kind, result } => {
+                    self.rpc_result(kind, result);
+                }
             }
+            changed = true;
+        }
+        // A finished live turn waits on the file; past the linger it is stale.
+        if self.live.as_ref().is_some_and(|live| live_expired(live, Instant::now())) {
+            self.live = None;
             changed = true;
         }
         while let Ok(result) = self.send_rx.try_recv() {
@@ -428,50 +875,168 @@ impl SessionPanel {
         changed
     }
 
+    /// Apply one reader delta: items at or after `from` are replaced
+    /// wholesale, and the fold's metadata is adopted.
+    fn apply_delta(&mut self, from: usize, items: Vec<Item>, meta: TranscriptMeta) {
+        // Past the initial delivery, anything arriving is file growth: the
+        // session is alive right now.
+        if self.last_seen > 0 {
+            self.last_growth = Some(Instant::now());
+        }
+        let from = from.min(self.transcript.items.len());
+        self.transcript.items.truncate(from);
+        self.transcript.items.extend(items);
+        // The file caught up with a finished live turn; the overlay is stale.
+        if self.live.as_ref().is_some_and(|live| live.ended_at.is_some()) {
+            self.live = None;
+        }
+        self.transcript.set_meta(meta);
+        self.last_seen = self.transcript.items.len();
+        self.rows_dirty = true;
+        // The splice has to reach back to the earliest item the deltas
+        // rewrote — an outcome can land on a call rows above the tail.
+        self.changed_from = Some(self.changed_from.map_or(from, |earlier| earlier.min(from)));
+        self.error.clear();
+    }
+
+    /// The reply to a socket command: a failed prompt drops the optimistic
+    /// bubble, the models reply refills the picker, and any refusal lands on
+    /// the status line.
+    fn rpc_result(&mut self, kind: RequestKind, result: Result<Option<Value>, String>) {
+        match (kind, result) {
+            (RequestKind::Prompt, Err(error)) => {
+                self.status = format!("couldn't send: {error}");
+                self.pending_prompt = None;
+                self.awaiting_response = false;
+                self.pending_steering = false;
+            }
+            (RequestKind::Models, Ok(Some(data))) => {
+                self.catalog = models_from(&data)
+                    .iter()
+                    .map(|model| AgentModel {
+                        provider: model.provider.clone(),
+                        id: model.id.clone(),
+                        name: model.name.clone(),
+                        ..AgentModel::default()
+                    })
+                    .collect();
+            }
+            (_, Err(error)) => self.status = error,
+            (_, Ok(_)) => {}
+        }
+    }
+
+    /// Queue a command on the extension socket. A dead channel only means
+    /// the reader thread is gone, which the reconnect path already reports.
+    fn send_rpc_command(&self, command: RpcCommand) {
+        if let Some(tx) = &self.rpc_tx {
+            let _ = tx.send(command);
+        }
+    }
+
+    /// The list index of the live overlay: after the rows and the
+    /// optimistic bubble.
+    fn live_index(&self) -> usize {
+        self.rows.len() + usize::from(self.pending_prompt.is_some())
+    }
+
+    /// Remeasure the overlay's row after its content changed.
+    fn bump_live(&mut self) {
+        let index = self.live_index();
+        self.list.remeasure_items(index..index + 1);
+    }
+
     /// Handle a keystroke. Returns whether it was consumed.
     pub fn key(
         &mut self,
-        key: &str,
+        keystroke: &Keystroke,
         input: &Entity<TextInput>,
         cx: &mut Context<PilusView>,
     ) -> bool {
-        match key {
+        match keystroke.key.as_str() {
             "escape" => {
                 // Open menus eat the first Escape in topmost order; the next
-                // one closes the panel.
+                // one closes the panel — unless it is pinned, where Escape
+                // does nothing so the pane's terminal stays replaced.
                 if self.picker.take().is_some() {
                     self.picker_dismissed = None;
                 } else if self.prompts_open {
                     self.prompts_open = false;
                     self.prompts_dismissed = false;
-                } else {
+                } else if !self.pinned {
                     self.close();
                 }
                 true
             }
             "enter" => {
-                self.submit(input, cx);
+                self.submit(input, cx, keystroke.modifiers.alt);
                 true
             }
             "end" => {
-                self.scroll.scroll_to_bottom();
+                self.follow_tail();
                 true
             }
             _ => false,
         }
     }
 
-    /// Send the composer's text to the live agent.
-    fn submit(&mut self, input: &Entity<TextInput>, cx: &mut Context<PilusView>) {
+    /// Send the composer's text to the live agent: over the extension
+    /// socket when it is up, through the pane's terminal otherwise. Alt
+    /// held on Enter queues a follow-up behind a busy turn.
+    fn submit(&mut self, input: &Entity<TextInput>, cx: &mut Context<PilusView>, alt: bool) {
         let text = input.read(cx).value().trim().to_string();
-        self.send_text(text, true, cx);
+        match route(&text, self.rpc_up, self.is_working(), alt) {
+            Route::Rpc(deliver_as) => self.send_rpc(text, deliver_as, input, cx),
+            Route::Terminal => self.send_text(text, true, cx),
+        }
+    }
+
+    /// Send a prompt over the extension socket. The composer clears at once
+    /// and the bubble stays optimistic until the file echoes the prompt.
+    fn send_rpc(
+        &mut self,
+        text: String,
+        deliver_as: Option<DeliverAs>,
+        input: &Entity<TextInput>,
+        cx: &mut Context<PilusView>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        self.set_optimistic(&text);
+        self.pending_from = self.transcript.items.len();
+        self.pending_steering = deliver_as.is_some();
+        self.follow_tail();
+        input.update(cx, |input, cx| input.clear(cx));
+        self.send_rpc_command(RpcCommand::Prompt {
+            text,
+            deliver_as,
+        });
+        cx.notify();
     }
 
     /// Send a picker command (`/model`, `/thinking`) without touching the
-    /// composer's draft.
+    /// composer's draft. The socket takes the typed command; the terminal
+    /// path only remains for when it is down.
     fn send_command(&mut self, command: String, cx: &mut Context<PilusView>) {
         self.picker = None;
         self.picker_dismissed = None;
+        if self.rpc_up {
+            if let Some(argument) = command.strip_prefix("/model ") {
+                let (provider, model) = argument.split_once('/').unwrap_or(("", argument));
+                self.send_rpc_command(RpcCommand::SetModel {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                });
+                return;
+            }
+            if let Some(level) = command.strip_prefix("/thinking ") {
+                self.send_rpc_command(RpcCommand::SetThinking {
+                    level: level.to_string(),
+                });
+                return;
+            }
+        }
         self.send_text(command, false, cx);
     }
 
@@ -505,7 +1070,7 @@ impl SessionPanel {
         if clear_input {
             self.set_optimistic(&text);
             self.pending_from = self.transcript.items.len();
-            self.scroll.scroll_to_bottom();
+            self.follow_tail();
         }
         let tx = self.send_tx.clone();
         std::thread::spawn(move || {
@@ -539,6 +1104,14 @@ impl SessionPanel {
     /// Interrupt the live agent the way its own Escape key does. The
     /// optimistic state clears at once; the transcript catches up.
     fn stop(&mut self, cx: &mut Context<PilusView>) {
+        if self.rpc_up {
+            self.send_rpc_command(RpcCommand::Abort);
+            self.pending_prompt = None;
+            self.awaiting_response = false;
+            self.pending_steering = false;
+            cx.notify();
+            return;
+        }
         let Some(endpoint) = self.endpoint.clone() else {
             return;
         };
@@ -588,45 +1161,95 @@ impl SessionPanel {
         if !self.expanded.remove(&index) {
             self.expanded.insert(index);
         }
-        // Keep the toggled row in view, so expanding or collapsing it never
-        // reads as the row vanishing. Indices are absolute while the scroll
-        // container holds a tail window, so translate past it.
-        let start = self.window_start();
-        self.scroll.scroll_to_item(index.saturating_sub(start));
+        // Remeasure the row in place, so expanding or collapsing it never
+        // reads as the row vanishing.
+        let row = self.row_of(index);
+        self.list.remeasure_items(row..row + 1);
     }
 
-    /// Reveal one more chunk of earlier items, holding the scroll position
-    /// on the first item that was already visible.
-    fn grow_earlier(&mut self) {
-        let len = self.transcript.items.len();
-        let old_start = len.saturating_sub(self.visible);
-        if old_start == 0 {
-            return;
-        }
-        self.visible += FILL_CHUNK;
-        let start = len.saturating_sub(self.visible);
-        self.scroll.scroll_to_top_of_item(old_start - start);
-    }
-
-    /// Absolute index of the first rendered item.
-    fn window_start(&self) -> usize {
-        self.transcript.items.len().saturating_sub(self.visible)
-    }
-
-    /// Scroll one absolute item into view, first widening the tail window
-    /// until it reaches that item.
-    ///
-    /// A prompt older than the window has no child to scroll to, so jumping
-    /// to it used to land on the window's first row. Growing the window is
-    /// what the background fill would have done anyway; doing it here makes
-    /// the jump land where the menu promised.
+    /// Scroll one absolute item into view, leaving the tail pin behind.
     fn jump_to(&mut self, index: usize) {
-        let len = self.transcript.items.len();
-        if index >= len {
-            return;
+        self.sync_list();
+        if index < self.transcript.items.len() {
+            self.list.scroll_to(ListOffset {
+                item_ix: self.row_of(index),
+                offset_in_item: px(0.0),
+            });
         }
-        self.visible = self.visible.max(len - index);
-        self.scroll.scroll_to_item(index - self.window_start());
+    }
+
+    /// Re-pin the list to the tail: follow new content and anchor at the end.
+    fn follow_tail(&mut self) {
+        self.list.set_follow_mode(FollowMode::Tail);
+    }
+
+    /// The list row holding absolute item `index`, or the last row when the
+    /// index lands past the end.
+    fn row_of(&self, item: usize) -> usize {
+        self.rows
+            .partition_point(|row| row.start <= item)
+            .saturating_sub(1)
+            .min(self.rows.len().saturating_sub(1))
+    }
+
+    /// Fold the transcript into rows and tell the list what changed.
+    ///
+    /// The last entry is the optimistic-prompt bubble while one is in
+    /// flight. A shrink means the transcript was rewound or replaced, so the
+    /// list resets; otherwise only the rows from the first difference on are
+    /// remeasured — and the old last row always is, because a tool outcome
+    /// attaches to it in place and a trailing `Working…` flips to
+    /// `Working for …` when something follows it.
+    fn sync_list(&mut self) {
+        let pending = self.pending_prompt.is_some();
+        let live = self.live.is_some();
+        if self.rows_dirty {
+            let new = build_rows(&self.transcript.items);
+            let old_count =
+                self.rows.len() + self.list_pending as usize + self.list_live as usize;
+            let new_count = new.len() + pending as usize + live as usize;
+            let old_coverage = self.rows.last().map_or(0, |row| row.end);
+            let new_coverage = new.last().map_or(0, |row| row.end);
+            if new_coverage < old_coverage {
+                self.list.reset(new_count);
+            } else {
+                let first = self.splice_start(&new);
+                self.list.splice(first..old_count, new_count - first);
+            }
+            self.changed_from = None;
+            self.rows = new;
+            self.rows_dirty = false;
+        } else {
+            // Only the tail entries changed: swap the count after the rows
+            // in place so the transcript never reflows.
+            let old_tail = self.list_pending as usize + self.list_live as usize;
+            let new_tail = pending as usize + live as usize;
+            if pending != self.list_pending || live != self.list_live {
+                self.list.splice(
+                    self.rows.len()..self.rows.len() + old_tail,
+                    new_tail,
+                );
+            }
+        }
+        self.list_pending = pending;
+        self.list_live = live;
+    }
+
+    /// The row a splice starts at: the first row whose range changed, moved
+    /// back to the row holding the earliest item the deltas rewrote — an
+    /// outcome attaching to an earlier call does not move the prefix diff.
+    /// The old last row always remeasures so a trailing `Working…` flips.
+    fn splice_start(&self, new: &[Row]) -> usize {
+        let mut first = self
+            .rows
+            .iter()
+            .zip(new.iter())
+            .position(|(old, new)| old != new)
+            .unwrap_or_else(|| self.rows.len().min(new.len()));
+        if let Some(changed) = self.changed_from {
+            first = first.min(self.row_of(changed));
+        }
+        first.min(self.rows.len().saturating_sub(1))
     }
 
     /// Toggle one tool-call group.
@@ -634,6 +1257,8 @@ impl SessionPanel {
         if !self.groups.remove(&index) {
             self.groups.insert(index);
         }
+        let row = self.row_of(index);
+        self.list.remeasure_items(row..row + 1);
     }
 
     /// Toggle one run of work between assistant replies.
@@ -641,6 +1266,8 @@ impl SessionPanel {
         if !self.work_open.remove(&index) {
             self.work_open.insert(index);
         }
+        let row = self.row_of(index);
+        self.list.remeasure_items(row..row + 1);
     }
 
     /// A chip: a small muted label on a subtle pill.
@@ -1226,93 +1853,154 @@ impl SessionPanel {
                 .child("Waiting for the first message…")
                 .into_any_element();
         }
-        // The scroll container's direct children are the items, so
-        // `scroll_to_bottom` can follow the tail. It is a flex sibling of the
-        // composer, so the composer can never cover the last message.
-        let mut list = div()
-            .id("pilus-session-scroll")
-            .flex_1()
-            .min_h(px(0.0))
-            .flex()
-            .flex_col()
-            // Every row takes the full width up to the reading measure, so
-            // `items_center` centers the column instead of each row's text.
-            .items_center()
-            .gap_4()
-            .px_6()
-            .py_6()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll);
-        // Consecutive tool calls collapse into one row, so a burst of 28 calls
-        // does not flood the transcript. `flex_shrink_0` keeps every row at
-        // its content height: without it a flex column whose content overflows
-        // shrinks the rows until they vanish.
-        // Only the tail window renders; the rest fills in behind the scenes
-        // (see `render`). Expansion keys stay absolute transcript indices, so
-        // growing the window never misaligns them.
-        let full = &self.transcript.items;
-        let window_start = full.len().saturating_sub(self.visible);
-        let items = &full[window_start..];
-        let mut index = 0;
-        while index < items.len() {
-            let absolute = window_start + index;
-            let row = if is_work(&items[index].kind) {
-                let run_start = index;
-                while index < items.len() && is_work(&items[index].kind) {
-                    index += 1;
-                }
-                let run = &items[run_start..index];
-                // A run that is only thinking needs no `Working…` wrapper;
-                // the thinking row stands on its own.
-                if run
-                    .iter()
-                    .all(|item| matches!(item.kind, ItemKind::Thinking { .. }))
-                {
-                    let mut column = div().flex().flex_col().gap_4();
-                    for (offset, item) in run.iter().enumerate() {
-                        column = column.child(div().flex_shrink_0().child(self.item(
-                            window_start + run_start + offset,
+        // The virtualized list is a flex sibling of the composer, so the
+        // composer can never cover the last message.
+        list(
+            self.list.clone(),
+            cx.processor(move |this: &mut PilusView, ix: usize, _window, cx| {
+                this.session.row_element(ix, fonts, cx)
+            }),
+        )
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .pt_6()
+        .pb_2()
+        .into_any_element()
+    }
+
+    /// One list entry: a transcript row wrapped to the reading measure, or
+    /// the optimistic prompt as the last entry. Out-of-range indices render
+    /// empty rather than panic, since the callback runs a frame after splice.
+    fn row_element(&mut self, ix: usize, fonts: Fonts, cx: &mut Context<PilusView>) -> AnyElement {
+        let Some(row) = self.rows.get(ix).copied() else {
+            return self.tail_element(ix, fonts, cx);
+        };
+        let items = &self.transcript.items;
+        let content = match row.kind {
+            RowKind::Item => self.item(row.start, &items[row.start], fonts, cx),
+            // A run that is only thinking needs no `Working…` wrapper; the
+            // thinking rows stand on their own.
+            RowKind::Thinking => {
+                let mut column = div().flex().flex_col().gap_4();
+                for (offset, item) in items[row.start..row.end].iter().enumerate() {
+                    column = column
+                        .child(div().flex_shrink_0().child(self.item(
+                            row.start + offset,
                             item,
                             fonts,
                             cx,
                         )));
-                    }
-                    column.into_any_element()
-                } else {
-                    self.work_group(
-                        window_start + run_start,
-                        run,
-                        window_start + index == full.len(),
-                        fonts,
-                        cx,
-                    )
                 }
-            } else {
-                let row = self.item(absolute, &items[index], fonts, cx);
-                index += 1;
-                row
-            };
-            list = list.child(
+                column.into_any_element()
+            }
+            RowKind::Work => self.work_group(
+                row.start,
+                &items[row.start..row.end],
+                row.end == items.len(),
+                fonts,
+                cx,
+            ),
+        };
+        div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .justify_center()
+            .px_6()
+            .pb_4()
+            .child(
                 div()
                     .w_full()
                     .max_w(px(TRANSCRIPT_MAX_W))
-                    .flex_shrink_0()
-                    .child(row),
-            );
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
+    /// The entries after the transcript rows, in order: the optimistic
+    /// prompt bubble, then the live turn overlay.
+    fn tail_element(&mut self, ix: usize, fonts: Fonts, cx: &mut Context<PilusView>) -> AnyElement {
+        let frame = |content: AnyElement| {
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .justify_center()
+                .px_6()
+                .pb_4()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(TRANSCRIPT_MAX_W))
+                        .child(content),
+                )
+                .into_any_element()
+        };
+        let extra = ix.saturating_sub(self.rows.len());
+        if extra == 0
+            && let Some(prompt) = self.pending_prompt.clone()
+        {
+            return frame(self.user_bubble(&prompt, 0, fonts));
         }
-        // The optimistic prompt rides below the transcript until pi appends
-        // the real user message.
-        if let Some(prompt) = &self.pending_prompt {
-            let bubble = self.user_bubble(prompt, 0, fonts);
-            list = list.child(
+        if extra == usize::from(self.pending_prompt.is_some()) && self.live.is_some() {
+            return frame(self.live_element(fonts, cx));
+        }
+        div().into_any_element()
+    }
+
+    /// The live turn overlay: pi's streaming message rendered like the
+    /// transcript's, plus a running tool's output tail. Item indices start
+    /// at [`LIVE_BASE`] so expand keys never collide with real items.
+    fn live_element(&mut self, fonts: Fonts, cx: &mut Context<PilusView>) -> AnyElement {
+        let theme = self.theme;
+        let Some(live) = &self.live else {
+            return div().into_any_element();
+        };
+        let mut column = div().flex().flex_col().gap_4();
+        for (offset, item) in live.items.iter().enumerate() {
+            column = column.child(
                 div()
-                    .w_full()
-                    .max_w(px(TRANSCRIPT_MAX_W))
                     .flex_shrink_0()
-                    .child(bubble),
+                    .child(self.item(LIVE_BASE + offset, item, fonts, cx)),
             );
         }
-        list.into_any_element()
+        if let Some((name, output)) = &live.tool {
+            // The last few lines of a running tool, tail-style, in the
+            // transcript's muted mono face.
+            let lines: Vec<&str> = output.lines().collect();
+            let tail = lines
+                .iter()
+                .skip(lines.len().saturating_sub(LIVE_TOOL_LINES))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
+            column = column.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(theme.panel_dim)
+                    .child(
+                        div()
+                            .text_size(px(fonts.label))
+                            .text_color(theme.muted)
+                            .child(format!("{name} · running")),
+                    )
+                    .child(
+                        div()
+                            .font_family(style::mono_family(&self.settings))
+                            .text_size(px(fonts.secondary))
+                            .text_color(theme.muted)
+                            .whitespace_normal()
+                            .child(tail),
+                    ),
+            );
+        }
+        column.into_any_element()
     }
 
     /// The sticky prompt composer, a flex sibling below the transcript.
@@ -1401,10 +2089,10 @@ impl SessionPanel {
             )
     }
 
-    /// Whether the scroll-to-bottom floater is needed: content overflows and
-    /// the tail is not pinned.
+    /// Whether the scroll-to-bottom floater is needed: the tail is not
+    /// pinned.
     fn needs_jump_button(&self) -> bool {
-        self.scroll.max_offset().y > px(0.0) && !self.following
+        !self.list.is_following_tail()
     }
 
     /// The composer's round button: a stop square while pi is working (it
@@ -1441,7 +2129,7 @@ impl SessionPanel {
                     this.session.stop(cx);
                 } else {
                     let input = this.session_prompt.clone();
-                    this.session.submit(&input, cx);
+                    this.session.submit(&input, cx, false);
                 }
             }))
     }
@@ -1504,8 +2192,7 @@ impl SessionPanel {
                     include_bytes!("../../assets/icons/arrow-down.svg"),
                 )
                 .on_click(cx.listener(|this: &mut PilusView, _, _, cx| {
-                    this.session.following = true;
-                    this.session.scroll.scroll_to_bottom();
+                    this.session.follow_tail();
                     cx.notify();
                 })),
             );
@@ -1558,8 +2245,7 @@ impl SessionPanel {
                 cx.listener(move |this: &mut PilusView, _, _, cx| {
                     this.session.prompts_open = false;
                     this.session.prompts_dismissed = false;
-                    // Leaving the tail: stop following so the jump sticks.
-                    this.session.following = false;
+                    // Scrolling to a row leaves the tail behind by itself.
                     this.session.jump_to(index);
                     cx.notify();
                 }),
@@ -1592,10 +2278,12 @@ impl SessionPanel {
             .is_some_and(|at| at.elapsed() < ACTIVE_WINDOW)
     }
 
-    /// Whether pi is still working: a prompt is in flight, optimistically
-    /// shown, still being steered, or the transcript ends mid-work with no
-    /// reply yet.
+    /// Whether pi is still working: while the socket is up its `busy` is
+    /// exact; the heuristics below are the fallback for when it is down.
     fn is_working(&self) -> bool {
+        if let Some(state) = &self.pi_state {
+            return state.busy;
+        }
         if self.sending || self.pending_prompt.is_some() || self.awaiting_response {
             return true;
         }
@@ -1688,7 +2376,7 @@ impl SessionPanel {
             fonts,
             cx,
         ));
-        let thinking = match transcript.thinking_level.clone() {
+        let thinking = match self.current_thinking() {
             Some(level) => pilus_client::effort_label(&level),
             None => "Thinking".to_string(),
         };
@@ -1700,6 +2388,25 @@ impl SessionPanel {
             fonts,
             cx,
         ));
+        if let Some(context) = self
+            .pi_state
+            .as_ref()
+            .and_then(|state| state.context.as_ref())
+        {
+            let color = if ctx_warns(context) {
+                theme.alert
+            } else {
+                theme.muted
+            };
+            row = row.child(
+                div()
+                    .pl_2()
+                    .text_size(px(fonts.label))
+                    .text_color(color)
+                    .whitespace_nowrap()
+                    .child(ctx_label(context)),
+            );
+        }
         if let Some(stats) = usage_stats(&transcript.usage) {
             row = row.child(
                 div()
@@ -1717,8 +2424,20 @@ impl SessionPanel {
 
     /// The model chip's label: the catalog's display name (`Muse Spark 1.3
     /// Contributor`) when the current `provider/id` slug is known, else the
-    /// slug itself.
+    /// slug itself. The extension's report is exact; the transcript fold is
+    /// the fallback while the socket is down.
     fn model_display(&self) -> String {
+        if let Some(model) = self
+            .pi_state
+            .as_ref()
+            .and_then(|state| state.model.as_ref())
+        {
+            return if model.name.is_empty() {
+                model.id.clone()
+            } else {
+                model.name.clone()
+            };
+        }
         let current = self.transcript.model.clone().unwrap_or_default();
         if current.is_empty() {
             return "model".to_string();
@@ -1735,6 +2454,33 @@ impl SessionPanel {
         }
         current
     }
+
+    /// The `provider/id` slug the model picker marks current, from the
+    /// extension's report when it is up.
+    fn current_model_slug(&self) -> String {
+        if let Some(model) = self
+            .pi_state
+            .as_ref()
+            .and_then(|state| state.model.as_ref())
+        {
+            return if model.provider.is_empty() {
+                model.id.clone()
+            } else {
+                format!("{}/{}", model.provider, model.id)
+            };
+        }
+        self.transcript.model.clone().unwrap_or_default()
+    }
+
+    /// The thinking level the picker marks current, from the extension's
+    /// report when it is up.
+    fn current_thinking(&self) -> Option<String> {
+        self.pi_state
+            .as_ref()
+            .and_then(|state| state.thinking.clone())
+            .or_else(|| self.transcript.thinking_level.clone())
+    }
+
     /// One picker chip, drawn with the composer face Home uses: a leading
     /// glyph, the value, and a chevron, highlighting while open.
     fn picker_chip(
@@ -1788,8 +2534,8 @@ impl SessionPanel {
         cx: &mut Context<PilusView>,
     ) -> AnyElement {
         let theme = self.theme;
-        let current_model = self.transcript.model.clone().unwrap_or_default();
-        let current_thinking = self.transcript.thinking_level.clone().unwrap_or_default();
+        let current_model = self.current_model_slug();
+        let current_thinking = self.current_thinking().unwrap_or_default();
         // One option per model: the catalog's `provider/id` value under its
         // display name, then any session model the catalog does not know.
         // Each entry is `(label, /model argument, is-current)`.
@@ -1895,7 +2641,6 @@ impl SessionPanel {
         self.theme = theme;
         self.settings = settings.clone();
         let fonts = Fonts::resolve(settings);
-        let count = self.transcript.items.len();
         // Drop the optimistic prompt once pi appends the real user message
         // (only matches at or after the send point, so resending the same
         // text cannot clear the new bubble early).
@@ -1935,46 +2680,9 @@ impl SessionPanel {
         if self.pending_steering && self.steered_turn_answered() {
             self.pending_steering = false;
         }
-        // The first paint shows the tail window only; the pin follows live
-        // turns, but reading history never yanks back down.
-        let offset_y = self.scroll.offset().y;
-        let max_y = self.scroll.max_offset().y;
-        let at_top = offset_y >= -px(1.0);
-        let at_bottom = offset_y <= px(4.0) - max_y;
-        let grew = count != self.last_seen;
-        if grew {
-            let first = self.last_seen == 0;
-            self.last_seen = count;
-            if first {
-                self.visible = count.min(TAIL_WINDOW);
-                self.following = true;
-            } else if self.following {
-                self.visible = count;
-            }
-            if count > 0 && (first || self.following) {
-                self.scroll.scroll_to_bottom();
-            }
-        }
-        if at_bottom {
-            self.following = true;
-        } else if !grew {
-            self.following = false;
-        }
-        // Background fill, a chunk per frame: while following, the window
-        // grows and rides the tail; parked at the top it grows and holds
-        // position, so scrolling up lazy-loads history. Mid-viewport stays
-        // frozen so reading never shifts.
-        if self.window_start() > 0 && (self.following || at_top) {
-            if self.following {
-                self.visible += FILL_CHUNK;
-                if count > 0 {
-                    self.scroll.scroll_to_bottom();
-                }
-            } else {
-                self.grow_earlier();
-            }
-            cx.notify();
-        }
+        // After the optimistic bookkeeping, so a landed prompt drops its
+        // entry in the same frame its real bubble appears.
+        self.sync_list();
         let header = self.header(fonts);
         let body = self.body(fonts, cx);
         let composer = self.composer(input, fonts, cx);
@@ -1991,124 +2699,462 @@ impl SessionPanel {
 }
 
 /// The background reader: resolve the session, then tail it until stopped.
+///
+/// A reported session id can precede its file — pi creates the file lazily,
+/// at the first user message — so a resolution miss is retried on the poll
+/// interval rather than raised as an error. Only real IO and SSH failures
+/// surface.
 fn reader_loop(
     endpoint: Endpoint,
     explicit: Option<PathBuf>,
+    session_id: Option<String>,
+    cache: SessionCache,
     tx: Sender<Update>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut tail = match open_tail(&endpoint, explicit) {
-        Ok(tail) => tail,
-        Err(error) => {
-            let _ = tx.send(Update::Error(error.to_string()));
-            return;
-        }
-    };
     let interval = match endpoint {
         Endpoint::Local { .. } => LOCAL_POLL,
         Endpoint::Remote { .. } => REMOTE_POLL,
     };
+    let (mut tail, key) = loop {
+        match open_tail(&endpoint, explicit.clone(), session_id.as_deref(), &cache) {
+            Ok(Some(opened)) => break opened,
+            Ok(None) => {
+                if sleep_sliced(interval, &stop) {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = tx.send(Update::Error(error.to_string()));
+                return;
+            }
+        }
+    };
     // Send the initial fold immediately so the panel is not blank for a tick.
-    if tx
-        .send(Update::Transcript(Box::new(tail.transcript().clone())))
-        .is_err()
-    {
+    if !send_delta(&tx, &tail, 0) {
+        cache.put(&key, tail);
         return;
     }
+    // A reused tail's catch-up poll may have marked an index that the full
+    // snapshot already covers; drain it so the next delta is not inflated.
+    tail.take_changed_from();
     while !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(interval);
-        if stop.load(Ordering::Relaxed) {
+        if sleep_sliced(interval, &stop) {
             break;
         }
         match tail.poll() {
             Ok(true) => {
-                if tx
-                    .send(Update::Transcript(Box::new(tail.transcript().clone())))
-                    .is_err()
-                {
+                // A metadata-only fold marks nothing, so `from` lands at the
+                // end and the delta carries `meta` alone.
+                let from = tail
+                    .take_changed_from()
+                    .unwrap_or_else(|| tail.transcript().items.len());
+                if !send_delta(&tx, &tail, from) {
                     break;
                 }
             }
             Ok(false) => {}
             Err(error) => {
-                if tx.send(Update::Error(error.to_string())).is_err() {
-                    break;
+                let _ = tx.send(Update::Error(error.to_string()));
+                return;
+            }
+        }
+    }
+    // The panel moved on; park the tail so a switch back reads only the
+    // bytes appended in between. An error exit above parks nothing: the
+    // tail can no longer be trusted.
+    cache.put(&key, tail);
+}
+
+/// Push one delta: every item at or after `from`, plus the fold's metadata.
+/// Returns false when the window has gone away.
+fn send_delta(tx: &Sender<Update>, tail: &Tail, from: usize) -> bool {
+    let transcript = tail.transcript();
+    let from = from.min(transcript.items.len());
+    tx.send(Update::Delta(Box::new(Delta {
+        from,
+        items: transcript.items[from..].to_vec(),
+        meta: transcript.meta(),
+    })))
+    .is_ok()
+}
+
+/// The node one-liner that relays a remote socket onto stdio. `shell` pins
+/// /bin/sh and the sidecar publishes pi's own node binary, so this runs
+/// wherever the extension does.
+const RELAY_JS: &str = "const s=require(\"net\").connect(process.argv[1]);\
+     process.stdin.pipe(s);s.pipe(process.stdout);\
+     s.on(\"error\",()=>process.exit(1));s.on(\"close\",()=>process.exit(0));";
+
+/// Wait between reconnect attempts: `/reload` restarts pi's socket, and a
+/// pi without the v2 extension should not spin the thread.
+const RPC_BACKOFF: Duration = Duration::from_secs(2);
+/// How long the RPC loop waits on a queued command before checking events
+/// and the stop flag.
+const RPC_COMMAND_WAIT: Duration = Duration::from_millis(50);
+
+/// A bidirectional RPC stream plus the relay child to kill on teardown.
+struct RpcConn {
+    lines: BufReader<Box<dyn Read + Send>>,
+    writer: Box<dyn Write + Send>,
+    child: Option<Child>,
+}
+
+/// One socket line folded for the loop: stream messages become items here,
+/// on the reader thread, so the GUI never sees pi's raw JSON.
+enum Incoming {
+    Event(RpcEvent),
+    Stream(Vec<Item>),
+    /// The socket closed or errored; the session is over.
+    Closed,
+}
+
+/// Which request a `response` answers.
+fn request_kind(command: &RpcCommand) -> RequestKind {
+    match command {
+        RpcCommand::Prompt { .. } => RequestKind::Prompt,
+        RpcCommand::Abort => RequestKind::Abort,
+        RpcCommand::SetModel { .. } => RequestKind::SetModel,
+        RpcCommand::SetThinking { .. } => RequestKind::SetThinking,
+        RpcCommand::Models => RequestKind::Models,
+        RpcCommand::State => RequestKind::State,
+    }
+}
+
+/// Connect to the extension socket at `path` (a temp path in tests).
+fn connect_local(path: &Path) -> Result<RpcConn, String> {
+    let stream = UnixStream::connect(path).map_err(|error| error.to_string())?;
+    let reader = stream
+        .try_clone()
+        .map_err(|error| error.to_string())?;
+    Ok(RpcConn {
+        lines: BufReader::new(Box::new(reader)),
+        writer: Box::new(stream),
+        child: None,
+    })
+}
+
+/// Reach the extension socket on a machine: read the sidecar pi wrote for
+/// the socket's path and its node binary, then relay stdio onto the socket.
+fn connect_remote(target: &SshTarget, session_id: &str) -> Result<RpcConn, String> {
+    if !safe_session_id(session_id) {
+        return Err(format!("pi reported an unusable session id `{session_id}`"));
+    }
+    let output = target
+        .shell(&format!(
+            "cat \"${{PI_CODING_AGENT_DIR:-$HOME/.pi/agent}}/pilus/{session_id}.json\""
+        ))
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!("no extension socket on {}", target.destination));
+    }
+    let sidecar = Sidecar::parse(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| format!("unreadable extension sidecar on {}", target.destination))?;
+    let mut child = target
+        .shell(&format!(
+            "exec {} -e {} {}",
+            shell_quote(&sidecar.exec_path),
+            shell_quote(RELAY_JS),
+            shell_quote(&sidecar.socket),
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let writer = child
+        .stdin
+        .take()
+        .ok_or_else(|| "the relay opened without stdin".to_string())?;
+    let reader = child
+        .stdout
+        .take()
+        .ok_or_else(|| "the relay opened without stdout".to_string())?;
+    Ok(RpcConn {
+        lines: BufReader::new(Box::new(reader)),
+        writer: Box::new(writer),
+        child: Some(child),
+    })
+}
+
+/// The extension channel's owner: connect, run one session, and reconnect
+/// on failure. A missing socket just means pi has not loaded the extension
+/// yet — the file tail keeps the panel honest meanwhile.
+fn rpc_loop(
+    endpoint: Endpoint,
+    session_id: String,
+    update: Sender<Update>,
+    commands: Receiver<RpcCommand>,
+    stop: Arc<AtomicBool>,
+) {
+    // One receiver survives every reconnect; the Mutex only exists because
+    // `Receiver` is not `Sync`, never because two threads compete for it.
+    let commands = Mutex::new(commands);
+    while !stop.load(Ordering::Relaxed) {
+        let conn = match &endpoint {
+            Endpoint::Local { .. } => {
+                connect_local(&socket_path(&agent_dir(), &session_id))
+            }
+            Endpoint::Remote { target, .. } => connect_remote(target, &session_id),
+        };
+        match conn {
+            Ok(conn) => rpc_session(conn, &update, &commands, &stop),
+            Err(_) => {
+                if sleep_sliced(RPC_BACKOFF, &stop) {
+                    return;
                 }
             }
         }
     }
 }
 
-/// Resolve and open the session's byte source.
-fn open_tail(endpoint: &Endpoint, explicit: Option<PathBuf>) -> Result<Tail, SessionError> {
-    match endpoint {
-        Endpoint::Local { api_socket, cwd } => {
-            let path = match explicit {
-                Some(path) => Some(path),
-                None => resolve_local(api_socket, cwd),
+/// Run one connected session until the socket drops or the panel stops.
+///
+/// A reader thread folds socket lines into [`Incoming`]; this loop drains
+/// them between 50ms command waits so events and replies interleave the
+/// way pi sends them.
+fn rpc_session(
+    conn: RpcConn,
+    update: &Sender<Update>,
+    commands: &Mutex<Receiver<RpcCommand>>,
+    stop: &AtomicBool,
+) {
+    let RpcConn {
+        lines,
+        mut writer,
+        mut child,
+    } = conn;
+    let (incoming_tx, incoming) = std::sync::mpsc::channel::<Incoming>();
+    std::thread::spawn(move || {
+        for line in lines.lines() {
+            let Ok(line) = line else {
+                break;
             };
-            match path {
-                Some(path) => Tail::open(path),
-                None => Err(SessionError::Source(format!(
-                    "no pi session found for `{cwd}`"
-                ))),
+            let incoming = match parse_event(&line) {
+                Some(RpcEvent::Stream(message)) => Incoming::Stream(live_items(&message)),
+                Some(event) => Incoming::Event(event),
+                None => continue,
+            };
+            if incoming_tx.send(incoming).is_err() {
+                return;
             }
         }
-        Endpoint::Remote { target, cwd } => {
-            let path = resolve_remote(target, cwd)?;
-            Tail::with_source(Box::new(SshSource {
-                target: target.clone(),
-                path,
-            }))
+        let _ = incoming_tx.send(Incoming::Closed);
+    });
+    let mut up = false;
+    let mut next_id = 0u64;
+    let mut pending: HashMap<String, RequestKind> = HashMap::new();
+    'session: loop {
+        let command = commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_timeout(RPC_COMMAND_WAIT);
+        match command {
+            Ok(command) => {
+                next_id += 1;
+                let id = next_id.to_string();
+                if writeln!(writer, "{}", command.to_line(&id)).is_err() {
+                    break;
+                }
+                pending.insert(id, request_kind(&command));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            // The panel went away.
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        while let Ok(incoming) = incoming.try_recv() {
+            match incoming {
+                Incoming::Closed => break 'session,
+                Incoming::Stream(items) => {
+                    if update.send(Update::RpcStream(items)).is_err() {
+                        break 'session;
+                    }
+                }
+                Incoming::Event(RpcEvent::Hello { .. }) => {
+                    up = true;
+                    if update.send(Update::RpcUp).is_err() {
+                        break 'session;
+                    }
+                    // Refill the picker's catalog from the live agent.
+                    next_id += 1;
+                    let id = next_id.to_string();
+                    if writeln!(writer, "{}", RpcCommand::Models.to_line(&id)).is_err() {
+                        break 'session;
+                    }
+                    pending.insert(id, RequestKind::Models);
+                }
+                Incoming::Event(RpcEvent::State(state)) => {
+                    if update.send(Update::RpcState(state)).is_err() {
+                        break 'session;
+                    }
+                }
+                Incoming::Event(RpcEvent::StreamEnd) => {
+                    if update.send(Update::RpcStreamEnd).is_err() {
+                        break 'session;
+                    }
+                }
+                Incoming::Event(RpcEvent::Stream(_)) => {
+                    // The reader folds streams into items; unreachable.
+                }
+                Incoming::Event(RpcEvent::Tool(tool)) => {
+                    if update.send(Update::RpcTool(*tool)).is_err() {
+                        break 'session;
+                    }
+                }
+                Incoming::Event(RpcEvent::Response {
+                    id,
+                    ok,
+                    error,
+                    data,
+                }) => {
+                    let Some(kind) = pending.remove(&id) else {
+                        continue;
+                    };
+                    let result = if ok {
+                        Ok(data)
+                    } else {
+                        Err(error.unwrap_or_else(|| "request failed".to_string()))
+                    };
+                    if update.send(Update::RpcResult { kind, result }).is_err() {
+                        break 'session;
+                    }
+                }
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    if let Some(mut child) = child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    // Only a session that got up announces it is down; a failed connect is
+    // invisible to the panel.
+    if up {
+        let _ = update.send(Update::RpcDown);
+    }
+}
+
+/// Sleep `total` in short slices so `stop` is seen quickly — a quick A→B→A
+/// switch must not wait out a whole poll interval to reuse its parked tail.
+/// Returns whether the sleep ended on `stop`.
+fn sleep_sliced(total: Duration, stop: &AtomicBool) -> bool {
+    const SLICE: Duration = Duration::from_millis(25);
+    let deadline = Instant::now() + total;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(SLICE));
+    }
+}
+
+/// Resolve and open the session's byte source.
+///
+/// `Ok(None)` is "not yet": the pane reported a session id pi has not
+/// written a file for. The reader retries it on the poll interval. The
+/// returned key is the tail's cache slot; a parked tail under it is reused
+/// after a `poll` catches it up on the bytes appended while it sat.
+fn open_tail(
+    endpoint: &Endpoint,
+    explicit: Option<PathBuf>,
+    session_id: Option<&str>,
+    cache: &SessionCache,
+) -> Result<Option<(Tail, String)>, SessionError> {
+    fn open_or_reuse(
+        cache: &SessionCache,
+        key: String,
+        open: impl FnOnce() -> Result<Tail, SessionError>,
+    ) -> Result<(Tail, String), SessionError> {
+        if let Some(mut tail) = cache.take(&key) {
+            tail.poll()?;
+            return Ok((tail, key));
+        }
+        Ok((open()?, key))
+    }
+
+    match endpoint {
+        Endpoint::Local { cwd, .. } => {
+            let path = match explicit {
+                Some(path) => Some(path),
+                None => resolve_local(cwd, session_id),
+            };
+            match path {
+                Some(path) => open_or_reuse(cache, path.to_string_lossy().into_owned(), || {
+                    Tail::open(&path)
+                })
+                .map(Some),
+                None => Ok(None),
+            }
+        }
+        Endpoint::Remote { target, .. } => {
+            let Some(path) = resolve_remote(target, session_id)? else {
+                return Ok(None);
+            };
+            open_or_reuse(
+                cache,
+                format!("{}:{path}", target.destination),
+                || {
+                    Tail::with_source(Box::new(SshSource {
+                        target: target.clone(),
+                        path,
+                    }))
+                },
+            )
+            .map(Some)
         }
     }
 }
 
-/// Find the local session file, preferring the id the daemon reports.
-fn resolve_local(api_socket: &std::path::Path, cwd: &str) -> Option<PathBuf> {
+/// Find the local session file for the reported id, or the cwd's newest
+/// when no id is known (`--session-ui <cwd>` only).
+fn resolve_local(cwd: &str, session_id: Option<&str>) -> Option<PathBuf> {
     let root = pilus_session::sessions_root();
-    if !cwd.is_empty()
-        && let Ok(mut client) = ControlClient::connect(api_socket)
-        && let Ok(sessions) = client.agent_sessions()
-    {
-        let id = sessions
-            .iter()
-            .filter(|session| session.agent == "pi")
-            .filter(|session| session.cwd == cwd || cwd.starts_with(&format!("{}/", session.cwd)))
-            .max_by_key(|session| session.cwd.len())
-            .map(|session| session.session_id.clone());
-        if let Some(id) = id
-            && let Some(path) = pilus_session::find_by_id(&root, cwd, &id)
-        {
-            return Some(path);
-        }
+    match session_id {
+        Some(id) => pilus_session::find_by_id(&root, cwd, id)
+            .or_else(|| pilus_session::find_any_by_id(&root, id)),
+        None => pilus_session::latest(&root, cwd),
     }
-    if cwd.is_empty() {
-        return None;
-    }
-    pilus_session::latest(&root, cwd)
 }
 
-/// Find the remote session file over SSH, preferring the daemon-reported id.
-fn resolve_remote(target: &SshTarget, cwd: &str) -> Result<String, SessionError> {
-    let slug = pilus_session::dir_name_for(cwd);
-    let id = ControlClient::connect_ssh(target.clone())
-        .ok()
-        .and_then(|mut client| client.agent_sessions().ok())
-        .and_then(|sessions| {
-            sessions
-                .into_iter()
-                .filter(|session| session.agent == "pi")
-                .find(|session| session.cwd == cwd)
-                .map(|session| session.session_id)
-        });
-    let glob = match id {
-        Some(id) => format!("*_{id}.jsonl"),
+/// Whether `id` is safe to interpolate into a remote glob: the same
+/// character set the daemon's `session_id` schema accepts.
+fn safe_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 256
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+}
+
+/// Find the remote session file over SSH for the reported id.
+///
+/// `Ok(None)` means the glob matched nothing: pi has not created the file
+/// yet.
+fn resolve_remote(
+    target: &SshTarget,
+    session_id: Option<&str>,
+) -> Result<Option<String>, SessionError> {
+    let glob = match session_id {
+        Some(id) => {
+            if !safe_session_id(id) {
+                return Err(SessionError::Source(format!(
+                    "pi reported an unusable session id `{id}`"
+                )));
+            }
+            format!("*_{id}.jsonl")
+        }
         None => "*.jsonl".to_string(),
     };
     let command = format!(
-        "dir=\"${{PI_CODING_AGENT_SESSION_DIR:-$HOME/.pi/agent/sessions}}/{slug}\"; \
-         ls -t \"$dir\"/{glob} 2>/dev/null | head -n1"
+        "root=\"${{PI_CODING_AGENT_SESSION_DIR:-$HOME/.pi/agent/sessions}}\"; \
+         ls -t \"$root\"/*/{glob} 2>/dev/null | head -n1"
     );
     let output = target
         .shell(&command)
@@ -2124,12 +3170,9 @@ fn resolve_remote(target: &SshTarget, cwd: &str) -> Result<String, SessionError>
     }
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if path.is_empty() {
-        return Err(SessionError::Source(format!(
-            "no pi session found for `{cwd}` on {}",
-            target.destination
-        )));
+        return Ok(None);
     }
-    Ok(path)
+    Ok(Some(path))
 }
 
 /// A session file on another machine, read through one SSH command per poll.
@@ -2587,51 +3630,206 @@ mod tests {
         assert_eq!(clip_lines(text, 2), "a\nb\n… (truncated)");
     }
 
-    #[test]
-    fn earlier_messages_grow_the_window() {
-        let mut panel = SessionPanel::default();
-        for index in 0..120 {
-            panel.transcript.items.push(Item {
-                id: index.to_string(),
-                timestamp: String::new(),
-                kind: ItemKind::Note {
-                    title: "n".to_string(),
-                    text: String::new(),
-                },
-            });
-        }
-        // First paint shows the tail only.
-        assert_eq!(panel.window_start(), 70);
-        panel.grow_earlier();
-        assert_eq!(panel.visible, TAIL_WINDOW + FILL_CHUNK);
-        assert_eq!(panel.window_start(), 0);
-        // Nothing left to reveal; a second press is a no-op.
-        panel.grow_earlier();
-        assert_eq!(panel.window_start(), 0);
+    fn push(panel: &mut SessionPanel, kind: ItemKind) {
+        let id = panel.transcript.items.len().to_string();
+        panel.transcript.items.push(Item {
+            id,
+            timestamp: String::new(),
+            kind,
+        });
+        panel.rows_dirty = true;
+    }
+
+    /// [User, Thinking, Thinking, Assistant, ToolCall, ToolResult, Bash,
+    /// Assistant, Thinking]: the grouping `body()` used to do inline.
+    fn grouped_transcript(panel: &mut SessionPanel) {
+        push(
+            panel,
+            ItemKind::User {
+                text: "prompt".to_string(),
+                images: 0,
+            },
+        );
+        push(
+            panel,
+            ItemKind::Thinking {
+                text: "a".to_string(),
+            },
+        );
+        push(
+            panel,
+            ItemKind::Thinking {
+                text: "b".to_string(),
+            },
+        );
+        push(
+            panel,
+            ItemKind::Assistant {
+                text: "checking".to_string(),
+                model: None,
+            },
+        );
+        push(
+            panel,
+            ItemKind::ToolCall {
+                call_id: "c1".to_string(),
+                name: "read".to_string(),
+                arguments: Value::Null,
+                outcome: None,
+            },
+        );
+        push(
+            panel,
+            ItemKind::ToolResult {
+                call_id: "c1".to_string(),
+                name: "read".to_string(),
+                text: String::new(),
+                images: 0,
+                is_error: false,
+            },
+        );
+        push(
+            panel,
+            ItemKind::Bash {
+                command: "ls".to_string(),
+                output: String::new(),
+                exit_code: Some(0),
+                cancelled: false,
+                truncated: false,
+            },
+        );
+        push(
+            panel,
+            ItemKind::Assistant {
+                text: "done".to_string(),
+                model: None,
+            },
+        );
+        push(
+            panel,
+            ItemKind::Thinking {
+                text: "c".to_string(),
+            },
+        );
     }
 
     #[test]
-    fn jumping_to_an_older_prompt_widens_the_window() {
+    fn rows_group_work_runs_like_the_transcript() {
+        let mut panel = SessionPanel::default();
+        grouped_transcript(&mut panel);
+        assert_eq!(
+            build_rows(&panel.transcript.items),
+            vec![
+                Row {
+                    start: 0,
+                    end: 1,
+                    kind: RowKind::Item
+                },
+                Row {
+                    start: 1,
+                    end: 3,
+                    kind: RowKind::Thinking
+                },
+                Row {
+                    start: 3,
+                    end: 4,
+                    kind: RowKind::Item
+                },
+                Row {
+                    start: 4,
+                    end: 7,
+                    kind: RowKind::Work
+                },
+                Row {
+                    start: 7,
+                    end: 8,
+                    kind: RowKind::Item
+                },
+                Row {
+                    start: 8,
+                    end: 9,
+                    kind: RowKind::Thinking
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn row_of_finds_the_row_holding_an_item() {
+        let mut panel = SessionPanel::default();
+        grouped_transcript(&mut panel);
+        panel.sync_list();
+        assert_eq!(panel.row_of(5), 3);
+        assert_eq!(panel.row_of(0), 0);
+        assert_eq!(panel.row_of(8), 5);
+    }
+
+    #[test]
+    fn appending_items_keeps_the_list_in_step() {
+        let mut panel = SessionPanel::default();
+        grouped_transcript(&mut panel);
+        panel.sync_list();
+        assert_eq!(panel.list.item_count(), panel.rows.len());
+        // More items, including extending the trailing work run in place.
+        push(
+            &mut panel,
+            ItemKind::ToolCall {
+                call_id: "c2".to_string(),
+                name: "read".to_string(),
+                arguments: Value::Null,
+                outcome: None,
+            },
+        );
+        push(
+            &mut panel,
+            ItemKind::Assistant {
+                text: "more".to_string(),
+                model: None,
+            },
+        );
+        panel.sync_list();
+        assert_eq!(panel.list.item_count(), panel.rows.len());
+        // The optimistic prompt is the extra last entry.
+        panel.pending_prompt = Some("queued".to_string());
+        panel.sync_list();
+        assert_eq!(panel.list.item_count(), panel.rows.len() + 1);
+        panel.pending_prompt = None;
+        panel.sync_list();
+        assert_eq!(panel.list.item_count(), panel.rows.len());
+        // A rewind resets the list to the new rows.
+        panel.transcript.items.truncate(3);
+        panel.rows_dirty = true;
+        panel.sync_list();
+        assert_eq!(panel.list.item_count(), panel.rows.len());
+    }
+
+    #[test]
+    fn jumping_to_a_prompt_scrolls_to_its_row_and_stops_following() {
         let mut panel = SessionPanel::default();
         for index in 0..120 {
-            panel.transcript.items.push(Item {
-                id: index.to_string(),
-                timestamp: String::new(),
-                kind: ItemKind::User {
+            push(
+                &mut panel,
+                ItemKind::User {
                     text: format!("prompt {index}"),
                     images: 0,
                 },
-            });
+            );
         }
-        // The tail window holds no row for the fifth prompt, so a jump has to
-        // reveal one before it can scroll.
-        assert_eq!(panel.window_start(), 70);
+        panel.sync_list();
+        assert!(panel.list.is_following_tail());
         panel.jump_to(5);
-        assert_eq!(panel.window_start(), 5);
-        // A prompt already in the window leaves the window alone.
-        panel.visible = TAIL_WINDOW;
-        panel.jump_to(119);
-        assert_eq!(panel.visible, TAIL_WINDOW);
+        assert_eq!(panel.list.logical_scroll_top().item_ix, 5);
+        assert!(!panel.list.is_following_tail());
+        panel.follow_tail();
+        assert!(panel.list.is_following_tail());
+    }
+
+    #[test]
+    fn session_id_only_allows_the_safe_charset() {
+        assert!(safe_session_id("c97a2b18-3c8d-4e2f-9a1b-0d2f4a6b8c10"));
+        for bad in ["a b", "x;rm", "../x", "a/b", ""] {
+            assert!(!safe_session_id(bad), "{bad:?} must be rejected");
+        }
     }
 
     #[test]
@@ -2953,5 +4151,278 @@ mod tests {
         );
         assert!(details.contains("$ ls"));
         assert!(details.contains("timeout: 30s"));
+    }
+
+    fn user(index: usize, text: &str) -> Item {
+        Item {
+            id: index.to_string(),
+            timestamp: String::new(),
+            kind: ItemKind::User {
+                text: text.to_string(),
+                images: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn deltas_apply_like_a_full_resend() {
+        let mut panel = SessionPanel::default();
+        let mut items = vec![user(0, "m0"), user(1, "m1"), user(2, "m2")];
+
+        // The first delivery is the whole snapshot.
+        panel.apply_delta(0, items.clone(), TranscriptMeta::default());
+        assert_eq!(panel.transcript.items, items);
+
+        // An append only carries the new tail.
+        items.push(user(3, "m3"));
+        panel.apply_delta(3, items[3..].to_vec(), TranscriptMeta::default());
+        assert_eq!(panel.transcript.items, items);
+
+        // An in-place rewrite resends from the item it touched.
+        items[1] = user(1, "edited");
+        panel.apply_delta(1, items[1..].to_vec(), TranscriptMeta::default());
+        assert_eq!(panel.transcript.items, items);
+
+        // A rewind resends from 0.
+        let fresh = vec![user(0, "only")];
+        panel.apply_delta(0, fresh.clone(), TranscriptMeta::default());
+        assert_eq!(panel.transcript.items, fresh);
+    }
+
+    #[test]
+    fn an_inplace_change_splices_from_its_row() {
+        let mut panel = SessionPanel::default();
+        grouped_transcript(&mut panel);
+        panel.sync_list();
+        assert_eq!(panel.list.item_count(), 6);
+
+        // A delta that rewrote item 5 (a call inside the Work row) does not
+        // move the row diff, but the splice still reaches back to row 3.
+        panel.changed_from = Some(5);
+        let new = build_rows(&panel.transcript.items);
+        assert_eq!(panel.splice_start(&new), 3);
+    }
+
+    /// A source that never produces bytes, standing in for a session file.
+    struct Empty;
+
+    impl Source for Empty {
+        fn byte_len(&mut self) -> pilus_session::Result<u64> {
+            Ok(0)
+        }
+        fn read_from(&mut self, _offset: u64) -> pilus_session::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn label(&self) -> String {
+            "test".to_string()
+        }
+    }
+
+    #[test]
+    fn the_session_cache_evicts_its_oldest_tail() {
+        let cache = SessionCache::default();
+        for index in 0..CACHED_TAILS + 2 {
+            cache.put(
+                &format!("session-{index}"),
+                Tail::with_source(Box::new(Empty)).expect("tail"),
+            );
+        }
+        // The first two inserts were pushed out.
+        assert!(cache.take("session-0").is_none());
+        assert!(cache.take("session-1").is_none());
+        for index in 2..CACHED_TAILS + 2 {
+            assert!(cache.take(&format!("session-{index}")).is_some());
+        }
+        assert!(cache.take("session-2").is_none());
+    }
+
+    #[test]
+    fn submits_route_between_the_socket_and_the_terminal() {
+        assert_eq!(route("/compact", true, false, false), Route::Terminal);
+        assert_eq!(route("hi", true, false, false), Route::Rpc(None));
+        assert_eq!(
+            route("hi", true, true, false),
+            Route::Rpc(Some(DeliverAs::Steer))
+        );
+        assert_eq!(
+            route("hi", true, true, true),
+            Route::Rpc(Some(DeliverAs::FollowUp))
+        );
+        assert_eq!(route("hi", false, false, false), Route::Terminal);
+    }
+
+    #[test]
+    fn working_follows_the_socket_state_when_it_is_up() {
+        let mut panel = SessionPanel {
+            pi_state: Some(PiState {
+                busy: true,
+                ..PiState::default()
+            }),
+            ..SessionPanel::default()
+        };
+        assert!(panel.is_working());
+        panel.pi_state = Some(PiState::default());
+        assert!(!panel.is_working());
+
+        // Down: the optimistic and transcript heuristics decide.
+        panel.pi_state = None;
+        assert!(!panel.is_working());
+        panel.pending_prompt = Some("queued".to_string());
+        assert!(panel.is_working());
+    }
+
+    #[test]
+    fn the_context_chip_formats_occupancy() {
+        let usage = ContextUsage {
+            tokens: Some(86_000),
+            context_window: 1_000_000,
+            percent: Some(0.421),
+        };
+        assert_eq!(ctx_label(&usage), "ctx 42% · 86k/1M");
+        let uncounted = ContextUsage {
+            tokens: None,
+            context_window: 1_048_576,
+            percent: None,
+        };
+        assert_eq!(ctx_label(&uncounted), "ctx –/1M");
+        assert!(ctx_warns(&ContextUsage {
+            tokens: None,
+            context_window: 1,
+            percent: Some(0.82),
+        }));
+        assert!(!ctx_warns(&usage));
+    }
+
+    #[test]
+    fn the_live_turn_rides_the_list_until_the_file_catches_up() {
+        let mut panel = SessionPanel::default();
+        grouped_transcript(&mut panel);
+        panel.sync_list();
+        assert_eq!(panel.list.item_count(), 6);
+
+        // What an RpcStream update does: the overlay becomes a list entry.
+        panel.live = Some(LiveTurn {
+            items: vec![user(9, "live")],
+            ..LiveTurn::default()
+        });
+        panel.sync_list();
+        assert_eq!(panel.list.item_count(), 7);
+
+        // The stream ended but the file has not landed it yet.
+        panel.live.as_mut().expect("live").ended_at = Some(Instant::now());
+        panel.sync_list();
+        assert_eq!(panel.list.item_count(), 7);
+
+        // The delta carrying the finished turn retires the overlay.
+        panel.apply_delta(9, vec![user(9, "landed")], TranscriptMeta::default());
+        assert!(panel.live.is_none());
+        panel.sync_list();
+        assert_eq!(panel.list.item_count(), panel.rows.len());
+    }
+
+    #[test]
+    fn a_running_tool_outlives_the_linger() {
+        let ended = Instant::now() - Duration::from_secs(10);
+        let mut live = LiveTurn {
+            ended_at: Some(ended),
+            ..LiveTurn::default()
+        };
+        assert!(live_expired(&live, Instant::now()));
+        live.tool = Some(("bash".to_string(), "out".to_string()));
+        assert!(!live_expired(&live, Instant::now()));
+    }
+
+    #[test]
+    fn the_rpc_session_speaks_the_extension_protocol() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("pilus-rpc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind");
+
+        // A fake extension: hello + a busy state, then it answers the
+        // client's first write (the models request) and hangs up.
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut writer = stream.try_clone().expect("clone");
+            writer
+                .write_all(
+                    b"{\"type\":\"hello\",\"protocol\":1,\"sessionId\":\"s\",\"sessionFile\":\"/tmp/s.jsonl\",\"pid\":1}\n",
+                )
+                .expect("hello");
+            writer
+                .write_all(b"{\"type\":\"state\",\"busy\":true}\n")
+                .expect("state");
+            let mut lines = BufReader::new(stream).lines();
+            let request = lines.next().expect("line").expect("read");
+            let value: Value = serde_json::from_str(&request).expect("json");
+            assert_eq!(value["cmd"], "models");
+            writer
+                .write_all(
+                    b"{\"type\":\"response\",\"id\":\"1\",\"ok\":true,\"data\":{\"models\":[{\"provider\":\"p\",\"id\":\"m\",\"name\":\"M\",\"contextWindow\":1,\"reasoning\":false}]}}\n",
+                )
+                .expect("reply");
+        });
+
+        let (update_tx, update_rx) = std::sync::mpsc::channel::<Update>();
+        let (_command_tx, command_rx) =
+            std::sync::mpsc::channel::<RpcCommand>();
+        let commands = Mutex::new(command_rx);
+        let stop = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let conn = connect_local(&path).expect("connect");
+                rpc_session(conn, &update_tx, &commands, &stop);
+            });
+        });
+        server.join().expect("server");
+
+        let mut updates = Vec::new();
+        while let Ok(update) = update_rx.try_recv() {
+            updates.push(update);
+        }
+        assert_eq!(updates.len(), 4);
+        assert!(matches!(updates[0], Update::RpcUp));
+        assert!(matches!(updates[1], Update::RpcState(_)));
+        match &updates[2] {
+            Update::RpcResult {
+                kind: RequestKind::Models,
+                result: Ok(Some(_)),
+            } => {}
+            _ => panic!("expected a models result"),
+        }
+        assert!(matches!(updates[3], Update::RpcDown));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reopen_retires_the_previous_sessions_senders() {
+        let mut panel = SessionPanel::default();
+        let stale_update = panel.tx.clone();
+        let stale_send = panel.send_tx.clone();
+        let stale_stop = panel.stop_tx.clone();
+
+        // What `open_with` does before spawning the next session's threads.
+        panel.rotate_channels();
+
+        let delta = || {
+            Update::Delta(Box::new(Delta {
+                from: 0,
+                items: vec![user(0, "stale")],
+                meta: TranscriptMeta::default(),
+            }))
+        };
+        // The old threads' sends die with their receivers: no crossover.
+        assert!(stale_update.send(delta()).is_err());
+        assert!(stale_send.send(Ok(())).is_err());
+        assert!(stale_stop.send(Err("stale".to_string())).is_err());
+
+        // The new session's own channel still lands.
+        panel.tx.send(delta()).expect("fresh channel");
+        assert!(matches!(panel.rx.try_recv(), Ok(Update::Delta(_))));
+        assert!(panel.rx.try_recv().is_err());
     }
 }

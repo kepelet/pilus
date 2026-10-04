@@ -233,6 +233,23 @@ pub fn run() -> Result<()> {
         if let Some(view) = cell.borrow().clone() {
             cx.update(|app| {
                 view.update(app, |view, cx| {
+                    // A reported state paints the context chip and the
+                    // picker's live model, exactly as an RPC-up panel shows.
+                    view.session.pi_state = Some(pilus_session::PiState {
+                        context: Some(pilus_session::ContextUsage {
+                            tokens: Some(655_360),
+                            context_window: 1_048_576,
+                            percent: Some(0.625),
+                        }),
+                        model: Some(pilus_session::PiModel {
+                            provider: "opencode-go".to_string(),
+                            id: "muse-spark-1.3-contributor".to_string(),
+                            name: "Muse Spark 1.3 Contributor".to_string(),
+                            ..pilus_session::PiModel::default()
+                        }),
+                        thinking: Some("high".to_string()),
+                        ..pilus_session::PiState::default()
+                    });
                     view.session.toggle(4);
                     view.session.toggle_work(6);
                     view.session.toggle_group(6);

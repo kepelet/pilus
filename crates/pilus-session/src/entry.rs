@@ -114,6 +114,46 @@ pub struct ToolOutcome {
     pub is_error: bool,
 }
 
+/// The lowest item index a fold touched since the last `take_changed_from`.
+///
+/// Bookkeeping, not content: `PartialEq` is always true so two folds stay
+/// comparable item-for-item regardless of when each was last read.
+#[derive(Clone, Debug, Default)]
+struct Dirty(Option<usize>);
+
+impl PartialEq for Dirty {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Dirty {
+    /// Record `index` as a lower bound on what changed.
+    fn mark(&mut self, index: usize) {
+        self.0 = Some(self.0.map_or(index, |low| low.min(index)));
+    }
+}
+
+/// Everything in a [`Transcript`] that is not the item list. A delta update
+/// carries it even when no item changed, so a usage-only line still
+/// refreshes the composer's counters.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranscriptMeta {
+    pub header: Header,
+    /// Whether a `session` header line has been seen.
+    pub has_header: bool,
+    pub usage: Usage,
+    /// The model selected by the latest `model_change` or assistant message.
+    pub model: Option<String>,
+    /// Every model spelling seen in this session, in first-seen order, for
+    /// the composer's model picker.
+    pub models: Vec<String>,
+    /// The thinking level selected by the latest `thinking_level_change`.
+    pub thinking_level: Option<String>,
+    /// Count of entry types this build did not recognize.
+    pub unknown: usize,
+}
+
 /// A rendered conversation: the header plus flat items in file order.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Transcript {
@@ -131,6 +171,8 @@ pub struct Transcript {
     pub thinking_level: Option<String>,
     /// Count of entry types this build did not recognize.
     pub unknown: usize,
+    /// Lowest item index touched since the mark was last taken.
+    changed_from: Dirty,
 }
 
 impl Transcript {
@@ -147,6 +189,41 @@ impl Transcript {
             return false;
         };
         self.apply(&value)
+    }
+
+    /// The non-item state of the fold, for a delta update's `meta`.
+    pub fn meta(&self) -> TranscriptMeta {
+        TranscriptMeta {
+            header: self.header.clone(),
+            has_header: self.has_header,
+            usage: self.usage,
+            model: self.model.clone(),
+            models: self.models.clone(),
+            thinking_level: self.thinking_level.clone(),
+            unknown: self.unknown,
+        }
+    }
+
+    /// Adopt `meta` in place of the current non-item state.
+    pub fn set_meta(&mut self, meta: TranscriptMeta) {
+        self.header = meta.header;
+        self.has_header = meta.has_header;
+        self.usage = meta.usage;
+        self.model = meta.model;
+        self.models = meta.models;
+        self.thinking_level = meta.thinking_level;
+        self.unknown = meta.unknown;
+    }
+
+    /// The lowest item index changed since the last call, or `None` when
+    /// only metadata moved. Taking the mark resets it.
+    pub fn take_changed_from(&mut self) -> Option<usize> {
+        self.changed_from.0.take()
+    }
+
+    /// Record `index` as changed (a rewind marks 0).
+    pub(crate) fn mark_changed(&mut self, index: usize) {
+        self.changed_from.mark(index);
     }
 
     /// Fold an already-decoded entry object.
@@ -177,27 +254,27 @@ impl Transcript {
                 };
                 self.model = Some(display.clone());
                 self.track_model(display);
-                self.items.push(Item {
-                    id,
-                    timestamp,
-                    kind: ItemKind::Note {
+                self.push(
+                    &id,
+                    &timestamp,
+                    ItemKind::Note {
                         title: "model".to_string(),
                         text: self.model.clone().unwrap_or_default(),
                     },
-                });
+                );
                 true
             }
             Some("thinking_level_change") => {
                 let level = str_field(value, "thinkingLevel");
                 self.thinking_level = Some(level.clone());
-                self.items.push(Item {
-                    id,
-                    timestamp,
-                    kind: ItemKind::Note {
+                self.push(
+                    &id,
+                    &timestamp,
+                    ItemKind::Note {
                         title: "thinking".to_string(),
                         text: level,
                     },
-                });
+                );
                 true
             }
             Some("usage") => {
@@ -211,28 +288,28 @@ impl Transcript {
                 if let Some(usage) = value.get("usage") {
                     self.usage.add(usage);
                 }
-                self.items.push(Item {
-                    id,
-                    timestamp,
-                    kind: ItemKind::Note {
+                self.push(
+                    &id,
+                    &timestamp,
+                    ItemKind::Note {
                         title: "compaction".to_string(),
                         text: str_field(value, "summary"),
                     },
-                });
+                );
                 true
             }
             Some("branch_summary") => {
                 if let Some(usage) = value.get("usage") {
                     self.usage.add(usage);
                 }
-                self.items.push(Item {
-                    id,
-                    timestamp,
-                    kind: ItemKind::Note {
+                self.push(
+                    &id,
+                    &timestamp,
+                    ItemKind::Note {
                         title: "branch summary".to_string(),
                         text: str_field(value, "summary"),
                     },
-                });
+                );
                 true
             }
             Some("custom_message") => {
@@ -240,10 +317,10 @@ impl Transcript {
                     return false;
                 }
                 let title = str_field(value, "customType");
-                self.items.push(Item {
-                    id,
-                    timestamp,
-                    kind: ItemKind::Note {
+                self.push(
+                    &id,
+                    &timestamp,
+                    ItemKind::Note {
                         title: if title.is_empty() {
                             "extension".to_string()
                         } else {
@@ -251,20 +328,20 @@ impl Transcript {
                         },
                         text: content_text(value.get("content")),
                     },
-                });
+                );
                 true
             }
             Some("session_info") => {
                 let name = str_field(value, "name");
                 self.header.name = Some(name.clone());
-                self.items.push(Item {
-                    id,
-                    timestamp,
-                    kind: ItemKind::Note {
+                self.push(
+                    &id,
+                    &timestamp,
+                    ItemKind::Note {
                         title: "name".to_string(),
                         text: name,
                     },
-                });
+                );
                 true
             }
             // Structural bookkeeping with nothing to paint.
@@ -487,6 +564,7 @@ impl Transcript {
 
     /// Append one item under an entry id and timestamp.
     fn push(&mut self, id: &str, timestamp: &str, kind: ItemKind) {
+        self.changed_from.mark(self.items.len());
         self.items.push(Item {
             id: id.to_string(),
             timestamp: timestamp.to_string(),
@@ -497,21 +575,24 @@ impl Transcript {
     /// Attach a tool result to its pending call, newest first.
     ///
     /// Returns whether a call was found; results are usually written directly
-    /// after their call, so the search starts at the end.
+    /// after their call, so the search starts at the end. The attach rewrites
+    /// an item in place, so its index is marked as changed.
     fn attach_outcome(&mut self, call_id: &str, outcome: ToolOutcome) -> bool {
         if call_id.is_empty() {
             return false;
         }
-        for item in self.items.iter_mut().rev() {
-            if let ItemKind::ToolCall {
+        for index in (0..self.items.len()).rev() {
+            let ItemKind::ToolCall {
                 call_id: id,
                 outcome: slot,
                 ..
-            } = &mut item.kind
-                && id.as_str() == call_id
-                && slot.is_none()
-            {
+            } = &mut self.items[index].kind
+            else {
+                continue;
+            };
+            if id.as_str() == call_id && slot.is_none() {
                 *slot = Some(outcome);
+                self.changed_from.mark(index);
                 return true;
             }
         }

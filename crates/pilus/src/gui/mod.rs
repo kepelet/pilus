@@ -936,11 +936,14 @@ struct SectionHeader {
 
 /// The focused pi pane the session panel currently stands in for, when
 /// `pi_gui_auto` replaced its terminal with the native conversation.
+/// `session` is the daemon's latest report; `None` means pi has not
+/// reported yet and the panel waits on the extension socket instead of
+/// flashing the terminal first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PiView {
     endpoint: EndpointId,
     pane: String,
-    session: String,
+    session: Option<String>,
 }
 
 /// A requested endpoint handoff waiting for its prepared frame.
@@ -1093,6 +1096,12 @@ struct MenuPrompt {
     placeholder: &'static str,
     action: PromptAction,
 }
+
+/// How long a pilus-initiated pi pin waits for `agent.list` to confirm
+/// before falling back to the snapshot. Shorter than the optimistic picks'
+/// four seconds: a wrong panel covers more than a wrong row highlight,
+/// and a confirming snapshot lands well inside this window.
+const PI_OPTIMISTIC_WINDOW: Duration = Duration::from_secs(2);
 
 /// First automatic reconnect delay.
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
@@ -1383,6 +1392,26 @@ struct PilusView {
     /// The pi pane the session panel is pinned to, if auto-switch put one
     /// up. `None` means the card shows the terminal again.
     pi_view: Option<PiView>,
+    /// A pi pane whose waiting panel the user escaped, keyed by endpoint
+    /// and pane: the terminal stays up until the pane reports a session
+    /// or loses focus, so a pi that never reports is not pinned forever.
+    pi_released: Option<(EndpointId, String)>,
+    /// A pi pin awaiting `agent.list` confirmation, set when pilus itself
+    /// moved focus to a pane the snapshot already knew was pi — a sidebar
+    /// row or a tab holding one. The snapshot's own record stands in so the
+    /// panel opens with the click instead of a reconcile behind it.
+    pi_optimistic: Option<(PiView, Agent, Instant)>,
+    /// Agents pilus launched moments ago, before `agent.list` has listed
+    /// them; `focus_agent` checks here so a launched pi pins immediately.
+    /// Pruned on age — the snapshot takes over within a few reconciles.
+    recent_launches: Vec<(EndpointId, Agent, Instant)>,
+    /// The last focused agent per endpoint and workspace. Switching to a
+    /// workspace restores its remembered pane, so the memory predicts
+    /// which agent holds focus a reconcile before `agent.list` says so.
+    workspace_focus: HashMap<(EndpointId, String), Agent>,
+    /// The same memory per tab: a tab restores the pane it last focused,
+    /// so `(endpoint, workspace, tab)` predicts a `focus_tab` outcome.
+    tab_focus: HashMap<(EndpointId, String, u16), Agent>,
     /// Machine ids whose pi extension install already ran this window, so
     /// the SSH write happens once per machine per launch.
     pi_ext_machines: HashSet<String>,
@@ -1716,6 +1745,11 @@ impl PilusView {
             home,
             session,
             pi_view: None,
+            pi_released: None,
+            pi_optimistic: None,
+            recent_launches: Vec::new(),
+            workspace_focus: HashMap::new(),
+            tab_focus: HashMap::new(),
             pi_ext_machines: HashSet::new(),
             home_prompt,
             session_prompt,
@@ -2107,7 +2141,7 @@ impl PilusView {
                     match result {
                         Ok(()) => {
                             self.status = "opened a local terminal".to_string();
-                            self.activate_opened_endpoint(None, cx);
+                            self.activate_opened_endpoint(None, None, cx);
                         }
                         Err(error) => {
                             self.status = format!("couldn't open a local terminal: {error}");
@@ -2117,13 +2151,26 @@ impl PilusView {
                 }
                 PickerEvent::HomeLaunched { machine, result } => {
                     match result {
-                        Ok(message) => {
+                        Ok((message, launched)) => {
                             // The agent is up and focused; only now leave the
                             // composer, so no empty terminal flashes first.
                             self.home_launching = false;
                             self.home.close();
                             self.status = message;
-                            self.activate_opened_endpoint(machine, cx);
+                            // `agent.list` will not list the pane for a
+                            // reconcile or two; the launch's own record
+                            // lets `focus_agent` pin a pi right away.
+                            let target = match &machine {
+                                None => EndpointId::Local,
+                                Some(id) => EndpointId::Machine(id.clone()),
+                            };
+                            if let Some(agent) = launched {
+                                self.recent_launches
+                                    .push((target, agent.clone(), Instant::now()));
+                                self.activate_opened_endpoint(machine, Some(agent.pane), cx);
+                            } else {
+                                self.activate_opened_endpoint(machine, None, cx);
+                            }
                         }
                         // Keep the composer up so the launch can be retried.
                         Err(error) => {
@@ -3635,9 +3682,39 @@ impl PilusView {
     ///
     /// The AGENTS row highlights immediately from the optimistic pick; the
     /// feed's next `agent.list` confirms it once the daemon has focused it.
+    /// A pi row gets the same optimism for its panel: the snapshot already
+    /// says the pane is pi, so the pin need not wait on the daemon's move.
     fn focus_agent(&mut self, pane: &str) {
         self.agent_sel = Some((self.active.clone(), pane.to_string()));
         self.agent_sel_at = Instant::now();
+        let picked = self
+            .agents
+            .iter()
+            .find(|agent| agent.pane == pane && agent.agent == "pi")
+            .or_else(|| {
+                // A pane pilus just launched outruns `agent.list`: its own
+                // record stands in until the snapshot knows the pane.
+                self.recent_launches
+                    .iter()
+                    .find_map(|(endpoint, agent, _)| {
+                        (*endpoint == self.active && agent.pane == pane && agent.agent == "pi")
+                            .then_some(agent)
+                    })
+            });
+        self.pi_optimistic = picked.map(|agent| {
+            (
+                PiView {
+                    endpoint: self.active.clone(),
+                    pane: agent.pane.clone(),
+                    session: agent.session.clone(),
+                },
+                agent.clone(),
+                Instant::now(),
+            )
+        });
+        if self.pi_optimistic.is_some() {
+            self.pi_released = None;
+        }
         if let Some(feed) = self.agent_feed.as_ref() {
             feed.focus_pane(pane);
         }
@@ -3656,6 +3733,33 @@ impl PilusView {
 
     /// Focus a workspace by id, switching the daemon's active workspace.
     fn focus_workspace(&mut self, workspace_id: &str) {
+        // The workspace will restore the pane it last focused — the
+        // memory names it, so a pi there pins ahead of the snapshot like
+        // any other pilus-initiated move.
+        let remembered = self
+            .workspace_focus
+            .get(&(self.active.clone(), workspace_id.to_string()))
+            .filter(|agent| agent.agent == "pi")
+            .and_then(|remembered| {
+                self.agents
+                    .iter()
+                    .find(|agent| agent.pane == remembered.pane && agent.agent == "pi")
+                    .cloned()
+            });
+        self.pi_optimistic = remembered.map(|agent| {
+            (
+                PiView {
+                    endpoint: self.active.clone(),
+                    pane: agent.pane.clone(),
+                    session: agent.session.clone(),
+                },
+                agent,
+                Instant::now(),
+            )
+        });
+        if self.pi_optimistic.is_some() {
+            self.pi_released = None;
+        }
         self.send_active(ClientMessage::ShellWorkspaceFocus {
             workspace_id: workspace_id.to_string(),
         });
@@ -3921,9 +4025,10 @@ impl PilusView {
 
     /// The pi pane the session panel should stand in for right now.
     ///
-    /// Auto mode only: the focused agent, when it is pi and its extension
-    /// has reported a session. A pane without a report stays on the
-    /// terminal — there is no safe guess for which file it is writing.
+    /// Auto mode only: the focused agent, when it is pi. The daemon's
+    /// report is carried along as a seed but no longer gates the pin — a
+    /// pane waiting on it still gets the waiting panel instead of a beat
+    /// of terminal pi's extension will replace anyway.
     /// Pure so tests can drive it with fabricated agents.
     fn pi_view_for(agents: &[Agent], auto: bool, endpoint: &EndpointId) -> Option<(PiView, Agent)> {
         if !auto {
@@ -3933,12 +4038,11 @@ impl PilusView {
         if agent.agent != "pi" {
             return None;
         }
-        let session = agent.session.clone()?;
         Some((
             PiView {
                 endpoint: endpoint.clone(),
                 pane: agent.pane.clone(),
-                session,
+                session: agent.session.clone(),
             },
             agent.clone(),
         ))
@@ -3946,6 +4050,16 @@ impl PilusView {
 
     /// Follow the focused pi pane: pin its conversation over the terminal,
     /// or close the panel when nothing pi-shaped holds focus.
+    ///
+    /// A focused pi pins even before its extension reports — the panel
+    /// waits on the socket rather than show a beat of terminal the report
+    /// then replaces. A pilus-initiated focus (an agent row or a tab
+    /// holding a pi) pins earlier still, on the snapshot's own record,
+    /// since the daemon's move is only reported a reconcile later. While
+    /// the socket is live its session id outranks the daemon's:
+    /// `pane.report_session` produces no event, so `agent.list` can lag a
+    /// `/new` by a reconcile tick, and reopening on that stale value would
+    /// blank the session the socket already followed.
     ///
     /// Also installs the session-report extension on a machine the first
     /// time it becomes the active endpoint — the daemon's `session` field
@@ -3959,52 +4073,119 @@ impl PilusView {
                 let _ = pi_extension::install_remote(&target);
             });
         }
-        let desired = Self::pi_view_for(&self.agents, self.settings.pi_gui_auto, &self.active);
+        remember_focus(
+            &self.agents,
+            self.surface.workspaces(),
+            &self.tabs,
+            &self.active,
+            &mut self.workspace_focus,
+            &mut self.tab_focus,
+        );
+        // A launch the snapshot has adopted (or never will) leaves the list.
+        self.recent_launches.retain(|(_, agent, at)| {
+            at.elapsed() < Duration::from_secs(8)
+                && !self.agents.iter().any(|known| known.pane == agent.pane)
+        });
+        let mut desired = Self::pi_view_for(&self.agents, self.settings.pi_gui_auto, &self.active);
+        // A pilus-initiated focus pins ahead of the snapshot: the daemon
+        // has not reported the move yet, so `pi_view_for` still names the
+        // pane we came from — or nothing. A snapshot showing the picked
+        // pane focused takes over (it produces the same `PiView`, so the
+        // panel never reopens); the window bounds a pick the daemon
+        // never confirms.
+        if self.settings.pi_gui_auto
+            && let Some((view, agent)) =
+                optimistic_pick(&self.agents, &self.active, &mut self.pi_optimistic)
+        {
+            desired = Some((view, agent));
+        }
+        // A waiting panel the user escaped stays released until the pane
+        // reports a session or loses focus; reopening it every tick would
+        // be the terminal flash all over again.
+        if let Some(key) = self.pi_released.clone() {
+            match &desired {
+                Some((view, _))
+                    if view.endpoint == key.0 && view.pane == key.1 && view.session.is_none() =>
+                {
+                    return false;
+                }
+                _ => self.pi_released = None,
+            }
+        }
         let view = desired.as_ref().map(|(view, _)| view.clone());
         if view == self.pi_view {
+            // A waiting panel that got closed by hand is a release, not a
+            // state change: remember it so the next tick does not reopen.
+            if let Some(view) = &self.pi_view
+                && view.session.is_none()
+                && !self.session.is_open()
+            {
+                self.pi_released = Some((view.endpoint.clone(), view.pane.clone()));
+            }
             return false;
         }
         match desired {
             Some((view, agent)) => {
                 let title = agent.label().to_string();
-                match &self.active {
-                    EndpointId::Local => self.session.open_local_session(
-                        self.api_socket(),
-                        expand_local(&agent.cwd),
-                        view.session.clone(),
-                        title,
-                        view.pane.clone(),
-                        cx,
-                    ),
-                    EndpointId::Machine(id) => {
-                        let Some(target) = self.machine_target_by_key(id) else {
-                            // The pane is real but the machine has no SSH
-                            // profile: nothing can read its session, so the
-                            // terminal stays up.
-                            let was_open = self.pi_view.take().is_some();
-                            if was_open {
-                                self.session.close();
-                            }
-                            return was_open;
-                        };
-                        self.session.open_remote_session(
-                            target,
-                            self.expand_cwd(id, &agent.cwd),
-                            view.session.clone(),
+                let same_pane = self
+                    .pi_view
+                    .as_ref()
+                    .is_some_and(|old| old.endpoint == view.endpoint && old.pane == view.pane);
+                // The extension socket learns the pane's session before
+                // the daemon's report catches up; while it is live its
+                // word stands.
+                let live = (same_pane && self.session.rpc_live())
+                    .then(|| self.session.live_session())
+                    .flatten();
+                let want = live.or_else(|| view.session.clone());
+                let already = same_pane && want == self.session.live_session();
+                if !already {
+                    match &self.active {
+                        EndpointId::Local => self.session.open_local_session(
+                            self.api_socket(),
+                            expand_local(&agent.cwd),
+                            want.clone(),
                             title,
                             view.pane.clone(),
                             cx,
-                        );
+                        ),
+                        EndpointId::Machine(id) => {
+                            let Some(target) = self.machine_target_by_key(id) else {
+                                // The pane is real but the machine has no
+                                // SSH profile: nothing can read its
+                                // session, so the terminal stays up.
+                                let was_open = self.pi_view.take().is_some();
+                                if was_open {
+                                    self.session.close();
+                                }
+                                return was_open;
+                            };
+                            self.session.open_remote_session(
+                                target,
+                                self.expand_cwd(id, &agent.cwd),
+                                want.clone(),
+                                title,
+                                view.pane.clone(),
+                                cx,
+                            );
+                        }
                     }
                 }
-                self.session.set_pinned(true);
+                // Only a known session pins: a waiting panel stays
+                // escapable so a pi that never reports is not a locked
+                // card.
+                self.session.set_pinned(want.is_some());
+                self.pi_view = Some(PiView {
+                    session: want,
+                    ..view
+                });
             }
             None => {
                 self.session.close();
                 self.session.set_pinned(false);
+                self.pi_view = None;
             }
         }
-        self.pi_view = view;
         true
     }
 
@@ -4059,7 +4240,7 @@ impl PilusView {
                 self.session.open_local_session(
                     self.api_socket(),
                     expand_local(&agent.cwd),
-                    session_id,
+                    Some(session_id),
                     agent.label().to_string(),
                     agent.pane.clone(),
                     cx,
@@ -4075,7 +4256,7 @@ impl PilusView {
                 self.session.open_remote_session(
                     target,
                     cwd,
-                    session_id,
+                    Some(session_id),
                     agent.label().to_string(),
                     agent.pane.clone(),
                     cx,
@@ -4973,14 +5154,17 @@ impl PilusView {
     /// Opening happens on the owning daemon, which may not own the visible
     /// surface; without the handoff the click looks like a no-op until the
     /// user manually switches to that machine.
-    fn activate_opened_endpoint(&mut self, machine: Option<String>, cx: &mut Context<Self>) {
+    fn activate_opened_endpoint(
+        &mut self,
+        machine: Option<String>,
+        pane: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let target = match machine {
             None => EndpointId::Local,
             Some(id) => EndpointId::Machine(id),
         };
-        if target != self.active {
-            self.activate_endpoint(target, None, None, cx);
-        }
+        self.activate_endpoint(target, None, pane, cx);
     }
 
     /// Route a keystroke to the open Settings page.
@@ -5672,7 +5856,11 @@ impl PilusView {
                     .items_center()
                     .justify_between()
                     .px_3()
-                    .child(style::section_label(theme, "PI SESSIONS", self.section_font()))
+                    .child(style::section_label(
+                        theme,
+                        "PI SESSIONS",
+                        self.section_font(),
+                    ))
                     .child(toggle),
             )
             .child(
@@ -8197,6 +8385,42 @@ impl PilusView {
         }
         self.tab_sel = Some(index);
         self.tab_sel_at = Instant::now();
+        // The tab restores the pane it last focused — the memory names it,
+        // so a pi there pins ahead of the snapshot like an agent row does.
+        // The live `agents` list re-validates it, so a pi that exited
+        // since cannot pin.
+        let workspace = self
+            .surface
+            .workspaces()
+            .iter()
+            .find(|workspace| workspace.active)
+            .map(|workspace| workspace.id.clone());
+        self.pi_optimistic = workspace
+            .and_then(|workspace| {
+                self.tab_focus
+                    .get(&(self.active.clone(), workspace, index))
+                    .filter(|agent| agent.agent == "pi")
+                    .and_then(|remembered| {
+                        self.agents
+                            .iter()
+                            .find(|agent| agent.pane == remembered.pane && agent.agent == "pi")
+                            .cloned()
+                    })
+            })
+            .map(|agent| {
+                (
+                    PiView {
+                        endpoint: self.active.clone(),
+                        pane: agent.pane.clone(),
+                        session: agent.session.clone(),
+                    },
+                    agent,
+                    Instant::now(),
+                )
+            });
+        if self.pi_optimistic.is_some() {
+            self.pi_released = None;
+        }
         if let Some(feed) = self.agent_feed.as_ref() {
             feed.focus_tab(index);
         }
@@ -11661,6 +11885,62 @@ fn status_label(status: &str) -> String {
     }
 }
 
+/// Record the snapshot's focused agent under its workspace and tab so a
+/// pilus-initiated `focus_workspace`/`focus_tab` can predict the pane the
+/// daemon restores, a reconcile before `agent.list` reports it. A group
+/// whose focused pane is a plain shell flags no agent, so its memory
+/// clears — the daemon restores that shell, not a stale pick.
+fn remember_focus(
+    agents: &[Agent],
+    workspaces: &[ShellWorkspace],
+    tabs: &[Tab],
+    active: &EndpointId,
+    workspace_focus: &mut HashMap<(EndpointId, String), Agent>,
+    tab_focus: &mut HashMap<(EndpointId, String, u16), Agent>,
+) {
+    if let Some(agent) = agents.iter().find(|agent| agent.focused) {
+        workspace_focus.insert((active.clone(), agent.workspace_id.clone()), agent.clone());
+        tab_focus.insert(
+            (active.clone(), agent.workspace_id.clone(), agent.tab),
+            agent.clone(),
+        );
+        return;
+    }
+    let Some(workspace) = workspaces
+        .iter()
+        .find(|workspace| workspace.active)
+        .map(|workspace| workspace.id.clone())
+    else {
+        return;
+    };
+    workspace_focus.remove(&(active.clone(), workspace.clone()));
+    if let Some(tab) = tabs.iter().find(|tab| tab.active) {
+        tab_focus.remove(&(active.clone(), workspace, tab.index));
+    }
+}
+
+/// The pending pilus-initiated pi pick, while it still stands: dropped
+/// once the snapshot shows its pane focused, once the active endpoint
+/// moves away (its pane id could collide there), or once its window
+/// lapses — the daemon may never confirm a guess that was wrong.
+fn optimistic_pick(
+    agents: &[Agent],
+    active: &EndpointId,
+    optimistic: &mut Option<(PiView, Agent, Instant)>,
+) -> Option<(PiView, Agent)> {
+    let (view, agent, at) = optimistic.as_ref()?;
+    let confirmed = view.endpoint == *active
+        && agents
+            .iter()
+            .find(|agent| agent.focused)
+            .is_some_and(|agent| agent.pane == view.pane);
+    if confirmed || view.endpoint != *active || at.elapsed() >= PI_OPTIMISTIC_WINDOW {
+        *optimistic = None;
+        return None;
+    }
+    Some((view.clone(), agent.clone()))
+}
+
 /// Whether a daemon's reported sidebars match the window's layout, ignoring
 /// the `agents` dock the window strips before sending.
 fn adopts_layout(
@@ -11696,7 +11976,7 @@ fn launch_home_agent(
     name: &str,
     agent: &str,
     prompt: &str,
-) -> Result<String, String> {
+) -> Result<(String, Option<Agent>), String> {
     client
         .open_workspace(location)
         .map_err(|error| error.to_string())?;
@@ -11717,7 +11997,16 @@ fn launch_home_agent(
     client
         .prompt_agent(target, prompt)
         .map_err(|error| error.to_string())?;
-    Ok(format!("started {agent} as {name}"))
+    // The pane is known before `agent.list` lists the agent: a record made
+    // now lets the pin follow the launch instead of waiting a reconcile.
+    let launched = pane.map(|pane| Agent {
+        pane,
+        agent: agent.to_string(),
+        name: name.to_string(),
+        cwd: location.to_string(),
+        ..Agent::default()
+    });
+    Ok((format!("started {agent} as {name}"), launched))
 }
 
 #[cfg(test)]
@@ -11743,16 +12032,14 @@ mod tests {
     }
 
     #[test]
-    fn pi_view_needs_auto_mode_and_a_reported_session() {
+    fn pi_view_needs_auto_mode_and_a_focused_pi() {
         let endpoint = EndpointId::Local;
         let focused = vec![agent("pi", true, Some("s1"))];
         // Auto off always declines, even with a live report in front.
         assert_eq!(PilusView::pi_view_for(&focused, false, &endpoint), None);
-        // A non-pi pane or a pi pane that has not reported stays terminal.
+        // A non-pi pane stays terminal.
         let non_pi = vec![agent("claude", true, Some("s1"))];
         assert_eq!(PilusView::pi_view_for(&non_pi, true, &endpoint), None);
-        let unreported = vec![agent("pi", true, None)];
-        assert_eq!(PilusView::pi_view_for(&unreported, true, &endpoint), None);
         // An unfocused pi is nobody's foreground.
         let background = vec![agent("pi", false, Some("s1"))];
         assert_eq!(PilusView::pi_view_for(&background, true, &endpoint), None);
@@ -11766,8 +12053,139 @@ mod tests {
             panic!("a focused, reporting pi must be chosen");
         };
         assert_eq!(view.pane, "7");
-        assert_eq!(view.session, "s1");
+        assert_eq!(view.session.as_deref(), Some("s1"));
         assert_eq!(view.endpoint, endpoint);
+    }
+
+    #[test]
+    fn pi_view_pins_a_pi_that_has_not_reported() {
+        // A focused pi without a report still pins: the waiting panel is
+        // what keeps the terminal from flashing before the report lands.
+        let endpoint = EndpointId::Local;
+        let agents = vec![agent("pi", true, None)];
+        let Some((view, _)) = PilusView::pi_view_for(&agents, true, &endpoint) else {
+            panic!("a focused pi pins even without a session");
+        };
+        assert_eq!(view.pane, "7");
+        assert_eq!(view.session, None);
+    }
+
+    fn workspace(id: &str, active: bool) -> ShellWorkspace {
+        ShellWorkspace {
+            dot: String::new(),
+            dot_color: 0,
+            id: id.to_string(),
+            index: 0,
+            name: String::new(),
+            cwd: String::new(),
+            branch: None,
+            active,
+            selected: false,
+            nested: false,
+        }
+    }
+
+    #[test]
+    fn focus_memory_records_workspace_and_tab() {
+        let endpoint = EndpointId::Local;
+        let mut workspaces = HashMap::new();
+        let mut tabs = HashMap::new();
+        let mut pi = agent("pi", true, Some("s1"));
+        pi.workspace_id = "w1".to_string();
+        pi.tab = 2;
+        remember_focus(
+            &[pi.clone()],
+            &[],
+            &[],
+            &endpoint,
+            &mut workspaces,
+            &mut tabs,
+        );
+        assert_eq!(
+            workspaces.get(&(endpoint.clone(), "w1".to_string())),
+            Some(&pi)
+        );
+        assert_eq!(tabs.get(&(endpoint, "w1".to_string(), 2)), Some(&pi));
+    }
+
+    #[test]
+    fn focus_memory_clears_a_group_focused_on_a_shell() {
+        let endpoint = EndpointId::Local;
+        let mut workspaces = HashMap::new();
+        let mut tabs = HashMap::new();
+        let mut pi = agent("pi", false, None);
+        pi.workspace_id = "w1".to_string();
+        pi.tab = 2;
+        workspaces.insert((endpoint.clone(), "w1".to_string()), pi.clone());
+        tabs.insert((endpoint.clone(), "w1".to_string(), 2), pi.clone());
+        // An unfocused agent means the active group's focused pane is a
+        // shell; both memories drop their entries for it.
+        remember_focus(
+            &[pi],
+            &[workspace("w1", true)],
+            &[Tab {
+                index: 2,
+                active: true,
+                ..Tab::default()
+            }],
+            &endpoint,
+            &mut workspaces,
+            &mut tabs,
+        );
+        assert!(workspaces.is_empty());
+        assert!(tabs.is_empty());
+    }
+
+    #[test]
+    fn optimistic_pick_stands_until_the_snapshot_confirms() {
+        let endpoint = EndpointId::Local;
+        let mut pi = agent("pi", false, Some("s1"));
+        pi.workspace_id = "w1".to_string();
+        let view = PiView {
+            endpoint: endpoint.clone(),
+            pane: pi.pane.clone(),
+            session: pi.session.clone(),
+        };
+        let mut optimistic = Some((view.clone(), pi.clone(), Instant::now()));
+        // The daemon still shows another pane focused: the pick stands.
+        let mut other = agent("claude", true, None);
+        other.pane = "9".to_string();
+        let pending = vec![pi.clone(), other.clone()];
+        assert_eq!(
+            optimistic_pick(&pending, &endpoint, &mut optimistic).map(|(v, _)| v.pane),
+            Some("7".to_string())
+        );
+        // The next snapshot focuses the pick: the pin resolves and drops.
+        let confirmed = vec![agent("pi", true, Some("s1")), other];
+        assert_eq!(
+            optimistic_pick(&confirmed, &endpoint, &mut optimistic),
+            None
+        );
+        assert!(optimistic.is_none());
+    }
+
+    #[test]
+    fn optimistic_pick_drops_on_endpoint_drift_and_age() {
+        let local = EndpointId::Local;
+        let machine = EndpointId::Machine("m1".to_string());
+        let pi = agent("pi", false, None);
+        let view = PiView {
+            endpoint: local.clone(),
+            pane: pi.pane.clone(),
+            session: None,
+        };
+        // A pick made for one endpoint cannot survive a switch to another.
+        let mut optimistic = Some((view.clone(), pi.clone(), Instant::now()));
+        assert_eq!(optimistic_pick(&[], &machine, &mut optimistic), None);
+        assert!(optimistic.is_none());
+        // A pick the daemon never confirms expires with its window.
+        let mut optimistic = Some((
+            view,
+            pi,
+            Instant::now() - PI_OPTIMISTIC_WINDOW - Duration::from_secs(1),
+        ));
+        assert_eq!(optimistic_pick(&[], &local, &mut optimistic), None);
+        assert!(optimistic.is_none());
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! macOS requires before it will hand out a Metal device.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -358,6 +359,55 @@ pub fn run() -> Result<()> {
             .save(format!("{OUT}/session-picker-thinking.png"))
             .context("save session-picker-thinking")?;
         println!("shot: {OUT}/session-picker-thinking.png");
+    }
+    // The waiting panel a focused pi gets before its extension reports:
+    // the auto pin's stand-in while the socket is discovered.
+    {
+        let cell: Rc<RefCell<Option<gpui::Entity<PilusView>>>> = Rc::new(RefCell::new(None));
+        let slot = cell.clone();
+        let window = cx
+            .open_window(size(px(1240.0), px(780.0)), move |window, cx| {
+                let view = cx.new(move |cx| {
+                    PilusView::new(
+                        pilus_client::ConnectTarget::local(),
+                        None,
+                        settings(),
+                        Rc::new(RefCell::new(MachineSignal::default())),
+                        Rc::new(RefCell::new(Theme::default())),
+                        None,
+                        window,
+                        cx,
+                    )
+                });
+                *slot.borrow_mut() = Some(view.clone());
+                view
+            })
+            .context("open session-waiting")?;
+        if let Some(view) = cell.borrow().clone() {
+            cx.update(|app| {
+                view.update(app, |view, cx| {
+                    view.session.open_local_session(
+                        PathBuf::from("/tmp/pilus-shot-api.sock"),
+                        "~/work/repo".to_string(),
+                        None,
+                        "pi".to_string(),
+                        "shot-pane".to_string(),
+                        cx,
+                    );
+                    cx.notify();
+                });
+            });
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        cx.run_until_parked();
+        let image = cx
+            .capture_screenshot(window.into())
+            .context("capture session-waiting")?;
+        std::fs::create_dir_all(OUT).context("create shots dir")?;
+        image
+            .save(format!("{OUT}/session-waiting.png"))
+            .context("save session-waiting")?;
+        println!("shot: {OUT}/session-waiting.png");
     }
     Ok(())
 }

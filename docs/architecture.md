@@ -122,11 +122,43 @@ scrolls inside the field.
 A sticky composer sits below the transcript as a flex sibling, so it can never
 cover the last message (a draft is capped at half the panel and scrolls inside
 its field). Enter (the field declines it; `submit_on_enter`) sends its text
-through the endpoint's control surface as `agent.prompt`, targeting the pane
-the panel found for the active workspace; a prompt is sent on a background
-thread and the field clears only when the daemon accepts it. The panel is still
-a view of the file pi writes — the prompt's effect appears when pi appends the
-next turn.
+over the pilus pi extension's RPC socket when one is connected — prompts,
+steer/follow-up delivery, abort, `/model`, `/thinking`, and `/new` all ride
+the same newline-JSON channel — and through the endpoint's control surface
+as `agent.prompt` when it is not, typing into pi's editor the way the
+terminal would. A prompt is sent on a background thread and the field
+clears only once it is accepted. The panel is still a view of the file pi
+writes — the prompt's effect appears when pi appends the next turn.
+
+The extension's sidecar names its pane, so the panel finds the socket by
+pane rather than waiting on the daemon's `agent.session` report — which
+carries no event and can lag a reconcile tick. A socket `hello` naming a
+new session (`/new`, `/resume`, `/fork`) retargets the reader in place:
+the same mechanism fills the auto-pinned panel shown while a focused pi
+has not reported yet, where a terminal would otherwise flash first.
+
+Remote sessions additionally keep a local copy. Pi's session file is
+append-only JSONL, so the reader mirrors every chunk it fetches into
+`~/.pilus/session-cache/<endpoint>/<session-id>.jsonl` at its source
+offset — writes that stay correct even when two tails shadow the same
+source. A tiny `<id>.path` file records where the session lived, so a
+re-open resolves nothing over SSH at all: the mirrored bytes fold and
+paint before the first network call, and the live tail resumes from the
+mirrored length. A stale path hint deletes itself on the first read
+error and falls back to the real resolve; a shrunk source rewinds and
+truncates its mirror. Local sessions skip the mirror — their reads are
+already local.
+
+A focus pilus itself initiates pins earlier still: an agent row names the
+pane outright, the view keeps a memory of the pane each workspace and tab
+last focused so a workspace or tab row predicts its own restore, and a
+Home launch hands its own pane record forward so a fresh pi pins before
+`agent.list` has ever listed it. The picked pi's panel opens with the
+click — waiting state if no report yet — instead of a reconcile behind
+it, and the snapshot's focused flag confirms or expires the pick within a
+short window. Focus moves made inside the terminal (a mouse click on a
+pane, a keybinding) reach the panel through the feed's reconcile alone;
+only moves pilus makes can be pre-empted.
 
 ### One path, local and remote
 
@@ -461,7 +493,9 @@ Each enabled machine becomes one endpoint:
   own control surface. Local uses the Unix control socket; a machine reaches
   `luvus uhp proxy` through the same SSH options, one request per invocation.
   Because `uhp proxy` forwards a single request, a remote feed reconciles on a
-  short timer instead of holding an `events.subscribe` stream.
+  short timer instead of holding an `events.subscribe` stream. An active feed
+  also runs an agents-only lane every ~1.2s — one request where a full pass
+  is five — so the pi panel's pin does not wait on the snapshot tick.
 
 There is no daemon-side machine method: the window owns every SSH process, and
 two clients attached to the same local session load the same profiles without

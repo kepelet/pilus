@@ -92,7 +92,8 @@ pub struct ContextUsage {
     pub tokens: Option<u64>,
     #[serde(default)]
     pub context_window: u64,
-    /// The fraction used (0–1), when pi computed it.
+    /// Context usage as a percentage of the window (0–100), when pi
+    /// computed it; null alongside `tokens` after a compaction.
     pub percent: Option<f64>,
 }
 

@@ -7,15 +7,22 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
-    Context, Div, ElementId, Font, FontWeight, IntoElement, MouseMoveEvent, Render, Stateful, div,
-    font, prelude::*, px,
+    Animation, AnimationExt, Context, Div, ElementId, Font, FontWeight, IntoElement, Length,
+    MouseMoveEvent, Path, PathBuilder, Pixels, Point, Render, Stateful, canvas, div, font, point,
+    prelude::*, px,
 };
 
 use crate::settings::{CHROME_FONT, Settings};
 
 use super::theme::Theme;
+
+/// How long a skeleton takes to fade from dim to lit and back. Long enough to
+/// read as breathing rather than a blink, and it respects reduce motion
+/// through [`AnimationExt::with_animation`].
+const SKELETON_PULSE: Duration = Duration::from_millis(1400);
 
 /// Base chrome text: body copy, rows, and editable control values.
 pub(super) const TEXT_BODY: f32 = 13.0;
@@ -30,6 +37,8 @@ pub(super) const CONTROL_HEIGHT_SMALL: f32 = 24.0;
 /// Click/drag zones splitting a slider track, so a press lands on 5% steps
 /// without any coordinate math.
 const SLIDER_SEGMENTS: usize = 20;
+/// The context gauge's outer diameter at the default Interface size.
+pub(super) const GAUGE_SIZE: f32 = 16.0;
 
 /// Scale a design-space chrome size to the user's Interface size.
 pub(super) fn scaled(settings: &Rc<RefCell<Settings>>, design: f32) -> f32 {
@@ -220,6 +229,75 @@ pub(super) fn slider<V: Render>(
         .child(track.child(zones))
 }
 
+/// A compact donut gauge for context occupancy: a track ring with an accent
+/// arc for the used fraction. The caller pairs it with the token counts.
+///
+/// `percent` is on the 0–100 scale pi reports; `None` paints the empty track,
+/// the state before pi re-counts after a compaction. `warns` turns the arc
+/// `theme.alert`. `size` comes from [`scaled`] so the gauge follows the
+/// Interface setting.
+pub(super) fn context_gauge(
+    id: impl Into<ElementId>,
+    percent: Option<f32>,
+    warns: bool,
+    theme: Theme,
+    size: f32,
+) -> impl IntoElement {
+    use std::f32::consts::{FRAC_PI_2, TAU};
+    let fraction = percent.unwrap_or(0.0).clamp(0.0, 100.0) / 100.0;
+    let arc = if warns { theme.alert } else { theme.accent };
+    let stroke = (size / 7.0).max(1.5);
+    let radius = (size - stroke) / 2.0;
+    div().id(id).w(px(size)).h(px(size)).flex_shrink_0().child(
+        canvas(
+            move |_bounds, _window, _cx| (),
+            move |bounds, (), window, _cx| {
+                let center = point(
+                    bounds.origin.x + px(bounds.size.width.as_f32() / 2.0),
+                    bounds.origin.y + px(bounds.size.height.as_f32() / 2.0),
+                );
+                if let Some(track) = ring_arc(center, radius, -FRAC_PI_2, TAU, stroke) {
+                    window.paint_path(track, theme.border);
+                }
+                if fraction > 0.0
+                    && let Some(path) = ring_arc(center, radius, -FRAC_PI_2, TAU * fraction, stroke)
+                {
+                    window.paint_path(path, arc);
+                }
+            },
+        )
+        .size_full(),
+    )
+}
+
+/// A stroked circular arc: `sweep` radians clockwise from `start` (0 is the
+/// 3 o'clock position), or the full ring when the sweep closes the circle.
+fn ring_arc(
+    center: Point<Pixels>,
+    radius: f32,
+    start: f32,
+    sweep: f32,
+    stroke: f32,
+) -> Option<Path<Pixels>> {
+    use std::f32::consts::{PI, TAU};
+    let at = |angle: f32| {
+        point(
+            center.x + px(radius * angle.cos()),
+            center.y + px(radius * angle.sin()),
+        )
+    };
+    let radii = point(px(radius), px(radius));
+    let mut builder = PathBuilder::stroke(px(stroke));
+    builder.move_to(at(start));
+    if sweep >= TAU {
+        builder.arc_to(radii, px(0.0), false, true, at(start + PI));
+        builder.arc_to(radii, px(0.0), false, true, at(start));
+    } else {
+        builder.arc_to(radii, px(0.0), sweep > PI, true, at(start + sweep));
+    }
+    builder.build().ok()
+}
+
 /// One button at an explicit height and horizontal padding.
 fn button_at(
     id: impl Into<ElementId>,
@@ -228,7 +306,7 @@ fn button_at(
     theme: Theme,
     text_size: f32,
     height: f32,
-    padding: gpui::Pixels,
+    padding: Pixels,
 ) -> Stateful<Div> {
     let (bg, fg, border) = button_colors(kind, theme);
     let hover_bg = match kind {
@@ -277,6 +355,31 @@ fn button_colors(kind: ButtonKind, theme: Theme) -> (gpui::Rgba, gpui::Rgba, gpu
         ),
         ButtonKind::Danger => (theme.panel_dim, theme.alert, theme.border),
     }
+}
+
+/// A placeholder bar for content that has not arrived yet.
+///
+/// A surface whose real content is still loading shows one of these instead of
+/// a fallback label: the shape reserves the space the text will take, so
+/// nothing jumps when it lands. `height` follows the text it stands in for,
+/// and the width is the caller's because only the caller knows how much of
+/// the line the content will fill.
+pub(super) fn skeleton(
+    id: impl Into<ElementId>,
+    theme: Theme,
+    width: impl Into<Length> + Clone,
+    height: f32,
+) -> impl IntoElement {
+    div()
+        .w(width)
+        .h(px(height))
+        .rounded_full()
+        .bg(theme.panel_dim)
+        .with_animation(
+            id,
+            Animation::new(SKELETON_PULSE).repeat(),
+            |this, phase| this.opacity(0.55 + 0.45 * phase),
+        )
 }
 
 /// One labelled field: a small muted label above a boxed control.

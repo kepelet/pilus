@@ -392,34 +392,28 @@ fn route(text: &str, rpc_up: bool, busy: bool, alt: bool) -> Route {
     })
 }
 
-/// The context chip's text: `ctx 42% · 84k/1M`, or `ctx –/1M` while pi has
-/// not re-counted after a compaction.
-fn ctx_label(usage: &ContextUsage) -> String {
-    match usage.tokens {
-        Some(tokens) => {
-            let percent = usage
-                .percent
-                .map_or_else(
-                    || {
-                        let window = usage.context_window.max(1) as f64;
-                        tokens as f64 / window * 100.0
-                    },
-                    |percent| percent * 100.0,
-                )
-                .round();
-            format!(
-                "ctx {percent:.0}% · {}/{}",
-                fmt_count(tokens),
-                fmt_count(usage.context_window)
-            )
-        }
-        None => format!("ctx –/{}", fmt_count(usage.context_window)),
-    }
+/// Occupancy as a percentage (0–100): pi's own figure, or computed from the
+/// token count when pi has not supplied one.
+fn ctx_percent(usage: &ContextUsage) -> Option<f64> {
+    usage.percent.or_else(|| {
+        usage
+            .tokens
+            .map(|tokens| tokens as f64 / usage.context_window.max(1) as f64 * 100.0)
+    })
 }
 
-/// Whether the context chip warns: at or above 80% full.
+/// Whether the context gauge warns: at or above 80% full.
 fn ctx_warns(usage: &ContextUsage) -> bool {
-    usage.percent.unwrap_or(0.0) >= 0.8
+    ctx_percent(usage).is_some_and(|percent| percent >= 80.0)
+}
+
+/// The gauge's companion text: `421k/1M`, or `–/1M` while pi has not
+/// re-counted after a compaction.
+fn ctx_counts(usage: &ContextUsage) -> String {
+    match usage.tokens {
+        Some(tokens) => format!("{}/{}", fmt_count(tokens), fmt_count(usage.context_window)),
+        None => format!("–/{}", fmt_count(usage.context_window)),
+    }
 }
 
 /// What a transcript row is, for [`build_rows`].
@@ -2868,10 +2862,24 @@ impl SessionPanel {
             row = row.child(
                 div()
                     .pl_2()
-                    .text_size(px(fonts.label))
-                    .text_color(color)
-                    .whitespace_nowrap()
-                    .child(ctx_label(context)),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(style::context_gauge(
+                        "session-context-gauge",
+                        ctx_percent(context).map(|percent| percent as f32),
+                        ctx_warns(context),
+                        theme,
+                        style::scaled(&self.settings, style::GAUGE_SIZE),
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(fonts.label))
+                            .text_color(color)
+                            .whitespace_nowrap()
+                            .child(ctx_counts(context)),
+                    ),
             );
         }
         if let Some(stats) = usage_stats(&transcript.usage) {
@@ -5106,25 +5114,48 @@ mod tests {
     }
 
     #[test]
-    fn the_context_chip_formats_occupancy() {
+    fn the_context_gauge_tracks_occupancy() {
+        // pi reports `percent` on a 0–100 scale, not as a fraction.
         let usage = ContextUsage {
-            tokens: Some(86_000),
+            tokens: Some(421_000),
             context_window: 1_000_000,
-            percent: Some(0.421),
+            percent: Some(42.1),
         };
-        assert_eq!(ctx_label(&usage), "ctx 42% · 86k/1M");
+        assert_eq!(ctx_percent(&usage), Some(42.1));
+        assert!(!ctx_warns(&usage));
+        assert_eq!(ctx_counts(&usage), "421k/1M");
+        assert!(ctx_warns(&ContextUsage {
+            tokens: None,
+            context_window: 1,
+            percent: Some(82.0),
+        }));
+        // Nothing to show until pi re-counts after a compaction.
         let uncounted = ContextUsage {
             tokens: None,
             context_window: 1_048_576,
             percent: None,
         };
-        assert_eq!(ctx_label(&uncounted), "ctx –/1M");
-        assert!(ctx_warns(&ContextUsage {
-            tokens: None,
-            context_window: 1,
-            percent: Some(0.82),
-        }));
-        assert!(!ctx_warns(&usage));
+        assert_eq!(ctx_percent(&uncounted), None);
+        assert_eq!(ctx_counts(&uncounted), "–/1M");
+
+        // Without pi's figure the gauge computes the same percentage from
+        // the token count, and the warning follows it.
+        let computed = ContextUsage {
+            tokens: Some(900_000),
+            context_window: 1_000_000,
+            percent: None,
+        };
+        assert_eq!(ctx_percent(&computed), Some(90.0));
+        assert!(ctx_warns(&computed));
+
+        // The captured wire fixture: 7367 / 1048576 ≈ 0.7%.
+        let fixture = ContextUsage {
+            tokens: Some(7_367),
+            context_window: 1_048_576,
+            percent: Some(0.702_571_868_896_484_4),
+        };
+        assert!(!ctx_warns(&fixture));
+        assert_eq!(ctx_counts(&fixture), "7.4k/1M");
     }
 
     #[test]

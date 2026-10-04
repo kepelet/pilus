@@ -42,6 +42,17 @@ use super::theme::Theme;
 /// Lines kept in an expanded card, so a 50 KB tool dump cannot drown the
 /// window.
 const EXPANDED_LINES: usize = 400;
+/// Widest the transcript column grows. A reading measure stops improving
+/// past this, so wider windows center the column instead of stretching it.
+const TRANSCRIPT_MAX_W: f32 = 760.0;
+/// The composer runs wider than the transcript: the prompt is the page's
+/// anchor, not one entry in its column.
+const COMPOSER_MAX_W: f32 = 880.0;
+/// The jump buttons hang beside the composer, so the dock reserves that
+/// much on both sides and the panel itself stays centered in the pane.
+const JUMP_GUTTER: f32 = 38.0;
+/// Air between the panel and the buttons, so the cluster never touches it.
+const JUMP_GAP: f32 = 8.0;
 /// How often a local session is re-read.
 const LOCAL_POLL: Duration = Duration::from_millis(300);
 /// How often a remote session is re-read; every poll is an SSH round trip.
@@ -65,6 +76,21 @@ enum Toggle {
     Group(usize),
     /// A run of work between assistant replies, keyed by its first item index.
     Work(usize),
+}
+
+/// One band of the composer's dock: the reservation that keeps the panel
+/// centered in the pane, then that band's content in the panel's place.
+///
+/// The row grows rightward, so a band that is not the panel leaves the
+/// gutter to whatever shares its row.
+fn dock_slot(content: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(JUMP_GAP))
+        .child(div().w(px(JUMP_GUTTER - JUMP_GAP)).flex_shrink_0())
+        .child(div().flex_1().min_w(px(0.0)).child(content))
 }
 
 /// Which composer picker is open, if any.
@@ -498,11 +524,14 @@ impl SessionPanel {
     /// Show a composer send optimistically: the bubble, the indicator, and
     /// `Steering…` when pi is genuinely already working.
     fn set_optimistic(&mut self, text: &str) {
-        // Only steer when pi is genuinely already working: our own
-        // unanswered prompt, or file growth right now. A stale trailing work
-        // item alone means `Working`, not `Steering…`.
-        self.pending_steering =
-            self.pending_prompt.is_some() || self.awaiting_response || self.recently_active();
+        // Steering means pi is mid-turn *now*: our own prompt is still
+        // unanswered, or the transcript ends in work the file is still
+        // growing into. A merely recent file is not enough — that only says
+        // the session is alive — and a stale trailing work item (an
+        // interrupted session) is not a turn either.
+        self.pending_steering = self.pending_prompt.is_some()
+            || self.awaiting_response
+            || (self.work_in_flight() && self.recently_active());
         self.pending_prompt = Some(text.to_string());
         self.awaiting_response = true;
     }
@@ -582,6 +611,22 @@ impl SessionPanel {
     /// Absolute index of the first rendered item.
     fn window_start(&self) -> usize {
         self.transcript.items.len().saturating_sub(self.visible)
+    }
+
+    /// Scroll one absolute item into view, first widening the tail window
+    /// until it reaches that item.
+    ///
+    /// A prompt older than the window has no child to scroll to, so jumping
+    /// to it used to land on the window's first row. Growing the window is
+    /// what the background fill would have done anyway; doing it here makes
+    /// the jump land where the menu promised.
+    fn jump_to(&mut self, index: usize) {
+        let len = self.transcript.items.len();
+        if index >= len {
+            return;
+        }
+        self.visible = self.visible.max(len - index);
+        self.scroll.scroll_to_item(index - self.window_start());
     }
 
     /// Toggle one tool-call group.
@@ -1190,6 +1235,9 @@ impl SessionPanel {
             .min_h(px(0.0))
             .flex()
             .flex_col()
+            // Every row takes the full width up to the reading measure, so
+            // `items_center` centers the column instead of each row's text.
+            .items_center()
             .gap_4()
             .px_6()
             .py_6()
@@ -1244,13 +1292,25 @@ impl SessionPanel {
                 index += 1;
                 row
             };
-            list = list.child(div().flex_shrink_0().child(row));
+            list = list.child(
+                div()
+                    .w_full()
+                    .max_w(px(TRANSCRIPT_MAX_W))
+                    .flex_shrink_0()
+                    .child(row),
+            );
         }
         // The optimistic prompt rides below the transcript until pi appends
         // the real user message.
         if let Some(prompt) = &self.pending_prompt {
             let bubble = self.user_bubble(prompt, 0, fonts);
-            list = list.child(div().flex_shrink_0().child(bubble));
+            list = list.child(
+                div()
+                    .w_full()
+                    .max_w(px(TRANSCRIPT_MAX_W))
+                    .flex_shrink_0()
+                    .child(bubble),
+            );
         }
         list.into_any_element()
     }
@@ -1295,21 +1355,21 @@ impl SessionPanel {
             );
         }
         // A cap keeps a very long draft from crowding the transcript; the
-        // field scrolls internally past it. The floating jump buttons anchor
-        // to this column, above the composer.
-        let mut column = div()
-            .flex_shrink_0()
+        // field scrolls internally past it. The jump buttons ride beside the
+        // panel, top aligned with it.
+        //
+        // Each band gets its own row: a band above the panel (the working
+        // indicator) would otherwise push the buttons up with it, and they
+        // must stay on the panel's top edge.
+        let mut dock = div()
+            .w_full()
+            .max_w(px(COMPOSER_MAX_W + 2.0 * JUMP_GUTTER))
             .flex()
-            .flex_col()
-            .relative()
-            .max_h(relative(0.5))
-            .px_4()
-            .pt_1()
-            .pb_4();
+            .flex_col();
         if self.is_working() {
-            column = column.child(self.working_row(fonts));
+            dock = dock.child(dock_slot(self.working_row(fonts)));
         }
-        column = column.child(bar);
+        let mut panel_row = dock_slot(bar);
         // The prompts jumper shows whenever there is a prompt to jump to;
         // the tail arrow only while unpinned.
         let has_prompts = self
@@ -1318,9 +1378,27 @@ impl SessionPanel {
             .iter()
             .any(|item| matches!(item.kind, ItemKind::User { .. }));
         if has_prompts || self.prompts_open {
-            column = column.child(self.jump_cluster(fonts, cx));
+            panel_row = panel_row.child(self.jump_cluster(fonts, cx));
         }
-        column
+        // The dock centers in the pane, so the panel itself stays centered
+        // while the buttons hang in the gutter beside it.
+        dock = dock.child(panel_row);
+        div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .max_h(relative(0.5))
+            .px_4()
+            .pt_1()
+            .pb_4()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .justify_center()
+                    .child(dock),
+            )
     }
 
     /// Whether the scroll-to-bottom floater is needed: content overflows and
@@ -1334,8 +1412,11 @@ impl SessionPanel {
     fn send_button(&self, cx: &mut Context<PilusView>) -> Stateful<Div> {
         let theme = self.theme;
         let stopping = self.is_working();
+        // A filled square reads as "stop" at 15px where the stroked outline
+        // reads as a rounded box, so the glyph carries weight the send arrow
+        // does not need.
         let glyph: &'static [u8] = if stopping {
-            include_bytes!("../../assets/icons/square.svg")
+            include_bytes!("../../assets/icons/square-fill.svg")
         } else {
             include_bytes!("../../assets/icons/arrow-up.svg")
         };
@@ -1346,6 +1427,9 @@ impl SessionPanel {
             .justify_center()
             .w(px(30.0))
             .h(px(30.0))
+            // The solid glyph needs air inside the rim that the thin arrow
+            // could spare.
+            .p_1()
             .flex_shrink_0()
             .rounded_full()
             .bg(theme.bg)
@@ -1362,8 +1446,8 @@ impl SessionPanel {
             }))
     }
 
-    /// The floating jump cluster above the composer: the prompts menu over a
-    /// row with the prompts button and the scroll-to-bottom arrow.
+    /// The jump buttons beside the composer: the prompts menu over a row
+    /// with the prompts button and the scroll-to-bottom arrow.
     fn jump_cluster(&self, fonts: Fonts, cx: &mut Context<PilusView>) -> AnyElement {
         let theme = self.theme;
         let circle = |id: &'static str, glyph: &'static [u8]| {
@@ -1381,19 +1465,26 @@ impl SessionPanel {
                 .hover(move |style| style.bg(theme.border))
                 .child(super::icon(glyph, 15.0, theme.panel_fg))
         };
+        // A narrow column beside the panel; the menu leaves it, so opening
+        // one never widens the dock.
         let mut cluster = div()
-            .absolute()
-            .right(px(16.0))
-            .bottom(relative(1.0))
-            .pb_2()
+            .relative()
+            .w(px(30.0))
+            .flex_shrink_0()
             .flex()
             .flex_col()
-            .items_end()
-            .gap_2();
+            .items_center();
         if self.prompts_open {
-            cluster = cluster.child(self.prompts_menu(fonts, cx));
+            cluster = cluster.child(
+                div()
+                    .absolute()
+                    .bottom(relative(1.0))
+                    .right(px(0.0))
+                    .pb_2()
+                    .child(self.prompts_menu(fonts, cx)),
+            );
         }
-        let mut row = div().flex().flex_row().gap_2();
+        let mut row = div().flex().flex_col().items_center().gap_2();
         row = row.child(
             circle(
                 "session-prompts-button",
@@ -1404,6 +1495,8 @@ impl SessionPanel {
                 cx.notify();
             })),
         );
+        // The tail arrow rides below the prompts button: it is the one that
+        // brings the jumper back to where the conversation is now.
         if self.needs_jump_button() {
             row = row.child(
                 circle(
@@ -1455,9 +1548,7 @@ impl SessionPanel {
                     .child("No prompts yet"),
             );
         }
-        let start = self.window_start();
         for (index, label) in prompts {
-            let child = index.saturating_sub(start);
             list = list.child(super::picker_row(
                 ("session-prompt-option", index),
                 label,
@@ -1469,7 +1560,7 @@ impl SessionPanel {
                     this.session.prompts_dismissed = false;
                     // Leaving the tail: stop following so the jump sticks.
                     this.session.following = false;
-                    this.session.scroll.scroll_to_item(child);
+                    this.session.jump_to(index);
                     cx.notify();
                 }),
             ));
@@ -1502,16 +1593,53 @@ impl SessionPanel {
     }
 
     /// Whether pi is still working: a prompt is in flight, optimistically
-    /// shown, or still awaiting pi's first responding content — or the
-    /// transcript ends mid-work with no reply yet.
+    /// shown, still being steered, or the transcript ends mid-work with no
+    /// reply yet.
     fn is_working(&self) -> bool {
         if self.sending || self.pending_prompt.is_some() || self.awaiting_response {
             return true;
         }
+        // A steer outlives the first thing pi does about it: the indicator
+        // rides until the steered turn answers.
+        if self.pending_steering {
+            return true;
+        }
+        self.work_in_flight()
+    }
+
+    /// Whether the transcript ends mid-work: pi's last word was a tool call,
+    /// its result, or its reasoning, so a turn is running.
+    fn work_in_flight(&self) -> bool {
         self.transcript
             .items
             .last()
             .is_some_and(|item| is_work(&item.kind))
+    }
+
+    /// Whether the steered turn is over: the last thing pi wrote after it is
+    /// prose or bookkeeping, with no work still queued.
+    ///
+    /// The first tool call of a reply is not the end of the turn, so the
+    /// optimistic `awaiting_response` window — which clears on any responding
+    /// content — cannot decide this. A finished turn still *contains* tool
+    /// calls, so the tail's last entry is what settles it; notes count as the
+    /// turn ending, because a compaction or a model change is what a turn
+    /// leaves behind, never something it is still doing.
+    fn steered_turn_answered(&self) -> bool {
+        let Some(tail) = self.transcript.items.get(self.pending_from..) else {
+            return false;
+        };
+        // Entries before pi echoed the steer back belong to the turn it
+        // interrupted.
+        let after_steer = match tail
+            .iter()
+            .position(|item| matches!(item.kind, ItemKind::User { .. }))
+        {
+            Some(echo) => &tail[echo + 1..],
+            None => tail,
+        };
+        // Nothing after the steer yet: the turn is still on its way.
+        after_steer.last().is_some_and(|item| !is_work(&item.kind))
     }
 
     /// The `(spinner) Working` line above the composer, or `Steering…` when
@@ -1799,8 +1927,13 @@ impl SessionPanel {
                 });
             if responded {
                 self.awaiting_response = false;
-                self.pending_steering = false;
             }
+        }
+        // The steering label rides until pi answers the steer. Clearing it
+        // with `awaiting_response` hid it on the first tool call, while the
+        // agent was still several turns from done.
+        if self.pending_steering && self.steered_turn_answered() {
+            self.pending_steering = false;
         }
         // The first paint shows the tail window only; the pin follows live
         // turns, but reading history never yanks back down.
@@ -2475,6 +2608,187 @@ mod tests {
         // Nothing left to reveal; a second press is a no-op.
         panel.grow_earlier();
         assert_eq!(panel.window_start(), 0);
+    }
+
+    #[test]
+    fn jumping_to_an_older_prompt_widens_the_window() {
+        let mut panel = SessionPanel::default();
+        for index in 0..120 {
+            panel.transcript.items.push(Item {
+                id: index.to_string(),
+                timestamp: String::new(),
+                kind: ItemKind::User {
+                    text: format!("prompt {index}"),
+                    images: 0,
+                },
+            });
+        }
+        // The tail window holds no row for the fifth prompt, so a jump has to
+        // reveal one before it can scroll.
+        assert_eq!(panel.window_start(), 70);
+        panel.jump_to(5);
+        assert_eq!(panel.window_start(), 5);
+        // A prompt already in the window leaves the window alone.
+        panel.visible = TAIL_WINDOW;
+        panel.jump_to(119);
+        assert_eq!(panel.visible, TAIL_WINDOW);
+    }
+
+    #[test]
+    fn steering_rides_until_the_turn_answers() {
+        let mut panel = SessionPanel::default();
+        let push = |panel: &mut SessionPanel, kind: ItemKind| {
+            let id = panel.transcript.items.len().to_string();
+            panel.transcript.items.push(Item {
+                id,
+                timestamp: String::new(),
+                kind,
+            });
+        };
+        panel.pending_steering = true;
+        panel.pending_from = 0;
+        // Nothing landed after the steer yet.
+        assert!(!panel.steered_turn_answered());
+        // pi echoing the steer back is not an answer.
+        push(
+            &mut panel,
+            ItemKind::User {
+                text: "steer".to_string(),
+                images: 0,
+            },
+        );
+        push(
+            &mut panel,
+            ItemKind::Thinking {
+                text: "reconsidering".to_string(),
+            },
+        );
+        assert!(!panel.steered_turn_answered());
+        assert!(panel.is_working());
+        // Prose mid-turn still leaves tool work queued behind it.
+        push(
+            &mut panel,
+            ItemKind::Assistant {
+                text: "checking".to_string(),
+                model: None,
+            },
+        );
+        push(
+            &mut panel,
+            ItemKind::ToolCall {
+                call_id: "c1".to_string(),
+                name: "read".to_string(),
+                arguments: Value::Null,
+                outcome: None,
+            },
+        );
+        push(
+            &mut panel,
+            ItemKind::ToolResult {
+                call_id: "c1".to_string(),
+                name: "read".to_string(),
+                text: String::new(),
+                images: 0,
+                is_error: false,
+            },
+        );
+        assert!(!panel.steered_turn_answered());
+        assert!(panel.is_working());
+        // The reply the turn ends on settles it, notes and all.
+        push(
+            &mut panel,
+            ItemKind::Assistant {
+                text: "done".to_string(),
+                model: None,
+            },
+        );
+        push(
+            &mut panel,
+            ItemKind::Note {
+                title: "compaction".to_string(),
+                text: String::new(),
+            },
+        );
+        assert!(panel.steered_turn_answered());
+    }
+
+    #[test]
+    fn steering_needs_a_turn_that_is_actually_running() {
+        let mut panel = SessionPanel::default();
+        let work = |panel: &mut SessionPanel, kind: ItemKind| {
+            let id = panel.transcript.items.len().to_string();
+            panel.transcript.items.push(Item {
+                id,
+                timestamp: String::new(),
+                kind,
+            });
+        };
+        // pi mid-turn, writing as it goes: this send steers.
+        panel.last_growth = Some(Instant::now());
+        work(
+            &mut panel,
+            ItemKind::ToolCall {
+                call_id: "c1".to_string(),
+                name: "read".to_string(),
+                arguments: Value::Null,
+                outcome: None,
+            },
+        );
+        panel.set_optimistic("mid-work");
+        assert!(panel.pending_steering);
+
+        // The reply landed and the turn is over; the next send starts a turn
+        // of its own, however recently the file moved.
+        panel.transcript.items.push(Item {
+            id: "a0".to_string(),
+            timestamp: String::new(),
+            kind: ItemKind::Assistant {
+                text: "done".to_string(),
+                model: None,
+            },
+        });
+        panel.pending_prompt = None;
+        panel.awaiting_response = false;
+        panel.last_growth = Some(Instant::now());
+        panel.set_optimistic("fresh");
+        assert!(!panel.pending_steering);
+        assert!(panel.is_working(), "our own turn is still unanswered");
+
+        // A work tail the file has not touched in a while is an interrupted
+        // session, not a running turn.
+        panel.pending_prompt = None;
+        panel.awaiting_response = false;
+        panel.last_growth = None;
+        panel.set_optimistic("after a crash");
+        assert!(!panel.pending_steering);
+    }
+
+    #[test]
+    fn notes_settle_a_steer_with_no_reply() {
+        let mut panel = SessionPanel::default();
+        panel.pending_steering = true;
+        panel.pending_from = 0;
+        // Nothing landed after the steer yet: still on its way.
+        assert!(!panel.steered_turn_answered());
+        panel.transcript.items.push(Item {
+            id: "u0".to_string(),
+            timestamp: String::new(),
+            kind: ItemKind::User {
+                text: "steer".to_string(),
+                images: 0,
+            },
+        });
+        assert!(!panel.steered_turn_answered());
+        // A compaction is what a turn leaves behind, not work it is doing.
+        panel.transcript.items.push(Item {
+            id: "n0".to_string(),
+            timestamp: String::new(),
+            kind: ItemKind::Note {
+                title: "compaction".to_string(),
+                text: String::new(),
+            },
+        });
+        assert!(panel.steered_turn_answered());
     }
 
     #[test]

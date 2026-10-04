@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pilus-protocol", "crates/pilus-client", "crates/pilus", "crates/pilus-agent"]
+members = ["crates/pilus-protocol", "crates/pilus-client", "crates/pilus-session", "crates/pilus", "crates/pilus-agent"]
 resolver = "2"
 
 [workspace.package]
@@ -30,6 +30,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # tools installed. `font-kit` supplies the macOS text backend.
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = ["font-kit", "runtime_shaders"] }
 interprocess = "2"
+# Markdown parsing for the native Pi Session transcript (markdown-rs).
+markdown = "1"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSGraphics", "NSImage", "NSImageRep", "NSResponder", "NSView", "NSVisualEffectView", "NSWindow", "std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSBundle", "NSData", "NSProcessInfo", "NSString", "std"] }
@@ -44,6 +46,7 @@ unicode-width = "0.2"
 
 pilus-client = { path = "crates/pilus-client" }
 pilus-protocol = { path = "crates/pilus-protocol" }
+pilus-session = { path = "crates/pilus-session" }
 
 [profile.release]
 lto = "thin"

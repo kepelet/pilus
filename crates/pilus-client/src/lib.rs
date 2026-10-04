@@ -21,12 +21,16 @@ mod surface;
 mod transport;
 mod uhp;
 pub use agents::AgentConfig;
+pub use agents::AgentModel;
+/// Display labels for pi thinking levels (`high` to `High`).
+pub use agents::effort_label;
 pub use autostart::{ensure_server, ensure_server_for};
 pub use connection::{ClientEvent, Connection, EndpointIdentity};
 pub use connector::{Connector, ConnectorOptions, ConnectorStatus, agent_binary};
 pub use control::{
-    Agent, AgentFeed, Appearance, AutomationSummary, BarSegment, BarWidget, ControlClient,
-    FeedScope, FeedUpdate, Tab, TaskSummary, ThemeInfo, WorktreeInfo, worktree_blockers,
+    Agent, AgentFeed, AgentSession, Appearance, AutomationSummary, BarSegment, BarWidget,
+    ControlClient, FeedScope, FeedUpdate, Tab, TaskSummary, ThemeInfo, WorktreeInfo,
+    worktree_blockers,
 };
 pub use discovery::{
     HOME_ENV, PILUS_HOME_ENV, SessionInfo, active_session, api_socket_path_for,

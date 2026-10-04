@@ -6,7 +6,9 @@
 //! fenced code blocks, lists, block quotes, tables, and rules.
 //!
 //! Inline styling rides one [`Text`] per paragraph, so wrapping stays natural;
-//! each run carries its own font and color.
+//! each run carries its own font and color. A paragraph with inline code lays
+//! out as a wrapping row instead, so each code span can wear a padded, rounded
+//! chip that a text run's flat background cannot draw.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -58,29 +60,42 @@ struct Style {
     link: bool,
 }
 
-/// Builds a paragraph's text and its runs in one pass.
+/// One atom of a paragraph: prose that flows as text, or an inline code span
+/// that needs its own padded, rounded chip.
+enum Atom {
+    Prose {
+        text: String,
+        runs: Vec<TextRun>,
+    },
+    /// An inline code span, carrying any punctuation that abuts it so a wrap
+    /// cannot strand that punctuation at the start of the next line.
+    Code {
+        value: String,
+        trailing: String,
+    },
+}
+
+/// Builds a paragraph's atoms in one pass.
 struct Inline<'a> {
+    atoms: Vec<Atom>,
     text: String,
     runs: Vec<TextRun>,
     chrome: &'a str,
-    mono: &'a str,
     fg: Hsla,
     accent: Hsla,
     muted: Hsla,
-    code_bg: Hsla,
 }
 
 impl<'a> Inline<'a> {
-    fn new(chrome: &'a str, mono: &'a str, theme: Theme, code_bg: Hsla) -> Self {
+    fn new(chrome: &'a str, theme: Theme) -> Self {
         Self {
+            atoms: Vec::new(),
             text: String::new(),
             runs: Vec::new(),
             chrome,
-            mono,
             fg: theme.fg.into(),
             accent: theme.accent.into(),
             muted: theme.muted.into(),
-            code_bg,
         }
     }
 
@@ -89,9 +104,17 @@ impl<'a> Inline<'a> {
         if value.is_empty() {
             return;
         }
-        let mut face = font(if style.code { self.mono } else { self.chrome });
-        // Inline code reads through its face and tint, not its weight; bold
-        // mono at body size looks heavier than the prose around it.
+        // Inline code becomes its own atom: its chip is padded and rounded,
+        // which a text run's flat background cannot draw.
+        if style.code {
+            self.flush();
+            self.atoms.push(Atom::Code {
+                value: value.to_string(),
+                trailing: String::new(),
+            });
+            return;
+        }
+        let mut face = font(self.chrome);
         face.weight = if style.bold {
             FontWeight::BOLD
         } else {
@@ -113,11 +136,34 @@ impl<'a> Inline<'a> {
             len: value.len(),
             font: face,
             color,
-            background_color: style.code.then_some(self.code_bg),
+            background_color: None,
             underline: None,
             strikethrough: None,
         });
         self.text.push_str(value);
+    }
+
+    /// Close the prose run in progress, if any.
+    fn flush(&mut self) {
+        if self.text.is_empty() {
+            return;
+        }
+        let mut text = std::mem::take(&mut self.text);
+        let mut runs = std::mem::take(&mut self.runs);
+        // Prose that abuts the previous chip — its punctuation and the space
+        // after it — is glued to that chip, so a wrap cannot strand a comma
+        // at the start of the next line or leave a leading space on it.
+        if let Some(Atom::Code { trailing, .. }) = self.atoms.last_mut() {
+            let glued = glued_prefix_len(&text);
+            if glued > 0 {
+                trailing.push_str(&text[..glued]);
+                text = text[glued..].to_string();
+                runs = drop_runs(runs, glued);
+            }
+        }
+        if !text.is_empty() {
+            self.atoms.push(Atom::Prose { text, runs });
+        }
     }
 
     /// Walk one inline node, threading `style` into its children.
@@ -197,10 +243,38 @@ impl<'a> Inline<'a> {
         }
     }
 
-    /// The styled text, once every child has been folded in.
-    fn element(self) -> StyledText {
-        StyledText::new(self.text).with_runs(self.runs)
+    /// The atoms, once every child has been folded in.
+    fn into_atoms(mut self) -> Vec<Atom> {
+        self.flush();
+        self.atoms
     }
+}
+
+/// How many leading bytes of `text` glue to a preceding chip: the run up to
+/// the first whitespace, plus that whitespace, so the chip keeps the spacing.
+fn glued_prefix_len(text: &str) -> usize {
+    let end = text.find(char::is_whitespace).unwrap_or(text.len());
+    match text[end..].chars().next() {
+        Some(space) => end + space.len_utf8(),
+        None => end,
+    }
+}
+
+/// Drop the runs covering the first `at` bytes of `text`, trimming a run that
+/// straddles the boundary.
+fn drop_runs(mut runs: Vec<TextRun>, at: usize) -> Vec<TextRun> {
+    let mut remaining = at;
+    let mut kept = Vec::new();
+    for mut run in runs.drain(..) {
+        if remaining >= run.len {
+            remaining -= run.len;
+        } else {
+            run.len -= remaining;
+            remaining = 0;
+            kept.push(run);
+        }
+    }
+    kept
 }
 
 /// Render one block node at the given base size.
@@ -377,7 +451,8 @@ fn list_item(
         .into_any_element()
 }
 
-/// A paragraph: inline runs in one wrapping [`Text`].
+/// A paragraph: inline runs in one wrapping [`Text`], or a wrapping row of
+/// prose and code chips when it contains inline code.
 fn inline(
     nodes: &[Node],
     theme: Theme,
@@ -386,18 +461,60 @@ fn inline(
     size: f32,
     weight: Option<FontWeight>,
 ) -> AnyElement {
-    let code_bg: Hsla = theme.panel_dim.into();
-    let mut builder = Inline::new(chrome, mono, theme, code_bg);
+    let mut builder = Inline::new(chrome, theme);
     builder.children(nodes, Style::default());
-    let text = builder.element();
+    let atoms = builder.into_atoms();
     let mut line = div()
         .w_full()
         .text_size(px(size))
         .text_color(theme.fg)
-        .whitespace_normal()
-        .child(text);
+        .whitespace_normal();
     if let Some(weight) = weight {
         line = line.font_weight(weight);
+    }
+    if atoms.iter().all(|atom| matches!(atom, Atom::Prose { .. })) {
+        let mut text = String::new();
+        let mut runs = Vec::new();
+        for atom in atoms {
+            if let Atom::Prose {
+                text: chunk,
+                runs: chunk_runs,
+            } = atom
+            {
+                text.push_str(&chunk);
+                runs.extend(chunk_runs);
+            }
+        }
+        line = line.child(StyledText::new(text).with_runs(runs));
+    } else {
+        let mut row = div().flex().flex_row().flex_wrap().items_baseline();
+        for atom in atoms {
+            match atom {
+                Atom::Prose { text, runs } => {
+                    row = row.child(StyledText::new(text).with_runs(runs));
+                }
+                Atom::Code { value, trailing } => {
+                    let chip = div()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(theme.panel_dim)
+                        .font_family(mono.to_string())
+                        .child(value);
+                    row = row.child(if trailing.is_empty() {
+                        chip.into_any_element()
+                    } else {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_baseline()
+                            .child(chip)
+                            .child(trailing)
+                            .into_any_element()
+                    });
+                }
+            }
+        }
+        line = line.child(row);
     }
     line.into_any_element()
 }
@@ -406,9 +523,7 @@ fn inline(
 mod tests {
     use super::*;
 
-    #[test]
-    fn inline_runs_cover_the_whole_text() {
-        let source = "**bold** and *italic* and `code` and [link](https://example.com)";
+    fn atoms(source: &str) -> Vec<Atom> {
         let root = markdown::to_mdast(source, &markdown::ParseOptions::gfm()).expect("parse");
         let Node::Root(root) = root else {
             panic!("expected root");
@@ -416,13 +531,47 @@ mod tests {
         let Node::Paragraph(paragraph) = &root.children[0] else {
             panic!("expected paragraph");
         };
-        let theme = Theme::default();
-        let mut inline = Inline::new("Chrome", "Mono", theme, theme.panel_dim.into());
+        let mut inline = Inline::new("Chrome", Theme::default());
         inline.children(&paragraph.children, Style::default());
-        // A run list that does not cover the text panics inside `StyledText`.
-        let covered: usize = inline.runs.iter().map(|run| run.len).sum();
-        assert_eq!(covered, inline.text.len());
-        assert!(inline.text.contains("bold"));
-        assert!(inline.text.contains("code"));
+        inline.into_atoms()
+    }
+
+    #[test]
+    fn inline_code_becomes_its_own_atom() {
+        let atoms = atoms("**bold** and *italic* and `code` and [link](https://example.com)");
+        assert_eq!(atoms.len(), 3);
+        // A prose atom's runs must cover its text, or `StyledText` panics.
+        for atom in &atoms {
+            if let Atom::Prose { text, runs } = atom {
+                let covered: usize = runs.iter().map(|run| run.len).sum();
+                assert_eq!(covered, text.len());
+            }
+        }
+        assert!(matches!(&atoms[0], Atom::Prose { text, .. } if text.contains("bold")));
+        assert!(matches!(
+            &atoms[1],
+            Atom::Code { value, trailing } if value == "code" && trailing == " "
+        ));
+        assert!(matches!(&atoms[2], Atom::Prose { text, .. } if text.contains("link")));
+    }
+
+    #[test]
+    fn punctuation_glues_to_the_chip() {
+        let atoms = atoms("Run `cargo test`, then read the output.");
+        assert_eq!(atoms.len(), 3);
+        assert!(matches!(&atoms[0], Atom::Prose { text, .. } if text == "Run "));
+        assert!(matches!(
+            &atoms[1],
+            Atom::Code { value, trailing } if value == "cargo test" && trailing == ", "
+        ));
+        // The space rides with the comma, so no prose atom starts with
+        // whitespace and a wrap cannot indent the continuation.
+        assert!(matches!(&atoms[2], Atom::Prose { text, .. } if text == "then read the output."));
+    }
+
+    #[test]
+    fn a_code_free_paragraph_stays_one_text() {
+        let atoms = atoms("just **bold** prose");
+        assert!(atoms.iter().all(|atom| matches!(atom, Atom::Prose { .. })));
     }
 }

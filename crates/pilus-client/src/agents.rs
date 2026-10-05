@@ -128,7 +128,7 @@ impl AgentConfig {
             && levels.iter().any(|level| level == effort)
         {
             args.push("--thinking".to_string());
-            args.push(thinking_flag(effort));
+            args.push(thinking_level(effort));
         }
         args
     }
@@ -727,8 +727,10 @@ fn sort_efforts(levels: &mut Vec<String>) {
     levels.dedup();
 }
 
-/// The flag value for a reasoning level label, the inverse of `effort_label`.
-fn thinking_flag(label: &str) -> String {
+/// The raw pi thinking level for a display label, the inverse of
+/// [`effort_label`] (`High` to `high`, `Extra High` to `xhigh`). Also the
+/// value pi's `--thinking` flag wants, since the flag speaks the raw level.
+pub fn thinking_level(label: &str) -> String {
     match label.to_ascii_lowercase().as_str() {
         "extra high" | "extra-high" | "extra_high" | "xhigh" => "xhigh".to_string(),
         "none" | "off" => "off".to_string(),

@@ -58,8 +58,12 @@ Assistant prose is rendered as Markdown (`markdown-rs` via `gui/markdown.rs`):
 headings, bold/italic/inline code, links, fenced code blocks, lists, block
 quotes, tables, and rules.
 
-The header is one borderless row: the session's first prompt on the left
-(truncated with an ellipsis), `host · cwd` on the right. Only the tail window
+The header is one borderless row: the session's first prompt on the left,
+cut to 80 characters and ellipsized to the window width. A remote pane shows
+a skeleton bar only until its reader reports — a fold, an error, or a
+confirmed empty session — so a fresh remote pane drops the skeleton instead
+of holding it forever; a local pane reads at once and never shows one. Only
+the tail window
 (the last 50 items) renders on first paint, so a huge session opens fast;
 the rest fills in behind the scenes a chunk per frame — pinned to the bottom
 while you follow the tail, or holding position when you park at the top, so
@@ -70,10 +74,16 @@ The composer is one
 rounded panel holding the input and, below it, the meta row: a model picker
 showing the catalog display name (`Muse Spark 1.3 Contributor`, falling back
 to the `provider/id` slug), a thinking-level picker showing just the level
-(`High`, via the shared `effort_label`), the token breakdown (`in • out •
-cache-hit % (cost)`), and, on the right side only, the circular arrow send
-button (Home's arrow style). The file records no context window, so none is
-shown.
+(`High`, via the shared `effort_label`), a context-occupancy donut with the
+token counts beside it, the token breakdown (`in • out • cache-hit % (cost)`),
+and, on the right side only, the circular arrow send button (Home's arrow
+style). The context readout comes from the extension socket and is hidden
+while pi reports no positive occupancy — a fresh session's zero, or the
+uncounted state after a compaction — so an empty gauge never paints. Both
+pickers read the extension socket's live report first, the
+transcript fold second, and pi's configured default from the endpoint's
+catalog last, so a fresh remote pane names the model and level pi will run
+even before its extension socket connects.
 The model picker offers every model in pi's catalog for the endpoint (loaded
 once in the background from the agent's models-store, locally or over SSH),
 plus any session model the catalog does not know; choosing one sends `/model`

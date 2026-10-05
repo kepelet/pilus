@@ -11,11 +11,29 @@ use gpui::{Keystroke, Modifiers};
 /// Returns `None` for modifier-only keystrokes, which carry no input.
 pub fn to_wire(keystroke: &Keystroke, kind: KeyEventKind) -> Option<KeyEvent> {
     let code = key_code(keystroke)?;
-    Some(KeyEvent::new_with_kind(
-        code,
-        modifiers(keystroke.modifiers),
-        kind,
-    ))
+    let mut modifiers = modifiers(keystroke.modifiers);
+    // Option already went into the glyph, so forwarding Alt as well would
+    // have the daemon send a Meta chord (`ESC` + char) instead of the text.
+    if option_composed(keystroke) {
+        modifiers.remove(KeyModifiers::ALT);
+    }
+    Some(KeyEvent::new_with_kind(code, modifiers, kind))
+}
+
+/// Whether Option produced a different character from the bare key, the way
+/// macOS types `—` for Option+Shift+- or `™` for Option+2. Named keys
+/// (`space`, `tab`, …) are excluded: their `key_char` never comes from the
+/// layout's Option level.
+fn option_composed(keystroke: &Keystroke) -> bool {
+    let mods = keystroke.modifiers;
+    mods.alt
+        && !mods.control
+        && !mods.platform
+        && keystroke.key.chars().count() == 1
+        && keystroke
+            .key_char
+            .as_deref()
+            .is_some_and(|typed| !typed.is_empty() && typed != keystroke.key)
 }
 
 fn key_code(keystroke: &Keystroke) -> Option<KeyCode> {
@@ -25,6 +43,10 @@ fn key_code(keystroke: &Keystroke) -> Option<KeyCode> {
         "escape" | "esc" => KeyCode::Esc,
         "backspace" => KeyCode::Backspace,
         "delete" | "del" => KeyCode::Delete,
+        // GPUI reports Shift+Tab as `tab` with Shift held. crossterm, and so
+        // the daemon, calls that key `BackTab` and encodes it as `CSI Z`; a
+        // shifted `Tab` would reach the pane as a plain tab.
+        "tab" if keystroke.modifiers.shift => KeyCode::BackTab,
         "tab" => KeyCode::Tab,
         "backtab" => KeyCode::BackTab,
         "up" => KeyCode::Up,
@@ -123,6 +145,55 @@ mod tests {
     fn character_uses_typed_char() {
         let event = to_wire(&stroke("s", Some("ß")), KeyEventKind::Press).expect("char");
         assert_eq!(event.code, KeyCode::Char('ß'));
+    }
+
+    #[test]
+    fn shift_tab_is_backtab() {
+        let mut shift_tab = stroke("tab", None);
+        shift_tab.modifiers.shift = true;
+        let event = to_wire(&shift_tab, KeyEventKind::Press).expect("backtab");
+        assert_eq!(event.code, KeyCode::BackTab);
+        // crossterm reports BackTab with Shift still held.
+        assert!(event.modifiers.contains(KeyModifiers::SHIFT));
+        assert_eq!(
+            to_wire(&stroke("tab", Some("\t")), KeyEventKind::Press)
+                .expect("tab")
+                .code,
+            KeyCode::Tab
+        );
+    }
+
+    #[test]
+    fn control_letters_keep_their_letter() {
+        // GPUI drops `key_char` under Control, so Ctrl+T must still name `t`.
+        let mut ctrl_t = stroke("t", None);
+        ctrl_t.modifiers.control = true;
+        let event = to_wire(&ctrl_t, KeyEventKind::Press).expect("ctrl-t");
+        assert_eq!(event.code, KeyCode::Char('t'));
+        assert!(event.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn option_composed_characters_arrive_as_text() {
+        // Option+Shift+- on a US layout: GPUI reports `_` with Alt held and
+        // the em dash as the typed character.
+        let mut em_dash = stroke("_", Some("—"));
+        em_dash.modifiers.alt = true;
+        let event = to_wire(&em_dash, KeyEventKind::Press).expect("em dash");
+        assert_eq!(event.code, KeyCode::Char('—'));
+        assert!(!event.modifiers.contains(KeyModifiers::ALT));
+
+        // Option that composes nothing stays a Meta chord.
+        let mut meta = stroke("x", Some("x"));
+        meta.modifiers.alt = true;
+        let event = to_wire(&meta, KeyEventKind::Press).expect("meta");
+        assert!(event.modifiers.contains(KeyModifiers::ALT));
+
+        // A named key keeps Alt even though its `key_char` differs.
+        let mut alt_space = stroke("space", Some(" "));
+        alt_space.modifiers.alt = true;
+        let event = to_wire(&alt_space, KeyEventKind::Press).expect("alt space");
+        assert!(event.modifiers.contains(KeyModifiers::ALT));
     }
 
     #[test]

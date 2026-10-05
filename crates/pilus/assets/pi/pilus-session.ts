@@ -1,6 +1,6 @@
 // installed by pilus; reinstalling or updating pilus overwrites this file.
 // add custom extensions beside this file instead of editing it.
-// PILUS_INTEGRATION_VERSION=4
+// PILUS_INTEGRATION_VERSION=5
 // @ts-nocheck
 //
 // Two jobs, both keyed by the session this pi process is in:
@@ -234,10 +234,11 @@ export default function (pi) {
           return;
         }
         case "abort":
+          // `busy` only clears on `agent_settled`, so a state push here
+          // would report the turn still running and undo the client's
+          // optimistic stop. The settle event pushes the honest value.
           ctx?.abort?.();
-          respond(client, id, true);
-          pushState();
-          return;
+          return respond(client, id, true);
         case "new": {
           const commands = pi.getCommands?.() ?? [];
           if (!commands.some((command) => command?.name === NEW_COMMAND)) {

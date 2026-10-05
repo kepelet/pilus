@@ -27,7 +27,7 @@ const SKELETON_PULSE: Duration = Duration::from_millis(1400);
 /// Base chrome text: body copy, rows, and editable control values.
 pub(super) const TEXT_BODY: f32 = 13.0;
 /// Headlines: the focal line of an empty state.
-pub(super) const TEXT_HEADLINE: f32 = 20.0;
+pub(super) const TEXT_HEADLINE: f32 = 22.0;
 /// Secondary text: footer, row detail, and feedback messages.
 pub(super) const TEXT_SECONDARY: f32 = 12.0;
 /// Section labels and small action text.

@@ -578,6 +578,24 @@ pub struct SessionPanel {
     /// The optimistic indicator reads `Steering…`: the prompt went out while
     /// pi was already working.
     pending_steering: bool,
+    /// Transcript length an abort settled: older trailing work is an
+    /// interrupted tail, not a running turn, so the socket-down fallback
+    /// and the steering guess ignore it. Items past it count again.
+    settled_through: usize,
+    /// When the user last interrupted the turn. While nothing has been
+    /// written since, the dock shows a `Stopped` receipt where `Working`
+    /// was; fresh growth hides it again.
+    stopped_at: Option<Instant>,
+    /// The model slug the user just picked, shown at once: the socket's
+    /// report and the file's echo confirm it, but a fresh session may have
+    /// neither yet (reconnecting socket, unwritten file) while pi already
+    /// runs on the pick.
+    picked_model: Option<String>,
+    /// The thinking level the user just picked, same optimism as above.
+    picked_thinking: Option<String>,
+    /// Transcript length when the pick went out: file truth adopted after
+    /// that point confirms (or corrects) the optimistic pick.
+    picked_from: usize,
     /// When the session file last grew. Delivery implies growth (the reader
     /// only forwards new bytes), so recency here means live work — unlike a
     /// trailing work item, which may be a stale interrupted tail.
@@ -670,6 +688,11 @@ impl Default for SessionPanel {
             prompts_dismissed: false,
             awaiting_response: false,
             pending_steering: false,
+            settled_through: 0,
+            stopped_at: None,
+            picked_model: None,
+            picked_thinking: None,
+            picked_from: 0,
             last_growth: None,
             expanded: HashSet::new(),
             groups: HashSet::new(),
@@ -878,6 +901,11 @@ impl SessionPanel {
         self.outbox.clear();
         self.awaiting_response = false;
         self.pending_steering = false;
+        self.settled_through = 0;
+        self.stopped_at = None;
+        self.picked_model = None;
+        self.picked_thinking = None;
+        self.picked_from = 0;
         self.last_growth = None;
         self.last_seen = 0;
         self.loaded = false;
@@ -1001,10 +1029,19 @@ impl SessionPanel {
         self.rows_dirty = true;
         self.changed_from = None;
         self.live = None;
+        // The outgoing session's model and thinking belong to it: a fresh
+        // `state` push names the new session's own pair, and until it
+        // lands the picker falls back to the catalog default pi will run.
+        self.pi_state = None;
         self.pending_prompt = None;
         self.pending_from = 0;
         self.awaiting_response = false;
         self.pending_steering = false;
+        self.settled_through = 0;
+        self.stopped_at = None;
+        self.picked_model = None;
+        self.picked_thinking = None;
+        self.picked_from = 0;
         self.outbox.clear();
         self.picker = None;
         self.prompts_open = false;
@@ -1140,8 +1177,14 @@ impl SessionPanel {
             changed = true;
         }
         while let Ok(result) = self.stop_rx.try_recv() {
-            if let Err(error) = result {
-                self.status = format!("couldn't stop: {error}");
+            match result {
+                // The terminal interrupt landed: same receipt as the
+                // socket path, without waiting on the file to agree.
+                Ok(()) => self.mark_stopped(),
+                Err(error) => {
+                    self.status = format!("couldn't stop: {error}");
+                    self.stopped_at = None;
+                }
             }
             changed = true;
         }
@@ -1172,6 +1215,17 @@ impl SessionPanel {
         }
         self.transcript.set_meta(meta);
         self.last_seen = self.transcript.items.len();
+        // File truth adopted after a pick confirms (or corrects) the
+        // optimistic chips; a rewind re-opens settled history.
+        if self.transcript.items.len() > self.picked_from {
+            if self.transcript.model.is_some() {
+                self.picked_model = None;
+            }
+            if self.transcript.thinking_level.is_some() {
+                self.picked_thinking = None;
+            }
+        }
+        self.settled_through = self.settled_through.min(from);
         self.loaded = true;
         self.rows_dirty = true;
         // The splice has to reach back to the earliest item the deltas
@@ -1181,8 +1235,8 @@ impl SessionPanel {
     }
 
     /// The reply to a socket command: a failed prompt drops the optimistic
-    /// bubble, the models reply refills the picker, and any refusal lands on
-    /// the status line.
+    /// bubble, the models reply refills the picker, a state reply refreshes
+    /// the pickers, and any refusal lands on the status line.
     fn rpc_result(&mut self, kind: RequestKind, result: Result<Option<Value>, String>) {
         match (kind, result) {
             (RequestKind::Prompt, Err(error)) => {
@@ -1190,6 +1244,15 @@ impl SessionPanel {
                 self.pending_prompt = None;
                 self.awaiting_response = false;
                 self.pending_steering = false;
+            }
+            (RequestKind::Abort, Err(error)) => {
+                self.status = format!("couldn't stop: {error}");
+            }
+            (RequestKind::Abort, Ok(_)) => {
+                // The optimistic `stop()` already recorded this; a repeat
+                // keeps the receipt fresh while a late `busy` push still
+                // corrects it.
+                self.mark_stopped();
             }
             (RequestKind::Models, Ok(Some(data))) => {
                 // The live reply lists the models pi can run but names no
@@ -1212,6 +1275,23 @@ impl SessionPanel {
                         }
                     })
                     .collect();
+            }
+            (RequestKind::State, Ok(Some(data))) => {
+                // The explicit refresh a fresh socket asks for after its
+                // hello: the pushed `state` event usually lands first and
+                // this just confirms it.
+                if let Ok(state) = serde_json::from_value::<PiState>(data) {
+                    self.pi_state = Some(state);
+                }
+            }
+            (RequestKind::SetModel, Err(error)) => {
+                // The pick did not take: drop its optimism, keep the error.
+                self.picked_model = None;
+                self.status = error;
+            }
+            (RequestKind::SetThinking, Err(error)) => {
+                self.picked_thinking = None;
+                self.status = error;
             }
             (_, Err(error)) => self.status = error,
             (_, Ok(_)) => {}
@@ -1303,9 +1383,11 @@ impl SessionPanel {
             Route::Rpc(deliver_as) => self.send_rpc(text, deliver_as, input, cx),
             // Slash commands reach pi's editor through the terminal and
             // leave no user bubble for the transcript to echo, so the
-            // composer shows nothing instead of a fake prompt.
+            // composer shows nothing instead of a fake prompt. A typed
+            // `/model` or `/thinking` still names the pickers at once.
             Route::Terminal if text.starts_with('/') => {
                 input.update(cx, |input, cx| input.clear(cx));
+                self.note_picked(&text);
                 self.send_text(text, false, cx);
             }
             Route::Terminal => self.send_text(text, true, cx),
@@ -1335,9 +1417,11 @@ impl SessionPanel {
 
     /// Send a picker command (`/model`, `/thinking`) without touching the
     /// composer's draft. The socket takes the typed command; the terminal
-    /// path only remains for when it is down.
+    /// path only remains for when it is down. Either way the pick shows at
+    /// once; the socket's report and the file's echo confirm it later.
     fn send_command(&mut self, command: String, cx: &mut Context<PilusView>) {
         self.close_picker(cx);
+        self.note_picked(&command);
         if self.rpc_up {
             if let Some(argument) = command.strip_prefix("/model ") {
                 let (provider, model) = argument.split_once('/').unwrap_or(("", argument));
@@ -1357,7 +1441,26 @@ impl SessionPanel {
         self.send_text(command, false, cx);
     }
 
-    /// Send `text` through the endpoint's control surface.
+    /// Remember a `/model` or `/thinking` pick so the chips name it while
+    /// the confirmation travels: on a fresh session the socket may still
+    /// be reconnecting and the file unwritten, while pi already runs on it.
+    /// File truth adopted after the pick clears it (see `apply_delta`); a
+    /// refusal clears it in `rpc_result`.
+    fn note_picked(&mut self, command: &str) {
+        if let Some(argument) = command.strip_prefix("/model ") {
+            let argument = argument.trim();
+            if !argument.is_empty() {
+                self.picked_model = Some(argument.to_string());
+                self.picked_from = self.transcript.items.len();
+            }
+        } else if let Some(level) = command.strip_prefix("/thinking ") {
+            let level = level.trim();
+            if !level.is_empty() {
+                self.picked_thinking = Some(level.to_string());
+                self.picked_from = self.transcript.items.len();
+            }
+        }
+    }
     fn send_text(&mut self, text: String, clear_input: bool, cx: &mut Context<PilusView>) {
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -1419,13 +1522,12 @@ impl SessionPanel {
     }
 
     /// Interrupt the live agent the way its own Escape key does. The
-    /// optimistic state clears at once; the transcript catches up.
+    /// optimistic state clears at once and the dock shows a `Stopped`
+    /// receipt where `Working` was; the transcript catches up.
     fn stop(&mut self, cx: &mut Context<PilusView>) {
         if self.rpc_up {
             self.send_rpc_command(RpcCommand::Abort);
-            self.pending_prompt = None;
-            self.awaiting_response = false;
-            self.pending_steering = false;
+            self.mark_stopped();
             cx.notify();
             return;
         }
@@ -1437,9 +1539,7 @@ impl SessionPanel {
             cx.notify();
             return;
         };
-        self.pending_prompt = None;
-        self.awaiting_response = false;
-        self.pending_steering = false;
+        self.mark_stopped();
         let tx = self.stop_tx.clone();
         std::thread::spawn(move || {
             let client = match &endpoint {
@@ -1452,6 +1552,23 @@ impl SessionPanel {
             let _ = tx.send(result);
         });
         cx.notify();
+    }
+
+    /// Record an interruption: the socket's `busy` clears so the send
+    /// button flips back at once, trailing work counts as settled history
+    /// rather than a running turn, and the dock shows a `Stopped` receipt
+    /// until fresh output lands. A late `busy` push still corrects this.
+    fn mark_stopped(&mut self) {
+        self.pending_prompt = None;
+        self.awaiting_response = false;
+        self.pending_steering = false;
+        if let Some(state) = &mut self.pi_state {
+            state.busy = false;
+            state.pending = false;
+        }
+        self.live = None;
+        self.settled_through = self.transcript.items.len();
+        self.stopped_at = Some(Instant::now());
     }
 
     /// Give the panel the field its open picker filters through. The view
@@ -2327,9 +2444,13 @@ impl SessionPanel {
                 )
                 .into_any_element();
         }
-        if self.transcript.items.is_empty() {
-            // An empty transcript is the normal first paint of a fresh
-            // session: pi writes its first line once it has one to write.
+        if self.shows_empty_state() {
+            return self.empty_state(fonts);
+        }
+        if self.transcript.items.is_empty() && self.pending_prompt.is_none() && self.live.is_none()
+        {
+            // A remote pane whose reader has not reported holds a blank
+            // rather than flash the placeholder before its first fold lands.
             return div().flex_1().min_h(px(0.0)).into_any_element();
         }
         // The virtualized list is a flex sibling of the composer, so the
@@ -2346,6 +2467,42 @@ impl SessionPanel {
         .pt_6()
         .pb_2()
         .into_any_element()
+    }
+
+    /// Whether the body shows the fresh-session placeholder: the reader has
+    /// reported an empty session and nothing is on its way in — no prompt
+    /// sent, no live turn. An existing session always has items, so this is
+    /// exactly the fresh/start case.
+    fn shows_empty_state(&self) -> bool {
+        self.loaded
+            && self.error.is_empty()
+            && self.transcript.items.is_empty()
+            && self.pending_prompt.is_none()
+            && self.live.is_none()
+    }
+
+    /// The fresh-session placeholder, centered in the transcript area:
+    /// nothing has been asked yet, so the headline names the next step.
+    fn empty_state(&self, fonts: Fonts) -> AnyElement {
+        let theme = self.theme;
+        div()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .px_6()
+            .text_center()
+            .child(
+                div()
+                    .text_size(px(fonts.headline))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(theme.fg)
+                    .child("What should we do?"),
+            )
+            .into_any_element()
     }
 
     /// One list entry: a transcript row wrapped to the reading measure, or
@@ -2525,6 +2682,8 @@ impl SessionPanel {
             .flex_col();
         if self.is_working() {
             dock = dock.child(dock_slot(self.working_row(fonts)));
+        } else if self.show_stopped() {
+            dock = dock.child(dock_slot(self.stopped_row(fonts)));
         }
         let mut panel_row = dock_slot(bar);
         // The prompts jumper shows whenever there is a prompt to jump to;
@@ -2749,6 +2908,11 @@ impl SessionPanel {
 
     /// Whether pi is still working: while the socket is up its `busy` is
     /// exact; the heuristics below are the fallback for when it is down.
+    ///
+    /// A trailing work item alone is not a turn: an interrupted session's
+    /// file also ends in one, so the fallback only counts it while the file
+    /// is actually growing. Otherwise opening a stopped session would paint
+    /// `Working` and the stop square forever.
     fn is_working(&self) -> bool {
         if let Some(state) = &self.pi_state {
             return state.busy;
@@ -2761,14 +2925,15 @@ impl SessionPanel {
         if self.pending_steering {
             return true;
         }
-        self.work_in_flight()
+        self.work_in_flight() && self.recently_active()
     }
 
-    /// Whether the transcript ends mid-work: pi's last word was a tool call,
-    /// its result, or its reasoning, so a turn is running.
+    /// Whether the transcript ends mid-work: pi's last word past the last
+    /// abort was a tool call, its result, or its reasoning, so a turn is
+    /// running. Work an abort settled is history, not a turn.
     fn work_in_flight(&self) -> bool {
-        self.transcript
-            .items
+        let settled = self.settled_through.min(self.transcript.items.len());
+        self.transcript.items[settled..]
             .last()
             .is_some_and(|item| is_work(&item.kind))
     }
@@ -2799,6 +2964,16 @@ impl SessionPanel {
         after_steer.last().is_some_and(|item| !is_work(&item.kind))
     }
 
+    /// Whether the dock shows the `Stopped` receipt: the user interrupted
+    /// since anything was last written, and pi is not working again. Fresh
+    /// growth hides it — the receipt covers the abort, not what follows.
+    fn show_stopped(&self) -> bool {
+        !self.is_working()
+            && self
+                .stopped_at
+                .is_some_and(|at| self.last_growth.is_none_or(|growth| growth <= at))
+    }
+
     /// The `(spinner) Working` line above the composer, or `Steering…` when
     /// the pending prompt went out while pi was already working.
     ///
@@ -2822,6 +2997,22 @@ impl SessionPanel {
             } else {
                 "Working"
             })
+    }
+
+    /// The `Stopped` receipt above the composer: the band `Working` held,
+    /// so the panel never shifts when a turn ends this way.
+    fn stopped_row(&self, fonts: Fonts) -> Div {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_1()
+            .pb_1()
+            .text_size(px(fonts.label))
+            .text_color(self.theme.muted)
+            .child("■")
+            .child("Stopped")
     }
 
     /// Model and thinking pickers, token stats, and the send arrow below the
@@ -2935,7 +3126,8 @@ impl SessionPanel {
     }
 
     /// The `provider/id` slug the model picker marks current: the
-    /// extension's report when it is up, the transcript fold while the
+    /// extension's report when it is up, the just-made pick while its
+    /// confirmation is still travelling, the transcript fold while the
     /// socket is down, else the catalog's own default so a fresh pane still
     /// names the model pi will run.
     fn current_model_slug(&self) -> String {
@@ -2950,6 +3142,9 @@ impl SessionPanel {
                 format!("{}/{}", model.provider, model.id)
             };
         }
+        if let Some(model) = self.picked_model.clone().filter(|model| !model.is_empty()) {
+            return model;
+        }
         if let Some(model) = self
             .transcript
             .model
@@ -2962,12 +3157,14 @@ impl SessionPanel {
     }
 
     /// The thinking level the picker marks current: the extension's report
-    /// when it is up, the transcript fold while the socket is down, else the
+    /// when it is up, the just-made pick while its confirmation is still
+    /// travelling, the transcript fold while the socket is down, else the
     /// catalog default so a fresh pane still names the level pi will run.
     fn current_thinking(&self) -> Option<String> {
         self.pi_state
             .as_ref()
             .and_then(|state| state.thinking.clone())
+            .or_else(|| self.picked_thinking.clone())
             .or_else(|| self.transcript.thinking_level.clone())
             .or_else(|| {
                 self.catalog_default()
@@ -3675,13 +3872,23 @@ fn rpc_session(
                     if update.send(Update::RpcUp).is_err() {
                         break 'session;
                     }
-                    // Refill the picker's catalog from the live agent.
+                    // Refill the picker's catalog from the live agent, and
+                    // ask for its state outright: a fresh socket already
+                    // pushes one, but the reply guarantees the pickers name
+                    // the new session's own model and thinking even when a
+                    // push is missed on a reconnect race.
                     next_id += 1;
                     let id = next_id.to_string();
                     if writeln!(writer, "{}", RpcCommand::Models.to_line(&id)).is_err() {
                         break 'session;
                     }
                     pending.insert(id, RequestKind::Models);
+                    next_id += 1;
+                    let id = next_id.to_string();
+                    if writeln!(writer, "{}", RpcCommand::State.to_line(&id)).is_err() {
+                        break 'session;
+                    }
+                    pending.insert(id, RequestKind::State);
                 }
                 Incoming::Event(RpcEvent::State(state)) => {
                     if update.send(Update::RpcState(state)).is_err() {
@@ -4104,6 +4311,7 @@ fn format_duration(millis: i64) -> String {
 /// The smaller muted scale for asides: thinking and structural notes.
 fn aside_fonts(fonts: Fonts) -> Fonts {
     Fonts {
+        headline: fonts.headline,
         body: fonts.secondary,
         secondary: fonts.label,
         label: fonts.label,
@@ -5394,7 +5602,7 @@ mod tests {
         let listener = UnixListener::bind(&path).expect("bind");
 
         // A fake extension: hello + a busy state, then it answers the
-        // client's first write (the models request) and hangs up.
+        // client's two hello refreshes (models, state) and hangs up.
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
             let mut writer = stream.try_clone().expect("clone");
@@ -5410,9 +5618,25 @@ mod tests {
             let request = lines.next().expect("line").expect("read");
             let value: Value = serde_json::from_str(&request).expect("json");
             assert_eq!(value["cmd"], "models");
+            let models_id = value["id"].as_str().unwrap_or("1").to_string();
+            let request = lines.next().expect("line").expect("read");
+            let value: Value = serde_json::from_str(&request).expect("json");
+            assert_eq!(value["cmd"], "state");
+            let state_id = value["id"].as_str().unwrap_or("2").to_string();
             writer
                 .write_all(
-                    b"{\"type\":\"response\",\"id\":\"1\",\"ok\":true,\"data\":{\"models\":[{\"provider\":\"p\",\"id\":\"m\",\"name\":\"M\",\"contextWindow\":1,\"reasoning\":false}]}}\n",
+                    format!(
+                        "{{\"type\":\"response\",\"id\":\"{models_id}\",\"ok\":true,\"data\":{{\"models\":[{{\"provider\":\"p\",\"id\":\"m\",\"name\":\"M\",\"contextWindow\":1,\"reasoning\":false}}]}}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .expect("reply");
+            writer
+                .write_all(
+                    format!(
+                        "{{\"type\":\"response\",\"id\":\"{state_id}\",\"ok\":true,\"data\":{{\"busy\":false}}}}\n"
+                    )
+                    .as_bytes(),
                 )
                 .expect("reply");
         });
@@ -5435,7 +5659,7 @@ mod tests {
         while let Ok(update) = update_rx.try_recv() {
             updates.push(update);
         }
-        assert_eq!(updates.len(), 5);
+        assert_eq!(updates.len(), 6);
         assert!(matches!(
             &updates[0],
             Update::SessionFollow { session_id } if session_id == "s"
@@ -5449,7 +5673,14 @@ mod tests {
             } => {}
             _ => panic!("expected a models result"),
         }
-        assert!(matches!(updates[4], Update::RpcDown));
+        match &updates[4] {
+            Update::RpcResult {
+                kind: RequestKind::State,
+                result: Ok(Some(_)),
+            } => {}
+            _ => panic!("expected a state result"),
+        }
+        assert!(matches!(updates[5], Update::RpcDown));
         assert_eq!(current, "s");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5506,7 +5737,7 @@ mod tests {
         write("other", Some("9"), "/tmp/other.sock");
         write("unkeyed", None, "/tmp/unkeyed.sock");
         let older = write("ours", Some("86"), "/tmp/ours.sock");
-        let newer = write("ours-new", Some("86"), "/tmp/ours-new.sock");
+        let _newer = write("ours-new", Some("86"), "/tmp/ours-new.sock");
         // Force the mtime race a `/new` creates: the newest sidecar wins.
         let old = std::time::SystemTime::now() - Duration::from_secs(60);
         std::fs::File::options()
@@ -5545,6 +5776,17 @@ mod tests {
         panel.reported = Some("s1".to_string());
         panel.expand_key = Some("s1".to_string());
         panel.expanded.insert(0);
+        // The outgoing session's live state must not leak into the new one:
+        // the pickers fall back to the catalog default until the fresh
+        // `state` push lands.
+        panel.pi_state = Some(PiState {
+            busy: true,
+            thinking: Some("high".to_string()),
+            ..PiState::default()
+        });
+        panel.picked_model = Some("other/flex".to_string());
+        panel.stopped_at = Some(Instant::now());
+        panel.settled_through = 1;
         push(
             &mut panel,
             ItemKind::User {
@@ -5562,6 +5804,10 @@ mod tests {
         assert_eq!(panel.epoch, epoch + 1);
         assert!(panel.transcript.items.is_empty());
         assert!(panel.expanded.is_empty());
+        assert!(panel.pi_state.is_none());
+        assert!(panel.picked_model.is_none());
+        assert!(panel.stopped_at.is_none());
+        assert_eq!(panel.settled_through, 0);
         assert_eq!(panel.expand_key.as_deref(), Some("s2"));
         // The outgoing expansion parked under its own id.
         assert!(
@@ -5592,6 +5838,185 @@ mod tests {
 
         assert_eq!(panel.reported.as_deref(), Some("s9"));
         assert!(matches!(switch_rx.try_recv(), Ok((_, id)) if id == "s9"));
+    }
+
+    #[test]
+    fn a_state_reply_refreshes_the_pickers() {
+        let mut panel = SessionPanel::default();
+        panel.rpc_result(
+            RequestKind::State,
+            Ok(Some(serde_json::json!({
+                "busy": false,
+                "thinking": "low",
+                "model": {
+                    "provider": "p",
+                    "id": "m",
+                    "name": "M",
+                },
+            }))),
+        );
+        let state = panel.pi_state.as_ref().expect("state");
+        assert!(!state.busy);
+        assert_eq!(state.thinking.as_deref(), Some("low"));
+        assert_eq!(panel.current_model_slug(), "p/m");
+        assert_eq!(panel.current_thinking().as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn an_abort_reply_clears_busy_and_names_the_failure() {
+        let mut panel = SessionPanel::default();
+        panel.pi_state = Some(PiState {
+            busy: true,
+            ..PiState::default()
+        });
+        panel.rpc_result(RequestKind::Abort, Ok(None));
+        assert!(!panel.pi_state.as_ref().expect("state").busy);
+        panel.pi_state = Some(PiState {
+            busy: true,
+            ..PiState::default()
+        });
+        panel.rpc_result(RequestKind::Abort, Err("denied".to_string()));
+        assert_eq!(panel.status, "couldn't stop: denied");
+        // The button stays up when the abort failed.
+        assert!(panel.pi_state.as_ref().expect("state").busy);
+    }
+
+    #[test]
+    fn stop_settles_the_trailing_work_and_receipts_above_the_composer() {
+        let mut panel = SessionPanel::default();
+        // Socket down, turn writing as it goes: the file's recency is what
+        // marks it live, not the trailing tool call alone.
+        panel.last_growth = Some(Instant::now());
+        push(
+            &mut panel,
+            ItemKind::ToolCall {
+                call_id: "c1".to_string(),
+                name: "read".to_string(),
+                arguments: Value::Null,
+                outcome: None,
+            },
+        );
+        assert!(panel.is_working());
+
+        panel.mark_stopped();
+        assert!(!panel.is_working(), "the button flips back to send");
+        assert!(panel.show_stopped(), "the receipt takes the Working band");
+
+        // Fresh work past the abort counts again: a failed abort re-lights.
+        push(
+            &mut panel,
+            ItemKind::ToolCall {
+                call_id: "c2".to_string(),
+                name: "read".to_string(),
+                arguments: Value::Null,
+                outcome: None,
+            },
+        );
+        assert!(panel.is_working());
+        assert!(!panel.show_stopped());
+    }
+
+    #[test]
+    fn opening_a_stopped_session_shows_send_not_stop() {
+        let mut panel = SessionPanel::default();
+        // A prior run was interrupted: the file ends mid-tool and has not
+        // grown since, and the socket has not reported yet. The stale tail
+        // must not paint `Working` or the stop square.
+        push(
+            &mut panel,
+            ItemKind::ToolCall {
+                call_id: "c1".to_string(),
+                name: "read".to_string(),
+                arguments: Value::Null,
+                outcome: None,
+            },
+        );
+        assert!(panel.last_growth.is_none());
+        assert!(!panel.is_working(), "the button is send, not stop");
+        assert!(
+            !panel.show_stopped(),
+            "no receipt for a session we did not stop"
+        );
+
+        // Once the file grows, the same tail reads as a live turn again.
+        panel.last_growth = Some(Instant::now());
+        assert!(panel.is_working());
+    }
+
+    #[test]
+    fn the_stopped_receipt_hides_once_output_lands() {
+        let mut panel = SessionPanel::default();
+        panel.mark_stopped();
+        assert!(panel.show_stopped());
+        // The aborted turn's remnant landing counts as fresh output.
+        panel.last_growth = Some(Instant::now());
+        assert!(!panel.show_stopped());
+    }
+
+    #[test]
+    fn a_pick_shows_at_once_and_file_truth_confirms_it() {
+        let mut panel = SessionPanel::default();
+        // A fresh pane: no socket report, empty transcript, catalog default.
+        let mut preferred = model("opencode-go", "muse", "Muse Spark");
+        preferred.is_default = true;
+        panel.catalog = vec![preferred];
+        assert_eq!(panel.current_model_slug(), "opencode-go/muse");
+
+        // The user picks while the socket is still reconnecting: the chips
+        // name the pick even though nothing confirms it yet.
+        panel.note_picked("/model other/flex");
+        panel.note_picked("/thinking low");
+        assert_eq!(panel.current_model_slug(), "other/flex");
+        assert_eq!(panel.current_thinking().as_deref(), Some("low"));
+
+        // The file echoing the pick adopts file truth.
+        let mut meta = TranscriptMeta::default();
+        meta.model = Some("other/flex".to_string());
+        meta.thinking_level = Some("low".to_string());
+        panel.apply_delta(0, vec![user(0, "hi")], meta);
+        assert!(panel.picked_model.is_none());
+        assert!(panel.picked_thinking.is_none());
+        assert_eq!(panel.current_model_slug(), "other/flex");
+        assert_eq!(panel.current_thinking().as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn a_fresh_session_names_the_next_step() {
+        let mut panel = SessionPanel::default();
+        // Nothing has loaded yet: hold the body blank so a remote pane does
+        // not flash the placeholder before its first fold lands.
+        assert!(!panel.shows_empty_state());
+
+        // The reader confirmed an empty session: this is the fresh case.
+        panel.loaded = true;
+        assert!(panel.shows_empty_state());
+
+        // An existing session has items, so the placeholder gives way.
+        push(
+            &mut panel,
+            ItemKind::User {
+                text: "hi".to_string(),
+                images: 0,
+            },
+        );
+        assert!(!panel.shows_empty_state());
+
+        // A fresh session with the first prompt already sent shows the
+        // optimistic bubble instead of the placeholder.
+        let mut fresh = SessionPanel {
+            loaded: true,
+            ..SessionPanel::default()
+        };
+        fresh.pending_prompt = Some("first".to_string());
+        assert!(!fresh.shows_empty_state());
+
+        // A live turn is content too, even before the file catches up.
+        let mut streaming = SessionPanel {
+            loaded: true,
+            ..SessionPanel::default()
+        };
+        streaming.live = Some(LiveTurn::default());
+        assert!(!streaming.shows_empty_state());
     }
 
     #[test]

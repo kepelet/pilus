@@ -137,11 +137,7 @@ fn picker_options(
 ) -> Vec<PickerOption> {
     let mut options: Vec<PickerOption> = Vec::new();
     for model in catalog {
-        let value = if model.provider.is_empty() {
-            model.id.clone()
-        } else {
-            format!("{}/{}", model.provider, model.id)
-        };
+        let value = model_slug(model);
         if value.is_empty() || options.iter().any(|known| known.value == value) {
             continue;
         }
@@ -169,6 +165,15 @@ fn picker_options(
         });
     }
     options
+}
+
+/// A model's `provider/id` slug, the spelling `/model` wants.
+fn model_slug(model: &AgentModel) -> String {
+    if model.provider.is_empty() {
+        model.id.clone()
+    } else {
+        format!("{}/{}", model.provider, model.id)
+    }
 }
 
 /// The rows a picker's filter keeps, as indices into `options`.
@@ -207,6 +212,10 @@ const ACTIVE_WINDOW: Duration = Duration::from_secs(90);
 /// Rows the prompts menu shows before it scrolls. It stacks its rows with
 /// a gap, so fewer of them fit than the picker’s packed list holds.
 const PROMPTS_MAX_ROWS: usize = 7;
+
+/// Characters the header keeps of the session's first prompt; the strip
+/// ellipsizes whatever overflows the window width.
+const TITLE_CHARS: usize = 80;
 
 /// How many option rows the composer picker shows: the menu's shared
 /// height budget, less its padding and, when the list is long enough to
@@ -260,6 +269,10 @@ enum RequestKind {
 /// What the reader thread sends back to the window.
 enum Update {
     Delta(Box<Delta>),
+    /// The reader resolved the session and found no file yet: a fresh pane
+    /// whose first prompt pi has not written. The header uses it to stop
+    /// holding a skeleton for a session that simply has no title.
+    Empty,
     /// The pi model catalog for the endpoint, for the model picker.
     Catalog(Vec<AgentModel>),
     /// A read or lookup failure, shown in place of the transcript.
@@ -393,13 +406,23 @@ fn route(text: &str, rpc_up: bool, busy: bool, alt: bool) -> Route {
 }
 
 /// Occupancy as a percentage (0–100): pi's own figure, or computed from the
-/// token count when pi has not supplied one.
+/// token count when pi has not supplied one. `None` when the window is
+/// unknown, so a zero never divides into a full red gauge.
 fn ctx_percent(usage: &ContextUsage) -> Option<f64> {
-    usage.percent.or_else(|| {
-        usage
-            .tokens
-            .map(|tokens| tokens as f64 / usage.context_window.max(1) as f64 * 100.0)
-    })
+    if let Some(percent) = usage.percent {
+        return Some(percent);
+    }
+    let tokens = usage.tokens?;
+    (usage.context_window > 0).then(|| tokens as f64 / usage.context_window as f64 * 100.0)
+}
+
+/// Whether the context readout is worth painting. A fresh session counts
+/// zero tokens, and pi reports no figure at all until it re-counts after a
+/// compaction; both would paint an empty gauge, so the composer hides the
+/// whole readout until there is occupancy to show. An unknown window hides it
+/// too, so a bare `0` never labels the counts.
+fn ctx_visible(usage: &ContextUsage) -> bool {
+    usage.context_window > 0 && ctx_percent(usage).is_some_and(|percent| percent > 0.0)
 }
 
 /// Whether the context gauge warns: at or above 80% full.
@@ -561,6 +584,11 @@ pub struct SessionPanel {
     last_growth: Option<Instant>,
     /// Item count at the last delivery, so growth marks the session active.
     last_seen: usize,
+    /// Whether the reader has delivered its first word for this session — a
+    /// fold, an error, or a confirmed empty file. Until then a remote header
+    /// holds a skeleton; after it, an absent first prompt is simply a fresh
+    /// session, not a load in flight.
+    loaded: bool,
     /// Earliest item index pending deltas rewrote, so `sync_list` remeasures
     /// a row an in-place change does not move the prefix diff to.
     changed_from: Option<usize>,
@@ -647,6 +675,7 @@ impl Default for SessionPanel {
             groups: HashSet::new(),
             work_open: HashSet::new(),
             last_seen: 0,
+            loaded: false,
             changed_from: None,
             cache: SessionCache::default(),
             expand_cache: HashMap::new(),
@@ -851,6 +880,7 @@ impl SessionPanel {
         self.pending_steering = false;
         self.last_growth = None;
         self.last_seen = 0;
+        self.loaded = false;
         self.target = target;
         self.endpoint = Some(endpoint.clone());
         self.reported = spec.session_id.clone();
@@ -937,6 +967,7 @@ impl SessionPanel {
         self.open = false;
         self.pinned = false;
         self.last_seen = 0;
+        self.loaded = false;
     }
 
     /// Take the session the extension socket says this pane moved to — a
@@ -979,6 +1010,7 @@ impl SessionPanel {
         self.prompts_open = false;
         self.last_growth = None;
         self.last_seen = 0;
+        self.loaded = false;
         self.error.clear();
         self.status.clear();
         self.epoch += 1;
@@ -1003,10 +1035,16 @@ impl SessionPanel {
                         self.apply_delta(delta.from, delta.items, delta.meta);
                     }
                 }
+                // The reader confirmed the session has no file yet, so there
+                // is nothing to wait for: the header drops its skeleton.
+                Update::Empty => self.loaded = true,
                 Update::Catalog(catalog) => {
                     self.catalog = catalog;
                 }
-                Update::Error(error) => self.error = error,
+                Update::Error(error) => {
+                    self.loaded = true;
+                    self.error = error;
+                }
                 Update::RpcUp => {
                     self.rpc_up = true;
                 }
@@ -1134,6 +1172,7 @@ impl SessionPanel {
         }
         self.transcript.set_meta(meta);
         self.last_seen = self.transcript.items.len();
+        self.loaded = true;
         self.rows_dirty = true;
         // The splice has to reach back to the earliest item the deltas
         // rewrote — an outcome can land on a call rows above the tail.
@@ -1153,13 +1192,24 @@ impl SessionPanel {
                 self.pending_steering = false;
             }
             (RequestKind::Models, Ok(Some(data))) => {
+                // The live reply lists the models pi can run but names no
+                // default; carry the catalog's own default flags across so the
+                // composer still falls back to them while the socket is up.
+                let previous = std::mem::take(&mut self.catalog);
                 self.catalog = models_from(&data)
                     .iter()
-                    .map(|model| AgentModel {
-                        provider: model.provider.clone(),
-                        id: model.id.clone(),
-                        name: model.name.clone(),
-                        ..AgentModel::default()
+                    .map(|model| {
+                        let known = previous
+                            .iter()
+                            .find(|old| old.provider == model.provider && old.id == model.id);
+                        AgentModel {
+                            provider: model.provider.clone(),
+                            id: model.id.clone(),
+                            name: model.name.clone(),
+                            is_default: known.is_some_and(|old| old.is_default),
+                            default_effort: known.and_then(|old| old.default_effort.clone()),
+                            ..AgentModel::default()
+                        }
                     })
                     .collect();
             }
@@ -2187,9 +2237,10 @@ impl SessionPanel {
     }
 
     /// The header strip: the session's first prompt, once it has one.
-    /// Until then a skeleton bar holds its place; a fallback label here
-    /// would name a session that does not exist yet. Model, cost, and usage
-    /// live in the composer now.
+    /// Until then a remote pane shows a skeleton bar while its first line
+    /// crosses the wire; a local pane, or a remote one whose reader has
+    /// already confirmed an empty session, collapses to nothing. Model,
+    /// cost, and usage live in the composer now.
     fn header(&self, fonts: Fonts) -> Div {
         let theme = self.theme;
         let title = match self.first_prompt() {
@@ -2204,8 +2255,16 @@ impl SessionPanel {
                 .text_ellipsis()
                 .child(prompt)
                 .into_any_element(),
-            None => style::skeleton("pilus-session-title-skeleton", theme, px(280.0), fonts.body)
-                .into_any_element(),
+            // The first line of a remote session arrives a round trip after the
+            // panel opens, so a skeleton holds its place until the reader
+            // reports one (or confirms there is none).
+            None if self.awaiting_title() => {
+                style::skeleton("pilus-session-title-skeleton", theme, px(280.0), fonts.body)
+                    .into_any_element()
+            }
+            // Nothing to wait for: a local pane reads at once, and a loaded
+            // remote pane simply has no title yet.
+            None => return div(),
         };
         div()
             .flex()
@@ -2214,6 +2273,18 @@ impl SessionPanel {
             .h(px(40.0))
             .px_4()
             .child(title)
+    }
+
+    /// Whether the session's bytes live on another machine, where every read
+    /// is a round trip behind the panel.
+    fn is_remote(&self) -> bool {
+        matches!(self.endpoint, Some(Endpoint::Remote { .. }))
+    }
+
+    /// Whether the header still waits on a first line: a remote pane whose
+    /// reader has not reported a fold, an error, or an empty session yet.
+    fn awaiting_title(&self) -> bool {
+        self.is_remote() && !self.loaded
     }
 
     /// The session's first prompt as one line, or `None` while the
@@ -2228,7 +2299,7 @@ impl SessionPanel {
                 _ => None,
             })?;
         let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        Some(truncate(&one_line, 240))
+        Some(truncate(&one_line, TITLE_CHARS))
     }
 
     /// The scrollable transcript, or the empty/error placeholder.
@@ -2790,6 +2861,7 @@ impl SessionPanel {
             .pi_state
             .as_ref()
             .and_then(|state| state.context.as_ref())
+            .filter(|context| ctx_visible(context))
         {
             let color = if ctx_warns(context) {
                 theme.alert
@@ -2850,25 +2922,22 @@ impl SessionPanel {
                 model.name.clone()
             };
         }
-        let current = self.transcript.model.clone().unwrap_or_default();
+        let current = self.current_model_slug();
         if current.is_empty() {
             return "model".to_string();
         }
         for model in &self.catalog {
-            let value = if model.provider.is_empty() {
-                model.id.clone()
-            } else {
-                format!("{}/{}", model.provider, model.id)
-            };
-            if value == current && !model.name.is_empty() {
+            if model_slug(model) == current && !model.name.is_empty() {
                 return model.name.clone();
             }
         }
         current
     }
 
-    /// The `provider/id` slug the model picker marks current, from the
-    /// extension's report when it is up.
+    /// The `provider/id` slug the model picker marks current: the
+    /// extension's report when it is up, the transcript fold while the
+    /// socket is down, else the catalog's own default so a fresh pane still
+    /// names the model pi will run.
     fn current_model_slug(&self) -> String {
         if let Some(model) = self
             .pi_state
@@ -2881,16 +2950,40 @@ impl SessionPanel {
                 format!("{}/{}", model.provider, model.id)
             };
         }
-        self.transcript.model.clone().unwrap_or_default()
+        if let Some(model) = self
+            .transcript
+            .model
+            .clone()
+            .filter(|model| !model.is_empty())
+        {
+            return model;
+        }
+        self.catalog_default().map(model_slug).unwrap_or_default()
     }
 
-    /// The thinking level the picker marks current, from the extension's
-    /// report when it is up.
+    /// The thinking level the picker marks current: the extension's report
+    /// when it is up, the transcript fold while the socket is down, else the
+    /// catalog default so a fresh pane still names the level pi will run.
     fn current_thinking(&self) -> Option<String> {
         self.pi_state
             .as_ref()
             .and_then(|state| state.thinking.clone())
             .or_else(|| self.transcript.thinking_level.clone())
+            .or_else(|| {
+                self.catalog_default()
+                    .and_then(|model| model.default_effort.as_deref())
+                    .map(pilus_client::thinking_level)
+            })
+    }
+
+    /// The model the catalog marks default, else its first row. The remote
+    /// catalog reads pi's own settings, so it names the model a fresh session
+    /// opens on even before the extension socket reports one.
+    fn catalog_default(&self) -> Option<&AgentModel> {
+        self.catalog
+            .iter()
+            .find(|model| model.is_default)
+            .or_else(|| self.catalog.first())
     }
 
     /// One picker chip, drawn with the composer face Home uses: a leading
@@ -3179,6 +3272,9 @@ fn reader_loop(
     let mut wanted = spec.session_id;
     let mut tag = tag;
     let mut opened: Option<OpenedTail> = None;
+    // Whether this session's "no file yet" has already been reported, so a
+    // fresh pane idles without re-sending the same empty note every poll.
+    let mut announced_empty = false;
     // A `false` send means the window went away: exit and park. An error
     // exits directly with nothing parked — a tail that failed is not to
     // be trusted again.
@@ -3193,6 +3289,7 @@ fn reader_loop(
                 }
                 wanted = Some(next_id);
                 tag = next_tag;
+                announced_empty = false;
             }
         }
         if stop.load(Ordering::Relaxed) {
@@ -3259,6 +3356,15 @@ fn reader_loop(
                         opened = Some(fresh);
                     }
                     Ok(None) => {
+                        // The session is known but pi has not written its file
+                        // yet: a fresh pane, not a load in flight. Tell the
+                        // panel once so its header drops the skeleton.
+                        if !announced_empty {
+                            announced_empty = true;
+                            if tx.send(Update::Empty).is_err() {
+                                park_and_exit = true;
+                            }
+                        }
                         if sleep_sliced(interval, &stop) {
                             continue;
                         }
@@ -4814,6 +4920,69 @@ mod tests {
     }
 
     #[test]
+    fn composer_falls_back_to_the_catalog_default() {
+        let mut panel = SessionPanel::default();
+        // A fresh pane with no extension socket and an empty transcript.
+        assert_eq!(panel.current_model_slug(), "");
+        assert_eq!(panel.current_thinking(), None);
+        assert_eq!(panel.model_display(), "model");
+
+        let mut preferred = model("opencode-go", "muse", "Muse Spark");
+        preferred.is_default = true;
+        preferred.default_effort = Some("Extra High".to_string());
+        panel.catalog = vec![model("openrouter", "gpt", "GPT"), preferred];
+
+        // The default names the chip and the picker's current row.
+        assert_eq!(panel.current_model_slug(), "opencode-go/muse");
+        assert_eq!(panel.model_display(), "Muse Spark");
+        assert_eq!(panel.current_thinking().as_deref(), Some("xhigh"));
+        panel.picker = Some(PickerKind::Thinking);
+        let current = panel
+            .picker_list_options()
+            .into_iter()
+            .find(|option| option.current)
+            .map(|option| option.value);
+        assert_eq!(current.as_deref(), Some("xhigh"));
+
+        // The live report still wins over the catalog default.
+        panel.pi_state = Some(PiState {
+            model: Some(pilus_session::PiModel {
+                provider: "openrouter".to_string(),
+                id: "gpt".to_string(),
+                name: "GPT".to_string(),
+                ..pilus_session::PiModel::default()
+            }),
+            thinking: Some("low".to_string()),
+            ..PiState::default()
+        });
+        assert_eq!(panel.current_model_slug(), "openrouter/gpt");
+        assert_eq!(panel.model_display(), "GPT");
+        assert_eq!(panel.current_thinking().as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn live_models_reply_keeps_the_catalog_default() {
+        let mut panel = SessionPanel::default();
+        let mut preferred = model("opencode-go", "muse", "Muse Spark");
+        preferred.is_default = true;
+        preferred.default_effort = Some("High".to_string());
+        panel.catalog = vec![preferred];
+        panel.rpc_result(
+            RequestKind::Models,
+            Ok(Some(serde_json::json!({
+                "models": [
+                    {"provider": "opencode-go", "id": "muse", "name": "Muse Spark"},
+                    {"provider": "openrouter", "id": "gpt", "name": "GPT"}
+                ]
+            }))),
+        );
+        assert_eq!(panel.catalog.len(), 2);
+        assert!(panel.catalog[0].is_default);
+        assert_eq!(panel.catalog[0].default_effort.as_deref(), Some("High"));
+        assert!(!panel.catalog[1].is_default);
+    }
+
+    #[test]
     fn capitalizes_note_titles() {
         assert_eq!(capitalize("compaction"), "Compaction");
         assert_eq!(capitalize("branch summary"), "Branch summary");
@@ -5059,6 +5228,7 @@ mod tests {
             percent: Some(42.1),
         };
         assert_eq!(ctx_percent(&usage), Some(42.1));
+        assert!(ctx_visible(&usage));
         assert!(!ctx_warns(&usage));
         assert_eq!(ctx_counts(&usage), "421k/1M");
         assert!(ctx_warns(&ContextUsage {
@@ -5074,6 +5244,15 @@ mod tests {
         };
         assert_eq!(ctx_percent(&uncounted), None);
         assert_eq!(ctx_counts(&uncounted), "–/1M");
+        assert!(!ctx_visible(&uncounted));
+
+        // A fresh session counts zero: the composer hides the readout rather
+        // than paint an empty gauge.
+        assert!(!ctx_visible(&ContextUsage {
+            tokens: Some(0),
+            context_window: 1_048_576,
+            percent: Some(0.0),
+        }));
 
         // Without pi's figure the gauge computes the same percentage from
         // the token count, and the warning follows it.
@@ -5085,6 +5264,16 @@ mod tests {
         assert_eq!(ctx_percent(&computed), Some(90.0));
         assert!(ctx_warns(&computed));
 
+        // An unknown window never divides into a full red gauge.
+        assert_eq!(
+            ctx_percent(&ContextUsage {
+                tokens: Some(7_367),
+                context_window: 0,
+                percent: None,
+            }),
+            None
+        );
+
         // The captured wire fixture: 7367 / 1048576 ≈ 0.7%.
         let fixture = ContextUsage {
             tokens: Some(7_367),
@@ -5093,6 +5282,66 @@ mod tests {
         };
         assert!(!ctx_warns(&fixture));
         assert_eq!(ctx_counts(&fixture), "7.4k/1M");
+    }
+
+    #[test]
+    fn the_header_keeps_the_first_prompt_short() {
+        let mut panel = SessionPanel::default();
+        panel.transcript.items.push(Item {
+            id: "u".to_string(),
+            timestamp: String::new(),
+            kind: ItemKind::User {
+                text: "word ".repeat(60),
+                images: 0,
+            },
+        });
+        let title = panel.first_prompt().expect("prompt");
+        assert_eq!(title.chars().count(), TITLE_CHARS + 1);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn only_a_remote_pane_shows_the_title_skeleton() {
+        let mut panel = SessionPanel::default();
+        assert!(!panel.is_remote());
+        assert!(!panel.awaiting_title());
+        panel.endpoint = Some(Endpoint::Local {
+            api_socket: PathBuf::from("/tmp/pilus.sock"),
+            cwd: "/w".to_string(),
+        });
+        assert!(!panel.awaiting_title());
+        panel.endpoint = Some(Endpoint::Remote {
+            target: SshTarget {
+                destination: "box".to_string(),
+                binary: "luvus".to_string(),
+                session: None,
+            },
+            cwd: "/w".to_string(),
+        });
+        // A remote pane holds the skeleton only until its reader reports.
+        assert!(panel.awaiting_title());
+        panel.loaded = true;
+        assert!(!panel.awaiting_title());
+    }
+
+    #[test]
+    fn a_reader_fold_clears_the_remote_skeleton() {
+        let mut panel = SessionPanel {
+            endpoint: Some(Endpoint::Remote {
+                target: SshTarget {
+                    destination: "box".to_string(),
+                    binary: "luvus".to_string(),
+                    session: None,
+                },
+                cwd: "/w".to_string(),
+            }),
+            ..SessionPanel::default()
+        };
+        assert!(panel.awaiting_title());
+        // An empty fold is still a report: the session is fresh, not loading.
+        panel.apply_delta(0, Vec::new(), TranscriptMeta::default());
+        assert!(!panel.awaiting_title());
+        assert!(panel.first_prompt().is_none());
     }
 
     #[test]

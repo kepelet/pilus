@@ -582,10 +582,15 @@ pub struct SessionPanel {
     /// interrupted tail, not a running turn, so the socket-down fallback
     /// and the steering guess ignore it. Items past it count again.
     settled_through: usize,
-    /// When the user last interrupted the turn. While nothing has been
-    /// written since, the dock shows a `Stopped` receipt where `Working`
-    /// was; fresh growth hides it again.
+    /// When the user last interrupted the turn. The interrupted turn keeps
+    /// writing its remnant, so `is_working` suppresses the socket-down
+    /// fallback until a new user turn starts, and the dock shows a
+    /// `Stopped` receipt where `Working` was.
     stopped_at: Option<Instant>,
+    /// Transcript length when the abort landed: a user item at or past it
+    /// is the new turn that ends the abort's receipt. Kept apart from
+    /// `settled_through`, which deltas may lower on a rewind.
+    abort_at: usize,
     /// The model slug the user just picked, shown at once: the socket's
     /// report and the file's echo confirm it, but a fresh session may have
     /// neither yet (reconnecting socket, unwritten file) while pi already
@@ -690,6 +695,7 @@ impl Default for SessionPanel {
             pending_steering: false,
             settled_through: 0,
             stopped_at: None,
+            abort_at: 0,
             picked_model: None,
             picked_thinking: None,
             picked_from: 0,
@@ -903,6 +909,7 @@ impl SessionPanel {
         self.pending_steering = false;
         self.settled_through = 0;
         self.stopped_at = None;
+        self.abort_at = 0;
         self.picked_model = None;
         self.picked_thinking = None;
         self.picked_from = 0;
@@ -1039,6 +1046,7 @@ impl SessionPanel {
         self.pending_steering = false;
         self.settled_through = 0;
         self.stopped_at = None;
+        self.abort_at = 0;
         self.picked_model = None;
         self.picked_thinking = None;
         self.picked_from = 0;
@@ -1226,6 +1234,20 @@ impl SessionPanel {
             }
         }
         self.settled_through = self.settled_through.min(from);
+        // A user item at or past the abort is the new turn that ends the
+        // abort's receipt; the interrupted turn's remnant never is.
+        if self.abort_settling()
+            && self
+                .transcript
+                .items
+                .get(self.abort_at.min(self.transcript.items.len())..)
+                .is_some_and(|tail| {
+                    tail.iter()
+                        .any(|item| matches!(item.kind, ItemKind::User { .. }))
+                })
+        {
+            self.stopped_at = None;
+        }
         self.loaded = true;
         self.rows_dirty = true;
         // The splice has to reach back to the earliest item the deltas
@@ -1509,6 +1531,8 @@ impl SessionPanel {
     /// Show a composer send optimistically: the bubble, the indicator, and
     /// `Steering…` when pi is genuinely already working.
     fn set_optimistic(&mut self, text: &str) {
+        // A fresh prompt is a new turn: the abort's receipt ends here.
+        self.stopped_at = None;
         // Steering means pi is mid-turn *now*: our own prompt is still
         // unanswered, or the transcript ends in work the file is still
         // growing into. A merely recent file is not enough — that only says
@@ -1557,7 +1581,7 @@ impl SessionPanel {
     /// Record an interruption: the socket's `busy` clears so the send
     /// button flips back at once, trailing work counts as settled history
     /// rather than a running turn, and the dock shows a `Stopped` receipt
-    /// until fresh output lands. A late `busy` push still corrects this.
+    /// until a new user turn starts. A late `busy` push still corrects this.
     fn mark_stopped(&mut self) {
         self.pending_prompt = None;
         self.awaiting_response = false;
@@ -1568,7 +1592,15 @@ impl SessionPanel {
         }
         self.live = None;
         self.settled_through = self.transcript.items.len();
+        self.abort_at = self.transcript.items.len();
         self.stopped_at = Some(Instant::now());
+    }
+
+    /// Whether we interrupted a turn and no new user turn has started since.
+    /// The aborted turn keeps writing its remnant, so the socket-down
+    /// fallback must not read that work as a running turn.
+    fn abort_settling(&self) -> bool {
+        self.stopped_at.is_some()
     }
 
     /// Give the panel the field its open picker filters through. The view
@@ -2500,7 +2532,7 @@ impl SessionPanel {
                     .text_size(px(fonts.headline))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(theme.fg)
-                    .child("What should we do?"),
+                    .child("What should Pi do?"),
             )
             .into_any_element()
     }
@@ -2925,6 +2957,11 @@ impl SessionPanel {
         if self.pending_steering {
             return true;
         }
+        // The interrupted turn keeps writing its remnant; that work is not
+        // a running turn until a new user prompt starts one.
+        if self.abort_settling() {
+            return false;
+        }
         self.work_in_flight() && self.recently_active()
     }
 
@@ -2964,14 +3001,13 @@ impl SessionPanel {
         after_steer.last().is_some_and(|item| !is_work(&item.kind))
     }
 
-    /// Whether the dock shows the `Stopped` receipt: the user interrupted
-    /// since anything was last written, and pi is not working again. Fresh
-    /// growth hides it — the receipt covers the abort, not what follows.
+    /// Whether the dock shows the `Stopped` receipt: we interrupted and pi
+    /// is not working again. It rides through the aborted turn's remnant
+    /// and ends only when a new user turn starts (or `is_working` turns
+    /// true for another reason), so the composer never flips back to
+    /// `Working` on the interrupted tail.
     fn show_stopped(&self) -> bool {
-        !self.is_working()
-            && self
-                .stopped_at
-                .is_some_and(|at| self.last_growth.is_none_or(|growth| growth <= at))
+        self.abort_settling() && !self.is_working()
     }
 
     /// The `(spinner) Working` line above the composer, or `Steering…` when
@@ -5902,18 +5938,35 @@ mod tests {
         assert!(!panel.is_working(), "the button flips back to send");
         assert!(panel.show_stopped(), "the receipt takes the Working band");
 
-        // Fresh work past the abort counts again: a failed abort re-lights.
+        // The aborted turn keeps writing its remnant — more work, and the
+        // file grows. It must not flip the composer back to `Working`.
+        panel.last_growth = Some(Instant::now());
         push(
             &mut panel,
-            ItemKind::ToolCall {
-                call_id: "c2".to_string(),
+            ItemKind::ToolResult {
+                call_id: "c1".to_string(),
                 name: "read".to_string(),
-                arguments: Value::Null,
-                outcome: None,
+                text: "partial".to_string(),
+                images: 0,
+                is_error: false,
             },
         );
+        assert!(!panel.is_working(), "the remnant is not a running turn");
+        assert!(
+            panel.show_stopped(),
+            "the receipt rides through the remnant"
+        );
+
+        // A new user turn is what ends the receipt: a prompt typed into the
+        // pi TUI lands as a user item past the abort.
+        let next = panel.transcript.items.len();
+        panel.apply_delta(next, vec![user(next, "next")], TranscriptMeta::default());
+        assert!(!panel.show_stopped(), "the new turn ends the receipt");
+        assert!(!panel.is_working(), "a bare user turn has no work yet");
+
+        // Our own send re-lights the composer at once.
+        panel.set_optimistic("mine");
         assert!(panel.is_working());
-        assert!(!panel.show_stopped());
     }
 
     #[test]
@@ -5944,12 +5997,23 @@ mod tests {
     }
 
     #[test]
-    fn the_stopped_receipt_hides_once_output_lands() {
+    fn the_stopped_receipt_rides_the_remnant_until_a_new_turn() {
         let mut panel = SessionPanel::default();
         panel.mark_stopped();
         assert!(panel.show_stopped());
-        // The aborted turn's remnant landing counts as fresh output.
+        // The aborted turn's remnant lands and the file grows: still a
+        // receipt, never `Working` again on the interrupted tail.
         panel.last_growth = Some(Instant::now());
+        push(
+            &mut panel,
+            ItemKind::Thinking {
+                text: "remnant".to_string(),
+            },
+        );
+        assert!(panel.show_stopped());
+        assert!(!panel.is_working());
+        // A new turn ends it.
+        panel.set_optimistic("next");
         assert!(!panel.show_stopped());
     }
 

@@ -7,12 +7,15 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationExt, Context, Div, ElementId, Font, FontWeight, IntoElement, Length,
-    MouseMoveEvent, Path, PathBuilder, Pixels, Point, Render, Stateful, canvas, div, font, point,
-    prelude::*, px,
+    AbsoluteLength, Animation, AnimationElement, AnimationExt, AnyElement, App, Bounds, Context,
+    Corners, DispatchPhase, Div, Edges, Element, ElementId, Font, FontWeight, GlobalElementId,
+    Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, Length,
+    MouseMoveEvent, Path, PathBuilder, Pixels, Point, Position, Rems, Render, Rgba, SharedString,
+    Stateful, Style, Transformation, Window, canvas, div, font, percentage, point, prelude::*, px,
+    svg,
 };
 
 use crate::settings::{CHROME_FONT, Settings};
@@ -23,6 +26,25 @@ use super::theme::Theme;
 /// read as breathing rather than a blink, and it respects reduce motion
 /// through [`AnimationExt::with_animation`].
 const SKELETON_PULSE: Duration = Duration::from_millis(1400);
+/// How long a floating panel takes to fade in when it opens: quick enough
+/// that a menu never feels slow to answer, long enough to read as motion.
+const ENTER: Duration = Duration::from_millis(140);
+/// How long a background fill takes to ease into a new hover or selection
+/// state. Short enough that a pointer sweeping down a list never trails.
+const FILL_EASE: Duration = Duration::from_millis(120);
+/// `rounded_sm`'s radius, for a fill under a dense list row.
+pub(super) const RADIUS_SM: AbsoluteLength = AbsoluteLength::Rems(Rems(0.25));
+/// `rounded_md`'s radius, for a fill under a control, row, or card.
+pub(super) const RADIUS_MD: AbsoluteLength = AbsoluteLength::Rems(Rems(0.375));
+/// `rounded_full`'s radius, for a fill under a pill or round button.
+pub(super) const RADIUS_FULL: AbsoluteLength = AbsoluteLength::Pixels(px(9999.0));
+/// How long a disclosure chevron takes to turn between its two states.
+const CHEVRON_TURN: Duration = Duration::from_millis(160);
+/// One full turn of the working spinner.
+const SPINNER_TURN: Duration = Duration::from_millis(900);
+/// The spinner's frame cap: a 7–14px glyph reads as smooth at 30fps, and a
+/// sidebar full of working agents should not hold the GPU at the display rate.
+const SPINNER_FPS: f32 = 30.0;
 
 /// Base chrome text: body copy, rows, and editable control values.
 pub(super) const TEXT_BODY: f32 = 13.0;
@@ -141,25 +163,142 @@ pub(super) fn small_button(
 }
 
 /// A compact on/off switch. Callers attach their own handler.
+///
+/// Flipping it slides the knob and eases both colors; a switch drawn for the
+/// first time (a page opening) appears settled.
 pub(super) fn toggle(id: impl Into<ElementId>, on: bool, theme: Theme) -> Stateful<Div> {
+    let track = if on { theme.accent } else { theme.border };
     div()
         .id(id)
-        .flex()
-        .items_center()
         .w(px(38.0))
         .h(px(20.0))
-        .p(px(2.0))
         .rounded_full()
-        .bg(if on { theme.accent } else { theme.border })
         .cursor_pointer()
-        .child(
-            div()
-                .w(px(16.0))
-                .h(px(16.0))
-                .rounded_full()
-                .bg(if on { theme.window_bg } else { theme.muted })
-                .ml(px(if on { 18.0 } else { 0.0 })),
-        )
+        .state_fill(track, track, RADIUS_FULL)
+        .child(Knob {
+            on,
+            on_color: theme.window_bg.into(),
+            off_color: theme.muted.into(),
+        })
+}
+
+/// A toggle's knob: an absolute layer over the track that paints the round
+/// knob at its eased position.
+struct Knob {
+    on: bool,
+    on_color: Hsla,
+    off_color: Hsla,
+}
+
+/// The knob's diameter and its inset from the track's edge.
+const KNOB: f32 = 16.0;
+const KNOB_INSET: f32 = 2.0;
+
+/// A knob's slide, kept across frames under its element id.
+struct KnobState {
+    from: f32,
+    to: f32,
+    started: Instant,
+}
+
+impl IntoElement for Knob {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for Knob {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some("pilus-knob".into())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(overlay_style(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let target = if self.on { 1.0 } else { 0.0 };
+        let now = Instant::now();
+        let reduce_motion = cx.reduce_motion();
+        let position = match id {
+            Some(id) => window.with_element_state(id, |state: Option<KnobState>, window| {
+                let mut state = state.unwrap_or(KnobState {
+                    from: target,
+                    to: target,
+                    started: now,
+                });
+                let at = |state: &KnobState| {
+                    let step =
+                        now.duration_since(state.started).as_secs_f32() / FILL_EASE.as_secs_f32();
+                    let eased = ease_out_cubic(step.clamp(0.0, 1.0));
+                    state.from + (state.to - state.from) * eased
+                };
+                if state.to != target {
+                    state.from = at(&state);
+                    state.to = target;
+                    state.started = now;
+                }
+                let position = if reduce_motion { target } else { at(&state) };
+                if position != target {
+                    window.request_animation_frame();
+                }
+                (position, state)
+            }),
+            None => target,
+        };
+        let travel = f32::from(bounds.size.width) - KNOB - 2.0 * KNOB_INSET;
+        let origin = point(
+            bounds.origin.x + px(KNOB_INSET + travel.max(0.0) * position),
+            bounds.origin.y + (bounds.size.height - px(KNOB)) / 2.0,
+        );
+        let knob = Bounds::new(origin, gpui::size(px(KNOB), px(KNOB)));
+        let color = mix(self.off_color.into(), self.on_color.into(), position);
+        window.paint_quad(gpui::fill(knob, color).corner_radii(px(KNOB / 2.0)));
+    }
+}
+
+/// An absolute layer covering its parent's box.
+fn overlay_style() -> Style {
+    Style {
+        position: Position::Absolute,
+        inset: Edges::all(Length::from(px(0.0))),
+        ..Style::default()
+    }
 }
 
 /// A horizontal amount slider: a filled track with a knob, reporting 5%
@@ -250,6 +389,14 @@ pub(super) fn context_gauge(
 ) -> impl IntoElement {
     use std::f32::consts::{FRAC_PI_2, TAU};
     let fraction = percent.unwrap_or(0.0).clamp(0.0, 100.0) / 100.0;
+    // Any positive occupancy gets a visible minimum arc: a fraction this
+    // small would tessellate to a sub-pixel sliver, so the gauge would read
+    // as empty even though the session has used context.
+    let sweep = if fraction > 0.0 {
+        (TAU * fraction).max(0.14)
+    } else {
+        0.0
+    };
     let arc = if warns { theme.alert } else { theme.accent };
     let stroke = (size / 7.0).max(1.5);
     let radius = (size - stroke) / 2.0;
@@ -264,8 +411,8 @@ pub(super) fn context_gauge(
                 if let Some(track) = ring_arc(center, radius, -FRAC_PI_2, TAU, stroke) {
                     window.paint_path(track, theme.border);
                 }
-                if fraction > 0.0
-                    && let Some(path) = ring_arc(center, radius, -FRAC_PI_2, TAU * fraction, stroke)
+                if sweep > 0.0
+                    && let Some(path) = ring_arc(center, radius, -FRAC_PI_2, sweep, stroke)
                 {
                     window.paint_path(path, arc);
                 }
@@ -333,7 +480,6 @@ fn button_at(
         .h(px(height))
         .px(padding)
         .rounded_md()
-        .bg(bg)
         .text_color(fg)
         .border_1()
         .border_color(border)
@@ -344,12 +490,13 @@ fn button_at(
             FontWeight::NORMAL
         })
         .cursor_pointer()
-        .hover(move |style| style.bg(hover_bg).text_color(hover_fg))
+        .state_fill(bg, hover_bg, RADIUS_MD)
+        .hover(move |style| style.text_color(hover_fg))
         .child(label)
 }
 
 /// The background, foreground, and border triple for a button treatment.
-fn button_colors(kind: ButtonKind, theme: Theme) -> (gpui::Rgba, gpui::Rgba, gpui::Rgba) {
+fn button_colors(kind: ButtonKind, theme: Theme) -> (Rgba, Rgba, Rgba) {
     match kind {
         ButtonKind::Primary => (theme.accent, theme.window_bg, theme.accent),
         ButtonKind::Secondary => (theme.panel_dim, theme.fg, theme.border),
@@ -384,6 +531,268 @@ pub(super) fn skeleton(
             id,
             Animation::new(SKELETON_PULSE).repeat(),
             |this, phase| this.opacity(0.55 + 0.45 * phase),
+        )
+}
+
+/// Fade a floating panel in as it opens: menus, pickers, the palette,
+/// popovers, and disclosed content.
+///
+/// The animation is keyed by `id` and replays only when the panel is drawn
+/// afresh, so a panel that stays open while its contents change never
+/// flickers. Opacity alone keeps every layout untouched: the panel sits at
+/// its final position from the first frame, so anchoring and hit-testing
+/// are exact throughout. Reduce motion skips it.
+pub(super) fn enter<E: IntoElement + Styled + 'static>(
+    id: impl Into<ElementId>,
+    panel: E,
+) -> AnimationElement<E> {
+    panel.with_animation(
+        id,
+        Animation::new(ENTER).with_easing(gpui::ease_out_quint()),
+        |panel, delta| panel.opacity(delta),
+    )
+}
+
+/// Animated backgrounds for anything a pointer or a selection lights up.
+///
+/// GPUI's `.hover()` swaps a style in a single frame. These paint the fill
+/// as an absolute layer under the element's children instead, easing it
+/// between states, so hovering a row, moving a selection, or switching tabs
+/// glides rather than blinks. Call them before adding children: the layer
+/// must be the first child to sit beneath them.
+pub(super) trait FillExt: ParentElement + Styled + Sized {
+    /// Ease the background to `hover` while the pointer is over it.
+    fn hover_fill(self, hover: impl Into<Hsla>, radius: AbsoluteLength) -> Self {
+        self.state_fill(gpui::transparent_black(), hover, radius)
+    }
+
+    /// Ease between a resting fill and `hover`. The resting fill animates
+    /// too, so a row whose selection changes slides its pill in and out.
+    /// It replaces the element's own `.bg()`, which would snap underneath.
+    fn state_fill(
+        self,
+        rest: impl Into<Hsla>,
+        hover: impl Into<Hsla>,
+        radius: AbsoluteLength,
+    ) -> Self {
+        self.relative().child(Fill {
+            rest: rest.into(),
+            hover: hover.into(),
+            radius,
+        })
+    }
+}
+
+impl<E: ParentElement + Styled> FillExt for E {}
+
+/// The layer [`FillExt`] paints: its parent's whole box, behind the content.
+struct Fill {
+    rest: Hsla,
+    hover: Hsla,
+    radius: AbsoluteLength,
+}
+
+/// A fill's transition, kept across frames under the layer's element id.
+struct FillState {
+    from: Rgba,
+    to: Rgba,
+    started: Instant,
+}
+
+impl FillState {
+    fn at(&self, now: Instant) -> Rgba {
+        let step = now.duration_since(self.started).as_secs_f32() / FILL_EASE.as_secs_f32();
+        mix(self.from, self.to, ease_out_cubic(step.clamp(0.0, 1.0)))
+    }
+}
+
+fn ease_out_cubic(step: f32) -> f32 {
+    1.0 - (1.0 - step).powi(3)
+}
+
+/// Blend two colors. A transparent end borrows the other end's hue, so a
+/// fill fading in from nothing never passes through a grey or black tint.
+fn mix(from: Rgba, to: Rgba, step: f32) -> Rgba {
+    let from = if from.a == 0.0 {
+        Rgba { a: 0.0, ..to }
+    } else {
+        from
+    };
+    let to = if to.a == 0.0 {
+        Rgba { a: 0.0, ..from }
+    } else {
+        to
+    };
+    let lerp = |a: f32, b: f32| a + (b - a) * step;
+    Rgba {
+        r: lerp(from.r, to.r),
+        g: lerp(from.g, to.g),
+        b: lerp(from.b, to.b),
+        a: lerp(from.a, to.a),
+    }
+}
+
+impl IntoElement for Fill {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for Fill {
+    type RequestLayoutState = ();
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        // Scoped under the parent's own id, so one fixed name is unique.
+        Some("pilus-fill".into())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(overlay_style(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        window.insert_hitbox(bounds, HitboxBehavior::Normal)
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        hitbox: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let hovered = hitbox.is_hovered(window);
+        let target = Rgba::from(if hovered { self.hover } else { self.rest });
+        let now = Instant::now();
+        let reduce_motion = cx.reduce_motion();
+        let color = match id {
+            Some(id) => window.with_element_state(id, |state: Option<FillState>, window| {
+                // A layer seen for the first time starts settled: a row
+                // appearing already hovered or selected does not fade up.
+                let mut state = state.unwrap_or(FillState {
+                    from: target,
+                    to: target,
+                    started: now,
+                });
+                if state.to != target {
+                    state.from = state.at(now);
+                    state.to = target;
+                    state.started = now;
+                }
+                let color = if reduce_motion { target } else { state.at(now) };
+                if color != target {
+                    window.request_animation_frame();
+                }
+                (color, state)
+            }),
+            None => target,
+        };
+        if color.a > 0.0 {
+            let radius = self.radius.to_pixels(window.rem_size());
+            window.paint_quad(
+                gpui::fill(bounds, color)
+                    .corner_radii(Corners::all(radius).clamp_radii_for_quad_size(bounds.size)),
+            );
+        }
+        // Repaint when the pointer crosses the edge, the way `.hover()` does.
+        let hitbox = hitbox.clone();
+        window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, _cx| {
+            if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) != hovered {
+                window.refresh();
+            }
+        });
+    }
+}
+
+/// A disclosure chevron: pointing right when collapsed, down when open.
+///
+/// With `animate` it turns between the two; the caller passes it only right
+/// after the user toggled, because a fresh element always plays from the
+/// start, and a row scrolling into view should not spin its chevron.
+pub(super) fn chevron(
+    id: impl Into<SharedString>,
+    expanded: bool,
+    animate: bool,
+    size: f32,
+    color: impl Into<Hsla>,
+) -> AnyElement {
+    use std::f32::consts::FRAC_PI_2;
+    let to = if expanded { FRAC_PI_2 } else { 0.0 };
+    let from = FRAC_PI_2 - to;
+    let glyph = svg()
+        .data(include_bytes!("../../assets/icons/chevron-right.svg"))
+        .w(px(size))
+        .h(px(size))
+        .flex_shrink_0()
+        .text_color(color.into());
+    if animate && from != to {
+        // Keyed by state, so each toggle is a new element that plays afresh.
+        glyph
+            .with_animation(
+                ElementId::NamedInteger(id.into(), u64::from(expanded)),
+                Animation::new(CHEVRON_TURN).with_easing(gpui::ease_out_quint()),
+                move |glyph, delta| {
+                    glyph.with_transformation(Transformation::rotate(gpui::radians(
+                        from + (to - from) * delta,
+                    )))
+                },
+            )
+            .into_any_element()
+    } else {
+        glyph
+            .with_transformation(Transformation::rotate(gpui::radians(to)))
+            .into_any_element()
+    }
+}
+
+/// The working indicator: a loader ring that turns for as long as it is
+/// painted.
+///
+/// It runs on its own animation clock, not on data arriving, so it keeps
+/// moving while an agent thinks without output. Every spinner shares one
+/// phase (`repeat_synced`), so a tab badge, a sidebar row, and the session
+/// dock turn together instead of drifting apart.
+pub(super) fn spinner(
+    id: impl Into<ElementId>,
+    size: f32,
+    color: impl Into<Hsla>,
+) -> impl IntoElement {
+    svg()
+        .data(include_bytes!("../../assets/icons/loader-circle.svg"))
+        .w(px(size))
+        .h(px(size))
+        .flex_shrink_0()
+        .text_color(color.into())
+        .with_animation(
+            id,
+            Animation::new(SPINNER_TURN)
+                .repeat_synced()
+                .with_max_fps(SPINNER_FPS),
+            |svg, phase| svg.with_transformation(Transformation::rotate(percentage(phase))),
         )
 }
 

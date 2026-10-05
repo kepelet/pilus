@@ -60,11 +60,15 @@ fn settings() -> Rc<RefCell<Settings>> {
 
 fn context() -> Result<HeadlessAppContext> {
     let platform = gpui_platform::current_platform(true);
-    Ok(HeadlessAppContext::with_platform(
+    let mut cx = HeadlessAppContext::with_platform(
         platform.text_system(),
         Arc::new(()),
         gpui_platform::current_headless_renderer,
-    ))
+    );
+    // Shots capture a frame or two after a panel opens; with motion on they
+    // would catch fades half-way and spinners mid-turn.
+    cx.update(|app| app.set_reduce_motion(true));
+    Ok(cx)
 }
 
 fn shoot<V: Render + 'static>(
@@ -359,6 +363,27 @@ pub fn run() -> Result<()> {
             .save(format!("{OUT}/session-picker-thinking.png"))
             .context("save session-picker-thinking")?;
         println!("shot: {OUT}/session-picker-thinking.png");
+        // The picker before the catalog lands: skeleton rows hold the space
+        // the options will take, so the menu never flashes empty.
+        if let Some(view) = cell.borrow().clone() {
+            cx.update(|app| {
+                view.update(app, |view, cx| {
+                    view.session.set_catalog_loading(true);
+                    view.session.open_picker_shot(PickerKind::Thinking);
+                    cx.notify();
+                });
+            });
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        cx.run_until_parked();
+        let image = cx
+            .capture_screenshot(window.into())
+            .context("capture session-picker-loading")?;
+        std::fs::create_dir_all(OUT).context("create shots dir")?;
+        image
+            .save(format!("{OUT}/session-picker-loading.png"))
+            .context("save session-picker-loading")?;
+        println!("shot: {OUT}/session-picker-loading.png");
     }
     // The waiting panel a focused pi gets before its extension reports:
     // the auto pin's stand-in while the socket is discovered.

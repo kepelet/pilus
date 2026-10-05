@@ -17,7 +17,7 @@ use gpui::{
 
 use crate::settings::Settings;
 
-use super::style::{self, ButtonKind};
+use super::style::{self, ButtonKind, FillExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, icon, terminal_inset_border};
@@ -311,9 +311,8 @@ impl UiPlaygroundView {
             .w(px(30.0))
             .h(px(30.0))
             .rounded_full()
-            .bg(theme.panel)
             .cursor_pointer()
-            .hover(move |style| style.bg(theme.border))
+            .state_fill(theme.panel, theme.border, style::RADIUS_FULL)
             .on_click(cx.listener(|this, _, _, cx| this.note("Send clicked".to_string(), cx)))
             .child(icon(
                 include_bytes!("../../assets/icons/arrow-up.svg"),
@@ -378,14 +377,18 @@ impl UiPlaygroundView {
             .h(px(24.0))
             .px_2()
             .rounded_md()
-            .bg(if active {
-                theme.panel
-            } else {
-                theme.panel.opacity(0.0)
-            })
             .text_color(fg)
             .cursor_pointer()
-            .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
+            .state_fill(
+                if active {
+                    theme.panel
+                } else {
+                    theme.panel.opacity(0.0)
+                },
+                theme.panel,
+                style::RADIUS_MD,
+            )
+            .hover(move |style| style.text_color(theme.panel_fg))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if this.dismissed_picker.take() == Some(index) {
                     // An outside press already closed this chip; stay closed.
@@ -449,7 +452,6 @@ impl UiPlaygroundView {
                     .h(px(28.0))
                     .px_3()
                     .rounded_md()
-                    .bg(if active { theme.panel } else { theme.bg })
                     .text_color(theme.panel_fg)
                     .text_size(px(self.fonts().body))
                     .font_weight(if active {
@@ -458,7 +460,11 @@ impl UiPlaygroundView {
                         FontWeight::NORMAL
                     })
                     .cursor_pointer()
-                    .hover(move |style| style.bg(theme.panel))
+                    .state_fill(
+                        if active { theme.panel } else { theme.bg },
+                        theme.panel,
+                        style::RADIUS_MD,
+                    )
                     .child(option)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.pickers[index].selected = option_index;
@@ -485,11 +491,15 @@ impl UiPlaygroundView {
             .h(px(26.0))
             .px_3()
             .rounded_md()
-            .bg(if active { theme.panel } else { theme.window_bg })
             .text_color(fg)
             .text_size(px(self.fonts().body))
             .cursor_pointer()
-            .hover(move |style| style.bg(theme.panel).text_color(theme.panel_fg))
+            .state_fill(
+                if active { theme.panel } else { theme.window_bg },
+                theme.panel,
+                style::RADIUS_MD,
+            )
+            .hover(move |style| style.text_color(theme.panel_fg))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.tab = index;
                 this.note(format!("{label} tab selected"), cx);
@@ -1086,7 +1096,7 @@ impl UiPlaygroundView {
                     .w(px(22.0))
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(move |style| style.bg(theme.panel))
+                    .hover_fill(theme.panel, style::RADIUS_MD)
                     .child(icon(
                         include_bytes!("../../assets/icons/plus.svg"),
                         11.0,
@@ -1155,7 +1165,8 @@ impl UiPlaygroundView {
             )
     }
 
-    /// An agent row with its brand icon and status.
+    /// An agent row with its brand icon and status. A working agent's
+    /// spinner turns on its own clock wherever the status is drawn.
     fn agent_row_demo(&self) -> Div {
         let theme = self.theme;
         div()
@@ -1182,8 +1193,17 @@ impl UiPlaygroundView {
             )
             .child(
                 div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
                     .text_size(px(self.fonts().label))
-                    .text_color(theme.ok)
+                    .text_color(theme.accent)
+                    .child(style::spinner(
+                        "playground-agent-spinner",
+                        10.0,
+                        theme.accent,
+                    ))
                     .child("working"),
             )
     }
@@ -1691,7 +1711,10 @@ impl Render for UiPlaygroundView {
                                                 .anchor(Anchor::TopLeft)
                                                 .offset(point(px(0.0), px(28.0)))
                                                 .snap_to_window_with_margin(px(8.0))
-                                                .child(self.picker_options(cx)),
+                                                .child(style::enter(
+                                                    "playground-picker-enter",
+                                                    self.picker_options(cx),
+                                                )),
                                         )
                                         .with_priority(1),
                                     ),

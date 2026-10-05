@@ -1778,6 +1778,13 @@ impl Render for UiPlaygroundView {
                             .gap_1()
                             .child(
                                 div()
+                                    .text_size(px(self.fonts().headline))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme.fg)
+                                    .child("Headline text"),
+                            )
+                            .child(
+                                div()
                                     .text_size(px(self.fonts().label))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(theme.muted)

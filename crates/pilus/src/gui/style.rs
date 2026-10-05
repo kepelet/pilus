@@ -26,6 +26,8 @@ const SKELETON_PULSE: Duration = Duration::from_millis(1400);
 
 /// Base chrome text: body copy, rows, and editable control values.
 pub(super) const TEXT_BODY: f32 = 13.0;
+/// Headlines: the focal line of an empty state.
+pub(super) const TEXT_HEADLINE: f32 = 20.0;
 /// Secondary text: footer, row detail, and feedback messages.
 pub(super) const TEXT_SECONDARY: f32 = 12.0;
 /// Section labels and small action text.
@@ -48,6 +50,8 @@ pub(super) fn scaled(settings: &Rc<RefCell<Settings>>, design: f32) -> f32 {
 /// The type scale a window renders with, resolved once per frame.
 #[derive(Clone, Copy)]
 pub(super) struct Fonts {
+    /// Headlines: the focal line of an empty state.
+    pub(super) headline: f32,
     /// Body text.
     pub(super) body: f32,
     /// Secondary text, one step below the body.
@@ -60,6 +64,7 @@ impl Fonts {
     /// Resolve the scale from the shared settings.
     pub(super) fn resolve(settings: &Rc<RefCell<Settings>>) -> Self {
         Self {
+            headline: scaled(settings, TEXT_HEADLINE),
             body: scaled(settings, TEXT_BODY),
             secondary: scaled(settings, TEXT_SECONDARY),
             label: scaled(settings, TEXT_LABEL),

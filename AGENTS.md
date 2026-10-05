@@ -64,6 +64,19 @@ is missing, add it to `style.rs` and to the playground first, then use it.
 - **Selection** in the sidebar (workspace, worktree, agent) is the `theme.panel`
   pill with `panel_fg`/`muted` text and a bold name. `selection_bg`/`selection_fg`
   belong to text selection and list highlighting, not sidebar rows.
+- **Motion**: every state change eases; nothing snaps.
+  - A floating panel (menu, picker, palette, popover, tooltip) or a page
+    opens through `style::enter`, wrapped on its open branch only so the fade
+    replays each time it appears.
+  - Hover and selection backgrounds go through `FillExt::hover_fill` /
+    `state_fill`, never `.hover(|s| s.bg(..))` or a selection-dependent
+    `.bg(..)`. Call them before adding children so the fill sits beneath.
+  - Disclosure uses `style::chevron`, switches `style::toggle`, and working
+    status `style::spinner`.
+  - The terminal grid never takes an opacity fade (a translucent window would
+    show the desktop through it); `reflow_alpha` fades its text instead. Do
+    not resize the daemon while the sidebar tweens: it reflows once when the
+    dock moves, and in-between sizes make it reflow again.
 - Every window root goes through `apply_chrome_font`, so the Interface family
   and size reach the whole tree. A new window opts in by taking the shared
   `Settings` and calling it in `render`.

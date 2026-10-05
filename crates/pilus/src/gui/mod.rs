@@ -46,14 +46,13 @@ use crossterm::event::{
 };
 use glass::Glass;
 use gpui::{
-    Action, Anchor, Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, ClipboardItem,
-    Context, DisplayId, Div, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla,
-    KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, SharedString, Stateful, SystemNotification, TextRun, TitlebarOptions,
-    Transformation, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, anchored,
-    deferred, div, font, img, linear_color_stop, linear_gradient, percentage, point, prelude::*,
-    px, relative, size, svg,
+    Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DisplayId, Div,
+    ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu,
+    MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    Stateful, SystemNotification, TextRun, TitlebarOptions, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, anchored, deferred, div, font, img, linear_color_stop,
+    linear_gradient, point, prelude::*, px, relative, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::{Release, UpdateStatus, Version};
@@ -75,6 +74,7 @@ use pilus_protocol::{
 use selection::{Cell, Selection};
 use session::SessionPanel;
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
+use style::FillExt;
 use text_input::{TextField, TextInput};
 use theme::Theme;
 use updater::Updater;
@@ -141,6 +141,9 @@ const SIDEBAR_ROW_HEIGHT: f32 = 28.0;
 /// Height of a one-line band that carries no control: a section header, an
 /// endpoint group label, or an empty-state placeholder.
 const SIDEBAR_BAND_HEIGHT: f32 = 24.0;
+/// How long after a sidebar section header is clicked its chevron may still
+/// turn: past the turn itself, so a late frame still catches it.
+const SECTION_TURN_WINDOW: Duration = Duration::from_millis(400);
 /// Space above a section header, on top of the list's row gap.
 const SIDEBAR_SECTION_GAP: f32 = 12.0;
 /// Breathing room between the terminal grid and the card's inset border.
@@ -149,9 +152,28 @@ const TERMINAL_PAD: f32 = 6.0;
 /// How long the sidebar takes to collapse or expand: long enough to read
 /// as a glide, short enough to stay out of the way.
 const SIDEBAR_ANIM_DURATION: Duration = Duration::from_millis(300);
-/// Slowest daemon resize cadence while the sidebar tweens: the flight
-/// tracks live without a per-frame storm.
-const SIDEBAR_RESIZE_THROTTLE: Duration = Duration::from_millis(50);
+/// How long terminal text takes to fade back in after the grid reflows to a
+/// new size, so a resize reads as a settle rather than a jump.
+const REFLOW_FADE: Duration = Duration::from_millis(180);
+/// The opacity text fades in from after a resize reflows it: a light dip,
+/// enough to soften the jump without reading as a flicker.
+const REFLOW_FLOOR: f32 = 0.6;
+/// The opacity text fades in from when the terminal's content is swapped
+/// (another tab, another machine, or the terminal coming back from Home,
+/// Settings, or the session panel): deep enough to read as a crossfade.
+const SWAP_FLOOR: f32 = 0.15;
+/// Size changes closer together than this belong to one resize (a window
+/// drag, a sidebar tween), which fades once instead of strobing per step.
+const REFLOW_BURST: Duration = Duration::from_millis(250);
+
+/// What the terminal card is showing, compared frame to frame: a change means
+/// its content was swapped rather than updated.
+#[derive(Clone, PartialEq, Eq)]
+struct SurfaceKey {
+    endpoint: String,
+    tab: Option<u16>,
+    shown: bool,
+}
 
 /// One sidebar collapse/expand tween, from the current openness to the target
 /// so a mid-slide reversal glides instead of jumping.
@@ -1142,9 +1164,19 @@ struct PilusView {
     /// tab strip, and terminal cannot land on edges from different tween
     /// instants — which leaves an unpainted seam between them.
     sidebar_open: f32,
-    /// Last daemon resize sent; the tween flight throttles resizes to this
-    /// cadence instead of storming once per frame.
-    last_resize_sent: Instant,
+    /// The sidebar section header clicked last, and when, so only that
+    /// chevron turns.
+    section_toggled: Option<(&'static str, Instant)>,
+    /// The painted frame's size and when it last changed, so a burst of
+    /// resizes fades the text once.
+    grid_size: (u16, u16),
+    grid_resized_at: Option<Instant>,
+    /// What the terminal is showing — endpoint, tab, and whether it is on
+    /// screen at all — so a swap fades the new content in.
+    surface_key: Option<SurfaceKey>,
+    /// The current text fade: when it began and the opacity it rises from;
+    /// `None` once the text has settled.
+    reflow_fade: Option<(Instant, f32)>,
     /// Whether the remembered frame changed since the last settings write.
     window_dirty: bool,
     /// When the frame last changed, so a drag settles before the write.
@@ -1626,7 +1658,11 @@ impl PilusView {
             sidebar_anim: None,
             last_sidebar_dock: None,
             sidebar_open: 1.0,
-            last_resize_sent: Instant::now(),
+            section_toggled: None,
+            grid_size: (0, 0),
+            grid_resized_at: None,
+            surface_key: None,
+            reflow_fade: None,
             window_dirty: false,
             window_moved_at: Instant::now(),
             cols: 120,
@@ -1807,7 +1843,9 @@ impl PilusView {
                     // `was_animating` covers the tick that returns settled.
                     let was_animating = view.sidebar_anim.is_some();
                     let settled = view.tick_sidebar_anim();
-                    if view.poll(cx) || changed || !settled || was_animating {
+                    // The reflow fade rides the same loop for the same reason.
+                    let reflowing = view.reflow_fade.is_some();
+                    if view.poll(cx) || changed || !settled || was_animating || reflowing {
                         cx.notify();
                     }
                 });
@@ -3384,6 +3422,10 @@ impl PilusView {
             InputLayer::Session => {
                 let input = self.session_prompt.clone();
                 if self.session.key(&event.keystroke, &input, cx) {
+                    // A consumed key must not also reach the composer's
+                    // input method, which would turn Ctrl+T into a
+                    // transpose or Shift+Tab into a backtab.
+                    cx.stop_propagation();
                     cx.notify();
                 }
             }
@@ -3970,23 +4012,42 @@ impl PilusView {
     /// The card's content: the Settings page while it is open, else the
     /// terminal grid. Sharing the card keeps the page inset exactly like
     /// the terminal, with the sidebar still showing beside it.
-    fn card_content(&mut self, cx: &mut Context<Self>, grid: Div, pad_x: f32, pad_y: f32) -> Div {
+    ///
+    /// Each page fades in under its own id, so switching pages replays it.
+    /// The terminal itself takes no opacity fade, which would show the
+    /// desktop through a translucent grid; its text fades instead (see
+    /// [`Self::reflow_alpha`]).
+    fn card_content(
+        &mut self,
+        cx: &mut Context<Self>,
+        grid: Div,
+        pad_x: f32,
+        pad_y: f32,
+    ) -> AnyElement {
         if self.home.is_open() {
-            return div()
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_hidden()
-                .child(self.home_page(cx));
+            return style::enter(
+                "pilus-page-home",
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .child(self.home_page(cx)),
+            )
+            .into_any_element();
         }
         if self.settings_open {
-            return self.settings_page(cx);
+            return style::enter("pilus-page-settings", self.settings_page(cx)).into_any_element();
         }
         if self.session.is_open() {
-            return div()
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_hidden()
-                .child(self.session_render(cx));
+            return style::enter(
+                "pilus-page-session",
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .child(self.session_render(cx)),
+            )
+            .into_any_element();
         }
         div()
             .flex_1()
@@ -3994,6 +4055,7 @@ impl PilusView {
             .pl(px(pad_x))
             .pt(px(pad_y))
             .child(grid)
+            .into_any_element()
     }
 
     /// Paint the Pi Session panel for the active workspace.
@@ -4974,9 +5036,8 @@ impl PilusView {
                 .w(px(30.0))
                 .h(px(30.0))
                 .rounded_full()
-                .bg(theme.panel)
                 .cursor_pointer()
-                .hover(move |style| style.bg(theme.border))
+                .state_fill(theme.panel, theme.border, style::RADIUS_FULL)
                 .on_click(cx.listener(|this, _, _, cx| this.home_send(cx)))
                 .child(icon(
                     include_bytes!("../../assets/icons/arrow-up.svg"),
@@ -5112,7 +5173,7 @@ impl PilusView {
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.panel_fg)
                     .cursor_pointer()
-                    .hover(move |style| style.bg(theme.panel))
+                    .hover_fill(theme.panel, style::RADIUS_MD)
                     .child(icon(
                         include_bytes!("../../assets/icons/plus.svg"),
                         13.0,
@@ -5166,7 +5227,7 @@ impl PilusView {
                 .anchor(Anchor::TopLeft)
                 .offset(point(px(0.0), px(PICKER_CHIP_H + 4.0)))
                 .snap_to_window_with_margin(px(8.0))
-                .child(list),
+                .child(style::enter("pilus-home-dropdown-enter", list)),
         )
         .with_priority(1)
         .into_any_element()
@@ -6233,11 +6294,6 @@ impl PilusView {
                 .rounded_md()
                 .border_1()
                 .border_color(if active { theme.accent } else { theme.border })
-                .bg(if active {
-                    theme.accent
-                } else {
-                    theme.panel_dim
-                })
                 .text_color(if active { theme.window_bg } else { theme.fg })
                 .text_size(px(self.section_font()))
                 .font_weight(if active {
@@ -6246,7 +6302,15 @@ impl PilusView {
                     FontWeight::NORMAL
                 })
                 .cursor_pointer()
-                .hover(|style| style.bg(theme.border))
+                .state_fill(
+                    if active {
+                        theme.accent
+                    } else {
+                        theme.panel_dim
+                    },
+                    theme.border,
+                    style::RADIUS_MD,
+                )
                 .child(value.label())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.set_update_channel(value, cx);
@@ -6255,9 +6319,9 @@ impl PilusView {
     }
 
     /// The Open Workspace picker overlay.
-    fn picker_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+    fn picker_overlay(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         if !self.picker.is_open() {
-            return div();
+            return div().into_any_element();
         }
         // Fit the panel inside the window so a short or narrow window never
         // clips the footer buttons.
@@ -6317,11 +6381,10 @@ impl PilusView {
             .h(px(26.0))
             .px_2()
             .rounded_md()
-            .bg(theme.panel)
             .text_size(px(self.footer_font()))
             .text_color(theme.fg)
             .cursor_pointer()
-            .hover(|style| style.bg(theme.border))
+            .state_fill(theme.panel, theme.border, style::RADIUS_MD)
             .child(icon(
                 include_bytes!("../../assets/icons/monitor.svg"),
                 13.0,
@@ -6377,18 +6440,21 @@ impl PilusView {
                         .px_2()
                         .rounded_md()
                         .text_size(px(self.chrome_font()))
-                        .bg(if active {
-                            theme.selection_bg
-                        } else {
-                            theme.sidebar_bg
-                        })
                         .text_color(if active {
                             theme.selection_fg
                         } else {
                             theme.panel_fg
                         })
                         .cursor_pointer()
-                        .hover(|style| style.bg(theme.panel))
+                        .state_fill(
+                            if active {
+                                theme.selection_bg
+                            } else {
+                                theme.sidebar_bg
+                            },
+                            theme.panel,
+                            style::RADIUS_MD,
+                        )
                         .child(icon(
                             include_bytes!("../../assets/icons/circle.svg"),
                             8.0,
@@ -6424,19 +6490,23 @@ impl PilusView {
                         })),
                 );
             }
-            div()
-                .absolute()
-                .occlude()
-                .top(px(44.0))
-                .right(px(8.0))
-                .w(px(240.0))
-                .rounded_md()
-                .bg(theme.sidebar_bg)
-                .border_1()
-                .border_color(terminal_inset_border())
-                .child(list)
+            style::enter(
+                "pilus-picker-endpoint-menu-enter",
+                div()
+                    .absolute()
+                    .occlude()
+                    .top(px(44.0))
+                    .right(px(8.0))
+                    .w(px(240.0))
+                    .rounded_md()
+                    .bg(theme.sidebar_bg)
+                    .border_1()
+                    .border_color(terminal_inset_border())
+                    .child(list),
+            )
+            .into_any_element()
         } else {
-            div()
+            div().into_any_element()
         };
 
         let entries = self.picker.entries();
@@ -6496,11 +6566,10 @@ impl PilusView {
                     .h(px(28.0))
                     .px_2()
                     .rounded_md()
-                    .bg(bg)
                     .text_color(fg)
                     .cursor_pointer()
                     .text_size(px(self.chrome_font()))
-                    .hover(|style| style.bg(theme.panel))
+                    .state_fill(bg, theme.panel, style::RADIUS_MD)
                     .child(icon(
                         row_icon,
                         14.0,
@@ -6601,46 +6670,50 @@ impl PilusView {
             );
         footer = footer.child(worktree).child(open);
 
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .occlude()
-            .bg(theme.window_bg.opacity(0.55))
-            .flex()
-            .justify_center()
-            .pt(px(HEADER_HEIGHT + 12.0))
-            .child(
-                div()
-                    .w(px(panel_w))
-                    .h(px(panel_h))
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .rounded_lg()
-                    .bg(theme.sidebar_bg)
-                    .border_1()
-                    .border_color(terminal_inset_border())
-                    .overflow_hidden()
-                    .child(header)
-                    .child(path_field)
-                    .child(rows)
-                    .child(footer)
-                    .child(menu)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    ),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.close_picker();
-                    cx.notify();
-                }),
-            )
+        style::enter(
+            "pilus-picker-enter",
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .occlude()
+                .bg(theme.window_bg.opacity(0.55))
+                .flex()
+                .justify_center()
+                .pt(px(HEADER_HEIGHT + 12.0))
+                .child(
+                    div()
+                        .w(px(panel_w))
+                        .h(px(panel_h))
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .bg(theme.sidebar_bg)
+                        .border_1()
+                        .border_color(terminal_inset_border())
+                        .overflow_hidden()
+                        .child(header)
+                        .child(path_field)
+                        .child(rows)
+                        .child(footer)
+                        .child(menu)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        ),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.close_picker();
+                        cx.notify();
+                    }),
+                ),
+        )
+        .into_any_element()
     }
 
     /// This client's session name: `default` when no session is named.
@@ -6923,6 +6996,60 @@ impl PilusView {
             to,
         });
         cx.notify();
+    }
+
+    /// The terminal text's opacity this frame: dipped and easing back to
+    /// full while the grid settles after a size change or a content swap.
+    ///
+    /// Only the text fades. Cell backgrounds stay put, so a translucent
+    /// window never flashes the desktop through the grid, and the layout
+    /// never moves. The first size change of a burst starts the fade; the
+    /// rest of a drag rides it out rather than restarting it. A sidebar
+    /// slide starts none: the daemon reflows once when the dock moves, and
+    /// a dip on top of that would read as the flicker it is meant to hide.
+    fn reflow_alpha(&mut self, reduce_motion: bool) -> f32 {
+        let now = Instant::now();
+        let key = SurfaceKey {
+            endpoint: self.active.key(),
+            tab: self
+                .tabs
+                .iter()
+                .find(|tab| self.tab_active(tab))
+                .map(|tab| tab.index),
+            shown: !self.home.is_open() && !self.settings_open && !self.session.is_open(),
+        };
+        if self.surface_key.as_ref() != Some(&key) {
+            // The first key is the launch: the first frame fades in too.
+            if !reduce_motion {
+                self.reflow_fade = Some((now, SWAP_FLOOR));
+            }
+            self.surface_key = Some(key);
+        }
+        if let Some(size) = self
+            .surface
+            .frame()
+            .map(|frame| (frame.width, frame.height))
+            && size != self.grid_size
+        {
+            let fresh = self
+                .grid_resized_at
+                .is_none_or(|at| now.duration_since(at) >= REFLOW_BURST);
+            if fresh && !reduce_motion && self.sidebar_anim.is_none() && self.reflow_fade.is_none()
+            {
+                self.reflow_fade = Some((now, REFLOW_FLOOR));
+            }
+            self.grid_size = size;
+            self.grid_resized_at = Some(now);
+        }
+        let Some((started, floor)) = self.reflow_fade else {
+            return 1.0;
+        };
+        let step = now.duration_since(started).as_secs_f32() / REFLOW_FADE.as_secs_f32();
+        if step >= 1.0 {
+            self.reflow_fade = None;
+            return 1.0;
+        }
+        reflow_opacity(floor, step)
     }
 
     /// Advance the sidebar tween; true once it settles at its target.
@@ -8559,7 +8686,7 @@ impl PilusView {
             .w(px(28.0))
             .rounded_md()
             .cursor_pointer()
-            .hover(move |style| style.bg(theme.panel.opacity(glass)))
+            .hover_fill(theme.panel.opacity(glass), style::RADIUS_MD)
             .child(icon(
                 include_bytes!("../../assets/icons/panel-left.svg"),
                 14.0,
@@ -8604,11 +8731,8 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.muted)
-            .hover(move |style| {
-                style
-                    .text_color(theme.panel_fg)
-                    .bg(theme.panel.opacity(glass))
-            })
+            .hover_fill(theme.panel.opacity(glass), style::RADIUS_MD)
+            .hover(move |style| style.text_color(theme.panel_fg))
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
                 13.0,
@@ -8722,17 +8846,19 @@ impl PilusView {
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            .bg(if active {
-                theme.panel.opacity(glass)
-            } else {
-                theme.panel.opacity(0.0)
-            })
+            // The raised fill eases in on the new tab and out of the old one,
+            // so switching tabs slides the selection instead of blinking it.
+            .state_fill(
+                if active {
+                    theme.panel.opacity(glass)
+                } else {
+                    theme.panel.opacity(0.0)
+                },
+                theme.panel.opacity(glass),
+                style::RADIUS_MD,
+            )
             .text_color(fg)
-            .hover(move |style| {
-                style
-                    .bg(theme.panel.opacity(glass))
-                    .text_color(theme.panel_fg)
-            })
+            .hover(move |style| style.text_color(theme.panel_fg))
             .tooltip(tip);
         let mut content = div()
             .flex_1()
@@ -8757,21 +8883,7 @@ impl PilusView {
             if agent.status != "idle" {
                 let status = status_color(&agent.status, theme);
                 let indicator = if agent.status == "working" {
-                    svg()
-                        .data(include_bytes!("../../assets/icons/loader-circle.svg"))
-                        .w(px(7.0))
-                        .h(px(7.0))
-                        .flex_shrink_0()
-                        .text_color(status)
-                        .with_animation(
-                            format!("pilus-tab-agent-spinner-{index}"),
-                            Animation::new(Duration::from_millis(900))
-                                .repeat_synced()
-                                .with_max_fps(30.0),
-                            |svg, phase| {
-                                svg.with_transformation(Transformation::rotate(percentage(phase)))
-                            },
-                        )
+                    style::spinner(format!("pilus-tab-agent-spinner-{index}"), 7.0, status)
                         .into_any_element()
                 } else {
                     div()
@@ -8867,7 +8979,7 @@ impl PilusView {
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            .hover(move |style| style.bg(theme.panel.opacity(glass)))
+            .hover_fill(theme.panel.opacity(glass), style::RADIUS_MD)
             .child(
                 div()
                     .text_color(theme.panel_fg)
@@ -8890,9 +9002,14 @@ impl PilusView {
     /// outside dismisses; the panel stops propagation so its own clicks land.
     /// It opens below the session picker in the top strip, offset by the same
     /// sidebar/fullscreen-dependent left inset the strip uses.
-    fn session_menu(&self, cx: &mut Context<Self>, cell_width: f32, fullscreen: bool) -> Div {
+    fn session_menu(
+        &self,
+        cx: &mut Context<Self>,
+        cell_width: f32,
+        fullscreen: bool,
+    ) -> AnyElement {
         if !self.session_menu_open {
-            return div();
+            return div().into_any_element();
         }
         let theme = self.theme;
         let strip_left = self.sidebar_px(cell_width);
@@ -8917,9 +9034,8 @@ impl PilusView {
                     .h(px(28.0))
                     .px_2()
                     .rounded_md()
-                    .bg(bg)
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme.panel))
+                    .state_fill(bg, theme.panel, style::RADIUS_MD)
                     .text_size(px(self.chrome_font()))
                     .child(icon(
                         if session.running {
@@ -8968,7 +9084,7 @@ impl PilusView {
                 .px_2()
                 .rounded_md()
                 .cursor_pointer()
-                .hover(|style| style.bg(theme.panel))
+                .hover_fill(theme.panel, style::RADIUS_MD)
                 .text_size(px(self.chrome_font()))
                 .text_color(theme.panel_fg)
                 .child(icon(
@@ -8982,36 +9098,40 @@ impl PilusView {
                     cx.notify();
                 })),
         );
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(menu_left))
-                    .top(px(HEADER_HEIGHT))
-                    .w(px(264.0))
-                    .rounded_md()
-                    .bg(theme.sidebar_bg)
-                    .border_1()
-                    .border_color(terminal_inset_border())
-                    .p_2()
-                    .child(items)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    ),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.session_menu_open = false;
-                    cx.notify();
-                }),
-            )
+        style::enter(
+            "pilus-session-menu-enter",
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(menu_left))
+                        .top(px(HEADER_HEIGHT))
+                        .w(px(264.0))
+                        .rounded_md()
+                        .bg(theme.sidebar_bg)
+                        .border_1()
+                        .border_color(terminal_inset_border())
+                        .p_2()
+                        .child(items)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        ),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.session_menu_open = false;
+                        cx.notify();
+                    }),
+                ),
+        )
+        .into_any_element()
     }
 
     /// The right-click context menu for a WORKSPACES or AGENTS row.
@@ -9021,9 +9141,9 @@ impl PilusView {
     /// cursor (`selected`) and mouse hover share the panel pill, and the
     /// menu clamps to the viewport so a row opened at the window's edge never
     /// draws off-screen.
-    fn context_menu_overlay(&self, cx: &mut Context<Self>, window: &Window) -> Div {
+    fn context_menu_overlay(&self, cx: &mut Context<Self>, window: &Window) -> AnyElement {
         let Some(menu) = self.context_menu.as_ref() else {
-            return div();
+            return div().into_any_element();
         };
         let theme = self.theme;
         let rows = self.menu_rows();
@@ -9058,12 +9178,15 @@ impl PilusView {
                     .px_2()
                     .rounded_md()
                     .cursor_pointer()
-                    .bg(if active {
-                        theme.panel
-                    } else {
-                        theme.window_bg.opacity(0.0)
-                    })
-                    .hover(|style| style.bg(theme.panel))
+                    .state_fill(
+                        if active {
+                            theme.panel
+                        } else {
+                            theme.window_bg.opacity(0.0)
+                        },
+                        theme.panel,
+                        style::RADIUS_MD,
+                    )
                     .text_size(px(self.chrome_font()))
                     .text_color(color)
                     .child(icon(sidebar_menu_icon(item), 15.0, color))
@@ -9109,37 +9232,41 @@ impl PilusView {
                 cx.listener(|_, _, _, cx| cx.stop_propagation()),
             );
 
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .occlude()
-            .child(panel)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.close_context_menu();
-                    cx.notify();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.close_context_menu();
-                    cx.notify();
-                }),
-            )
+        style::enter(
+            "pilus-context-menu-enter",
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .occlude()
+                .child(panel)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.close_context_menu();
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _, _, cx| {
+                        this.close_context_menu();
+                        cx.notify();
+                    }),
+                ),
+        )
+        .into_any_element()
     }
 
     /// The rename/alias/branch prompt a context-menu action opened.
     ///
     /// Same shape as the palette: a dimmed catcher over everything and a
     /// centered field panel that stops propagation so its own clicks land.
-    fn menu_prompt_overlay(&self, cx: &mut Context<Self>) -> Div {
+    fn menu_prompt_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(prompt) = self.menu_prompt.as_ref() else {
-            return div();
+            return div().into_any_element();
         };
         let theme = self.theme;
         // A destructive confirm swaps the field for the target path, a warning,
@@ -9244,41 +9371,45 @@ impl PilusView {
                 cx.listener(|_, _, _, cx| cx.stop_propagation()),
             );
 
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .occlude()
-            .bg(theme.window_bg.opacity(0.55))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(panel)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.menu_prompt = None;
-                    cx.notify();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.menu_prompt = None;
-                    cx.notify();
-                }),
-            )
+        style::enter(
+            "pilus-menu-prompt-enter",
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .occlude()
+                .bg(theme.window_bg.opacity(0.55))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(panel)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.menu_prompt = None;
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _, _, cx| {
+                        this.menu_prompt = None;
+                        cx.notify();
+                    }),
+                ),
+        )
+        .into_any_element()
     }
 
     /// The ⌘⇧P overlay: a query field above a filtered command list.
     ///
     /// A transparent catcher covers the window so a click outside the panel
     /// dismisses it; the panel stops propagation so its own clicks land.
-    fn palette_overlay(&self, cx: &mut Context<Self>) -> Div {
+    fn palette_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
         if !self.palette.is_open() {
-            return div();
+            return div().into_any_element();
         }
         let theme = self.theme;
         let entries = self.palette_entries();
@@ -9327,17 +9458,18 @@ impl PilusView {
                     .h(px(30.0))
                     .px_3()
                     .rounded_md()
-                    .bg(bg)
-                    .cursor_pointer()
-                    .text_size(px(self.chrome_font()))
-                    .text_color(fg)
-                    .hover(move |style| {
-                        style.bg(if active {
+                    .state_fill(
+                        bg,
+                        if active {
                             theme.selection_bg
                         } else {
                             theme.panel
-                        })
-                    })
+                        },
+                        style::RADIUS_MD,
+                    )
+                    .cursor_pointer()
+                    .text_size(px(self.chrome_font()))
+                    .text_color(fg)
                     .child(div().flex_1().child(entry.title.clone()))
                     .child(
                         div()
@@ -9379,42 +9511,46 @@ impl PilusView {
             .text_size(px(self.chrome_font()))
             .child(palette_input);
 
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .occlude()
-            .bg(theme.window_bg.opacity(0.55))
-            .flex()
-            .justify_center()
-            .pt(px(HEADER_HEIGHT + 12.0))
-            .child(
-                div()
-                    .w(px(560.0))
-                    .max_h(px(420.0))
-                    .flex()
-                    .flex_col()
-                    .rounded_lg()
-                    .bg(theme.sidebar_bg)
-                    .border_1()
-                    .border_color(terminal_inset_border())
-                    .overflow_hidden()
-                    .child(field)
-                    .child(rows)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    ),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.palette.close();
-                    cx.notify();
-                }),
-            )
+        style::enter(
+            "pilus-palette-enter",
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .occlude()
+                .bg(theme.window_bg.opacity(0.55))
+                .flex()
+                .justify_center()
+                .pt(px(HEADER_HEIGHT + 12.0))
+                .child(
+                    div()
+                        .w(px(560.0))
+                        .max_h(px(420.0))
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .bg(theme.sidebar_bg)
+                        .border_1()
+                        .border_color(terminal_inset_border())
+                        .overflow_hidden()
+                        .child(field)
+                        .child(rows)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        ),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.palette.close();
+                        cx.notify();
+                    }),
+                ),
+        )
+        .into_any_element()
     }
 
     /// One workspace row: the name on the first line, the working directory on
@@ -9549,9 +9685,8 @@ impl PilusView {
             .pr(px(SIDEBAR_ROW_PAD))
             .py_1()
             .rounded_md()
-            .bg(bg)
             .cursor_pointer()
-            .hover(move |style| style.bg(theme.panel.opacity(glass)))
+            .state_fill(bg, theme.panel.opacity(glass), style::RADIUS_MD)
             .tooltip(tip)
             .child(head);
         // The path line follows the daemon's Show Path / Hide Path toggle.
@@ -9673,9 +9808,8 @@ impl PilusView {
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            .bg(bg)
             .text_color(theme.panel_fg)
-            .hover(move |style| style.bg(theme.panel.opacity(glass)))
+            .state_fill(bg, theme.panel.opacity(glass), style::RADIUS_MD)
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
                 SIDEBAR_GLYPH,
@@ -9707,9 +9841,8 @@ impl PilusView {
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            .bg(bg)
             .text_color(theme.panel_fg)
-            .hover(move |style| style.bg(theme.panel.opacity(glass)))
+            .state_fill(bg, theme.panel.opacity(glass), style::RADIUS_MD)
             .child(icon(
                 include_bytes!("../../assets/icons/agents/pi.svg"),
                 SIDEBAR_GLYPH,
@@ -9775,9 +9908,8 @@ impl PilusView {
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            .bg(bg)
             .text_color(theme.panel_fg)
-            .hover(move |style| style.bg(theme.panel.opacity(glass)))
+            .state_fill(bg, theme.panel.opacity(glass), style::RADIUS_MD)
             .child(icon(kind.icon(), SIDEBAR_GLYPH, theme.muted))
             .child(label.child(kind.label().to_string()))
             .child(badge)
@@ -9845,18 +9977,26 @@ impl PilusView {
                     .hover(|style| style.text_color(theme.panel_fg))
                     // The chevron wears the shared glyph box, so it lines up
                     // with the rows' leading icons.
-                    .child(div().w(px(SIDEBAR_GLYPH)).flex_shrink_0().child(icon(
-                        if collapsed {
-                            include_bytes!("../../assets/icons/chevron-right.svg")
-                        } else {
-                            include_bytes!("../../assets/icons/chevron-down.svg")
-                        },
-                        12.0,
-                        theme.muted,
-                    )))
+                    .child(
+                        div()
+                            .w(px(SIDEBAR_GLYPH))
+                            .flex_shrink_0()
+                            .child(style::chevron(
+                                format!("{id}-chevron"),
+                                !collapsed,
+                                self.section_toggled.is_some_and(|(last, at)| {
+                                    last == id && at.elapsed() < SECTION_TURN_WINDOW
+                                }),
+                                12.0,
+                                theme.muted,
+                            )),
+                    )
                     .child(label)
                     .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border()))
-                    .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.section_toggled = Some((id, Instant::now()));
+                        toggle(this, cx);
+                    })),
             );
         // A section with nothing to add shows no button: a control that does
         // nothing is worse than one that is missing.
@@ -9873,7 +10013,7 @@ impl PilusView {
                 .w(px(SIDEBAR_BAND_HEIGHT))
                 .rounded_md()
                 .cursor_pointer()
-                .hover(move |style| style.bg(theme.panel.opacity(glass)))
+                .hover_fill(theme.panel.opacity(glass), style::RADIUS_MD)
                 .child(icon(
                     include_bytes!("../../assets/icons/plus.svg"),
                     11.0,
@@ -10043,7 +10183,9 @@ impl PilusView {
                     .child("No workspaces yet"),
             );
         }
-        section.child(children)
+        // Collapsed sections drop their rows, so the fade replays each time
+        // the section opens.
+        section.child(style::enter("pilus-workspaces-rows", children))
     }
 
     /// The display label for an endpoint.
@@ -10135,7 +10277,7 @@ impl PilusView {
                     .child("No agents"),
             );
         }
-        section.child(children)
+        section.child(style::enter("pilus-agents-rows", children))
     }
 
     /// One agent row: the agent and its label on the first line, the working
@@ -10194,9 +10336,8 @@ impl PilusView {
             .pr(px(SIDEBAR_ROW_PAD))
             .py_1()
             .rounded_md()
-            .bg(bg)
             .cursor_pointer()
-            .hover(move |style| style.bg(theme.panel.opacity(glass)))
+            .state_fill(bg, theme.panel.opacity(glass), style::RADIUS_MD)
             .tooltip(tip)
             .child(
                 div()
@@ -10219,14 +10360,24 @@ impl PilusView {
                             .text_color(fg)
                             .child(label),
                     )
-                    .child(
+                    .child(if agent.status == "working" {
+                        // A working agent turns where the dot sits, so the
+                        // row says "busy" without waiting on a status push.
+                        style::spinner(
+                            format!("pilus-agent-spinner-{}-{}", endpoint.key(), agent.pane),
+                            10.0,
+                            status,
+                        )
+                        .into_any_element()
+                    } else {
                         div()
                             .flex_shrink_0()
                             .w(px(8.0))
                             .h(px(8.0))
                             .rounded_full()
-                            .bg(status),
-                    ),
+                            .bg(status)
+                            .into_any_element()
+                    }),
             );
         // The path line follows the daemon's Show Path / Hide Path toggle.
         if self.sidebar_agent_paths {
@@ -10369,11 +10520,16 @@ impl PilusView {
     ///
     /// The viewport is whatever fits inside the card (or the full-bleed
     /// terminal); planning with anything else lays out columns the card
-    /// clips off. While the sidebar tweens, resizes throttle to a gentle
-    /// cadence so the daemon tracks the flight without a per-frame storm.
+    /// clips off.
+    ///
+    /// Nothing is sent while the sidebar slides. The daemon already moves
+    /// its pane by the dock's width the moment the sidebar message lands,
+    /// which is the final width; resizing toward the card's in-between
+    /// widths made the TUI reflow narrower and back again, several times a
+    /// slide — the flicker. The card clips or pads the grid until the tween
+    /// settles, and the trailing render sends any size still owed.
     fn sync_metrics(&mut self, window: &Window) {
-        if self.sidebar_anim.is_some() && self.last_resize_sent.elapsed() < SIDEBAR_RESIZE_THROTTLE
-        {
+        if self.sidebar_anim.is_some() {
             return;
         }
         let layout = self.card_layout(window, self.framed());
@@ -10394,7 +10550,6 @@ impl PilusView {
         self.cols = cols;
         self.rows = rows;
         self.sent_cell = cell;
-        self.last_resize_sent = Instant::now();
         let resize = ClientMessage::Resize {
             cols,
             rows,
@@ -10488,6 +10643,7 @@ impl Render for PilusView {
         } else {
             terminal_bg.opacity(glass)
         };
+        let text_alpha = self.reflow_alpha(cx.reduce_motion());
         let grid = match self.surface.frame() {
             Some(frame) => render_grid(
                 frame,
@@ -10503,6 +10659,7 @@ impl Render for PilusView {
                 glass,
                 layout.slack_x,
                 layout.slack_y,
+                text_alpha,
             ),
             None => {
                 let mut empty = div()
@@ -10733,6 +10890,7 @@ fn render_grid(
     glass: f32,
     slack_x: f32,
     slack_y: f32,
+    text_alpha: f32,
 ) -> Div {
     let end_row = SKIPPED_DAEMON_ROWS
         .saturating_add(max_rows)
@@ -10752,6 +10910,7 @@ fn render_grid(
             max_cols,
             glass,
             slack_x,
+            text_alpha,
         ));
     }
     // Full-bleed pools the sub-cell remainder below the last row; extend
@@ -10790,6 +10949,7 @@ fn render_row(
     max_cols: u16,
     glass: f32,
     slack_x: f32,
+    text_alpha: f32,
 ) -> Div {
     let width = usize::from(frame.width);
     let skip = usize::from(skip_cols).min(width);
@@ -10873,7 +11033,7 @@ fn render_row(
             .font_family(font_family)
             .text_size(px(font_size))
             .line_height(line_height)
-            .text_color(fg)
+            .text_color(fg.opacity(text_alpha))
             .child(text);
         if mods & M_BOLD != 0 {
             span = span.font_weight(FontWeight::BOLD);
@@ -11006,6 +11166,13 @@ fn bottom_fill_spans(
 /// Ease-in-out cubic for the sidebar tween: gentle departure and landing
 /// with peak velocity mid-flight, so the glide reads as smooth motion
 /// instead of a snap.
+/// Text opacity `step` of the way through a fade up from `floor`: quick off
+/// the floor, gentle into full.
+fn reflow_opacity(floor: f32, step: f32) -> f32 {
+    let eased = 1.0 - (1.0 - step.clamp(0.0, 1.0)).powi(3);
+    floor + (1.0 - floor) * eased
+}
+
 fn ease_in_out_cubic(step: f32) -> f32 {
     if step < 0.5 {
         4.0 * step.powi(3)
@@ -11355,14 +11522,18 @@ fn picker_face(
         .h(px(PICKER_CHIP_H))
         .px_2()
         .rounded_md()
-        .bg(if open {
-            highlight
-        } else {
-            theme.panel.opacity(0.0)
-        })
         .text_color(fg)
         .cursor_pointer()
-        .hover(move |style| style.bg(highlight).text_color(theme.panel_fg))
+        .state_fill(
+            if open {
+                highlight
+            } else {
+                theme.panel.opacity(0.0)
+            },
+            highlight,
+            style::RADIUS_MD,
+        )
+        .hover(move |style| style.text_color(theme.panel_fg))
         .on_click(on_toggle)
         .child(leading)
         .child(
@@ -11434,7 +11605,6 @@ fn picker_option_row(
         .h(px(PICKER_ROW_H))
         .px_3()
         .rounded_md()
-        .bg(if active { theme.panel } else { theme.bg })
         .text_color(theme.panel_fg)
         .font_weight(if active {
             FontWeight::BOLD
@@ -11443,7 +11613,11 @@ fn picker_option_row(
         })
         .text_size(px(font_size))
         .cursor_pointer()
-        .hover(move |style| style.bg(theme.panel))
+        .state_fill(
+            if active { theme.panel } else { theme.bg },
+            theme.panel,
+            style::RADIUS_MD,
+        )
         // Long values (session prompts) truncate to one row.
         .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
         .when_some(hint, |row, hint| {
@@ -11730,7 +11904,9 @@ impl Render for SidebarTip {
         for (text, color) in &self.lines {
             card = card.child(div().text_color(*color).child(text.clone()));
         }
-        card
+        // Each hover builds a fresh tip view, so the fade plays every time
+        // one appears.
+        style::enter("pilus-sidebar-tip-enter", card)
     }
 }
 
@@ -12315,6 +12491,18 @@ mod tests {
             linked_worktree_path(&worktrees, "~/.luvus/worktrees/repo/feature-two"),
             None
         );
+    }
+
+    #[test]
+    fn reflowed_text_fades_up_from_the_floor() {
+        assert!((reflow_opacity(REFLOW_FLOOR, 0.0) - REFLOW_FLOOR).abs() < f32::EPSILON);
+        assert!((reflow_opacity(SWAP_FLOOR, 1.0) - 1.0).abs() < f32::EPSILON);
+        let mut last = reflow_opacity(SWAP_FLOOR, 0.0);
+        for step in 1..=10 {
+            let next = reflow_opacity(SWAP_FLOOR, step as f32 / 10.0);
+            assert!(next >= last, "the fade never dips back");
+            last = next;
+        }
     }
 
     #[test]

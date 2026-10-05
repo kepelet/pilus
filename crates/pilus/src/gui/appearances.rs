@@ -16,7 +16,7 @@ use gpui::{
 };
 use pilus_client::{Appearance, ControlClient, ThemeInfo};
 
-use super::style;
+use super::style::{self, FillExt};
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, scheme};
 use crate::settings::Settings;
@@ -317,8 +317,7 @@ impl AppearancesView {
             .py_2()
             .rounded_md()
             .cursor_pointer()
-            .bg(bg)
-            .hover(|style| style.bg(theme.panel))
+            .state_fill(bg, theme.panel, style::RADIUS_MD)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.select(id.clone());
                 cx.notify();
@@ -372,10 +371,9 @@ impl AppearancesView {
             .w(px(24.0))
             .h(px(22.0))
             .rounded_md()
-            .bg(theme.panel_dim)
             .cursor_pointer()
             .text_color(theme.fg)
-            .hover(|style| style.bg(theme.panel))
+            .state_fill(theme.panel_dim, theme.panel, style::RADIUS_MD)
             .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
             .child(label)
     }
@@ -400,9 +398,12 @@ impl AppearancesView {
             .h(px(24.0))
             .px_2()
             .rounded_md()
-            .bg(if open { theme.panel } else { theme.panel_dim })
             .cursor_pointer()
-            .hover(|style| style.bg(theme.panel))
+            .state_fill(
+                if open { theme.panel } else { theme.panel_dim },
+                theme.panel,
+                style::RADIUS_MD,
+            )
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
                     if this.open_picker == Some(field) {
@@ -602,7 +603,7 @@ impl AppearancesView {
                     .cursor_pointer()
                     .text_size(px(self.fonts().secondary))
                     .text_color(if selected { theme.accent } else { theme.fg })
-                    .hover(|style| style.bg(theme.panel))
+                    .hover_fill(theme.panel, style::RADIUS_SM)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         match field {
                             FontField::Ui => {
@@ -777,7 +778,10 @@ impl Render for AppearancesView {
             .on_action(cx.listener(|_, _: &CloseTab, window, _| window.remove_window()));
         let mut root = super::apply_chrome_font(root, &self.shared_settings).child(list);
         if let Some(field) = self.open_picker {
-            root = root.child(self.picker_overlay(field, window, cx));
+            root = root.child(style::enter(
+                "appearances-picker-enter",
+                self.picker_overlay(field, window, cx),
+            ));
         }
         root
     }

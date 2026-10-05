@@ -41,7 +41,7 @@ use serde_json::Value;
 use crate::settings::Settings;
 
 use super::PilusView;
-use super::style::{self, Fonts};
+use super::style::{self, FillExt, Fonts};
 use super::text_input::TextInput;
 use super::theme::Theme;
 
@@ -74,7 +74,7 @@ enum Section {
 }
 
 /// What a section header's click toggles.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Toggle {
     /// One section, keyed by its item index.
     Item(usize),
@@ -108,6 +108,15 @@ pub(super) enum PickerKind {
 
 /// Thinking levels pi accepts for `/thinking`, from its settings reference.
 const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// How long after a section opens its body still fades in. Longer than the
+/// fade itself, so a frame painted a little late still catches it.
+const DISCLOSE_WINDOW: Duration = Duration::from_millis(400);
+
+/// Skeleton rows a picker paints while its catalog loads. Enough to fill
+/// the menu the real rows will occupy, so the panel does not jump when they
+/// land.
+const PICKER_SKELETON_ROWS: usize = 5;
 
 /// One composer picker row: what it shows, what choosing it sends, and
 /// whether the live session is already on it.
@@ -416,13 +425,12 @@ fn ctx_percent(usage: &ContextUsage) -> Option<f64> {
     (usage.context_window > 0).then(|| tokens as f64 / usage.context_window as f64 * 100.0)
 }
 
-/// Whether the context readout is worth painting. A fresh session counts
-/// zero tokens, and pi reports no figure at all until it re-counts after a
-/// compaction; both would paint an empty gauge, so the composer hides the
-/// whole readout until there is occupancy to show. An unknown window hides it
-/// too, so a bare `0` never labels the counts.
+/// Whether the context readout is worth painting: only an unknown window
+/// hides it. A known window always shows, even at zero, so the gauge is a
+/// stable fixture of the composer rather than something that disappears on
+/// a fresh or just-compacted session.
 fn ctx_visible(usage: &ContextUsage) -> bool {
-    usage.context_window > 0 && ctx_percent(usage).is_some_and(|percent| percent > 0.0)
+    usage.context_window > 0
 }
 
 /// Whether the context gauge warns: at or above 80% full.
@@ -536,8 +544,15 @@ pub struct SessionPanel {
     /// The pi model catalog for this endpoint, loaded once in the
     /// background; the picker falls back to session models until it lands.
     catalog: Vec<AgentModel>,
+    /// Whether the catalog read is still in flight. The pickers paint
+    /// skeleton rows until it lands, so an empty menu never reads as "no
+    /// models".
+    catalog_loading: bool,
     /// Item indices the user has expanded from their collapsed default.
     expanded: HashSet<usize>,
+    /// The section the user last toggled, and when: its chevron turns and an
+    /// opened body fades in, once.
+    disclosed: Option<(Toggle, Instant)>,
     /// Group indices (a run of tool calls, keyed by its first item) expanded.
     groups: HashSet<usize>,
     /// Work groups (a stretch of thinking and tool calls between assistant
@@ -680,6 +695,8 @@ impl Default for SessionPanel {
             list_pending: false,
             rows_dirty: false,
             catalog: Vec::new(),
+            catalog_loading: false,
+            disclosed: None,
             picker: None,
             picker_dismissed: None,
             picker_field: None,
@@ -896,6 +913,7 @@ impl SessionPanel {
         self.pi_state = None;
         self.live = None;
         self.catalog.clear();
+        self.catalog_loading = true;
         self.picker = None;
         self.picker_dismissed = None;
         self.picker_cursor = 0;
@@ -952,9 +970,12 @@ impl SessionPanel {
                 Endpoint::Local { .. } => pilus_client::agents::local(),
                 Endpoint::Remote { target, .. } => pilus_client::agents::remote(target),
             };
-            if let Some(pi) = configs.iter().find(|config| config.kind == "pi") {
-                let _ = catalog_tx.send(Update::Catalog(pi.models.clone()));
-            }
+            let models = configs
+                .iter()
+                .find(|config| config.kind == "pi")
+                .map(|pi| pi.models.clone())
+                .unwrap_or_default();
+            let _ = catalog_tx.send(Update::Catalog(models));
         });
         cx.notify();
     }
@@ -1003,6 +1024,7 @@ impl SessionPanel {
         self.pinned = false;
         self.last_seen = 0;
         self.loaded = false;
+        self.catalog_loading = false;
     }
 
     /// Take the session the extension socket says this pane moved to — a
@@ -1085,6 +1107,7 @@ impl SessionPanel {
                 Update::Empty => self.loaded = true,
                 Update::Catalog(catalog) => {
                     self.catalog = catalog;
+                    self.catalog_loading = false;
                 }
                 Update::Error(error) => {
                     self.loaded = true;
@@ -1293,7 +1316,7 @@ impl SessionPanel {
                             name: model.name.clone(),
                             is_default: known.is_some_and(|old| old.is_default),
                             default_effort: known.and_then(|old| old.default_effort.clone()),
-                            ..AgentModel::default()
+                            efforts: known.and_then(|old| old.efforts.clone()),
                         }
                     })
                     .collect();
@@ -1361,6 +1384,9 @@ impl SessionPanel {
             }
             return true;
         }
+        if self.pi_shortcut(keystroke, cx) {
+            return true;
+        }
         match keystroke.key.as_str() {
             "escape" => {
                 // Open menus eat the first Escape in topmost order; the next
@@ -1384,6 +1410,115 @@ impl SessionPanel {
             }
             _ => false,
         }
+    }
+
+    /// pi's own TUI shortcuts, answered natively so the panel responds to
+    /// the keys a pi user already reaches for. The bindings follow pi's
+    /// keybinding reference; anything else falls through to the composer.
+    fn pi_shortcut(&mut self, keystroke: &Keystroke, cx: &mut Context<PilusView>) -> bool {
+        let mods = keystroke.modifiers;
+        if mods.alt || mods.platform {
+            return false;
+        }
+        match (keystroke.key.as_str(), mods.control, mods.shift) {
+            ("tab", false, true) => self.cycle_thinking(cx),
+            ("t", true, false) => self.toggle_all(|kind| matches!(kind, ItemKind::Thinking { .. })),
+            ("o", true, false) => self.toggle_all(is_tool_output),
+            ("l", true, false) => self.toggle_picker(PickerKind::Model, cx),
+            ("p", true, shift) => self.cycle_model(if shift { -1 } else { 1 }, cx),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Step to the next thinking level the current model accepts, wrapping
+    /// like pi's Shift+Tab. A model with a single level has nothing to cycle.
+    fn cycle_thinking(&mut self, cx: &mut Context<PilusView>) {
+        let options = self.thinking_options();
+        if let Some(value) = cycle_value(&options, 1) {
+            self.choose_picker(PickerKind::Thinking, value, cx);
+        }
+    }
+
+    /// Step through the model picker's rows, like pi's Ctrl+P and
+    /// Shift+Ctrl+P.
+    fn cycle_model(&mut self, step: isize, cx: &mut Context<PilusView>) {
+        if let Some(value) = cycle_value(&self.model_options(), step) {
+            self.choose_picker(PickerKind::Model, value, cx);
+        }
+    }
+
+    /// Expand every item `wanted` picks, or collapse them all when every one
+    /// is already showing: pi's Ctrl+T for thinking and Ctrl+O for tool
+    /// output. Expanding also opens the work runs and call groups holding
+    /// the items, or they would open behind a collapsed header.
+    fn toggle_all(&mut self, wanted: fn(&ItemKind) -> bool) {
+        self.sync_list();
+        let targets: Vec<usize> = self
+            .transcript
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| wanted(&item.kind))
+            .map(|(index, _)| index)
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        if targets.iter().all(|index| self.item_shown(*index)) {
+            for index in &targets {
+                self.expanded.remove(index);
+            }
+        } else {
+            for index in targets {
+                self.expanded.insert(index);
+                if let Some(run) = self.work_run_of(index) {
+                    self.work_open.insert(run);
+                }
+                if let Some(group) = self.call_group_of(index) {
+                    self.groups.insert(group);
+                }
+            }
+        }
+        self.list.remeasure();
+    }
+
+    /// Whether an item is expanded and nothing collapsed hides it.
+    fn item_shown(&self, index: usize) -> bool {
+        self.expanded.contains(&index)
+            && self
+                .work_run_of(index)
+                .is_none_or(|run| self.work_open.contains(&run))
+            && self
+                .call_group_of(index)
+                .is_none_or(|group| self.groups.contains(&group))
+    }
+
+    /// The start of the collapsed work run holding `index`, if any.
+    fn work_run_of(&self, index: usize) -> Option<usize> {
+        let row = self.rows.get(self.row_of(index))?;
+        (row.kind == RowKind::Work && (row.start..row.end).contains(&index)).then_some(row.start)
+    }
+
+    /// The start of the multi-call group holding a tool call, keyed the way
+    /// [`Self::work_group`] keys it. A lone call has no group header.
+    fn call_group_of(&self, index: usize) -> Option<usize> {
+        let run = self.work_run_of(index)?;
+        let items = &self.transcript.items;
+        let is_call = |at: usize| matches!(items[at].kind, ItemKind::ToolCall { .. });
+        if !is_call(index) {
+            return None;
+        }
+        let row_end = self.rows.get(self.row_of(index))?.end;
+        let mut start = index;
+        while start > run && is_call(start - 1) {
+            start -= 1;
+        }
+        let mut end = index + 1;
+        while end < row_end && is_call(end) {
+            end += 1;
+        }
+        (end - start > 1).then_some(start)
     }
 
     /// Send the composer's text to the live agent: over the extension
@@ -1663,6 +1798,14 @@ impl SessionPanel {
     #[cfg(feature = "visual-test")]
     pub(super) fn set_catalog(&mut self, catalog: Vec<AgentModel>) {
         self.catalog = catalog;
+        self.catalog_loading = false;
+    }
+
+    /// Hold the pickers on their loading skeletons for a shot, since the
+    /// catalog read normally lands before the frame is captured.
+    #[cfg(feature = "visual-test")]
+    pub(super) fn set_catalog_loading(&mut self, loading: bool) {
+        self.catalog_loading = loading;
     }
 
     /// A freshly opened picker: an empty query, and the highlight on the
@@ -1760,21 +1903,59 @@ impl SessionPanel {
     /// Every row the open picker offers, current value marked.
     fn picker_list_options(&self) -> Vec<PickerOption> {
         match self.picker {
-            Some(PickerKind::Thinking) => THINKING_LEVELS
-                .iter()
-                .map(|level| PickerOption {
-                    label: level.to_string(),
-                    value: level.to_string(),
-                    hint: None,
-                    current: *level == self.current_thinking().unwrap_or_default(),
-                })
-                .collect(),
-            _ => picker_options(
-                &self.catalog,
-                &self.transcript.models,
-                &self.current_model_slug(),
-            ),
+            Some(PickerKind::Thinking) => self.thinking_options(),
+            _ => self.model_options(),
         }
+    }
+
+    /// The model picker's rows, current model marked.
+    fn model_options(&self) -> Vec<PickerOption> {
+        picker_options(
+            &self.catalog,
+            &self.transcript.models,
+            &self.current_model_slug(),
+        )
+    }
+
+    /// The thinking levels the current model accepts, as the catalog spells
+    /// them. `None` when the model is unknown, so the picker falls back to
+    /// pi's full set instead of guessing wrong.
+    fn current_model_efforts(&self) -> Option<Vec<String>> {
+        let slug = self.current_model_slug();
+        if slug.is_empty() {
+            return None;
+        }
+        self.catalog
+            .iter()
+            .find(|model| model_slug(model) == slug)
+            .and_then(|model| model.efforts.clone())
+    }
+
+    /// The thinking picker's rows: exactly the levels the current model
+    /// accepts. A model with no reasoning gets only `off` (pi's own rule),
+    /// and an unknown model gets the full set.
+    fn thinking_options(&self) -> Vec<PickerOption> {
+        let current = self.current_thinking().unwrap_or_default();
+        let levels: Vec<String> = match self.current_model_efforts() {
+            Some(efforts) if efforts.is_empty() => vec!["off".to_string()],
+            Some(efforts) => efforts,
+            None => THINKING_LEVELS
+                .iter()
+                .map(|level| (*level).to_string())
+                .collect(),
+        };
+        levels
+            .into_iter()
+            .map(|level| {
+                let value = pilus_client::thinking_level(&level);
+                PickerOption {
+                    label: pilus_client::effort_label(&level),
+                    current: value == current,
+                    value,
+                    hint: None,
+                }
+            })
+            .collect()
     }
 
     /// Move the open picker's highlight, keeping it in view.
@@ -1813,6 +1994,7 @@ impl SessionPanel {
         if !self.expanded.remove(&index) {
             self.expanded.insert(index);
         }
+        self.note_disclosed(Toggle::Item(index));
         // Remeasure the row in place, so expanding or collapsing it never
         // reads as the row vanishing.
         let row = self.row_of(index);
@@ -1906,6 +2088,7 @@ impl SessionPanel {
         if !self.groups.remove(&index) {
             self.groups.insert(index);
         }
+        self.note_disclosed(Toggle::Group(index));
         let row = self.row_of(index);
         self.list.remeasure_items(row..row + 1);
     }
@@ -1915,8 +2098,38 @@ impl SessionPanel {
         if !self.work_open.remove(&index) {
             self.work_open.insert(index);
         }
+        self.note_disclosed(Toggle::Work(index));
         let row = self.row_of(index);
         self.list.remeasure_items(row..row + 1);
+    }
+
+    /// Remember the section just toggled, so its chevron turns and, when it
+    /// opened, its body fades in.
+    fn note_disclosed(&mut self, toggle: Toggle) {
+        self.disclosed = Some((toggle, Instant::now()));
+    }
+
+    /// Whether `toggle` is the section the user flipped a moment ago.
+    fn recently_toggled(&self, toggle: Toggle) -> bool {
+        self.disclosed
+            .is_some_and(|(last, at)| last == toggle && at.elapsed() < DISCLOSE_WINDOW)
+    }
+
+    /// A section body, faded in when the user has just opened it.
+    ///
+    /// Only a fresh disclosure animates: the list drops the element state of
+    /// rows that scroll away, so a fade keyed on the body alone would replay
+    /// whenever an open section scrolled back into view.
+    fn disclose(&self, toggle: Toggle, body: Div) -> AnyElement {
+        if self.recently_toggled(toggle) {
+            style::enter(
+                gpui::SharedString::from(format!("session-disclose-{}", toggle_key(toggle))),
+                body,
+            )
+            .into_any_element()
+        } else {
+            body.into_any_element()
+        }
     }
 
     /// A chip: a small muted label on a subtle pill.
@@ -2158,12 +2371,13 @@ impl SessionPanel {
                     .text_color(label_color)
                     .child(label),
             )
-            .child(
-                div()
-                    .text_size(px(fonts.label))
-                    .text_color(theme.muted)
-                    .child(if expanded { "⌄" } else { "›" }),
-            )
+            .child(style::chevron(
+                format!("session-chevron-{}", toggle_key(toggle)),
+                expanded,
+                self.recently_toggled(toggle),
+                fonts.label,
+                theme.muted,
+            ))
     }
 
     /// A muted section: a clickable header with a chevron, and a body shown
@@ -2205,22 +2419,18 @@ impl SessionPanel {
                     .text_size(px(fonts.secondary))
                     .text_color(theme.muted)
                     .whitespace_normal()
-                    .child(clip_lines(&body, EXPANDED_LINES))
-                    .into_any_element(),
-                Section::Markdown(body_fonts) => div()
-                    .pb_2()
-                    .child(super::markdown::render(
-                        &body,
-                        Theme {
-                            fg: theme.muted,
-                            ..theme
-                        },
-                        body_fonts,
-                        &self.settings,
-                    ))
-                    .into_any_element(),
+                    .child(clip_lines(&body, EXPANDED_LINES)),
+                Section::Markdown(body_fonts) => div().pb_2().child(super::markdown::render(
+                    &body,
+                    Theme {
+                        fg: theme.muted,
+                        ..theme
+                    },
+                    body_fonts,
+                    &self.settings,
+                )),
             };
-            column = column.child(block);
+            column = column.child(self.disclose(Toggle::Item(index), block));
         }
         column.into_any_element()
     }
@@ -2258,14 +2468,17 @@ impl SessionPanel {
         if expanded {
             let details = tool_details(name, arguments, outcome);
             column = column.child(
-                div()
-                    .pb_2()
-                    .overflow_hidden()
-                    .font_family(style::mono_family(&self.settings))
-                    .text_size(px(fonts.secondary))
-                    .text_color(theme.muted)
-                    .whitespace_normal()
-                    .child(clip_lines(&details, EXPANDED_LINES)),
+                self.disclose(
+                    Toggle::Item(index),
+                    div()
+                        .pb_2()
+                        .overflow_hidden()
+                        .font_family(style::mono_family(&self.settings))
+                        .text_size(px(fonts.secondary))
+                        .text_color(theme.muted)
+                        .whitespace_normal()
+                        .child(clip_lines(&details, EXPANDED_LINES)),
+                ),
             );
         }
         column.into_any_element()
@@ -2327,7 +2540,7 @@ impl SessionPanel {
                     ));
                 }
             }
-            column = column.child(inner);
+            column = column.child(self.disclose(Toggle::Group(start), inner));
         }
         column.into_any_element()
     }
@@ -2380,7 +2593,7 @@ impl SessionPanel {
                     index += 1;
                 }
             }
-            column = column.child(inner);
+            column = column.child(self.disclose(Toggle::Work(start), inner));
         }
         column.into_any_element()
     }
@@ -2501,23 +2714,36 @@ impl SessionPanel {
         .into_any_element()
     }
 
-    /// Whether the body shows the fresh-session placeholder: the reader has
-    /// reported an empty session and nothing is on its way in — no prompt
-    /// sent, no live turn. An existing session always has items, so this is
-    /// exactly the fresh/start case.
+    /// Whether the body shows the fresh-session placeholder: the panel is
+    /// open with nothing on its way in — no prompt sent, no live turn. A
+    /// pane with no reported session is a fresh start, so the placeholder
+    /// paints at once instead of waiting on a read; a known session waits
+    /// for the reader to confirm it is empty, so an existing one never
+    /// flashes the placeholder before its first fold lands.
     fn shows_empty_state(&self) -> bool {
-        self.loaded
+        self.open
             && self.error.is_empty()
             && self.transcript.items.is_empty()
             && self.pending_prompt.is_none()
             && self.live.is_none()
+            && (self.loaded || self.reported.is_none())
+    }
+
+    /// The directory the session runs in, `~`-shortened, for the empty
+    /// state's subtitle.
+    fn cwd_display(&self) -> Option<String> {
+        let cwd = match self.endpoint.as_ref()? {
+            Endpoint::Local { cwd, .. } | Endpoint::Remote { cwd, .. } => cwd,
+        };
+        (!cwd.is_empty()).then(|| super::shorten_home(cwd))
     }
 
     /// The fresh-session placeholder, centered in the transcript area:
-    /// nothing has been asked yet, so the headline names the next step.
+    /// nothing has been asked yet, so the headline names the next step and
+    /// the directory says where it will run.
     fn empty_state(&self, fonts: Fonts) -> AnyElement {
         let theme = self.theme;
-        div()
+        let mut column = div()
             .flex_1()
             .min_h(px(0.0))
             .flex()
@@ -2533,8 +2759,25 @@ impl SessionPanel {
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(theme.fg)
                     .child("What should Pi do?"),
-            )
-            .into_any_element()
+            );
+        if let Some(cwd) = self.cwd_display() {
+            column = column.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(fonts.secondary))
+                    .text_color(theme.muted)
+                    .child(super::icon(
+                        include_bytes!("../../assets/icons/folder.svg"),
+                        14.0,
+                        theme.muted,
+                    ))
+                    .child(div().max_w(px(420.0)).truncate().child(cwd)),
+            );
+        }
+        column.into_any_element()
     }
 
     /// One list entry: a transcript row wrapped to the reading measure, or
@@ -2676,6 +2919,7 @@ impl SessionPanel {
         input.update(cx, |input, _cx| {
             input.set_style(theme, style::chrome_font(&self.settings), px(fonts.body));
         });
+        let has_text = !input.read(cx).value().trim().is_empty();
         let mut bar = div()
             .flex()
             .flex_col()
@@ -2690,7 +2934,7 @@ impl SessionPanel {
                         .child(input.clone()),
                 ),
             )
-            .child(self.meta_row(fonts, cx));
+            .child(self.meta_row(has_text, fonts, cx));
         if !self.status.is_empty() {
             bar = bar.child(
                 div()
@@ -2757,9 +3001,12 @@ impl SessionPanel {
 
     /// The composer's round button: a stop square while pi is working (it
     /// interrupts the run like pi's own Escape), the send arrow otherwise.
-    fn send_button(&self, cx: &mut Context<PilusView>) -> Stateful<Div> {
+    /// An idle button with an empty draft is disabled, so the arrow reads
+    /// as unavailable until there is something to send.
+    fn send_button(&self, enabled: bool, cx: &mut Context<PilusView>) -> Stateful<Div> {
         let theme = self.theme;
         let stopping = self.is_working();
+        let active = stopping || enabled;
         // A filled square reads as "stop" at 15px where the stroked outline
         // reads as a rounded box, so the glyph carries weight the send arrow
         // does not need.
@@ -2768,7 +3015,7 @@ impl SessionPanel {
         } else {
             include_bytes!("../../assets/icons/arrow-up.svg")
         };
-        div()
+        let mut button = div()
             .id("session-send")
             .flex()
             .items_center()
@@ -2780,18 +3027,24 @@ impl SessionPanel {
             .p_1()
             .flex_shrink_0()
             .rounded_full()
-            .bg(theme.bg)
-            .cursor_pointer()
-            .hover(move |style| style.bg(theme.border))
-            .child(super::icon(glyph, 15.0, theme.panel_fg))
-            .on_click(cx.listener(move |this: &mut PilusView, _, _, cx| {
-                if stopping {
-                    this.session.stop(cx);
-                } else {
-                    let input = this.session_prompt.clone();
-                    this.session.submit(&input, cx, false);
-                }
-            }))
+            .bg(theme.bg);
+        // The fill goes in before the glyph so it paints beneath it.
+        if active {
+            button = button
+                .cursor_pointer()
+                .hover_fill(theme.border, style::RADIUS_FULL)
+                .on_click(cx.listener(move |this: &mut PilusView, _, _, cx| {
+                    if stopping {
+                        this.session.stop(cx);
+                    } else {
+                        let input = this.session_prompt.clone();
+                        this.session.submit(&input, cx, false);
+                    }
+                }));
+        } else {
+            button = button.opacity(0.4);
+        }
+        button.child(super::icon(glyph, 15.0, theme.panel_fg))
     }
 
     /// The jump buttons beside the composer: the prompts menu over a row
@@ -2808,9 +3061,8 @@ impl SessionPanel {
                 .h(px(30.0))
                 .flex_shrink_0()
                 .rounded_full()
-                .bg(theme.panel)
                 .cursor_pointer()
-                .hover(move |style| style.bg(theme.border))
+                .state_fill(theme.panel, theme.border, style::RADIUS_FULL)
                 .child(super::icon(glyph, 15.0, theme.panel_fg))
         };
         // A narrow column beside the panel; the menu leaves it, so opening
@@ -3013,11 +3265,9 @@ impl SessionPanel {
     /// The `(spinner) Working` line above the composer, or `Steering…` when
     /// the pending prompt went out while pi was already working.
     ///
-    /// The frame advances with transcript growth, so it moves while pi works
-    /// without needing a repaint timer.
+    /// The spinner runs on its own clock rather than on transcript growth,
+    /// so it keeps turning through a long silent think.
     fn working_row(&self, fonts: Fonts) -> Div {
-        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let frame = FRAMES[self.transcript.items.len() % FRAMES.len()];
         div()
             .flex()
             .flex_row()
@@ -3027,7 +3277,11 @@ impl SessionPanel {
             .pb_1()
             .text_size(px(fonts.label))
             .text_color(self.theme.muted)
-            .child(frame)
+            .child(style::spinner(
+                "session-working-spinner",
+                fonts.label,
+                self.theme.muted,
+            ))
             .child(if self.pending_steering {
                 "Steering…"
             } else {
@@ -3052,8 +3306,9 @@ impl SessionPanel {
     }
 
     /// Model and thinking pickers, token stats, and the send arrow below the
-    /// input. The right side holds only the send button.
-    fn meta_row(&self, fonts: Fonts, cx: &mut Context<PilusView>) -> Div {
+    /// input. The right side holds only the send button, disabled while the
+    /// draft is empty.
+    fn meta_row(&self, has_text: bool, fonts: Fonts, cx: &mut Context<PilusView>) -> Div {
         let theme = self.theme;
         let transcript = &self.transcript;
         let mut row = div()
@@ -3129,7 +3384,7 @@ impl SessionPanel {
             );
         }
         row = row.child(div().flex_1());
-        row = row.child(self.send_button(cx));
+        row = row.child(self.send_button(has_text, cx));
         row
     }
 
@@ -3274,6 +3529,9 @@ impl SessionPanel {
         cx: &mut Context<PilusView>,
     ) -> AnyElement {
         let theme = self.theme;
+        if self.catalog_loading {
+            return self.picker_skeleton(fonts);
+        }
         let (options, matches) = self.picker_rows(&self.picker_filter(cx));
         let cursor = self.picker_cursor.min(matches.len().saturating_sub(1));
         let filtered = self.picker_filtered();
@@ -3368,6 +3626,34 @@ impl SessionPanel {
         self.anchored_picker(list, list_h)
     }
 
+    /// The picker menu while the catalog loads: skeleton bars in place of
+    /// the option rows, so the menu reserves the space the real rows will
+    /// take and the panel never flashes an empty list.
+    fn picker_skeleton(&self, fonts: Fonts) -> AnyElement {
+        let theme = self.theme;
+        let rows = PICKER_SKELETON_ROWS;
+        let list_h = super::picker_menu_h(rows, false);
+        let mut list = super::picker_menu("pilus-session-picker", theme).max_h(px(list_h));
+        for row in 0..rows {
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .w_full()
+                    .h(px(super::PICKER_ROW_H))
+                    .px_3()
+                    .child(style::skeleton(
+                        ("session-picker-skeleton", row),
+                        theme,
+                        relative(0.72),
+                        fonts.body,
+                    )),
+            );
+        }
+        self.anchored_picker(list, list_h)
+    }
+
     /// Float a picker menu above its chip: the anchored overlay offsets by
     /// the menu's exact height so opening it never moves the composer.
     fn anchored_picker(&self, menu: Stateful<Div>, height: f32) -> AnyElement {
@@ -3376,7 +3662,7 @@ impl SessionPanel {
                 .anchor(Anchor::TopLeft)
                 .offset(point(px(0.0), px(-(height + 6.0))))
                 .snap_to_window_with_margin(px(8.0))
-                .child(menu),
+                .child(style::enter("session-picker-enter", menu)),
         )
         .with_priority(1)
         .into_any_element()
@@ -4272,6 +4558,42 @@ fn clip_lines(text: &str, max: usize) -> String {
     shown
 }
 
+/// A stable name for a section toggle, for element ids.
+fn toggle_key(toggle: Toggle) -> String {
+    match toggle {
+        Toggle::Item(index) => format!("item-{index}"),
+        Toggle::Group(index) => format!("group-{index}"),
+        Toggle::Work(index) => format!("work-{index}"),
+    }
+}
+
+/// Whether an item is tool output: what pi's Ctrl+O folds.
+fn is_tool_output(kind: &ItemKind) -> bool {
+    matches!(
+        kind,
+        ItemKind::ToolCall { .. } | ItemKind::ToolResult { .. } | ItemKind::Bash { .. }
+    )
+}
+
+/// The value `step` rows away from the current option, wrapping at either
+/// end. With nothing marked current the cycle enters at the near end.
+/// `None` when there is no other value to move to.
+fn cycle_value(options: &[PickerOption], step: isize) -> Option<String> {
+    let len = options.len() as isize;
+    let current = options.iter().position(|option| option.current);
+    if len == 0 || (len == 1 && current.is_some()) {
+        return None;
+    }
+    let next = match current {
+        Some(at) => (at as isize + step).rem_euclid(len),
+        None if step < 0 => len - 1,
+        None => 0,
+    };
+    options
+        .get(next as usize)
+        .map(|option| option.value.clone())
+}
+
 /// Whether an item is part of a stretch of work between assistant replies.
 fn is_work(kind: &ItemKind) -> bool {
     matches!(
@@ -4640,6 +4962,7 @@ fn expand_local(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pilus_session::PiModel;
 
     #[test]
     fn truncate_marks_clipped_text() {
@@ -4736,6 +5059,65 @@ mod tests {
             vec!["pi/known", "other/model"]
         );
         assert_eq!(options[1].hint, None);
+    }
+
+    #[test]
+    fn the_thinking_picker_follows_the_models_efforts() {
+        let mut panel = SessionPanel::default();
+        let mut deepseek = model("hyper", "deepseek", "DeepSeek");
+        deepseek.efforts = Some(vec!["Low".into(), "High".into(), "Extra High".into()]);
+        let mut plain = model("pi", "plain", "Plain");
+        plain.efforts = Some(Vec::new());
+        panel.catalog = vec![deepseek, plain];
+        panel.pi_state = Some(PiState {
+            model: Some(PiModel {
+                provider: "hyper".into(),
+                id: "deepseek".into(),
+                name: "DeepSeek".into(),
+                ..PiModel::default()
+            }),
+            thinking: Some("high".into()),
+            ..PiState::default()
+        });
+        let options = panel.thinking_options();
+        assert_eq!(
+            options.iter().map(|o| o.value.as_str()).collect::<Vec<_>>(),
+            vec!["low", "high", "xhigh"]
+        );
+        assert_eq!(options[1].label, "High");
+        assert!(options[1].current);
+
+        // A non-reasoning model offers only `off`, as pi clamps it.
+        panel.pi_state = Some(PiState {
+            model: Some(PiModel {
+                provider: "pi".into(),
+                id: "plain".into(),
+                name: "Plain".into(),
+                ..PiModel::default()
+            }),
+            ..PiState::default()
+        });
+        assert_eq!(
+            panel
+                .thinking_options()
+                .iter()
+                .map(|o| o.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["off"]
+        );
+
+        // An unknown model falls back to pi's full set.
+        panel.catalog.clear();
+        panel.pi_state = Some(PiState {
+            model: Some(PiModel {
+                provider: "mystery".into(),
+                id: "x".into(),
+                name: "X".into(),
+                ..PiModel::default()
+            }),
+            ..PiState::default()
+        });
+        assert_eq!(panel.thinking_options().len(), THINKING_LEVELS.len());
     }
 
     #[test]
@@ -4840,6 +5222,64 @@ mod tests {
                 text: "c".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn ctrl_t_folds_every_thinking_block() {
+        let mut panel = SessionPanel::default();
+        grouped_transcript(&mut panel);
+        let thinking = |kind: &ItemKind| matches!(kind, ItemKind::Thinking { .. });
+
+        panel.toggle_all(thinking);
+        assert_eq!(panel.expanded, HashSet::from([1, 2, 8]));
+
+        // Every block already showing: the same key folds them all again.
+        panel.toggle_all(thinking);
+        assert!(panel.expanded.is_empty());
+    }
+
+    #[test]
+    fn ctrl_o_opens_tool_output_behind_its_work_header() {
+        let mut panel = SessionPanel::default();
+        grouped_transcript(&mut panel);
+
+        // Expanded items behind a collapsed work run are not showing, so the
+        // key opens the run rather than folding what nobody can see.
+        panel.expanded.extend([4, 5, 6]);
+        panel.toggle_all(is_tool_output);
+        assert!(panel.work_open.contains(&4));
+        assert_eq!(panel.expanded, HashSet::from([4, 5, 6]));
+
+        panel.toggle_all(is_tool_output);
+        assert!(panel.expanded.is_empty());
+    }
+
+    #[test]
+    fn cycling_wraps_and_enters_at_the_near_end() {
+        let option = |value: &str, current: bool| PickerOption {
+            label: value.to_string(),
+            value: value.to_string(),
+            hint: None,
+            current,
+        };
+        let options = vec![
+            option("low", false),
+            option("high", true),
+            option("xhigh", false),
+        ];
+        assert_eq!(cycle_value(&options, 1).as_deref(), Some("xhigh"));
+        assert_eq!(cycle_value(&options, -1).as_deref(), Some("low"));
+
+        let last = vec![option("low", false), option("high", true)];
+        assert_eq!(cycle_value(&last, 1).as_deref(), Some("low"));
+
+        let unmarked = vec![option("a", false), option("b", false)];
+        assert_eq!(cycle_value(&unmarked, 1).as_deref(), Some("a"));
+        assert_eq!(cycle_value(&unmarked, -1).as_deref(), Some("b"));
+
+        // A non-reasoning model's lone `off` has nowhere to go.
+        assert_eq!(cycle_value(&[option("off", true)], 1), None);
+        assert_eq!(cycle_value(&[], 1), None);
     }
 
     #[test]
@@ -5190,11 +5630,11 @@ mod tests {
 
         // The live report still wins over the catalog default.
         panel.pi_state = Some(PiState {
-            model: Some(pilus_session::PiModel {
+            model: Some(PiModel {
                 provider: "openrouter".to_string(),
                 id: "gpt".to_string(),
                 name: "GPT".to_string(),
-                ..pilus_session::PiModel::default()
+                ..PiModel::default()
             }),
             thinking: Some("low".to_string()),
             ..PiState::default()
@@ -5480,7 +5920,8 @@ mod tests {
             context_window: 1,
             percent: Some(82.0),
         }));
-        // Nothing to show until pi re-counts after a compaction.
+        // After a compaction pi re-counts: the readout still paints, with an
+        // empty track and the counts, rather than vanishing.
         let uncounted = ContextUsage {
             tokens: None,
             context_window: 1_048_576,
@@ -5488,11 +5929,10 @@ mod tests {
         };
         assert_eq!(ctx_percent(&uncounted), None);
         assert_eq!(ctx_counts(&uncounted), "–/1M");
-        assert!(!ctx_visible(&uncounted));
+        assert!(ctx_visible(&uncounted));
 
-        // A fresh session counts zero: the composer hides the readout rather
-        // than paint an empty gauge.
-        assert!(!ctx_visible(&ContextUsage {
+        // A fresh session counts zero, and the gauge still holds its place.
+        assert!(ctx_visible(&ContextUsage {
             tokens: Some(0),
             context_window: 1_048_576,
             percent: Some(0.0),
@@ -6047,11 +6487,18 @@ mod tests {
     #[test]
     fn a_fresh_session_names_the_next_step() {
         let mut panel = SessionPanel::default();
-        // Nothing has loaded yet: hold the body blank so a remote pane does
-        // not flash the placeholder before its first fold lands.
+        // Closed: the placeholder never paints.
         assert!(!panel.shows_empty_state());
 
-        // The reader confirmed an empty session: this is the fresh case.
+        // A pane with no reported session is a fresh start: the placeholder
+        // paints at once instead of waiting on a read.
+        panel.open = true;
+        assert!(panel.shows_empty_state());
+
+        // A reported session waits for the reader to confirm it is empty, so
+        // an existing pane never flashes the placeholder before its fold.
+        panel.reported = Some("s1".to_string());
+        assert!(!panel.shows_empty_state());
         panel.loaded = true;
         assert!(panel.shows_empty_state());
 
@@ -6068,6 +6515,7 @@ mod tests {
         // A fresh session with the first prompt already sent shows the
         // optimistic bubble instead of the placeholder.
         let mut fresh = SessionPanel {
+            open: true,
             loaded: true,
             ..SessionPanel::default()
         };
@@ -6076,6 +6524,7 @@ mod tests {
 
         // A live turn is content too, even before the file catches up.
         let mut streaming = SessionPanel {
+            open: true,
             loaded: true,
             ..SessionPanel::default()
         };

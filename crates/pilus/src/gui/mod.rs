@@ -133,9 +133,6 @@ const SIDEBAR_NEST_INDENT: f32 = 4.0;
 /// Share of the selected pill's strength a hover fill carries, so hovering a
 /// row hints at the selection without matching it.
 const SIDEBAR_HOVER_WEIGHT: f32 = 0.6;
-/// Left inset for the children of a section, so rows sit under their section
-/// header's label instead of flush with its chevron.
-const SIDEBAR_CHILD_INDENT: f32 = 8.0;
 /// Box every leading sidebar glyph sits in, so labels share one column
 /// whatever the glyph is: chevron, folder, brand mark, or status dot.
 const SIDEBAR_GLYPH: f32 = 14.0;
@@ -214,6 +211,11 @@ const CARD_GAP_RIGHT: f32 = CARD_GAP;
 const SIDEBAR_TOGGLE_W: f32 = 28.0;
 /// Height of a tab pill in the top chrome.
 const TAB_HEIGHT: f32 = 26.0;
+/// Top-left of the traffic lights: their left edge shares the sidebar glyph
+/// column (row edge + row padding) and their 12px discs centre on the 20px
+/// midline of the sidebar header and tab strip.
+const TRAFFIC_LIGHT_POSITION: Point<Pixels> =
+    point(px(SIDEBAR_ROW_EDGE + SIDEBAR_ROW_PAD), px(14.0));
 /// Left inset for the collapsed tab strip: clears the floating traffic lights
 /// (the third light ends near 64px) with a comfortable gap before the toggle.
 const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
@@ -576,10 +578,7 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
                 titlebar: Some(TitlebarOptions {
                     title: Some("pilus".into()),
                     appears_transparent: true,
-                    // Centred on the sidebar toggle icon box (22px from the
-                    // window top) and left-aligned with the sidebar nav glyphs
-                    // (12px panel padding + 8px row padding).
-                    traffic_light_position: Some(point(px(12.0), px(15.0))),
+                    traffic_light_position: Some(TRAFFIC_LIGHT_POSITION),
                 }),
                 ..Default::default()
             },
@@ -745,7 +744,7 @@ fn open_main_window(
             titlebar: Some(TitlebarOptions {
                 title: Some("pilus".into()),
                 appears_transparent: true,
-                traffic_light_position: Some(point(px(12.0), px(15.0))),
+                traffic_light_position: Some(TRAFFIC_LIGHT_POSITION),
             }),
             ..Default::default()
         },
@@ -10581,7 +10580,7 @@ impl PilusView {
         if self.workspaces_collapsed {
             return section;
         }
-        let mut children = div().flex().flex_col().gap_1().pl(px(SIDEBAR_CHILD_INDENT));
+        let mut children = div().flex().flex_col().gap_1();
         let mut any = false;
         for id in self.connected_endpoints() {
             let host = id.machine_id().map(|_| self.endpoint_label(&id));
@@ -10598,6 +10597,7 @@ impl PilusView {
                     .flex()
                     .items_center()
                     .h(px(SIDEBAR_BAND_HEIGHT))
+                    .pl(px(SIDEBAR_ROW_PAD))
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
                     .child("No workspaces yet"),
@@ -10649,9 +10649,7 @@ impl PilusView {
         let mut children = div()
             .flex()
             .flex_col()
-            .gap_1()
-            .pl(px(SIDEBAR_CHILD_INDENT))
-            .pr(px(SIDEBAR_CHILD_INDENT));
+            .gap_1();
         let mut any = false;
         // The AGENTS-scope menu row narrows the dock to the visible surface's
         // active workspace, mirroring the daemon's own scope filter.
@@ -10686,6 +10684,7 @@ impl PilusView {
                     .flex()
                     .items_center()
                     .h(px(SIDEBAR_BAND_HEIGHT))
+                    .pl(px(SIDEBAR_ROW_PAD))
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
                     .child("No agents"),

@@ -1388,12 +1388,6 @@ struct PilusView {
     /// client flag for the agents list, so this is purely local. Both path
     /// toggles default to hidden and persist through `Settings`.
     sidebar_agent_paths: bool,
-    /// Workspace ids pinned to the top of WORKSPACES, per endpoint. The
-    /// daemon's own dock tracks these client-side too, so the label and the
-    /// action pair without a protocol field.
-    pinned_workspaces: HashSet<(String, String)>,
-    /// Live agent panes pinned to the top of AGENTS, per endpoint.
-    pinned_agents: HashSet<(String, String)>,
     /// Whether AGENTS shows only the active workspace's agents.
     agents_this_workspace: bool,
     /// The open right-click menu on a WORKSPACES or AGENTS row, if any.
@@ -1851,8 +1845,6 @@ impl PilusView {
             sidebar_layout: None,
             sidebar_workspace_paths,
             sidebar_agent_paths,
-            pinned_workspaces: HashSet::new(),
-            pinned_agents: HashSet::new(),
             agents_this_workspace: false,
             context_menu: None,
             menu_prompt: None,
@@ -8103,27 +8095,20 @@ impl PilusView {
         let Some(menu) = self.context_menu.as_ref() else {
             return Vec::new();
         };
-        let (pinned, linked) = match &menu.target {
+        let linked = match &menu.target {
+            // Only a confirmed linked checkout offers Delete Worktree;
+            // unknown and known-not-linked leave the row out.
             SidebarMenuTarget::Workspace {
                 endpoint,
                 workspace_id,
                 ..
-            } => (
-                self.pinned_workspaces
-                    .contains(&(endpoint.clone(), workspace_id.clone())),
-                // Only a confirmed linked checkout offers Delete Worktree;
-                // unknown and known-not-linked leave the row out.
-                self.worktree_linked
-                    .get(&(endpoint.clone(), workspace_id.clone()))
-                    .is_some_and(Option::is_some),
-            ),
-            SidebarMenuTarget::Agent { endpoint, pane, .. } => (
-                self.pinned_agents
-                    .contains(&(endpoint.clone(), pane.clone())),
-                false,
-            ),
+            } => self
+                .worktree_linked
+                .get(&(endpoint.clone(), workspace_id.clone()))
+                .is_some_and(Option::is_some),
+            SidebarMenuTarget::Agent { .. } => false,
         };
-        menu.rows(pinned, linked)
+        menu.rows(linked)
     }
 
     /// Drive the open context menu from the keyboard.
@@ -8217,10 +8202,6 @@ impl PilusView {
                 self.close_context_menu();
                 self.menu_open_rename(&target, cx);
             }
-            (SidebarMenuTarget::Workspace { .. }, SidebarItem::Pin | SidebarItem::Unpin) => {
-                self.close_context_menu();
-                self.menu_pin_workspace(&target, item == SidebarItem::Pin, cx);
-            }
             (SidebarMenuTarget::Workspace { .. }, SidebarItem::TogglePaths) => {
                 self.close_context_menu();
                 self.menu_toggle_workspace_paths(cx);
@@ -8300,10 +8281,6 @@ impl PilusView {
                 self.close_context_menu();
                 self.menu_close_agent(&target, cx);
             }
-            (SidebarMenuTarget::Agent { .. }, SidebarItem::Pin | SidebarItem::Unpin) => {
-                self.close_context_menu();
-                self.menu_pin_agent(&target, item == SidebarItem::Pin, cx);
-            }
             (SidebarMenuTarget::Agent { .. }, SidebarItem::TogglePaths) => {
                 self.close_context_menu();
                 self.menu_toggle_agent_paths(cx);
@@ -8340,8 +8317,6 @@ impl PilusView {
         };
         let workspace_id = workspace_id.clone();
         let name = name.clone();
-        self.pinned_workspaces
-            .remove(&(endpoint.clone(), workspace_id.clone()));
         let tx = self.menu_tx.clone();
         std::thread::spawn(move || {
             let error = client
@@ -8408,57 +8383,6 @@ impl PilusView {
         );
     }
 
-    /// Pin or unpin a workspace; the daemon floats its group first on the
-    /// next catalog projection.
-    fn menu_pin_workspace(
-        &mut self,
-        target: &SidebarMenuTarget,
-        pinned: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let SidebarMenuTarget::Workspace {
-            endpoint,
-            workspace_id,
-            name,
-            ..
-        } = target
-        else {
-            return;
-        };
-        let key = (endpoint.clone(), workspace_id.clone());
-        if pinned {
-            self.pinned_workspaces.insert(key.clone());
-        } else {
-            self.pinned_workspaces.remove(&key);
-        }
-        let Some(mut client) = self.control_client_for_endpoint(&self.endpoint_by_key(endpoint))
-        else {
-            self.status = "no control connection for the selected endpoint".to_string();
-            cx.notify();
-            return;
-        };
-        let workspace_id = workspace_id.clone();
-        let name = name.clone();
-        let tx = self.menu_tx.clone();
-        std::thread::spawn(move || {
-            let error = client
-                .pin_workspace(&workspace_id, pinned)
-                .err()
-                .map(|error| error.to_string());
-            tx.send(MenuOpResult {
-                ok: format!("{} {name}", if pinned { "pinned" } else { "unpinned" }),
-                error,
-                renamed_workspace: None,
-                renamed_agent: None,
-                worktree_probe: None,
-                worktree_cleared: None,
-                worktree_escalated: None,
-            })
-            .ok();
-        });
-        cx.notify();
-    }
-
     /// Flip whether the WORKSPACES rows draw their path line, persisting the
     /// choice and pushing it to the daemon's own dock.
     fn menu_toggle_workspace_paths(&mut self, cx: &mut Context<Self>) {
@@ -8508,7 +8432,6 @@ impl PilusView {
         };
         let pane = pane.clone();
         let name = name.clone();
-        self.pinned_agents.remove(&(endpoint.clone(), pane.clone()));
         self.agent_sel = None;
         let tx = self.menu_tx.clone();
         std::thread::spawn(move || {
@@ -8527,27 +8450,6 @@ impl PilusView {
             })
             .ok();
         });
-        cx.notify();
-    }
-
-    /// Pin or unpin a live agent; pinned rows float to the top of AGENTS.
-    fn menu_pin_agent(&mut self, target: &SidebarMenuTarget, pinned: bool, cx: &mut Context<Self>) {
-        let SidebarMenuTarget::Agent {
-            endpoint,
-            pane,
-            name,
-            ..
-        } = target
-        else {
-            return;
-        };
-        let key = (endpoint.clone(), pane.clone());
-        if pinned {
-            self.pinned_agents.insert(key);
-        } else {
-            self.pinned_agents.remove(&key);
-        }
-        self.status = format!("{} {}", if pinned { "pinned" } else { "unpinned" }, name);
         cx.notify();
     }
 
@@ -8578,9 +8480,19 @@ impl PilusView {
         else {
             return;
         };
+        // The task board is the native Tasks page, not the daemon's view.
+        if item == SidebarItem::OpenBoard {
+            self.activate_endpoint(
+                self.endpoint_by_key(endpoint),
+                Some(workspace_id.clone()),
+                None,
+                cx,
+            );
+            self.open_tasks(cx);
+            return;
+        }
         let (bind, nav) = match item {
             SidebarItem::OpenGit => ('g', None),
-            SidebarItem::OpenBoard => ('o', Some(NavKind::Orchestration)),
             SidebarItem::OpenMission => ('m', Some(NavKind::Mission)),
             _ => return,
         };
@@ -10710,8 +10622,7 @@ impl PilusView {
         let mut any = false;
         for id in self.connected_endpoints() {
             let host = id.machine_id().map(|_| self.endpoint_label(&id));
-            let workspaces = self.endpoint_workspaces(&id);
-            for workspace in workspaces {
+            for workspace in self.endpoint_workspaces(&id) {
                 any = true;
                 children =
                     children.child(self.workspace_row(&id, workspace, host.as_deref(), false, cx));
@@ -10832,10 +10743,6 @@ impl PilusView {
             if agents.is_empty() {
                 continue;
             }
-            // Pinned agents float to the top; a stable sort keeps the pinned
-            // and unpinned blocks in the order the daemon reported them.
-            agents
-                .sort_by_key(|agent| !self.pinned_agents.contains(&(id.key(), agent.pane.clone())));
             any = true;
             for agent in agents {
                 children = children.child(self.agent_row(&id, agent, cx));
@@ -12617,7 +12524,6 @@ fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
     match item {
         SidebarItem::Close => include_bytes!("../../assets/icons/x.svg"),
         SidebarItem::Rename => include_bytes!("../../assets/icons/pencil.svg"),
-        SidebarItem::Pin | SidebarItem::Unpin => include_bytes!("../../assets/icons/pin.svg"),
         SidebarItem::TogglePaths => include_bytes!("../../assets/icons/folder.svg"),
         SidebarItem::QuickActions => include_bytes!("../../assets/icons/chevron-right.svg"),
         SidebarItem::CopyPath | SidebarItem::CopyBranch => {

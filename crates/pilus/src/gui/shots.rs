@@ -107,6 +107,14 @@ pub fn run() -> Result<()> {
     let mut cx = context()?;
     shoot(
         &mut cx,
+        "terminal-glyphs",
+        560.0,
+        300.0,
+        Duration::ZERO,
+        |_, cx| cx.new(|_| GlyphGridView),
+    )?;
+    shoot(
+        &mut cx,
         "playground",
         820.0,
         3600.0,
@@ -937,6 +945,134 @@ pub fn run_main() -> Result<()> {
     view_cell.borrow_mut().take();
     drop(view);
     Ok(())
+}
+
+/// The lines the glyph grid paints: the Claude Code logo, box drawing, the
+/// block quadrants fonts often lack, wide fallbacks, and descenders.
+const GLYPH_LINES: [&str; 10] = [
+    " ▐▛███▜▌   Claude Code v2.0",
+    "▝▜█████▛▘  Opus 4.5 · Claude Max",
+    "  ▘▘ ▝▝    ~/projects/pilus",
+    "╭──────────────╮ ⏺ ✻ ⎿ … ● → ✓ ✗ ❯ ⚡",
+    "│ gjpqy ÄÉÅ @W │ ▀▄█▌▐░▒▓ ▖▗▘▙▚▛▜▝▞▟",
+    "╰──────────────╯ ━┃┏┓┗┛ ╔═╗ ▔▁▏▕",
+    "italic: The quick brown fox jumps",
+    "bold:   The quick brown fox jumps",
+    "wide:   日本語 テスト 🙂 ok",
+    "  ⎿  Read 42 lines (ctrl+o to expand)",
+];
+
+/// A terminal surface painted through [`super::render_grid`] from a synthetic
+/// frame, so glyph clipping can be reviewed without a daemon.
+struct GlyphGridView;
+
+impl Render for GlyphGridView {
+    fn render(
+        &mut self,
+        window: &mut Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{ParentElement as _, Styled as _};
+        use pilus_protocol::{CellData, FrameData};
+        let theme = Theme::default();
+        let settings = Settings::default();
+        let font_size = settings.terminal_font_size;
+        let width: u16 = 44;
+        let lines: Vec<&str> = std::iter::repeat_n("", usize::from(super::SKIPPED_DAEMON_ROWS))
+            .chain(GLYPH_LINES)
+            .chain(std::iter::repeat_n(
+                "",
+                usize::from(super::SKIPPED_DAEMON_BOTTOM_ROWS),
+            ))
+            .collect();
+        let height = lines.len() as u16;
+        let mut cells = Vec::with_capacity(usize::from(width) * usize::from(height));
+        for (row, line) in lines.iter().enumerate() {
+            let logo = (2..5).contains(&row);
+            let mods = match row {
+                8 => super::M_ITALIC,
+                9 => super::M_BOLD,
+                _ => 0,
+            };
+            let mut column = 0u16;
+            for grapheme in line.chars() {
+                let symbol = grapheme.to_string();
+                let wide = pilus_protocol::symbol_width(&symbol) >= 2;
+                let fg = if logo && column < 10 {
+                    (2 << 24) | 0x00d7_7757
+                } else {
+                    0
+                };
+                cells.push(CellData {
+                    symbol,
+                    fg,
+                    bg: 0,
+                    mods,
+                });
+                column += 1;
+                if wide {
+                    cells.push(CellData {
+                        symbol: String::new(),
+                        fg,
+                        bg: 0,
+                        mods,
+                    });
+                    column += 1;
+                }
+            }
+            while column < width {
+                cells.push(CellData::blank(0, 0));
+                column += 1;
+            }
+            cells.truncate((row + 1) * usize::from(width));
+        }
+        let frame = FrameData {
+            width,
+            height,
+            cells,
+            hyperlinks: Vec::new(),
+            cursor: None,
+            cursor_visible: false,
+        };
+        let cell_height = (font_size * super::LINE_HEIGHT_RATIO).round().max(1.0);
+        let cell_width: f32 = window
+            .text_system()
+            .shape_line(
+                "M".into(),
+                px(font_size),
+                &[gpui::TextRun {
+                    len: 1,
+                    font: gpui::font(settings.terminal_font.as_str()),
+                    color: gpui::Hsla::default(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            )
+            .width
+            .into();
+        gpui::div()
+            .size_full()
+            .bg(theme.window_bg)
+            .p_4()
+            .child(super::render_grid(
+                &frame,
+                theme,
+                font_size,
+                settings.terminal_font.as_str(),
+                px(cell_height),
+                None,
+                cell_width,
+                0,
+                width,
+                height - super::SKIPPED_DAEMON_ROWS - super::SKIPPED_DAEMON_BOTTOM_ROWS,
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+            ))
+    }
 }
 
 /// Advance the simulated clock and drain tasks, so polling loops run.

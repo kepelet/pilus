@@ -1424,10 +1424,11 @@ struct PilusView {
     /// The pi pane the session panel is pinned to, if auto-switch put one
     /// up. `None` means the card shows the terminal again.
     pi_view: Option<PiView>,
-    /// A pi pane whose waiting panel the user escaped, keyed by endpoint
-    /// and pane: the terminal stays up until the pane reports a session
-    /// or loses focus, so a pi that never reports is not pinned forever.
-    pi_released: Option<(EndpointId, String)>,
+    /// A pi pane whose panel the user closed or browsed away from, keyed by
+    /// endpoint, pane, and the session that was showing: the terminal stays
+    /// up until the pane reports a session (for a waiting panel) or loses
+    /// focus, so a closed panel is not reopened every tick.
+    pi_released: Option<(EndpointId, String, Option<String>)>,
     /// A pi pin awaiting `agent.list` confirmation, set when pilus itself
     /// moved focus to a pane the snapshot already knew was pi — a sidebar
     /// row or a tab holding one. The snapshot's own record stands in so the
@@ -4160,28 +4161,31 @@ impl PilusView {
         {
             desired = Some((view, agent));
         }
-        // A waiting panel the user escaped stays released until the pane
-        // reports a session or loses focus; reopening it every tick would
-        // be the terminal flash all over again.
-        if let Some(key) = self.pi_released.clone() {
+        // A panel the user closed or browsed away from stays released until
+        // the pane reports a session (a waiting panel that finally got one)
+        // or loses focus; reopening it every tick would be the terminal
+        // flash, or the history browse, all over again.
+        if let Some((endpoint, pane, released_session)) = self.pi_released.clone() {
             match &desired {
-                Some((view, _))
-                    if view.endpoint == key.0 && view.pane == key.1 && view.session.is_none() =>
-                {
-                    return false;
+                Some((view, _)) if view.endpoint == endpoint && view.pane == pane => {
+                    if released_session.is_none() && view.session.is_some() {
+                        self.pi_released = None;
+                    } else {
+                        return false;
+                    }
                 }
                 _ => self.pi_released = None,
             }
         }
         let view = desired.as_ref().map(|(view, _)| view.clone());
         if view == self.pi_view {
-            // A waiting panel that got closed by hand is a release, not a
-            // state change: remember it so the next tick does not reopen.
+            // A panel that got closed by hand is a release, not a state
+            // change: remember it so the next tick does not reopen.
             if let Some(view) = &self.pi_view
-                && view.session.is_none()
                 && !self.session.is_open()
             {
-                self.pi_released = Some((view.endpoint.clone(), view.pane.clone()));
+                let session = view.session.clone();
+                self.pi_released = Some((view.endpoint.clone(), view.pane.clone(), session));
             }
             return false;
         }
@@ -4245,6 +4249,32 @@ impl PilusView {
             }
         }
         true
+    }
+
+    /// Remember that the auto-pinned panel was dismissed, so the next sync
+    /// does not reopen it while the same pane stays focused. A manual panel
+    /// (`--session-ui`, no pane) records nothing.
+    fn record_pi_release(&mut self) {
+        if let Some(view) = &self.pi_view {
+            let session = self.session.live_session().or_else(|| view.session.clone());
+            self.pi_released = Some((view.endpoint.clone(), view.pane.clone(), session));
+        }
+    }
+
+    /// Close the Pi Session panel from its header button.
+    fn release_pi_session(&mut self, cx: &mut Context<Self>) {
+        self.record_pi_release();
+        self.session.close();
+        self.session.set_pinned(false);
+        cx.notify();
+    }
+
+    /// Detach the panel from its live pane before browsing the history.
+    /// The chosen session is read-only, so the auto-pin must not retarget it
+    /// back to the pane's current session next tick.
+    fn release_pi_for_history(&mut self) {
+        self.record_pi_release();
+        self.session.set_pinned(false);
     }
 
     /// Open the Pi Session panel for the active workspace's agent.

@@ -21,7 +21,8 @@ mod rpc;
 mod tail;
 
 pub use discover::{
-    dir_name_for, find_any_by_id, find_by_id, latest, list, resolve, sessions_dir, sessions_root,
+    SessionListing, dir_name_for, find_any_by_id, find_by_id, find_by_partial_id, first_prompt_in,
+    id_from_path, latest, list, listing, resolve, sessions_dir, sessions_root,
 };
 pub use entry::{Header, Item, ItemKind, ToolOutcome, Transcript, TranscriptMeta, Usage};
 pub use rpc::{

@@ -20,7 +20,7 @@ use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, HeadlessAppContext, Render, Window, point, px, size};
 
 use super::machines::MachineManagerView;
-use super::session::PickerKind;
+use super::session::{HistoryEntry, PickerKind};
 use super::theme::Theme;
 use super::update_window::UpdateWindow;
 use super::updater::Updater;
@@ -384,6 +384,60 @@ pub fn run() -> Result<()> {
             .save(format!("{OUT}/session-picker-loading.png"))
             .context("save session-picker-loading")?;
         println!("shot: {OUT}/session-picker-loading.png");
+    }
+    // The session history menu under the header's clock button, with the
+    // live session marked and older ones titled by their openers.
+    {
+        let cell: Rc<RefCell<Option<gpui::Entity<PilusView>>>> = Rc::new(RefCell::new(None));
+        let slot = cell.clone();
+        let spec = sample.to_string_lossy().into_owned();
+        let window = cx
+            .open_window(size(px(1240.0), px(780.0)), move |window, cx| {
+                let view = cx.new(move |cx| {
+                    PilusView::new(
+                        pilus_client::ConnectTarget::local(),
+                        None,
+                        settings(),
+                        Rc::new(RefCell::new(MachineSignal::default())),
+                        Rc::new(RefCell::new(Theme::default())),
+                        Some(spec),
+                        window,
+                        cx,
+                    )
+                });
+                *slot.borrow_mut() = Some(view.clone());
+                view
+            })
+            .context("open session-history")?;
+        std::thread::sleep(Duration::from_millis(400));
+        cx.run_until_parked();
+        if let Some(view) = cell.borrow().clone() {
+            cx.update(|app| {
+                view.update(app, |view, cx| {
+                    let entry = |id: &str, title: &str| HistoryEntry {
+                        path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+                        id: id.to_string(),
+                        title: title.to_string(),
+                    };
+                    view.session.open_history_shot(vec![
+                        entry("shot-0001", "Refactor the auth module"),
+                        entry("shot-0000", "Add a retry to the uploader"),
+                        entry("shot-0002", ""),
+                    ]);
+                    cx.notify();
+                });
+            });
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        cx.run_until_parked();
+        let image = cx
+            .capture_screenshot(window.into())
+            .context("capture session-history")?;
+        std::fs::create_dir_all(OUT).context("create shots dir")?;
+        image
+            .save(format!("{OUT}/session-history.png"))
+            .context("save session-history")?;
+        println!("shot: {OUT}/session-history.png");
     }
     // The waiting panel a focused pi gets before its extension reports:
     // the auto pin's stand-in while the socket is discovered.

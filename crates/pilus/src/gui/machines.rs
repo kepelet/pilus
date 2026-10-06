@@ -445,45 +445,18 @@ impl MachineManagerView {
     fn add_form(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let installing = self.busy.as_deref() == Some("add");
-        let check = div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(14.0))
-            .h(px(14.0))
-            .rounded_sm()
-            .border_1()
-            .border_color(if self.form.install {
-                theme.accent
-            } else {
-                theme.muted
-            })
-            .bg(if self.form.install {
-                theme.accent
-            } else {
-                theme.panel_dim
-            })
-            .child(if self.form.install {
-                div().w(px(6.0)).h(px(6.0)).rounded_sm().bg(theme.window_bg)
-            } else {
-                div()
-            });
-        let checkbox = div()
-            .id("pilus-machine-install")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .cursor_pointer()
-            .text_size(px(self.fonts().secondary))
-            .text_color(theme.fg)
-            .child(check)
-            .child("Install luvus if needed")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.form.install = !this.form.install;
-                this.pending_remove = None;
-                cx.notify();
-            }));
+        let checkbox = style::checkbox(
+            "pilus-machine-install",
+            self.form.install,
+            "Install luvus if needed",
+            theme,
+            self.fonts().secondary,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.form.install = !this.form.install;
+            this.pending_remove = None;
+            cx.notify();
+        }));
         let mut add = style::button(
             "pilus-machine-add",
             if installing {
@@ -508,13 +481,11 @@ impl MachineManagerView {
             .gap_2()
             .px_3()
             .pt_3()
-            .child(
-                div()
-                    .text_size(px(self.fonts().body))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(theme.fg)
-                    .child("Add a machine"),
-            )
+            .child(style::section_label(
+                theme,
+                "ADD A MACHINE",
+                self.fonts().label,
+            ))
             .child(
                 div()
                     .flex()
@@ -712,14 +683,7 @@ impl MachineManagerView {
             .pt_3()
             .pb_2()
             .overflow_y_scroll();
-        list = list.child(
-            div()
-                .text_size(px(self.fonts().label))
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(theme.muted)
-                .pb_1()
-                .child("SAVED MACHINES"),
-        );
+        list = list.child(style::section_label(theme, "SAVED MACHINES", self.fonts().label).pb_1());
         if self.machines.is_empty() {
             return list.child(
                 div()
@@ -786,12 +750,7 @@ impl Render for MachineManagerView {
                     .justify_between()
                     .px_3()
                     .pt_3()
-                    .child(
-                        div()
-                            .text_size(px(style::scaled(&self.shared_settings, 15.0)))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("Remote Machines"),
-                    )
+                    .child(style::title(theme, "Remote Machines", self.fonts().title))
                     .child(refresh),
             )
             .child(self.add_form(window, cx))

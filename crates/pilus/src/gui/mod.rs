@@ -947,23 +947,18 @@ struct Endpoint {
     feed: AgentFeed,
 }
 
-/// A sidebar section header's click handler: collapse the section, or run
-/// its add action.
+/// A sidebar section header's click handler: collapse the section.
 type SectionAction = Box<dyn Fn(&mut PilusView, &mut Context<PilusView>)>;
 
-/// A sidebar section header's identity and its two actions. Bundling them
-/// lets every section share one header builder, so their labels stay in one
-/// column and their add buttons on one edge.
+/// A sidebar section header's identity and its toggle. Bundling them lets
+/// every section share one header builder, so their labels stay in one
+/// column.
 struct SectionHeader {
     /// Clickable chevron-and-label row.
     id: &'static str,
     label: &'static str,
     collapsed: bool,
     toggle: SectionAction,
-    /// The section's add button: its element id and its click action.
-    /// `None` when the section has nothing to add, so a control that does
-    /// nothing never shows.
-    add: Option<(&'static str, SectionAction)>,
 }
 
 /// The focused pi pane the session panel currently stands in for, when
@@ -1326,6 +1321,8 @@ struct PilusView {
     tab_sel_at: Instant,
     /// Keeps the tab list scrolled when tabs overflow the strip.
     tab_scroll: ScrollHandle,
+    /// The tab index the strip last scrolled to, so it only follows changes.
+    tab_scrolled: std::cell::Cell<Option<u16>>,
     /// Optimistic endpoint pick from a click, until the handoff commits or
     /// every stage of the switch has ended.
     endpoint_sel: Option<EndpointId>,
@@ -1783,6 +1780,7 @@ impl PilusView {
             tab_sel: None,
             tab_sel_at: Instant::now(),
             tab_scroll: ScrollHandle::new(),
+            tab_scrolled: std::cell::Cell::new(None),
             endpoint_sel: None,
             agent_sel: None,
             agent_sel_at: Instant::now(),
@@ -6429,43 +6427,14 @@ impl PilusView {
         };
 
         let auto_check = self.settings.auto_check_updates;
-        let checkbox = div()
-            .id("pilus-update-auto-check")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .cursor_pointer()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(14.0))
-                    .h(px(14.0))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if auto_check {
-                        theme.accent
-                    } else {
-                        theme.border
-                    })
-                    .bg(if auto_check {
-                        theme.accent
-                    } else {
-                        theme.panel_dim
-                    })
-                    .text_size(px(style::scaled(&self.shared_settings, 10.0)))
-                    .text_color(theme.window_bg)
-                    .child(if auto_check { "✓" } else { "" }),
-            )
-            .child(
-                div()
-                    .text_size(px(self.footer_font()))
-                    .text_color(theme.fg)
-                    .child("Check for updates on launch"),
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_check(cx)));
+        let checkbox = style::checkbox(
+            "pilus-update-auto-check",
+            auto_check,
+            "Check for updates on launch",
+            theme,
+            self.footer_font(),
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_check(cx)));
 
         // `pilus` checks the public manifest and installs the daemon archive
         // itself; only the restart goes through the CLI, which knows the
@@ -6789,13 +6758,11 @@ impl PilusView {
             .px_3()
             .border_b_1()
             .border_color(terminal_inset_border())
-            .child(
-                div()
-                    .text_size(px(style::scaled(&self.shared_settings, 14.0)))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.fg)
-                    .child("Open Workspace"),
-            )
+            .child(style::title(
+                theme,
+                "Open Workspace",
+                style::Fonts::resolve(&self.shared_settings).title,
+            ))
             .child(menu_button);
         let menu = if self.picker.menu_open() {
             let choices = self.picker.menu_choices();
@@ -6970,41 +6937,17 @@ impl PilusView {
         }
 
         let hidden = self.picker.show_hidden();
-        let check = div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(13.0))
-            .h(px(13.0))
-            .rounded_sm()
-            .border_1()
-            .border_color(if hidden { theme.accent } else { theme.muted })
-            .bg(if hidden {
-                theme.accent
-            } else {
-                theme.panel_dim
-            })
-            .child(if hidden {
-                div().w(px(5.0)).h(px(5.0)).rounded_sm().bg(theme.window_bg)
-            } else {
-                div()
-            });
-        let hidden_toggle = div()
-            .id("pilus-picker-hidden")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .flex_shrink_0()
-            .cursor_pointer()
-            .text_size(px(self.footer_font()))
-            .text_color(theme.fg)
-            .child(check)
-            .child("Hidden")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.picker.toggle_hidden();
-                cx.notify();
-            }));
+        let hidden_toggle = style::checkbox(
+            "pilus-picker-hidden",
+            hidden,
+            "Hidden",
+            theme,
+            self.footer_font(),
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.picker.toggle_hidden();
+            cx.notify();
+        }));
         let open = style::button(
             "pilus-picker-open",
             "Open this folder",
@@ -9137,6 +9080,20 @@ impl PilusView {
         for tab in &self.tabs {
             tabs = tabs.child(self.tab_item(tab, &selection, cx));
         }
+        // Follow the active tab into view when it changes, not every frame,
+        // so a manual scroll along the strip is left alone. Child 0 is the
+        // glide pill, so a tab's child index is its position plus one.
+        let active_tab = self
+            .tabs
+            .iter()
+            .position(|tab| self.tab_active(tab))
+            .map(|position| (position, self.tabs[position].index));
+        if self.tab_scrolled.get() != active_tab.map(|(_, index)| index) {
+            self.tab_scrolled.set(active_tab.map(|(_, index)| index));
+            if let Some((position, _)) = active_tab {
+                self.tab_scroll.scroll_to_item(position + 1);
+            }
+        }
         let new_tab = div()
             .id("pilus-new-tab")
             .flex()
@@ -9191,13 +9148,7 @@ impl PilusView {
         // page owns the card; the session picker stays on every page. The plus
         // follows the tabs until overflow makes the scroll viewport shrink.
         if !self.settings_open && !self.home.is_open() {
-            let separator = div()
-                .mx_1()
-                .h(px(14.0))
-                .w(px(1.0))
-                .flex_shrink_0()
-                .bg(theme.border.opacity(0.5));
-            tab_strip = tab_strip.child(separator).child(tabs).child(new_tab);
+            tab_strip = tab_strip.child(tabs).child(new_tab);
         }
         div()
             .absolute()
@@ -9458,7 +9409,8 @@ impl PilusView {
             .items_center()
             .gap_2()
             .h(px(TAB_HEIGHT))
-            .px_2()
+            .pl(px(6.0))
+            .pr_2()
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
@@ -9786,12 +9738,11 @@ impl PilusView {
             .bg(theme.sidebar_bg)
             .border_1()
             .border_color(terminal_inset_border())
-            .child(
-                div()
-                    .text_size(px(self.chrome_font()))
-                    .text_color(theme.panel_fg)
-                    .child(prompt.title),
-            )
+            .child(style::title(
+                theme,
+                prompt.title,
+                style::Fonts::resolve(&self.shared_settings).title,
+            ))
             .child(
                 div()
                     .text_size(px(self.section_font()))
@@ -10431,31 +10382,26 @@ impl PilusView {
         self.send_active(press(KeyCode::Char(key), KeyModifiers::NONE));
     }
 
-    /// One sidebar section header: collapse chevron, label, hairline, and —
-    /// when the section has one — its add button.
+    /// One sidebar section header: collapse chevron, label, and hairline.
     ///
-    /// Every section draws through this, so their labels share one column and
-    /// their buttons one edge; the header is a band, not a control, so it
-    /// takes `SIDEBAR_BAND_HEIGHT`.
+    /// Every section draws through this, so their labels share one column;
+    /// the header is a band, not a control, so it takes `SIDEBAR_BAND_HEIGHT`.
     fn section_header(&self, spec: SectionHeader, cx: &mut Context<Self>) -> Div {
         let SectionHeader {
             id,
             label,
             collapsed,
             toggle,
-            add,
         } = spec;
         let theme = self.theme;
-        let glass = self.settings.glass_opacity();
         let header = div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
             .h(px(SIDEBAR_BAND_HEIGHT))
-            // The add button is the one element that touches the panel edge,
-            // so it breaks out of the row inset; the toggle stays on the row
-            // glyph column, which keeps the chevron beside its label.
+            // The hairline runs to the panel edge, breaking out of the row
+            // inset; the chevron stays on the row glyph column.
             .mr(px(-SIDEBAR_ROW_EDGE))
             .child(
                 div()
@@ -10495,33 +10441,7 @@ impl PilusView {
                         toggle(this, cx);
                     })),
             );
-        // A section with nothing to add shows no button: a control that does
-        // nothing is worse than one that is missing.
-        let Some((add_id, add)) = add else {
-            return header;
-        };
-        header.child(
-            div()
-                .id(add_id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(SIDEBAR_BAND_HEIGHT))
-                .w(px(SIDEBAR_BAND_HEIGHT))
-                .rounded_md()
-                .cursor_pointer()
-                .hover_fill(theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
-                .child(icon(
-                    include_bytes!("../../assets/icons/plus.svg"),
-                    11.0,
-                    theme.muted,
-                ))
-                // The button sits beside the toggle, never inside it.
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    add(this, cx);
-                })),
-        )
+        header
     }
 
     /// Expand the daemon's `~`-shorthand dirs against the owning machine.
@@ -10645,13 +10565,6 @@ impl PilusView {
                         this.workspaces_collapsed = !this.workspaces_collapsed;
                         cx.notify();
                     }),
-                    add: Some((
-                        "pilus-add-workspace",
-                        Box::new(|this, cx| {
-                            this.leave_settings_page();
-                            this.open_picker(cx);
-                        }),
-                    )),
                 },
                 cx,
             ));
@@ -10717,15 +10630,14 @@ impl PilusView {
                         this.agents_collapsed = !this.agents_collapsed;
                         cx.notify();
                     }),
-                    // No add action yet; a future one starts agents here.
-                    add: None,
                 },
                 cx,
             ));
         if self.agents_collapsed {
             return section;
         }
-        let mut children = div().flex().flex_col().gap_1().pl(px(SIDEBAR_CHILD_INDENT));
+        let mut children = div().flex().flex_col().gap_1().pl(px(SIDEBAR_CHILD_INDENT))
+            .pr(px(SIDEBAR_CHILD_INDENT));
         let mut any = false;
         // The AGENTS-scope menu row narrows the dock to the visible surface's
         // active workspace, mirroring the daemon's own scope filter.
@@ -11297,7 +11209,7 @@ impl Render for PilusView {
                     // and the hint points at the one place that can update it.
                     empty = empty.child(self.status.clone()).child(
                         div()
-                            .text_size(px(style::scaled(&self.shared_settings, 11.0)))
+                            .text_size(px(self.section_font()))
                             .text_color(theme.muted)
                             .child("Settings → Updates can update the Luvus daemon."),
                     );

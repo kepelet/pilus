@@ -5394,6 +5394,7 @@ fn format_duration(millis: i64) -> String {
 fn aside_fonts(fonts: Fonts) -> Fonts {
     Fonts {
         headline: fonts.headline,
+        title: fonts.title,
         body: fonts.secondary,
         secondary: fonts.label,
         label: fonts.label,

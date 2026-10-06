@@ -99,11 +99,6 @@ fn reads_and_commands_over_one_connection_per_request() {
                     assert_eq!(request["params"]["name"], "assets");
                     serde_json::json!({ "type": "ok" })
                 }
-                "workspace.pin" => {
-                    assert_eq!(request["params"]["workspace_id"], "ws1");
-                    assert_eq!(request["params"]["pinned"], true);
-                    serde_json::json!({ "type": "ok" })
-                }
                 "workspace.close" => {
                     assert_eq!(request["params"]["workspace_id"], "ws2");
                     serde_json::json!({ "type": "ok" })
@@ -185,7 +180,6 @@ fn reads_and_commands_over_one_connection_per_request() {
     client
         .rename_workspace("ws1", "assets")
         .expect("rename workspace");
-    client.pin_workspace("ws1", true).expect("pin workspace");
     client.close_workspace("ws2").expect("close workspace");
     client.close_pane("4").expect("close pane");
     client.name_agent("2", "auth-fix").expect("name agent");

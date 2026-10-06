@@ -768,15 +768,6 @@ impl ControlClient {
         Ok(())
     }
 
-    /// Pin or unpin a workspace, floating its group to the top of the dock.
-    pub fn pin_workspace(&mut self, workspace_id: &str, pinned: bool) -> Result<()> {
-        self.request(
-            "workspace.pin",
-            json!({ "workspace_id": workspace_id, "pinned": pinned }),
-        )?;
-        Ok(())
-    }
-
     /// Close a workspace and the panes inside it.
     pub fn close_workspace(&mut self, workspace_id: &str) -> Result<()> {
         self.request("workspace.close", json!({ "workspace_id": workspace_id }))?;

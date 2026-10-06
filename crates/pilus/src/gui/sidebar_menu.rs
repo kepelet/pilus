@@ -1,13 +1,13 @@
 //! The native right-click context menus for the sidebar's WORKSPACES and
 //! AGENTS rows.
 //!
-//! Luvus opens a context menu on a WORKSPACES row (close, rename, pin, path
+//! Luvus opens a context menu on a WORKSPACES row (close, rename, path
 //! visibility, copy path/branch, new worktree, and the git/task/mission
-//! boards) and on an AGENTS row (rename, close, pin, path visibility, and the
+//! boards) and on an AGENTS row (rename, close, path visibility, and the
 //! dock's workspace scope). `pilus` draws those menus natively; the items a
 //! client can reach ride the control API (`workspace.*`, `agent.name`,
-//! `pane.close`, `worktree.create`), and the purely presentational ones (pin,
-//! path toggle, scope) are client state, exactly as they are in the daemon's
+//! `pane.close`, `worktree.create`), and the purely presentational ones (path
+//! toggle, scope) are client state, exactly as they are in the daemon's
 //! own TUI. This module owns the menu's state machine and item order; the
 //! window renders it and performs the actions, so nothing here knows GPUI.
 
@@ -43,17 +43,13 @@ pub enum MenuTarget {
 
 /// One row of the open context menu, in render order.
 ///
-/// `Pin`/`Unpin` are separate rows like the daemon's menu, though they run
-/// the same action; labels flip with the row's current state. `Divider` is a
-/// non-interactive separator.
+/// `Divider` is a non-interactive separator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
     /// Close the workspace, or close the agent's pane.
     Close,
     /// Rename the workspace's label, or give the agent's pane a live alias.
     Rename,
-    Pin,
-    Unpin,
     /// Toggle the second (path) line of every row in the owning section.
     TogglePaths,
     /// The parent row of the copy submenu.
@@ -90,14 +86,10 @@ impl Item {
 
     /// The label, resolved against the state the row toggles: `paths_visible`
     /// flips Show Path/Hide Path, and `scoped` flips the AGENTS scope row.
-    /// Pin/Unpin rows are emitted by the builders, so the labels here are
-    /// static like the daemon's catalog.
     pub fn label(self, paths_visible: bool, scoped: bool) -> &'static str {
         match self {
             Self::Close => "Close",
             Self::Rename => "Rename",
-            Self::Pin => "Pin to Top",
-            Self::Unpin => "Unpin",
             Self::TogglePaths => {
                 if paths_visible {
                     "Hide Path"
@@ -153,19 +145,18 @@ impl SidebarMenu {
     /// The submenu the open menu shows: the Quick Actions copy rows when that
     /// submenu is up, otherwise the top-level rows.
     ///
-    /// `pinned` picks the Pin or Unpin row; a WORKSPACES target's git rows
-    /// appear when its branch says it is a repo, and the deleted-worktree row
+    /// A WORKSPACES target's git rows appear when its branch says it is a repo, and the deleted-worktree row
     /// only when `linked` says the daemon's `worktree.list` found this row's
     /// checkout as a linked worktree.
-    pub fn rows(&self, pinned: bool, linked: bool) -> Vec<Item> {
+    pub fn rows(&self, linked: bool) -> Vec<Item> {
         if self.quick_open {
             return self.quick_rows();
         }
         match &self.target {
             MenuTarget::Workspace { branch, .. } => {
-                workspace_rows(pinned, branch.as_deref().is_some(), linked)
+                workspace_rows(branch.as_deref().is_some(), linked)
             }
-            MenuTarget::Agent { .. } => agent_rows(pinned),
+            MenuTarget::Agent { .. } => agent_rows(),
         }
     }
 
@@ -200,13 +191,11 @@ impl SidebarMenu {
 
 /// WORKSPACES top-level rows, in the daemon's render order: node actions,
 /// the copy submenu, worktrees when the row is a git repo, then the board
-/// actions below a divider. The path toggle's label is applied at render,
-/// so the builder only needs the pin state to choose Pin vs Unpin.
-fn workspace_rows(pinned: bool, is_repo: bool, linked: bool) -> Vec<Item> {
+/// actions below a divider. The path toggle's label is applied at render.
+fn workspace_rows(is_repo: bool, linked: bool) -> Vec<Item> {
     let mut items = vec![
         Item::Close,
         Item::Rename,
-        if pinned { Item::Unpin } else { Item::Pin },
         Item::TogglePaths,
         Item::QuickActions,
     ];
@@ -227,13 +216,12 @@ fn workspace_rows(pinned: bool, is_repo: bool, linked: bool) -> Vec<Item> {
     items
 }
 
-/// A live agent's rows: pane actions, pin, path toggle, then the dock's
+/// A live agent's rows: pane actions, path toggle, then the dock's
 /// workspace scope below a divider.
-fn agent_rows(pinned: bool) -> Vec<Item> {
+fn agent_rows() -> Vec<Item> {
     vec![
         Item::Rename,
         Item::Close,
-        if pinned { Item::Unpin } else { Item::Pin },
         Item::TogglePaths,
         Item::Divider,
         Item::ToggleScope,
@@ -246,13 +234,12 @@ mod tests {
 
     #[test]
     fn workspace_rows_follow_the_daemons_order() {
-        let rows = workspace_rows(false, true, true);
+        let rows = workspace_rows(true, true);
         assert_eq!(
             rows,
             vec![
                 Item::Close,
                 Item::Rename,
-                Item::Pin,
                 Item::TogglePaths,
                 Item::QuickActions,
                 Item::DeleteWorktree,
@@ -265,27 +252,16 @@ mod tests {
         );
         // A non-repo row drops the git rows; the boards stay. The delete row
         // needs a confirmed linked checkout, not just any repo row.
-        let rows = workspace_rows(false, false, false);
+        let rows = workspace_rows(false, false);
         assert!(!rows.contains(&Item::DeleteWorktree));
         assert!(!rows.contains(&Item::NewWorktree));
         assert!(!rows.contains(&Item::OpenGit));
-        let main = workspace_rows(false, true, false);
+        let main = workspace_rows(true, false);
         assert!(!main.contains(&Item::DeleteWorktree));
-        let linked = workspace_rows(false, true, true);
+        let linked = workspace_rows(true, true);
         assert!(linked.contains(&Item::DeleteWorktree));
         assert_eq!(rows[rows.len() - 2], Item::OpenBoard);
         assert_eq!(rows[rows.len() - 1], Item::OpenMission);
-    }
-
-    #[test]
-    fn pin_row_flips_to_unpin_when_already_pinned() {
-        let rows = workspace_rows(true, false, false);
-        assert!(rows.contains(&Item::Unpin));
-        assert!(!rows.contains(&Item::Pin));
-
-        let rows = workspace_rows(false, false, false);
-        assert!(rows.contains(&Item::Pin));
-        assert!(!rows.contains(&Item::Unpin));
     }
 
     #[test]
@@ -312,11 +288,10 @@ mod tests {
     #[test]
     fn agent_rows_carry_scope_below_the_divider() {
         assert_eq!(
-            agent_rows(false),
+            agent_rows(),
             vec![
                 Item::Rename,
                 Item::Close,
-                Item::Pin,
                 Item::TogglePaths,
                 Item::Divider,
                 Item::ToggleScope,

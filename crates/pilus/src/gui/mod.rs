@@ -973,6 +973,8 @@ struct Endpoint {
     status: String,
     tabs: Vec<Tab>,
     agents: Vec<Agent>,
+    /// The feed has delivered at least once, so an empty list is real.
+    agents_loaded: bool,
     bar_widgets: Vec<BarWidget>,
     automations: AutomationSummary,
     tasks: TaskSummary,
@@ -1308,6 +1310,9 @@ struct PilusView {
     tabs: Vec<Tab>,
     /// Latest live agent sessions for the AGENTS section.
     agents: Vec<Agent>,
+    /// The agent feed has delivered at least once, so an empty AGENTS list
+    /// is real rather than still loading.
+    agents_loaded: bool,
     /// Latest automation/task counts for the nav badges.
     automations: AutomationSummary,
     tasks: TaskSummary,
@@ -1794,6 +1799,7 @@ impl PilusView {
             bar_widgets: Vec::new(),
             tabs: Vec::new(),
             agents: Vec::new(),
+            agents_loaded: false,
             automations: AutomationSummary::default(),
             tasks: TaskSummary::default(),
             machines: Vec::new(),
@@ -2066,6 +2072,7 @@ impl PilusView {
                 self.bar_widgets = update.bar;
                 self.tabs = update.tabs;
                 self.agents = update.agents;
+                self.agents_loaded = true;
                 self.automations = update.automations;
                 self.tasks = update.tasks;
                 tabs_changed = true;
@@ -2665,8 +2672,9 @@ impl PilusView {
             // The cached chrome draws nowhere while hidden, so only an agent
             // change costs a repaint.
             while let Some(update) = endpoint.feed.try_recv() {
-                if update.agents != endpoint.agents {
+                if !endpoint.agents_loaded || update.agents != endpoint.agents {
                     endpoint.agents = update.agents;
+                    endpoint.agents_loaded = true;
                     changed = true;
                 }
                 endpoint.tabs = update.tabs;
@@ -2976,6 +2984,7 @@ impl PilusView {
             status,
             tabs,
             agents,
+            agents_loaded,
             bar_widgets,
             automations,
             tasks,
@@ -2995,6 +3004,7 @@ impl PilusView {
             status: std::mem::replace(&mut self.status, status),
             tabs: std::mem::replace(&mut self.tabs, tabs),
             agents: std::mem::replace(&mut self.agents, agents),
+            agents_loaded: std::mem::replace(&mut self.agents_loaded, agents_loaded),
             bar_widgets: std::mem::replace(&mut self.bar_widgets, bar_widgets),
             automations: std::mem::replace(&mut self.automations, automations),
             tasks: std::mem::replace(&mut self.tasks, tasks),
@@ -3346,6 +3356,7 @@ impl PilusView {
                 status: "connecting…".to_string(),
                 tabs: Vec::new(),
                 agents: Vec::new(),
+                agents_loaded: false,
                 bar_widgets: Vec::new(),
                 automations: AutomationSummary::default(),
                 tasks: TaskSummary::default(),
@@ -3383,6 +3394,26 @@ impl PilusView {
             .get(id)
             .map(|endpoint| endpoint.surface.workspaces())
             .unwrap_or(&[])
+    }
+
+    /// Whether an endpoint has reported its workspace catalog yet.
+    fn endpoint_workspaces_loaded(&self, id: &EndpointId) -> bool {
+        if *id == self.active {
+            return self.surface.workspaces_loaded();
+        }
+        self.endpoints
+            .get(id)
+            .is_some_and(|endpoint| endpoint.surface.workspaces_loaded())
+    }
+
+    /// Whether an endpoint's agent feed has delivered yet.
+    fn endpoint_agents_loaded(&self, id: &EndpointId) -> bool {
+        if *id == self.active {
+            return self.agents_loaded;
+        }
+        self.endpoints
+            .get(id)
+            .is_some_and(|endpoint| endpoint.agents_loaded)
     }
 
     /// The agent list of an endpoint, active or stashed.
@@ -7128,6 +7159,7 @@ impl PilusView {
                 self.agent_sel = None;
                 self.close_picker();
                 self.agents = Vec::new();
+                self.agents_loaded = false;
                 self.automations = AutomationSummary::default();
                 self.tasks = TaskSummary::default();
                 self.agent_feed = Some(AgentFeed::spawn(self.api_socket()));
@@ -10628,7 +10660,13 @@ impl PilusView {
             }
         }
         if !any {
-            children = children.child(
+            let loading = self
+                .connected_endpoints()
+                .iter()
+                .any(|id| !self.endpoint_workspaces_loaded(id));
+            children = children.child(if loading {
+                self.sidebar_skeleton("pilus-workspaces-skeleton", &[0.62, 0.48, 0.7])
+            } else {
                 div()
                     .flex()
                     .items_center()
@@ -10636,12 +10674,48 @@ impl PilusView {
                     .pl(px(SIDEBAR_ROW_PAD))
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
-                    .child("No workspaces yet"),
-            );
+                    .child("No workspaces yet")
+            });
         }
         // Collapsed sections drop their rows, so the fade replays each time
         // the section opens.
         section.child(style::enter("pilus-workspaces-rows", children))
+    }
+
+    /// Placeholder rows for a sidebar list still in flight: a glyph dot and a
+    /// label bar per row, in the geometry of a real row so nothing shifts
+    /// when the content lands. `fractions` set each bar's share of the width.
+    fn sidebar_skeleton(&self, id: &'static str, fractions: &[f32]) -> Div {
+        let theme = self.theme;
+        let mut rows = div().flex().flex_col().gap_1();
+        for (index, fraction) in fractions.iter().enumerate() {
+            rows = rows.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(SIDEBAR_GLYPH_GAP))
+                    .h(px(SIDEBAR_ROW_HEIGHT))
+                    .px(px(SIDEBAR_ROW_PAD))
+                    .child(
+                        div()
+                            .w(px(SIDEBAR_GLYPH))
+                            .flex_shrink_0()
+                            .flex()
+                            .justify_center()
+                            .child(style::skeleton((id, index * 2), theme, px(10.0), 10.0)),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(style::skeleton(
+                            (id, index * 2 + 1),
+                            theme,
+                            relative(*fraction),
+                            self.chrome_font() * 0.8,
+                        )),
+                    ),
+            );
+        }
+        rows
     }
 
     /// The display label for an endpoint.
@@ -10715,7 +10789,13 @@ impl PilusView {
             }
         }
         if !any {
-            children = children.child(
+            let loading = self
+                .connected_endpoints()
+                .iter()
+                .any(|id| !self.endpoint_agents_loaded(id));
+            children = children.child(if loading {
+                self.sidebar_skeleton("pilus-agents-skeleton", &[0.55, 0.7])
+            } else {
                 div()
                     .flex()
                     .items_center()
@@ -10723,8 +10803,8 @@ impl PilusView {
                     .pl(px(SIDEBAR_ROW_PAD))
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
-                    .child("No agents"),
-            );
+                    .child("No agents")
+            });
         }
         section.child(style::enter("pilus-agents-rows", children))
     }

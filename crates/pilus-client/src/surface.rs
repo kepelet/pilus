@@ -28,6 +28,9 @@ pub struct Surface {
     clipboard_receipt: Option<u64>,
     open_url: Option<String>,
     workspaces: Vec<ShellWorkspace>,
+    /// Whether the daemon has reported a catalog yet, so an empty list can
+    /// be told apart from one still in flight.
+    workspaces_loaded: bool,
     shell_dock: Option<ShellDockRect>,
     /// The dock in effect when the current frame was produced. The server
     /// sends `ShellDock` before the matching `Frame`, so the live rect can
@@ -89,6 +92,11 @@ impl Surface {
     /// workspaces dock.
     pub fn workspaces(&self) -> &[ShellWorkspace] {
         &self.workspaces
+    }
+
+    /// Whether a workspace catalog has arrived, even an empty one.
+    pub fn workspaces_loaded(&self) -> bool {
+        self.workspaces_loaded
     }
 
     /// Update a workspace's projected label in place.
@@ -179,6 +187,7 @@ impl Surface {
             }
             ServerMessage::ShellWorkspaces(workspaces) => {
                 self.workspaces.clone_from(workspaces);
+                self.workspaces_loaded = true;
                 SurfaceChange::Repaint
             }
             ServerMessage::ShellDock(rect) => {

@@ -10705,14 +10705,12 @@ impl PilusView {
                             .justify_center()
                             .child(style::skeleton((id, index * 2), theme, px(10.0), 10.0)),
                     )
-                    .child(
-                        div().flex_1().min_w_0().child(style::skeleton(
-                            (id, index * 2 + 1),
-                            theme,
-                            relative(*fraction),
-                            self.chrome_font() * 0.8,
-                        )),
-                    ),
+                    .child(div().flex_1().min_w_0().child(style::skeleton(
+                        (id, index * 2 + 1),
+                        theme,
+                        relative(*fraction),
+                        self.chrome_font() * 0.8,
+                    ))),
             );
         }
         rows
@@ -10756,10 +10754,7 @@ impl PilusView {
         if self.agents_collapsed {
             return section;
         }
-        let mut children = div()
-            .flex()
-            .flex_col()
-            .gap_1();
+        let mut children = div().flex().flex_col().gap_1();
         let mut any = false;
         // The AGENTS-scope menu row narrows the dock to the visible surface's
         // active workspace, mirroring the daemon's own scope filter.
@@ -12930,10 +12925,30 @@ fn truncate_label(label: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
-/// A tab's label: its workspace cwd plus the `⌘N` shortcut. The cwd is capped
-/// before the shortcut is appended, so `⌘N` is never truncated away.
+/// Collapse every directory but the last to its initial (`.s` for a dotted
+/// one), so `~/.superset/projects/l3s` reads `~/.s/p/l3s` in a narrow tab.
+fn abbreviate_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    let last = parts.len() - 1;
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            if i == last || *part == "~" {
+                return (*part).to_string();
+            }
+            let take = if part.starts_with('.') { 2 } else { 1 };
+            part.chars().take(take).collect()
+        })
+        .collect::<Vec<String>>()
+        .join("/")
+}
+
+/// A tab's label: its abbreviated workspace cwd plus the `⌘N` shortcut. The
+/// cwd is capped before the shortcut is appended, so `⌘N` is never truncated
+/// away.
 fn tab_label(cwd: &str, index: u16) -> String {
-    format!("{} ⌘{index}", truncate_label(cwd, 24))
+    format!("{} ⌘{index}", truncate_label(&abbreviate_path(cwd), 24))
 }
 
 /// A color for an agent status dot.
@@ -13630,9 +13645,23 @@ mod tests {
 
     #[test]
     fn tab_label_keeps_cwd_and_shortcut() {
-        assert_eq!(tab_label("~/work/pilus", 3), "~/work/pilus ⌘3");
+        assert_eq!(tab_label("~/work/pilus", 3), "~/w/pilus ⌘3");
+        assert_eq!(tab_label("~", 1), "~ ⌘1");
         let long = tab_label("~/work/a-directory-name-that-will-not-fit", 7);
         assert!(long.ends_with("… ⌘7"));
+    }
+
+    #[test]
+    fn abbreviate_path_keeps_last_component_and_dotted_prefix() {
+        assert_eq!(abbreviate_path("~/.superset/projects/l3s"), "~/.s/p/l3s");
+        assert_eq!(
+            abbreviate_path("~/Developer/App/ClaudeCode"),
+            "~/D/A/ClaudeCode"
+        );
+        assert_eq!(
+            abbreviate_path("/Developer/App/ClaudeCode"),
+            "/D/A/ClaudeCode"
+        );
     }
 
     #[test]

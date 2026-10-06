@@ -59,6 +59,17 @@ const COMPOSER_MAX_W: f32 = 880.0;
 const JUMP_GUTTER: f32 = 38.0;
 /// Air between the panel and the buttons, so the cluster never touches it.
 const JUMP_GAP: f32 = 8.0;
+/// How long a fresh panel's model and thinking chips wait on the extension
+/// socket's first report before settling for the file's or the catalog's
+/// answer. The socket usually reports well inside this; a pi without the
+/// extension just shows the fallback a beat later.
+const CHIP_SETTLE: Duration = Duration::from_millis(1500);
+/// Width of the model chip's skeleton: about a short model name.
+const MODEL_SKELETON_W: f32 = 110.0;
+/// Width of the thinking chip's skeleton: about one effort label.
+const THINKING_SKELETON_W: f32 = 56.0;
+/// The jump buttons' diameter, which their skeleton matches.
+const JUMP_BUTTON: f32 = 30.0;
 /// How often a local session is re-read.
 const LOCAL_POLL: Duration = Duration::from_millis(300);
 /// How often a remote session is re-read; every poll is an SSH round trip.
@@ -225,10 +236,11 @@ const PROMPTS_MAX_ROWS: usize = 7;
 /// Sessions the history menu lists. Newest first; older ones stay on disk
 /// but are beyond the picker's useful reach.
 const HISTORY_LIMIT: usize = 40;
-/// Bytes of each remote session read to find its opener. The first user
-/// message sits near the top; sampling a slice keeps the listing to one
-/// SSH round trip instead of one read per session.
-const HISTORY_SAMPLE_BYTES: usize = 8192;
+/// Bytes of each remote session's first user line shipped back to title
+/// it. Pi writes a system prompt tens of kilobytes long ahead of that
+/// line, so the listing greps for the line itself rather than sampling the
+/// file's head; the cap only bounds a long pasted prompt.
+const HISTORY_SAMPLE_BYTES: usize = 4096;
 
 /// One row in the session history menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,12 +254,15 @@ pub(super) struct HistoryEntry {
 }
 
 impl HistoryEntry {
-    /// The row's label: the opener when there is one, else the id.
+    /// The row's label: the opener when there is one, else when the
+    /// session started — an id is no name a person can read.
     fn label(&self) -> String {
-        if self.title.is_empty() {
-            self.id.clone()
-        } else {
-            self.title.clone()
+        if !self.title.is_empty() {
+            return self.title.clone();
+        }
+        match session_started(&self.path) {
+            Some(started) => format!("Untitled · {started}"),
+            None => "Untitled session".to_string(),
         }
     }
 }
@@ -547,6 +562,14 @@ fn new_list_state() -> ListState {
 /// The Pi Session panel's state, embedded in [`PilusView`].
 pub struct SessionPanel {
     open: bool,
+    /// Hidden but still live: its pane left the screen, and the reader,
+    /// socket, and transcript keep running so coming back shows the
+    /// conversation as it is now instead of reloading it.
+    suspended: bool,
+    /// When this panel was last opened on a session: the model and
+    /// thinking chips hold skeletons for the socket's first report rather
+    /// than flashing a fallback that the report then replaces.
+    opened_at: Option<Instant>,
     /// The panel stands in for a pi pane's terminal: Escape does not close
     /// it, so there is no way to strand the pane behind the card.
     pinned: bool,
@@ -723,6 +746,8 @@ impl Default for SessionPanel {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         Self {
             open: false,
+            suspended: false,
+            opened_at: None,
             pinned: false,
             error: String::new(),
             endpoint: None,
@@ -796,6 +821,42 @@ impl SessionPanel {
     /// Whether the panel should paint in the card.
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Hide the panel without stopping it: its pane left the screen, but
+    /// the user is likely to come back. Floating menus close so the return
+    /// lands on the conversation, not a stale picker.
+    pub fn suspend(&mut self) {
+        if !self.open {
+            return;
+        }
+        self.open = false;
+        self.suspended = true;
+        self.picker = None;
+        self.picker_dismissed = None;
+        self.prompts_open = false;
+        self.prompts_dismissed = false;
+        self.history_open = false;
+        self.history_dismissed = false;
+    }
+
+    /// Show a suspended panel again exactly as it stands.
+    pub fn resume(&mut self) {
+        if self.suspended {
+            self.suspended = false;
+            self.open = true;
+        }
+    }
+
+    /// An empty panel that shares this one's wiring (the picker's filter
+    /// field), to stand in while this one is parked.
+    pub(super) fn sibling(&self) -> Self {
+        Self {
+            picker_field: self.picker_field.clone(),
+            theme: self.theme,
+            settings: self.settings.clone(),
+            ..Self::default()
+        }
     }
 
     /// Open the panel for a local cwd (or an explicit session file).
@@ -922,6 +983,7 @@ impl SessionPanel {
         self.close();
         self.rotate_channels();
         self.open = true;
+        self.opened_at = Some(Instant::now());
         self.error.clear();
         self.status.clear();
         self.sending = false;
@@ -1077,6 +1139,7 @@ impl SessionPanel {
     pub fn close(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.open = false;
+        self.suspended = false;
         self.pinned = false;
         self.last_seen = 0;
         self.loaded = false;
@@ -3146,9 +3209,26 @@ impl SessionPanel {
             .items
             .iter()
             .any(|item| matches!(item.kind, ItemKind::User { .. }));
-        if has_prompts || self.prompts_open {
-            panel_row = panel_row.child(self.jump_cluster(fonts, cx));
-        }
+        // The cluster's column is always reserved, so the panel never
+        // narrows when the first prompt lands; a loading transcript holds a
+        // skeleton there until it knows whether there is one.
+        panel_row = if has_prompts || self.prompts_open {
+            panel_row.child(self.jump_cluster(fonts, cx))
+        } else if !self.loaded {
+            panel_row.child(
+                div()
+                    .w(px(JUMP_BUTTON))
+                    .flex_shrink_0()
+                    .child(style::skeleton(
+                        "session-jump-skeleton",
+                        theme,
+                        px(JUMP_BUTTON),
+                        JUMP_BUTTON,
+                    )),
+            )
+        } else {
+            panel_row.child(div().w(px(JUMP_BUTTON)).flex_shrink_0())
+        };
         // The dock centers in the pane, so the panel itself stays centered
         // while the buttons hang in the gutter beside it.
         dock = dock.child(panel_row);
@@ -3451,7 +3531,7 @@ impl SessionPanel {
         let command = format!(
             "root=\"${{PI_CODING_AGENT_SESSION_DIR:-$HOME/.pi/agent/sessions}}\"; \
              for f in $(ls -t \"$root\"/{dir}/*.jsonl 2>/dev/null | head -n {HISTORY_LIMIT}); do \
-             printf '\\n@@PILUS %s\\n' \"$f\"; head -c {HISTORY_SAMPLE_BYTES} \"$f\"; printf '\\n'; done"
+             printf '\\n@@PILUS %s\\n' \"$f\"; grep -m1 '\"role\":\"user\"' \"$f\" | head -c {HISTORY_SAMPLE_BYTES}; printf '\\n'; done"
         );
         let Ok(output) = target.shell(&command).output() else {
             return Vec::new();
@@ -3600,26 +3680,48 @@ impl SessionPanel {
             .px_2()
             .pt_1()
             .pb_2();
-        row = row.child(self.picker_chip(
-            "session-model-picker",
-            include_bytes!("../../assets/icons/cpu.svg"),
-            self.model_display(),
-            PickerKind::Model,
-            fonts,
-            cx,
-        ));
-        let thinking = match self.current_thinking() {
-            Some(level) => pilus_client::effort_label(&level),
-            None => "Thinking".to_string(),
-        };
-        row = row.child(self.picker_chip(
-            "session-thinking-picker",
-            include_bytes!("../../assets/icons/gauge.svg"),
-            thinking,
-            PickerKind::Thinking,
-            fonts,
-            cx,
-        ));
+        let cpu: &'static [u8] = include_bytes!("../../assets/icons/cpu.svg");
+        let gauge: &'static [u8] = include_bytes!("../../assets/icons/gauge.svg");
+        // Until the session names its model, a skeleton holds the chip's
+        // place: a placeholder that the first report renames would jump
+        // the whole row sideways.
+        row = row.child(if self.model_pending() {
+            self.chip_skeleton("session-model-skeleton", cpu, MODEL_SKELETON_W, fonts)
+                .into_any_element()
+        } else {
+            self.picker_chip(
+                "session-model-picker",
+                cpu,
+                self.model_display(),
+                PickerKind::Model,
+                fonts,
+                cx,
+            )
+            .into_any_element()
+        });
+        row = row.child(if self.thinking_pending() {
+            self.chip_skeleton(
+                "session-thinking-skeleton",
+                gauge,
+                THINKING_SKELETON_W,
+                fonts,
+            )
+            .into_any_element()
+        } else {
+            let thinking = match self.current_thinking() {
+                Some(level) => pilus_client::effort_label(&level),
+                None => "Thinking".to_string(),
+            };
+            self.picker_chip(
+                "session-thinking-picker",
+                gauge,
+                thinking,
+                PickerKind::Thinking,
+                fonts,
+                cx,
+            )
+            .into_any_element()
+        });
         if let Some(context) = self
             .pi_state
             .as_ref()
@@ -3667,6 +3769,59 @@ impl SessionPanel {
         row = row.child(div().flex_1());
         row = row.child(self.send_button(has_text, cx));
         row
+    }
+
+    /// Whether the panel is still waiting to learn what a chip should say:
+    /// the reader's first fold, the catalog, or — briefly — the extension
+    /// socket's first report, which outranks both.
+    fn chips_loading(&self) -> bool {
+        let socket_settling = self.rpc_tx.is_some()
+            && !self.rpc_up
+            && self.opened_at.is_some_and(|at| at.elapsed() < CHIP_SETTLE);
+        !self.loaded || self.catalog_loading || socket_settling
+    }
+
+    /// Whether the model chip still waits on its first answer.
+    fn model_pending(&self) -> bool {
+        let known = self
+            .pi_state
+            .as_ref()
+            .is_some_and(|state| state.model.is_some())
+            || self.picked_model.is_some()
+            || self.transcript.model.is_some();
+        !known && self.chips_loading()
+    }
+
+    /// Whether the thinking chip still waits on its first answer.
+    fn thinking_pending(&self) -> bool {
+        let known = self
+            .pi_state
+            .as_ref()
+            .is_some_and(|state| state.thinking.is_some())
+            || self.picked_thinking.is_some()
+            || self.transcript.thinking_level.is_some();
+        !known && self.chips_loading()
+    }
+
+    /// A picker chip's loading face: its glyph and a pulsing bar where the
+    /// value will land, at the chip's own height.
+    fn chip_skeleton(
+        &self,
+        id: &'static str,
+        glyph: &'static [u8],
+        width: f32,
+        fonts: Fonts,
+    ) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(super::PICKER_CHIP_H))
+            .px_2()
+            .child(super::icon(glyph, 14.0, theme.muted))
+            .child(style::skeleton(id, theme, px(width), fonts.secondary))
     }
 
     /// The model chip's label: the catalog's display name (`Muse Spark 1.3
@@ -4809,17 +4964,26 @@ fn header_icon_button(id: &'static str, glyph: &'static [u8], theme: Theme) -> S
         .child(super::icon(glyph, 15.0, theme.muted))
 }
 
+/// When a session started, from the timestamp pi puts at the front of its
+/// file name (`2026-10-06T03-02-28-378Z_<id>.jsonl`), as `2026-10-06 03:02`.
+fn session_started(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let (date, time) = name.split_once('T')?;
+    let mut clock = time.split('-');
+    let (hour, minute) = (clock.next()?, clock.next()?);
+    let numeric =
+        |part: &str, len: usize| part.len() == len && part.bytes().all(|b| b.is_ascii_digit());
+    (date.len() == 10 && numeric(hour, 2) && numeric(minute, 2))
+        .then(|| format!("{date} {hour}:{minute}"))
+}
+
 /// Fold the remote history sample into entries.
 ///
 /// The command emits a `@@PILUS <path>` marker before each sampled file; a
 /// file whose name carries no id is skipped rather than shown as a row with
 /// no way to open it.
 fn parse_history_output(output: &str) -> Vec<HistoryEntry> {
-    fn finish(
-        current: &mut Option<String>,
-        body: &mut String,
-        entries: &mut Vec<HistoryEntry>,
-    ) {
+    fn finish(current: &mut Option<String>, body: &mut String, entries: &mut Vec<HistoryEntry>) {
         if let Some(path) = current.take()
             && let Some(id) = session_id_from_path(&path)
         {
@@ -5388,7 +5552,7 @@ mod tests {
     }
 
     #[test]
-    fn history_entry_label_falls_back_to_the_id() {
+    fn history_entry_label_falls_back_to_the_start_time() {
         let titled = HistoryEntry {
             path: PathBuf::from("/s/t_a.jsonl"),
             id: "a".into(),
@@ -5396,11 +5560,18 @@ mod tests {
         };
         assert_eq!(titled.label(), "Fix the parser");
         let untitled = HistoryEntry {
-            path: PathBuf::from("/s/t_b.jsonl"),
+            path: PathBuf::from("/s/2026-10-06T03-02-28-378Z_b.jsonl"),
             id: "b".into(),
             title: String::new(),
         };
-        assert_eq!(untitled.label(), "b");
+        assert_eq!(untitled.label(), "Untitled · 2026-10-06 03:02");
+        // A name with no timestamp still never shows the raw id.
+        let bare = HistoryEntry {
+            path: PathBuf::from("/s/t_c.jsonl"),
+            id: "c".into(),
+            title: String::new(),
+        };
+        assert_eq!(bare.label(), "Untitled session");
     }
 
     #[test]

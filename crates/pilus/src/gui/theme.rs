@@ -12,6 +12,12 @@
 
 use gpui::{Rgba, rgb};
 
+/// How far translucent chrome darkens `window_bg` toward black.
+const CHROME_SHADE: f32 = 0.35;
+/// How much of the remaining transparency translucent chrome fills in, so it
+/// reads denser than the grid at every opacity.
+const CHROME_DENSITY: f32 = 0.45;
+
 /// The client's own chrome palette.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
@@ -101,6 +107,28 @@ impl Theme {
             ok: p.green,
             alert: p.coral,
             ansi: ansi_from(&p),
+        }
+    }
+
+    /// The glass fill behind the sidebar, the tab strip, and any native page
+    /// that owns the card, at window opacity `glass`.
+    ///
+    /// Under translucency every surface would otherwise paint the same
+    /// `window_bg` at the same alpha, so chrome and terminal blur into one
+    /// sheet and a page's text sits straight on the desktop. The chrome
+    /// takes a deeper shade and a denser coat than the grid beside it: it
+    /// frames the terminal, and stays readable however low the slider goes.
+    /// An opaque window keeps the seamless base.
+    pub fn chrome_glass(self, glass: f32) -> Rgba {
+        if glass >= 1.0 {
+            return self.window_bg;
+        }
+        let shade = 1.0 - CHROME_SHADE;
+        Rgba {
+            r: self.window_bg.r * shade,
+            g: self.window_bg.g * shade,
+            b: self.window_bg.b * shade,
+            a: glass + (1.0 - glass) * CHROME_DENSITY,
         }
     }
 
@@ -297,6 +325,21 @@ fn indexed_rgb(index: u8) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn translucent_chrome_is_darker_and_denser_than_the_grid() {
+        let theme = Theme::from_palette(default_palette());
+        let glass = 0.6;
+        let chrome = theme.chrome_glass(glass);
+        assert!(
+            chrome.a > glass,
+            "chrome coat {} must out-cover the grid",
+            chrome.a
+        );
+        assert!(luminance(chrome) < luminance(theme.window_bg));
+        // Opaque, chrome and terminal are one seamless base.
+        assert_eq!(theme.chrome_glass(1.0), theme.window_bg);
+    }
 
     #[test]
     fn reset_uses_default() {

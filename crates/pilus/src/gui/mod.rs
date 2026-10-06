@@ -61,8 +61,8 @@ use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use pilus_client::{
     Agent, AgentConfig, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent,
-    ConnectTarget, Connection, ConnectorStatus, ControlClient, HOME_ENV, MachineInfo, SessionInfo,
-    SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary,
+    ConnectTarget, Connection, ConnectorStatus, ControlClient, HOME_ENV, MachineInfo, PaneFrame,
+    SessionInfo, SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary,
     common_git_dirs_remote, config_dir, connect_machine, expand_local, expand_remote,
     generate_session_name, install_agent, list_machines, list_session_infos, luvus_binary,
     pilus_config_dir, refresh_machines, split_client_socket,
@@ -149,9 +149,9 @@ const SIDEBAR_SECTION_GAP: f32 = 12.0;
 /// Breathing room between the terminal grid and the card's inset border.
 /// Opposite gaps stay equal because the whole-cell grid is centered.
 const TERMINAL_PAD: f32 = 6.0;
-/// How long the sidebar takes to collapse or expand: long enough to read
-/// as a glide, short enough to stay out of the way.
-const SIDEBAR_ANIM_DURATION: Duration = Duration::from_millis(300);
+/// How long the sidebar takes to collapse or expand: long enough for its
+/// spring to overshoot and settle, short enough to stay out of the way.
+const SIDEBAR_ANIM_DURATION: Duration = Duration::from_millis(460);
 /// How long terminal text takes to fade back in after the grid reflows to a
 /// new size, so a resize reads as a settle rather than a jump.
 const REFLOW_FADE: Duration = Duration::from_millis(180);
@@ -165,6 +165,9 @@ const SWAP_FLOOR: f32 = 0.15;
 /// Size changes closer together than this belong to one resize (a window
 /// drag, a sidebar tween), which fades once instead of strobing per step.
 const REFLOW_BURST: Duration = Duration::from_millis(250);
+/// Longest the terminal holds its pre-toggle snapshot waiting for a frame
+/// drawn with the new dock: a slow link must not leave it stale.
+const SIDEBAR_FREEZE_MAX: Duration = Duration::from_secs(2);
 
 /// What the terminal card is showing, compared frame to frame: a change means
 /// its content was swapped rather than updated.
@@ -1124,6 +1127,20 @@ struct MenuPrompt {
 /// four seconds: a wrong panel covers more than a wrong row highlight,
 /// and a confirming snapshot lands well inside this window.
 const PI_OPTIMISTIC_WINDOW: Duration = Duration::from_secs(2);
+/// Panels kept alive after their pi pane leaves the screen, newest first.
+/// Each holds a reader and a socket, so the list stays short.
+const PI_PARKED_MAX: usize = 3;
+/// How long a parked panel keeps following its session before it is shut
+/// down; a return after that reads the session afresh.
+const PI_PARK_TTL: Duration = Duration::from_secs(300);
+/// How often the on-screen pi pane's place in its tab is re-read: a split,
+/// a resize, or a zoom moves it without any event the window hears.
+const PI_FRAME_POLL_LOCAL: Duration = Duration::from_millis(500);
+/// The same over SSH, where every read is a proxied round trip.
+const PI_FRAME_POLL_REMOTE: Duration = Duration::from_secs(2);
+/// How long a click beside a split pi panel counts as moving focus off it,
+/// ahead of the `agent.list` that confirms the daemon followed the click.
+const PI_BLUR_WINDOW: Duration = Duration::from_secs(4);
 
 /// First automatic reconnect delay.
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
@@ -1159,6 +1176,13 @@ struct PilusView {
     /// to zero the instant it answers; the collapse tween folds this one away
     /// instead.
     last_sidebar_dock: Option<ShellDockRect>,
+    /// The frame on screen when the sidebar started to move, with its dock
+    /// skip and when it was taken. The daemon moves its panes the moment
+    /// it hears the toggle, so the live grid would reflow under the sliding
+    /// card — the flicker, the jump, and a glimpse of the daemon's own dock
+    /// columns. The card slides this snapshot instead and swaps to the live
+    /// grid once both have landed.
+    sidebar_freeze: Option<(FrameData, u16, Instant)>,
     /// Sidebar openness sampled once at the top of `render`. Every surface in
     /// one frame reads this instead of re-sampling the clock, so the panel,
     /// tab strip, and terminal cannot land on edges from different tween
@@ -1434,6 +1458,28 @@ struct PilusView {
     /// row or a tab holding one. The snapshot's own record stands in so the
     /// panel opens with the click instead of a reconcile behind it.
     pi_optimistic: Option<(PiView, Agent, Instant)>,
+    /// Panels whose pane left the screen, still following their sessions,
+    /// with when they were parked: returning to the pane swaps its panel
+    /// back in as it stands instead of reloading the conversation.
+    pi_parked: Vec<(PiView, SessionPanel, Instant)>,
+    /// The pi pane on screen (focused, or sharing the active tab through a
+    /// split), whose frame the window keeps reading.
+    pi_candidate: Option<(EndpointId, String)>,
+    /// Where `pi_candidate` sits in its tab, as last read.
+    pi_frame: Option<(EndpointId, String, PaneFrame)>,
+    pi_frame_rx: Receiver<(EndpointId, String, Option<PaneFrame>)>,
+    pi_frame_tx: Sender<(EndpointId, String, Option<PaneFrame>)>,
+    /// A frame read is in flight; one at a time.
+    pi_frame_pending: bool,
+    /// When the last frame read went out.
+    pi_frame_at: Option<Instant>,
+    /// Whether the pi view's pane holds the daemon's focus. In a split with
+    /// another pane focused, the panel shows but the keyboard stays with
+    /// the terminal.
+    pi_focused: bool,
+    /// A click on the grid beside a split panel, moving focus to the other
+    /// pane before `agent.list` says so.
+    pi_blurred_at: Option<Instant>,
     /// Agents pilus launched moments ago, before `agent.list` has listed
     /// them; `focus_agent` checks here so a launched pi pins immediately.
     /// Pruned on age — the snapshot takes over within a few reconciles.
@@ -1533,6 +1579,7 @@ impl PilusView {
         let (machine_op_tx, machine_op_rx) = std::sync::mpsc::channel();
         let (home_resolve_tx, home_resolve_rx) = std::sync::mpsc::channel();
         let (agent_config_tx, agent_config_rx) = std::sync::mpsc::channel();
+        let (pi_frame_tx, pi_frame_rx) = std::sync::mpsc::channel();
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let (machine_connect_tx, machine_connect_rx) = std::sync::mpsc::channel();
         let (picker_tx, picker_rx) = std::sync::mpsc::channel();
@@ -1658,6 +1705,7 @@ impl PilusView {
             glass: Glass::new(),
             sidebar_anim: None,
             last_sidebar_dock: None,
+            sidebar_freeze: None,
             sidebar_open: 1.0,
             section_toggled: None,
             grid_size: (0, 0),
@@ -1784,6 +1832,15 @@ impl PilusView {
             pi_view: None,
             pi_released: None,
             pi_optimistic: None,
+            pi_parked: Vec::new(),
+            pi_candidate: None,
+            pi_frame: None,
+            pi_frame_rx,
+            pi_frame_tx,
+            pi_frame_pending: false,
+            pi_frame_at: None,
+            pi_focused: false,
+            pi_blurred_at: None,
             recent_launches: Vec::new(),
             workspace_focus: HashMap::new(),
             tab_focus: HashMap::new(),
@@ -1844,9 +1901,16 @@ impl PilusView {
                     // `was_animating` covers the tick that returns settled.
                     let was_animating = view.sidebar_anim.is_some();
                     let settled = view.tick_sidebar_anim();
+                    let released = view.release_sidebar_freeze(cx.reduce_motion());
                     // The reflow fade rides the same loop for the same reason.
                     let reflowing = view.reflow_fade.is_some();
-                    if view.poll(cx) || changed || !settled || was_animating || reflowing {
+                    if view.poll(cx)
+                        || changed
+                        || !settled
+                        || was_animating
+                        || reflowing
+                        || released
+                    {
                         cx.notify();
                     }
                 });
@@ -1957,7 +2021,9 @@ impl PilusView {
         if tabs_changed {
             self.reconcile_nav();
         }
+        changed |= self.poll_pi_frame(tabs_changed);
         changed |= self.sync_pi_view(cx);
+        self.poll_parked_sessions(cx);
         // Drop the optimistic endpoint pick once the handoff commits (the
         // committed highlight needs no pick) or every stage of the switch has
         // ended without one (the highlight must revert to the real surface).
@@ -2310,7 +2376,7 @@ impl PilusView {
         let events: Vec<ClientEvent> = self
             .connection
             .as_ref()
-            .map(|connection| std::iter::from_fn(|| connection.try_recv()).collect())
+            .map(Connection::drain)
             .unwrap_or_default();
         for event in events {
             match event {
@@ -2500,7 +2566,7 @@ impl PilusView {
             let events: Vec<ClientEvent> = endpoint
                 .connection
                 .as_ref()
-                .map(|connection| std::iter::from_fn(|| connection.try_recv()).collect())
+                .map(Connection::drain)
                 .unwrap_or_default();
             for event in events {
                 endpoint.last_rx = Instant::now();
@@ -3446,8 +3512,27 @@ impl PilusView {
             self.palette.is_open(),
             self.home.is_open(),
             self.settings_open,
-            self.session.is_open(),
+            self.session_owns_keys(),
         )
+    }
+
+    /// Whether the session panel takes the keyboard: always when it owns
+    /// the card, and in a split only while its pane holds focus — keys for
+    /// the pane beside it belong to the terminal.
+    fn session_owns_keys(&self) -> bool {
+        self.session.is_open() && (self.pi_split().is_none() || self.pi_focused)
+    }
+
+    /// The pi panel's place in the card when its pane shares the tab with a
+    /// split: the panel covers only that pane and the terminal shows the
+    /// rest. `None` while the panel owns the whole card.
+    fn pi_split(&self) -> Option<PaneFrame> {
+        if !self.session.is_open() {
+            return None;
+        }
+        let view = self.pi_view.as_ref()?;
+        let (endpoint, pane, frame) = self.pi_frame.as_ref()?;
+        (*endpoint == view.endpoint && *pane == view.pane && !frame.is_full()).then_some(*frame)
     }
 
     /// Forward a keystroke to the daemon's terminal.
@@ -4022,9 +4107,9 @@ impl PilusView {
         &mut self,
         cx: &mut Context<Self>,
         grid: Div,
-        pad_x: f32,
-        pad_y: f32,
+        layout: &CardLayout,
     ) -> AnyElement {
+        let (pad_x, pad_y) = (layout.pad_x, layout.pad_y);
         if self.home.is_open() {
             return style::enter(
                 "pilus-page-home",
@@ -4038,6 +4123,9 @@ impl PilusView {
         }
         if self.settings_open {
             return style::enter("pilus-page-settings", self.settings_page(cx)).into_any_element();
+        }
+        if let Some(frame) = self.pi_split() {
+            return self.split_session(cx, grid, layout, frame);
         }
         if self.session.is_open() {
             return style::enter(
@@ -4056,6 +4144,79 @@ impl PilusView {
             .pl(px(pad_x))
             .pt(px(pad_y))
             .child(grid)
+            .into_any_element()
+    }
+
+    /// The terminal with the pi panel laid over its own pane only, so the
+    /// panes it was split with stay live beside it.
+    ///
+    /// A press on the panel focuses its pane (the daemon would have, had
+    /// the press reached the grid); the panel's own controls still get it.
+    fn split_session(
+        &mut self,
+        cx: &mut Context<Self>,
+        grid: Div,
+        layout: &CardLayout,
+        frame: PaneFrame,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let place = pane_place(frame, layout);
+        let mut panel = div()
+            .id("pilus-split-session")
+            .absolute()
+            .left(px(place.left))
+            .top(px(place.top))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .occlude()
+            .bg(self.chrome_fill())
+            .border_1()
+            .rounded_md()
+            // Focus is the one edge accent earns here: it says which side
+            // of the split the keyboard is on.
+            .border_color(if self.pi_focused {
+                theme.accent.opacity(0.55)
+            } else {
+                terminal_inset_border()
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.pi_blurred_at = None;
+                    if !this.pi_focused
+                        && let Some(view) = this.pi_view.clone()
+                    {
+                        this.pi_focused = true;
+                        this.focus_agent(&view.pane);
+                        cx.notify();
+                    }
+                }),
+            );
+        panel = match place.width {
+            Some(width) => panel.w(px(width)),
+            None => panel.right(px(0.0)),
+        };
+        panel = match place.height {
+            Some(height) => panel.h(px(height)),
+            None => panel.bottom(px(0.0)),
+        };
+        div()
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .size_full()
+                    .pl(px(layout.pad_x))
+                    .pt(px(layout.pad_y))
+                    .child(grid),
+            )
+            .child(style::enter(
+                "pilus-split-session-enter",
+                panel.child(self.session_render(cx)),
+            ))
             .into_any_element()
     }
 
@@ -4092,14 +4253,29 @@ impl PilusView {
     /// pane waiting on it still gets the waiting panel instead of a beat
     /// of terminal pi's extension will replace anyway.
     /// Pure so tests can drive it with fabricated agents.
-    fn pi_view_for(agents: &[Agent], auto: bool, endpoint: &EndpointId) -> Option<(PiView, Agent)> {
+    ///
+    /// With no pi focused, a pi sharing the visible tab (`visible`: the
+    /// active workspace id and tab index) through a split still counts —
+    /// its panel covers just its own pane beside the focused one. The
+    /// caller only shows it once the pane's frame confirms the split.
+    fn pi_view_for(
+        agents: &[Agent],
+        auto: bool,
+        endpoint: &EndpointId,
+        visible: Option<(&str, u16)>,
+    ) -> Option<(PiView, Agent)> {
         if !auto {
             return None;
         }
-        let agent = agents.iter().find(|agent| agent.focused)?;
-        if agent.agent != "pi" {
-            return None;
-        }
+        let agent = match agents.iter().find(|agent| agent.focused) {
+            Some(agent) if agent.agent == "pi" => agent,
+            _ => {
+                let (workspace, tab) = visible?;
+                agents.iter().find(|agent| {
+                    agent.agent == "pi" && agent.workspace_id == workspace && agent.tab == tab
+                })?
+            }
+        };
         Some((
             PiView {
                 endpoint: endpoint.clone(),
@@ -4148,7 +4324,21 @@ impl PilusView {
             at.elapsed() < Duration::from_secs(8)
                 && !self.agents.iter().any(|known| known.pane == agent.pane)
         });
-        let mut desired = Self::pi_view_for(&self.agents, self.settings.pi_gui_auto, &self.active);
+        let visible_workspace = self
+            .surface
+            .workspaces()
+            .iter()
+            .find(|workspace| workspace.active)
+            .map(|workspace| workspace.id.clone());
+        let visible_tab = self.tabs.iter().find(|tab| tab.active).map(|tab| tab.index);
+        let visible = visible_workspace.as_deref().zip(visible_tab);
+        let mut desired = Self::pi_view_for(
+            &self.agents,
+            self.settings.pi_gui_auto,
+            &self.active,
+            visible,
+        );
+        let mut focused = desired.as_ref().is_some_and(|(_, agent)| agent.focused);
         // A pilus-initiated focus pins ahead of the snapshot: the daemon
         // has not reported the move yet, so `pi_view_for` still names the
         // pane we came from — or nothing. A snapshot showing the picked
@@ -4160,7 +4350,37 @@ impl PilusView {
                 optimistic_pick(&self.agents, &self.active, &mut self.pi_optimistic)
         {
             desired = Some((view, agent));
+            focused = true;
         }
+        // The frame reader follows the pi on screen whether or not its panel
+        // shows yet: an unfocused one waits on it below.
+        self.pi_candidate = desired
+            .as_ref()
+            .map(|(view, _)| (view.endpoint.clone(), view.pane.clone()));
+        // A click beside the panel moved focus off it; the snapshot catches
+        // up within a reconcile or two.
+        if let Some(at) = self.pi_blurred_at {
+            if !focused || at.elapsed() >= PI_BLUR_WINDOW {
+                self.pi_blurred_at = None;
+            } else {
+                focused = false;
+            }
+        }
+        // An unfocused pi shows only beside a split it is known to share;
+        // until its frame says so, the focused pane's terminal owns the card.
+        if !focused && let Some((view, _)) = &desired {
+            let split = self
+                .pi_frame
+                .as_ref()
+                .is_some_and(|(endpoint, pane, frame)| {
+                    *endpoint == view.endpoint && *pane == view.pane && !frame.is_full()
+                });
+            if !split {
+                desired = None;
+            }
+        }
+        let focus_changed = self.pi_focused != focused;
+        self.pi_focused = focused;
         // A panel the user closed or browsed away from stays released until
         // the pane reports a session (a waiting panel that finally got one)
         // or loses focus; reopening it every tick would be the terminal
@@ -4179,6 +4399,9 @@ impl PilusView {
         }
         let view = desired.as_ref().map(|(view, _)| view.clone());
         if view == self.pi_view {
+            if focus_changed {
+                return true;
+            }
             // A panel that got closed by hand is a release, not a state
             // change: remember it so the next tick does not reopen.
             if let Some(view) = &self.pi_view
@@ -4191,10 +4414,16 @@ impl PilusView {
         }
         match desired {
             Some((view, agent)) => {
-                let same_pane = self
+                let mut same_pane = self
                     .pi_view
                     .as_ref()
                     .is_some_and(|old| old.endpoint == view.endpoint && old.pane == view.pane);
+                // Coming back to a pane whose panel was parked swaps it in
+                // as it stands — no reload, no skeleton, same scroll.
+                if !same_pane {
+                    self.park_session();
+                    same_pane = self.unpark_session(&view);
+                }
                 // The extension socket learns the pane's session before
                 // the daemon's report catches up; while it is live its
                 // word stands.
@@ -4243,12 +4472,117 @@ impl PilusView {
                 });
             }
             None => {
-                self.session.close();
+                self.park_session();
                 self.session.set_pinned(false);
-                self.pi_view = None;
             }
         }
         true
+    }
+
+    /// Set the auto-pinned panel aside when its pane leaves the screen: it
+    /// keeps following the session, and the card gets an empty stand-in.
+    /// A panel the user already closed has nothing worth keeping.
+    fn park_session(&mut self) {
+        let Some(view) = self.pi_view.take() else {
+            self.session.close();
+            return;
+        };
+        if !self.session.is_open() {
+            self.session.close();
+            return;
+        }
+        self.session.suspend();
+        let stand_in = self.session.sibling();
+        let panel = std::mem::replace(&mut self.session, stand_in);
+        self.pi_parked.retain(|(parked, _, _)| {
+            !(parked.endpoint == view.endpoint && parked.pane == view.pane)
+        });
+        self.pi_parked.insert(0, (view, panel, Instant::now()));
+        while self.pi_parked.len() > PI_PARKED_MAX {
+            if let Some((_, mut evicted, _)) = self.pi_parked.pop() {
+                evicted.close();
+            }
+        }
+    }
+
+    /// Swap the parked panel for `view`'s pane back in. Returns whether one
+    /// was waiting.
+    fn unpark_session(&mut self, view: &PiView) -> bool {
+        let Some(index) = self.pi_parked.iter().position(|(parked, _, _)| {
+            parked.endpoint == view.endpoint && parked.pane == view.pane
+        }) else {
+            return false;
+        };
+        let (_, mut panel, _) = self.pi_parked.remove(index);
+        panel.resume();
+        let mut stand_in = std::mem::replace(&mut self.session, panel);
+        stand_in.close();
+        true
+    }
+
+    /// Keep parked panels current and retire the ones left too long.
+    fn poll_parked_sessions(&mut self, cx: &mut Context<Self>) {
+        let input = self.session_prompt.clone();
+        self.pi_parked.retain_mut(|(_, panel, parked_at)| {
+            if parked_at.elapsed() >= PI_PARK_TTL {
+                panel.close();
+                return false;
+            }
+            panel.poll(&input, cx);
+            true
+        });
+    }
+
+    /// Read where the on-screen pi pane sits in its tab, off the GUI
+    /// thread, and fold the answers in. Returns whether the panel's frame
+    /// changed.
+    fn poll_pi_frame(&mut self, refresh: bool) -> bool {
+        let mut changed = false;
+        while let Ok((endpoint, pane, frame)) = self.pi_frame_rx.try_recv() {
+            self.pi_frame_pending = false;
+            if self.pi_candidate.as_ref() != Some(&(endpoint.clone(), pane.clone())) {
+                continue;
+            }
+            let next = frame.map(|frame| (endpoint, pane, frame));
+            if next != self.pi_frame {
+                self.pi_frame = next;
+                changed = true;
+            }
+        }
+        let Some((endpoint, pane)) = self.pi_candidate.clone() else {
+            if self.pi_frame.take().is_some() {
+                changed = true;
+            }
+            return changed;
+        };
+        if self.pi_frame_pending {
+            return changed;
+        }
+        let known = self
+            .pi_frame
+            .as_ref()
+            .is_some_and(|(known_endpoint, known_pane, _)| {
+                *known_endpoint == endpoint && *known_pane == pane
+            });
+        let interval = match endpoint {
+            EndpointId::Local => PI_FRAME_POLL_LOCAL,
+            EndpointId::Machine(_) => PI_FRAME_POLL_REMOTE,
+        };
+        let due = !known || refresh || self.pi_frame_at.is_none_or(|at| at.elapsed() >= interval);
+        if !due {
+            return changed;
+        }
+        let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
+            return changed;
+        };
+        self.pi_frame_pending = true;
+        self.pi_frame_at = Some(Instant::now());
+        let tx = self.pi_frame_tx.clone();
+        std::thread::spawn(move || {
+            let frame = client.pane_layout(&pane).ok();
+            let _ = tx.send((endpoint, pane, frame));
+        });
+        changed
     }
 
     /// Remember that the auto-pinned panel was dismissed, so the next sync
@@ -7014,6 +7348,16 @@ impl PilusView {
         // sampling after the flip would pin `from` to the new target and
         // the tween would run from `to` to `to` (no motion at all).
         let from = self.sidebar_factor();
+        // A toggle mid-flight keeps the snapshot it already holds: that is
+        // the grid the user last saw settled.
+        if self.sidebar_freeze.is_none() {
+            let skip = self.skipped_cols();
+            self.sidebar_freeze = self
+                .surface
+                .frame()
+                .cloned()
+                .map(|frame| (frame, skip, Instant::now()));
+        }
         self.sidebar_visible = !self.sidebar_visible;
         if let Some(layout) = self.sidebar_layout.as_mut() {
             layout.left.visible = self.sidebar_visible;
@@ -7046,7 +7390,9 @@ impl PilusView {
                 .iter()
                 .find(|tab| self.tab_active(tab))
                 .map(|tab| tab.index),
-            shown: !self.home.is_open() && !self.settings_open && !self.session.is_open(),
+            shown: !self.home.is_open()
+                && !self.settings_open
+                && (!self.session.is_open() || self.pi_split().is_some()),
         };
         if self.surface_key.as_ref() != Some(&key) {
             // The first key is the launch: the first frame fades in too.
@@ -7055,10 +7401,7 @@ impl PilusView {
             }
             self.surface_key = Some(key);
         }
-        if let Some(size) = self
-            .surface
-            .frame()
-            .map(|frame| (frame.width, frame.height))
+        if let Some(size) = self.shown_frame().map(|frame| (frame.width, frame.height))
             && size != self.grid_size
         {
             let fresh = self
@@ -7102,7 +7445,11 @@ impl PilusView {
                 let elapsed = anim.started.elapsed().as_secs_f32();
                 let total = SIDEBAR_ANIM_DURATION.as_secs_f32();
                 let step = (elapsed / total).clamp(0.0, 1.0);
-                anim.from + (anim.to - anim.from) * ease_in_out_cubic(step)
+                // A spring, not an ease: the panel and the terminal beside
+                // it overshoot their landing a touch and settle, so the
+                // slide reads as elastic. Collapsing never folds past
+                // closed — a negative width has nothing to show.
+                (anim.from + (anim.to - anim.from) * style::ease_spring(step)).max(0.0)
             }
             None => {
                 if self.sidebar_visible {
@@ -7232,7 +7579,7 @@ impl PilusView {
     }
 
     fn cell_at(&mut self, window: &Window, position: Point<Pixels>) -> Option<Cell> {
-        let (width, height) = match self.surface.frame() {
+        let (width, height) = match self.shown_frame() {
             Some(frame) if frame.width > 0 && frame.height > 0 => (frame.width, frame.height),
             _ => return None,
         };
@@ -7266,7 +7613,7 @@ impl PilusView {
         let Some(hover) = self.hover_cell else {
             return false;
         };
-        let Some(frame) = self.surface.frame() else {
+        let Some(frame) = self.shown_frame() else {
             return false;
         };
         if hover.row >= frame.height || hover.column >= frame.width {
@@ -7530,7 +7877,7 @@ impl PilusView {
         let Some(selection) = self.selection else {
             return;
         };
-        let Some(frame) = self.surface.frame() else {
+        let Some(frame) = self.shown_frame() else {
             return;
         };
         let text = selection.text(frame);
@@ -8475,7 +8822,6 @@ impl PilusView {
         let Some(dock) = self.sidebar_dock() else {
             return div();
         };
-        let theme = self.theme;
         let panel_w = f32::from(dock.width) * cell_width;
 
         // The scroll container stays a plain block. Making it a flex column
@@ -8528,7 +8874,7 @@ impl PilusView {
             .h(px(bottom))
             .flex()
             .flex_col()
-            .bg(theme.window_bg.opacity(self.settings.glass_opacity()))
+            .bg(self.chrome_fill())
             .overflow_hidden()
             // Fixed clearance for the floating traffic lights; the sections
             // scroll under it instead of disappearing beneath the titlebar.
@@ -8746,8 +9092,17 @@ impl PilusView {
             .overflow_x_scroll()
             .overflow_y_hidden()
             .track_scroll(&self.tab_scroll);
+        // The raised fill is one pill that slides to the selected tab, so a
+        // switch reads as motion from the old tab to the new one.
+        let selection = style::GlideSlot::default();
+        tabs = tabs.child(style::glide(
+            "pilus-tab-glide",
+            &selection,
+            theme.panel.opacity(glass),
+            style::RADIUS_MD,
+        ));
         for tab in &self.tabs {
-            tabs = tabs.child(self.tab_item(tab, cx));
+            tabs = tabs.child(self.tab_item(tab, &selection, cx));
         }
         let new_tab = div()
             .id("pilus-new-tab")
@@ -8804,12 +9159,17 @@ impl PilusView {
             .flex()
             .flex_col()
             .justify_center()
-            .bg(theme.window_bg.opacity(glass))
+            .bg(self.chrome_fill())
             .border_color(theme.border)
             .child(tab_strip)
     }
 
-    fn tab_item(&self, tab: &Tab, cx: &mut Context<Self>) -> impl IntoElement {
+    fn tab_item(
+        &self,
+        tab: &Tab,
+        selection: &style::GlideSlot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = self.theme;
         let glass = self.settings.glass_opacity();
         let active = self.tab_active(tab);
@@ -8876,15 +9236,14 @@ impl PilusView {
             .rounded_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            // The raised fill eases in on the new tab and out of the old one,
-            // so switching tabs slides the selection instead of blinking it.
-            .state_fill(
+            // The selected tab's raised fill is the strip's glide pill;
+            // hovering any other tab only hints at it.
+            .hover_fill(
                 if active {
-                    theme.panel.opacity(glass)
-                } else {
                     theme.panel.opacity(0.0)
+                } else {
+                    theme.panel.opacity(glass * 0.5)
                 },
-                theme.panel.opacity(glass),
                 style::RADIUS_MD,
             )
             .text_color(fg)
@@ -8961,6 +9320,11 @@ impl PilusView {
                 .font_family(style::mono_family(&self.shared_settings))
                 .child(label),
         );
+        let tab = if active {
+            tab.child(style::glide_target(selection))
+        } else {
+            tab
+        };
         tab.child(content)
             .child(close)
             .on_click(cx.listener(move |this, _, _, cx| this.focus_tab(index, cx)))
@@ -8972,10 +9336,50 @@ impl PilusView {
     /// the matching frame, so jumping the skip on the control message paints
     /// the old frame's blank dock cells as a black band mid-toggle.
     fn skipped_cols(&self) -> u16 {
+        if let Some((_, skip, _)) = &self.sidebar_freeze {
+            return *skip;
+        }
         match self.surface.frame_dock() {
             Some(dock) if dock.x == 0 => dock.width,
             _ => 0,
         }
+    }
+
+    /// The frame the card paints: the sidebar's snapshot while it slides,
+    /// otherwise the live one. Pointer mapping reads the same frame, so a
+    /// click lands on what is drawn.
+    fn shown_frame(&self) -> Option<&FrameData> {
+        match &self.sidebar_freeze {
+            Some((frame, _, _)) => Some(frame),
+            None => self.surface.frame(),
+        }
+    }
+
+    /// Hand the card back to the live grid once the slide has settled and
+    /// the daemon has drawn a frame with the dock where the sidebar now is
+    /// (or the wait ran long). Returns whether it swapped.
+    fn release_sidebar_freeze(&mut self, reduce_motion: bool) -> bool {
+        let Some((_, _, taken)) = &self.sidebar_freeze else {
+            return false;
+        };
+        if self.sidebar_anim.is_some() {
+            return false;
+        }
+        let live_skip = match self.surface.frame_dock() {
+            Some(dock) if dock.x == 0 => dock.width,
+            _ => 0,
+        };
+        let landed = (live_skip > 0) == self.sidebar_visible;
+        if !landed && taken.elapsed() < SIDEBAR_FREEZE_MAX {
+            return false;
+        }
+        self.sidebar_freeze = None;
+        // The panes may have reflowed into their new width; a short text
+        // fade softens the swap the way any resize settles.
+        if !reduce_motion {
+            self.reflow_fade = Some((Instant::now(), REFLOW_FLOOR));
+        }
+        true
     }
 
     /// The dock the sidebar paints against: the live one while the daemon
@@ -10540,6 +10944,13 @@ impl PilusView {
         }
     }
 
+    /// The fill behind the sidebar, the tab strip, and a native page: a
+    /// shade denser than the terminal under translucency, so the chrome
+    /// frames the grid and a page's text never sits on the bare desktop.
+    fn chrome_fill(&self) -> gpui::Rgba {
+        self.theme.chrome_glass(self.settings.glass_opacity())
+    }
+
     /// Whether the terminal keeps its floating inset card: only the opaque
     /// window frames the grid, so any translucency runs full-bleed.
     fn framed(&self) -> bool {
@@ -10597,6 +11008,92 @@ impl PilusView {
                 let _ = connection.send(resize.clone());
             }
         }
+    }
+}
+
+/// Where a split pane's panel sits inside the card, in card pixels. An
+/// edge on the card's own edge runs to it (`None` size), so the panel meets
+/// the card flush instead of stopping at the last whole cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PanePlace {
+    left: f32,
+    top: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+}
+
+/// A pane's cell span on the visible grid: `[col0, col1)` by `[row0, row1)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaneCells {
+    col0: u16,
+    col1: u16,
+    row0: u16,
+    row1: u16,
+}
+
+/// Round a pane's fractional frame to the whole cells of a `cols` by
+/// `rows` grid.
+fn pane_cells(frame: PaneFrame, cols: u16, rows: u16) -> PaneCells {
+    let span = |start: f32, size: f32, cells: u16| {
+        let count = f32::from(cells);
+        let first = (start * count).round().clamp(0.0, count);
+        let last = ((start + size) * count).round().clamp(first, count);
+        (first as u16, last as u16)
+    };
+    let (col0, col1) = span(frame.x, frame.width, cols);
+    let (row0, row1) = span(frame.y, frame.height, rows);
+    PaneCells {
+        col0,
+        col1,
+        row0,
+        row1,
+    }
+}
+
+/// A copy of `frame` with the split pi pane's cells blanked.
+///
+/// The panel over the pane is glass under translucency, so whatever the
+/// cells beneath it hold — pi's own TUI — would read through it. Blank
+/// cells keep the grid's glass there and nothing else.
+fn mask_pane(frame: &FrameData, cells: PaneCells, skip_cols: u16) -> FrameData {
+    let mut masked = frame.clone();
+    let width = usize::from(frame.width);
+    let col0 = usize::from(skip_cols.saturating_add(cells.col0)).min(width);
+    let col1 = usize::from(skip_cols.saturating_add(cells.col1)).min(width);
+    for row in cells.row0..cells.row1 {
+        let row = usize::from(SKIPPED_DAEMON_ROWS.saturating_add(row));
+        if row >= usize::from(frame.height) {
+            break;
+        }
+        let start = row * width;
+        if let Some(span) = masked.cells.get_mut(start + col0..start + col1) {
+            span.fill(CellData::default());
+        }
+    }
+    masked
+}
+
+/// Map a pane's fractional frame onto the card's whole-cell grid.
+fn pane_place(frame: PaneFrame, layout: &CardLayout) -> PanePlace {
+    let cells = pane_cells(frame, layout.cols, layout.rows);
+    let (col0, col1) = (f32::from(cells.col0), f32::from(cells.col1));
+    let (row0, row1) = (f32::from(cells.row0), f32::from(cells.row1));
+    let (to_right, to_bottom) = (cells.col1 >= layout.cols, cells.row1 >= layout.rows);
+    let left = if col0 <= 0.0 {
+        0.0
+    } else {
+        layout.pad_x + col0 * layout.cell_w
+    };
+    let top = if row0 <= 0.0 {
+        0.0
+    } else {
+        layout.pad_y + row0 * layout.cell_h
+    };
+    PanePlace {
+        left,
+        top,
+        width: (!to_right).then_some(layout.pad_x + col1 * layout.cell_w - left),
+        height: (!to_bottom).then_some(layout.pad_y + row1 * layout.cell_h - top),
     }
 }
 
@@ -10661,20 +11158,39 @@ impl Render for PilusView {
         // so requiring them here would flip the card opaque mid-resize and
         // double-blend every cell for a frame (a visible blink). The card
         // still backs the framed pad ring and any short frame.
-        let sealed = match self.surface.frame() {
+        let sealed = match self.shown_frame() {
             Some(frame) => {
                 frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS)
                     >= SKIPPED_DAEMON_ROWS.saturating_add(layout.rows)
             }
             None => false,
         };
-        let card_bg = if sealed && !framed {
+        // A native page that owns the whole card has no cells to carry the
+        // glass, so it takes the chrome's denser coat: under translucency
+        // its text would otherwise sit straight on the desktop.
+        let page_owns_card = self.home.is_open()
+            || self.settings_open
+            || (self.session.is_open() && self.pi_split().is_none());
+        let card_bg = if page_owns_card {
+            self.chrome_fill()
+        } else if sealed && !framed {
             terminal_bg.opacity(0.0)
         } else {
             terminal_bg.opacity(glass)
         };
         let text_alpha = self.reflow_alpha(cx.reduce_motion());
-        let grid = match self.surface.frame() {
+        // Beside a split pi panel, the pane under it paints blank.
+        let masked = self
+            .pi_split()
+            .zip(self.shown_frame())
+            .map(|(pane, frame)| {
+                mask_pane(
+                    frame,
+                    pane_cells(pane, layout.cols, layout.rows),
+                    self.skipped_cols(),
+                )
+            });
+        let grid = match masked.as_ref().or(self.shown_frame()) {
             Some(frame) => render_grid(
                 frame,
                 grid_theme,
@@ -10728,6 +11244,13 @@ impl Render for PilusView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    // A press beside a split pi panel focuses the pane under
+                    // it in the daemon; hand the keyboard back to the
+                    // terminal now rather than a reconcile later.
+                    if this.pi_focused && this.pi_split().is_some() {
+                        this.pi_focused = false;
+                        this.pi_blurred_at = Some(Instant::now());
+                    }
                     this.begin_selection(event, window, cx);
                 }),
             )
@@ -10888,7 +11411,7 @@ impl Render for PilusView {
                         .border_color(terminal_inset_border())
                         .rounded_md();
                 }
-                card.child(self.card_content(cx, grid, layout.pad_x, layout.pad_y))
+                card.child(self.card_content(cx, grid, &layout))
             }))
             // Chrome layers live at the root so they paint above the content
             // and the sidebar: the menu overlay must never slide beneath it.
@@ -11193,22 +11716,11 @@ fn bottom_fill_spans(
     spans
 }
 
-/// Ease-in-out cubic for the sidebar tween: gentle departure and landing
-/// with peak velocity mid-flight, so the glide reads as smooth motion
-/// instead of a snap.
 /// Text opacity `step` of the way through a fade up from `floor`: quick off
 /// the floor, gentle into full.
 fn reflow_opacity(floor: f32, step: f32) -> f32 {
     let eased = 1.0 - (1.0 - step.clamp(0.0, 1.0)).powi(3);
     floor + (1.0 - floor) * eased
-}
-
-fn ease_in_out_cubic(step: f32) -> f32 {
-    if step < 0.5 {
-        4.0 * step.powi(3)
-    } else {
-        1.0 - (-2.0 * step + 2.0).powi(3) / 2.0
-    }
 }
 
 /// Whether `symbol` can safely flow inside a multi-cell shaped run.
@@ -12276,20 +12788,118 @@ mod tests {
         let endpoint = EndpointId::Local;
         let focused = vec![agent("pi", true, Some("s1"))];
         // Auto off always declines, even with a live report in front.
-        assert_eq!(PilusView::pi_view_for(&focused, false, &endpoint), None);
+        assert_eq!(
+            PilusView::pi_view_for(&focused, false, &endpoint, None),
+            None
+        );
         // A non-pi pane stays terminal.
         let non_pi = vec![agent("claude", true, Some("s1"))];
-        assert_eq!(PilusView::pi_view_for(&non_pi, true, &endpoint), None);
+        assert_eq!(PilusView::pi_view_for(&non_pi, true, &endpoint, None), None);
         // An unfocused pi is nobody's foreground.
         let background = vec![agent("pi", false, Some("s1"))];
-        assert_eq!(PilusView::pi_view_for(&background, true, &endpoint), None);
+        assert_eq!(
+            PilusView::pi_view_for(&background, true, &endpoint, None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_split_pane_maps_onto_whole_cells_and_meets_the_card_edges() {
+        let layout = CardLayout {
+            card_x: 0.0,
+            card_top: 0.0,
+            card_right: 0.0,
+            card_bottom: 0.0,
+            pad_x: 6.0,
+            pad_y: 4.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cols: 80,
+            rows: 24,
+            cell_w: 8.0,
+            cell_h: 16.0,
+            slack_x: 0.0,
+            slack_y: 0.0,
+        };
+        let right_half = PaneFrame {
+            x: 0.5,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        };
+        let place = pane_place(right_half, &layout);
+        assert_eq!(place.left, 6.0 + 40.0 * 8.0);
+        assert_eq!(place.top, 0.0);
+        // Its right and bottom edges are the card's.
+        assert_eq!((place.width, place.height), (None, None));
+        let top_left = PaneFrame {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 0.5,
+        };
+        let place = pane_place(top_left, &layout);
+        assert_eq!((place.left, place.top), (0.0, 0.0));
+        assert_eq!(place.width, Some(6.0 + 40.0 * 8.0));
+        assert_eq!(place.height, Some(4.0 + 12.0 * 16.0));
+    }
+
+    #[test]
+    fn a_split_pi_pane_is_blanked_under_its_panel() {
+        let mut frame = FrameData::blank(6, SKIPPED_DAEMON_ROWS + 2, 0x00ff_ffff, 0);
+        for cell in &mut frame.cells {
+            cell.symbol = "x".to_string();
+        }
+        // Right half of a 4-column visible grid behind a 2-column dock.
+        let cells = pane_cells(
+            PaneFrame {
+                x: 0.5,
+                y: 0.0,
+                width: 0.5,
+                height: 1.0,
+            },
+            4,
+            2,
+        );
+        let masked = mask_pane(&frame, cells, 2);
+        let row = usize::from(SKIPPED_DAEMON_ROWS) * 6;
+        let symbols: Vec<&str> = masked.cells[row..row + 6]
+            .iter()
+            .map(symbol)
+            .collect();
+        assert_eq!(symbols, ["x", "x", "x", "x", " ", " "]);
+    }
+
+    #[test]
+    fn pi_view_falls_back_to_a_pi_sharing_the_visible_tab() {
+        let endpoint = EndpointId::Local;
+        let mut split = agent("pi", false, Some("s1"));
+        split.workspace_id = "w1".to_string();
+        split.tab = 2;
+        let agents = vec![split];
+        // Beside the focused shell in the visible tab, the pi is a split.
+        let Some((view, agent)) = PilusView::pi_view_for(&agents, true, &endpoint, Some(("w1", 2)))
+        else {
+            panic!("a pi in the visible tab is on screen");
+        };
+        assert_eq!(view.pane, "7");
+        assert!(!agent.focused);
+        // Another tab or workspace hides it.
+        assert_eq!(
+            PilusView::pi_view_for(&agents, true, &endpoint, Some(("w1", 1))),
+            None
+        );
+        assert_eq!(
+            PilusView::pi_view_for(&agents, true, &endpoint, Some(("w2", 2))),
+            None
+        );
     }
 
     #[test]
     fn pi_view_reports_the_focused_pane() {
         let endpoint = EndpointId::Local;
         let agents = vec![agent("pi", true, Some("s1"))];
-        let Some((view, _)) = PilusView::pi_view_for(&agents, true, &endpoint) else {
+        let Some((view, _)) = PilusView::pi_view_for(&agents, true, &endpoint, None) else {
             panic!("a focused, reporting pi must be chosen");
         };
         assert_eq!(view.pane, "7");
@@ -12303,7 +12913,7 @@ mod tests {
         // what keeps the terminal from flashing before the report lands.
         let endpoint = EndpointId::Local;
         let agents = vec![agent("pi", true, None)];
-        let Some((view, _)) = PilusView::pi_view_for(&agents, true, &endpoint) else {
+        let Some((view, _)) = PilusView::pi_view_for(&agents, true, &endpoint, None) else {
             panic!("a focused pi pins even without a session");
         };
         assert_eq!(view.pane, "7");
@@ -12536,13 +13146,18 @@ mod tests {
     }
 
     #[test]
-    fn ease_in_out_cubic_glides_through_the_middle() {
-        assert_eq!(ease_in_out_cubic(0.0), 0.0);
-        assert_eq!(ease_in_out_cubic(1.0), 1.0);
-        // Symmetric: halfway through time means halfway through travel,
-        // unlike an ease-out that spends itself up front.
-        assert!((ease_in_out_cubic(0.5) - 0.5).abs() < 0.01);
-        assert!(ease_in_out_cubic(0.25) < 0.25);
+    fn spring_departs_overshoots_and_settles() {
+        assert_eq!(style::ease_spring(0.0), 0.0);
+        assert_eq!(style::ease_spring(1.0), 1.0);
+        // Quick off the mark, unlike an ease-in that idles at the start.
+        assert!(style::ease_spring(0.15) > 0.25);
+        // A gentle overshoot: elastic, never a bounce.
+        let peak = (0..=100)
+            .map(|step| style::ease_spring(step as f32 / 100.0))
+            .fold(0.0_f32, f32::max);
+        assert!(peak > 1.0 && peak < 1.1, "peak {peak}");
+        // Settled well before the duration ends.
+        assert!((style::ease_spring(0.95) - 1.0).abs() < 0.01);
     }
 
     #[test]

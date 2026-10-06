@@ -31,7 +31,7 @@ pub use connection::{ClientEvent, Connection, EndpointIdentity};
 pub use connector::{Connector, ConnectorOptions, ConnectorStatus, agent_binary};
 pub use control::{
     Agent, AgentFeed, AgentSession, Appearance, AutomationSummary, BarSegment, BarWidget,
-    ControlClient, FeedScope, FeedUpdate, Tab, TaskSummary, ThemeInfo, WorktreeInfo,
+    ControlClient, FeedScope, FeedUpdate, PaneFrame, Tab, TaskSummary, ThemeInfo, WorktreeInfo,
     worktree_blockers,
 };
 pub use discovery::{

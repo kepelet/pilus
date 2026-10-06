@@ -112,7 +112,7 @@ impl Surface {
     }
 
     /// The dock that matches the current frame, for deriving the columns a
-    /// client-owned sidebar covers. Updates only when a frame does.
+    /// client-owned sidebar covers. Updates only when a frame or diff lands.
     pub fn frame_dock(&self) -> Option<ShellDockRect> {
         self.frame_dock
     }
@@ -144,6 +144,12 @@ impl Surface {
                     None => false,
                 };
                 if applied {
+                    // A dock toggle keeps the grid's size, so the daemon
+                    // usually redraws it as a diff, not a full frame. The
+                    // diff follows its `ShellDock` like a frame would; a
+                    // skip left on the old dock would show the daemon's
+                    // own dock columns beside the native sidebar.
+                    self.frame_dock = self.shell_dock;
                     SurfaceChange::Repaint
                 } else {
                     self.needs_full_frame = true;
@@ -246,6 +252,29 @@ mod tests {
 
         surface.apply(&ServerMessage::Frame(full(2, 1)));
         assert!(surface.frame_dock().is_none());
+    }
+
+    #[test]
+    fn a_diff_after_the_dock_message_adopts_the_new_dock() {
+        let mut surface = Surface::new();
+        surface.apply(&ServerMessage::Frame(full(2, 1)));
+        assert!(surface.frame_dock().is_none());
+        // Showing the sidebar keeps the grid size, so the redraw is a diff.
+        let dock = ShellDockRect {
+            width: 36,
+            ..ShellDockRect::default()
+        };
+        surface.apply(&ServerMessage::ShellDock(Some(dock)));
+        assert!(surface.frame_dock().is_none());
+        let diff = ServerMessage::FrameDiff(FrameDiff {
+            width: 2,
+            height: 1,
+            runs: Vec::new(),
+            cursor: None,
+            cursor_visible: false,
+        });
+        surface.apply(&diff);
+        assert_eq!(surface.frame_dock(), Some(dock));
     }
 
     #[test]

@@ -222,6 +222,36 @@ const ACTIVE_WINDOW: Duration = Duration::from_secs(90);
 /// a gap, so fewer of them fit than the picker’s packed list holds.
 const PROMPTS_MAX_ROWS: usize = 7;
 
+/// Sessions the history menu lists. Newest first; older ones stay on disk
+/// but are beyond the picker's useful reach.
+const HISTORY_LIMIT: usize = 40;
+/// Bytes of each remote session read to find its opener. The first user
+/// message sits near the top; sampling a slice keeps the listing to one
+/// SSH round trip instead of one read per session.
+const HISTORY_SAMPLE_BYTES: usize = 8192;
+
+/// One row in the session history menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct HistoryEntry {
+    /// The session file, opened when the row is chosen.
+    pub(super) path: PathBuf,
+    /// The session id the file name carries.
+    pub(super) id: String,
+    /// The session's first prompt, empty when it has none yet.
+    pub(super) title: String,
+}
+
+impl HistoryEntry {
+    /// The row's label: the opener when there is one, else the id.
+    fn label(&self) -> String {
+        if self.title.is_empty() {
+            self.id.clone()
+        } else {
+            self.title.clone()
+        }
+    }
+}
+
 /// Characters the header keeps of the session's first prompt; the strip
 /// ellipsizes whatever overflows the window width.
 const TITLE_CHARS: usize = 80;
@@ -284,6 +314,8 @@ enum Update {
     Empty,
     /// The pi model catalog for the endpoint, for the model picker.
     Catalog(Vec<AgentModel>),
+    /// The session history for the endpoint, newest first.
+    History(Vec<HistoryEntry>),
     /// A read or lookup failure, shown in place of the transcript.
     Error(String),
     /// The extension's RPC socket answered a hello.
@@ -587,6 +619,16 @@ pub struct SessionPanel {
     /// press just dismissed it (so its own button's click stays closed).
     prompts_open: bool,
     prompts_dismissed: bool,
+    /// Whether the session history menu is open, and whether an outside
+    /// press just dismissed it.
+    history_open: bool,
+    history_dismissed: bool,
+    /// The endpoint's earlier sessions, newest first. Read once per panel
+    /// open on a background thread; empty while the read is in flight.
+    history: Vec<HistoryEntry>,
+    /// Whether the history read is still in flight, so the menu shows
+    /// skeleton rows instead of "no earlier sessions".
+    history_loading: bool,
     /// A sent prompt is still waiting for pi's first responding content.
     /// The optimistic indicator persists through this, not just the send.
     awaiting_response: bool,
@@ -708,6 +750,10 @@ impl Default for SessionPanel {
             pending_from: 0,
             prompts_open: false,
             prompts_dismissed: false,
+            history_open: false,
+            history_dismissed: false,
+            history: Vec::new(),
+            history_loading: false,
             awaiting_response: false,
             pending_steering: false,
             settled_through: 0,
@@ -764,25 +810,29 @@ impl SessionPanel {
         target: Option<String>,
         cx: &mut Context<PilusView>,
     ) {
-        // An explicit file bypasses discovery entirely.
-        let explicit = PathBuf::from(&spec);
-        let endpoint = if explicit.is_file() {
-            Endpoint::Local {
-                api_socket,
-                cwd: String::new(),
-            }
+        let path = PathBuf::from(&spec);
+        // Mirror pi's `--session <path|id>`: an explicit file is used as-is,
+        // a directory or a bare cwd resolves to its newest session, and a
+        // separator-free spec that names no directory is tried as a full or
+        // partial session id before the cwd fallback.
+        let (explicit, cwd, resolve_latest) = if path.is_file() {
+            (Some(path), String::new(), false)
+        } else if path.is_dir() {
+            (None, local_cwd(&spec), true)
+        } else if let Some(found) = pilus_session::resolve(&spec) {
+            (Some(found), String::new(), false)
         } else {
-            Endpoint::Local {
-                api_socket,
-                cwd: expand_local(&spec),
-            }
+            // Nothing resolved: keep the spec as the cwd so the reader's
+            // "no session" message can name what was asked for.
+            (None, local_cwd(&spec), true)
         };
         self.open_with(
-            endpoint,
+            Endpoint::Local { api_socket, cwd },
             ReadSpec {
-                explicit: explicit.is_file().then_some(explicit),
+                explicit,
                 session_id: None,
-                resolve_latest: true,
+                resolve_latest,
+                display: spec,
             },
             target,
             cx,
@@ -807,6 +857,7 @@ impl SessionPanel {
                 explicit: None,
                 session_id,
                 resolve_latest: false,
+                display: String::new(),
             },
             Some(pane),
             cx,
@@ -829,6 +880,7 @@ impl SessionPanel {
                 explicit: None,
                 session_id,
                 resolve_latest: false,
+                display: String::new(),
             },
             Some(pane),
             cx,
@@ -922,6 +974,10 @@ impl SessionPanel {
         self.pending_from = 0;
         self.prompts_open = false;
         self.prompts_dismissed = false;
+        self.history_open = false;
+        self.history_dismissed = false;
+        self.history.clear();
+        self.history_loading = false;
         self.outbox.clear();
         self.awaiting_response = false;
         self.pending_steering = false;
@@ -1025,6 +1081,9 @@ impl SessionPanel {
         self.last_seen = 0;
         self.loaded = false;
         self.catalog_loading = false;
+        self.history_open = false;
+        self.history_dismissed = false;
+        self.history_loading = false;
     }
 
     /// Take the session the extension socket says this pane moved to — a
@@ -1108,6 +1167,10 @@ impl SessionPanel {
                 Update::Catalog(catalog) => {
                     self.catalog = catalog;
                     self.catalog_loading = false;
+                }
+                Update::History(history) => {
+                    self.history = history;
+                    self.history_loading = false;
                 }
                 Update::Error(error) => {
                     self.loaded = true;
@@ -1806,6 +1869,15 @@ impl SessionPanel {
     #[cfg(feature = "visual-test")]
     pub(super) fn set_catalog_loading(&mut self, loading: bool) {
         self.catalog_loading = loading;
+    }
+
+    /// Fill and open the history menu for a shot, since the harness has no
+    /// endpoint behind it to list sessions from.
+    #[cfg(feature = "visual-test")]
+    pub(super) fn open_history_shot(&mut self, entries: Vec<HistoryEntry>) {
+        self.history = entries;
+        self.history_loading = false;
+        self.history_open = true;
     }
 
     /// A freshly opened picker: an empty query, and the highlight on the
@@ -2598,16 +2670,15 @@ impl SessionPanel {
         column.into_any_element()
     }
 
-    /// The header strip: the session's first prompt, once it has one.
-    /// Until then a remote pane shows a skeleton bar while its first line
-    /// crosses the wire; a local pane, or a remote one whose reader has
-    /// already confirmed an empty session, collapses to nothing. Model,
-    /// cost, and usage live in the composer now.
-    fn header(&self, fonts: Fonts) -> Div {
+    /// The header strip: the session's first prompt, once it has one, then
+    /// the history and close buttons. Until a first line lands a remote pane
+    /// shows a skeleton bar while it crosses the wire; a local pane, or a
+    /// remote one whose reader has already confirmed an empty session, holds
+    /// the space with nothing. Model, cost, and usage live in the composer.
+    fn header(&self, fonts: Fonts, cx: &mut Context<PilusView>) -> Div {
         let theme = self.theme;
         let title = match self.first_prompt() {
             Some(prompt) => div()
-                .flex_1()
                 .min_w(px(0.0))
                 .overflow_hidden()
                 .text_size(px(fonts.body))
@@ -2626,15 +2697,121 @@ impl SessionPanel {
             }
             // Nothing to wait for: a local pane reads at once, and a loaded
             // remote pane simply has no title yet.
-            None => return div(),
+            None => div().into_any_element(),
         };
-        div()
+        let mut row = div()
+            .relative()
             .flex()
             .flex_shrink_0()
             .items_center()
+            .gap_2()
             .h(px(40.0))
             .px_4()
-            .child(title)
+            .child(div().flex_1().min_w(px(0.0)).child(title))
+            .child(self.history_button(cx))
+            .child(self.close_button(cx));
+        // The menu floats below the header, right-aligned under its button,
+        // so opening it never shifts the transcript.
+        if self.history_open {
+            row = row.child(
+                div()
+                    .absolute()
+                    .top(relative(1.0))
+                    .right(px(0.0))
+                    .pt_2()
+                    .child(self.history_menu(fonts, cx)),
+            );
+        }
+        row
+    }
+
+    /// The header's history button: opens the session menu.
+    fn history_button(&self, cx: &mut Context<PilusView>) -> Stateful<Div> {
+        let theme = self.theme;
+        header_icon_button(
+            "session-history-button",
+            include_bytes!("../../assets/icons/clock.svg"),
+            theme,
+        )
+        .on_click(cx.listener(|this: &mut PilusView, _, _, cx| {
+            this.session.toggle_history(cx);
+        }))
+    }
+
+    /// The header's close button: dismisses the panel. The click is also a
+    /// release, so the auto-pin does not reopen the same pane next tick.
+    fn close_button(&self, cx: &mut Context<PilusView>) -> Stateful<Div> {
+        let theme = self.theme;
+        header_icon_button(
+            "session-close-button",
+            include_bytes!("../../assets/icons/x.svg"),
+            theme,
+        )
+        .on_click(cx.listener(|this: &mut PilusView, _, _, cx| {
+            this.release_pi_session(cx);
+        }))
+    }
+
+    /// The session history menu: the endpoint's earlier sessions, newest
+    /// first. Choosing one reads it in place, read-only.
+    fn history_menu(&self, fonts: Fonts, cx: &mut Context<PilusView>) -> AnyElement {
+        let theme = self.theme;
+        let rows = self.history.len().clamp(1, picker_visible_rows(false));
+        let list_h = super::picker_rows_h(rows).min(super::PICKER_MENU_MAX_H);
+        let mut list = super::picker_menu("pilus-session-history", theme)
+            .max_h(px(list_h))
+            .on_mouse_down_out(cx.listener(|this: &mut PilusView, _, _, cx| {
+                this.session.dismiss_history();
+                cx.notify();
+            }));
+        if self.history_loading && self.history.is_empty() {
+            for row in 0..PICKER_SKELETON_ROWS {
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .h(px(super::PICKER_ROW_H))
+                        .px_3()
+                        .child(style::skeleton(
+                            ("session-history-skeleton", row),
+                            theme,
+                            relative(0.72),
+                            fonts.body,
+                        )),
+                );
+            }
+        } else if self.history.is_empty() {
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(super::PICKER_ROW_H))
+                    .px_3()
+                    .text_size(px(fonts.body))
+                    .text_color(theme.muted)
+                    .child("No earlier sessions"),
+            );
+        } else {
+            for (index, entry) in self.history.iter().enumerate() {
+                let path = entry.path.clone();
+                let active = self.reported.as_deref() == Some(entry.id.as_str());
+                list = list.child(super::picker_row(
+                    ("session-history-option", index),
+                    entry.label(),
+                    active,
+                    theme,
+                    fonts.body,
+                    cx.listener(move |this: &mut PilusView, _, _, cx| {
+                        // Browsing an old session detaches from the live pane,
+                        // so remember the release before the panel retargets.
+                        this.release_pi_for_history();
+                        this.session.open_history_entry(path.clone(), cx);
+                        cx.notify();
+                    }),
+                ));
+            }
+        }
+        style::enter("session-history-enter", list).into_any_element()
     }
 
     /// Whether the session's bytes live on another machine, where every read
@@ -3183,6 +3360,110 @@ impl SessionPanel {
         self.prompts_open = false;
     }
 
+    /// Toggle the history menu from its header button, loading the
+    /// endpoint's sessions on first open. An outside press already closed
+    /// it in the capture phase; then the click stays closed.
+    fn toggle_history(&mut self, cx: &mut Context<PilusView>) {
+        if self.history_dismissed {
+            self.history_dismissed = false;
+            self.history_open = false;
+            return;
+        }
+        self.history_open = !self.history_open;
+        if self.history_open {
+            self.load_history();
+        }
+        cx.notify();
+    }
+
+    /// Close the history menu from an outside press.
+    fn dismiss_history(&mut self) {
+        self.history_dismissed = self.history_open;
+        self.history_open = false;
+    }
+
+    /// Read the endpoint's earlier sessions on a background thread. The
+    /// panel's own channel carries the result, so a listing left over from
+    /// a previous open is dropped when `rotate_channels` replaced it.
+    fn load_history(&mut self) {
+        if self.history_loading {
+            return;
+        }
+        let Some(endpoint) = self.endpoint.clone() else {
+            return;
+        };
+        self.history_loading = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let entries = match &endpoint {
+                Endpoint::Local { cwd, .. } => Self::local_history(cwd),
+                Endpoint::Remote { target, cwd } => Self::remote_history(target, cwd),
+            };
+            let _ = tx.send(Update::History(entries));
+        });
+    }
+
+    /// Switch the panel to a session chosen from the history menu.
+    ///
+    /// The chosen session is an older file, not the pane's live one, so the
+    /// panel drops its pane target: the transcript is read-only, and no
+    /// prompt or state push can land in it.
+    pub(super) fn open_history_entry(&mut self, path: PathBuf, cx: &mut Context<PilusView>) {
+        let Some(endpoint) = self.endpoint.clone() else {
+            return;
+        };
+        self.open_with(
+            endpoint,
+            ReadSpec {
+                explicit: Some(path),
+                session_id: None,
+                resolve_latest: false,
+                display: String::new(),
+            },
+            None,
+            cx,
+        );
+    }
+
+    /// The endpoint's earlier sessions, newest first, from the local store.
+    fn local_history(cwd: &str) -> Vec<HistoryEntry> {
+        if cwd.is_empty() {
+            return Vec::new();
+        }
+        pilus_session::listing(&pilus_session::sessions_root(), cwd, HISTORY_LIMIT)
+            .into_iter()
+            .map(|session| HistoryEntry {
+                path: session.path,
+                id: session.id,
+                title: session.title,
+            })
+            .collect()
+    }
+
+    /// The remote mirror of [`Self::local_history`]: one SSH round trip
+    /// that lists the cwd's sessions and samples each opener, since a read
+    /// per session would be a round trip per row.
+    fn remote_history(target: &SshTarget, cwd: &str) -> Vec<HistoryEntry> {
+        if cwd.is_empty() {
+            return Vec::new();
+        }
+        let dir = pilus_session::dir_name_for(cwd);
+        let command = format!(
+            "root=\"${{PI_CODING_AGENT_SESSION_DIR:-$HOME/.pi/agent/sessions}}\"; \
+             for f in $(ls -t \"$root\"/{dir}/*.jsonl 2>/dev/null | head -n {HISTORY_LIMIT}); do \
+             printf '\\n@@PILUS %s\\n' \"$f\"; head -c {HISTORY_SAMPLE_BYTES} \"$f\"; printf '\\n'; done"
+        );
+        let Ok(output) = target.shell(&command).output() else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let mut entries = parse_history_output(&String::from_utf8_lossy(&output.stdout));
+        entries.truncate(HISTORY_LIMIT);
+        entries
+    }
+
     /// Whether the session file has grown recently: live work, not a stale
     /// interrupted tail.
     fn recently_active(&self) -> bool {
@@ -3721,7 +4002,7 @@ impl SessionPanel {
         // After the optimistic bookkeeping, so a landed prompt drops its
         // entry in the same frame its real bubble appears.
         self.sync_list();
-        let header = self.header(fonts);
+        let header = self.header(fonts, cx);
         let body = self.body(fonts, cx);
         let composer = self.composer(input, fonts, cx);
         div()
@@ -3748,6 +4029,9 @@ struct ReadSpec {
     /// `--session-ui` only: no id resolves the cwd's newest session file.
     /// Pane opens never guess.
     resolve_latest: bool,
+    /// The argument `--session-ui` was given, named in a "no session"
+    /// message. Empty for a pane open.
+    display: String,
 }
 
 /// The background reader: resolve the session, then tail it until stopped
@@ -3853,7 +4137,10 @@ fn reader_loop(
                 }
             }
             None => {
-                if wanted.is_none() && !spec.resolve_latest {
+                // A pane with no reported id has nothing to open yet; an
+                // explicit file and a `--session-ui` cwd are targets even
+                // without one.
+                if wanted.is_none() && !spec.resolve_latest && spec.explicit.is_none() {
                     // No session yet and guessing is off the table: wait
                     // for a follow or the stop flag.
                     if sleep_sliced(interval, &stop) {
@@ -3875,6 +4162,17 @@ fn reader_loop(
                         opened = Some(fresh);
                     }
                     Ok(None) => {
+                        // `--session-ui` names an existing session, so a miss
+                        // is the argument the user passed, not a fresh pane
+                        // waiting on its first prompt: report it instead of
+                        // idling on an empty placeholder.
+                        if spec.resolve_latest {
+                            let _ = tx.send(Update::Error(format!(
+                                "No Pi session found for `{}`",
+                                spec.display
+                            )));
+                            return;
+                        }
                         // The session is known but pi has not written its file
                         // yet: a fresh pane, not a load in flight. Tell the
                         // panel once so its header drops the skeleton.
@@ -4329,23 +4627,28 @@ fn open_tail(
         }
         Endpoint::Remote { target, .. } => {
             let dir = remote_cache_dir(target);
-            // A session id also names the mirror, so a re-open folds the
-            // cached copy before any SSH call — and the cached path skips
-            // the resolve glob too.
-            let hinted = session_id.and_then(|id| remote_path_hint(&dir, id));
-            let (path, hint) = match hinted {
-                Some((path, hint)) => (path, Some(hint)),
-                None => {
-                    let Some(path) = resolve_remote(target, session_id)? else {
-                        return Ok(None);
-                    };
-                    let id = session_id
-                        .map(str::to_string)
-                        .or_else(|| session_id_from_path(&path));
-                    if let Some(id) = id.as_deref() {
-                        write_remote_path_hint(&dir, id, &path);
+            // An explicit path (a history choice) is already resolved, so
+            // skip the glob; otherwise a session id also names the mirror,
+            // so a re-open folds the cached copy before any SSH call — and
+            // the cached path skips the resolve glob too.
+            let (path, hint) = if let Some(path) = explicit {
+                (path.to_string_lossy().into_owned(), None)
+            } else {
+                let hinted = session_id.and_then(|id| remote_path_hint(&dir, id));
+                match hinted {
+                    Some((path, hint)) => (path, Some(hint)),
+                    None => {
+                        let Some(path) = resolve_remote(target, session_id)? else {
+                            return Ok(None);
+                        };
+                        let id = session_id
+                            .map(str::to_string)
+                            .or_else(|| session_id_from_path(&path));
+                        if let Some(id) = id.as_deref() {
+                            write_remote_path_hint(&dir, id, &path);
+                        }
+                        (path, None)
                     }
-                    (path, None)
                 }
             };
             // The mirror is keyed by the session id — resolved or the one
@@ -4488,6 +4791,64 @@ fn sanitize_id(id: &str) -> Option<String> {
 fn session_id_from_path(path: &str) -> Option<String> {
     let stem = Path::new(path).file_stem()?.to_str()?;
     sanitize_id(stem.split_once('_')?.1)
+}
+
+/// A compact header icon button: a bordered hover fill under a muted glyph.
+fn header_icon_button(id: &'static str, glyph: &'static [u8], theme: Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(28.0))
+        .h(px(28.0))
+        .flex_shrink_0()
+        .rounded_md()
+        .cursor_pointer()
+        .hover_fill(theme.border, style::RADIUS_MD)
+        .child(super::icon(glyph, 15.0, theme.muted))
+}
+
+/// Fold the remote history sample into entries.
+///
+/// The command emits a `@@PILUS <path>` marker before each sampled file; a
+/// file whose name carries no id is skipped rather than shown as a row with
+/// no way to open it.
+fn parse_history_output(output: &str) -> Vec<HistoryEntry> {
+    fn finish(
+        current: &mut Option<String>,
+        body: &mut String,
+        entries: &mut Vec<HistoryEntry>,
+    ) {
+        if let Some(path) = current.take()
+            && let Some(id) = session_id_from_path(&path)
+        {
+            entries.push(HistoryEntry {
+                path: PathBuf::from(path),
+                id,
+                title: pilus_session::first_prompt_in(body).unwrap_or_default(),
+            });
+        }
+        body.clear();
+    }
+    let mut entries = Vec::new();
+    let mut current: Option<String> = None;
+    let mut body = String::new();
+    for line in output.lines() {
+        match line.strip_prefix("@@PILUS ") {
+            Some(path) => {
+                finish(&mut current, &mut body, &mut entries);
+                current = Some(path.trim().to_string());
+            }
+            None if current.is_some() => {
+                body.push_str(line);
+                body.push('\n');
+            }
+            None => {}
+        }
+    }
+    finish(&mut current, &mut body, &mut entries);
+    entries
 }
 
 /// A session file on another machine, read through one SSH command per poll.
@@ -4959,6 +5320,15 @@ fn expand_local(path: &str) -> String {
     pilus_client::expand_local(path)
 }
 
+/// Resolve a cwd spec to the absolute path pi keys its session folder by.
+/// Pi names the folder from the process cwd, so a relative `--session-ui .`
+/// must be made absolute before it can match.
+fn local_cwd(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| expand_local(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4998,6 +5368,39 @@ mod tests {
         );
         assert_eq!(session_id_from_path("/tmp/nounderscore.jsonl"), None);
         assert_eq!(session_id_from_path("/tmp/dir/"), None);
+    }
+
+    #[test]
+    fn history_output_folds_markers_into_entries() {
+        let output = "\n@@PILUS /s/--app--/t_one.jsonl\n\
+            {\"type\":\"session\",\"id\":\"one\"}\n\
+            {\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"fix   it\"}}\n\
+            \n@@PILUS /s/--app--/t_two.jsonl\n\
+            {\"type\":\"session\",\"id\":\"two\"}\n";
+        let entries = parse_history_output(output);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "one");
+        assert_eq!(entries[0].title, "fix it");
+        assert_eq!(entries[1].id, "two");
+        assert!(entries[1].title.is_empty());
+        // A file whose name carries no id is skipped, not shown unopenable.
+        assert!(parse_history_output("@@PILUS /s/nounderscore.jsonl\n{}").is_empty());
+    }
+
+    #[test]
+    fn history_entry_label_falls_back_to_the_id() {
+        let titled = HistoryEntry {
+            path: PathBuf::from("/s/t_a.jsonl"),
+            id: "a".into(),
+            title: "Fix the parser".into(),
+        };
+        assert_eq!(titled.label(), "Fix the parser");
+        let untitled = HistoryEntry {
+            path: PathBuf::from("/s/t_b.jsonl"),
+            id: "b".into(),
+            title: String::new(),
+        };
+        assert_eq!(untitled.label(), "b");
     }
 
     #[test]

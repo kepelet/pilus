@@ -47,12 +47,14 @@ pub enum Launch {
     },
     /// Open the main window with the native Pi Session panel on a cwd or file.
     SessionUi {
-        /// A session `.jsonl` path, or a cwd whose latest session is shown.
+        /// A session `.jsonl` path, a session id (full or partial), or a cwd
+        /// whose latest session is shown.
         spec: String,
     },
     /// Fold a Pi session and print its transcript, without opening a window.
     ProbeSession {
-        /// A session `.jsonl` path, or a cwd whose latest session is shown.
+        /// A session `.jsonl` path, a session id (full or partial), or a cwd
+        /// whose latest session is shown.
         spec: String,
     },
     /// Play every notification cue once, so the audio path can be heard
@@ -243,8 +245,8 @@ fn print_help() {
          \x20   --probe-uhp      Stream one pane via UHP and print the screen\n\
          \x20   --probe-feed     Run the event-driven feed briefly and print it\n\
          \x20   --probe-machine ID  Attach to a saved machine over SSH and print it\n\
-         \x20   --session-ui [CWD|FILE]  Open the main window on a Pi session\n\
-         \x20   --probe-session [CWD|FILE]  Print a Pi session's transcript\n\
+         \x20   --session-ui [CWD|FILE|ID]  Open the main window on a Pi session\n\
+         \x20   --probe-session [CWD|FILE|ID]  Print a Pi session's transcript\n\
          \x20   --check-updates  Check the OTA release source and print it\n\
          \x20   --channel NAME   Channel for --check-updates (stable or preview)\n\
          \x20   --feed-url URL   Static release manifest for --check-updates\n\

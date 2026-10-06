@@ -59,7 +59,14 @@ headings, bold/italic/inline code, links, fenced code blocks, lists, block
 quotes, tables, and rules.
 
 The header is one borderless row: the session's first prompt on the left,
-cut to 80 characters and ellipsized to the window width. A remote pane shows
+cut to 80 characters and ellipsized to the window width, then a clock button
+that opens the session history and an × button that closes the panel. The
+close is a release: the auto-pin leaves the same pane alone until it reports
+a session or loses focus, so closing a pinned conversation is not undone on
+the next reconcile. The history menu lists the endpoint's earlier sessions
+for the same cwd, newest first, each titled by its first prompt (read from
+the file, or from one SSH sample per row on a machine); choosing one opens
+that file read-only, detached from the live pane. A remote pane shows
 a skeleton bar only until its reader reports — a fold, an error, or a
 confirmed empty session — so a fresh remote pane drops the skeleton instead
 of holding it forever; a local pane reads at once and never shows one. Only
@@ -217,7 +224,11 @@ debug build). Sockets live there:
 
 `pilus` attaches to the **render** socket (`luvus-client.sock`). `$LUVUS_SESSION`
 selects a session, matching the daemon's own environment convention; `--session`
-and `--socket` override it. When the derived path is too long for `sun_path`,
+and `--socket` override it. `--session-ui` is separate: it opens the native Pi
+Session panel on a session file, a session id (full or partial, mirroring pi's
+own `--session <path|id>`), or a cwd whose newest session is read. A spec that
+resolves to nothing paints the reader's "no session found" error instead of an
+empty placeholder. When the derived path is too long for `sun_path`,
 both the daemon and `pilus` relocate it to a hashed, owner-scoped alias under the
 temporary directory (`discovery::alias_for`).
 

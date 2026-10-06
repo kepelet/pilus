@@ -504,6 +504,68 @@ pub fn run() -> Result<()> {
             .context("save session-waiting")?;
         println!("shot: {OUT}/session-waiting.png");
     }
+    // The Tasks page, seeded with one task per interesting status: the list,
+    // a selected task's detail pane, and the new-task composer. It needs no
+    // daemon, so it rides the standalone captures.
+    {
+        let cell: Rc<RefCell<Option<gpui::Entity<PilusView>>>> = Rc::new(RefCell::new(None));
+        let slot = cell.clone();
+        let window = cx
+            .open_window(size(px(shot_width()), px(780.0)), move |window, cx| {
+                let view = cx.new(move |cx| {
+                    PilusView::new(
+                        pilus_client::ConnectTarget::local(),
+                        None,
+                        settings(),
+                        Rc::new(RefCell::new(MachineSignal::default())),
+                        Rc::new(RefCell::new(Theme::default())),
+                        None,
+                        window,
+                        cx,
+                    )
+                });
+                *slot.borrow_mut() = Some(view.clone());
+                view
+            })
+            .context("open tasks")?;
+        let view = cell.borrow().clone().context("tasks view captured")?;
+        // Let start-up connection churn finish; it respawns the live feed.
+        settle(&mut cx, 40);
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                // Detach the live feed, or the local daemon's own tasks
+                // would replace the sample.
+                view.agent_feed = None;
+                view.agents_loaded = true;
+                view.tasks = sample_tasks();
+                view.open_tasks(cx);
+            });
+        });
+        settle(&mut cx, 4);
+        capture(&mut cx, window.into(), "tasks")?;
+        cx.update(|app| view.update(app, |view, cx| view.tasks_panel_select("t3", cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "tasks-detail")?;
+        cx.update(|app| view.update(app, |view, cx| view.tasks_panel_compose(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "tasks-compose")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.tasks_panel_pick(super::task_compose::TaskPicker::Deps, cx)
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "tasks-compose-deps")?;
+        // The list's own machine picker, with the composer closed.
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.tasks_panel_pick(super::task_compose::TaskPicker::Deps, cx);
+                view.tasks_panel_pick(super::task_compose::TaskPicker::ScopeMachine, cx);
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "tasks-scope-machine")?;
+    }
     Ok(())
 }
 
@@ -1085,6 +1147,57 @@ impl Render for GlyphGridView {
                 0.0,
                 1.0,
             ))
+    }
+}
+
+/// A queue spanning the lifecycle, for the Tasks page captures.
+fn sample_tasks() -> pilus_client::TaskSummary {
+    use pilus_client::{Task, TaskStatus};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let task = |id: &str, title: &str, status, age: u64| Task {
+        id: id.to_string(),
+        title: title.to_string(),
+        status: Some(status),
+        updated: now.saturating_sub(age),
+        created: now.saturating_sub(age + 600),
+        attempt: 1,
+        ..Task::default()
+    };
+    let items = vec![
+        Task {
+            assignee: Some(4),
+            paths: vec!["src/auth/**".into(), "tests/auth/**".into()],
+            gate: Some("cargo test auth".into()),
+            prompt: Some(
+                "Move session refresh behind the new token store and cover expiry.".into(),
+            ),
+            context_percent: Some(46),
+            mode: Some("worktree".into()),
+            branch: Some("task/t3".into()),
+            ..task("t3", "Refactor session refresh", TaskStatus::Running, 240)
+        },
+        Task {
+            deps: vec!["t3".into()],
+            paths: vec!["src/api/**".into()],
+            ..task("t4", "Rate-limit the public API", TaskStatus::Queued, 3_600)
+        },
+        task("t5", "Document the token store", TaskStatus::Queued, 7_200),
+        Task {
+            outputs: vec!["1 test failed: auth::expiry".into()],
+            gate: Some("cargo test auth".into()),
+            ..task("t2", "Fix expiry off-by-one", TaskStatus::Review, 900)
+        },
+        Task {
+            branch: Some("task/t1".into()),
+            ..task("t1", "Add token store", TaskStatus::Done, 86_400)
+        },
+    ];
+    pilus_client::TaskSummary {
+        open: 4,
+        total: items.len() as u32,
+        items,
     }
 }
 

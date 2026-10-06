@@ -127,6 +127,25 @@ pub(super) fn section_label(theme: Theme, text: impl IntoElement, size: f32) -> 
         .child(text)
 }
 
+/// A small outlined tag for a value that qualifies a row: a dependency, a
+/// path glob, a mode. It sits in a list row or a property cell and never
+/// takes a click of its own.
+pub(super) fn chip(theme: Theme, text: impl IntoElement, size: f32) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .h(px(size * 1.7))
+        .px(px(6.0))
+        .rounded_sm()
+        .border_1()
+        .border_color(theme.border)
+        .text_size(px(size))
+        .text_color(theme.muted)
+        .child(text)
+}
+
 /// A window or panel title: bold body-colored text one step above the body.
 pub(super) fn title(theme: Theme, text: impl IntoElement, size: f32) -> Div {
     div()

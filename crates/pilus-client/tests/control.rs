@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::thread;
 
-use pilus_client::ControlClient;
+use pilus_client::{ControlClient, MissionScope};
 
 #[test]
 fn reads_and_commands_over_one_connection_per_request() {
@@ -21,7 +21,7 @@ fn reads_and_commands_over_one_connection_per_request() {
 
     let listener = UnixListener::bind(&socket).expect("bind");
     let server = thread::spawn(move || {
-        for _ in 0..15 {
+        for _ in 0..14 {
             let (stream, _) = listener.accept().expect("accept");
             let mut reader = BufReader::new(stream.try_clone().expect("clone"));
             let mut writer = stream;
@@ -196,5 +196,128 @@ fn reads_and_commands_over_one_connection_per_request() {
     client
         .remove_worktree("/repo/fix-branch", true)
         .expect("remove worktree");
+    server.join().expect("server thread");
+}
+
+#[test]
+fn mission_control_reads_and_row_actions() {
+    let dir = std::env::temp_dir().join(format!("pilus-mission-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let socket = dir.join("luvus.sock");
+    let _ = std::fs::remove_file(&socket);
+
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let server = thread::spawn(move || {
+        for _ in 0..13 {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut writer = stream;
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read request");
+            let request: serde_json::Value = serde_json::from_str(&line).expect("json");
+            let params = &request["params"];
+            let result = match request["method"].as_str().expect("method") {
+                "mission.snapshot" => {
+                    assert_eq!(params["scope"], "all");
+                    assert_eq!(params["workspace_id"], "ws1");
+                    serde_json::json!({
+                        "type": "mission_snapshot", "scope": "all", "refreshing": false,
+                        "summary": {"agents": 1, "tokens": 20, "cost_usd": 1.5,
+                                    "burn_usd_per_hour": 0.75},
+                        "automation": {"summary": {"definitions": 1, "enabled": 1,
+                                                   "scheduled": 1, "running": 0, "review": 0,
+                                                   "failed": 0, "next_run_at": 99},
+                                       "rows": [{"id": "a1", "name": "Nightly",
+                                                 "state": "scheduled", "next_run_at": 99,
+                                                 "agent_id": "codex"}]},
+                        "rows": [{"kind": "live", "pane": "7", "agent": "claude",
+                                  "state": "working", "workspace_id": "ws1",
+                                  "workspace_name": "api", "tab": "1", "location": "t1",
+                                  "usage": {"model": "opus", "tokens_in": 12, "tokens_out": 8,
+                                            "cache_tokens": 0, "context": 0.25,
+                                            "cost_usd": 1.5}}]
+                    })
+                }
+                "mission.refresh" => {
+                    assert_eq!(params["scope"], "workspace");
+                    assert!(params.get("workspace_id").is_none());
+                    serde_json::json!({ "type": "mission_refresh", "refreshing": true })
+                }
+                "config.get" => serde_json::json!({
+                    "type": "config", "config": { "mission_budget": 50.0 }
+                }),
+                "agent.keys" => {
+                    assert_eq!(params["target"], "7");
+                    assert_eq!(params["keys"], serde_json::json!(["y", "enter"]));
+                    serde_json::json!({ "type": "ok" })
+                }
+                "agent.fork" => {
+                    assert_eq!(params["target"], "7");
+                    assert_eq!(params["focus"], false);
+                    serde_json::json!({ "type": "agent_fork", "pane": "8" })
+                }
+                "agent.resume" => {
+                    assert_eq!(params["session_id"], "s-1");
+                    serde_json::json!({ "type": "ok" })
+                }
+                "agent.read" => {
+                    assert_eq!(params["lines"], 6);
+                    serde_json::json!({ "type": "agent_read", "text": "Allow edit? (y/n)" })
+                }
+                "automation.get" => serde_json::json!({
+                    "type": "automation",
+                    "automation": {"id": "a1", "name": "Nightly", "enabled": true,
+                                   "trigger": {"kind": "daily", "timezone": "UTC",
+                                               "second_of_day": 3600},
+                                   "task": {"title": "Sweep", "prompt": "p", "agent_id": "codex",
+                                            "mode": "worktree", "access": "workspace"}}
+                }),
+                "automation.history" => {
+                    assert_eq!(params["id"], "a1");
+                    serde_json::json!({ "type": "automation_history",
+                                        "runs": [{"id": "r1", "status": "succeeded",
+                                                  "scheduled_at": 5}] })
+                }
+                "automation.preview" => {
+                    assert_eq!(params["trigger"]["kind"], "daily");
+                    serde_json::json!({ "type": "automation_preview",
+                                        "occurrences_utc": [3600, 90000] })
+                }
+                "automation.run" | "automation.disable" | "automation.enable" => {
+                    assert_eq!(params["id"], "a1");
+                    serde_json::json!({ "type": "ok" })
+                }
+                other => panic!("unexpected method: {other}"),
+            };
+            let response = serde_json::json!({ "id": request["id"], "result": result });
+            writeln!(writer, "{response}").expect("write response");
+        }
+    });
+
+    let mut client = ControlClient::connect(&socket).expect("connect");
+    let snapshot = client
+        .mission_snapshot(MissionScope::All, Some("ws1"))
+        .expect("snapshot");
+    assert_eq!(snapshot.rows[0].pane.as_deref(), Some("7"));
+    assert_eq!(snapshot.burn_usd_per_hour, Some(0.75));
+    assert_eq!(snapshot.automations[0].name, "Nightly");
+    client
+        .mission_refresh(MissionScope::Workspace, None)
+        .expect("refresh");
+    assert_eq!(client.mission_budget().expect("budget"), Some(50.0));
+    client.agent_keys("7", &["y", "enter"]).expect("approve");
+    client.fork_agent("7").expect("fork");
+    client.resume_agent("s-1").expect("resume");
+    assert_eq!(
+        client.read_agent("7", 6).expect("read"),
+        "Allow edit? (y/n)"
+    );
+    let detail = client.automation_detail("a1").expect("detail");
+    assert_eq!(detail.schedule, "Daily at 01:00 (UTC)");
+    assert_eq!(detail.occurrences, [3600, 90000]);
+    assert_eq!(detail.runs[0].status, "succeeded");
+    client.run_automation("a1").expect("run");
+    client.set_automation_enabled("a1", false).expect("pause");
+    client.set_automation_enabled("a1", true).expect("enable");
     server.join().expect("server thread");
 }

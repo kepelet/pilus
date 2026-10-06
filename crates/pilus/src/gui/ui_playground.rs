@@ -549,6 +549,70 @@ impl UiPlaygroundView {
 
     /// The context gauge and its companion token counts across states:
     /// unknown, empty, partial, warning, and full occupancy.
+    /// Meters at the readings Mission Control draws: unknown, partial, and
+    /// past the compaction threshold.
+    fn meter_demo(&self) -> Div {
+        let theme = self.theme;
+        let height = style::scaled(&self.settings, 6.0);
+        let cases: [(&str, Option<f32>, bool); 4] = [
+            ("unknown", None, false),
+            ("28%", Some(0.28), false),
+            ("60%", Some(0.6), false),
+            ("91% · compact soon", Some(0.91), true),
+        ];
+        let mut column = div().flex().flex_col().gap_3().w_full();
+        for (name, fraction, warns) in cases {
+            column = column.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(div().w(px(160.0)).flex_shrink_0().child(style::meter(
+                        format!("pg-meter-{name}"),
+                        fraction,
+                        if warns { theme.alert } else { theme.accent },
+                        theme,
+                        height,
+                    )))
+                    .child(
+                        div()
+                            .text_size(px(self.fonts().label))
+                            .text_color(if warns { theme.alert } else { theme.muted })
+                            .child(name.to_string()),
+                    ),
+            );
+        }
+        column
+    }
+
+    /// The Mission Control metrics row: one tile per headline figure.
+    fn stat_tile_demo(&self) -> Div {
+        let theme = self.theme;
+        let fonts = self.fonts();
+        style::stat_strip(theme)
+            .w_full()
+            .child(style::stat_tile(
+                theme,
+                fonts,
+                "AGENTS",
+                "04",
+                theme.accent,
+                "3 live · 4 total",
+            ))
+            .child(style::stat_tile(
+                theme,
+                fonts,
+                "BLOCKED",
+                "01",
+                theme.alert,
+                "awaiting response",
+            ))
+            .child(style::stat_tile(
+                theme, fonts, "SPEND", "$25.16", theme.ok, "$1.20/hr",
+            ))
+    }
+
     fn context_gauge_demo(&self) -> Div {
         let theme = self.theme;
         let size = style::scaled(&self.settings, style::GAUGE_SIZE);
@@ -1750,6 +1814,8 @@ impl Render for UiPlaygroundView {
             )
             .child(self.section("SLIDER", self.tray(self.slider_demo(cx))))
             .child(self.section("CONTEXT GAUGE", self.tray(self.context_gauge_demo())))
+            .child(self.section("METER", self.tray(self.meter_demo())))
+            .child(self.section("STAT TILE", self.tray(self.stat_tile_demo())))
             .child(
                 self.section(
                     "SIDEBAR",

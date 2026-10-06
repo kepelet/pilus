@@ -15,6 +15,8 @@ mod home;
 mod keys;
 mod machines;
 mod markdown;
+mod mission;
+mod page_split;
 mod palette;
 mod pi_extension;
 mod picker;
@@ -60,6 +62,8 @@ use gpui::{
 use gpui_platform::application;
 use gpui_updater_core::{Release, UpdateStatus, Version};
 use home::{HomeField, HomeFocus, HomePanel};
+use mission::MissionPanel;
+use page_split::{PageSplit, SplitAxis, page_extent};
 use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use pilus_client::{
@@ -264,8 +268,9 @@ impl NavKind {
 
     /// The `<bind>` chord that opens this destination in the daemon.
     ///
-    /// Automations surface in Mission Control and tasks on the task board,
-    /// so the data rows deep-link to the view that shows them.
+    /// Tasks, Mission Control, and Automations open native pages, so only
+    /// Orchestration still sends its chord; the others keep the daemon's
+    /// binding so `tab_view` can follow a chord typed in a pane.
     fn chord(self) -> char {
         match self {
             NavKind::Automations | NavKind::Mission => 'm',
@@ -861,6 +866,10 @@ struct CardLayout {
     /// edge colors over this strip so no card-colored sliver shows.
     slack_x: f32,
     slack_y: f32,
+    /// Pixels a split page takes from the card's leading edge or top, ahead
+    /// of the grid's own padding. Zero with no split.
+    page_w: f32,
+    page_h: f32,
 }
 
 /// Which surface owns the keyboard, in stacking order.
@@ -879,6 +888,8 @@ enum InputLayer {
     Settings,
     /// The native Tasks page.
     Tasks,
+    /// The native Mission Control page.
+    Mission,
     /// The native Pi Session page.
     Session,
     /// The live terminal grid.
@@ -895,6 +906,7 @@ fn top_layer(
     home: bool,
     settings: bool,
     tasks: bool,
+    mission: bool,
     session: bool,
 ) -> InputLayer {
     if picker {
@@ -907,6 +919,8 @@ fn top_layer(
         InputLayer::Settings
     } else if tasks {
         InputLayer::Tasks
+    } else if mission {
+        InputLayer::Mission
     } else if session {
         InputLayer::Session
     } else {
@@ -1551,6 +1565,14 @@ struct PilusView {
     /// Daemon answers to Tasks page mutations, run off the GUI thread.
     tasks_op_rx: Receiver<task_compose::TasksMsg>,
     tasks_op_tx: Sender<task_compose::TasksMsg>,
+    /// The native Mission Control page: its state and the daemon's last
+    /// dashboard snapshot.
+    mission: MissionPanel,
+    /// Mission Control's reply field for a blocked agent.
+    mission_answer: Entity<TextInput>,
+    /// The terminal sharing the card with the open Mission Control or Tasks
+    /// page. Cleared whenever neither page is open.
+    page_split: Option<PageSplit>,
     /// The Pi Session composer's field.
     session_prompt: Entity<TextInput>,
     /// Agent availability and models for the Home composer.
@@ -1670,6 +1692,12 @@ impl PilusView {
             )
             .submit_on_enter()
         });
+        let mission_answer = mission::answer_input(
+            style::chrome_font(&shared_settings),
+            initial_fonts.body,
+            initial_theme,
+            cx,
+        );
         let tasks_inputs = TasksInputs::new(
             style::chrome_font(&shared_settings),
             initial_fonts.body,
@@ -1917,6 +1945,9 @@ impl PilusView {
             tasks_inputs,
             tasks_op_rx,
             tasks_op_tx,
+            mission: MissionPanel::default(),
+            mission_answer,
+            page_split: None,
             session_prompt,
             agent_configs: Vec::new(),
             agent_config_cache: HashMap::new(),
@@ -2221,6 +2252,7 @@ impl PilusView {
             self.tasks_receive(message);
             changed = true;
         }
+        changed |= self.mission_tick();
         while let Ok(resolved) = self.home_resolve_rx.try_recv() {
             self.home_resolve_pending = false;
             for (endpoint_key, home) in resolved.homes {
@@ -3588,6 +3620,7 @@ impl PilusView {
             InputLayer::Home => self.home_key(event, cx),
             InputLayer::Settings => self.settings_key(event, cx),
             InputLayer::Tasks => self.tasks_key(event, cx),
+            InputLayer::Mission => self.mission_key(event, cx),
             InputLayer::Session => {
                 let input = self.session_prompt.clone();
                 if self.session.key(&event.keystroke, &input, cx) {
@@ -3614,9 +3647,22 @@ impl PilusView {
             self.palette.is_open(),
             self.home.is_open(),
             self.settings_open,
-            self.tasks_panel.is_open(),
+            self.tasks_panel.is_open() && !self.terminal_beside_page(),
+            self.mission.is_open() && !self.terminal_beside_page(),
             self.session_owns_keys(),
         )
+    }
+
+    /// The split of the open Mission Control or Tasks page, if any.
+    fn page_split(&self) -> Option<PageSplit> {
+        let page_open = self.tasks_panel.is_open() || self.mission.is_open();
+        self.page_split.filter(|_| page_open)
+    }
+
+    /// Whether the terminal beside a split page holds the keyboard.
+    fn terminal_beside_page(&self) -> bool {
+        self.page_split()
+            .is_some_and(|split| split.terminal_focused)
     }
 
     /// Whether the session panel takes the keyboard: always when it owns
@@ -3893,8 +3939,14 @@ impl PilusView {
             Command::FocusTab(index) => self.focus_tab(index, cx),
             Command::SwitchSession(name) => self.switch_session(&name),
             Command::NewSession => self.start_new_session(),
-            Command::FocusWorkspace(id) => self.focus_workspace(&id),
-            Command::FocusAgent(pane) => self.focus_agent(&pane),
+            Command::FocusWorkspace(id) => {
+                self.leave_settings_page();
+                self.focus_workspace(&id);
+            }
+            Command::FocusAgent(pane) => {
+                self.leave_settings_page();
+                self.focus_agent(&pane);
+            }
         }
     }
 
@@ -4057,6 +4109,7 @@ impl PilusView {
     fn leave_settings_page(&mut self) {
         self.settings_open = false;
         self.tasks_panel.close();
+        self.mission.close();
         self.home.close();
         self.update_url_editing = false;
     }
@@ -4282,15 +4335,20 @@ impl PilusView {
             .into_any_element();
         }
         if self.tasks_panel.is_open() {
-            return style::enter(
-                "pilus-page-tasks",
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_hidden()
-                    .child(self.tasks_page(cx)),
-            )
-            .into_any_element();
+            let page = div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.tasks_page(cx));
+            return self.page_card("pilus-page-tasks", page, grid, layout, cx);
+        }
+        if self.mission.is_open() {
+            let page = div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.mission_page(cx));
+            return self.page_card("pilus-page-mission", page, grid, layout, cx);
         }
         if self.settings_open {
             return style::enter("pilus-page-settings", self.settings_page(cx)).into_any_element();
@@ -4316,6 +4374,67 @@ impl PilusView {
             .pt(px(pad_y))
             .child(grid)
             .into_any_element()
+    }
+
+    /// A native page in the card: alone, or leading the terminal when split.
+    ///
+    /// The page keeps its fade under its own id; the terminal half takes
+    /// none (see [`Self::card_content`]). A press on either half hands it
+    /// the keyboard, and the hairline between them is the chrome's.
+    fn page_card(
+        &mut self,
+        id: &'static str,
+        page: Div,
+        grid: Div,
+        layout: &CardLayout,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(split) = self.page_split() else {
+            return style::enter(id, page).into_any_element();
+        };
+        let page_extent = match split.axis {
+            SplitAxis::Right => layout.page_w,
+            SplitAxis::Down => layout.page_h,
+        };
+        let mut lead = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .overflow_hidden()
+            .border_color(terminal_inset_border())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    if let Some(split) = this.page_split.as_mut()
+                        && split.terminal_focused
+                    {
+                        split.terminal_focused = false;
+                        cx.notify();
+                    }
+                }),
+            );
+        lead = match split.axis {
+            SplitAxis::Right => lead.w(px(page_extent)).h_full().border_r_1(),
+            SplitAxis::Down => lead.h(px(page_extent)).w_full().border_b_1(),
+        };
+        let terminal = div()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .pl(px(layout.pad_x))
+            .pt(px(layout.pad_y))
+            .child(grid);
+        let row = div()
+            .flex()
+            .size_full()
+            .child(style::enter(id, lead.child(page)));
+        match split.axis {
+            SplitAxis::Right => row.flex_row(),
+            SplitAxis::Down => row.flex_col(),
+        }
+        .child(terminal)
+        .into_any_element()
     }
 
     /// The terminal with the pi panel laid over its own pane only, so the
@@ -5392,6 +5511,12 @@ impl PilusView {
                 .tasks_inputs
                 .focus_handle(self.tasks_panel.compose_focus(), cx),
             InputLayer::Tasks => None,
+            // The reply field holds focus while it is open; otherwise the
+            // window root reads the page's shortcuts.
+            InputLayer::Mission if self.mission.answering() => {
+                Some(self.mission_answer.focus_handle(cx))
+            }
+            InputLayer::Mission => None,
             // An open session picker takes the keyboard, so a query reaches
             // its filter field instead of the prompt the user is typing.
             InputLayer::Session => Some(
@@ -8491,14 +8616,19 @@ impl PilusView {
             self.open_tasks(cx);
             return;
         }
-        let (bind, nav) = match item {
-            SidebarItem::OpenGit => ('g', None),
-            SidebarItem::OpenMission => ('m', Some(NavKind::Mission)),
-            _ => return,
-        };
-        if let Some(kind) = nav {
-            self.nav_sel = Some(kind);
-            self.nav_sel_at = Instant::now();
+        // Mission Control is the native page too, on this row's endpoint.
+        if item == SidebarItem::OpenMission {
+            self.activate_endpoint(
+                self.endpoint_by_key(endpoint),
+                Some(workspace_id.clone()),
+                None,
+                cx,
+            );
+            self.open_mission(cx);
+            return;
+        }
+        if item != SidebarItem::OpenGit {
+            return;
         }
         self.status = format!("opening {name}…");
         self.activate_endpoint(
@@ -8507,7 +8637,7 @@ impl PilusView {
             None,
             cx,
         );
-        self.send_bind(bind);
+        self.send_bind('g');
         cx.notify();
     }
 
@@ -8943,6 +9073,8 @@ impl PilusView {
         if !tab_exists(&self.tabs, index) {
             return;
         }
+        // Moving to a tab leaves any page (and its split) covering the card.
+        self.leave_settings_page();
         self.tab_sel = Some(index);
         self.tab_sel_at = Instant::now();
         // The tab restores the pane it last focused — the memory names it,
@@ -9044,10 +9176,26 @@ impl PilusView {
     }
 
     /// Split the focused pane; `right` is side by side, `down` is stacked.
-    fn split(&self, direction: &str) {
+    ///
+    /// With Mission Control or Tasks open there is no pane to split: the
+    /// page shares the card with the terminal instead.
+    fn split(&mut self, direction: &str, cx: &mut Context<Self>) {
+        if let Some(axis) = SplitAxis::from_direction(direction)
+            && (self.tasks_panel.is_open() || self.mission.is_open())
+        {
+            self.page_split = PageSplit::after(self.page_split(), axis);
+            cx.notify();
+            return;
+        }
         if let Some(feed) = self.agent_feed.as_ref() {
             feed.split(direction);
         }
+    }
+
+    /// Shot-harness entry point: split the open page like the chord does.
+    #[cfg(feature = "visual-test")]
+    pub(super) fn page_split_show(&mut self, direction: &str, cx: &mut Context<Self>) {
+        self.split(direction, cx);
     }
 
     /// Close the active daemon tab, falling back to the last known one.
@@ -10270,6 +10418,9 @@ impl PilusView {
         if self.tasks_panel.is_open() {
             return kind == NavKind::Tasks;
         }
+        if self.mission.is_open() {
+            return kind == NavKind::Mission;
+        }
         if self.nav_sel != Some(kind) {
             return false;
         }
@@ -10405,9 +10556,17 @@ impl PilusView {
             .child(label.child(kind.label().to_string()))
             .child(badge)
             .on_click(cx.listener(move |this, _, _, cx| {
-                if kind == NavKind::Tasks {
-                    this.open_tasks(cx);
-                    return;
+                match kind {
+                    NavKind::Tasks => {
+                        this.open_tasks(cx);
+                        return;
+                    }
+                    // Automations live on Mission Control's automation strip.
+                    NavKind::Mission | NavKind::Automations => {
+                        this.open_mission(cx);
+                        return;
+                    }
+                    NavKind::Orchestration => {}
                 }
                 this.leave_settings_page();
                 this.nav_sel = Some(kind);
@@ -10964,6 +11123,13 @@ impl PilusView {
         let inner_w = f32::from(viewport.width) - card_x - gap_right - 2.0 * border;
         let inner_h =
             f32::from(viewport.height) - HEADER_HEIGHT - gap_top - gap_bottom - 2.0 * border;
+        // A split page leads the card; the grid fits what it leaves.
+        let (page_w, page_h) = match self.page_split().map(|split| split.axis) {
+            Some(SplitAxis::Right) => (page_extent(inner_w), 0.0),
+            Some(SplitAxis::Down) => (0.0, page_extent(inner_h)),
+            None => (0.0, 0.0),
+        };
+        let (inner_w, inner_h) = (inner_w - page_w, inner_h - page_h);
         // The framed card reserves breathing room around the grid; full-bleed
         // spends every pixel on cells instead.
         let breathing = if framed { TERMINAL_PAD } else { 0.0 };
@@ -11006,14 +11172,16 @@ impl PilusView {
             card_bottom: gap_bottom + shrink_y,
             pad_x,
             pad_y,
-            origin_x: card_x + border + pad_x,
-            origin_y: HEADER_HEIGHT + gap_top + border + pad_y,
+            origin_x: card_x + border + page_w + pad_x,
+            origin_y: HEADER_HEIGHT + gap_top + border + page_h + pad_y,
             cols,
             rows,
             cell_w,
             cell_h,
             slack_x,
             slack_y,
+            page_w,
+            page_h,
         }
     }
 
@@ -11188,6 +11356,11 @@ impl Render for PilusView {
         // One tween sample per frame: every edge below reads `sidebar_open`,
         // so the panel, tab strip, and card stay flush while the sidebar flies.
         self.sidebar_open = self.sidebar_factor();
+        // A split belongs to the page it opened beside; closing the page
+        // ends it, so the next page starts whole.
+        if self.page_split.is_some() && self.page_split().is_none() {
+            self.page_split = None;
+        }
         self.sync_metrics(window);
         self.sync_home();
         self.sync_focus(window, cx);
@@ -11254,6 +11427,7 @@ impl Render for PilusView {
         // Beside a split pi panel, the pane under it paints blank.
         let masked = self
             .pi_split()
+            .filter(|_| self.page_split().is_none())
             .zip(self.shown_frame())
             .map(|(pane, frame)| {
                 mask_pane(
@@ -11321,6 +11495,11 @@ impl Render for PilusView {
                     if this.pi_focused && this.pi_split().is_some() {
                         this.pi_focused = false;
                         this.pi_blurred_at = Some(Instant::now());
+                    }
+                    // A press on the terminal beside a split page takes the
+                    // keyboard from the page.
+                    if let Some(split) = this.page_split.as_mut() {
+                        split.terminal_focused = true;
                     }
                     this.begin_selection(event, window, cx);
                 }),
@@ -11398,8 +11577,8 @@ impl Render for PilusView {
             .on_action(cx.listener(|this, _: &OpenLocalTerminal, _window, cx| {
                 this.open_local_terminal(cx);
             }))
-            .on_action(cx.listener(|this, _: &SplitVertical, _window, _cx| this.split("right")))
-            .on_action(cx.listener(|this, _: &SplitHorizontal, _window, _cx| this.split("down")))
+            .on_action(cx.listener(|this, _: &SplitVertical, _window, cx| this.split("right", cx)))
+            .on_action(cx.listener(|this, _: &SplitHorizontal, _window, cx| this.split("down", cx)))
             .on_action(cx.listener(|this, _: &CloseTab, _window, cx| {
                 this.close_active_tab();
                 cx.notify();
@@ -13147,6 +13326,8 @@ mod tests {
             cell_h: 16.0,
             slack_x: 0.0,
             slack_y: 0.0,
+            page_w: 0.0,
+            page_h: 0.0,
         };
         let right_half = PaneFrame {
             x: 0.5,
@@ -13646,34 +13827,38 @@ mod tests {
     fn overlays_own_the_keyboard_over_content() {
         // Each content page owns the keyboard on its own...
         assert_eq!(
-            top_layer(false, false, true, false, false, false),
+            top_layer(false, false, true, false, false, false, false),
             InputLayer::Home
         );
         assert_eq!(
-            top_layer(false, false, false, true, false, false),
+            top_layer(false, false, false, true, false, false, false),
             InputLayer::Settings
         );
         assert_eq!(
-            top_layer(false, false, false, false, false, true),
+            top_layer(false, false, false, false, false, false, true),
             InputLayer::Session
         );
         // ...but an overlay opened above one takes over.
         assert_eq!(
-            top_layer(false, true, true, false, false, false),
+            top_layer(false, true, true, false, false, false, false),
             InputLayer::Palette
         );
         assert_eq!(
-            top_layer(false, true, false, true, false, false),
+            top_layer(false, true, false, true, false, false, false),
             InputLayer::Palette
         );
         // The folder picker is the topmost overlay.
         assert_eq!(
-            top_layer(true, true, true, true, false, true),
+            top_layer(true, true, true, true, false, false, true),
             InputLayer::Picker
+        );
+        assert_eq!(
+            top_layer(false, false, false, false, false, true, true),
+            InputLayer::Mission
         );
         // With nothing open, the grid has it.
         assert_eq!(
-            top_layer(false, false, false, false, false, false),
+            top_layer(false, false, false, false, false, false, false),
             InputLayer::Terminal
         );
     }

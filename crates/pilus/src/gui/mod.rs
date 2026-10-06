@@ -26,6 +26,8 @@ pub(crate) mod shots;
 mod sidebar_menu;
 pub(crate) mod sound;
 mod style;
+mod task_compose;
+mod tasks;
 mod text_input;
 mod theme;
 mod ui_playground;
@@ -76,6 +78,7 @@ use selection::{Cell, Selection};
 use session::SessionPanel;
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
 use style::FillExt;
+use tasks::{TasksInputs, TasksPanel};
 use text_input::{TextField, TextInput};
 use theme::Theme;
 use updater::Updater;
@@ -896,6 +899,8 @@ enum InputLayer {
     Home,
     /// The Settings page (machines, updates).
     Settings,
+    /// The native Tasks page.
+    Tasks,
     /// The native Pi Session page.
     Session,
     /// The live terminal grid.
@@ -906,7 +911,14 @@ enum InputLayer {
 ///
 /// Overlays sit above content, so the picker beats the palette and both beat
 /// the Home composer, Settings, and the session page.
-fn top_layer(picker: bool, palette: bool, home: bool, settings: bool, session: bool) -> InputLayer {
+fn top_layer(
+    picker: bool,
+    palette: bool,
+    home: bool,
+    settings: bool,
+    tasks: bool,
+    session: bool,
+) -> InputLayer {
     if picker {
         InputLayer::Picker
     } else if palette {
@@ -915,6 +927,8 @@ fn top_layer(picker: bool, palette: bool, home: bool, settings: bool, session: b
         InputLayer::Home
     } else if settings {
         InputLayer::Settings
+    } else if tasks {
+        InputLayer::Tasks
     } else if session {
         InputLayer::Session
     } else {
@@ -1544,6 +1558,13 @@ struct PilusView {
     pi_ext_machines: HashSet<String>,
     /// The composer's prompt, an IME-capable field over `home`'s buffer.
     home_prompt: Entity<TextInput>,
+    /// The Tasks page's own state; the tasks come from `tasks` (the feed).
+    tasks_panel: TasksPanel,
+    /// The Tasks composer's text fields.
+    tasks_inputs: TasksInputs,
+    /// Daemon answers to Tasks page mutations, run off the GUI thread.
+    tasks_op_rx: Receiver<task_compose::TasksMsg>,
+    tasks_op_tx: Sender<task_compose::TasksMsg>,
     /// The Pi Session composer's field.
     session_prompt: Entity<TextInput>,
     /// Agent availability and models for the Home composer.
@@ -1625,6 +1646,7 @@ impl PilusView {
         let (machine_tx, machine_rx) = std::sync::mpsc::channel();
         let (machine_list_tx, machine_list_rx) = std::sync::mpsc::channel();
         let (machine_op_tx, machine_op_rx) = std::sync::mpsc::channel();
+        let (tasks_op_tx, tasks_op_rx) = std::sync::mpsc::channel();
         let (home_resolve_tx, home_resolve_rx) = std::sync::mpsc::channel();
         let (agent_config_tx, agent_config_rx) = std::sync::mpsc::channel();
         let (pi_frame_tx, pi_frame_rx) = std::sync::mpsc::channel();
@@ -1662,6 +1684,12 @@ impl PilusView {
             )
             .submit_on_enter()
         });
+        let tasks_inputs = TasksInputs::new(
+            style::chrome_font(&shared_settings),
+            initial_fonts.body,
+            initial_theme,
+            cx,
+        );
         let session_prompt = cx.new(|cx| {
             TextInput::new(
                 String::new(),
@@ -1903,6 +1931,10 @@ impl PilusView {
             tab_focus: HashMap::new(),
             pi_ext_machines: HashSet::new(),
             home_prompt,
+            tasks_panel: TasksPanel::default(),
+            tasks_inputs,
+            tasks_op_rx,
+            tasks_op_tx,
             session_prompt,
             agent_configs: Vec::new(),
             agent_config_cache: HashMap::new(),
@@ -2203,6 +2235,13 @@ impl PilusView {
             } else {
                 self.status = message;
             }
+            changed = true;
+        }
+        if self.tasks_panel.is_open() {
+            self.tasks_tick();
+        }
+        while let Ok(message) = self.tasks_op_rx.try_recv() {
+            self.tasks_receive(message);
             changed = true;
         }
         while let Ok(resolved) = self.home_resolve_rx.try_recv() {
@@ -3570,6 +3609,7 @@ impl PilusView {
             InputLayer::Palette => self.palette_key(event, window, cx),
             InputLayer::Home => self.home_key(event, cx),
             InputLayer::Settings => self.settings_key(event, cx),
+            InputLayer::Tasks => self.tasks_key(event, cx),
             InputLayer::Session => {
                 let input = self.session_prompt.clone();
                 if self.session.key(&event.keystroke, &input, cx) {
@@ -3596,6 +3636,7 @@ impl PilusView {
             self.palette.is_open(),
             self.home.is_open(),
             self.settings_open,
+            self.tasks_panel.is_open(),
             self.session_owns_keys(),
         )
     }
@@ -3981,6 +4022,7 @@ impl PilusView {
     /// the terminal surface they cover, so acting on one dismisses the other.
     fn leave_settings_page(&mut self) {
         self.settings_open = false;
+        self.tasks_panel.close();
         self.home.close();
         self.update_url_editing = false;
     }
@@ -4203,6 +4245,17 @@ impl PilusView {
                     .min_h(px(0.0))
                     .overflow_hidden()
                     .child(self.home_page(cx)),
+            )
+            .into_any_element();
+        }
+        if self.tasks_panel.is_open() {
+            return style::enter(
+                "pilus-page-tasks",
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .child(self.tasks_page(cx)),
             )
             .into_any_element();
         }
@@ -5293,6 +5346,12 @@ impl PilusView {
                     None
                 }
             }
+            // The composer's text fields hold focus; its pickers leave it
+            // with the window, which reads their keys.
+            InputLayer::Tasks if self.tasks_panel.composing() => self
+                .tasks_inputs
+                .focus_handle(self.tasks_panel.compose_focus(), cx),
+            InputLayer::Tasks => None,
             // An open session picker takes the keyboard, so a query reaches
             // its filter field instead of the prompt the user is typing.
             InputLayer::Session => Some(
@@ -10304,6 +10363,9 @@ impl PilusView {
     /// then yields to whatever the daemon actually focused. Exactly one row
     /// ever lights, so a click never sprays the highlight across the menu.
     fn nav_active(&self, kind: NavKind) -> bool {
+        if self.tasks_panel.is_open() {
+            return kind == NavKind::Tasks;
+        }
         if self.nav_sel != Some(kind) {
             return false;
         }
@@ -10439,6 +10501,10 @@ impl PilusView {
             .child(label.child(kind.label().to_string()))
             .child(badge)
             .on_click(cx.listener(move |this, _, _, cx| {
+                if kind == NavKind::Tasks {
+                    this.open_tasks(cx);
+                    return;
+                }
                 this.leave_settings_page();
                 this.nav_sel = Some(kind);
                 this.nav_sel_at = Instant::now();
@@ -13679,31 +13745,34 @@ mod tests {
     fn overlays_own_the_keyboard_over_content() {
         // Each content page owns the keyboard on its own...
         assert_eq!(
-            top_layer(false, false, true, false, false),
+            top_layer(false, false, true, false, false, false),
             InputLayer::Home
         );
         assert_eq!(
-            top_layer(false, false, false, true, false),
+            top_layer(false, false, false, true, false, false),
             InputLayer::Settings
         );
         assert_eq!(
-            top_layer(false, false, false, false, true),
+            top_layer(false, false, false, false, false, true),
             InputLayer::Session
         );
         // ...but an overlay opened above one takes over.
         assert_eq!(
-            top_layer(false, true, true, false, false),
+            top_layer(false, true, true, false, false, false),
             InputLayer::Palette
         );
         assert_eq!(
-            top_layer(false, true, false, true, false),
+            top_layer(false, true, false, true, false, false),
             InputLayer::Palette
         );
         // The folder picker is the topmost overlay.
-        assert_eq!(top_layer(true, true, true, true, true), InputLayer::Picker);
+        assert_eq!(
+            top_layer(true, true, true, true, false, true),
+            InputLayer::Picker
+        );
         // With nothing open, the grid has it.
         assert_eq!(
-            top_layer(false, false, false, false, false),
+            top_layer(false, false, false, false, false, false),
             InputLayer::Terminal
         );
     }

@@ -855,6 +855,32 @@ impl UiPlaygroundView {
             .child(dot(theme.muted, "muted", theme))
     }
 
+    /// The task status glyphs, each tinted by its role, beside the chip that
+    /// qualifies a task row.
+    fn task_status_demo(&self) -> Div {
+        let theme = self.theme;
+        let fonts = self.fonts();
+        let mut row = div().flex().flex_row().flex_wrap().items_center().gap_4();
+        for status in pilus_client::TaskStatus::ALL {
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(super::tasks::status_glyph(status, fonts.body, theme))
+                    .child(
+                        div()
+                            .text_size(px(fonts.secondary))
+                            .text_color(theme.panel_fg)
+                            .child(status.label()),
+                    ),
+            );
+        }
+        row.child(style::chip(theme, "after t1", fonts.label))
+            .child(style::chip(theme, "src/auth/** +2", fonts.label))
+    }
+
     /// The vendored icon grid.
     fn icon_grid(&self) -> Div {
         let theme = self.theme;
@@ -1747,6 +1773,7 @@ impl Render for UiPlaygroundView {
             .child(self.section("FEEDBACK", self.tray(self.feedback_demos())))
             .child(self.section("SMALL BUTTONS", self.tray(self.small_buttons(cx))))
             .child(self.section("BADGES & DOTS", self.tray(self.badges())))
+            .child(self.section("TASK STATUS & CHIPS", self.tray(self.task_status_demo())))
             .child(
                 self.section(
                     "ROWS",

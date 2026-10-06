@@ -26,6 +26,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, never, select, tick, unbounde
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
+use crate::tasks::{NewTask, Task, TaskStatus};
 use crate::transport::{SshTarget, Stream};
 
 const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
@@ -226,6 +227,33 @@ fn is_armed(item: &Value) -> bool {
     true
 }
 
+/// The id-only task lifecycle calls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskAction {
+    /// Run the quality gate and mark the task done on a pass.
+    Done,
+    /// Integrate the task's branch into `luvus/integration`.
+    Merge,
+    /// Archive the attempt and queue a fresh one.
+    Retry,
+    /// Give the task back to the queue.
+    Release,
+    /// Remove the task.
+    Delete,
+}
+
+impl TaskAction {
+    fn method(self) -> &'static str {
+        match self {
+            Self::Done => "task.done",
+            Self::Merge => "task.merge",
+            Self::Retry => "task.retry",
+            Self::Release => "task.release",
+            Self::Delete => "task.delete",
+        }
+    }
+}
+
 /// How many tasks exist, and how many still need attention.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TaskSummary {
@@ -233,6 +261,8 @@ pub struct TaskSummary {
     pub open: u32,
     /// Every task, open or not.
     pub total: u32,
+    /// The tasks themselves, in daemon order.
+    pub items: Vec<Task>,
 }
 
 impl TaskSummary {
@@ -244,7 +274,11 @@ impl TaskSummary {
             .unwrap_or_default();
         let total = items.len() as u32;
         let open = items.iter().filter(|item| is_open(item)).count() as u32;
-        Self { open, total }
+        Self {
+            open,
+            total,
+            items: Task::list_from_json(value),
+        }
     }
 }
 
@@ -862,6 +896,67 @@ impl ControlClient {
     pub fn task_summary(&mut self) -> Result<TaskSummary> {
         let result = self.request("task.list", json!({}))?;
         Ok(TaskSummary::from_json(&result))
+    }
+
+    /// Queue a new task in `workspace_id`, returning it as the daemon
+    /// recorded it.
+    pub fn add_task(&mut self, task: &NewTask, workspace_id: &str) -> Result<Option<Task>> {
+        let mut params = json!({ "title": task.title, "workspace_id": workspace_id });
+        if !task.prompt.is_empty() {
+            params["prompt"] = json!(task.prompt);
+        }
+        if !task.paths.is_empty() {
+            params["paths"] = json!(task.paths);
+        }
+        if !task.deps.is_empty() {
+            params["deps"] = json!(task.deps);
+        }
+        if !task.gate.is_empty() {
+            params["gate"] = json!(task.gate);
+        }
+        let result = self.request("task.add", params)?;
+        Ok(Task::from_json(result.get("task").unwrap_or(&result)))
+    }
+
+    /// Hand a queued task to an agent, in its own worktree unless `mode`
+    /// says `workspace`.
+    pub fn start_task(
+        &mut self,
+        id: &str,
+        agent: Option<&str>,
+        mode: &str,
+        workspace_id: &str,
+    ) -> Result<()> {
+        let mut params =
+            json!({ "id": id, "mode": mode, "focus": false, "workspace_id": workspace_id });
+        if let Some(agent) = agent {
+            params["agent"] = json!(agent);
+        }
+        self.request("task.start", params).map(drop)
+    }
+
+    /// Set a task's status by hand (`task.update`).
+    pub fn set_task_status(&mut self, id: &str, status: TaskStatus) -> Result<()> {
+        self.request("task.update", json!({ "id": id, "status": status.wire() }))
+            .map(drop)
+    }
+
+    /// Replace a task's prompt, or clear it with `None`.
+    pub fn set_task_prompt(&mut self, id: &str, prompt: Option<&str>) -> Result<()> {
+        self.request("task.update", json!({ "id": id, "prompt": prompt }))
+            .map(drop)
+    }
+
+    /// Attach a note to a task.
+    pub fn note_task(&mut self, id: &str, note: &str) -> Result<()> {
+        self.request("task.update", json!({ "id": id, "note": note }))
+            .map(drop)
+    }
+
+    /// Run one of the id-only lifecycle methods: `done` (runs the quality
+    /// gate), `merge`, `retry`, `release`, or `delete`.
+    pub fn task_action(&mut self, action: TaskAction, id: &str) -> Result<()> {
+        self.request(action.method(), json!({ "id": id })).map(drop)
     }
 
     /// Focus the tab at `index` (1-based).
@@ -1575,7 +1670,11 @@ mod tests {
         });
         assert_eq!(
             TaskSummary::from_json(&value),
-            TaskSummary { open: 2, total: 4 }
+            TaskSummary {
+                open: 2,
+                total: 4,
+                items: Vec::new(),
+            }
         );
     }
 

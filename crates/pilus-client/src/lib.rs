@@ -18,6 +18,7 @@ mod error;
 mod git;
 mod machines;
 mod surface;
+mod tasks;
 mod transport;
 mod uhp;
 pub use agents::AgentConfig;
@@ -31,8 +32,8 @@ pub use connection::{ClientEvent, Connection, EndpointIdentity};
 pub use connector::{Connector, ConnectorOptions, ConnectorStatus, agent_binary};
 pub use control::{
     Agent, AgentFeed, AgentSession, Appearance, AutomationSummary, BarSegment, BarWidget,
-    ControlClient, FeedScope, FeedUpdate, PaneFrame, Tab, TaskSummary, ThemeInfo, WorktreeInfo,
-    worktree_blockers,
+    ControlClient, FeedScope, FeedUpdate, PaneFrame, Tab, TaskAction, TaskSummary, ThemeInfo,
+    WorktreeInfo, worktree_blockers,
 };
 pub use discovery::{
     HOME_ENV, PILUS_HOME_ENV, SessionInfo, active_session, api_socket_path_for,
@@ -48,6 +49,7 @@ pub use git::{
 pub use machines::{MachineInfo, connect_machine, install_agent, list_machines, refresh_machines};
 pub use pilus_protocol as protocol;
 pub use surface::{Surface, SurfaceChange};
+pub use tasks::{NewTask, Task, TaskStatus, split_list};
 pub use transport::SshTarget;
 pub use uhp::{Capabilities, Event, EventStream, Frame, Observer, Terminal, UhpClient};
 

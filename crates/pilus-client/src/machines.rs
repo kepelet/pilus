@@ -132,6 +132,136 @@ pub fn connect_machine(machine: &MachineInfo, cols: u16, rows: u16) -> Result<Co
     })
 }
 
+/// Restart the remote daemon so it loads the binary the profile now points at.
+///
+/// Runs `<remote_binary> server restart` over SSH. After `machine enable
+/// --install` the profile's `remote_binary` is the freshly provisioned copy,
+/// so restarting through it is what moves a running daemon off the old
+/// release. This stops every pane in that remote session; callers confirm
+/// first.
+pub fn restart_remote(machine: &MachineInfo) -> Result<String> {
+    remote_server(machine, "restart")
+}
+
+/// Stop the remote daemon through the profile's current binary.
+///
+/// `luvus machine enable --install` finishes by handshaking with whatever
+/// server is already running there, and a daemon older than this client
+/// rejects that handshake ("protocol version mismatch") even though the new
+/// binary is fine. Stopping the old daemon first leaves nothing to reject, so
+/// the install can start a fresh server from the new binary. Callers confirm
+/// first: it stops every pane in that remote session.
+pub fn stop_remote(machine: &MachineInfo) -> Result<String> {
+    let output = remote_server(machine, "stop")?;
+    clear_stale_sockets(machine);
+    Ok(output)
+}
+
+/// Remove the socket files an old daemon left behind after `server stop`.
+///
+/// The 0.14.2 binary leaves `luvus-client.sock` and `luvus.sock` in place. A
+/// newer `remote-client-bridge --start-if-missing` then finds a socket with
+/// nothing listening, refuses to start a server ("Connection refused ... no
+/// server was started"), and SSH only reports the connection closed. The
+/// files are removed only when `server status` says the daemon is not running.
+fn clear_stale_sockets(machine: &MachineInfo) {
+    let Some(target) = machine.ssh_target() else {
+        return;
+    };
+    let Ok(status) = target.command(&["server", "status"]).output() else {
+        return;
+    };
+    let status = String::from_utf8_lossy(&status.stdout);
+    if !status.contains("not running") {
+        return;
+    }
+    let Some(socket) = status_socket(&status) else {
+        return;
+    };
+    let dir = socket.rsplit_once('/').map_or(".", |(dir, _)| dir);
+    let _ = run_ssh(
+        &target,
+        &format!(
+            "rm -f {} {}",
+            shell_quote(&format!("{dir}/luvus-client.sock")),
+            shell_quote(&format!("{dir}/luvus.sock"))
+        ),
+    );
+}
+
+/// The client socket path printed by `luvus server status`.
+fn status_socket(status: &str) -> Option<String> {
+    status
+        .split_whitespace()
+        .find(|token| token.starts_with('/') && token.ends_with("/luvus-client.sock"))
+        .map(str::to_string)
+}
+
+fn remote_server(machine: &MachineInfo, verb: &str) -> Result<String> {
+    let target = machine.ssh_target().ok_or_else(|| {
+        Error::Machine(format!(
+            "machine `{}` has no verified remote binary; run `luvus machine enable {}`",
+            machine.id, machine.id
+        ))
+    })?;
+    let output = target.command(&["server", verb]).output()?;
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+    if !output.status.success() {
+        let stderr = text(&output.stderr);
+        return Err(Error::Machine(if stderr.is_empty() {
+            format!("could not {verb} the daemon on `{}`", machine.id)
+        } else {
+            stderr
+        }));
+    }
+    Ok(text(&output.stdout))
+}
+
+/// The provisioned `luvus` for `version` on the machine, when one exists.
+///
+/// `machine add --install` can copy a binary into the versioned remote
+/// directory and still fail its closing handshake, leaving the install behind
+/// with no profile pointing at it. This finds that copy so the profile can be
+/// re-added against it.
+pub fn find_installed_binary(machine: &MachineInfo, version: &str) -> Option<String> {
+    let target = machine.ssh_target()?;
+    // The version lands in a remote shell command, so refuse anything but a
+    // plain version string.
+    if version.is_empty()
+        || !version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return None;
+    }
+    let found = run_ssh(
+        &target,
+        &format!(
+            "ls -d \"$HOME\"/.local/share/luvus/remote/v{version}/*/luvus 2>/dev/null | head -n 1"
+        ),
+    )
+    .ok()?;
+    let path = found.trim();
+    path.starts_with('/').then(|| path.to_string())
+}
+
+/// Whether `remote` is an older release than `local`.
+///
+/// Compares dotted numeric versions (a leading `v` and any `-pre`/`+build`
+/// suffix are ignored). Anything unparseable is not "behind": an unknown
+/// version should not nag the user to upgrade.
+pub fn is_behind(remote: &str, local: &str) -> bool {
+    fn parse(version: &str) -> Option<Vec<u64>> {
+        let core = version.trim().trim_start_matches('v');
+        let core = core.split(['-', '+']).next()?;
+        core.split('.').map(|part| part.parse().ok()).collect()
+    }
+    match (parse(remote), parse(local)) {
+        (Some(remote), Some(local)) => remote < local,
+        _ => false,
+    }
+}
+
 /// List profiles under `root` and probe each one's reachability.
 ///
 /// Probes run in parallel with an overall deadline; anything unanswered in
@@ -436,6 +566,25 @@ mod tests {
         assert!(machines[0].enabled);
         assert_eq!(machines[1].display(), "lab");
         assert!(!machines[1].enabled);
+    }
+
+    #[test]
+    fn status_socket_reads_the_client_socket_path() {
+        let status = "\\   /   Luvus server\n \\_/    status   not running\n(o_o)   session  zz-old\n/|_|\\   socket   /Users/x/.luvus/sessions/zz-old/luvus-client.sock\n";
+        assert_eq!(
+            status_socket(status).as_deref(),
+            Some("/Users/x/.luvus/sessions/zz-old/luvus-client.sock")
+        );
+        assert_eq!(status_socket("no path here"), None);
+    }
+
+    #[test]
+    fn is_behind_compares_numerically() {
+        assert!(is_behind("0.14.2", "0.15.0"));
+        assert!(is_behind("v0.9.0", "0.10.0"));
+        assert!(!is_behind("0.15.0", "0.15.0"));
+        assert!(!is_behind("0.16.0", "0.15.9"));
+        assert!(!is_behind("unknown", "0.15.0"));
     }
 
     #[test]

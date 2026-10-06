@@ -157,31 +157,9 @@ const TERMINAL_PAD: f32 = 6.0;
 /// How long the sidebar takes to collapse or expand: long enough for its
 /// spring to overshoot and settle, short enough to stay out of the way.
 const SIDEBAR_ANIM_DURATION: Duration = Duration::from_millis(460);
-/// How long terminal text takes to fade back in after the grid reflows to a
-/// new size, so a resize reads as a settle rather than a jump.
-const REFLOW_FADE: Duration = Duration::from_millis(180);
-/// The opacity text fades in from after a resize reflows it: a light dip,
-/// enough to soften the jump without reading as a flicker.
-const REFLOW_FLOOR: f32 = 0.6;
-/// The opacity text fades in from when the terminal's content is swapped
-/// (another tab, another machine, or the terminal coming back from Home,
-/// Settings, or the session panel): deep enough to read as a crossfade.
-const SWAP_FLOOR: f32 = 0.15;
-/// Size changes closer together than this belong to one resize (a window
-/// drag, a sidebar tween), which fades once instead of strobing per step.
-const REFLOW_BURST: Duration = Duration::from_millis(250);
 /// Longest the terminal holds its pre-toggle snapshot waiting for a frame
 /// drawn with the new dock: a slow link must not leave it stale.
 const SIDEBAR_FREEZE_MAX: Duration = Duration::from_secs(2);
-
-/// What the terminal card is showing, compared frame to frame: a change means
-/// its content was swapped rather than updated.
-#[derive(Clone, PartialEq, Eq)]
-struct SurfaceKey {
-    endpoint: String,
-    tab: Option<u16>,
-    shown: bool,
-}
 
 /// One sidebar collapse/expand tween, from the current openness to the target
 /// so a mid-slide reversal glides instead of jumping.
@@ -1243,16 +1221,6 @@ struct PilusView {
     /// The sidebar section header clicked last, and when, so only that
     /// chevron turns.
     section_toggled: Option<(&'static str, Instant)>,
-    /// The painted frame's size and when it last changed, so a burst of
-    /// resizes fades the text once.
-    grid_size: (u16, u16),
-    grid_resized_at: Option<Instant>,
-    /// What the terminal is showing — endpoint, tab, and whether it is on
-    /// screen at all — so a swap fades the new content in.
-    surface_key: Option<SurfaceKey>,
-    /// The current text fade: when it began and the opacity it rises from;
-    /// `None` once the text has settled.
-    reflow_fade: Option<(Instant, f32)>,
     /// Whether the remembered frame changed since the last settings write.
     window_dirty: bool,
     /// When the frame last changed, so a drag settles before the write.
@@ -1789,10 +1757,6 @@ impl PilusView {
             sidebar_freeze: None,
             sidebar_open: 1.0,
             section_toggled: None,
-            grid_size: (0, 0),
-            grid_resized_at: None,
-            surface_key: None,
-            reflow_fade: None,
             window_dirty: false,
             window_moved_at: Instant::now(),
             cols: 120,
@@ -1990,9 +1954,7 @@ impl PilusView {
                     // `was_animating` covers the tick that returns settled.
                     let was_animating = view.sidebar_anim.is_some();
                     let settled = view.tick_sidebar_anim();
-                    let released = view.release_sidebar_freeze(cx.reduce_motion());
-                    // The reflow fade rides the same loop for the same reason.
-                    let reflowing = view.reflow_fade.is_some();
+                    let released = view.release_sidebar_freeze();
                     // The transcript glide behind the jump buttons.
                     let gliding = view.session.tick_scroll();
                     if view.poll(cx)
@@ -2000,7 +1962,6 @@ impl PilusView {
                         || changed
                         || !settled
                         || was_animating
-                        || reflowing
                         || released
                     {
                         cx.notify();
@@ -4227,9 +4188,8 @@ impl PilusView {
     /// the terminal, with the sidebar still showing beside it.
     ///
     /// Each page fades in under its own id, so switching pages replays it.
-    /// The terminal itself takes no opacity fade, which would show the
-    /// desktop through a translucent grid; its text fades instead (see
-    /// [`Self::reflow_alpha`]).
+    /// The terminal itself takes no fade, which would show the desktop
+    /// through a translucent grid.
     fn card_content(
         &mut self,
         cx: &mut Context<Self>,
@@ -7461,59 +7421,6 @@ impl PilusView {
         cx.notify();
     }
 
-    /// The terminal text's opacity this frame: dipped and easing back to
-    /// full while the grid settles after a size change or a content swap.
-    ///
-    /// Only the text fades. Cell backgrounds stay put, so a translucent
-    /// window never flashes the desktop through the grid, and the layout
-    /// never moves. The first size change of a burst starts the fade; the
-    /// rest of a drag rides it out rather than restarting it. A sidebar
-    /// slide starts none: the daemon reflows once when the dock moves, and
-    /// a dip on top of that would read as the flicker it is meant to hide.
-    fn reflow_alpha(&mut self, reduce_motion: bool) -> f32 {
-        let now = Instant::now();
-        let key = SurfaceKey {
-            endpoint: self.active.key(),
-            tab: self
-                .tabs
-                .iter()
-                .find(|tab| self.tab_active(tab))
-                .map(|tab| tab.index),
-            shown: !self.home.is_open()
-                && !self.settings_open
-                && (!self.session.is_open() || self.pi_split().is_some()),
-        };
-        if self.surface_key.as_ref() != Some(&key) {
-            // The first key is the launch: the first frame fades in too.
-            if !reduce_motion {
-                self.reflow_fade = Some((now, SWAP_FLOOR));
-            }
-            self.surface_key = Some(key);
-        }
-        if let Some(size) = self.shown_frame().map(|frame| (frame.width, frame.height))
-            && size != self.grid_size
-        {
-            let fresh = self
-                .grid_resized_at
-                .is_none_or(|at| now.duration_since(at) >= REFLOW_BURST);
-            if fresh && !reduce_motion && self.sidebar_anim.is_none() && self.reflow_fade.is_none()
-            {
-                self.reflow_fade = Some((now, REFLOW_FLOOR));
-            }
-            self.grid_size = size;
-            self.grid_resized_at = Some(now);
-        }
-        let Some((started, floor)) = self.reflow_fade else {
-            return 1.0;
-        };
-        let step = now.duration_since(started).as_secs_f32() / REFLOW_FADE.as_secs_f32();
-        if step >= 1.0 {
-            self.reflow_fade = None;
-            return 1.0;
-        }
-        reflow_opacity(floor, step)
-    }
-
     /// Advance the sidebar tween; true once it settles at its target.
     fn tick_sidebar_anim(&mut self) -> bool {
         let settled = match &self.sidebar_anim {
@@ -9507,7 +9414,7 @@ impl PilusView {
     /// Hand the card back to the live grid once the slide has settled and
     /// the daemon has drawn a frame with the dock where the sidebar now is
     /// (or the wait ran long). Returns whether it swapped.
-    fn release_sidebar_freeze(&mut self, reduce_motion: bool) -> bool {
+    fn release_sidebar_freeze(&mut self) -> bool {
         let Some((_, _, taken)) = &self.sidebar_freeze else {
             return false;
         };
@@ -9523,11 +9430,6 @@ impl PilusView {
             return false;
         }
         self.sidebar_freeze = None;
-        // The panes may have reflowed into their new width; a short text
-        // fade softens the swap the way any resize settles.
-        if !reduce_motion {
-            self.reflow_fade = Some((Instant::now(), REFLOW_FLOOR));
-        }
         true
     }
 
@@ -11352,7 +11254,6 @@ impl Render for PilusView {
         } else {
             terminal_bg.opacity(glass)
         };
-        let text_alpha = self.reflow_alpha(cx.reduce_motion());
         // Beside a split pi panel, the pane under it paints blank.
         let masked = self
             .pi_split()
@@ -11379,7 +11280,6 @@ impl Render for PilusView {
                 glass,
                 layout.slack_x,
                 layout.slack_y,
-                text_alpha,
             ),
             None => {
                 let mut empty = div()
@@ -11618,7 +11518,6 @@ fn render_grid(
     glass: f32,
     slack_x: f32,
     slack_y: f32,
-    text_alpha: f32,
 ) -> Div {
     let end_row = SKIPPED_DAEMON_ROWS
         .saturating_add(max_rows)
@@ -11638,7 +11537,6 @@ fn render_grid(
             max_cols,
             glass,
             slack_x,
-            text_alpha,
         ));
     }
     // Full-bleed pools the sub-cell remainder below the last row; extend
@@ -11677,7 +11575,6 @@ fn render_row(
     max_cols: u16,
     glass: f32,
     slack_x: f32,
-    text_alpha: f32,
 ) -> Div {
     let width = usize::from(frame.width);
     let skip = usize::from(skip_cols).min(width);
@@ -11746,7 +11643,7 @@ fn render_row(
         if let Some((rects, shade)) = block_element(&text) {
             let column = f32::from(start_column.saturating_sub(skip_cols));
             for rect in rects {
-                blocks.add(column, rect, fg.opacity(text_alpha * shade));
+                blocks.add(column, rect, fg.opacity(shade));
             }
             continue;
         }
@@ -11754,7 +11651,7 @@ fn render_row(
             let column = f32::from(start_column.saturating_sub(skip_cols));
             let left = (column * cell_width).round();
             let right = ((column + 1.0) * cell_width).round();
-            let color = fg.opacity(text_alpha);
+            let color = fg;
             if let Some(strokes) =
                 box_drawing::strokes(c, left, right, f32::from(line_height), light_stroke)
             {
@@ -11798,7 +11695,7 @@ fn render_row(
             .font_family(font_family)
             .text_size(px(font_size))
             .line_height(line_height)
-            .text_color(fg.opacity(text_alpha))
+            .text_color(fg)
             .child(text);
         if mods & M_BOLD != 0 {
             span = span.font_weight(FontWeight::BOLD);
@@ -11969,13 +11866,6 @@ fn bottom_fill_spans(
         index = next;
     }
     spans
-}
-
-/// Text opacity `step` of the way through a fade up from `floor`: quick off
-/// the floor, gentle into full.
-fn reflow_opacity(floor: f32, step: f32) -> f32 {
-    let eased = 1.0 - (1.0 - step.clamp(0.0, 1.0)).powi(3);
-    floor + (1.0 - floor) * eased
 }
 
 /// Whether `symbol` can safely flow inside a multi-cell shaped run.
@@ -13548,18 +13438,6 @@ mod tests {
             linked_worktree_path(&worktrees, "~/.luvus/worktrees/repo/feature-two"),
             None
         );
-    }
-
-    #[test]
-    fn reflowed_text_fades_up_from_the_floor() {
-        assert!((reflow_opacity(REFLOW_FLOOR, 0.0) - REFLOW_FLOOR).abs() < f32::EPSILON);
-        assert!((reflow_opacity(SWAP_FLOOR, 1.0) - 1.0).abs() < f32::EPSILON);
-        let mut last = reflow_opacity(SWAP_FLOOR, 0.0);
-        for step in 1..=10 {
-            let next = reflow_opacity(SWAP_FLOOR, step as f32 / 10.0);
-            assert!(next >= last, "the fade never dips back");
-            last = next;
-        }
     }
 
     #[test]

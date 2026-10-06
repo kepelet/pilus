@@ -11561,25 +11561,44 @@ fn render_row(
         );
     }
 
+    let mut blocks = BlockBands::default();
     for (start_column, run_cells, text, (fg, _bg, mods)) in
         collect_runs(frame.width, &rendered, theme, row, selection)
     {
+        if let Some((rects, shade)) = block_element(&text) {
+            let column = f32::from(start_column.saturating_sub(skip_cols));
+            for rect in rects {
+                blocks.add(column, rect, fg.opacity(text_alpha * shade));
+            }
+            continue;
+        }
         // Runs position relative to the painted slice: the container starts
         // at the first visible column, so absolute daemon columns would
         // shove every run right by the skipped width (and clip the edge).
+        //
+        // The span reaches half a row past each edge with the line box still
+        // centered, so the clip that keeps a fallback glyph out of its
+        // neighbors' columns does not also shave glyphs taller than the row
+        // (`⎿` reaching up to the line above, accents, emoji).
+        let clip_cells = run_cells.saturating_add(u16::from(overflows_into_blank(
+            &rendered,
+            &text,
+            start_column.saturating_add(run_cells),
+        )));
         let mut span = div()
             .absolute()
             .left(px(
                 f32::from(start_column.saturating_sub(skip_cols)) * cell_width
             ))
-            .top(px(0.0))
-            .right(px(row_width
+            .top(line_height * -0.5)
+            .right(px((row_width
                 - f32::from(
                     start_column
-                        .saturating_add(run_cells)
+                        .saturating_add(clip_cells)
                         .saturating_sub(skip_cols),
-                ) * cell_width))
-            .h(line_height)
+                ) * cell_width)
+                .max(0.0)))
+            .h(line_height * 2.0)
             .flex()
             .items_center()
             .overflow_hidden()
@@ -11598,6 +11617,22 @@ fn render_row(
             span = span.underline();
         }
         element = element.child(span);
+    }
+    // Whole-pixel edges: strips that end on one column then share the exact
+    // same coordinate, whatever float sum produced it, and snap together.
+    let height = f32::from(line_height);
+    let x_edge = |x: f32| (x * cell_width).round();
+    let y_edge = |y: f32| (y * height).round();
+    for band in blocks.0 {
+        element = element.child(
+            div()
+                .absolute()
+                .left(px(x_edge(band.x0)))
+                .w(px(x_edge(band.x1) - x_edge(band.x0)))
+                .top(px(y_edge(band.y0)))
+                .h(px(y_edge(band.y1) - y_edge(band.y0)))
+                .bg(band.color),
+        );
     }
     // Full-bleed pools the sub-cell remainder at the row's right edge, and a
     // lagging daemon leaves whole columns of it: extend the last background
@@ -11733,9 +11768,10 @@ fn reflow_opacity(floor: f32, step: f32) -> f32 {
 /// the version's last digit). Isolate those cells in their own fixed-width
 /// spans so the error cannot accumulate past one glyph.
 ///
-/// Box-drawing and block glyphs are the exception: the monospace font carries
-/// them at the base advance, and a border or bar must shape as one run so its
-/// strokes tile across cells instead of being clipped one span at a time.
+/// Box-drawing glyphs are the exception: the monospace font carries them at
+/// the base advance, and a border must shape as one run so its strokes tile
+/// across cells instead of being clipped one span at a time. Block elements
+/// are not shaped at all; see [`block_element`].
 fn is_flowable(symbol: &str) -> bool {
     if pilus_protocol::symbol_width(symbol) > 1 {
         return false;
@@ -11744,7 +11780,136 @@ fn is_flowable(symbol: &str) -> bool {
         || symbol
             .chars()
             .next()
-            .is_some_and(|c| matches!(c, '\u{2500}'..='\u{259f}'))
+            .is_some_and(|c| matches!(c, '\u{2500}'..='\u{257f}'))
+}
+
+/// Whether a run's clip may widen by one cell into a blank `next_column`.
+///
+/// A fallback glyph is drawn at its own font's advance, which can be wider than
+/// the Menlo cell: Claude Code's `⎿` loses its foot. A blank neighbor paints no
+/// text, so letting the glyph finish over it cannot overlap anything; flowing
+/// runs already shape to the grid and keep their exact clip.
+fn overflows_into_blank(rendered: &[(u16, &CellData, bool)], text: &str, next_column: u16) -> bool {
+    if is_flowable(text) {
+        return false;
+    }
+    rendered
+        .binary_search_by_key(&next_column, |(column, _, _)| *column)
+        .ok()
+        .is_some_and(|index| symbol(rendered[index].1) == " ")
+}
+
+/// One painted strip of block elements, in cell units within its row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BlockBand {
+    x0: f32,
+    x1: f32,
+    y0: f32,
+    y1: f32,
+    color: gpui::Rgba,
+}
+
+/// A row's block elements, merged into the fewest horizontal strips.
+///
+/// GPUI snaps each quad edge to the device grid on its own, so two rects
+/// meeting at a fractional boundary can round apart and leave a one-pixel
+/// seam (a dark line beside the eyes of the Claude Code logo). Cutting every
+/// rect at the cell's half-height and joining touching strips of one color
+/// leaves no vertical boundary inside a solid area for the rounding to open.
+#[derive(Debug, Default)]
+struct BlockBands(Vec<BlockBand>);
+
+impl BlockBands {
+    fn add(&mut self, column: f32, [x0, y0, x1, y1]: [f32; 4], color: gpui::Rgba) {
+        let (x0, x1) = (column + x0, column + x1);
+        if y0 < 0.5 && y1 > 0.5 {
+            self.push(BlockBand {
+                x0,
+                x1,
+                y0,
+                y1: 0.5,
+                color,
+            });
+            self.push(BlockBand {
+                x0,
+                x1,
+                y0: 0.5,
+                y1,
+                color,
+            });
+        } else {
+            self.push(BlockBand {
+                x0,
+                x1,
+                y0,
+                y1,
+                color,
+            });
+        }
+    }
+
+    fn push(&mut self, band: BlockBand) {
+        let joins = |prior: &BlockBand| {
+            prior.x1 == band.x0
+                && prior.y0 == band.y0
+                && prior.y1 == band.y1
+                && prior.color == band.color
+        };
+        match self.0.iter_mut().rev().find(|prior| joins(prior)) {
+            Some(prior) => prior.x1 = band.x1,
+            None => self.0.push(band),
+        }
+    }
+}
+
+/// The cell-relative rects `[x0, y0, x1, y1]` and coverage of a block element
+/// (U+2580–U+259F), or `None` for any other symbol.
+///
+/// A font draws these between its ascent and descent, which is shorter than
+/// the row, and Menlo lacks the quadrants entirely; either way stacked blocks
+/// leave gaps (the Claude Code logo splits into bands). Painting them as rects
+/// fills the cell exactly, so they tile across rows as well as columns.
+fn block_element(symbol: &str) -> Option<(Vec<[f32; 4]>, f32)> {
+    const UL: [f32; 4] = [0.0, 0.0, 0.5, 0.5];
+    const UR: [f32; 4] = [0.5, 0.0, 1.0, 0.5];
+    const LL: [f32; 4] = [0.0, 0.5, 0.5, 1.0];
+    const LR: [f32; 4] = [0.5, 0.5, 1.0, 1.0];
+    const FULL: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    let mut chars = symbol.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    let eighths = |n: u32| n as f32 / 8.0;
+    let block = match c {
+        '\u{2580}' => (vec![[0.0, 0.0, 1.0, 0.5]], 1.0),
+        '\u{2581}'..='\u{2588}' => {
+            let n = c as u32 - 0x2580;
+            (vec![[0.0, 1.0 - eighths(n), 1.0, 1.0]], 1.0)
+        }
+        '\u{2589}'..='\u{258f}' => {
+            let n = 0x2590 - c as u32;
+            (vec![[0.0, 0.0, eighths(n), 1.0]], 1.0)
+        }
+        '\u{2590}' => (vec![[0.5, 0.0, 1.0, 1.0]], 1.0),
+        '\u{2591}' => (vec![FULL], 0.25),
+        '\u{2592}' => (vec![FULL], 0.5),
+        '\u{2593}' => (vec![FULL], 0.75),
+        '\u{2594}' => (vec![[0.0, 0.0, 1.0, eighths(1)]], 1.0),
+        '\u{2595}' => (vec![[1.0 - eighths(1), 0.0, 1.0, 1.0]], 1.0),
+        '\u{2596}' => (vec![LL], 1.0),
+        '\u{2597}' => (vec![LR], 1.0),
+        '\u{2598}' => (vec![UL], 1.0),
+        '\u{2599}' => (vec![UL, LL, LR], 1.0),
+        '\u{259a}' => (vec![UL, LR], 1.0),
+        '\u{259b}' => (vec![UL, UR, LL], 1.0),
+        '\u{259c}' => (vec![UL, UR, LR], 1.0),
+        '\u{259d}' => (vec![UR], 1.0),
+        '\u{259e}' => (vec![UR, LL], 1.0),
+        '\u{259f}' => (vec![UR, LL, LR], 1.0),
+        _ => return None,
+    };
+    Some(block)
 }
 
 /// Group one row's cells into pinned runs sharing one style.
@@ -12863,10 +13028,7 @@ mod tests {
         );
         let masked = mask_pane(&frame, cells, 2);
         let row = usize::from(SKIPPED_DAEMON_ROWS) * 6;
-        let symbols: Vec<&str> = masked.cells[row..row + 6]
-            .iter()
-            .map(symbol)
-            .collect();
+        let symbols: Vec<&str> = masked.cells[row..row + 6].iter().map(symbol).collect();
         assert_eq!(symbols, ["x", "x", "x", "x", " ", " "]);
     }
 
@@ -13427,6 +13589,90 @@ mod tests {
         // advances differ from the measured cell width.
         assert!(!is_flowable("\u{e0a0}"));
         assert!(!is_flowable("\u{1f4e6}"));
+    }
+
+    #[test]
+    fn fallback_glyphs_overflow_only_into_a_blank_neighbor() {
+        let cells: Vec<CellData> = ["\u{23bf}", " ", "\u{23bf}", "R", "a"]
+            .iter()
+            .map(|symbol| CellData {
+                symbol: (*symbol).to_string(),
+                ..CellData::blank(0, 0)
+            })
+            .collect();
+        let rendered: Vec<(u16, &CellData, bool)> = cells
+            .iter()
+            .enumerate()
+            .map(|(column, cell)| (column as u16, cell, false))
+            .collect();
+        assert!(overflows_into_blank(&rendered, "\u{23bf}", 1));
+        assert!(!overflows_into_blank(&rendered, "\u{23bf}", 3));
+        // Past the row's last cell there is nothing to borrow.
+        assert!(!overflows_into_blank(&rendered, "\u{23bf}", 5));
+        // Shaped runs already match the grid.
+        assert!(!overflows_into_blank(&rendered, "a", 1));
+    }
+
+    #[test]
+    fn logo_blocks_merge_into_seamless_bands() {
+        // `▛███▜`: one top strip across all five cells; the bottom strips
+        // break only at the two eyes.
+        let color = gpui::rgb(0xd77757);
+        let mut bands = BlockBands::default();
+        for (column, symbol) in ["\u{259b}", "\u{2588}", "\u{2588}", "\u{2588}", "\u{259c}"]
+            .iter()
+            .enumerate()
+        {
+            let (rects, _) = block_element(symbol).expect("block");
+            for rect in rects {
+                bands.add(column as f32, rect, color);
+            }
+        }
+        let spans: Vec<(f32, f32, f32, f32)> = bands
+            .0
+            .iter()
+            .map(|band| (band.x0, band.x1, band.y0, band.y1))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (0.0, 5.0, 0.0, 0.5),
+                (0.0, 0.5, 0.5, 1.0),
+                (1.0, 4.0, 0.5, 1.0),
+                (4.5, 5.0, 0.5, 1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn block_elements_fill_their_cell_geometry() {
+        assert_eq!(
+            block_element("\u{2588}"),
+            Some((vec![[0.0, 0.0, 1.0, 1.0]], 1.0))
+        );
+        assert_eq!(
+            block_element("\u{2581}"),
+            Some((vec![[0.0, 0.875, 1.0, 1.0]], 1.0))
+        );
+        assert_eq!(
+            block_element("\u{258f}"),
+            Some((vec![[0.0, 0.0, 0.125, 1.0]], 1.0))
+        );
+        assert_eq!(
+            block_element("\u{2589}"),
+            Some((vec![[0.0, 0.0, 0.875, 1.0]], 1.0))
+        );
+        // The Claude Code logo's eyes: `▛` leaves the lower-right quadrant open.
+        assert_eq!(
+            block_element("\u{259b}").map(|(rects, _)| rects.len()),
+            Some(3)
+        );
+        assert_eq!(block_element("\u{2592}").map(|(_, shade)| shade), Some(0.5));
+        assert_eq!(block_element("\u{2500}"), None);
+        assert_eq!(block_element("a"), None);
+        // Each block paints on its own rather than shaping with neighbors.
+        assert!(!is_flowable("\u{2588}"));
+        assert!(is_flowable("\u{2500}"));
     }
 
     #[test]

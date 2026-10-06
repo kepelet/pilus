@@ -1108,6 +1108,9 @@ enum Command {
     NewTab,
     CloseTab(u16),
     Split(String),
+    /// Re-read the snapshot without changing anything: a state change made
+    /// on another connection (a workspace focus) needs its chrome read back.
+    Refresh,
 }
 
 /// A background feed that keeps a fresh snapshot and forwards commands.
@@ -1145,6 +1148,9 @@ const RECONCILE_AGENTS: Duration = Duration::from_secs(3);
 /// refresh is five proxied requests — too heavy at a focus-chasing cadence —
 /// but `agent.list` alone is one, and locally it is a trivial socket read.
 const RECONCILE_AGENTS_FAST: Duration = Duration::from_millis(1200);
+
+/// Gaps between the reads a [`AgentFeed::refresh_soon`] triggers.
+const REFRESH_FOLLOW_UPS: [Duration; 2] = [Duration::from_millis(350), Duration::from_millis(900)];
 
 /// How long to wait before resubscribing after the event stream ends.
 const RESUBSCRIBE: Duration = Duration::from_millis(500);
@@ -1234,6 +1240,16 @@ impl AgentFeed {
         let _ = self.commands.send(Command::FocusPane(pane.to_string()));
     }
 
+    /// Re-read the chrome now and again shortly after.
+    ///
+    /// A change sent over the surface connection (a workspace focus) never
+    /// passes through this feed, so nothing would pull its tab list until the
+    /// next tick — five seconds over SSH. The follow-ups cover the daemon
+    /// applying the change after the first read.
+    pub fn refresh_soon(&self) {
+        let _ = self.commands.send(Command::Refresh);
+    }
+
     /// Ask the daemon to focus the tab at `index`.
     pub fn focus_tab(&self, index: u16) {
         let _ = self.commands.send(Command::FocusTab(index));
@@ -1264,6 +1280,17 @@ impl AgentFeed {
 /// tab clicks to a single snapshot read.
 fn run_commands(transport: ControlTransport, commands: Receiver<Command>, pokes: Sender<()>) {
     while let Ok(command) = commands.recv() {
+        if matches!(command, Command::Refresh) {
+            let pokes = pokes.clone();
+            thread::spawn(move || {
+                for gap in REFRESH_FOLLOW_UPS {
+                    pokes.send(()).ok();
+                    thread::sleep(gap);
+                }
+                pokes.send(()).ok();
+            });
+            continue;
+        }
         let mut client = ControlClient::from_transport(transport.clone());
         serve(&mut client, command);
         // A burst of queued commands shares one reconcile pass.
@@ -1284,6 +1311,7 @@ fn serve(client: &mut ControlClient, command: Command) {
         Command::NewTab => client.new_tab(),
         Command::CloseTab(index) => client.close_tab(index),
         Command::Split(direction) => client.split_pane(&direction),
+        Command::Refresh => return,
     };
 }
 

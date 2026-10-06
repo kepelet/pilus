@@ -399,7 +399,7 @@ impl PilusView {
 
     /// The id of the workspace the window is showing: the fallback home for a
     /// task that predates `project`.
-    fn active_workspace_id(&self) -> Option<String> {
+    pub(super) fn active_workspace_id(&self) -> Option<String> {
         self.surface
             .workspaces()
             .iter()

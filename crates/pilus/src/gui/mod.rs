@@ -127,8 +127,12 @@ const SIDEBAR_ROW_EDGE: f32 = 4.0;
 /// Inset of a row's content from its own box: before the leading glyph, and
 /// before a trailing badge, status dot, or branch.
 const SIDEBAR_ROW_PAD: f32 = 8.0;
-/// Extra inset for a row nested under another row.
-const SIDEBAR_NEST_INDENT: f32 = 16.0;
+/// Extra inset for a row nested under another row. Small, because the elbow
+/// connector carries the hierarchy and the indent only has to clear it.
+const SIDEBAR_NEST_INDENT: f32 = 4.0;
+/// Share of the selected pill's strength a hover fill carries, so hovering a
+/// row hints at the selection without matching it.
+const SIDEBAR_HOVER_WEIGHT: f32 = 0.6;
 /// Left inset for the children of a section, so rows sit under their section
 /// header's label instead of flush with its chevron.
 const SIDEBAR_CHILD_INDENT: f32 = 8.0;
@@ -206,6 +210,8 @@ const SHEEN_HEIGHT: f32 = 0.32;
 /// Right margin on the card. Matches the other sides so the terminal sits
 /// centered between the sidebar and the window edge.
 const CARD_GAP_RIGHT: f32 = CARD_GAP;
+/// Width of the sidebar collapse/expand button.
+const SIDEBAR_TOGGLE_W: f32 = 28.0;
 /// Height of a tab pill in the top chrome.
 const TAB_HEIGHT: f32 = 26.0;
 /// Left inset for the collapsed tab strip: clears the floating traffic lights
@@ -8901,13 +8907,24 @@ impl PilusView {
                     .items_center()
                     .justify_end()
                     .pr(px(8.0))
-                    .child(self.sidebar_toggle(cx)),
+                    .child(self.sidebar_toggle("pilus-sidebar-toggle", cx)),
             )
             .child(list);
         // A translucent sidebar parts from the terminal with the inset
         // hairline; the opaque one meets it seamlessly.
+        // It is an overlay rather than a border: a border would take a pixel
+        // from the panel's content box and leave the rows' right inset one
+        // short of their left, but only while the window is translucent.
         if !self.framed() {
-            panel = panel.border_r_1().border_color(terminal_inset_border());
+            panel = panel.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .bottom(px(0.0))
+                    .right(px(0.0))
+                    .w(px(1.0))
+                    .bg(terminal_inset_border()),
+            );
         }
         panel
     }
@@ -9062,20 +9079,20 @@ impl PilusView {
     /// The sidebar collapse/expand button: pinned to the sidebar's top
     /// clearance while it is open, floating at the strip's head while it is
     /// hidden so the sidebar can always come back.
-    fn sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar_toggle(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let glass = self.settings.glass_opacity();
         div()
-            .id("pilus-sidebar-toggle")
+            .id(id)
             .flex()
             .items_center()
             .justify_center()
             .flex_shrink_0()
             .h(px(TAB_HEIGHT))
-            .w(px(28.0))
+            .w(px(SIDEBAR_TOGGLE_W))
             .rounded_md()
             .cursor_pointer()
-            .hover_fill(theme.panel.opacity(glass), style::RADIUS_MD)
+            .hover_fill(theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
             .child(icon(
                 include_bytes!("../../assets/icons/panel-left.svg"),
                 14.0,
@@ -9145,10 +9162,26 @@ impl PilusView {
             .h(px(TAB_STRIP_HEIGHT))
             .pl(px(pad))
             .pr(px(8.0));
-        // The toggle lives in the sidebar while it is open; only a settled
-        // hidden sidebar parks it at the strip's head.
-        if !self.sidebar_visible && self.sidebar_anim.is_none() {
-            tab_strip = tab_strip.child(self.sidebar_toggle(cx));
+        // The toggle lives in the sidebar while it is open. As the sidebar
+        // leaves, a slot at the strip's head opens in step with it and the
+        // toggle fades in, so the way back is there from the first frame and
+        // the tabs glide aside instead of jumping when the tween settles.
+        let parked = (1.0 - self.sidebar_open).clamp(0.0, 1.0);
+        if parked > 0.0 {
+            tab_strip = tab_strip.child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .overflow_hidden()
+                    // The slot is the toggle plus the strip's gap after it;
+                    // the negative margin cancels the gap so a closed slot
+                    // takes no room at all.
+                    .w(px((SIDEBAR_TOGGLE_W + 4.0) * parked))
+                    .mr(px(-4.0))
+                    .opacity(parked * parked)
+                    .child(self.sidebar_toggle("pilus-sidebar-toggle-parked", cx)),
+            );
         }
         tab_strip = tab_strip.child(self.session_picker(cx).flex_shrink_0());
         // Tabs belong to the terminal surface, so they hide with it while a
@@ -10020,11 +10053,18 @@ impl PilusView {
         let active = self.endpoint_selected(endpoint) && workspace.active;
         let remote = endpoint.machine_id().is_some();
         let bg = if active {
-            theme.panel.opacity(glass)
+            theme.sidebar_raise(glass, 1.0)
         } else {
-            theme.panel.opacity(0.0)
+            theme.sidebar_raise(glass, 0.0)
         };
         let cwd = self.shorten_cwd(&endpoint.key(), &workspace.cwd);
+        // The home workspace is named for the machine it lives on, since its
+        // own name is just the user's directory.
+        let title = if cwd == "~" && !workspace.nested {
+            self.endpoint_label(endpoint)
+        } else {
+            workspace.name.clone()
+        };
         let mut lines = vec![(format!("Directory: {cwd}"), theme.muted)];
         if let Some(branch) = workspace.branch.clone() {
             lines.push((format!("Branch: {branch}"), theme.branch));
@@ -10032,7 +10072,7 @@ impl PilusView {
         if let Some(host) = host {
             lines.push((format!("Host: {host}"), theme.muted));
         }
-        let tip = row_tooltip(workspace.name.clone(), theme.panel_fg, lines, theme);
+        let tip = row_tooltip(title.clone(), theme.panel_fg, lines, theme);
 
         let mut head = div()
             .flex()
@@ -10051,23 +10091,38 @@ impl PilusView {
                     .child(icon(bytes, size, color))
             };
             head = head.child(if workspace.nested {
-                glyph(
-                    include_bytes!("../../assets/icons/circle.svg"),
-                    10.0,
-                    theme.muted,
-                )
+                // A worktree hangs off the workspace above it: an elbow
+                // ("|_") says so in place of the indent a deeper row needs.
+                div()
+                    .w(px(SIDEBAR_GLYPH))
+                    .h(px(SIDEBAR_GLYPH))
+                    .flex_shrink_0()
+                    .child(
+                        div()
+                            .ml(px(2.0))
+                            .mt(px(-6.0))
+                            .w(px(8.0))
+                            .h(px(13.0))
+                            .border_l_1()
+                            .border_b_1()
+                            .border_color(theme.muted.opacity(0.5))
+                            .rounded_bl(px(3.0)),
+                    )
+                    .into_any_element()
             } else if remote {
                 glyph(
                     include_bytes!("../../assets/icons/server.svg"),
                     SIDEBAR_GLYPH,
                     theme.muted,
                 )
+                .into_any_element()
             } else {
                 glyph(
                     include_bytes!("../../assets/icons/folder.svg"),
                     SIDEBAR_GLYPH,
                     theme.panel_fg,
                 )
+                .into_any_element()
             });
         }
         // The name owns the first line. The machine name stays out of the
@@ -10077,7 +10132,7 @@ impl PilusView {
             .min_w_0()
             .truncate()
             .text_color(theme.panel_fg);
-        head = head.child(name.child(workspace.name.clone()));
+        head = head.child(name.child(title));
 
         // Second line: the path grows and truncates; the branch rides at the
         // far right, where it competes with the path instead of the name.
@@ -10125,7 +10180,7 @@ impl PilusView {
             .py_1()
             .rounded_md()
             .cursor_pointer()
-            .state_fill(bg, theme.panel.opacity(glass), style::RADIUS_MD)
+            .state_fill(bg, theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
             .tooltip(tip)
             .child(head);
         // The path line follows the daemon's Show Path / Hide Path toggle.
@@ -10231,9 +10286,9 @@ impl PilusView {
         let theme = self.theme;
         let glass = self.settings.glass_opacity();
         let bg = if self.home.is_open() {
-            theme.panel.opacity(glass)
+            theme.sidebar_raise(glass, 1.0)
         } else {
-            theme.panel.opacity(0.0)
+            theme.sidebar_raise(glass, 0.0)
         };
         div()
             .id("pilus-new-workspace")
@@ -10248,7 +10303,7 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
-            .state_fill(bg, theme.panel.opacity(glass), style::RADIUS_MD)
+            .state_fill(bg, theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
                 SIDEBAR_GLYPH,
@@ -10264,9 +10319,9 @@ impl PilusView {
         let theme = self.theme;
         let glass = self.settings.glass_opacity();
         let bg = if self.session.is_open() {
-            theme.panel.opacity(glass)
+            theme.sidebar_raise(glass, 1.0)
         } else {
-            theme.panel.opacity(0.0)
+            theme.sidebar_raise(glass, 0.0)
         };
         div()
             .id("pilus-pi-session")
@@ -10281,7 +10336,7 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
-            .state_fill(bg, theme.panel.opacity(glass), style::RADIUS_MD)
+            .state_fill(bg, theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
             .child(icon(
                 include_bytes!("../../assets/icons/agents/pi.svg"),
                 SIDEBAR_GLYPH,
@@ -10315,9 +10370,9 @@ impl PilusView {
         let glass = self.settings.glass_opacity();
         let active = self.nav_active(kind);
         let bg = if active {
-            theme.panel.opacity(glass)
+            theme.sidebar_raise(glass, 1.0)
         } else {
-            theme.panel.opacity(0.0)
+            theme.sidebar_raise(glass, 0.0)
         };
         let badge = match kind {
             NavKind::Automations => Some(self.automations.enabled.to_string()),
@@ -10348,7 +10403,7 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
-            .state_fill(bg, theme.panel.opacity(glass), style::RADIUS_MD)
+            .state_fill(bg, theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
             .child(icon(kind.icon(), SIDEBAR_GLYPH, theme.muted))
             .child(label.child(kind.label().to_string()))
             .child(badge)
@@ -10452,7 +10507,7 @@ impl PilusView {
                 .w(px(SIDEBAR_BAND_HEIGHT))
                 .rounded_md()
                 .cursor_pointer()
-                .hover_fill(theme.panel.opacity(glass), style::RADIUS_MD)
+                .hover_fill(theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
                 .child(icon(
                     include_bytes!("../../assets/icons/plus.svg"),
                     11.0,
@@ -10725,9 +10780,9 @@ impl PilusView {
         // The focused row borrows the workspace/worktree pill, so a selected
         // agent reads like a selected workspace instead of a text selection.
         let bg = if focused {
-            theme.panel.opacity(glass)
+            theme.sidebar_raise(glass, 1.0)
         } else {
-            theme.panel.opacity(0.0)
+            theme.sidebar_raise(glass, 0.0)
         };
         let fg = theme.panel_fg;
         let dim = theme.muted;
@@ -10770,7 +10825,7 @@ impl PilusView {
             .py_1()
             .rounded_md()
             .cursor_pointer()
-            .state_fill(bg, theme.panel.opacity(glass), style::RADIUS_MD)
+            .state_fill(bg, theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
             .tooltip(tip)
             .child(
                 div()
@@ -10780,11 +10835,38 @@ impl PilusView {
                     .gap(px(SIDEBAR_GLYPH_GAP))
                     .min_w_0()
                     .text_size(px(self.chrome_font()))
-                    .child(div().w(px(SIDEBAR_GLYPH)).flex_shrink_0().child(icon(
-                        agent_icon(&agent.agent),
-                        12.0,
-                        fg,
-                    )))
+                    // Status leads, in the shared glyph box, so the label
+                    // column matches the other rows; the brand mark trails.
+                    .child(
+                        div()
+                            .w(px(SIDEBAR_GLYPH))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(if agent.status == "working" {
+                                // A working agent turns where the dot sits, so
+                                // the row says "busy" without waiting on a
+                                // status push.
+                                style::spinner(
+                                    format!(
+                                        "pilus-agent-spinner-{}-{}",
+                                        endpoint.key(),
+                                        agent.pane
+                                    ),
+                                    10.0,
+                                    status,
+                                )
+                                .into_any_element()
+                            } else {
+                                div()
+                                    .w(px(8.0))
+                                    .h(px(8.0))
+                                    .rounded_full()
+                                    .bg(status)
+                                    .into_any_element()
+                            }),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -10793,24 +10875,11 @@ impl PilusView {
                             .text_color(fg)
                             .child(label),
                     )
-                    .child(if agent.status == "working" {
-                        // A working agent turns where the dot sits, so the
-                        // row says "busy" without waiting on a status push.
-                        style::spinner(
-                            format!("pilus-agent-spinner-{}-{}", endpoint.key(), agent.pane),
-                            10.0,
-                            status,
-                        )
-                        .into_any_element()
-                    } else {
+                    .child(
                         div()
                             .flex_shrink_0()
-                            .w(px(8.0))
-                            .h(px(8.0))
-                            .rounded_full()
-                            .bg(status)
-                            .into_any_element()
-                    }),
+                            .child(icon(agent_icon(&agent.agent), 12.0, fg)),
+                    ),
             );
         // The path line follows the daemon's Show Path / Hide Path toggle.
         if self.sidebar_agent_paths {

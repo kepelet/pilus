@@ -132,6 +132,26 @@ impl Theme {
         }
     }
 
+    /// The raised fill under a selected or hovered sidebar row, at window
+    /// opacity `glass`.
+    ///
+    /// `panel` is tuned against the opaque `window_bg`, but under translucency
+    /// the sidebar is shaded darker than that (`chrome_glass`), so the same
+    /// pill stands out harder than the opaque one does. Blending the pill
+    /// toward the chrome shade as the window turns translucent keeps its
+    /// contrast with the sidebar constant; `weight` scales it down for hover.
+    pub fn sidebar_raise(self, glass: f32, weight: f32) -> Rgba {
+        let chrome = self.chrome_glass(glass);
+        let keep = glass.clamp(0.0, 1.0);
+        let mix = |panel: f32, base: f32| panel * keep + base * (1.0 - keep);
+        Rgba {
+            r: mix(self.panel.r, chrome.r),
+            g: mix(self.panel.g, chrome.g),
+            b: mix(self.panel.b, chrome.b),
+            a: chrome.a * weight,
+        }
+    }
+
     /// The chrome palette the daemon projects for a thin client, used when the
     /// active theme is not one we have vendored. Roles the projection omits
     /// keep the built-in default.

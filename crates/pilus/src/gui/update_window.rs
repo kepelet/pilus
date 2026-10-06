@@ -171,12 +171,7 @@ impl Render for UpdateWindow {
                     .gap_2()
                     .px_6()
                     .pt_6()
-                    .child(
-                        div()
-                            .text_size(px(style::scaled(&self.settings, 15.0)))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child(heading),
-                    )
+                    .child(style::title(theme, heading, self.fonts().title))
                     .child(
                         div()
                             .text_size(px(self.fonts().secondary))

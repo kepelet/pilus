@@ -96,7 +96,7 @@ impl Item {
         match self {
             Self::Close => "Close",
             Self::Rename => "Rename",
-            Self::Pin => "Pin to top",
+            Self::Pin => "Pin to Top",
             Self::Unpin => "Unpin",
             Self::TogglePaths => {
                 if paths_visible {
@@ -105,7 +105,7 @@ impl Item {
                     "Show Path"
                 }
             }
-            Self::QuickActions => "Quick Actions ▸",
+            Self::QuickActions => "Quick Actions",
             Self::CopyPath => "Copy Path",
             Self::CopyBranch => "Copy Branch",
             Self::NewWorktree => "New Git Worktree",

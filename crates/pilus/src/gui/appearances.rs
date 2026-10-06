@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, Context, Div, FocusHandle, KeyDownEvent, MouseButton, Render, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, size,
+    WindowOptions, div, prelude::*, px, size, svg,
 };
 use pilus_client::{Appearance, ControlClient, ThemeInfo};
 
-use super::style::{self, FillExt};
+use super::style::{self, ButtonKind, FillExt};
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, scheme};
 use crate::settings::Settings;
@@ -303,7 +303,7 @@ impl AppearancesView {
             .py(px(1.0))
             .rounded_sm()
             .bg(theme.panel_dim)
-            .text_size(px(style::scaled(&self.shared_settings, 10.0)))
+            .text_size(px(self.fonts().label))
             .text_color(theme.muted)
             .child(info.appearance.clone());
 
@@ -346,10 +346,12 @@ impl AppearancesView {
 
         if active {
             row = row.child(
-                div()
-                    .text_size(px(self.fonts().secondary))
-                    .text_color(theme.accent)
-                    .child("✓"),
+                svg()
+                    .data(include_bytes!("../../assets/icons/check.svg"))
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .flex_shrink_0()
+                    .text_color(theme.accent),
             );
         }
         row
@@ -362,20 +364,16 @@ impl AppearancesView {
         cx: &mut Context<Self>,
         handler: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> gpui::Stateful<Div> {
-        let theme = self.theme;
-        div()
-            .id(id)
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(24.0))
-            .h(px(22.0))
-            .rounded_md()
-            .cursor_pointer()
-            .text_color(theme.fg)
-            .state_fill(theme.panel_dim, theme.panel, style::RADIUS_MD)
-            .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
-            .child(label)
+        style::small_button(
+            id,
+            label,
+            ButtonKind::Secondary,
+            self.theme,
+            self.fonts().secondary,
+        )
+        .w(px(style::CONTROL_HEIGHT_SMALL))
+        .px_0()
+        .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
     }
 
     fn font_row(&self, field: FontField, label: &str, cx: &mut Context<Self>) -> Div {
@@ -395,9 +393,11 @@ impl AppearancesView {
             .items_center()
             .justify_between()
             .flex_1()
-            .h(px(24.0))
+            .h(px(style::CONTROL_HEIGHT_SMALL))
             .px_2()
             .rounded_md()
+            .border_1()
+            .border_color(theme.border)
             .cursor_pointer()
             .state_fill(
                 if open { theme.panel } else { theme.panel_dim },
@@ -416,7 +416,14 @@ impl AppearancesView {
                 }),
             )
             .child(div().overflow_hidden().child(family))
-            .child(div().text_color(theme.muted).child("▾"));
+            .child(
+                svg()
+                    .data(include_bytes!("../../assets/icons/chevron-down.svg"))
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .flex_shrink_0()
+                    .text_color(theme.muted),
+            );
 
         let smaller = self.step_button(
             format!("pilus-font-{key}-smaller"),

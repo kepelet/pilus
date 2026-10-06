@@ -53,6 +53,8 @@ const SPINNER_FPS: f32 = 30.0;
 pub(super) const TEXT_BODY: f32 = 13.0;
 /// Headlines: the focal line of an empty state.
 pub(super) const TEXT_HEADLINE: f32 = 22.0;
+/// Titles: the heading at the top of a window or a floating panel.
+pub(super) const TEXT_TITLE: f32 = 15.0;
 /// Secondary text: footer, row detail, and feedback messages.
 pub(super) const TEXT_SECONDARY: f32 = 12.0;
 /// Section labels and small action text.
@@ -77,6 +79,8 @@ pub(super) fn scaled(settings: &Rc<RefCell<Settings>>, design: f32) -> f32 {
 pub(super) struct Fonts {
     /// Headlines: the focal line of an empty state.
     pub(super) headline: f32,
+    /// Window and panel titles, between the headline and the body.
+    pub(super) title: f32,
     /// Body text.
     pub(super) body: f32,
     /// Secondary text, one step below the body.
@@ -90,6 +94,7 @@ impl Fonts {
     pub(super) fn resolve(settings: &Rc<RefCell<Settings>>) -> Self {
         Self {
             headline: scaled(settings, TEXT_HEADLINE),
+            title: scaled(settings, TEXT_TITLE),
             body: scaled(settings, TEXT_BODY),
             secondary: scaled(settings, TEXT_SECONDARY),
             label: scaled(settings, TEXT_LABEL),
@@ -119,6 +124,15 @@ pub(super) fn section_label(theme: Theme, text: impl IntoElement, size: f32) -> 
         .text_size(px(size))
         .font_weight(FontWeight::BOLD)
         .text_color(theme.muted)
+        .child(text)
+}
+
+/// A window or panel title: bold body-colored text one step above the body.
+pub(super) fn title(theme: Theme, text: impl IntoElement, size: f32) -> Div {
+    div()
+        .text_size(px(size))
+        .font_weight(FontWeight::BOLD)
+        .text_color(theme.fg)
         .child(text)
 }
 
@@ -196,6 +210,73 @@ struct Knob {
 /// The knob's diameter and its inset from the track's edge.
 const KNOB: f32 = 16.0;
 const KNOB_INSET: f32 = 2.0;
+
+/// A checkbox's edge length at the default Interface size.
+const CHECKBOX: f32 = 14.0;
+
+/// A labelled checkbox. Callers attach their own handler.
+///
+/// The box is two eased fills, an outline and a well inset by a hairline, so
+/// checking it eases the edge and the body together instead of snapping a
+/// border color. The mark fades in each time it is set.
+pub(super) fn checkbox(
+    id: impl Into<SharedString>,
+    checked: bool,
+    label: impl IntoElement,
+    theme: Theme,
+    text_size: f32,
+) -> Stateful<Div> {
+    let id = id.into();
+    let edge = if checked { theme.accent } else { theme.border };
+    let well = if checked {
+        theme.accent
+    } else {
+        theme.panel_dim
+    };
+    let mut inner = div()
+        .id("well")
+        // After the fill: `state_fill` makes its element relative.
+        .state_fill(well, well, RADIUS_SM)
+        .absolute()
+        .inset(px(1.0))
+        .flex()
+        .items_center()
+        .justify_center();
+    if checked {
+        inner = inner.child(
+            svg()
+                .data(include_bytes!("../../assets/icons/check.svg"))
+                .w(px(CHECKBOX - 4.0))
+                .h(px(CHECKBOX - 4.0))
+                .text_color(theme.window_bg)
+                .with_animation(
+                    ElementId::NamedInteger(id.clone(), 1),
+                    Animation::new(FILL_EASE).with_easing(gpui::ease_out_quint()),
+                    |mark, delta| mark.opacity(delta),
+                ),
+        );
+    }
+    div()
+        .id(ElementId::Name(id))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .flex_shrink_0()
+        .cursor_pointer()
+        .text_size(px(text_size))
+        .text_color(theme.fg)
+        .child(
+            div()
+                .id("box")
+                .w(px(CHECKBOX))
+                .h(px(CHECKBOX))
+                .flex_shrink_0()
+                .state_fill(edge, edge, RADIUS_SM)
+                .child(inner),
+        )
+        .child(label)
+}
 
 /// A knob's slide, kept across frames under its element id.
 struct KnobState {

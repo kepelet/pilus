@@ -602,50 +602,21 @@ impl UiPlaygroundView {
 
     /// A working checkbox.
     fn checkbox(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let checked = self.checked;
-        div()
-            .id("pg-checkbox")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.checked = !this.checked;
-                let checked = this.checked;
-                this.note(
-                    format!("Checkbox {}", if checked { "on" } else { "off" }),
-                    cx,
-                );
-            }))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(16.0))
-                    .h(px(16.0))
-                    .rounded_sm()
-                    .bg(if checked {
-                        theme.accent
-                    } else {
-                        theme.panel_dim
-                    })
-                    .border_1()
-                    .border_color(if checked { theme.accent } else { theme.border })
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded_xs().bg(if checked {
-                        theme.window_bg
-                    } else {
-                        theme.panel.opacity(0.0)
-                    })),
-            )
-            .child(
-                div()
-                    .text_size(px(self.fonts().body))
-                    .text_color(theme.fg)
-                    .child("Checkbox"),
-            )
+        style::checkbox(
+            "pg-checkbox",
+            self.checked,
+            "Checkbox",
+            self.theme,
+            self.fonts().body,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.checked = !this.checked;
+            let checked = this.checked;
+            this.note(
+                format!("Checkbox {}", if checked { "on" } else { "off" }),
+                cx,
+            );
+        }))
     }
 
     /// The color swatch grid.
@@ -688,7 +659,7 @@ impl UiPlaygroundView {
                     )
                     .child(
                         div()
-                            .text_size(px(style::scaled(&self.settings, 10.0)))
+                            .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
                             .child(name),
                     ),
@@ -737,7 +708,7 @@ impl UiPlaygroundView {
                     )
                     .child(
                         div()
-                            .text_size(px(style::scaled(&self.settings, 10.0)))
+                            .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
                             .child(*name),
                     ),
@@ -851,7 +822,7 @@ impl UiPlaygroundView {
             .px_1()
             .rounded_full()
             .bg(theme.accent)
-            .text_size(px(style::scaled(&self.settings, 10.0)))
+            .text_size(px(self.fonts().label))
             .text_color(theme.window_bg)
             .child("3");
         let dot = |color: gpui::Rgba, label: &'static str, theme: Theme| {
@@ -1806,13 +1777,12 @@ impl Render for UiPlaygroundView {
                                     .text_color(theme.fg)
                                     .child("Headline text"),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(self.fonts().label))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme.muted)
-                                    .child("SECTION LABEL"),
-                            )
+                            .child(style::title(theme, "Title text", self.fonts().title))
+                            .child(style::section_label(
+                                theme,
+                                "SECTION LABEL",
+                                self.fonts().label,
+                            ))
                             .child(
                                 div()
                                     .text_size(px(self.fonts().body))

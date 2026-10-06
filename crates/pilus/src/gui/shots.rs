@@ -45,6 +45,15 @@ const SAMPLE_SESSION: &str = r#"{"type":"session","version":3,"id":"shot-0001","
 {"type":"compaction","id":"k1","parentId":"a2","timestamp":"2024-12-03T14:01:00.000Z","summary":"Implemented token refresh and its regression test.","firstKeptEntryId":"a2","tokensBefore":42000}
 "#;
 
+/// Width of the session captures; `PILUS_SHOT_WIDTH` narrows them to exercise
+/// the compact composer.
+fn shot_width() -> f32 {
+    std::env::var("PILUS_SHOT_WIDTH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1240.0)
+}
+
 /// Fresh settings for one captured window. `PILUS_SHOT_FONT_SIZE` overrides the
 /// Interface size so scaling can be reviewed without editing the app.
 fn settings() -> Rc<RefCell<Settings>> {
@@ -225,7 +234,7 @@ pub fn run() -> Result<()> {
         let slot = cell.clone();
         let spec = sample.to_string_lossy().into_owned();
         let window = cx
-            .open_window(size(px(1240.0), px(780.0)), move |window, cx| {
+            .open_window(size(px(shot_width()), px(780.0)), move |window, cx| {
                 let view = cx.new(move |cx| {
                     PilusView::new(
                         pilus_client::ConnectTarget::local(),
@@ -291,7 +300,7 @@ pub fn run() -> Result<()> {
         let slot = cell.clone();
         let spec = sample.to_string_lossy().into_owned();
         let window = cx
-            .open_window(size(px(1240.0), px(780.0)), move |window, cx| {
+            .open_window(size(px(shot_width()), px(780.0)), move |window, cx| {
                 let view = cx.new(move |cx| {
                     PilusView::new(
                         pilus_client::ConnectTarget::local(),
@@ -400,7 +409,7 @@ pub fn run() -> Result<()> {
         let slot = cell.clone();
         let spec = sample.to_string_lossy().into_owned();
         let window = cx
-            .open_window(size(px(1240.0), px(780.0)), move |window, cx| {
+            .open_window(size(px(shot_width()), px(780.0)), move |window, cx| {
                 let view = cx.new(move |cx| {
                     PilusView::new(
                         pilus_client::ConnectTarget::local(),
@@ -453,7 +462,7 @@ pub fn run() -> Result<()> {
         let cell: Rc<RefCell<Option<gpui::Entity<PilusView>>>> = Rc::new(RefCell::new(None));
         let slot = cell.clone();
         let window = cx
-            .open_window(size(px(1240.0), px(780.0)), move |window, cx| {
+            .open_window(size(px(shot_width()), px(780.0)), move |window, cx| {
                 let view = cx.new(move |cx| {
                     PilusView::new(
                         pilus_client::ConnectTarget::local(),
@@ -509,7 +518,7 @@ pub fn run_main() -> Result<()> {
 
     let mut cx = context()?;
     let window = cx
-        .open_window(size(px(1240.0), px(780.0)), move |window, cx| {
+        .open_window(size(px(shot_width()), px(780.0)), move |window, cx| {
             let view = cx.new(|cx| {
                 PilusView::new(
                     target.clone(),

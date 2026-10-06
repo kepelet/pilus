@@ -162,3 +162,25 @@ fn image_only_user_turn_still_appears() {
         other => panic!("expected user, got {other:?}"),
     }
 }
+
+#[test]
+fn context_tokens_follow_the_latest_good_response_and_reset_on_compaction() {
+    let reply = |id: &str, total: u64, stop: &str| {
+        format!(
+            r#"{{"type":"message","id":"{id}","timestamp":"t","message":{{"role":"assistant","provider":"p","model":"m","content":[{{"type":"text","text":"x"}}],"usage":{{"input":1,"output":1,"totalTokens":{total}}},"stopReason":"{stop}"}}}}"#
+        )
+    };
+    let mut transcript = Transcript::default();
+    assert_eq!(transcript.context_tokens, None);
+    transcript.push_line(&reply("a1", 1000, "stop"));
+    assert_eq!(transcript.context_tokens, Some(1000));
+    // A failed response's partial count is ignored.
+    transcript.push_line(&reply("a2", 5, "error"));
+    assert_eq!(transcript.context_tokens, Some(1000));
+    transcript.push_line(&reply("a3", 2500, "stop"));
+    assert_eq!(transcript.context_tokens, Some(2500));
+    transcript.push_line(r#"{"type":"compaction","id":"c","timestamp":"t","summary":"s"}"#);
+    assert_eq!(transcript.context_tokens, None);
+    transcript.push_line(&reply("a4", 700, "stop"));
+    assert_eq!(transcript.context_tokens, Some(700));
+}

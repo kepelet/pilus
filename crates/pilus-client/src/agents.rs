@@ -43,6 +43,8 @@ pub struct AgentModel {
     pub default_effort: Option<String>,
     /// Whether the agent marks this as its current default.
     pub is_default: bool,
+    /// The model's context window in tokens, when the catalog says.
+    pub context_window: Option<u64>,
 }
 
 /// One coding agent's presence and model catalog on a machine.
@@ -341,6 +343,7 @@ fn apply_pi(config: &mut AgentConfig, store: Option<&Value>, settings: Option<&V
                     efforts: pi_efforts(model),
                     default_effort: None,
                     is_default: false,
+                    context_window: model.get("contextWindow").and_then(Value::as_u64),
                 });
             }
         }
@@ -421,6 +424,7 @@ fn parse_opencode_models(stdout: &str) -> Vec<AgentModel> {
             efforts: None,
             default_effort: None,
             is_default: false,
+            context_window: None,
         });
     };
     for line in stdout.lines() {
@@ -562,6 +566,7 @@ fn parse_codex_models(result: &Value) -> Vec<AgentModel> {
                     .get("isDefault")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                context_window: None,
             })
         })
         .filter(|model| !model.name.is_empty())
@@ -798,6 +803,7 @@ mod tests {
             efforts: Some(vec!["Low".into(), "High".into()]),
             default_effort: Some("High".into()),
             is_default: true,
+            context_window: None,
         });
         assert_eq!(config.efforts_for("A"), vec!["Default", "Low", "High"]);
         assert_eq!(config.default_effort_for("A").as_deref(), Some("High"));

@@ -166,7 +166,9 @@ fn first_prompt(path: &Path) -> Option<String> {
 /// The first user prompt in a chunk of session JSONL, for a caller that has
 /// already read the bytes (a remote sample, say).
 pub fn first_prompt_in(text: &str) -> Option<String> {
-    text.lines().take(PROMPT_SCAN_LINES).find_map(prompt_of_line)
+    text.lines()
+        .take(PROMPT_SCAN_LINES)
+        .find_map(prompt_of_line)
 }
 
 /// One session line projected to a user prompt, when it is one.
@@ -314,7 +316,10 @@ mod tests {
             Some("fix the \"gauge\" please and also the very long tail that got cu")
         );
         // A cut line that is not a user turn is no prompt.
-        assert_eq!(first_prompt_in(r#"{"message":{"role":"system","content":"x"#), None);
+        assert_eq!(
+            first_prompt_in(r#"{"message":{"role":"system","content":"x"#),
+            None
+        );
     }
 
     #[test]
@@ -395,7 +400,10 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         let file = dir.join("2024-01-01T00-00-00-000Z_pick-me.jsonl");
         std::fs::write(&file, "{}\n").expect("write session");
-        assert_eq!(resolve(file.to_string_lossy().as_ref()).as_deref(), Some(file.as_path()));
+        assert_eq!(
+            resolve(file.to_string_lossy().as_ref()).as_deref(),
+            Some(file.as_path())
+        );
         // A path that does not exist and has no matching sessions is nothing.
         assert_eq!(resolve("/definitely/not/a/session"), None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -420,7 +428,11 @@ mod tests {
         let empty = dir.join("2024-01-01T00-00-01-000Z_empty.jsonl");
         std::fs::write(&empty, "{}\n").expect("write empty session");
         let entries = listing(&root, "/tmp/app", 10);
-        assert!(entries.iter().any(|entry| entry.id == "empty" && entry.title.is_empty()));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.id == "empty" && entry.title.is_empty())
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

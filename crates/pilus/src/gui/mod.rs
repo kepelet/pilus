@@ -1321,6 +1321,10 @@ struct PilusView {
     tab_sel_at: Instant,
     /// Keeps the tab list scrolled when tabs overflow the strip.
     tab_scroll: ScrollHandle,
+    /// The rows the sidebar's shared hover pill can land on.
+    sidebar_hover: style::HoverSlot,
+    /// The row the sidebar's selection pill is gliding to.
+    sidebar_selection: style::GlideSlot,
     /// The tab index the strip last scrolled to, so it only follows changes.
     tab_scrolled: std::cell::Cell<Option<u16>>,
     /// Optimistic endpoint pick from a click, until the handoff commits or
@@ -1780,6 +1784,8 @@ impl PilusView {
             tab_sel: None,
             tab_sel_at: Instant::now(),
             tab_scroll: ScrollHandle::new(),
+            sidebar_hover: style::HoverSlot::default(),
+            sidebar_selection: style::GlideSlot::default(),
             tab_scrolled: std::cell::Cell::new(None),
             endpoint_sel: None,
             agent_sel: None,
@@ -8805,6 +8811,23 @@ impl PilusView {
             .pt(px(SIDEBAR_TOP_INSET))
             .pb(px(SIDEBAR_LIST_PAD));
 
+        // One hover pill glides between rows, the way the tab strip's
+        // selection does, instead of each row lighting up on its own.
+        content = content.child(style::hover_glide(
+            "pilus-sidebar-hover",
+            &self.sidebar_hover,
+            self.theme
+                .sidebar_raise(self.settings.glass_opacity(), SIDEBAR_HOVER_WEIGHT),
+            style::RADIUS_MD,
+        ));
+        // The selected row's raised fill is a second pill under the rows, so
+        // changing the selection reads as motion, like the tab strip's.
+        content = content.child(style::glide(
+            "pilus-sidebar-selection",
+            &self.sidebar_selection,
+            self.theme.sidebar_raise(self.settings.glass_opacity(), 1.0),
+            style::RADIUS_MD,
+        ));
         content = content.child(self.new_workspace_row(cx));
         // Auto mode replaces focused pi panes itself, so the manual toggle
         // row only exists while the setting is off.
@@ -9038,7 +9061,10 @@ impl PilusView {
             .w(px(SIDEBAR_TOGGLE_W))
             .rounded_md()
             .cursor_pointer()
-            .hover_fill(theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
+            .hover_fill(
+                theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT),
+                style::RADIUS_MD,
+            )
             .child(icon(
                 include_bytes!("../../assets/icons/panel-left.svg"),
                 14.0,
@@ -10003,14 +10029,9 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
-        let glass = self.settings.glass_opacity();
         let active = self.endpoint_selected(endpoint) && workspace.active;
         let remote = endpoint.machine_id().is_some();
-        let bg = if active {
-            theme.sidebar_raise(glass, 1.0)
-        } else {
-            theme.sidebar_raise(glass, 0.0)
-        };
+        let selected = active;
         let cwd = self.shorten_cwd(&endpoint.key(), &workspace.cwd);
         // The home workspace is named for the machine it lives on, since its
         // own name is just the user's directory.
@@ -10134,7 +10155,8 @@ impl PilusView {
             .py_1()
             .rounded_md()
             .cursor_pointer()
-            .state_fill(bg, theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
+            .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
+            .child(style::hover_target(&self.sidebar_hover))
             .tooltip(tip)
             .child(head);
         // The path line follows the daemon's Show Path / Hide Path toggle.
@@ -10238,12 +10260,7 @@ impl PilusView {
     /// chosen, so this row toggles the same composer as the Cmd+Shift+N chord.
     fn new_workspace_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let glass = self.settings.glass_opacity();
-        let bg = if self.home.is_open() {
-            theme.sidebar_raise(glass, 1.0)
-        } else {
-            theme.sidebar_raise(glass, 0.0)
-        };
+        let selected = self.home.is_open();
         div()
             .id("pilus-new-workspace")
             .flex()
@@ -10257,7 +10274,8 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
-            .state_fill(bg, theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
+            .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
+            .child(style::hover_target(&self.sidebar_hover))
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
                 SIDEBAR_GLYPH,
@@ -10271,12 +10289,7 @@ impl PilusView {
     /// workspace.
     fn session_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let glass = self.settings.glass_opacity();
-        let bg = if self.session.is_open() {
-            theme.sidebar_raise(glass, 1.0)
-        } else {
-            theme.sidebar_raise(glass, 0.0)
-        };
+        let selected = self.session.is_open();
         div()
             .id("pilus-pi-session")
             .flex()
@@ -10290,7 +10303,8 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
-            .state_fill(bg, theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
+            .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
+            .child(style::hover_target(&self.sidebar_hover))
             .child(icon(
                 include_bytes!("../../assets/icons/agents/pi.svg"),
                 SIDEBAR_GLYPH,
@@ -10321,13 +10335,8 @@ impl PilusView {
     /// One sidebar destination: lucide glyph, label, live badge, chord click.
     fn nav_row(&self, kind: NavKind, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let glass = self.settings.glass_opacity();
         let active = self.nav_active(kind);
-        let bg = if active {
-            theme.sidebar_raise(glass, 1.0)
-        } else {
-            theme.sidebar_raise(glass, 0.0)
-        };
+        let selected = active;
         let badge = match kind {
             NavKind::Automations => Some(self.automations.enabled.to_string()),
             NavKind::Tasks => Some(self.tasks.open.to_string()),
@@ -10357,7 +10366,8 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
-            .state_fill(bg, theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
+            .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
+            .child(style::hover_target(&self.sidebar_hover))
             .child(icon(kind.icon(), SIDEBAR_GLYPH, theme.muted))
             .child(label.child(kind.label().to_string()))
             .child(badge)
@@ -10636,7 +10646,11 @@ impl PilusView {
         if self.agents_collapsed {
             return section;
         }
-        let mut children = div().flex().flex_col().gap_1().pl(px(SIDEBAR_CHILD_INDENT))
+        let mut children = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pl(px(SIDEBAR_CHILD_INDENT))
             .pr(px(SIDEBAR_CHILD_INDENT));
         let mut any = false;
         // The AGENTS-scope menu row narrows the dock to the visible surface's
@@ -10690,15 +10704,10 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
-        let glass = self.settings.glass_opacity();
         let focused = self.agent_focused(endpoint, agent);
         // The focused row borrows the workspace/worktree pill, so a selected
         // agent reads like a selected workspace instead of a text selection.
-        let bg = if focused {
-            theme.sidebar_raise(glass, 1.0)
-        } else {
-            theme.sidebar_raise(glass, 0.0)
-        };
+        let selected = focused;
         let fg = theme.panel_fg;
         let dim = theme.muted;
         let status = status_color(&agent.status, theme);
@@ -10740,7 +10749,8 @@ impl PilusView {
             .py_1()
             .rounded_md()
             .cursor_pointer()
-            .state_fill(bg, theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
+            .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
+            .child(style::hover_target(&self.sidebar_hover))
             .tooltip(tip)
             .child(
                 div()

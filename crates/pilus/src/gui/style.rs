@@ -873,6 +873,279 @@ pub(super) fn glide(
     }
 }
 
+/// The hoverable rows a [`hover_glide`] pill can land on, as they were laid
+/// out this frame.
+#[derive(Clone, Default)]
+pub(super) struct HoverSlot(Rc<RefCell<Vec<HoverRow>>>);
+
+type HoverRow = (Bounds<Pixels>, Hitbox);
+
+/// Mark the element this is a child of as a row the hover pill can land on.
+pub(super) fn hover_target(slot: &HoverSlot) -> impl IntoElement {
+    HoverMarker(slot.clone())
+}
+
+/// One hover highlight shared by a list of rows: it fades in under the row
+/// the pointer enters, then flies from row to row on the tab strip's spring,
+/// and fades out when the pointer leaves the list.
+///
+/// Place it as the first child of the rows' common ancestor so it paints
+/// beneath them and clears the slot before any marker writes to it.
+pub(super) fn hover_glide(
+    id: impl Into<ElementId>,
+    slot: &HoverSlot,
+    color: Rgba,
+    radius: AbsoluteLength,
+) -> impl IntoElement {
+    HoverGlide {
+        id: id.into(),
+        slot: slot.clone(),
+        color,
+        radius,
+    }
+}
+
+struct HoverMarker(HoverSlot);
+
+impl IntoElement for HoverMarker {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for HoverMarker {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(overlay_style(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        self.0.0.borrow_mut().push((bounds, hitbox));
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+}
+
+struct HoverGlide {
+    id: ElementId,
+    slot: HoverSlot,
+    color: Rgba,
+    radius: AbsoluteLength,
+}
+
+/// The pill's flight and fade, in coordinates relative to the pill layer's
+/// origin so scrolling the list moves it with its rows.
+struct HoverState {
+    flight: GlideState,
+    fade_from: f32,
+    fade_to: f32,
+    fade_started: Instant,
+}
+
+impl HoverState {
+    fn alpha(&self, now: Instant) -> f32 {
+        let step = now.duration_since(self.fade_started).as_secs_f32() / FILL_EASE.as_secs_f32();
+        self.fade_from + (self.fade_to - self.fade_from) * ease_out_cubic(step.clamp(0.0, 1.0))
+    }
+
+    fn fade_to(&mut self, to: f32, now: Instant) {
+        if self.fade_to != to {
+            self.fade_from = self.alpha(now);
+            self.fade_to = to;
+            self.fade_started = now;
+        }
+    }
+}
+
+impl IntoElement for HoverGlide {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for HoverGlide {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(overlay_style(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.slot.0.borrow_mut().clear();
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(id) = id else {
+            return;
+        };
+        let hovered = self
+            .slot
+            .0
+            .borrow()
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (_, hitbox))| hitbox.is_hovered(window))
+            .map(|(index, (rect, _))| (index, *rect));
+        let target = hovered.map(|(_, rect)| Bounds {
+            origin: rect.origin - bounds.origin,
+            size: rect.size,
+        });
+        let now = Instant::now();
+        let reduce_motion = cx.reduce_motion();
+        let (pill, alpha) = window.with_element_state(id, |state: Option<HoverState>, window| {
+            let mut state = state.unwrap_or_else(|| {
+                let rest = target.unwrap_or_default();
+                HoverState {
+                    flight: GlideState {
+                        from: rest,
+                        to: rest,
+                        started: now,
+                    },
+                    fade_from: 0.0,
+                    fade_to: 0.0,
+                    fade_started: now,
+                }
+            });
+            match target {
+                Some(target) => {
+                    if state.fade_to == 0.0 && state.alpha(now) < 0.05 {
+                        // Nothing is showing, so the pill appears under
+                        // the row instead of flying in from the last one.
+                        state.flight = GlideState {
+                            from: target,
+                            to: target,
+                            started: now,
+                        };
+                    } else if state.flight.to != target {
+                        state.flight.from = state.flight.at(now);
+                        state.flight.to = target;
+                        state.flight.started = now;
+                    }
+                    state.fade_to(1.0, now);
+                }
+                None => state.fade_to(0.0, now),
+            }
+            let flying = !state.flight.settled(now);
+            let alpha = state.alpha(now);
+            let fading = alpha != state.fade_to;
+            let pill = if reduce_motion || !flying {
+                state.flight.to
+            } else {
+                state.flight.at(now)
+            };
+            let alpha = if reduce_motion { state.fade_to } else { alpha };
+            if !reduce_motion && (flying || fading) {
+                window.request_animation_frame();
+            }
+            ((pill, alpha), state)
+        });
+        if alpha > 0.0 {
+            let pill = Bounds {
+                origin: pill.origin + bounds.origin,
+                size: pill.size,
+            };
+            let radius = self.radius.to_pixels(window.rem_size());
+            let color = Rgba {
+                a: self.color.a * alpha,
+                ..self.color
+            };
+            window.paint_quad(
+                gpui::fill(pill, color)
+                    .corner_radii(Corners::all(radius).clamp_radii_for_quad_size(pill.size)),
+            );
+        }
+        // Repaint when the pointer crosses into another row, the way
+        // `.hover()` does.
+        let slot = self.slot.clone();
+        let current = hovered.map(|(index, _)| index);
+        window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, _cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            let now = slot
+                .0
+                .borrow()
+                .iter()
+                .rposition(|(_, hitbox)| hitbox.is_hovered(window));
+            if now != current {
+                window.refresh();
+            }
+        });
+    }
+}
+
 struct GlideMarker(GlideSlot);
 
 impl IntoElement for GlideMarker {

@@ -639,6 +639,16 @@ pub struct SessionPanel {
     /// Work groups (a stretch of thinking and tool calls between assistant
     /// replies, keyed by its first item) expanded.
     work_open: HashSet<usize>,
+    /// Active work runs (keyed like `work_open`) the user collapsed. A run
+    /// that is still being worked on opens by default, so only the closing
+    /// needs remembering; once the turn ends the run falls back to
+    /// `work_open` and so to collapsed.
+    work_shut: HashSet<usize>,
+    /// Active thinking items the user collapsed, for the same reason.
+    thinking_shut: HashSet<usize>,
+    /// The first item index of the latest batch appended to the transcript
+    /// and when it landed: items from there on fade in while it is fresh.
+    arrived: Option<(usize, Instant)>,
     /// Which composer picker is open, if any.
     picker: Option<PickerKind>,
     /// The picker an outside press just dismissed, so the following click on
@@ -827,6 +837,9 @@ impl Default for SessionPanel {
             expanded: HashSet::new(),
             groups: HashSet::new(),
             work_open: HashSet::new(),
+            work_shut: HashSet::new(),
+            thinking_shut: HashSet::new(),
+            arrived: None,
             last_seen: 0,
             loaded: false,
             changed_from: None,
@@ -1027,6 +1040,8 @@ impl SessionPanel {
         self.expanded.clear();
         self.groups.clear();
         self.work_open.clear();
+        self.work_shut.clear();
+        self.thinking_shut.clear();
         // A session id identifies its expansion; a standalone file its path,
         // and a bare cwd spec (`--session-ui`) the cwd itself.
         let expand_key = spec
@@ -1208,6 +1223,8 @@ impl SessionPanel {
             self.groups.clear();
             self.work_open.clear();
         }
+        self.work_shut.clear();
+        self.thinking_shut.clear();
         self.transcript = Transcript::default();
         self.list = new_list_state();
         self.rows.clear();
@@ -1631,12 +1648,17 @@ impl SessionPanel {
         if targets.iter().all(|index| self.item_shown(*index)) {
             for index in &targets {
                 self.expanded.remove(index);
+                if self.thinking_is_active(*index) {
+                    self.thinking_shut.insert(*index);
+                }
             }
         } else {
             for index in targets {
                 self.expanded.insert(index);
+                self.thinking_shut.remove(&index);
                 if let Some(run) = self.work_run_of(index) {
                     self.work_open.insert(run);
+                    self.work_shut.remove(&run);
                 }
                 if let Some(group) = self.call_group_of(index) {
                     self.groups.insert(group);
@@ -1646,12 +1668,66 @@ impl SessionPanel {
         self.list.remeasure();
     }
 
+    /// Whether the work run starting at `start` is the one pi is on right
+    /// now: it ends the transcript while a turn runs.
+    fn work_is_active(&self, start: usize) -> bool {
+        self.is_working()
+            && self.rows.get(self.row_of(start)).is_some_and(|row| {
+                row.kind == RowKind::Work
+                    && row.start == start
+                    && row.end == self.transcript.items.len()
+            })
+    }
+
+    /// Whether a work run shows its body: open by default while active.
+    fn work_is_open(&self, start: usize) -> bool {
+        if self.work_is_active(start) {
+            !self.work_shut.contains(&start)
+        } else {
+            self.work_open.contains(&start)
+        }
+    }
+
+    /// Whether `index` is a thinking item of the turn in progress, whether
+    /// still streaming in the live overlay or already in the transcript's
+    /// trailing run.
+    fn thinking_is_active(&self, index: usize) -> bool {
+        if !self.is_working() {
+            return false;
+        }
+        if index >= LIVE_BASE {
+            return self.live.as_ref().is_some_and(|live| {
+                matches!(
+                    live.items.get(index - LIVE_BASE).map(|item| &item.kind),
+                    Some(ItemKind::Thinking { .. })
+                )
+            });
+        }
+        let items = &self.transcript.items;
+        matches!(
+            items.get(index).map(|item| &item.kind),
+            Some(ItemKind::Thinking { .. })
+        ) && self
+            .rows
+            .get(self.row_of(index))
+            .is_some_and(|row| row.kind != RowKind::Item && row.end == items.len())
+    }
+
+    /// Whether a thinking item shows its body: open by default while active.
+    fn thinking_is_open(&self, index: usize) -> bool {
+        if self.thinking_is_active(index) {
+            !self.thinking_shut.contains(&index)
+        } else {
+            self.expanded.contains(&index)
+        }
+    }
+
     /// Whether an item is expanded and nothing collapsed hides it.
     fn item_shown(&self, index: usize) -> bool {
-        self.expanded.contains(&index)
+        self.thinking_is_open(index)
             && self
                 .work_run_of(index)
-                .is_none_or(|run| self.work_open.contains(&run))
+                .is_none_or(|run| self.work_is_open(run))
             && self
                 .call_group_of(index)
                 .is_none_or(|group| self.groups.contains(&group))
@@ -2163,8 +2239,13 @@ impl SessionPanel {
 
     /// Toggle one card between collapsed and expanded.
     pub(super) fn toggle(&mut self, index: usize) {
-        if !self.expanded.remove(&index) {
-            self.expanded.insert(index);
+        let set = if self.thinking_is_active(index) {
+            &mut self.thinking_shut
+        } else {
+            &mut self.expanded
+        };
+        if !set.remove(&index) {
+            set.insert(index);
         }
         self.note_disclosed(Toggle::Item(index));
         // Remeasure the row in place, so expanding or collapsing it never
@@ -2298,6 +2379,16 @@ impl SessionPanel {
             let new_count = new.len() + pending as usize + live as usize;
             let old_coverage = self.rows.last().map_or(0, |row| row.end);
             let new_coverage = new.last().map_or(0, |row| row.end);
+            // Only items pi appends mid-session fade in. A first load, or
+            // items the live overlay or the optimistic bubble already
+            // showed, would flash a second time as they land in the file.
+            if old_coverage > 0
+                && new_coverage > old_coverage
+                && !self.list_live
+                && !self.list_pending
+            {
+                self.arrived = Some((old_coverage, Instant::now()));
+            }
             if new_coverage < old_coverage {
                 self.list.reset(new_count);
             } else {
@@ -2350,8 +2441,13 @@ impl SessionPanel {
 
     /// Toggle one run of work between assistant replies.
     pub(super) fn toggle_work(&mut self, index: usize) {
-        if !self.work_open.remove(&index) {
-            self.work_open.insert(index);
+        let set = if self.work_is_active(index) {
+            &mut self.work_shut
+        } else {
+            &mut self.work_open
+        };
+        if !set.remove(&index) {
+            set.insert(index);
         }
         self.note_disclosed(Toggle::Work(index));
         let row = self.row_of(index);
@@ -2368,6 +2464,22 @@ impl SessionPanel {
     fn recently_toggled(&self, toggle: Toggle) -> bool {
         self.disclosed
             .is_some_and(|(last, at)| last == toggle && at.elapsed() < DISCLOSE_WINDOW)
+    }
+
+    /// Fade an item in when it has just been appended to the transcript.
+    ///
+    /// Gated on a short window for the same reason as [`Self::disclose`]:
+    /// the list drops element state for rows that scroll away, so an
+    /// unconditional fade would replay on every scroll back.
+    fn arrive(&self, index: usize, content: AnyElement) -> AnyElement {
+        match self.arrived {
+            Some((from, at)) if index >= from && at.elapsed() < DISCLOSE_WINDOW => style::enter(
+                gpui::SharedString::from(format!("session-arrive-{index}")),
+                div().w_full().child(content),
+            )
+            .into_any_element(),
+            _ => content,
+        }
     }
 
     /// A section body, faded in when the user has just opened it.
@@ -2439,7 +2551,10 @@ impl SessionPanel {
         cx: &mut Context<PilusView>,
     ) -> AnyElement {
         let theme = self.theme;
-        let expanded = self.expanded.contains(&index);
+        let expanded = match &item.kind {
+            ItemKind::Thinking { .. } => self.thinking_is_open(index),
+            _ => self.expanded.contains(&index),
+        };
         match &item.kind {
             ItemKind::User { text, images } => self.user_bubble(text, *images, fonts),
             ItemKind::Assistant { text, .. } => div()
@@ -2811,7 +2926,7 @@ impl SessionPanel {
         cx: &mut Context<PilusView>,
     ) -> AnyElement {
         let theme = self.theme;
-        let expanded = self.work_open.contains(&start);
+        let expanded = self.work_is_open(start);
         let header = self.section_header(
             ("session-work", start).into(),
             work_label(run, trailing),
@@ -2837,14 +2952,12 @@ impl SessionPanel {
                     {
                         index += 1;
                     }
-                    inner = inner.child(self.tool_group(
-                        start + group_start,
-                        &run[group_start..index],
-                        fonts,
-                        cx,
-                    ));
+                    let group =
+                        self.tool_group(start + group_start, &run[group_start..index], fonts, cx);
+                    inner = inner.child(self.arrive(start + group_start, group));
                 } else {
-                    inner = inner.child(self.item(start + index, &run[index], fonts, cx));
+                    let element = self.item(start + index, &run[index], fonts, cx);
+                    inner = inner.child(self.arrive(start + index, element));
                     index += 1;
                 }
             }
@@ -3149,28 +3262,34 @@ impl SessionPanel {
         };
         let items = &self.transcript.items;
         let content = match row.kind {
-            RowKind::Item => self.item(row.start, &items[row.start], fonts, cx),
+            RowKind::Item => {
+                let element = self.item(row.start, &items[row.start], fonts, cx);
+                self.arrive(row.start, element)
+            }
             // A run that is only thinking needs no `Working…` wrapper; the
             // thinking rows stand on their own.
             RowKind::Thinking => {
                 let mut column = div().flex().flex_col().gap_4();
                 for (offset, item) in items[row.start..row.end].iter().enumerate() {
-                    column = column.child(div().flex_shrink_0().child(self.item(
-                        row.start + offset,
-                        item,
-                        fonts,
-                        cx,
-                    )));
+                    let element = self.item(row.start + offset, item, fonts, cx);
+                    column = column.child(
+                        div()
+                            .flex_shrink_0()
+                            .child(self.arrive(row.start + offset, element)),
+                    );
                 }
                 column.into_any_element()
             }
-            RowKind::Work => self.work_group(
-                row.start,
-                &items[row.start..row.end],
-                row.end == items.len(),
-                fonts,
-                cx,
-            ),
+            RowKind::Work => {
+                let element = self.work_group(
+                    row.start,
+                    &items[row.start..row.end],
+                    row.end == items.len(),
+                    fonts,
+                    cx,
+                );
+                self.arrive(row.start, element)
+            }
         };
         div()
             .w_full()
@@ -3201,7 +3320,13 @@ impl SessionPanel {
         if extra == 0
             && let Some(prompt) = self.pending_prompt.clone()
         {
-            return frame(self.user_bubble(&prompt, 0, fonts));
+            return frame(
+                style::enter(
+                    "session-pending-prompt",
+                    div().w_full().child(self.user_bubble(&prompt, 0, fonts)),
+                )
+                .into_any_element(),
+            );
         }
         if extra == usize::from(self.pending_prompt.is_some()) && self.live.is_some() {
             return frame(self.live_element(fonts, cx));
@@ -3219,11 +3344,10 @@ impl SessionPanel {
         };
         let mut column = div().flex().flex_col().gap_4();
         for (offset, item) in live.items.iter().enumerate() {
-            column = column.child(div().flex_shrink_0().child(self.item(
-                LIVE_BASE + offset,
-                item,
-                fonts,
-                cx,
+            let element = self.item(LIVE_BASE + offset, item, fonts, cx);
+            column = column.child(div().flex_shrink_0().child(style::enter(
+                gpui::SharedString::from(format!("session-live-{offset}")),
+                div().w_full().child(element),
             )));
         }
         if let Some((name, output)) = &live.tool {
@@ -3333,11 +3457,14 @@ impl SessionPanel {
         }
         // The prompts jumper shows whenever there is a prompt to jump to;
         // the tail arrow only while unpinned.
-        let has_prompts = self
+        let user_turns = self
             .transcript
             .items
             .iter()
-            .any(|item| matches!(item.kind, ItemKind::User { .. }));
+            .filter(|item| matches!(item.kind, ItemKind::User { .. }))
+            .count()
+            + usize::from(self.pending_prompt.is_some());
+        let has_prompts = user_turns > 1;
         let show_cluster = has_prompts || self.prompts_open;
         let panel_row = if compact {
             // Full width, with the buttons riding the panel's top edge.

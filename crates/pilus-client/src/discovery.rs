@@ -263,32 +263,38 @@ pub fn list_session_infos(root: &Path) -> Vec<SessionInfo> {
 /// Locate the `luvus` CLI for session lifecycle commands.
 ///
 /// `$LUVUS_BIN` wins, then `PATH`, then the usual install spots. The GUI
-/// bundle doesn't inherit a login shell's `PATH`, hence the fallbacks.
+/// bundle doesn't inherit a login shell's `PATH`, hence the fallbacks. A copy
+/// inside the remote-provisioning cache is only a last resort: it is versioned
+/// and frozen, so preferring it would pin every later `machine enable
+/// --install` (which ships the local binary) to the version that was cached.
 pub fn luvus_binary() -> Option<PathBuf> {
     if let Some(custom) = std::env::var_os(BIN_ENV).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(custom));
     }
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(dirs) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&dirs) {
-            let candidate = dir.join("luvus");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
+        candidates.extend(std::env::split_paths(&dirs).map(|dir| dir.join("luvus")));
     }
     if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
         let home = PathBuf::from(home);
-        for suffix in [".local/bin/luvus", ".cargo/bin/luvus"] {
-            let candidate = home.join(suffix);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+        candidates.extend([".local/bin/luvus", ".cargo/bin/luvus"].map(|suffix| home.join(suffix)));
+    }
+    candidates.extend(["/opt/homebrew/bin/luvus", "/usr/local/bin/luvus"].map(PathBuf::from));
+    let mut cached = None;
+    for candidate in candidates.into_iter().filter(|path| path.is_file()) {
+        if is_provisioning_cache(&candidate) {
+            cached.get_or_insert(candidate);
+        } else {
+            return Some(candidate);
         }
     }
-    ["/opt/homebrew/bin/luvus", "/usr/local/bin/luvus"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|candidate| candidate.is_file())
+    cached
+}
+
+/// Whether `path` is the versioned remote-provisioning copy of `luvus`.
+pub fn is_provisioning_cache(path: &Path) -> bool {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    resolved.to_string_lossy().contains("/luvus/remote/")
 }
 
 /// Generate a fresh `adjective-noun` session name, docker-style.

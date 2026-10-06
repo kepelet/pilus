@@ -16,7 +16,10 @@ use gpui::{
     App, Bounds, Context, Div, Entity, FocusHandle, Focusable, Font, KeyDownEvent, MouseButton,
     Pixels, Render, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
-use pilus_client::{HOME_ENV, MachineInfo, luvus_binary, refresh_machines};
+use pilus_client::{
+    HOME_ENV, MachineInfo, find_installed_binary, is_behind, list_machines, luvus_binary,
+    refresh_machines, restart_remote, stop_remote,
+};
 
 use crate::settings::Settings;
 
@@ -151,9 +154,19 @@ enum MachineOp {
     Remove {
         id: String,
     },
-    /// Re-provision the remote binary from this machine's local Luvus
-    /// install, which is how a remote daemon moves to a newer release.
+    /// Bring this Mac's Luvus to the latest release, then re-provision the
+    /// remote binary from it. `enable --install` ships the local binary, so the
+    /// remote can only be as new as the local install.
     Update {
+        id: String,
+    },
+    /// Restart the remote daemon so it loads the binary `Update` installed.
+    Restart {
+        id: String,
+    },
+    /// Stop an old remote daemon, then install. For a daemon too old to
+    /// complete the `enable --install` handshake, which `Update` reports.
+    StopAndUpdate {
         id: String,
     },
 }
@@ -161,6 +174,17 @@ enum MachineOp {
 /// The outcome of one background CLI run.
 enum OpOutcome {
     Ok(String),
+    /// A new remote binary is in place but the old daemon is still running.
+    Installed {
+        id: String,
+        message: String,
+    },
+    /// The running remote daemon rejected this client's protocol, so the
+    /// install cannot finish until that daemon is stopped.
+    NeedsStop {
+        id: String,
+        message: String,
+    },
     Err(String),
 }
 
@@ -179,6 +203,18 @@ pub struct MachineManagerView {
     busy: Option<String>,
     /// A remove awaiting its second click.
     pending_remove: Option<String>,
+    /// A machine whose daemon still runs the pre-upgrade binary.
+    pending_restart: Option<String>,
+    /// A machine whose old daemon must be stopped before it can be upgraded.
+    pending_stop: Option<String>,
+    /// A stop-and-upgrade awaiting its second click.
+    confirming_stop: Option<String>,
+    /// A restart awaiting its second click; it stops that session's panes.
+    confirming_restart: Option<String>,
+    /// The `luvus` version installed on this Mac, to flag outdated machines.
+    local_version: Option<String>,
+    version_rx: Receiver<Option<String>>,
+    version_tx: Sender<Option<String>>,
     status: String,
     refreshing: bool,
     last_probe: Instant,
@@ -200,6 +236,7 @@ impl MachineManagerView {
     ) -> Self {
         let (op_tx, op_rx) = std::sync::mpsc::channel();
         let (list_tx, list_rx) = std::sync::mpsc::channel();
+        let (version_tx, version_rx) = std::sync::mpsc::channel();
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let theme = *shared_theme.borrow();
@@ -216,6 +253,13 @@ impl MachineManagerView {
             form: Form::new(&font, px(fonts.body), theme, cx),
             busy: None,
             pending_remove: None,
+            pending_restart: None,
+            pending_stop: None,
+            confirming_stop: None,
+            confirming_restart: None,
+            local_version: None,
+            version_rx,
+            version_tx,
             status: "Loading machines…".to_string(),
             refreshing: false,
             last_probe: Instant::now(),
@@ -264,10 +308,31 @@ impl MachineManagerView {
             }
             changed = true;
         }
+        while let Ok(version) = self.version_rx.try_recv() {
+            self.local_version = version;
+            changed = true;
+        }
         while let Ok(outcome) = self.op_rx.try_recv() {
             self.busy = None;
             match outcome {
+                OpOutcome::NeedsStop { id, message } => {
+                    self.pending_stop = Some(id);
+                    self.confirming_stop = None;
+                    self.status = message;
+                }
+                OpOutcome::Installed { id, message } => {
+                    self.pending_stop = None;
+                    self.confirming_stop = None;
+                    self.pending_restart = Some(id);
+                    self.status = message;
+                    self.signal.borrow_mut().revision += 1;
+                    self.reload();
+                }
                 OpOutcome::Ok(message) => {
+                    self.pending_stop = None;
+                    self.confirming_stop = None;
+                    self.pending_restart = None;
+                    self.confirming_restart = None;
                     self.status = if message.is_empty() {
                         "Done.".to_string()
                     } else {
@@ -300,7 +365,7 @@ impl MachineManagerView {
         let tx = self.list_tx.clone();
         self.refreshing = true;
         std::thread::spawn(move || {
-            tx.send(pilus_client::list_machines(&root)).ok();
+            tx.send(list_machines(&root)).ok();
         });
     }
 
@@ -310,7 +375,11 @@ impl MachineManagerView {
         let tx = self.list_tx.clone();
         self.refreshing = true;
         self.last_probe = Instant::now();
+        let version_tx = self.version_tx.clone();
         std::thread::spawn(move || {
+            version_tx
+                .send(crate::luvus_update::installed_version().map(|v| v.to_string()))
+                .ok();
             tx.send(refresh_machines(&root)).ok();
         });
     }
@@ -558,11 +627,21 @@ impl MachineManagerView {
             cx.notify();
         }));
 
+        let behind = match (machine.version.as_deref(), self.local_version.as_deref()) {
+            (Some(remote), Some(local)) => is_behind(remote, local),
+            _ => false,
+        };
+        let restart_due = self.pending_restart.as_deref() == Some(machine.id.as_str());
+        let restart_confirming = self.confirming_restart.as_deref() == Some(machine.id.as_str());
         let update_id = id.clone();
         let mut update_button = style::small_button(
             format!("pilus-machine-update-{id}"),
-            "Update",
-            ButtonKind::Ghost,
+            if behind { "Upgrade" } else { "Update" },
+            if behind {
+                ButtonKind::Secondary
+            } else {
+                ButtonKind::Ghost
+            },
             theme,
             self.fonts().label,
         );
@@ -580,6 +659,78 @@ impl MachineManagerView {
                 },
                 &update_id,
             );
+            cx.notify();
+        }));
+
+        let restart_id = id.clone();
+        let restart_button = style::small_button(
+            format!("pilus-machine-restart-{id}"),
+            if restart_confirming {
+                "Confirm restart"
+            } else {
+                "Restart"
+            },
+            ButtonKind::Ghost,
+            theme,
+            self.fonts().label,
+        )
+        .text_color(theme.alert)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if this.busy.is_some() {
+                return;
+            }
+            if this.confirming_restart.as_deref() == Some(restart_id.as_str()) {
+                this.confirming_restart = None;
+                this.start_op(
+                    MachineOp::Restart {
+                        id: restart_id.clone(),
+                    },
+                    &restart_id,
+                );
+            } else {
+                this.confirming_restart = Some(restart_id.clone());
+                this.status = format!(
+                    "Restart `{restart_id}`? This stops every pane in its session. \
+                     Click Confirm restart to continue."
+                );
+            }
+            cx.notify();
+        }));
+
+        let stop_due = self.pending_stop.as_deref() == Some(machine.id.as_str());
+        let stop_confirming = self.confirming_stop.as_deref() == Some(machine.id.as_str());
+        let stop_id = id.clone();
+        let stop_button = style::small_button(
+            format!("pilus-machine-stop-{id}"),
+            if stop_confirming {
+                "Confirm stop"
+            } else {
+                "Stop & upgrade"
+            },
+            ButtonKind::Ghost,
+            theme,
+            self.fonts().label,
+        )
+        .text_color(theme.alert)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if this.busy.is_some() {
+                return;
+            }
+            if this.confirming_stop.as_deref() == Some(stop_id.as_str()) {
+                this.confirming_stop = None;
+                this.start_op(
+                    MachineOp::StopAndUpdate {
+                        id: stop_id.clone(),
+                    },
+                    &stop_id,
+                );
+            } else {
+                this.confirming_stop = Some(stop_id.clone());
+                this.status = format!(
+                    "Stop `{stop_id}`'s daemon? Its panes end (the session is saved). \
+                     Click Confirm stop to continue."
+                );
+            }
             cx.notify();
         }));
 
@@ -662,11 +813,19 @@ impl MachineManagerView {
                                     .clone()
                                     .map(|version| div().child(format!("v{version}"))),
                             )
+                            .children(behind.then(|| {
+                                div().text_color(theme.alert).child(format!(
+                                    "behind v{}",
+                                    self.local_version.clone().unwrap_or_default()
+                                ))
+                            }))
                             .child(div().text_color(status_color).child(status)),
                     ),
             )
             .child(toggle_button)
-            .children(machine.enabled.then_some(update_button))
+            .children(stop_due.then_some(stop_button))
+            .children((machine.enabled && restart_due).then_some(restart_button))
+            .child(update_button)
             .child(remove_button)
     }
 
@@ -784,18 +943,49 @@ fn machine_status(machine: &MachineInfo, theme: Theme) -> (String, gpui::Rgba) {
 
 /// Run one `luvus machine …` mutation and capture its result.
 fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
+    if let MachineOp::Restart { id } = &op {
+        return restart_machine(root, id);
+    }
+    let stop_note = match &op {
+        MachineOp::StopAndUpdate { id } => match stop_machine(root, id) {
+            Ok(note) => note,
+            Err(outcome) => return outcome,
+        },
+        _ => String::new(),
+    };
+    // Local first: the remote can only be as new as the binary that ships it.
+    let local_note = match &op {
+        MachineOp::Update { .. } => refresh_local_install(),
+        MachineOp::StopAndUpdate { .. } => String::new(),
+        _ => String::new(),
+    };
     let Some(binary) = luvus_binary() else {
         return OpOutcome::Err("luvus binary not found on PATH".to_string());
     };
+    if let MachineOp::StopAndUpdate { id } = &op {
+        return reinstall_machine(&binary, root, id, &stop_note);
+    }
     // A short confirmation instead of the CLI's JSON stdout.
     let success = match &op {
         MachineOp::Add { id, .. } => format!("Added `{id}`."),
         MachineOp::Enable { id, .. } => format!("Enabled `{id}`."),
         MachineOp::Disable { id } => format!("Disabled `{id}`."),
         MachineOp::Remove { id } => format!("Removed `{id}`."),
-        MachineOp::Update { id } => format!("Updated `{id}`."),
+        MachineOp::Update { id } => format!(
+            "{local_note}Installed on `{id}`. Restart it to load the new daemon \
+             (this stops its panes)."
+        ),
+        MachineOp::StopAndUpdate { id } => format!(
+            "Stopped the old daemon and installed on `{id}`; it starts on the new Luvus when \
+             the machine reconnects."
+        ),
+        MachineOp::Restart { .. } => String::new(),
     };
     let mut args: Vec<String> = vec!["machine".to_string()];
+    let mut update_id = None;
+    // The machine to offer Stop & upgrade for when the CLI reports a protocol
+    // mismatch; set for both Enable and Update, since either can hit it.
+    let mut mismatch_id = None;
     match op {
         MachineOp::Add {
             id,
@@ -821,6 +1011,7 @@ fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
             }
         }
         MachineOp::Enable { id, install } => {
+            mismatch_id = Some(id.clone());
             args.push("enable".to_string());
             args.push(id);
             if install {
@@ -839,9 +1030,14 @@ fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
         // the profile's versioned `remote_binary`, so it is the CLI's own
         // remote-update path rather than a second install mechanism.
         MachineOp::Update { id } => {
+            update_id = Some(id.clone());
+            mismatch_id = Some(id.clone());
             args.push("enable".to_string());
             args.push(id);
             args.push("--install".to_string());
+        }
+        MachineOp::StopAndUpdate { .. } | MachineOp::Restart { .. } => {
+            return OpOutcome::Ok(String::new());
         }
     }
     match std::process::Command::new(binary)
@@ -849,15 +1045,162 @@ fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
         .env(HOME_ENV, root)
         .output()
     {
-        Ok(output) if output.status.success() => OpOutcome::Ok(success),
+        Ok(output) if output.status.success() => match update_id {
+            Some(id) => OpOutcome::Installed {
+                id,
+                message: success,
+            },
+            None => OpOutcome::Ok(success),
+        },
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if let Some(id) = mismatch_id.filter(|_| is_protocol_mismatch(&stderr)) {
+                return OpOutcome::NeedsStop {
+                    message: format!(
+                        "{local_note}`{id}` runs a Luvus too old for this client. Click Stop & \
+                         upgrade to stop it (its session is saved) and install the new binary."
+                    ),
+                    id,
+                };
+            }
             OpOutcome::Err(if stderr.is_empty() {
-                "The command failed.".to_string()
+                format!("{stop_note}The command failed.")
             } else {
-                stderr
+                format!("{stop_note}{stderr}")
             })
         }
+        Err(error) => OpOutcome::Err(error.to_string()),
+    }
+}
+
+/// Whether CLI output says the remote speaks another protocol revision.
+///
+/// The CLI words this two ways: the handshake's "protocol version mismatch"
+/// and the pre-flight "remote display protocol N does not match local M".
+fn is_protocol_mismatch(stderr: &str) -> bool {
+    stderr.contains("protocol version mismatch") || stderr.contains("does not match local")
+}
+
+/// Install the latest Luvus on this Mac when one is newer.
+///
+/// Returns a sentence for the status line. A failure (offline, or a package
+/// manager owns the install) is reported but never stops the remote step: the
+/// machine can still be provisioned from whatever is installed here.
+fn refresh_local_install() -> String {
+    let engine = crate::luvus_update::engine();
+    match crate::luvus_update::check(&engine) {
+        Ok(Some(release)) => match crate::luvus_update::install(&engine, &release, |_, _| {}) {
+            Ok(_) => format!("Updated this Mac to v{}. ", release.version),
+            Err(error) => format!("Could not update this Mac ({error}). "),
+        },
+        Ok(None) => String::new(),
+        Err(error) => format!("Could not check for a newer Luvus ({error}). "),
+    }
+}
+
+/// Stop one machine's old daemon so `enable --install` has nothing to reject.
+///
+/// An already-stopped or unreachable daemon is not an error here: the install
+/// that follows reports any real connectivity problem itself.
+fn stop_machine(root: &Path, id: &str) -> Result<String, OpOutcome> {
+    let Some(machine) = list_machines(root).into_iter().find(|m| m.id == id) else {
+        return Err(OpOutcome::Err(format!(
+            "machine `{id}` is not in the catalog"
+        )));
+    };
+    // Kept, not dropped: if the daemon survives, the install that follows
+    // fails with the same mismatch, and this says why.
+    Ok(match stop_remote(&machine) {
+        Ok(output) if output.is_empty() => "Stopped the old daemon. ".to_string(),
+        Ok(output) => format!("Stop said: {output}. "),
+        Err(error) => format!("Could not stop the old daemon ({error}). "),
+    })
+}
+
+/// Run one `luvus` command against `root`, returning its stderr on failure.
+fn run_luvus(binary: &Path, root: &Path, args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new(binary)
+        .args(args)
+        .env(HOME_ENV, root)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        "The command failed.".to_string()
+    } else {
+        stderr
+    })
+}
+
+/// Replace a machine's profile so the new Luvus provisions it from scratch.
+///
+/// `machine enable --install` keeps the profile's saved `remote_binary` and
+/// starts it for the closing handshake, so a pinned old binary rejects the
+/// newer client even with its daemon stopped. Removing the profile (which
+/// leaves the remote untouched) and adding it again with `--install` has
+/// nothing pinned to reuse. If the add fails, the old profile is restored
+/// disabled, pointing at its previous binary, so the machine is not lost.
+fn reinstall_machine(binary: &Path, root: &Path, id: &str, stop_note: &str) -> OpOutcome {
+    let Some(machine) = list_machines(root).into_iter().find(|m| m.id == id) else {
+        return OpOutcome::Err(format!("machine `{id}` is not in the catalog"));
+    };
+    let mut add = vec!["machine", "add", id, "--host", machine.destination.as_str()];
+    if !machine.display.is_empty() {
+        add.extend(["--label", machine.display.as_str()]);
+    }
+    if let Some(session) = machine.preferred_session.as_deref() {
+        add.extend(["--session", session]);
+    }
+    if let Err(error) = run_luvus(binary, root, &["machine", "remove", id]) {
+        return OpOutcome::Err(format!("{stop_note}could not remove `{id}`: {error}"));
+    }
+    let mut install = add.clone();
+    install.push("--install");
+    let Err(error) = run_luvus(binary, root, &install) else {
+        return OpOutcome::Ok(format!("{stop_note}Reinstalled `{id}` on the new Luvus."));
+    };
+    // The install can land the binary and still fail its closing handshake.
+    // Point a fresh profile at that copy and enable it, which is the sequence
+    // that works by hand.
+    if let Some(version) = crate::luvus_update::installed_version().map(|v| v.to_string())
+        && let Some(path) = find_installed_binary(&machine, &version)
+    {
+        let mut pinned = add.clone();
+        pinned.extend(["--disabled", "--remote-binary", path.as_str()]);
+        if run_luvus(binary, root, &pinned).is_ok() {
+            return match run_luvus(binary, root, &["machine", "enable", id]) {
+                Ok(()) => OpOutcome::Ok(format!(
+                    "{stop_note}Reinstalled `{id}` on the new Luvus (install reported: {error})."
+                )),
+                Err(enable_error) => OpOutcome::Err(format!(
+                    "{stop_note}Installed {path} but enabling `{id}` failed: {enable_error}. \
+                     The profile is saved disabled."
+                )),
+            };
+        }
+    }
+    let mut restore = add;
+    restore.push("--disabled");
+    if !machine.remote_binary.is_empty() {
+        restore.extend(["--remote-binary", machine.remote_binary.as_str()]);
+    }
+    let restored = match run_luvus(binary, root, &restore) {
+        Ok(()) => "The old profile was restored, disabled.".to_string(),
+        Err(restore_error) => format!("Restoring the old profile also failed: {restore_error}"),
+    };
+    OpOutcome::Err(format!("{stop_note}{error}\n{restored}"))
+}
+
+/// Restart one machine's daemon through its freshly provisioned binary.
+fn restart_machine(root: &Path, id: &str) -> OpOutcome {
+    let Some(machine) = list_machines(root).into_iter().find(|m| m.id == id) else {
+        return OpOutcome::Err(format!("machine `{id}` is not in the catalog"));
+    };
+    match restart_remote(&machine) {
+        Ok(_) => OpOutcome::Ok(format!("Restarted `{id}` on the new Luvus.")),
         Err(error) => OpOutcome::Err(error.to_string()),
     }
 }
@@ -889,5 +1232,21 @@ pub fn open(
     );
     if let Err(error) = opened {
         eprintln!("pilus: could not open the machines window: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_protocol_mismatch;
+
+    #[test]
+    fn both_cli_wordings_count_as_a_protocol_mismatch() {
+        assert!(is_protocol_mismatch(
+            "Error: remote Luvus rejected the client: protocol version mismatch"
+        ));
+        assert!(is_protocol_mismatch(
+            "no remote changes made\n\nCaused by:\n    remote display protocol 18 does not match local 20"
+        ));
+        assert!(!is_protocol_mismatch("Host key verification failed."));
     }
 }

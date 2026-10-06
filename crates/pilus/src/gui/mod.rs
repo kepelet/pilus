@@ -2856,10 +2856,17 @@ impl PilusView {
                     });
                     entry.failures = entry.failures.saturating_add(1);
                     entry.next_at = Instant::now() + reconnect_delay(entry.failures);
-                    self.status = if entry.failures >= RECONNECT_ATTEMPTS {
-                        format!("{id}: {error} (still retrying)")
+                    // A protocol mismatch never heals by retrying; point at the
+                    // upgrade flow instead of leaving the user with a bare error.
+                    let hint = if error.contains("protocol mismatch") {
+                        " — open Remote Machines and choose Upgrade, then Restart"
                     } else {
-                        format!("{id}: {error}")
+                        ""
+                    };
+                    self.status = if entry.failures >= RECONNECT_ATTEMPTS {
+                        format!("{id}: {error}{hint} (still retrying)")
+                    } else {
+                        format!("{id}: {error}{hint}")
                     };
                     changed = true;
                 }
@@ -6482,11 +6489,15 @@ impl PilusView {
         if machine.enabled {
             self.run_machine_page_op(
                 &id,
-                vec!["disable".to_string()],
+                vec!["disable".to_string(), id.clone()],
                 format!("Disabled `{id}`."),
             );
         } else {
-            self.run_machine_page_op(&id, vec!["enable".to_string()], format!("Enabled `{id}`."));
+            self.run_machine_page_op(
+                &id,
+                vec!["enable".to_string(), id.clone()],
+                format!("Enabled `{id}`."),
+            );
         }
     }
 
@@ -6501,7 +6512,11 @@ impl PilusView {
             return;
         }
         self.machine_pending_remove = None;
-        self.run_machine_page_op(&id, vec!["remove".to_string()], format!("Removed `{id}`."));
+        self.run_machine_page_op(
+            &id,
+            vec!["remove".to_string(), id.clone()],
+            format!("Removed `{id}`."),
+        );
     }
 
     /// Run one `luvus machine …` mutation off-thread, then report back.
@@ -6518,6 +6533,9 @@ impl PilusView {
         std::thread::spawn(move || {
             let message = match run_machine_cli(&root, args) {
                 Ok(()) => success,
+                Err(error) if error.contains("does not match local") => {
+                    format!("{error}\nOpen Remote Machines and choose Update, then Stop & upgrade.")
+                }
                 Err(error) => error,
             };
             op_tx.send(message).ok();
@@ -11430,8 +11448,8 @@ impl Render for PilusView {
         };
         // Tasks and Mission Control own the card only while unsplit; split,
         // `page_card` coats each half itself.
-        let page_alone = (self.tasks_panel.is_open() || self.mission.is_open())
-            && self.page_split().is_none();
+        let page_alone =
+            (self.tasks_panel.is_open() || self.mission.is_open()) && self.page_split().is_none();
         let card_bg = if page_owns_card || page_alone {
             self.chrome_fill()
         } else if self.page_split().is_some() {

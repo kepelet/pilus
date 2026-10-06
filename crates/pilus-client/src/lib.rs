@@ -39,15 +39,18 @@ pub use control::{
 pub use discovery::{
     HOME_ENV, PILUS_HOME_ENV, SessionInfo, active_session, api_socket_path_for,
     client_socket_path_for, client_socket_path_under, config_dir, describe, generate_session_name,
-    list_session_infos, list_sessions, luvus_binary, pilus_config_dir, pilus_workspaces_dir,
-    session_dir_for, split_client_socket, validate_session,
+    is_provisioning_cache, list_session_infos, list_sessions, luvus_binary, pilus_config_dir,
+    pilus_workspaces_dir, session_dir_for, split_client_socket, validate_session,
 };
 pub use error::{Error, Result};
 pub use git::{
     RemoteRepos, common_git_dirs_remote, discard_worktree_changes, expand_local, expand_remote,
     init_repository, worktree_is_dirty,
 };
-pub use machines::{MachineInfo, connect_machine, install_agent, list_machines, refresh_machines};
+pub use machines::{
+    MachineInfo, connect_machine, find_installed_binary, install_agent, is_behind, list_machines,
+    refresh_machines, restart_remote, stop_remote,
+};
 pub use mission::{
     AutomationDetail, AutomationHealth, AutomationRow, AutomationRun, MissionRow, MissionScope,
     MissionSnapshot, MissionUsage,

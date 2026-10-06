@@ -154,12 +154,14 @@ impl Theme {
 
     /// The chrome palette the daemon projects for a thin client, used when the
     /// active theme is not one we have vendored. Roles the projection omits
-    /// keep the built-in default.
+    /// keep the built-in default, as does the window/terminal background.
     pub fn from_chrome(chrome: pilus_protocol::MachineFormTheme) -> Self {
         let base = Self::default();
         let c = |packed, fallback| resolve(packed, fallback, &base.ansi);
         Self {
-            window_bg: c(chrome.accent_text, base.window_bg), // crust
+            // The base stays ours: it is the terminal's background too, and
+            // that should not shift with whichever theme the daemon runs.
+            window_bg: base.window_bg,
             bg: base.bg,
             sidebar_bg: c(chrome.rule, base.sidebar_bg), // surface1
             fg: c(chrome.text, base.fg),

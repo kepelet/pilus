@@ -109,7 +109,7 @@ pub fn run() -> Result<()> {
         &mut cx,
         "terminal-glyphs",
         560.0,
-        300.0,
+        440.0,
         Duration::ZERO,
         |_, cx| cx.new(|_| GlyphGridView),
     )?;
@@ -949,7 +949,7 @@ pub fn run_main() -> Result<()> {
 
 /// The lines the glyph grid paints: the Claude Code logo, box drawing, the
 /// block quadrants fonts often lack, wide fallbacks, and descenders.
-const GLYPH_LINES: [&str; 10] = [
+const GLYPH_LINES: [&str; 14] = [
     " ▐▛███▜▌   Claude Code v2.0",
     "▝▜█████▛▘  Opus 4.5 · Claude Max",
     "  ▘▘ ▝▝    ~/projects/pilus",
@@ -960,6 +960,10 @@ const GLYPH_LINES: [&str; 10] = [
     "bold:   The quick brown fox jumps",
     "wide:   日本語 テスト 🙂 ok",
     "  ⎿  Read 42 lines (ctrl+o to expand)",
+    "┌─┬─┐ ╭──╮ ┏━┳━┓ ╔═╦═╗ ╓─╖ ┄┄ ┈┈ ╌╌ ╱╲",
+    "│ │ │ │  │ ┃ ┃ ┃ ║ ║ ║ ║ ║ ┆  ┊  ╎  ╲╱",
+    "├─┼─┤ │  │ ┣━╋━┫ ╠═╬═╣ ╟─╢ ┆  ┊  ╎  ╳",
+    "└─┴─┘ ╰──╯ ┗━┻━┛ ╚═╩═╝ ╙─╜ ┘└ ╴╶ ╼╾",
 ];
 
 /// A terminal surface painted through [`super::render_grid`] from a synthetic

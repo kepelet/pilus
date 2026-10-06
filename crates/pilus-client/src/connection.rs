@@ -8,8 +8,10 @@
 //! 4. if `Ready::probe_terminal` is set, the client replies with
 //!    [`ClientMessage::TerminalColors`] before the server will stream frames.
 
-use std::sync::Arc;
+use std::io::BufReader;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pilus_protocol::{
@@ -49,10 +51,26 @@ pub enum ClientEvent {
     },
 }
 
+/// How long the link must stay quiet before a burst of server messages is
+/// handed to the window. A redraw often leaves the daemon as several
+/// messages (a dock move, then the frame; a clear, then the repaint); over
+/// SSH they arrive milliseconds apart, and painting between them shows the
+/// half-drawn state for a frame — the remote flicker.
+const BURST_SETTLE: Duration = Duration::from_millis(3);
+/// Longest a burst is held, so continuous output still streams at display
+/// rate instead of waiting for a quiet gap that never comes.
+const BURST_HOLD: Duration = Duration::from_millis(12);
+/// Read-side buffer, so a frame costs one syscall rather than two per
+/// message (length prefix, then body).
+const READ_BUFFER: usize = 64 * 1024;
+
 /// An attached, version-checked link to a Luvus daemon.
 pub struct Connection {
     outbound: Sender<ClientMessage>,
     inbound: Receiver<ClientEvent>,
+    /// Held while a burst is forwarded and while [`Connection::drain`]
+    /// empties the queue, so a drain never splits one.
+    gate: Arc<Mutex<()>>,
     /// Kept so dropping the connection can terminate a spawned SSH bridge.
     stream: Arc<Stream>,
     label: String,
@@ -134,9 +152,12 @@ impl Connection {
 
         let (outbound_tx, outbound_rx) = unbounded::<ClientMessage>();
         let (inbound_tx, inbound_rx) = unbounded::<ClientEvent>();
+        let gate = Arc::new(Mutex::new(()));
 
         spawn_writer(Arc::clone(&stream), outbound_rx);
-        spawn_reader(Arc::clone(&stream), inbound_tx.clone(), version);
+        let (raw_tx, raw_rx) = unbounded::<ClientEvent>();
+        spawn_reader(Arc::clone(&stream), raw_tx, version);
+        spawn_coalescer(raw_rx, inbound_tx.clone(), Arc::clone(&gate));
 
         inbound_tx
             .send(ClientEvent::Ready {
@@ -148,6 +169,7 @@ impl Connection {
         Ok(Self {
             outbound: outbound_tx,
             inbound: inbound_rx,
+            gate,
             stream,
             label: label.to_string(),
             identity,
@@ -184,8 +206,18 @@ impl Connection {
         self.inbound.try_recv().ok()
     }
 
+    /// Take every event that has arrived, whole bursts only.
+    ///
+    /// A window drains with this once per tick: the coalescer forwards a
+    /// burst under the same gate, so the drain sees all of it or none, and
+    /// a redraw split across messages is never painted half applied.
+    pub fn drain(&self) -> Vec<ClientEvent> {
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.inbound.try_iter().collect()
+    }
+
     /// Wait up to `timeout` for the next event.
-    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<ClientEvent> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<ClientEvent> {
         self.inbound.recv_timeout(timeout).ok()
     }
 
@@ -323,7 +355,7 @@ fn spawn_reader(stream: Arc<Stream>, inbound: Sender<ClientEvent>, version: u32)
             // Frames are positional; tell this thread's decoder which shape the
             // negotiated daemon sends.
             set_decode_version(version);
-            let mut reader = &*stream;
+            let mut reader = BufReader::with_capacity(READ_BUFFER, &*stream);
             loop {
                 match pilus_protocol::read_message::<_, ServerMessage>(&mut reader) {
                     Ok(message) => {
@@ -345,11 +377,60 @@ fn spawn_reader(stream: Arc<Stream>, inbound: Sender<ClientEvent>, version: u32)
         .ok();
 }
 
+/// Forward the reader's events in bursts: everything that arrives within
+/// [`BURST_SETTLE`] of the previous event, up to [`BURST_HOLD`] in all,
+/// goes out together under `gate`. A disconnect flushes at once.
+fn spawn_coalescer(raw: Receiver<ClientEvent>, inbound: Sender<ClientEvent>, gate: Arc<Mutex<()>>) {
+    thread::Builder::new()
+        .name("pilus-coalesce".into())
+        .spawn(move || {
+            while let Ok(first) = raw.recv() {
+                let mut burst = vec![first];
+                let deadline = Instant::now() + BURST_HOLD;
+                while !matches!(burst.last(), Some(ClientEvent::Disconnected { .. })) {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    match raw.recv_timeout(left.min(BURST_SETTLE)) {
+                        Ok(event) => burst.push(event),
+                        Err(_) => break,
+                    }
+                }
+                let _gate = gate.lock().unwrap_or_else(|e| e.into_inner());
+                for event in burst {
+                    if inbound.send(event).is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn a_burst_is_forwarded_whole() {
+        let (raw_tx, raw_rx) = unbounded();
+        let (inbound_tx, inbound_rx) = unbounded();
+        let gate = Arc::new(Mutex::new(()));
+        spawn_coalescer(raw_rx, inbound_tx, Arc::clone(&gate));
+        let notify = |text: &str| ClientEvent::Message(ServerMessage::Notify(text.to_string()));
+        raw_tx.send(notify("clear")).expect("send");
+        thread::sleep(Duration::from_millis(1));
+        raw_tx.send(notify("repaint")).expect("send");
+        // Nothing is handed over until the link goes quiet.
+        assert!(inbound_rx.try_recv().is_err());
+        thread::sleep(BURST_HOLD * 3);
+        let _gate = gate.lock().expect("gate");
+        let burst: Vec<ClientEvent> = inbound_rx.try_iter().collect();
+        assert_eq!(burst.len(), 2, "both halves of the redraw land together");
+    }
 
     /// A scripted peer on a child process's stdio, proving a remote bridge is
     /// handshaken exactly like a local socket. Raw bincode frames are written

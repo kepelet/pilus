@@ -5,7 +5,7 @@
 //! windows. Sizes here are design sizes at the default Interface size and are
 //! scaled to the user's setting by [`scaled`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,9 @@ const ENTER: Duration = Duration::from_millis(140);
 /// How long a background fill takes to ease into a new hover or selection
 /// state. Short enough that a pointer sweeping down a list never trails.
 const FILL_EASE: Duration = Duration::from_millis(120);
+/// How long a selection pill takes to glide to its new target. A touch
+/// longer than a fill fade: the spring's settle needs room to read.
+const GLIDE: Duration = Duration::from_millis(340);
 /// `rounded_sm`'s radius, for a fill under a dense list row.
 pub(super) const RADIUS_SM: AbsoluteLength = AbsoluteLength::Rems(Rems(0.25));
 /// `rounded_md`'s radius, for a fill under a control, row, or card.
@@ -725,6 +728,262 @@ impl Element for Fill {
                 window.refresh();
             }
         });
+    }
+}
+
+/// A damped spring from 0 to 1: a quick departure, a slight overshoot,
+/// and a settle — motion that reads as elastic rather than eased.
+///
+/// Lands within a hair of 1.0 at `step == 1.0`; callers still snap to the
+/// target once their duration has passed.
+pub(super) fn ease_spring(step: f32) -> f32 {
+    if step >= 1.0 {
+        return 1.0;
+    }
+    let step = step.max(0.0);
+    // Damping and frequency are tuned for a ~6% overshoot that settles
+    // inside the duration; stiffer reads as a bounce, softer as a lag.
+    let decay = (-SPRING_DAMPING * step).exp();
+    1.0 - decay
+        * ((SPRING_FREQUENCY * step).cos()
+            + (SPRING_DAMPING / SPRING_FREQUENCY) * (SPRING_FREQUENCY * step).sin())
+}
+
+/// How fast [`ease_spring`]'s oscillation dies away.
+const SPRING_DAMPING: f32 = 8.0;
+/// [`ease_spring`]'s angular frequency over the unit duration.
+const SPRING_FREQUENCY: f32 = 9.0;
+
+/// Where a glide's target sits this frame.
+///
+/// The target's marker writes its bounds during prepaint; the pill reads
+/// them during paint, which GPUI runs after the whole tree has prepainted,
+/// so the pill always lands on this frame's layout.
+#[derive(Clone, Default)]
+pub(super) struct GlideSlot(Rc<Cell<Option<Bounds<Pixels>>>>);
+
+/// Mark the element this is a child of as the glide's target. Add it as a
+/// child of the selected item only.
+pub(super) fn glide_target(slot: &GlideSlot) -> impl IntoElement {
+    GlideMarker(slot.clone())
+}
+
+/// A selection pill that slides between targets instead of fading out of
+/// one and into the next: the selected tab's raised fill travels from the
+/// old tab to the new one on a spring.
+///
+/// Place it as the first child of the targets' common parent, so it paints
+/// beneath them and resets the slot before any marker writes it. A pill
+/// seen for the first time starts settled.
+pub(super) fn glide(
+    id: impl Into<ElementId>,
+    slot: &GlideSlot,
+    color: Rgba,
+    radius: AbsoluteLength,
+) -> impl IntoElement {
+    Glide {
+        id: id.into(),
+        slot: slot.clone(),
+        color,
+        radius,
+    }
+}
+
+struct GlideMarker(GlideSlot);
+
+impl IntoElement for GlideMarker {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for GlideMarker {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(overlay_style(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.0.0.set(Some(bounds));
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+}
+
+struct Glide {
+    id: ElementId,
+    slot: GlideSlot,
+    color: Rgba,
+    radius: AbsoluteLength,
+}
+
+/// A glide's flight, in coordinates relative to the pill layer's origin so
+/// scrolling the strip moves the pill with its tabs instead of animating.
+struct GlideState {
+    from: Bounds<Pixels>,
+    to: Bounds<Pixels>,
+    started: Instant,
+}
+
+impl GlideState {
+    fn at(&self, now: Instant) -> Bounds<Pixels> {
+        let step = now.duration_since(self.started).as_secs_f32() / GLIDE.as_secs_f32();
+        let eased = ease_spring(step);
+        let lerp = |a: Pixels, b: Pixels| a + (b - a) * eased;
+        Bounds {
+            origin: point(
+                lerp(self.from.origin.x, self.to.origin.x),
+                lerp(self.from.origin.y, self.to.origin.y),
+            ),
+            size: gpui::size(
+                lerp(self.from.size.width, self.to.size.width).max(px(0.0)),
+                lerp(self.from.size.height, self.to.size.height).max(px(0.0)),
+            ),
+        }
+    }
+
+    fn settled(&self, now: Instant) -> bool {
+        now.duration_since(self.started) >= GLIDE
+    }
+}
+
+impl IntoElement for Glide {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for Glide {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(overlay_style(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        // Siblings after this one prepaint next; only a marker drawn this
+        // frame may name the target.
+        self.slot.0.set(None);
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(target) = self.slot.0.get() else {
+            return;
+        };
+        let Some(id) = id else {
+            return;
+        };
+        let target = Bounds {
+            origin: target.origin - bounds.origin,
+            size: target.size,
+        };
+        let now = Instant::now();
+        let reduce_motion = cx.reduce_motion();
+        let pill = window.with_element_state(id, |state: Option<GlideState>, window| {
+            let mut state = state.unwrap_or(GlideState {
+                from: target,
+                to: target,
+                started: now,
+            });
+            if state.to != target {
+                // A target that only resized (a label grew) follows at once;
+                // a move to another item flies there from wherever the pill
+                // is now.
+                if state.to.origin == target.origin && state.settled(now) {
+                    state.from = target;
+                } else {
+                    state.from = state.at(now);
+                }
+                state.to = target;
+                state.started = now;
+            }
+            let pill = if reduce_motion || state.settled(now) {
+                target
+            } else {
+                window.request_animation_frame();
+                state.at(now)
+            };
+            (pill, state)
+        });
+        let pill = Bounds {
+            origin: pill.origin + bounds.origin,
+            size: pill.size,
+        };
+        let radius = self.radius.to_pixels(window.rem_size());
+        window.paint_quad(
+            gpui::fill(pill, self.color)
+                .corner_radii(Corners::all(radius).clamp_radii_for_quad_size(pill.size)),
+        );
     }
 }
 

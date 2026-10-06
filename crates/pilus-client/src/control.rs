@@ -316,6 +316,47 @@ fn is_open(item: &Value) -> bool {
     }
 }
 
+/// A pane's rectangle as fractions of its tab's pane area, from
+/// `pane.layout`.
+///
+/// The daemon lays panes out in a fixed logical space rather than cells, so
+/// the fractions hold at any grid size; a window maps them onto whatever
+/// area it paints the panes in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneFrame {
+    /// Left edge, 0.0 at the area's left.
+    pub x: f32,
+    /// Top edge, 0.0 at the area's top.
+    pub y: f32,
+    /// Width, 1.0 for the full area.
+    pub width: f32,
+    /// Height, 1.0 for the full area.
+    pub height: f32,
+}
+
+impl PaneFrame {
+    fn from_json(value: &Value) -> Option<Self> {
+        let rect = value.get("rect")?;
+        let size = value.get("logical_size")?;
+        let field = |value: &Value, key: &str| value.get(key).and_then(Value::as_f64);
+        let (area_w, area_h) = (field(size, "width")?, field(size, "height")?);
+        if area_w <= 0.0 || area_h <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            x: (field(rect, "x")? / area_w) as f32,
+            y: (field(rect, "y")? / area_h) as f32,
+            width: (field(rect, "width")? / area_w) as f32,
+            height: (field(rect, "height")? / area_h) as f32,
+        })
+    }
+
+    /// Whether the pane fills its tab: no split shares the area.
+    pub fn is_full(&self) -> bool {
+        self.x <= 0.001 && self.y <= 0.001 && self.width >= 0.999 && self.height >= 0.999
+    }
+}
+
 /// One live agent session as reported by `agent.list`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Agent {
@@ -841,6 +882,13 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Where `pane` sits in its tab, from `pane.layout`.
+    pub fn pane_layout(&mut self, pane: &str) -> Result<PaneFrame> {
+        let result = self.request("pane.layout", json!({ "pane": pane }))?;
+        PaneFrame::from_json(&result)
+            .ok_or_else(|| Error::Control("pane.layout: malformed rect".to_string()))
+    }
+
     /// Split the focused pane; `direction` is `right`, `down`, or `auto`.
     pub fn split_pane(&mut self, direction: &str) -> Result<()> {
         self.request("pane.split", json!({ "direction": direction }))?;
@@ -1345,7 +1393,7 @@ fn is_structural(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, AutomationSummary, Tab, TaskSummary, enrich_tab_runtime, is_structural,
+        Agent, AutomationSummary, PaneFrame, Tab, TaskSummary, enrich_tab_runtime, is_structural,
         read_line_within, worktree_blockers,
     };
     use crate::error::Error;
@@ -1354,6 +1402,29 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn pane_frame_maps_the_logical_rect_to_fractions() {
+        let whole = json!({
+            "logical_size": { "width": 10000, "height": 10000 },
+            "rect": { "x": 0, "y": 0, "width": 10000, "height": 10000 }
+        });
+        assert!(PaneFrame::from_json(&whole).expect("frame").is_full());
+        let right = json!({
+            "logical_size": { "width": 10000, "height": 10000 },
+            "rect": { "x": 5000, "y": 0, "width": 5000, "height": 10000 }
+        });
+        let frame = PaneFrame::from_json(&right).expect("frame");
+        assert!(!frame.is_full());
+        assert!((frame.x - 0.5).abs() < f32::EPSILON);
+        assert!((frame.width - 0.5).abs() < f32::EPSILON);
+        // A degenerate area is no layout at all.
+        let empty = json!({
+            "logical_size": { "width": 0, "height": 0 },
+            "rect": { "x": 0, "y": 0, "width": 0, "height": 0 }
+        });
+        assert_eq!(PaneFrame::from_json(&empty), None);
+    }
 
     #[test]
     fn agent_parses_the_reported_session() {

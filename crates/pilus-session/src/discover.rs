@@ -171,12 +171,48 @@ pub fn first_prompt_in(text: &str) -> Option<String> {
 
 /// One session line projected to a user prompt, when it is one.
 fn prompt_of_line(line: &str) -> Option<String> {
-    let entry = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+        return truncated_prompt(line);
+    };
     let message = entry.get("message")?;
     if message.get("role").and_then(|role| role.as_str()) != Some("user") {
         return None;
     }
     message_text(message)
+}
+
+/// The prompt in a user line that was cut short — a remote listing caps
+/// each line it ships, and a pasted prompt can run past the cap. Reads the
+/// first text block's string up to its closing quote or the cut, whichever
+/// comes first.
+fn truncated_prompt(line: &str) -> Option<String> {
+    if !line.contains("\"role\":\"user\"") {
+        return None;
+    }
+    let start = line.find("\"text\":\"")? + "\"text\":\"".len();
+    let mut text = String::new();
+    let mut chars = line[start..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n' | 't' | 'r') => text.push(' '),
+                Some('u') => {
+                    let code: String = chars.by_ref().take(4).collect();
+                    if let Some(decoded) =
+                        u32::from_str_radix(&code, 16).ok().and_then(char::from_u32)
+                    {
+                        text.push(decoded);
+                    }
+                }
+                Some(escaped) => text.push(escaped),
+                None => break,
+            },
+            c => text.push(c),
+        }
+    }
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some(text)
 }
 
 /// A message's text blocks joined and collapsed to one line; `None` when it
@@ -269,6 +305,17 @@ fn home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cut_user_line_still_yields_its_prompt() {
+        let line = r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"fix the \"gauge\"\nplease and also the very long tail that got cu"#;
+        assert_eq!(
+            first_prompt_in(line).as_deref(),
+            Some("fix the \"gauge\" please and also the very long tail that got cu")
+        );
+        // A cut line that is not a user turn is no prompt.
+        assert_eq!(first_prompt_in(r#"{"message":{"role":"system","content":"x"#), None);
+    }
 
     #[test]
     fn slug_matches_pis_encoding() {

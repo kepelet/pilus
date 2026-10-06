@@ -4,15 +4,16 @@
 //! `theme.use`, both on a background thread) plus the client-owned font
 //! settings, which are shared live with the main window and persisted.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Context, Div, FocusHandle, KeyDownEvent, MouseButton, Render, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, size, svg,
+    Anchor, AnyElement, App, Bounds, Context, Div, FocusHandle, KeyDownEvent, MouseButton, Render,
+    Window, WindowBounds, WindowOptions, anchored, canvas, deferred, div, point, prelude::*, px,
+    size, svg,
 };
 use pilus_client::{Appearance, ControlClient, ThemeInfo};
 
@@ -39,6 +40,15 @@ enum FontField {
     Terminal,
 }
 
+impl FontField {
+    fn index(self) -> usize {
+        match self {
+            Self::Ui => 0,
+            Self::Terminal => 1,
+        }
+    }
+}
+
 /// The Appearances window root view.
 pub struct AppearancesView {
     api_socket: PathBuf,
@@ -56,8 +66,9 @@ pub struct AppearancesView {
     select_rx: Receiver<String>,
     select_tx: Sender<String>,
     open_picker: Option<FontField>,
-    /// Where the open picker should drop, in window coordinates.
-    picker_anchor: gpui::Point<gpui::Pixels>,
+    /// Each trigger's last painted bounds, in window coordinates, so the
+    /// dropdown lines up with the control rather than with the click.
+    trigger_bounds: [Rc<Cell<Bounds<gpui::Pixels>>>; 2],
     focus_handle: FocusHandle,
 }
 
@@ -105,7 +116,10 @@ impl AppearancesView {
             select_rx,
             select_tx,
             open_picker: None,
-            picker_anchor: gpui::point(px(0.0), px(0.0)),
+            trigger_bounds: [
+                Rc::new(Cell::new(Bounds::default())),
+                Rc::new(Cell::new(Bounds::default())),
+            ],
             focus_handle,
         };
 
@@ -376,7 +390,13 @@ impl AppearancesView {
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
     }
 
-    fn font_row(&self, field: FontField, label: &str, cx: &mut Context<Self>) -> Div {
+    fn font_row(
+        &self,
+        field: FontField,
+        label: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let theme = self.theme;
         let family = self.family(field);
         let size = self.size(field);
@@ -385,9 +405,11 @@ impl AppearancesView {
             FontField::Terminal => "term",
         };
         let open = self.open_picker == Some(field);
+        let measured = self.trigger_bounds[field.index()].clone();
 
         let trigger = div()
             .id(format!("pilus-font-{key}-pick"))
+            .relative()
             .flex()
             .flex_row()
             .items_center()
@@ -404,17 +426,30 @@ impl AppearancesView {
                 theme.panel,
                 style::RADIUS_MD,
             )
-            .on_click(
-                cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
-                    if this.open_picker == Some(field) {
-                        this.open_picker = None;
-                    } else {
-                        this.open_picker = Some(field);
-                        this.picker_anchor = event.position();
-                    }
-                    cx.notify();
-                }),
+            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _window, cx| {
+                if this.open_picker == Some(field) {
+                    this.open_picker = None;
+                } else {
+                    this.open_picker = Some(field);
+                }
+                cx.notify();
+            }))
+            .child(
+                canvas(move |bounds, _, _| measured.set(bounds), |_, (), _, _| {})
+                    .absolute()
+                    .size_full(),
             )
+            .when(open, |this| {
+                this.child(
+                    // Pinned to the trigger's corner: left in the flex row, the
+                    // anchored child would be centered by `items_center`.
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .child(self.picker_panel(field, window, cx)),
+                )
+            })
             .child(div().overflow_hidden().child(family))
             .child(
                 svg()
@@ -591,8 +626,14 @@ impl AppearancesView {
             .whitespace_nowrap()
     }
 
-    /// A dropdown list of every available family for one field.
-    fn picker_overlay(&self, field: FontField, window: &Window, cx: &mut Context<Self>) -> Div {
+    /// A dropdown list of every available family for one field, anchored to
+    /// the trigger it is a child of so window-coordinate drift cannot move it.
+    fn picker_panel(
+        &self,
+        field: FontField,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = self.theme;
         let current = self.family(field);
         let names = font_options(field, self.families(field));
@@ -629,28 +670,54 @@ impl AppearancesView {
             );
         }
 
-        // Drop below the trigger, or above it when there is more room there,
-        // and clamp so the panel always stays inside the window.
-        let viewport = window.viewport_size();
-        let vw = f32::from(viewport.width);
-        let vh = f32::from(viewport.height);
-        let ax = f32::from(self.picker_anchor.x);
-        let ay = f32::from(self.picker_anchor.y);
-        let panel_w = 360.0_f32;
-        let space_up = (ay - 12.0).max(0.0);
-        let space_down = (vh - ay - 32.0).max(0.0);
-        // Open downward (the familiar direction) unless there is little room
-        // below; when flipping above, keep the panel near the cursor rather
-        // than letting it stretch to the top of the window.
-        let open_up = space_down < 160.0;
+        // Drop below the trigger, or above it when there is more room there.
+        let trigger = self.trigger_bounds[field.index()].get();
+        let vh = f32::from(window.viewport_size().height);
+        let ty = f32::from(trigger.origin.y);
+        let th = f32::from(trigger.size.height);
+        let panel_w = f32::from(trigger.size.width).max(240.0);
+        let gap = 4.0;
+        let space_up = (ty - gap - 8.0).max(0.0);
+        let space_down = (vh - ty - th - gap - 8.0).max(0.0);
+        let open_up = space_down < 160.0 && space_up > space_down;
         let max_h = (if open_up { space_up } else { space_down }).clamp(80.0, 300.0);
-        let top = if open_up {
-            (ay - 6.0 - max_h).max(6.0)
+        let (corner, offset) = if open_up {
+            (Anchor::BottomLeft, point(px(0.0), px(-gap)))
         } else {
-            ay + 26.0
+            (Anchor::TopLeft, point(px(0.0), px(th + gap)))
         };
-        let left = ax.clamp(8.0, (vw - panel_w - 8.0).max(8.0));
 
+        deferred(
+            anchored()
+                .anchor(corner)
+                .offset(offset)
+                .snap_to_window_with_margin(px(8.0))
+                .child(style::enter(
+                    "appearances-picker-enter",
+                    div()
+                        .id("pilus-font-picker")
+                        .w(px(panel_w))
+                        .max_h(px(max_h))
+                        .rounded_md()
+                        .bg(theme.sidebar_bg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .overflow_y_scroll()
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                        .child(list),
+                )),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+
+    /// Full-window scrim: a click outside the open dropdown closes it.
+    fn picker_scrim(&self, cx: &mut Context<Self>) -> Div {
         div()
             .absolute()
             .top(px(0.0))
@@ -658,26 +725,6 @@ impl AppearancesView {
             .right(px(0.0))
             .bottom(px(0.0))
             .occlude()
-            .child(
-                div()
-                    .id("pilus-font-picker")
-                    .absolute()
-                    .top(px(top))
-                    .left(px(left))
-                    .w(px(panel_w))
-                    .max_h(px(max_h))
-                    .rounded_md()
-                    .bg(theme.sidebar_bg)
-                    .border_1()
-                    .border_color(theme.border)
-                    .overflow_y_scroll()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    )
-                    .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.stop_propagation()))
-                    .child(list),
-            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -761,8 +808,8 @@ impl Render for AppearancesView {
 
         list = list
             .child(self.section_heading("FONTS"))
-            .child(self.font_row(FontField::Ui, "Interface", cx))
-            .child(self.font_row(FontField::Terminal, "Terminal", cx));
+            .child(self.font_row(FontField::Ui, "Interface", window, cx))
+            .child(self.font_row(FontField::Terminal, "Terminal", window, cx));
 
         list = list
             .child(self.section_heading("TRANSPARENCY"))
@@ -784,11 +831,8 @@ impl Render for AppearancesView {
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
             .on_action(cx.listener(|_, _: &CloseTab, window, _| window.remove_window()));
         let mut root = super::apply_chrome_font(root, &self.shared_settings).child(list);
-        if let Some(field) = self.open_picker {
-            root = root.child(style::enter(
-                "appearances-picker-enter",
-                self.picker_overlay(field, window, cx),
-            ));
+        if self.open_picker.is_some() {
+            root = root.child(self.picker_scrim(cx));
         }
         root
     }
@@ -801,7 +845,7 @@ pub fn open(
     config_root: PathBuf,
     cx: &mut App,
 ) {
-    let bounds = gpui::Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
+    let bounds = Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),

@@ -310,6 +310,10 @@ gpui::actions!([
     CopySelection,
     /// Paste the system clipboard into the pane.
     PasteClipboard,
+    /// Hide the application, as Cmd+H does in every Mac app.
+    HideApp,
+    /// Hide every other application.
+    HideOtherApps,
     /// Minimize the active window.
     MinimizeWindow,
     /// Zoom (maximize) the active window.
@@ -465,24 +469,35 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
             connector::stop();
             cx.quit();
         });
+        cx.on_action(|_: &HideApp, cx: &mut App| cx.hide());
+        cx.on_action(|_: &HideOtherApps, cx: &mut App| cx.hide_other_apps());
+        // Key and menu dispatch run inside the target window's own update,
+        // where `window.update` fails because the window is already leased;
+        // defer until it has been released.
         cx.on_action(|_: &MinimizeWindow, cx: &mut App| {
-            if let Some(window) = cx.active_window() {
-                window
-                    .update(cx, |_, window, _| window.minimize_window())
-                    .ok();
-            }
+            cx.defer(|cx| {
+                if let Some(window) = frontmost_window(cx) {
+                    window
+                        .update(cx, |_, window, _| window.minimize_window())
+                        .ok();
+                }
+            });
         });
         cx.on_action(|_: &ZoomWindow, cx: &mut App| {
-            if let Some(window) = cx.active_window() {
-                window.update(cx, |_, window, _| window.zoom_window()).ok();
-            }
+            cx.defer(|cx| {
+                if let Some(window) = frontmost_window(cx) {
+                    window.update(cx, |_, window, _| window.zoom_window()).ok();
+                }
+            });
         });
         cx.on_action(|_: &CloseWindow, cx: &mut App| {
-            if let Some(window) = cx.active_window() {
-                window
-                    .update(cx, |_, window, _| window.remove_window())
-                    .ok();
-            }
+            cx.defer(|cx| {
+                if let Some(window) = frontmost_window(cx) {
+                    window
+                        .update(cx, |_, window, _| window.remove_window())
+                        .ok();
+                }
+            });
         });
         cx.on_action({
             let target = new_window_target.clone();
@@ -501,11 +516,13 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
             }
         });
         cx.on_action(|_: &CloseAllWindows, cx: &mut App| {
-            for window in cx.windows() {
-                window
-                    .update(cx, |_, window, _| window.remove_window())
-                    .ok();
-            }
+            cx.defer(|cx| {
+                for window in cx.windows() {
+                    window
+                        .update(cx, |_, window, _| window.remove_window())
+                        .ok();
+                }
+            });
         });
         cx.on_action({
             let settings = settings.clone();
@@ -530,6 +547,9 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
                 MenuItem::separator(),
                 MenuItem::action("Appearances", OpenAppearances),
                 MenuItem::action("Settings", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("Hide pilus", HideApp),
+                MenuItem::action("Hide Others", HideOtherApps),
                 MenuItem::separator(),
                 MenuItem::action("Quit pilus", QuitApp),
             ]),
@@ -610,6 +630,19 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
     Ok(())
 }
 
+/// The window the user is looking at. The platform's notion of the active
+/// window can lag a menu or key-equivalent dispatch, so fall back to asking
+/// each window whether it holds focus.
+fn frontmost_window(cx: &mut App) -> Option<gpui::AnyWindowHandle> {
+    cx.active_window().or_else(|| {
+        cx.windows().into_iter().find(|handle| {
+            handle
+                .update(cx, |_, window, _| window.is_window_active())
+                .unwrap_or(false)
+        })
+    })
+}
+
 /// Every application-level keybinding, in one place so a duplicate chord is a
 /// test failure rather than a shadowed shortcut.
 fn app_key_bindings() -> Vec<KeyBinding> {
@@ -619,6 +652,8 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-c", CopySelection, Some("!Input")),
         KeyBinding::new("cmd-v", PasteClipboard, Some("!Input")),
         KeyBinding::new("cmd-a", SelectAllGrid, Some("!Input")),
+        KeyBinding::new("cmd-h", HideApp, None),
+        KeyBinding::new("cmd-alt-h", HideOtherApps, None),
         KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("cmd-n", NewWindow, None),
         KeyBinding::new("cmd-shift-n", OpenHome, None),
@@ -3585,6 +3620,7 @@ impl PilusView {
                     | "t"
                     | "v"
                     | "m"
+                    | "h"
                     | "w"
                     | "q"
             )

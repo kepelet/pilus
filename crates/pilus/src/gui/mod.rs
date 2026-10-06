@@ -8,6 +8,7 @@
 mod about;
 mod app_icon;
 mod appearances;
+mod box_drawing;
 mod connector;
 mod glass;
 mod home;
@@ -51,7 +52,7 @@ use gpui::{
     MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
     Stateful, SystemNotification, TextRun, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, anchored, deferred, div, font, img, linear_color_stop,
+    WindowBounds, WindowOptions, anchored, canvas, deferred, div, font, img, linear_color_stop,
     linear_gradient, point, prelude::*, px, relative, size, svg,
 };
 use gpui_platform::application;
@@ -11562,6 +11563,9 @@ fn render_row(
     }
 
     let mut blocks = BlockBands::default();
+    let mut box_rects = BoxRects::default();
+    let mut box_curves: Vec<(box_drawing::Curve, gpui::Rgba)> = Vec::new();
+    let light_stroke = box_drawing::light_stroke(font_size);
     for (start_column, run_cells, text, (fg, _bg, mods)) in
         collect_runs(frame.width, &rendered, theme, row, selection)
     {
@@ -11569,6 +11573,21 @@ fn render_row(
             let column = f32::from(start_column.saturating_sub(skip_cols));
             for rect in rects {
                 blocks.add(column, rect, fg.opacity(text_alpha * shade));
+            }
+            continue;
+        }
+        if let Some(c) = box_drawing::box_char(&text) {
+            let column = f32::from(start_column.saturating_sub(skip_cols));
+            let left = (column * cell_width).round();
+            let right = ((column + 1.0) * cell_width).round();
+            let color = fg.opacity(text_alpha);
+            if let Some(strokes) =
+                box_drawing::strokes(c, left, right, f32::from(line_height), light_stroke)
+            {
+                for rect in strokes.rects {
+                    box_rects.add(rect, color);
+                }
+                box_curves.extend(strokes.curves.into_iter().map(|curve| (curve, color)));
             }
             continue;
         }
@@ -11632,6 +11651,33 @@ fn render_row(
                 .top(px(y_edge(band.y0)))
                 .h(px(y_edge(band.y1) - y_edge(band.y0)))
                 .bg(band.color),
+        );
+    }
+    for (rect, color) in box_rects.0 {
+        element = element.child(
+            div()
+                .absolute()
+                .left(px(rect.x0))
+                .w(px(rect.x1 - rect.x0))
+                .top(px(rect.y0))
+                .h(px(rect.y1 - rect.y0))
+                .bg(color),
+        );
+    }
+    if !box_curves.is_empty() {
+        element = element.child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, (), window, _| {
+                    for (curve, color) in box_curves {
+                        if let Some(path) = curve.path(bounds.origin, light_stroke) {
+                            window.paint_path(path, color);
+                        }
+                    }
+                },
+            )
+            .absolute()
+            .inset_0(),
         );
     }
     // Full-bleed pools the sub-cell remainder at the row's right edge, and a
@@ -11768,19 +11814,10 @@ fn reflow_opacity(floor: f32, step: f32) -> f32 {
 /// the version's last digit). Isolate those cells in their own fixed-width
 /// spans so the error cannot accumulate past one glyph.
 ///
-/// Box-drawing glyphs are the exception: the monospace font carries them at
-/// the base advance, and a border must shape as one run so its strokes tile
-/// across cells instead of being clipped one span at a time. Block elements
-/// are not shaped at all; see [`block_element`].
+/// Box-drawing and block elements are not shaped at all; each paints from
+/// its own cell's geometry (see [`box_drawing`] and [`block_element`]).
 fn is_flowable(symbol: &str) -> bool {
-    if pilus_protocol::symbol_width(symbol) > 1 {
-        return false;
-    }
-    symbol.is_ascii()
-        || symbol
-            .chars()
-            .next()
-            .is_some_and(|c| matches!(c, '\u{2500}'..='\u{257f}'))
+    pilus_protocol::symbol_width(symbol) <= 1 && symbol.is_ascii()
 }
 
 /// Whether a run's clip may widen by one cell into a blank `next_column`.
@@ -11858,6 +11895,30 @@ impl BlockBands {
         match self.0.iter_mut().rev().find(|prior| joins(prior)) {
             Some(prior) => prior.x1 = band.x1,
             None => self.0.push(band),
+        }
+    }
+}
+
+/// A row's box-drawing rects, with collinear strokes of one color joined.
+///
+/// A border such as `────` then paints as one quad rather than one per cell,
+/// and the overlapping arms of a junction (`┬` beside `─`) fold into it
+/// instead of doubling a translucent color where they cross.
+#[derive(Debug, Default)]
+struct BoxRects(Vec<(box_drawing::Rect, gpui::Rgba)>);
+
+impl BoxRects {
+    fn add(&mut self, rect: box_drawing::Rect, color: gpui::Rgba) {
+        let joins = |(prior, prior_color): &(box_drawing::Rect, gpui::Rgba)| {
+            *prior_color == color
+                && prior.y0 == rect.y0
+                && prior.y1 == rect.y1
+                && rect.x0 >= prior.x0
+                && rect.x0 <= prior.x1
+        };
+        match self.0.iter_mut().rev().find(|prior| joins(prior)) {
+            Some((prior, _)) => prior.x1 = prior.x1.max(rect.x1),
+            None => self.0.push((rect, color)),
         }
     }
 }
@@ -13391,7 +13452,7 @@ mod tests {
     }
 
     #[test]
-    fn box_drawing_glyphs_flow_as_one_run() {
+    fn box_drawing_glyphs_paint_cell_by_cell() {
         let theme = Theme::default();
         let mut frame = FrameData::blank(4, 1, 0, 0);
         for cell in frame.cells.iter_mut() {
@@ -13403,11 +13464,13 @@ mod tests {
             .enumerate()
             .map(|(index, cell)| (index as u16, cell, false))
             .collect();
-        // A border must shape as one run so its strokes tile across cells
-        // instead of being clipped span by span.
-        assert_eq!(
-            collect_runs(frame.width, &rendered, theme, 0, None).len(),
-            1
+        // Each stroke paints from its own cell's geometry; `BoxRects` joins
+        // the border back into one quad.
+        let runs = collect_runs(frame.width, &rendered, theme, 0, None);
+        assert_eq!(runs.len(), 4);
+        assert!(
+            runs.iter()
+                .all(|(_, cells, text, _)| *cells == 1 && box_drawing::box_char(text).is_some())
         );
     }
 
@@ -13672,7 +13735,7 @@ mod tests {
         assert_eq!(block_element("a"), None);
         // Each block paints on its own rather than shaping with neighbors.
         assert!(!is_flowable("\u{2588}"));
-        assert!(is_flowable("\u{2500}"));
+        assert!(!is_flowable("\u{2500}"));
     }
 
     #[test]

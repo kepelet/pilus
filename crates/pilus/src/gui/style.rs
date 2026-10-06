@@ -401,7 +401,10 @@ pub(super) fn context_gauge(
         0.0
     };
     let arc = if warns { theme.alert } else { theme.accent };
-    let stroke = (size / 7.0).max(1.5);
+    // The panel's own hairline colour is invisible on the composer fill, so
+    // the track borrows the muted text role at low strength.
+    let track_color = Hsla::from(theme.muted).opacity(0.28);
+    let stroke = (size / 7.0).max(1.75);
     let radius = (size - stroke) / 2.0;
     div().id(id).w(px(size)).h(px(size)).flex_shrink_0().child(
         canvas(
@@ -412,7 +415,7 @@ pub(super) fn context_gauge(
                     bounds.origin.y + px(bounds.size.height.as_f32() / 2.0),
                 );
                 if let Some(track) = ring_arc(center, radius, -FRAC_PI_2, TAU, stroke) {
-                    window.paint_path(track, theme.border);
+                    window.paint_path(track, track_color);
                 }
                 if sweep > 0.0
                     && let Some(path) = ring_arc(center, radius, -FRAC_PI_2, sweep, stroke)

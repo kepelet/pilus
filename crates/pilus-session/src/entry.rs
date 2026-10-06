@@ -37,6 +37,19 @@ pub struct Usage {
     pub cost: f64,
 }
 
+/// The context size one response's usage implies, as pi counts it: the
+/// provider's total when given, else the parts summed.
+fn context_tokens(usage: &Value) -> u64 {
+    let total = field_u64(usage, "totalTokens");
+    if total > 0 {
+        return total;
+    }
+    field_u64(usage, "input")
+        + field_u64(usage, "output")
+        + field_u64(usage, "cacheRead")
+        + field_u64(usage, "cacheWrite")
+}
+
 impl Usage {
     /// Add one usage object, ignoring fields the object omits.
     fn add(&mut self, usage: &Value) {
@@ -152,6 +165,10 @@ pub struct TranscriptMeta {
     pub thinking_level: Option<String>,
     /// Count of entry types this build did not recognize.
     pub unknown: usize,
+    /// The context size pi would report: the latest completed assistant
+    /// response's token total. `None` before any response and again after a
+    /// compaction, until a response lands that counts the shorter context.
+    pub context_tokens: Option<u64>,
 }
 
 /// A rendered conversation: the header plus flat items in file order.
@@ -171,6 +188,8 @@ pub struct Transcript {
     pub thinking_level: Option<String>,
     /// Count of entry types this build did not recognize.
     pub unknown: usize,
+    /// The context size pi would report; see [`TranscriptMeta::context_tokens`].
+    pub context_tokens: Option<u64>,
     /// Lowest item index touched since the mark was last taken.
     changed_from: Dirty,
 }
@@ -201,6 +220,7 @@ impl Transcript {
             models: self.models.clone(),
             thinking_level: self.thinking_level.clone(),
             unknown: self.unknown,
+            context_tokens: self.context_tokens,
         }
     }
 
@@ -213,6 +233,7 @@ impl Transcript {
         self.models = meta.models;
         self.thinking_level = meta.thinking_level;
         self.unknown = meta.unknown;
+        self.context_tokens = meta.context_tokens;
     }
 
     /// The lowest item index changed since the last call, or `None` when
@@ -288,6 +309,7 @@ impl Transcript {
                 if let Some(usage) = value.get("usage") {
                     self.usage.add(usage);
                 }
+                self.context_tokens = None;
                 self.push(
                     &id,
                     &timestamp,
@@ -400,6 +422,16 @@ impl Transcript {
                 }
                 if let Some(usage) = message.get("usage") {
                     self.usage.add(usage);
+                    // An aborted or failed response carries a partial count
+                    // pi itself ignores.
+                    let failed = matches!(
+                        opt_str(message, "stopReason").as_deref(),
+                        Some("aborted" | "error")
+                    );
+                    let tokens = context_tokens(usage);
+                    if !failed && tokens > 0 {
+                        self.context_tokens = Some(tokens);
+                    }
                     changed = true;
                 }
                 // Assistant content is normally an array of blocks; tolerate a
@@ -528,6 +560,7 @@ impl Transcript {
                 changed = true;
             }
             "compactionSummary" => {
+                self.context_tokens = None;
                 self.push(
                     id,
                     timestamp,

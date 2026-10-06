@@ -13,7 +13,7 @@
 //! background threads, so the GUI thread only ever applies item deltas to a
 //! folded [`Transcript`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     Anchor, AnyElement, App, Context, Div, ElementId, Entity, FollowMode, Keystroke, ListAlignment,
-    ListOffset, ListState, ScrollStrategy, Stateful, UniformListScrollHandle, anchored, deferred,
-    div, list, point, prelude::*, px, relative, uniform_list,
+    ListOffset, ListState, ScrollHandle, ScrollStrategy, Stateful, UniformListScrollHandle, anchored,
+    canvas, deferred, div, list, point, prelude::*, px, relative, uniform_list,
 };
 use pilus_client::{AgentModel, ControlClient, SshTarget};
 use pilus_session::{
@@ -59,6 +59,9 @@ const COMPOSER_MAX_W: f32 = 880.0;
 const JUMP_GUTTER: f32 = 38.0;
 /// Air between the panel and the buttons, so the cluster never touches it.
 const JUMP_GAP: f32 = 8.0;
+/// Below this pane width the composer drops its side gutter, takes the full
+/// width, and the jump buttons float over its top edge instead.
+const COMPACT_BELOW: f32 = 560.0;
 /// How long a fresh panel's model and thinking chips wait on the extension
 /// socket's first report before settling for the file's or the catalog's
 /// answer. The socket usually reports well inside this; a pi without the
@@ -551,6 +554,29 @@ fn build_rows(items: &[Item]) -> Vec<Row> {
     rows
 }
 
+/// Where a transcript glide is headed.
+#[derive(Clone, Copy)]
+enum ScrollGoal {
+    /// The tail, re-pinned when the glide lands.
+    Bottom,
+    /// A transcript item's row, with the pixel offset it resolved to.
+    Item { index: usize, to: f32 },
+}
+
+/// A transcript glide: the list eases from where it was to its goal, then
+/// lands exactly with the list's own jump so estimated row heights cannot
+/// leave it short.
+struct ScrollTween {
+    from: f32,
+    goal: ScrollGoal,
+    started: Instant,
+    duration: Duration,
+}
+
+/// Shortest and longest a transcript glide runs; distance picks between.
+const SCROLL_GLIDE_MIN: Duration = Duration::from_millis(260);
+const SCROLL_GLIDE_MAX: Duration = Duration::from_millis(520);
+
 /// A fresh list state anchored at the tail: the first layout walks up from
 /// the end and only measures what is visible.
 fn new_list_state() -> ListState {
@@ -630,6 +656,13 @@ pub struct SessionPanel {
     /// Scroll position for the picker's virtualized option list, which is
     /// how a catalog of hundreds of models stays browsable.
     picker_scroll: UniformListScrollHandle,
+    /// The composer row's width as last painted, which decides between the
+    /// side gutter and the full-width layout.
+    dock_width: Rc<Cell<f32>>,
+    /// Scroll position of the model/effort/context row.
+    meta_scroll: ScrollHandle,
+    /// The glide a jump button started, until it lands.
+    scroll_tween: Option<ScrollTween>,
     /// Whether the in-flight send clears the composer on success; picker
     /// commands (`/model`, `/thinking`) leave the draft alone.
     send_clears_input: bool,
@@ -770,6 +803,9 @@ impl Default for SessionPanel {
             picker_cursor: 0,
             picker_query: String::new(),
             picker_scroll: UniformListScrollHandle::default(),
+            dock_width: Rc::new(Cell::new(0.0)),
+            meta_scroll: ScrollHandle::new(),
+            scroll_tween: None,
             send_clears_input: true,
             pending_prompt: None,
             pending_from: 0,
@@ -1441,6 +1477,7 @@ impl SessionPanel {
                             id: model.id.clone(),
                             name: model.name.clone(),
                             is_default: known.is_some_and(|old| old.is_default),
+                            context_window: None,
                             default_effort: known.and_then(|old| old.default_effort.clone()),
                             efforts: known.and_then(|old| old.efforts.clone()),
                         }
@@ -1531,7 +1568,7 @@ impl SessionPanel {
                 true
             }
             "end" => {
-                self.follow_tail();
+                self.glide_to_tail(!cx.reduce_motion());
                 true
             }
             _ => false,
@@ -2137,19 +2174,102 @@ impl SessionPanel {
     }
 
     /// Scroll one absolute item into view, leaving the tail pin behind.
-    fn jump_to(&mut self, index: usize) {
+    ///
+    /// Glides there unless motion is reduced or the row is already close
+    /// enough that easing would only read as lag.
+    fn jump_to(&mut self, index: usize, animate: bool) {
         self.sync_list();
-        if index < self.transcript.items.len() {
-            self.list.scroll_to(ListOffset {
-                item_ix: self.row_of(index),
-                offset_in_item: px(0.0),
-            });
+        if index >= self.transcript.items.len() {
+            return;
         }
+        let target = ListOffset {
+            item_ix: self.row_of(index),
+            offset_in_item: px(0.0),
+        };
+        if !animate {
+            self.scroll_tween = None;
+            self.list.scroll_to(target);
+            return;
+        }
+        let from = self.settle_scroll_position();
+        // Resolve the destination's pixel offset by landing on it and
+        // coming straight back; nothing paints in between.
+        let home = self.list.logical_scroll_top();
+        self.list.scroll_to(target);
+        let to = -self.list.scroll_px_offset_for_scrollbar().y.as_f32();
+        self.list.scroll_to(home);
+        self.start_glide(from, ScrollGoal::Item { index, to });
     }
 
     /// Re-pin the list to the tail: follow new content and anchor at the end.
     fn follow_tail(&mut self) {
+        self.scroll_tween = None;
         self.list.set_follow_mode(FollowMode::Tail);
+    }
+
+    /// Glide to the tail, then re-pin it.
+    fn glide_to_tail(&mut self, animate: bool) {
+        if !animate || self.list.is_following_tail() {
+            self.follow_tail();
+            return;
+        }
+        let from = self.settle_scroll_position();
+        self.start_glide(from, ScrollGoal::Bottom);
+    }
+
+    /// The list's scroll position in pixels, with the tail's "past the end"
+    /// anchor swapped for the real bottom edge so a glide starts from
+    /// what is on screen.
+    fn settle_scroll_position(&mut self) -> f32 {
+        let count = self.list.item_count();
+        if self.list.is_following_tail() || self.list.logical_scroll_top().item_ix >= count {
+            let viewport = self.list.viewport_bounds().size.height;
+            self.list.scroll_by(-viewport);
+        }
+        -self.list.scroll_px_offset_for_scrollbar().y.as_f32()
+    }
+
+    fn start_glide(&mut self, from: f32, goal: ScrollGoal) {
+        let to = match goal {
+            ScrollGoal::Bottom => self.list.max_offset_for_scrollbar().y.as_f32(),
+            ScrollGoal::Item { to, .. } => to,
+        };
+        let distance = (to - from).abs();
+        let extra = SCROLL_GLIDE_MAX - SCROLL_GLIDE_MIN;
+        let duration = SCROLL_GLIDE_MIN + extra.mul_f32((distance / 6000.0).clamp(0.0, 1.0));
+        self.scroll_tween = Some(ScrollTween {
+            from,
+            goal,
+            started: Instant::now(),
+            duration,
+        });
+    }
+
+    /// Advance the glide one frame; true while it still needs frames.
+    pub(super) fn tick_scroll(&mut self) -> bool {
+        let Some(tween) = &self.scroll_tween else {
+            return false;
+        };
+        let step = (tween.started.elapsed().as_secs_f32() / tween.duration.as_secs_f32()).min(1.0);
+        if step >= 1.0 {
+            let goal = tween.goal;
+            self.scroll_tween = None;
+            match goal {
+                ScrollGoal::Bottom => self.follow_tail(),
+                ScrollGoal::Item { index, .. } => self.jump_to(index, false),
+            }
+            return true;
+        }
+        let to = match tween.goal {
+            // The bottom moves while rows measure and output streams in.
+            ScrollGoal::Bottom => self.list.max_offset_for_scrollbar().y.as_f32(),
+            ScrollGoal::Item { to, .. } => to,
+        };
+        let eased = 1.0 - (1.0 - step).powi(5);
+        let wanted = tween.from + (to - tween.from) * eased;
+        let now = -self.list.scroll_px_offset_for_scrollbar().y.as_f32();
+        self.list.scroll_by(px(wanted - now));
+        true
     }
 
     /// The list row holding absolute item `index`, or the last row when the
@@ -3191,17 +3311,26 @@ impl SessionPanel {
         // Each band gets its own row: a band above the panel (the working
         // indicator) would otherwise push the buttons up with it, and they
         // must stay on the panel's top edge.
+        let measured = self.dock_width.get();
+        let compact = measured > 0.0 && measured < COMPACT_BELOW;
+        let gutter = if compact { 0.0 } else { 2.0 * JUMP_GUTTER };
         let mut dock = div()
             .w_full()
-            .max_w(px(COMPOSER_MAX_W + 2.0 * JUMP_GUTTER))
+            .max_w(px(COMPOSER_MAX_W + gutter))
             .flex()
             .flex_col();
+        let band = |content: Div| {
+            if compact {
+                div().child(content)
+            } else {
+                dock_slot(content)
+            }
+        };
         if self.is_working() {
-            dock = dock.child(dock_slot(self.working_row(fonts)));
+            dock = dock.child(band(self.working_row(fonts)));
         } else if self.show_stopped() {
-            dock = dock.child(dock_slot(self.stopped_row(fonts)));
+            dock = dock.child(band(self.stopped_row(fonts)));
         }
-        let mut panel_row = dock_slot(bar);
         // The prompts jumper shows whenever there is a prompt to jump to;
         // the tail arrow only while unpinned.
         let has_prompts = self
@@ -3209,29 +3338,49 @@ impl SessionPanel {
             .items
             .iter()
             .any(|item| matches!(item.kind, ItemKind::User { .. }));
-        // The cluster's column is always reserved, so the panel never
-        // narrows when the first prompt lands; a loading transcript holds a
-        // skeleton there until it knows whether there is one.
-        panel_row = if has_prompts || self.prompts_open {
-            panel_row.child(self.jump_cluster(fonts, cx))
-        } else if !self.loaded {
-            panel_row.child(
-                div()
-                    .w(px(JUMP_BUTTON))
-                    .flex_shrink_0()
-                    .child(style::skeleton(
-                        "session-jump-skeleton",
-                        theme,
-                        px(JUMP_BUTTON),
-                        JUMP_BUTTON,
-                    )),
-            )
+        let show_cluster = has_prompts || self.prompts_open;
+        let panel_row = if compact {
+            // Full width, with the buttons riding the panel's top edge.
+            let mut row = div().relative().child(bar);
+            if show_cluster {
+                row = row.child(
+                    div()
+                        .absolute()
+                        .bottom(relative(1.0))
+                        .right(px(8.0))
+                        .pb_2()
+                        .child(self.jump_cluster(true, fonts, cx)),
+                );
+            }
+            row
         } else {
-            panel_row.child(div().w(px(JUMP_BUTTON)).flex_shrink_0())
+            // The cluster's column is always reserved, so the panel never
+            // narrows when the first prompt lands; a loading transcript
+            // holds a skeleton there until it knows whether there is one.
+            let mut row = dock_slot(bar);
+            row = if show_cluster {
+                row.child(self.jump_cluster(false, fonts, cx))
+            } else if !self.loaded {
+                row.child(
+                    div()
+                        .w(px(JUMP_BUTTON))
+                        .flex_shrink_0()
+                        .child(style::skeleton(
+                            "session-jump-skeleton",
+                            theme,
+                            px(JUMP_BUTTON),
+                            JUMP_BUTTON,
+                        )),
+                )
+            } else {
+                row.child(div().w(px(JUMP_BUTTON)).flex_shrink_0())
+            };
+            row
         };
         // The dock centers in the pane, so the panel itself stays centered
         // while the buttons hang in the gutter beside it.
         dock = dock.child(panel_row);
+        let width_probe = self.dock_width.clone();
         div()
             .flex_shrink_0()
             .flex()
@@ -3242,10 +3391,27 @@ impl SessionPanel {
             .pb_4()
             .child(
                 div()
+                    .relative()
                     .w_full()
                     .flex()
                     .flex_row()
                     .justify_center()
+                    .child(
+                        // Measures the row, which is pane-wide in both
+                        // layouts, so the layout choice cannot feed back.
+                        canvas(
+                            move |bounds, window, _cx| {
+                                let width = bounds.size.width.as_f32();
+                                if (width_probe.get() - width).abs() > 0.5 {
+                                    width_probe.set(width);
+                                    window.refresh();
+                                }
+                            },
+                            |_, (), _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
                     .child(dock),
             )
     }
@@ -3306,7 +3472,7 @@ impl SessionPanel {
 
     /// The jump buttons beside the composer: the prompts menu over a row
     /// with the prompts button and the scroll-to-bottom arrow.
-    fn jump_cluster(&self, fonts: Fonts, cx: &mut Context<PilusView>) -> AnyElement {
+    fn jump_cluster(&self, compact: bool, fonts: Fonts, cx: &mut Context<PilusView>) -> AnyElement {
         let theme = self.theme;
         let circle = |id: &'static str, glyph: &'static [u8]| {
             div()
@@ -3324,13 +3490,12 @@ impl SessionPanel {
         };
         // A narrow column beside the panel; the menu leaves it, so opening
         // one never widens the dock.
-        let mut cluster = div()
-            .relative()
-            .w(px(30.0))
-            .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .items_center();
+        let mut cluster = div().relative().flex_shrink_0().flex().items_center();
+        cluster = if compact {
+            cluster.flex_row()
+        } else {
+            cluster.w(px(30.0)).flex_col()
+        };
         if self.prompts_open {
             cluster = cluster.child(
                 div()
@@ -3341,7 +3506,8 @@ impl SessionPanel {
                     .child(self.prompts_menu(fonts, cx)),
             );
         }
-        let mut row = div().flex().flex_col().items_center().gap_2();
+        let mut row = div().flex().items_center().gap_2();
+        row = if compact { row.flex_row() } else { row.flex_col() };
         row = row.child(
             circle(
                 "session-prompts-button",
@@ -3361,7 +3527,7 @@ impl SessionPanel {
                     include_bytes!("../../assets/icons/arrow-down.svg"),
                 )
                 .on_click(cx.listener(|this: &mut PilusView, _, _, cx| {
-                    this.session.follow_tail();
+                    this.session.glide_to_tail(!cx.reduce_motion());
                     cx.notify();
                 })),
             );
@@ -3415,7 +3581,7 @@ impl SessionPanel {
                     this.session.prompts_open = false;
                     this.session.prompts_dismissed = false;
                     // Scrolling to a row leaves the tail behind by itself.
-                    this.session.jump_to(index);
+                    this.session.jump_to(index, !cx.reduce_motion());
                     cx.notify();
                 }),
             ));
@@ -3672,14 +3838,9 @@ impl SessionPanel {
     fn meta_row(&self, has_text: bool, fonts: Fonts, cx: &mut Context<PilusView>) -> Div {
         let theme = self.theme;
         let transcript = &self.transcript;
-        let mut row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .pt_1()
-            .pb_2();
+        // The chips, gauge, and token counts scroll sideways when they
+        // outgrow the panel; the send button stays put beside them.
+        let mut row = div().flex().flex_none().flex_row().items_center().gap_1();
         let cpu: &'static [u8] = include_bytes!("../../assets/icons/cpu.svg");
         let gauge: &'static [u8] = include_bytes!("../../assets/icons/gauge.svg");
         // Until the session names its model, a skeleton holds the chip's
@@ -3722,12 +3883,8 @@ impl SessionPanel {
             )
             .into_any_element()
         });
-        if let Some(context) = self
-            .pi_state
-            .as_ref()
-            .and_then(|state| state.context.as_ref())
-            .filter(|context| ctx_visible(context))
-        {
+        if let Some(context) = self.context_usage().filter(ctx_visible) {
+            let context = &context;
             let color = if ctx_warns(context) {
                 theme.alert
             } else {
@@ -3766,9 +3923,51 @@ impl SessionPanel {
                     .child(stats),
             );
         }
-        row = row.child(div().flex_1());
-        row = row.child(self.send_button(has_text, cx));
-        row
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .pt_1()
+            .pb_2()
+            .child(
+                div()
+                    .id("session-meta-scroll")
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.meta_scroll)
+                    .child(row),
+            )
+            .child(self.send_button(has_text, cx))
+    }
+
+    /// The context occupancy to paint: the extension's own report when it
+    /// is up, else one rebuilt from the transcript — the latest response's
+    /// token total over the current model's catalog window — so a session
+    /// whose socket is down, or whose machine never loaded the extension
+    /// (a fresh SSH host), still shows its gauge.
+    fn context_usage(&self) -> Option<ContextUsage> {
+        if let Some(context) = self
+            .pi_state
+            .as_ref()
+            .and_then(|state| state.context.clone())
+        {
+            return Some(context);
+        }
+        let slug = self.current_model_slug();
+        let window = self
+            .catalog
+            .iter()
+            .find(|model| model_slug(model) == slug)
+            .or_else(|| self.catalog.iter().find(|model| model.id == slug))
+            .and_then(|model| model.context_window)?;
+        Some(ContextUsage {
+            tokens: self.transcript.context_tokens,
+            context_window: window,
+            percent: None,
+        })
     }
 
     /// Whether the panel is still waiting to learn what a chip should say:
@@ -5960,7 +6159,7 @@ mod tests {
         }
         panel.sync_list();
         assert!(panel.list.is_following_tail());
-        panel.jump_to(5);
+        panel.jump_to(5, false);
         assert_eq!(panel.list.logical_scroll_top().item_ix, 5);
         assert!(!panel.list.is_following_tail());
         panel.follow_tail();
@@ -6540,6 +6739,40 @@ mod tests {
         };
         assert!(!ctx_warns(&fixture));
         assert_eq!(ctx_counts(&fixture), "7.4k/1M");
+    }
+
+    #[test]
+    fn the_gauge_falls_back_to_the_transcript_without_the_extension() {
+        let mut panel = SessionPanel::default();
+        panel.catalog.push(AgentModel {
+            provider: "anthropic".to_string(),
+            id: "sonnet".to_string(),
+            name: "Sonnet".to_string(),
+            context_window: Some(200_000),
+            ..AgentModel::default()
+        });
+        panel.transcript.model = Some("anthropic/sonnet".to_string());
+        panel.transcript.context_tokens = Some(50_000);
+        let usage = panel.context_usage().expect("fallback usage");
+        assert_eq!(ctx_percent(&usage), Some(25.0));
+        assert_eq!(ctx_counts(&usage), "50k/200k");
+        // After a compaction the counts are unknown but the window stays.
+        panel.transcript.context_tokens = None;
+        let usage = panel.context_usage().expect("fallback usage");
+        assert_eq!(ctx_counts(&usage), "–/200k");
+        // An uncatalogued model has no window, so nothing paints.
+        panel.transcript.model = Some("other/unknown".to_string());
+        assert!(panel.context_usage().is_none());
+        // The extension's report outranks the fallback.
+        panel.pi_state = Some(PiState {
+            context: Some(ContextUsage {
+                tokens: Some(1),
+                context_window: 10,
+                percent: Some(10.0),
+            }),
+            ..PiState::default()
+        });
+        assert_eq!(panel.context_usage().map(|c| c.context_window), Some(10));
     }
 
     #[test]

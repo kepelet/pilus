@@ -1917,7 +1917,10 @@ impl PilusView {
                     let released = view.release_sidebar_freeze(cx.reduce_motion());
                     // The reflow fade rides the same loop for the same reason.
                     let reflowing = view.reflow_fade.is_some();
+                    // The transcript glide behind the jump buttons.
+                    let gliding = view.session.tick_scroll();
                     if view.poll(cx)
+                        || gliding
                         || changed
                         || !settled
                         || was_animating

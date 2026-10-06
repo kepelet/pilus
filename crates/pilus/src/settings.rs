@@ -81,6 +81,12 @@ pub struct Settings {
     /// Replace a focused pi pane's terminal with the native conversation
     /// view. On by default.
     pub pi_gui_auto: bool,
+    /// Whether WORKSPACES rows draw their path line. Off by default; the
+    /// sidebar's Show Path row turns it on and persists the choice.
+    pub sidebar_workspace_paths: bool,
+    /// Whether AGENTS rows draw their path line. Off by default, persisted
+    /// like the workspace toggle.
+    pub sidebar_agent_paths: bool,
 }
 
 impl Default for Settings {
@@ -99,6 +105,8 @@ impl Default for Settings {
             opacity: OPACITY,
             blur: BLUR,
             pi_gui_auto: true,
+            sidebar_workspace_paths: false,
+            sidebar_agent_paths: false,
         }
     }
 }
@@ -228,9 +236,20 @@ mod tests {
             opacity: 0.7,
             blur: 0.5,
             pi_gui_auto: true,
+            sidebar_workspace_paths: true,
+            sidebar_agent_paths: true,
         };
         let text = serde_json::to_string(&settings).expect("serialize");
         let back: Settings = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(back, settings);
+    }
+
+    #[test]
+    fn missing_sidebar_paths_default_hidden() {
+        // Files written before the toggles existed hide both path lines.
+        let back: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert!(!back.sidebar_workspace_paths);
+        assert!(!back.sidebar_agent_paths);
     }
 }

@@ -1328,11 +1328,12 @@ struct PilusView {
     agent_sel_at: Instant,
     /// The sidebar layout we superseded the daemon's with, once known.
     sidebar_layout: Option<pilus_protocol::SidebarsConfig>,
-    /// Whether workspace paths are shown in that layout.
+    /// Whether workspace paths are shown in that layout. Persisted in the
+    /// client's settings, not adopted from the daemon: the sidebar is ours.
     sidebar_workspace_paths: bool,
     /// Whether the AGENTS rows draw their path line. The daemon projects no
-    /// client flag for the agents list, so this mirrors `workspace_paths`
-    /// locally; both default to shown, as the daemon's own config does.
+    /// client flag for the agents list, so this is purely local. Both path
+    /// toggles default to hidden and persist through `Settings`.
     sidebar_agent_paths: bool,
     /// Workspace ids pinned to the top of WORKSPACES, per endpoint. The
     /// daemon's own dock tracks these client-side too, so the label and the
@@ -1587,6 +1588,11 @@ impl PilusView {
         let (theme_tx, theme_rx) = std::sync::mpsc::channel();
         let (daemon_tx, daemon_rx) = std::sync::mpsc::channel();
         let settings = shared_settings.borrow().clone();
+        // The path toggles seed the sidebar flags; the daemon's own
+        // `workspace_paths` is deliberately not adopted, since the client
+        // owns its sidebar and these are the user's persisted choices.
+        let sidebar_workspace_paths = settings.sidebar_workspace_paths;
+        let sidebar_agent_paths = settings.sidebar_agent_paths;
         let update_request = UpdateRequest::from_settings(
             &settings.update_channel,
             settings.update_feed_url.clone(),
@@ -1774,8 +1780,8 @@ impl PilusView {
             agent_sel: None,
             agent_sel_at: Instant::now(),
             sidebar_layout: None,
-            sidebar_workspace_paths: false,
-            sidebar_agent_paths: true,
+            sidebar_workspace_paths,
+            sidebar_agent_paths,
             pinned_workspaces: HashSet::new(),
             pinned_agents: HashSet::new(),
             agents_this_workspace: false,
@@ -2067,7 +2073,6 @@ impl PilusView {
             remove_dock(&mut layout.left, "agents");
             remove_dock(&mut layout.right, "agents");
             self.sidebar_revision = sidebars.revision;
-            self.sidebar_workspace_paths = sidebars.workspace_paths;
             self.sidebar_layout = Some(layout);
             self.push_sidebar_layout();
         }
@@ -7121,7 +7126,6 @@ impl PilusView {
                 self.press_anchor = None;
                 self.dragging = false;
                 self.sidebar_layout = None;
-                self.sidebar_workspace_paths = false;
                 self.sidebar_revision = 0;
                 self.bar_widgets = Vec::new();
                 self.tabs = Vec::new();
@@ -8373,16 +8377,24 @@ impl PilusView {
         cx.notify();
     }
 
-    /// Flip whether the WORKSPACES rows draw their path line.
+    /// Flip whether the WORKSPACES rows draw their path line, persisting the
+    /// choice and pushing it to the daemon's own dock.
     fn menu_toggle_workspace_paths(&mut self, cx: &mut Context<Self>) {
         self.sidebar_workspace_paths = !self.sidebar_workspace_paths;
+        self.settings.sidebar_workspace_paths = self.sidebar_workspace_paths;
+        self.settings.save(&self.pilus_root);
+        *self.shared_settings.borrow_mut() = self.settings.clone();
         self.push_sidebar_layout();
         cx.notify();
     }
 
-    /// Flip whether the AGENTS rows draw their path line.
+    /// Flip whether the AGENTS rows draw their path line, persisting the
+    /// choice locally since the daemon has no agents-path flag.
     fn menu_toggle_agent_paths(&mut self, cx: &mut Context<Self>) {
         self.sidebar_agent_paths = !self.sidebar_agent_paths;
+        self.settings.sidebar_agent_paths = self.sidebar_agent_paths;
+        self.settings.save(&self.pilus_root);
+        *self.shared_settings.borrow_mut() = self.settings.clone();
         cx.notify();
     }
 
@@ -9990,9 +10002,10 @@ impl PilusView {
     /// One workspace row: the name on the first line, the working directory on
     /// the second. The active workspace gets the pill.
     ///
-    /// `host` is the machine name for a remote row, shown muted so a flat list
-    /// still says where the workspace lives. `compact` drops the leading icon
-    /// for rows nested under another row, which already carries one.
+    /// `host` is the machine name for a remote row, kept for the tooltip and
+    /// the leading server glyph; the row itself stays unlabelled. `compact`
+    /// drops the leading icon for rows nested under another row, which
+    /// already carries one.
     fn workspace_row(
         &self,
         endpoint: &EndpointId,
@@ -10056,23 +10069,14 @@ impl PilusView {
                 )
             });
         }
-        // The name owns the first line. A badge here would have to take
-        // space away from it, and a label never loses to its own decoration.
+        // The name owns the first line. The machine name stays out of the
+        // row (the tooltip names it), so nothing competes with the label.
         let name = div()
             .flex_1()
             .min_w_0()
             .truncate()
             .text_color(theme.panel_fg);
         head = head.child(name.child(workspace.name.clone()));
-        if let Some(host) = host {
-            head = head.child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(self.section_font()))
-                    .text_color(theme.muted)
-                    .child(host.to_string()),
-            );
-        }
 
         // Second line: the path grows and truncates; the branch rides at the
         // far right, where it competes with the path instead of the name.
@@ -10636,7 +10640,8 @@ impl PilusView {
     }
 
     /// AGENTS: live agent sessions grouped by endpoint; clicking a row focuses
-    /// its pane, activating the owning endpoint first when it is hidden.
+    /// its pane, activating the owning endpoint first when it is hidden. The
+    /// machine name stays out of the rows and is named in the tooltip.
     fn agents_section(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let section = div()
@@ -10686,16 +10691,6 @@ impl PilusView {
             agents
                 .sort_by_key(|agent| !self.pinned_agents.contains(&(id.key(), agent.pane.clone())));
             any = true;
-            children = children.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(px(SIDEBAR_BAND_HEIGHT))
-                    .text_size(px(self.section_font()))
-                    .text_color(theme.muted)
-                    .child(self.endpoint_label(&id)),
-            );
             for agent in agents {
                 children = children.child(self.agent_row(&id, agent, cx));
             }
@@ -10745,6 +10740,9 @@ impl PilusView {
         ];
         if !agent.workspace_name.is_empty() {
             lines.push((format!("Workspace: {}", agent.workspace_name), dim));
+        }
+        if matches!(endpoint, EndpointId::Machine(_)) {
+            lines.push((format!("Host: {}", self.endpoint_label(endpoint)), dim));
         }
         lines.push((format!("Directory: {cwd}"), dim));
         if let Some(branch) = branch.clone() {

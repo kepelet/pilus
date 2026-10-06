@@ -1157,6 +1157,25 @@ struct MenuPrompt {
 /// four seconds: a wrong panel covers more than a wrong row highlight,
 /// and a confirming snapshot lands well inside this window.
 const PI_OPTIMISTIC_WINDOW: Duration = Duration::from_secs(2);
+
+/// How long a cached tab strip may stand in for a workspace click before the
+/// daemon's list is taken as it is. Spans a remote click's SSH round trips.
+const TABS_PICK_WINDOW: Duration = Duration::from_secs(4);
+
+/// A cached tab strip shown for a workspace click the daemon has not reported.
+struct TabsPick {
+    /// Tab ids the daemon last listed, which mark a reply as still stale.
+    from: Vec<String>,
+    /// When the strip was swapped in.
+    at: Instant,
+}
+
+impl TabsPick {
+    /// Whether `tabs` is still the list the click moved away from.
+    fn is_stale(&self, tabs: &[Tab]) -> bool {
+        self.at.elapsed() < TABS_PICK_WINDOW && tabs.iter().map(|tab| &tab.id).eq(self.from.iter())
+    }
+}
 /// Panels kept alive after their pi pane leaves the screen, newest first.
 /// Each holds a reader and a socket, so the list stays short.
 const PI_PARKED_MAX: usize = 3;
@@ -1340,6 +1359,11 @@ struct PilusView {
     tab_sel: Option<u16>,
     /// When the optimistic tab pick was made, so stale picks age out.
     tab_sel_at: Instant,
+    /// Tabs last seen for each workspace, so a workspace click can show its
+    /// strip before the daemon reports it.
+    tabs_cache: HashMap<(EndpointId, String), Vec<Tab>>,
+    /// A cached strip standing in for the daemon's until `tab.list` moves on.
+    tabs_pick: Option<TabsPick>,
     /// Keeps the tab list scrolled when tabs overflow the strip.
     tab_scroll: ScrollHandle,
     /// The rows the sidebar's shared hover pill can land on.
@@ -1814,6 +1838,8 @@ impl PilusView {
             nav_sel: None,
             nav_sel_at: Instant::now(),
             tab_sel: None,
+            tabs_cache: HashMap::new(),
+            tabs_pick: None,
             tab_sel_at: Instant::now(),
             tab_scroll: ScrollHandle::new(),
             sidebar_hover: style::HoverSlot::default(),
@@ -1957,12 +1983,7 @@ impl PilusView {
                     let released = view.release_sidebar_freeze();
                     // The transcript glide behind the jump buttons.
                     let gliding = view.session.tick_scroll();
-                    if view.poll(cx)
-                        || gliding
-                        || changed
-                        || !settled
-                        || was_animating
-                        || released
+                    if view.poll(cx) || gliding || changed || !settled || was_animating || released
                     {
                         cx.notify();
                     }
@@ -2060,17 +2081,20 @@ impl PilusView {
         self.drive_pending_switch();
         self.expire_pending_switch();
         let mut tabs_changed = false;
-        if let Some(feed) = self.agent_feed.as_ref() {
-            while let Some(update) = feed.try_recv() {
-                self.bar_widgets = update.bar;
-                self.tabs = update.tabs;
-                self.agents = update.agents;
-                self.agents_loaded = true;
-                self.automations = update.automations;
-                self.tasks = update.tasks;
-                tabs_changed = true;
-                changed = true;
-            }
+        let updates: Vec<_> = self
+            .agent_feed
+            .as_ref()
+            .map(|feed| std::iter::from_fn(|| feed.try_recv()).collect())
+            .unwrap_or_default();
+        for update in updates {
+            self.bar_widgets = update.bar;
+            self.adopt_tabs(update.tabs);
+            self.agents = update.agents;
+            self.agents_loaded = true;
+            self.automations = update.automations;
+            self.tasks = update.tasks;
+            tabs_changed = true;
+            changed = true;
         }
         if tabs_changed {
             self.reconcile_nav();
@@ -3030,6 +3054,7 @@ impl PilusView {
         self.dragging = false;
         self.nav_sel = None;
         self.tab_sel = None;
+        self.tabs_pick = None;
         self.endpoint_sel = None;
         self.close_picker();
         // The swapped-in tabs carry their own active kind; follow it so the
@@ -3974,9 +3999,65 @@ impl PilusView {
         if self.pi_optimistic.is_some() {
             self.pi_released = None;
         }
+        self.show_cached_tabs(workspace_id);
         self.send_active(ClientMessage::ShellWorkspaceFocus {
             workspace_id: workspace_id.to_string(),
         });
+        // The focus rides the surface connection, which the feed never sees:
+        // ask it to read the new workspace's tabs back now, not on its tick.
+        if let Some(feed) = self.agent_feed.as_ref() {
+            feed.refresh_soon();
+        }
+    }
+
+    /// Take the daemon's tab list, remembering it for its workspace.
+    ///
+    /// While a cached strip stands in for a workspace click, a list that is
+    /// still the old workspace's is the daemon catching up, not news: showing
+    /// it would flick the strip back before it moves forward again.
+    fn adopt_tabs(&mut self, tabs: Vec<Tab>) {
+        if self
+            .tabs_pick
+            .as_ref()
+            .is_some_and(|pick| pick.is_stale(&tabs))
+        {
+            return;
+        }
+        self.tabs_pick = None;
+        if let Some(workspace) = self.active_workspace_id() {
+            self.tabs_cache
+                .insert((self.active.clone(), workspace), tabs.clone());
+        }
+        self.tabs = tabs;
+    }
+
+    /// Swap in the strip last seen for `workspace_id`, if any, so the click
+    /// reads at once instead of a feed round trip later (several over SSH).
+    fn show_cached_tabs(&mut self, workspace_id: &str) {
+        let Some(cached) = self
+            .tabs_cache
+            .get(&(self.active.clone(), workspace_id.to_string()))
+            .filter(|cached| !cached.is_empty())
+            .cloned()
+        else {
+            return;
+        };
+        let from: Vec<String> = self.tabs.iter().map(|tab| tab.id.clone()).collect();
+        if cached.iter().map(|tab| &tab.id).eq(from.iter()) {
+            return;
+        }
+        // A pick that has not landed yet keeps its original baseline: the
+        // daemon is still showing that list, not the one we swapped in.
+        let from = match self.tabs_pick.take() {
+            Some(pick) if pick.at.elapsed() < TABS_PICK_WINDOW => pick.from,
+            _ => from,
+        };
+        self.tabs_pick = Some(TabsPick {
+            from,
+            at: Instant::now(),
+        });
+        self.tab_sel = None;
+        self.tabs = cached;
     }
 
     /// Leave the full-card pages (Home and Settings): sidebar actions address
@@ -4409,10 +4490,13 @@ impl PilusView {
                 let _ = pi_extension::install_remote(&target);
             });
         }
+        // The strip may be the next workspace's while the surface still shows
+        // this one; pairing them would record or erase the wrong memory.
+        let strip_agrees = self.tabs_pick.is_none();
         remember_focus(
             &self.agents,
             self.surface.workspaces(),
-            &self.tabs,
+            if strip_agrees { &self.tabs } else { &[] },
             &self.active,
             &mut self.workspace_focus,
             &mut self.tab_focus,
@@ -4428,7 +4512,11 @@ impl PilusView {
             .iter()
             .find(|workspace| workspace.active)
             .map(|workspace| workspace.id.clone());
-        let visible_tab = self.tabs.iter().find(|tab| tab.active).map(|tab| tab.index);
+        let visible_tab = self
+            .tabs
+            .iter()
+            .find(|tab| tab.active && strip_agrees)
+            .map(|tab| tab.index);
         let visible = visible_workspace.as_deref().zip(visible_tab);
         let mut desired = Self::pi_view_for(
             &self.agents,
@@ -7173,6 +7261,8 @@ impl PilusView {
                 self.sidebar_revision = 0;
                 self.bar_widgets = Vec::new();
                 self.tabs = Vec::new();
+                self.tabs_cache.clear();
+                self.tabs_pick = None;
                 self.tab_sel = None;
                 self.endpoint_sel = None;
                 self.agent_sel = None;
@@ -13073,6 +13163,28 @@ fn launch_home_agent(
 
 #[cfg(test)]
 mod tests {
+    fn strip(ids: &[&str]) -> Vec<Tab> {
+        ids.iter()
+            .enumerate()
+            .map(|(position, id)| Tab {
+                index: position as u16 + 1,
+                id: (*id).to_string(),
+                ..Tab::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tabs_pick_holds_off_only_the_list_it_left() {
+        let pick = TabsPick {
+            from: vec!["a".into(), "b".into()],
+            at: Instant::now(),
+        };
+        assert!(pick.is_stale(&strip(&["a", "b"])));
+        assert!(!pick.is_stale(&strip(&["c", "d"])));
+        assert!(!pick.is_stale(&strip(&["a"])));
+    }
+
     use super::*;
 
     /// A blank cell carrying only attribute bits.

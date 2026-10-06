@@ -10100,7 +10100,7 @@ impl PilusView {
                     .child(
                         div()
                             .ml(px(2.0))
-                            .mt(px(-6.0))
+                            .mt(px(-2.5))
                             .w(px(8.0))
                             .h(px(13.0))
                             .border_l_1()

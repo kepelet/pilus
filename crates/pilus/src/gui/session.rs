@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     Anchor, AnyElement, App, Context, Div, ElementId, Entity, FollowMode, Keystroke, ListAlignment,
-    ListOffset, ListState, ScrollHandle, ScrollStrategy, Stateful, UniformListScrollHandle, anchored,
-    canvas, deferred, div, list, point, prelude::*, px, relative, uniform_list,
+    ListOffset, ListState, ScrollHandle, ScrollStrategy, Stateful, UniformListScrollHandle,
+    anchored, canvas, deferred, div, list, point, prelude::*, px, relative, uniform_list,
 };
 use pilus_client::{AgentModel, ControlClient, SshTarget};
 use pilus_session::{
@@ -3507,7 +3507,11 @@ impl SessionPanel {
             );
         }
         let mut row = div().flex().items_center().gap_2();
-        row = if compact { row.flex_row() } else { row.flex_col() };
+        row = if compact {
+            row.flex_row()
+        } else {
+            row.flex_col()
+        };
         row = row.child(
             circle(
                 "session-prompts-button",

@@ -4321,6 +4321,7 @@ impl PilusView {
         cx: &mut Context<Self>,
         grid: Div,
         layout: &CardLayout,
+        terminal_fill: gpui::Rgba,
     ) -> AnyElement {
         let (pad_x, pad_y) = (layout.pad_x, layout.pad_y);
         if self.home.is_open() {
@@ -4340,7 +4341,7 @@ impl PilusView {
                 .min_h(px(0.0))
                 .overflow_hidden()
                 .child(self.tasks_page(cx));
-            return self.page_card("pilus-page-tasks", page, grid, layout, cx);
+            return self.page_card("pilus-page-tasks", page, grid, layout, terminal_fill, cx);
         }
         if self.mission.is_open() {
             let page = div()
@@ -4348,7 +4349,7 @@ impl PilusView {
                 .min_h(px(0.0))
                 .overflow_hidden()
                 .child(self.mission_page(cx));
-            return self.page_card("pilus-page-mission", page, grid, layout, cx);
+            return self.page_card("pilus-page-mission", page, grid, layout, terminal_fill, cx);
         }
         if self.settings_open {
             return style::enter("pilus-page-settings", self.settings_page(cx)).into_any_element();
@@ -4387,6 +4388,7 @@ impl PilusView {
         page: Div,
         grid: Div,
         layout: &CardLayout,
+        terminal_fill: gpui::Rgba,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(split) = self.page_split() else {
@@ -4401,6 +4403,9 @@ impl PilusView {
             .flex_col()
             .flex_shrink_0()
             .overflow_hidden()
+            // The card is clear beside a page, so each half carries its own
+            // coat: the page the chrome's, the terminal the grid's.
+            .bg(self.chrome_fill())
             .border_color(terminal_inset_border())
             .on_mouse_down(
                 MouseButton::Left,
@@ -4422,6 +4427,7 @@ impl PilusView {
             .min_w(px(0.0))
             .min_h(px(0.0))
             .overflow_hidden()
+            .bg(terminal_fill)
             .pl(px(layout.pad_x))
             .pt(px(layout.pad_y))
             .child(grid);
@@ -11417,12 +11423,21 @@ impl Render for PilusView {
         let page_owns_card = self.home.is_open()
             || self.settings_open
             || (self.session.is_open() && self.pi_split().is_none());
-        let card_bg = if page_owns_card {
-            self.chrome_fill()
-        } else if sealed && !framed {
+        let terminal_fill = if sealed && !framed {
             terminal_bg.opacity(0.0)
         } else {
             terminal_bg.opacity(glass)
+        };
+        // Tasks and Mission Control own the card only while unsplit; split,
+        // `page_card` coats each half itself.
+        let page_alone = (self.tasks_panel.is_open() || self.mission.is_open())
+            && self.page_split().is_none();
+        let card_bg = if page_owns_card || page_alone {
+            self.chrome_fill()
+        } else if self.page_split().is_some() {
+            terminal_bg.opacity(0.0)
+        } else {
+            terminal_fill
         };
         // Beside a split pi panel, the pane under it paints blank.
         let masked = self
@@ -11661,7 +11676,7 @@ impl Render for PilusView {
                         .border_color(terminal_inset_border())
                         .rounded_md();
                 }
-                card.child(self.card_content(cx, grid, &layout))
+                card.child(self.card_content(cx, grid, &layout, terminal_fill))
             }))
             // Chrome layers live at the root so they paint above the content
             // and the sidebar: the menu overlay must never slide beneath it.

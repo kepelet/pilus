@@ -32,6 +32,9 @@ const ENTER: Duration = Duration::from_millis(140);
 /// How long a background fill takes to ease into a new hover or selection
 /// state. Short enough that a pointer sweeping down a list never trails.
 const FILL_EASE: Duration = Duration::from_millis(120);
+/// How long a meter's fill takes to slide to a new reading: slow enough to
+/// see which way a value moved.
+const METER_EASE: Duration = Duration::from_millis(420);
 /// How long a selection pill takes to glide to its new target. A touch
 /// longer than a fill fade: the spring's settle needs room to read.
 const GLIDE: Duration = Duration::from_millis(340);
@@ -526,6 +529,203 @@ pub(super) fn context_gauge(
         )
         .size_full(),
     )
+}
+
+/// A horizontal fill bar: context fill, a share of spend.
+///
+/// The fill eases from its last width to `fraction` whenever the value
+/// changes, so a refreshed reading slides rather than snaps; a meter drawn
+/// for the first time appears settled. `None` paints the empty track for a
+/// value not known yet. `color` is the caller's role (`accent`, or `alert`
+/// past a warning threshold); `height` comes from [`scaled`].
+pub(super) fn meter(
+    id: impl Into<ElementId>,
+    fraction: Option<f32>,
+    color: Rgba,
+    theme: Theme,
+    height: f32,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .relative()
+        .w_full()
+        .h(px(height))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(Hsla::from(theme.muted).opacity(0.18))
+        .child(Meter {
+            fraction: fraction.unwrap_or(0.0).clamp(0.0, 1.0),
+            color,
+        })
+}
+
+/// The eased fill [`meter`] paints over its track.
+struct Meter {
+    fraction: f32,
+    color: Rgba,
+}
+
+/// A meter's transition, kept across frames under the element's id.
+struct MeterState {
+    from: f32,
+    to: f32,
+    started: Instant,
+}
+
+impl MeterState {
+    fn at(&self, now: Instant) -> f32 {
+        let step = now.duration_since(self.started).as_secs_f32() / METER_EASE.as_secs_f32();
+        self.from + (self.to - self.from) * ease_out_cubic(step.clamp(0.0, 1.0))
+    }
+}
+
+impl IntoElement for Meter {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for Meter {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some("pilus-meter".into())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(overlay_style(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let target = self.fraction;
+        let now = Instant::now();
+        let reduce_motion = cx.reduce_motion();
+        let fraction = match id {
+            Some(id) => window.with_element_state(id, |state: Option<MeterState>, window| {
+                let mut state = state.unwrap_or(MeterState {
+                    from: target,
+                    to: target,
+                    started: now,
+                });
+                if (state.to - target).abs() > f32::EPSILON {
+                    state.from = state.at(now);
+                    state.to = target;
+                    state.started = now;
+                }
+                let fraction = if reduce_motion { target } else { state.at(now) };
+                if (fraction - target).abs() > f32::EPSILON {
+                    window.request_animation_frame();
+                }
+                (fraction, state)
+            }),
+            None => target,
+        };
+        if fraction <= 0.0 {
+            return;
+        }
+        // Any positive reading keeps a visible sliver, like the gauge's
+        // minimum arc: a hairline would read as empty.
+        let width = (bounds.size.width.as_f32() * fraction).max(bounds.size.height.as_f32());
+        let fill = Bounds::new(
+            bounds.origin,
+            gpui::size(
+                px(width.min(bounds.size.width.as_f32())),
+                bounds.size.height,
+            ),
+        );
+        window.paint_quad(
+            gpui::fill(fill, self.color).corner_radii(Corners::all(px(bounds
+                .size
+                .height
+                .as_f32()
+                / 2.0))),
+        );
+    }
+}
+
+/// The row [`stat_tile`]s sit in. Tiles are square and flush: the strip owns
+/// the top, bottom, and left edges and each tile its right one, so every
+/// seam is a single hairline.
+pub(super) fn stat_strip(theme: Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .border_t_1()
+        .border_b_1()
+        .border_l_1()
+        .border_color(theme.border)
+}
+
+/// One headline figure on a dashboard: a section label, the value in its
+/// role color, and a muted line of detail beneath. Tiles sit flush in a
+/// [`stat_strip`] and share it evenly; they take no click.
+pub(super) fn stat_tile(
+    theme: Theme,
+    fonts: Fonts,
+    label: &'static str,
+    value: impl Into<SharedString>,
+    value_color: Rgba,
+    detail: impl Into<SharedString>,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .flex_1()
+        .min_w(px(0.0))
+        .px_3()
+        .py_2()
+        .bg(theme.panel_dim)
+        .border_r_1()
+        .border_color(theme.border)
+        .child(section_label(theme, label, fonts.label))
+        .child(
+            div()
+                .text_size(px(fonts.headline))
+                .font_weight(FontWeight::BOLD)
+                .text_color(value_color)
+                .child(value.into()),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_size(px(fonts.secondary))
+                .text_color(theme.muted)
+                .child(detail.into()),
+        )
 }
 
 /// A stroked circular arc: `sweep` radians clockwise from `start` (0 is the

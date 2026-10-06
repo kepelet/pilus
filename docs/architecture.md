@@ -335,6 +335,20 @@ because one tab open emits several structural events. `--probe-feed` drives the
 same feed headlessly. Clicking an agent row focuses its pane; clicking a
 workspace row sends `ShellWorkspaceFocus`.
 
+**Mission Control.** The Mission Control and Automations nav rows open a
+native page (`gui/mission.rs`) in place of the daemon's `mission` tab. It
+reads the daemon's own dashboard model with `mission.snapshot` every two
+seconds while open (faster while a usage scan runs), and asks for a
+`mission.refresh` scan when it opens, when the scope changes, and on
+Refresh. The snapshot omits terminal text, so the line a blocked agent is
+waiting on comes from `agent.read`. Row actions are UHP calls on a
+background thread: `agent.prompt` (answer), `agent.keys` (approve,
+interrupt), `agent.fork`, `pane.close`, and `agent.resume`, which is matched
+back to `agent.sessions` by agent, workspace folder, and position because
+the snapshot carries no session ids. Automations open a detail pane from
+`automation.get`/`history`/`preview` with run and pause controls. Dismissing
+a resumable session has no daemon API, so it is hidden on this client only.
+
 **Right-click menus.** WORKSPACES and AGENTS rows carry the daemon's native
 context menus, drawn by a floating GPUI panel mirroring the daemon's own menu
 structure: close, rename, pin, path visibility, and copy path/branch for
@@ -344,9 +358,10 @@ exists. Most items ride the control API — `workspace.close`/`rename`/`pin`,
 `pane.close`, `agent.name`, `worktree.create` (targeting the right-clicked
 workspace's repo via its index) — and run on a background thread reported
 through a menu-status channel, so a remote round trip never blocks the window.
-Boards (`Open Git Tab`, `Open Task Board`, `Open Mission Control`) first focus
-the workspace, then send the daemon's prefix chord (`Ctrl+Space` + `g`/`o`/`m`)
-like the Mission and Orchestration nav rows. The presentational rows are
+Boards first focus the workspace. `Open Git Tab` then sends the daemon's
+prefix chord (`Ctrl+Space` + `g`); `Open Task Board` and `Open Mission
+Control` open the native Tasks and Mission Control pages instead, the latter
+pinned to that workspace. The presentational rows are
 client state, exactly as they are in the daemon's own TUI: pins float the row
 to the top (the workspace pin is additionally pushed through `workspace.pin`,
 so the daemon's next projection reorders the catalog), path visibility drives

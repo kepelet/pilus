@@ -17,6 +17,7 @@ mod discovery;
 mod error;
 mod git;
 mod machines;
+mod mission;
 mod surface;
 mod tasks;
 mod transport;
@@ -47,6 +48,10 @@ pub use git::{
     init_repository, worktree_is_dirty,
 };
 pub use machines::{MachineInfo, connect_machine, install_agent, list_machines, refresh_machines};
+pub use mission::{
+    AutomationDetail, AutomationHealth, AutomationRow, AutomationRun, MissionRow, MissionScope,
+    MissionSnapshot, MissionUsage,
+};
 pub use pilus_protocol as protocol;
 pub use surface::{Surface, SurfaceChange};
 pub use tasks::{NewTask, Task, TaskStatus, split_list};

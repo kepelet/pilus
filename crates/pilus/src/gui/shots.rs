@@ -565,6 +565,33 @@ pub fn run() -> Result<()> {
         });
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "tasks-scope-machine")?;
+        // Mission Control on a canned dashboard: the roster with a blocked
+        // agent selected, its reply field, and an automation's detail.
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                let (snapshot, hints) = sample_mission();
+                view.mission_show(snapshot, hints, cx);
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "mission")?;
+        cx.update(|app| view.update(app, |view, cx| view.mission_show_answer(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "mission-answer")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.mission_show_automation(sample_automation(), cx)
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "mission-automation")?;
+        // The page beside the terminal, each way.
+        cx.update(|app| view.update(app, |view, cx| view.page_split_show("right", cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "mission-split-right")?;
+        cx.update(|app| view.update(app, |view, cx| view.page_split_show("down", cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "mission-split-down")?;
     }
     Ok(())
 }
@@ -1197,6 +1224,144 @@ fn sample_tasks() -> pilus_client::TaskSummary {
         open: 4,
         total: items.len() as u32,
         items,
+    }
+}
+
+/// A fleet with one agent per state, a resumable session, and two
+/// automations, for the Mission Control captures.
+fn sample_mission() -> (
+    pilus_client::MissionSnapshot,
+    std::collections::HashMap<String, String>,
+) {
+    use pilus_client::{
+        AutomationHealth, AutomationRow, MissionRow, MissionSnapshot, MissionUsage,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let usage = |model: &str, tokens_in: u64, tokens_out: u64, context: f32, cost: f64| {
+        Some(MissionUsage {
+            model: model.to_string(),
+            tokens_in,
+            tokens_out,
+            cache_tokens: tokens_in * 6,
+            context: Some(context),
+            cost_usd: Some(cost),
+        })
+    };
+    let live = |pane: &str, agent: &str, state: &str, tab: u16, location: &str| MissionRow {
+        pane: Some(pane.to_string()),
+        agent: agent.to_string(),
+        state: state.to_string(),
+        workspace_id: "ws1".to_string(),
+        workspace_name: "pilus".to_string(),
+        tab: Some(tab),
+        location: location.to_string(),
+        usage: None,
+    };
+    let rows = vec![
+        MissionRow {
+            usage: usage("claude-opus-4-1", 9_800_000, 1_400_000, 0.91, 214.62),
+            ..live("4", "claude", "blocked", 2, "core p1/2 · t3")
+        },
+        MissionRow {
+            usage: usage("gpt-5-codex", 2_100_000, 380_000, 0.42, 18.4),
+            ..live("6", "codex", "working", 3, "notes")
+        },
+        MissionRow {
+            usage: usage("claude-sonnet-4-5", 640_000, 92_000, 0.28, 3.1),
+            ..live("7", "claude", "done", 3, "notes p2/2")
+        },
+        live("9", "pi", "idle", 1, "t1"),
+        MissionRow {
+            pane: None,
+            agent: "copilot".to_string(),
+            state: "idle".to_string(),
+            workspace_id: "ws1".to_string(),
+            workspace_name: "pilus".to_string(),
+            tab: None,
+            location: "—".to_string(),
+            usage: None,
+        },
+    ];
+    let snapshot = MissionSnapshot {
+        refreshing: false,
+        tokens: 14_412_000,
+        cost_usd: 236.12,
+        burn_usd_per_hour: Some(4.2),
+        automation: AutomationHealth {
+            definitions: 2,
+            enabled: 1,
+            scheduled: 1,
+            running: 0,
+            review: 0,
+            failed: 1,
+            next_run_at: Some(now + 3 * 3600 + 120),
+        },
+        automations: vec![
+            AutomationRow {
+                id: "a1".to_string(),
+                name: "Morning review".to_string(),
+                state: "scheduled".to_string(),
+                next_run_at: Some(now + 3 * 3600 + 120),
+                latest_error: None,
+                agent_id: "codex".to_string(),
+                enabled: true,
+            },
+            AutomationRow {
+                id: "a2".to_string(),
+                name: "Nightly dependency sweep".to_string(),
+                state: "failed".to_string(),
+                next_run_at: None,
+                latest_error: Some("gate failed".to_string()),
+                agent_id: "claude".to_string(),
+                enabled: true,
+            },
+        ],
+        rows,
+    };
+    let hints = std::collections::HashMap::from([(
+        "4".to_string(),
+        "Allow edit to crates/pilus/src/gui/mod.rs? (y/n)".to_string(),
+    )]);
+    (snapshot, hints)
+}
+
+/// One automation's full detail, for the Mission Control capture.
+fn sample_automation() -> pilus_client::AutomationDetail {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    pilus_client::AutomationDetail {
+        id: "a1".to_string(),
+        name: "Morning review".to_string(),
+        enabled: true,
+        schedule: "Weekly on Mon, Tue, Wed, Thu, Fri at 08:00 (Asia/Makassar)".to_string(),
+        policy: "Run latest missed · Skip overlapping".to_string(),
+        target: "New worker".to_string(),
+        title: "Review changes".to_string(),
+        prompt: "Review the workspace and report risks.".to_string(),
+        agent_id: "codex".to_string(),
+        mode: "workspace".to_string(),
+        access: "read_only".to_string(),
+        paths: vec!["crates/**".to_string()],
+        gate: Some("cargo test".to_string()),
+        occurrences: (0..5).map(|day| now + 3 * 3600 + day * 86_400).collect(),
+        runs: vec![
+            pilus_client::AutomationRun {
+                id: "r2".to_string(),
+                status: "succeeded".to_string(),
+                scheduled_at: now.saturating_sub(21 * 3600),
+                ..pilus_client::AutomationRun::default()
+            },
+            pilus_client::AutomationRun {
+                id: "r1".to_string(),
+                status: "failed".to_string(),
+                scheduled_at: now.saturating_sub(45 * 3600),
+                error: Some("gate failed: 2 tests".to_string()),
+                ..pilus_client::AutomationRun::default()
+            },
+        ],
     }
 }
 

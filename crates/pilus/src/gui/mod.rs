@@ -152,7 +152,7 @@ const SECTION_TURN_WINDOW: Duration = Duration::from_millis(400);
 /// Space above a section header, on top of the list's row gap.
 const SIDEBAR_SECTION_GAP: f32 = 12.0;
 /// Breathing room between the terminal grid and the card's inset border.
-/// Opposite gaps stay equal because the whole-cell grid is centered.
+/// The card snaps to whole cells, so all four gaps stay exactly this.
 const TERMINAL_PAD: f32 = 6.0;
 /// How long the sidebar takes to collapse or expand: long enough for its
 /// spring to overshoot and settle, short enough to stay out of the way.
@@ -11070,18 +11070,23 @@ impl PilusView {
         let breathing = if framed { TERMINAL_PAD } else { 0.0 };
         let cols = ((inner_w - 2.0 * breathing) / cell_w).clamp(20.0, 500.0) as u16;
         let rows = ((inner_h - 2.0 * breathing) / cell_h).clamp(5.0, 300.0) as u16;
-        // The framed card centers the whole-cell grid so opposite gaps match
-        // and every gap is at least `TERMINAL_PAD`; full-bleed pins the grid
-        // to the top-left instead, so the terminal truly reaches the edges.
-        let pad_x = if framed {
-            ((inner_w - f32::from(cols) * cell_w) / 2.0).max(0.0)
+        // The framed card snaps to the cell grid: the sub-cell remainder
+        // leaves the card (widening its right and bottom gaps to the window)
+        // instead of padding the grid, so all four insets stay exactly
+        // `TERMINAL_PAD`. Full-bleed pins the grid to the top-left instead,
+        // so the terminal truly reaches the edges.
+        let (pad_x, pad_y) = if framed {
+            (TERMINAL_PAD, TERMINAL_PAD)
         } else {
-            0.0
+            (0.0, 0.0)
         };
-        let pad_y = if framed {
-            ((inner_h - f32::from(rows) * cell_h) / 2.0).max(0.0)
+        let (shrink_x, shrink_y) = if framed {
+            (
+                (inner_w - 2.0 * breathing - f32::from(cols) * cell_w).max(0.0),
+                (inner_h - 2.0 * breathing - f32::from(rows) * cell_h).max(0.0),
+            )
         } else {
-            0.0
+            (0.0, 0.0)
         };
         // Full-bleed pools the leftover fraction at the far edges; the grid
         // extends its edge colors over it below.
@@ -11098,8 +11103,8 @@ impl PilusView {
         CardLayout {
             card_x,
             card_top: gap_top,
-            card_right: gap_right,
-            card_bottom: gap_bottom,
+            card_right: gap_right + shrink_x,
+            card_bottom: gap_bottom + shrink_y,
             pad_x,
             pad_y,
             origin_x: card_x + border + pad_x,

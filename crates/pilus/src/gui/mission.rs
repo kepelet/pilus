@@ -20,8 +20,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, Entity, FontWeight, Hsla, KeyDownEvent, Rgba,
-    SharedString, div, prelude::*, px,
+    Anchor, AnyElement, ClickEvent, Context, Div, Entity, FontWeight, Hsla, KeyDownEvent, Rgba,
+    SharedString, anchored, deferred, div, point, prelude::*, px,
 };
 use pilus_client::{
     AutomationDetail, AutomationHealth, AutomationRow, MissionRow, MissionScope, MissionSnapshot,
@@ -30,7 +30,10 @@ use pilus_client::{
 use super::style::{self, ButtonKind, FillExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
-use super::{EndpointId, PilusView, agent_icon, icon, status_color, terminal_inset_border};
+use super::{
+    EndpointId, PICKER_CHIP_H, PICKER_MENU_MAX_H, PilusView, agent_icon, icon, picker_face,
+    picker_menu, status_color, terminal_inset_border,
+};
 
 /// How often an open page re-reads the snapshot.
 const REFRESH: Duration = Duration::from_secs(2);
@@ -45,6 +48,12 @@ const HINT_LINES: u16 = 8;
 
 const DETAIL_WIDTH: f32 = 340.0;
 const ROW_HEIGHT: f32 = 34.0;
+/// Four icon buttons and the gaps between them, plus the cell padding.
+const ACTIONS_WIDTH: f32 = 128.0;
+/// The table's narrowest layout; a narrower pane scrolls it sideways.
+const TABLE_MIN_WIDTH: f32 = 776.0;
+/// The location column's floor, so the flexible column never collapses.
+const LOCATION_MIN_WIDTH: f32 = 120.0;
 
 /// The headline state the header shows: what needs you first.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +140,8 @@ pub(super) struct MissionPanel {
     /// Whether the side pane shows the selection (the daemon's `o`).
     detail_open: bool,
     answering: bool,
+    /// Whether the machine picker's list is open.
+    machine_menu: bool,
     confirm_close: Option<String>,
     /// What each blocked live pane is waiting on, by pane.
     hints: HashMap<String, String>,
@@ -158,6 +169,7 @@ impl Default for MissionPanel {
             selection: None,
             detail_open: true,
             answering: false,
+            machine_menu: false,
             confirm_close: None,
             hints: HashMap::new(),
             dismissed: HashSet::new(),
@@ -942,8 +954,6 @@ impl PilusView {
             .flex_col()
             .flex_1()
             .min_w(px(0.0))
-            .gap_4()
-            .p_4()
             .overflow_y_scroll();
         if loaded {
             main = main
@@ -968,6 +978,26 @@ impl PilusView {
         } else {
             self.mission.status.clone()
         };
+        let signal = Signal::of(&refs);
+        let status = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_shrink_0()
+            .gap_2()
+            .pr_3()
+            .mr_3()
+            .border_r_1()
+            .border_color(terminal_inset_border())
+            .text_color(signal.color(theme))
+            .child(
+                div()
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .rounded_full()
+                    .bg(signal.color(theme)),
+            )
+            .child(signal.label());
         let footer = div()
             .px_4()
             .h(px(style::scaled(&self.shared_settings, 28.0)))
@@ -978,8 +1008,8 @@ impl PilusView {
             .border_color(terminal_inset_border())
             .text_size(px(fonts.secondary))
             .text_color(theme.muted)
-            .truncate()
-            .child(footer_text);
+            .child(status)
+            .child(div().flex_1().min_w(px(0.0)).truncate().child(footer_text));
 
         div()
             .relative()
@@ -987,15 +1017,14 @@ impl PilusView {
             .flex_col()
             .size_full()
             .min_h(px(0.0))
-            .child(self.mission_header(&refs, cx))
+            .child(self.mission_header(cx))
             .child(body)
             .child(footer)
     }
 
-    fn mission_header(&self, rows: &[&MissionRow], cx: &mut Context<Self>) -> Div {
+    fn mission_header(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let signal = Signal::of(rows);
         let machines = self.mission_machines(cx);
         let refreshing = self
             .mission
@@ -1021,21 +1050,6 @@ impl PilusView {
             fonts.secondary,
         )
         .on_click(cx.listener(|this, _, _, cx| this.mission_rescan(cx)));
-        let badge = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .text_size(px(fonts.secondary))
-            .text_color(signal.color(theme))
-            .child(
-                div()
-                    .w(px(8.0))
-                    .h(px(8.0))
-                    .rounded_full()
-                    .bg(signal.color(theme)),
-            )
-            .child(signal.label());
         div()
             .flex()
             .flex_row()
@@ -1047,15 +1061,14 @@ impl PilusView {
             .border_b_1()
             .border_color(terminal_inset_border())
             .child(style::title(theme, "Mission Control", fonts.title))
-            .child(badge)
             .child(div().flex_1())
             .children(machines)
             .child(refresh)
     }
 
-    /// The machine picker: Local and every enabled saved machine, one click
-    /// to switch. Absent when Local is the only machine.
-    fn mission_machines(&self, cx: &mut Context<Self>) -> Option<Div> {
+    /// The machine picker, the same face and list as the Tasks page's: Local
+    /// and every enabled saved machine. Absent when Local is the only one.
+    fn mission_machines(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let mut endpoints = vec![EndpointId::Local];
@@ -1068,28 +1081,171 @@ impl PilusView {
         if endpoints.len() < 2 {
             return None;
         }
-        let mut picker = div().flex().flex_row().items_center().gap_1();
-        for endpoint in endpoints {
-            let kind = if self.endpoint_selected(&endpoint) {
-                ButtonKind::Secondary
-            } else {
-                ButtonKind::Ghost
-            };
-            let target = endpoint.clone();
-            picker = picker.child(
-                style::small_button(
-                    format!("pilus-mission-machine-{}", endpoint.key()),
-                    self.endpoint_label(&endpoint),
-                    kind,
-                    theme,
-                    fonts.secondary,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.activate_endpoint(target.clone(), None, None, cx);
-                })),
+        let open = self.mission.machine_menu;
+        let mut face = picker_face(
+            "pilus-mission-machine-picker",
+            icon(
+                include_bytes!("../../assets/icons/server.svg"),
+                14.0,
+                theme.muted,
+            )
+            .into_any_element(),
+            self.endpoint_label(&self.active),
+            150.0,
+            open,
+            theme.panel,
+            theme,
+            fonts.secondary,
+            cx.listener(|this, _, _, cx| {
+                this.mission.machine_menu = !this.mission.machine_menu;
+                cx.notify();
+            }),
+        );
+        if open {
+            let mut list = picker_menu("pilus-mission-machine-menu", theme)
+                .max_h(px(PICKER_MENU_MAX_H))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.mission.machine_menu = false;
+                    cx.notify();
+                }));
+            for endpoint in endpoints {
+                let chosen = self.endpoint_selected(&endpoint);
+                let target = endpoint.clone();
+                list = list.child(
+                    div()
+                        .id(format!("pilus-mission-machine-{}", endpoint.key()))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .h(px(30.0))
+                        .px_3()
+                        .rounded_md()
+                        .text_size(px(fonts.body))
+                        .text_color(theme.panel_fg)
+                        .cursor_pointer()
+                        .state_fill(
+                            if chosen {
+                                theme.panel
+                            } else {
+                                theme.panel.opacity(0.0)
+                            },
+                            theme.panel,
+                            style::RADIUS_MD,
+                        )
+                        .child(icon(
+                            include_bytes!("../../assets/icons/check.svg"),
+                            13.0,
+                            if chosen {
+                                theme.accent
+                            } else {
+                                theme.accent.opacity(0.0)
+                            },
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .child(self.endpoint_label(&endpoint)),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.mission.machine_menu = false;
+                            this.activate_endpoint(target.clone(), None, None, cx);
+                            cx.notify();
+                        })),
+                );
+            }
+            face = face.relative().child(
+                div().absolute().top(px(0.0)).left(px(0.0)).child(
+                    deferred(
+                        anchored()
+                            .anchor(Anchor::TopLeft)
+                            .offset(point(px(0.0), px(PICKER_CHIP_H + 4.0)))
+                            .snap_to_window_with_margin(px(8.0))
+                            .child(style::enter("pilus-mission-machine-enter", list)),
+                    )
+                    .with_priority(2),
+                ),
             );
         }
-        Some(picker)
+        Some(face.into_any_element())
+    }
+
+    /// A row's icon-only controls. Each acts on its own row, not the
+    /// selection, so a click selects the row first and takes no second click.
+    fn mission_row_actions(&self, key: &str, row: &MissionRow, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let group = div().flex().flex_row().items_center().gap_1();
+        let Some(_) = row.pane else {
+            return group;
+        };
+        let blocked = row.state == "blocked";
+        let working = row.state == "working";
+        let button = |name: &str,
+                      glyph: &'static [u8],
+                      color: Rgba,
+                      shown: bool,
+                      run: fn(&mut PilusView, &mut Context<PilusView>)| {
+            let target = key.to_string();
+            let face = icon(
+                glyph,
+                13.0,
+                if shown {
+                    color
+                } else {
+                    theme.muted.opacity(0.35)
+                },
+            );
+            let el = style::small_button(
+                format!("pilus-mission-{name}-{key}"),
+                face,
+                ButtonKind::Ghost,
+                theme,
+                fonts.secondary,
+            );
+            if shown {
+                el.on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.mission.selection = Some(Selection::Agent(target.clone()));
+                    this.mission.detail_open = true;
+                    run(this, cx);
+                }))
+                .into_any_element()
+            } else {
+                el.opacity(0.5).into_any_element()
+            }
+        };
+        group
+            .child(button(
+                "answer",
+                include_bytes!("../../assets/icons/message-square.svg"),
+                theme.panel_fg,
+                blocked,
+                |this, cx| this.mission_open_answer(cx),
+            ))
+            .child(button(
+                "approve",
+                include_bytes!("../../assets/icons/check.svg"),
+                theme.ok,
+                blocked,
+                |this, cx| this.mission_row_op(RowOp::Approve, cx),
+            ))
+            .child(button(
+                "stop",
+                include_bytes!("../../assets/icons/square.svg"),
+                theme.alert,
+                working || blocked,
+                |this, cx| this.mission_row_op(RowOp::Stop, cx),
+            ))
+            .child(button(
+                "fork",
+                include_bytes!("../../assets/icons/git-fork.svg"),
+                theme.panel_fg,
+                true,
+                |this, cx| this.mission_row_op(RowOp::Fork, cx),
+            ))
     }
 
     fn mission_metrics(&self, rows: &[&MissionRow]) -> Div {
@@ -1120,6 +1276,7 @@ impl PilusView {
             None => burn,
         };
         style::stat_strip(theme)
+            .border_l_0()
             .child(style::stat_tile(
                 theme,
                 fonts,
@@ -1202,9 +1359,10 @@ impl PilusView {
                     .text_color(theme.muted)
                     .child(summary),
             );
-        let mut column = div().flex().flex_col().gap_2().child(header);
+        let header = header.px_4().pt_4().pb_2();
+        let mut column = div().flex().flex_col().child(header);
         if snapshot.automations.is_empty() {
-            return column;
+            return column.pb_2();
         }
         let mut list = div().flex().flex_col();
         for row in &snapshot.automations {
@@ -1213,8 +1371,8 @@ impl PilusView {
         column = column.child(
             div()
                 .p_1()
-                .rounded_md()
-                .border_1()
+                .border_t_1()
+                .border_b_1()
                 .border_color(theme.border)
                 .child(list),
         );
@@ -1319,33 +1477,46 @@ impl PilusView {
             .bg(theme.panel_dim)
             .border_b_1()
             .border_color(theme.border)
-            .child(label("#", Some(36.0), false, false))
-            .child(label("AGENT", None, false, false))
-            .child(label("STATE", Some(76.0), false, false))
-            .child(label("LOCATION", Some(120.0), false, false))
-            .child(label("MODEL", Some(68.0), false, false))
-            .child(label("TOKENS", Some(68.0), true, false))
-            .child(label("CONTEXT", Some(112.0), false, false))
-            .child(label("COST", Some(76.0), true, true));
-        let mut column = div().flex().flex_col().gap_2().child(style::section_label(
-            theme,
-            "AGENT SESSIONS",
-            fonts.label,
-        ));
+            .child(label("#", Some(32.0), false, false))
+            .child(label("AGENT", Some(108.0), false, false))
+            .child(label("STATE", Some(68.0), false, false))
+            .child(
+                label("LOCATION", None, false, false).min_w(self.mission_min(LOCATION_MIN_WIDTH)),
+            )
+            .child(label("MODEL", Some(60.0), false, false))
+            .child(label("TOKENS", Some(90.0), true, false))
+            .child(label("CONTEXT", Some(140.0), false, false))
+            .child(label("COST", Some(68.0), true, false))
+            .child(label("ACTIONS", Some(ACTIONS_WIDTH), false, true));
+        let column = div().flex().flex_col().child(
+            style::section_label(theme, "AGENT SESSIONS", fonts.label)
+                .px_4()
+                .pt_4()
+                .pb_2(),
+        );
         if rows.is_empty() {
             return column.child(self.mission_empty());
         }
         let mut list = div()
             .flex()
             .flex_col()
-            .border_1()
+            .min_w(self.mission_min(TABLE_MIN_WIDTH))
+            .border_t_1()
             .border_color(theme.border)
             .child(header);
         for (index, (key, row)) in rows.iter().enumerate() {
             list = list.child(self.mission_row(index + 1, key, row, index + 1 < rows.len(), cx));
         }
-        column = column.child(list);
-        column
+        column.child(
+            div()
+                .id("pilus-mission-table")
+                .overflow_x_scroll()
+                .child(list),
+        )
+    }
+
+    fn mission_min(&self, width: f32) -> gpui::Pixels {
+        px(style::scaled(&self.shared_settings, width))
     }
 
     /// One table cell: a fixed width, or the flexible column when `width` is
@@ -1434,14 +1605,14 @@ impl PilusView {
             .cursor_pointer()
             .state_fill(rest, hover, square)
             .child(
-                self.mission_cell(Some(36.0), false)
+                self.mission_cell(Some(32.0), false)
                     .font_family(mono.clone())
                     .text_size(px(fonts.secondary))
                     .text_color(theme.muted)
                     .child(format!("{number:02}")),
             )
             .child(
-                self.mission_cell(None, false)
+                self.mission_cell(Some(108.0), false)
                     .gap_2()
                     .child(
                         div()
@@ -1467,27 +1638,28 @@ impl PilusView {
                     ),
             )
             .child(
-                self.mission_cell(Some(76.0), false)
+                self.mission_cell(Some(68.0), false)
                     .text_size(px(fonts.secondary))
                     .text_color(state_color)
                     .child(state),
             )
             .child(
-                self.mission_cell(Some(120.0), false)
+                self.mission_cell(None, false)
+                    .min_w(self.mission_min(LOCATION_MIN_WIDTH))
                     .truncate()
                     .text_size(px(fonts.secondary))
                     .text_color(theme.muted)
                     .child(row.location.clone()),
             )
             .child(
-                self.mission_cell(Some(68.0), false)
+                self.mission_cell(Some(60.0), false)
                     .truncate()
                     .text_size(px(fonts.secondary))
                     .text_color(theme.branch)
                     .child(model),
             )
             .child(
-                self.mission_cell(Some(68.0), false)
+                self.mission_cell(Some(90.0), false)
                     .justify_end()
                     .font_family(mono.clone())
                     .text_size(px(fonts.secondary))
@@ -1495,7 +1667,7 @@ impl PilusView {
                     .child(tokens),
             )
             .child(
-                self.mission_cell(Some(112.0), false)
+                self.mission_cell(Some(140.0), false)
                     .gap_2()
                     .child(div().flex_1().child(style::meter(
                         format!("pilus-mission-ctx-{key}"),
@@ -1520,28 +1692,33 @@ impl PilusView {
                     ),
             )
             .child(
-                self.mission_cell(Some(76.0), true)
+                self.mission_cell(Some(68.0), false)
                     .justify_end()
                     .font_family(mono)
                     .text_size(px(fonts.secondary))
                     .text_color(theme.ok)
                     .child(cost),
+            )
+            .child(
+                self.mission_cell(Some(ACTIONS_WIDTH), true)
+                    .px_1()
+                    .child(self.mission_row_actions(key, row, cx)),
             );
         let row_el = if rule_below {
             row_el.border_b_1().border_color(theme.border)
         } else {
             row_el
         };
-        row_el
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                let pick = Selection::Agent(key_owned.clone());
-                if event.click_count() >= 2 {
-                    this.mission.selection = Some(pick);
-                    this.mission_go(cx);
-                    return;
-                }
-                this.mission_select(Some(pick), cx);
-            }))
+        row_el.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            let pick = Selection::Agent(key_owned.clone());
+            if event.click_count() >= 2 {
+                this.mission.selection = Some(pick);
+                this.mission_go(cx);
+                return;
+            }
+            this.mission.detail_open = true;
+            this.mission_select(Some(pick), cx);
+        }))
     }
 
     /// The side pane: the selected agent or automation, then the fleet's

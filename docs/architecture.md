@@ -350,9 +350,12 @@ like the Mission and Orchestration nav rows. The presentational rows are
 client state, exactly as they are in the daemon's own TUI: pins float the row
 to the top (the workspace pin is additionally pushed through `workspace.pin`,
 so the daemon's next projection reorders the catalog), path visibility drives
-the second line of every row in the section (workspace paths ride the existing
-`ShellDockLayout.workspace_paths` flag; agent paths are per-window state), and
-the agents scope filters the dock to the visible surface's active workspace.
+the second line of every row in the section and is hidden until the user
+picks **Show Path** (both toggles persist in the client's `settings.json`;
+the workspace one is additionally mirrored to the daemon through
+`ShellDockLayout.workspace_paths`), and the agents scope filters the dock to
+the visible surface's active workspace. Machine names stay out of the sidebar
+rows and are named in the row tooltip instead.
 **Delete Worktree** is the one destructive row, so it is gated and confirmed:
 `worktree.list` is probed once per workspace when its menu opens (successful
 answers cached per endpoint + stable workspace id; the row is added only after

@@ -9005,22 +9005,19 @@ impl PilusView {
                     .child(self.sidebar_toggle("pilus-sidebar-toggle", cx)),
             )
             .child(list);
-        // A translucent sidebar parts from the terminal with the inset
-        // hairline; the opaque one meets it seamlessly.
+        // The hairline parts the sidebar from the terminal at every opacity.
         // It is an overlay rather than a border: a border would take a pixel
         // from the panel's content box and leave the rows' right inset one
-        // short of their left, but only while the window is translucent.
-        if !self.framed() {
-            panel = panel.child(
-                div()
-                    .absolute()
-                    .top(px(0.0))
-                    .bottom(px(0.0))
-                    .right(px(0.0))
-                    .w(px(1.0))
-                    .bg(terminal_inset_border()),
-            );
-        }
+        // short of their left.
+        panel = panel.child(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .right(px(0.0))
+                .w(px(1.0))
+                .bg(terminal_inset_border()),
+        );
         panel
     }
 
@@ -11054,15 +11051,18 @@ impl PilusView {
         let viewport = window.viewport_size();
         // A translucent terminal drops the inset card and runs to the window
         // edges; the opaque one keeps its gaps, hairline, and rounding.
-        let gap_left = if framed { CARD_GAP } else { 0.0 };
+        // The sidebar's hairline is the card's left edge, so the card abuts
+        // it at every opacity and the sidebar spacing never depends on it.
+        let gap_left = 0.0;
         let gap_top = if framed { CARD_GAP_TOP } else { 0.0 };
         let gap_right = if framed { CARD_GAP_RIGHT } else { 0.0 };
         let gap_bottom = if framed { CARD_GAP } else { 0.0 };
         let border = if framed { 1.0 } else { 0.0 };
+        let border_left = 0.0;
         let card_x = self.sidebar_px(cell_w) + gap_left;
         // The card's inner box: inside the hairline border, before the grid's
         // own breathing room.
-        let inner_w = f32::from(viewport.width) - card_x - gap_right - 2.0 * border;
+        let inner_w = f32::from(viewport.width) - card_x - gap_right - border - border_left;
         let inner_h =
             f32::from(viewport.height) - HEADER_HEIGHT - gap_top - gap_bottom - 2.0 * border;
         // The framed card reserves breathing room around the grid; full-bleed
@@ -11107,7 +11107,7 @@ impl PilusView {
             card_bottom: gap_bottom + shrink_y,
             pad_x,
             pad_y,
-            origin_x: card_x + border + pad_x,
+            origin_x: card_x + border_left + pad_x,
             origin_y: HEADER_HEIGHT + gap_top + border + pad_y,
             cols,
             rows,
@@ -11583,7 +11583,8 @@ impl Render for PilusView {
                     card = card
                         .border_1()
                         .border_color(terminal_inset_border())
-                        .rounded_md();
+                        .border_l_0()
+                        .rounded_r_md();
                 }
                 card.child(self.card_content(cx, grid, &layout))
             }))

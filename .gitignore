@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# scratch experiments (companion app, etc.)
+/.experiment

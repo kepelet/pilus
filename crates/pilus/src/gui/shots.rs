@@ -1080,7 +1080,8 @@ impl Render for GlyphGridView {
         let settings = Settings::default();
         let font_size = settings.terminal_font_size;
         let width: u16 = 44;
-        let lines: Vec<&str> = std::iter::repeat_n("", usize::from(super::SKIPPED_DAEMON_ROWS))
+        let skip_rows = super::SKIPPED_DAEMON_ROWS;
+        let lines: Vec<&str> = std::iter::repeat_n("", usize::from(skip_rows))
             .chain(GLYPH_LINES)
             .chain(std::iter::repeat_n(
                 "",
@@ -1167,8 +1168,9 @@ impl Render for GlyphGridView {
                 None,
                 cell_width,
                 0,
+                skip_rows,
                 width,
-                height - super::SKIPPED_DAEMON_ROWS - super::SKIPPED_DAEMON_BOTTOM_ROWS,
+                height - skip_rows - super::SKIPPED_DAEMON_BOTTOM_ROWS,
                 1.0,
                 0.0,
                 0.0,

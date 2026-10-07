@@ -87,6 +87,15 @@ pub struct Settings {
     /// Whether AGENTS rows draw their path line. Off by default, persisted
     /// like the workspace toggle.
     pub sidebar_agent_paths: bool,
+    /// On remote machines, show the daemon row just below its tab strip, so a
+    /// `clear`ed prompt sits under the native tab bar instead of behind it.
+    /// On by default for newer Luvus, which no longer draws a title row
+    /// there; turn it off for an older Luvus or one with `show_title`
+    /// enabled.
+    pub terminal_top_spacing: bool,
+    /// The same choice for the local daemon. Off by default: the Luvus
+    /// installed alongside pilus still draws its title row.
+    pub local_terminal_top_spacing: bool,
 }
 
 impl Default for Settings {
@@ -107,6 +116,8 @@ impl Default for Settings {
             pi_gui_auto: true,
             sidebar_workspace_paths: false,
             sidebar_agent_paths: false,
+            terminal_top_spacing: true,
+            local_terminal_top_spacing: false,
         }
     }
 }
@@ -180,6 +191,15 @@ mod tests {
     }
 
     #[test]
+    fn missing_top_spacing_defaults_on() {
+        // Files written before the toggle existed follow newer Luvus.
+        let back: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert!(back.terminal_top_spacing);
+        assert!(!back.local_terminal_top_spacing);
+    }
+
+    #[test]
     fn missing_opacity_stays_translucent() {
         // Files written before the control existed have no opacity key.
         let back: Settings =
@@ -238,6 +258,8 @@ mod tests {
             pi_gui_auto: true,
             sidebar_workspace_paths: true,
             sidebar_agent_paths: true,
+            terminal_top_spacing: false,
+            local_terminal_top_spacing: true,
         };
         let text = serde_json::to_string(&settings).expect("serialize");
         let back: Settings = serde_json::from_str(&text).expect("deserialize");

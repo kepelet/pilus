@@ -640,25 +640,133 @@ peers; when enrollment is enabled, the control ALPN stays open so a new device
 can present its code. The connector runs the gateway `--no-expiry`, because it
 pairs once and must hold that token for its whole run.
 
+### Running as a background service
+
+Remote access is only worth having if it is there when the window is not, so
+the connector runs as a per-user service, not as a child of the window.
+`pilus-agent service install` writes a LaunchAgent (macOS) or a user systemd
+unit (Linux) that runs `pilus-agent serve --iroh --control --service` at login
+and restarts it on failure; `service uninstall` removes it and `service status`
+reports it. Nothing needs root. `install` is idempotent and leaves a running,
+unchanged service alone, because the window calls it on every launch and
+bouncing the service would drop every connected device. The service gets a
+small explicit `PATH` and `LUVUS_BIN`/`LUVUS_HOME` recorded at install time,
+since launchd and systemd hand services almost no environment.
+
+`serve --iroh` supervises its own gateway (`supervisor.rs`). It starts
+`luvus uhp access`, pairs, publishes the token to `AuthState`, and when the
+gateway child exits (daemon restart, sleep and wake) starts another with capped
+backoff. Enrolled devices fetch the token on demand, so none re-enrolls. If the
+Luvus daemon is not answering `ping`, the supervisor runs `server start` (at
+most once a minute), because after a reboot nothing else has. The iroh handlers
+read the gateway address per stream, so a restart needs no handler rebuilt, and
+while the gateway is down a stream gets a UHP-shaped `unavailable` error rather
+than a stall. `--service` also keeps enrollment codes out of the log.
+
+The identity key, `devices.json`, the admin socket and the log all live under
+`<state root>/agent/`. The identity and the device list persist, so the
+endpoint id and every enrolled device survive restarts. The **enrollment code
+does not**: it exists only in memory, lasts ten minutes, and is replaced after
+each enrollment. The service therefore never needs a restart to hand one out;
+`new_code` on the admin socket mints a fresh one on demand.
+
+### The admin socket
+
+`<state root>/agent/agent.sock` (`0600` in a `0700` directory) answers one JSON
+request per connection: `status` (endpoint id, current ticket, gateway health,
+enrolled devices, never a code), `new_code` (a code plus the
+`pilus://pair/<ticket>?code=…&name=…` link a QR encodes) and `revoke`. It is the
+only way the window reads the service, and it is why the window needs no stdout.
+`pilus_client::agent_service` is the client; `gui/connector.rs` caches its answer
+from a poller thread, so the GUI thread never touches the socket or runs the
+installer.
+
+### The hub
+
+A phone should pair with the machine it trusts, not with every host that
+machine can reach. The hub (`hub.rs`, ALPN `luvus/hub/1`) is that one front
+door. An enrolled device sends `{"id","machine"?,"method","params"?}` and gets
+`{"id","result"}` or `{"id","error":{"code","message"}}`; `hub.machines` lists
+this machine plus every saved SSH machine. `local` (the default) goes to the
+gateway with its delegated token. Any other id is a saved machine, reached the
+way the window reaches it: `luvus uhp proxy` over the user's own SSH. Luvus's
+`--machines` gateway flag is only the catalog (`machine.list/status/sessions`),
+not a router, which is why the fan-out lives here.
+
+What a device may call depends on its **level**, stored per device in
+`devices.json` (a file without levels reads as `control`, so existing pairings
+keep working):
+
+- **view**: the read-only subset of what the gateway allows (lists, status,
+  snapshots, reads; anything the classifier has not heard of counts as a write).
+- **control**: exactly the gateway token's `allowed_methods`. Prompt and
+  interrupt agents, retry tasks, focus things.
+- **operate**: control, plus `task.add`, `task.start`, `agent.start` and
+  `workspace.open`. The gateway refuses these, so the hub runs them itself: on
+  this machine through Luvus's owner socket, on a saved machine through
+  `luvus uhp proxy` over SSH (whose owner socket accepts them natively).
+
+Operate is remote code execution by design (a task's agent and gate command, an
+agent, a shell in a new workspace), and on an SSH machine it is exactly as
+powerful as sitting at that machine. So it is opt-in per device, and a level can
+only be **raised by a live enrollment code at that level**, which exists only on
+the host: *Add device* with "Allow the next device to start work" ticked. The
+admin socket can only **lower** a level (Settings: *Limit to control*, *Limit to
+view only*), and a lowered or revoked device is refused on the very next request
+of a connection that is already open, because the level is looked up per stream.
+Re-enrolling an already-enrolled device with a live code at another level
+re-levels it; presenting no code or a dead one changes nothing, so a plain
+re-pair never promotes. The hub rewrites `uhp.capabilities` so each device sees
+its own allowed methods and `level`, not the gateway token's.
+
+Every request, local or remote, is checked against these lists, and an empty
+gateway allowlist **fails closed** at every level. Methods that stream or block
+(`events.subscribe`, `wait.*`, `terminal.backend.observe`, …) are refused at
+every level because a stream carries one request and one reply. Every write a
+device makes, and every refusal of one, is logged as
+`audit: <device> [<level>] <machine> <method> <outcome>`; parameters are never
+logged because they may hold prompts. SSH calls are capped at six at a time and
+the machine catalog is cached for ten seconds. A service started by launchd
+inherits `SSH_AUTH_SOCK`, so keys loaded into the user's agent work; a key that
+needs a passphrase prompt will not.
+
+### Settings
+
 The **Settings** page puts a **REMOTE ACCESS** section above **REMOTE MACHINES**,
 with a `style::toggle` switch backed by `Settings.connector`, **off by default**.
-Turning it on starts the connector and persists the choice; `gui::connector` owns
-one process-wide child so it keeps running after the page closes and starts again
-on the next launch. The instruction line stays put and the connection details
-(`endpoint id`, `enroll` code, `ticket`, each with a Copy button) appear below it
-only while the connector runs. Each machine row in that page gains an **Install
-agent** action that stages this build's `pilus-agent` under a temporary sibling
-beside the verified remote `luvus` binary and renames it into place over SSH;
-a remote platform that does not match this build is refused before any bytes
-move. The action intentionally does not launch an unmanaged background process:
-the UI reports the exact `serve --iroh --control` command to run on that
-machine, so the endpoint, ticket, and enrollment code the agent prints remain
-visible to the user. The separate Remote Machines window
-keeps add/enable/disable/remove.
+Switching it on installs and starts the service; off stops and removes it.
+Quitting pilus does **not** stop it. While it runs the section shows its health
+(`Running`, or `waiting for Luvus` with the reason), an **Add device** button
+with its *Allow the next device to start work* choice (off every time), and the
+paired devices, each showing its level, with **Limit to…** and **Revoke**. Add device mints a code and shows it as a
+QR (`style::qr_code`, always dark on light whatever the theme, because a scanner
+needs the contrast), with Copy rows for the code and the link; the card hides
+itself when the code expires. Endpoint id and ticket stay below as copy rows.
+Each machine row in that page gains an **Install agent** action that stages this
+build's `pilus-agent` under a temporary sibling beside the verified remote
+`luvus` binary and renames it into place over SSH; a remote platform that does
+not match this build is refused before any bytes move. The action intentionally
+does not launch an unmanaged background process: the UI reports the exact
+`serve --iroh --control` command to run on that machine, so the endpoint, ticket,
+and enrollment code the agent prints remain visible to the user. The separate
+Remote Machines window keeps add/enable/disable/remove.
 
 The connector must be found before any of this works: `scripts/bundle-macos.sh`
 builds and copies `pilus-agent` into `Contents/MacOS/` beside `pilus`, and
-`just build`/`just run` build it too, so the app can start it as a sibling.
+`just build`/`just run` build it too, so the app can start it as a sibling. The
+service's plist records that path, so moving or replacing the app is picked up
+at the next launch, when `install` rewrites the plist.
+
+`tests/service.rs` runs the real binary against a real Luvus daemon in a
+throwaway `LUVUS_HOME`, with every ambient `LUVUS_SOCKET_PATH`/`LUVUS_API_ADDRESS`
+scrubbed from the children (a pane exports them, and they override `LUVUS_HOME`,
+so without the scrub the test would drive the developer's live session): it proves the gateway comes up by itself, that a code
+minted over the admin socket enrolls a device, that the hub serves the local
+machine and refuses what the gateway refuses, and that after the gateway is
+killed the same enrolled device is served again with no new code. It also covers
+the levels: each device is told its own methods, operate adds a task and opens a
+workspace in the daemon, control and view are refused the same calls, lowering
+applies at once, and a level cannot be raised from the admin socket.
 
 ## Mouse and selection
 

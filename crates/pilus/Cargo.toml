@@ -39,6 +39,7 @@ unicode-segmentation.workspace = true
 gpui = { workspace = true, optional = true }
 image.workspace = true
 gpui_platform = { workspace = true, optional = true }
+qrcode = { version = "0.14.1", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

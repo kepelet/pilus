@@ -71,8 +71,8 @@ use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use pilus_client::{
     Agent, AgentConfig, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent,
-    ConnectTarget, Connection, ConnectorStatus, ControlClient, HOME_ENV, MachineInfo, PaneFrame,
-    SessionInfo, SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary,
+    ConnectTarget, Connection, ControlClient, HOME_ENV, MachineInfo, PaneFrame, SessionInfo,
+    SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary,
     common_git_dirs_remote, config_dir, connect_machine, expand_local, expand_remote,
     generate_session_name, install_agent, list_machines, list_session_infos, luvus_binary,
     pilus_config_dir, refresh_machines, split_client_socket,
@@ -411,19 +411,11 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
                 let _ = window.update(cx, |_, window, _| window.activate_window());
             }
         });
-        // A persisted "this node" choice starts the connector with the app, so
-        // it survives closing the Remote Machines window. A failed start clears
-        // the flag rather than failing on every launch.
-        if settings.borrow().connector {
-            match connector::start(&connector::default_options()) {
-                Ok(()) => {}
-                Err(error) => {
-                    eprintln!("pilus: remote access did not start: {error}");
-                    settings.borrow_mut().connector = false;
-                    settings.borrow().save(&pilus_root);
-                }
-            }
-        }
+        // Remote access is a background service that outlives this window, so
+        // launch only reconciles it with the saved choice: a healthy running
+        // service is left alone, and one installed from an older build or app
+        // location moves onto this binary.
+        connector::ensure(settings.borrow().connector);
         cx.on_action({
             let api = appearances_socket.clone();
             let settings = settings.clone();
@@ -448,7 +440,6 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
             }
         });
         cx.on_action(|_: &QuitApp, cx: &mut App| {
-            connector::stop();
             cx.quit();
         });
         cx.on_action(|_: &HideApp, cx: &mut App| cx.hide());
@@ -1351,10 +1342,13 @@ struct PilusView {
     machine_op_tx: Sender<String>,
     /// The machine id whose CLI mutation is running, if any.
     machine_busy: Option<String>,
-    /// The host connector's latest observed state, polled each tick.
-    connector_status: ConnectorStatus,
+    /// Remote access as the background service last reported it, read each tick.
+    remote: connector::RemoteAccess,
     /// A machine remove awaiting its second click, if any.
     machine_pending_remove: Option<String>,
+    /// Whether the next pairing code lets its device start work (tasks,
+    /// agents, workspaces). Off until the user asks, every time the page opens.
+    pairing_operate: bool,
     /// Registered appearance themes and the selected id, from `theme.list`.
     appearance: Appearance,
     /// Last theme poll; the registry only changes on user action.
@@ -1633,7 +1627,6 @@ impl PilusView {
         .detach();
         // A quit flushes the frame without waiting for the debounce.
         cx.on_app_quit(|view, _cx| {
-            connector::stop();
             view.settings.save(&view.pilus_root);
             async {}
         })
@@ -1853,8 +1846,9 @@ impl PilusView {
             machine_op_rx,
             machine_op_tx,
             machine_busy: None,
-            connector_status: ConnectorStatus::default(),
+            remote: connector::snapshot(),
             machine_pending_remove: None,
+            pairing_operate: false,
             appearance: Appearance::default(),
             last_theme_poll: Instant::now() - Duration::from_secs(11),
             theme_refreshing: false,
@@ -2096,9 +2090,9 @@ impl PilusView {
             self.catalog_dirty = true;
             changed = true;
         }
-        let connector_status = connector::status();
-        if connector_status != self.connector_status {
-            self.connector_status = connector_status;
+        let remote = connector::snapshot();
+        if remote != self.remote {
+            self.remote = remote;
             changed = true;
         }
         changed |= self.poll_active(cx);
@@ -6215,16 +6209,25 @@ impl PilusView {
     /// with the same status and enable/remove actions as the manager window.
     /// Adding and provisioning stay in the full manager window.
     /// The REMOTE ACCESS section: reach this machine from another device.
+    ///
+    /// The switch installs a background service, so the section describes the
+    /// service, not a window feature: it keeps running after pilus closes and
+    /// starts at login. Pairing is a button, not a startup side effect: "Add
+    /// device" mints a fresh code on demand and shows it as a QR.
     fn remote_access_section_block(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let running = connector::running();
-        let status = &self.connector_status;
-        let toggle = style::toggle("pilus-remote-access-toggle", running, theme).on_click(
+        let remote = &self.remote;
+        let toggle = style::toggle("pilus-remote-access-toggle", remote.on(), theme).on_click(
             cx.listener(|this, _, _, cx| {
                 this.toggle_connector();
                 cx.notify();
             }),
         );
+        let blurb = if remote.on() {
+            "Runs in the background and starts at login, so your phone can reach this machine and the machines it manages. Turn off to stop it."
+        } else {
+            "Reach this machine, and every machine it manages, from your phone. Keeps running after pilus closes."
+        };
         let mut section = div()
             .flex()
             .flex_col()
@@ -6243,15 +6246,14 @@ impl PilusView {
                     ))
                     .child(toggle),
             )
-            // The instruction stays put; the connection details appear below.
             .child(
                 div()
                     .px_3()
                     .text_size(px(self.footer_font()))
                     .text_color(theme.muted)
-                    .child("Enable to reach this machine from another device"),
+                    .child(blurb),
             );
-        if let Some(error) = &status.error {
+        if let Some(error) = &remote.error {
             section = section.child(
                 div()
                     .px_3()
@@ -6259,61 +6261,300 @@ impl PilusView {
                     .text_color(theme.alert)
                     .child(error.clone()),
             );
-        } else if running {
-            let mut output = div()
-                .mx_3()
-                .px_3()
-                .py_2()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .rounded_md()
-                .bg(theme.panel)
-                .border_1()
-                .border_color(theme.border);
-            match (&status.endpoint_id, &status.ticket) {
-                (Some(id), Some(ticket)) => {
-                    output = output.child(self.copy_row(
-                        "endpoint",
-                        id.clone(),
-                        "pilus-copy-endpoint",
-                        cx,
-                    ));
-                    if let Some(enrollment) = &status.enrollment {
-                        output = output.child(self.copy_row(
-                            "enroll",
-                            enrollment.clone(),
-                            "pilus-copy-enroll",
-                            cx,
-                        ));
-                    }
-                    output = output.child(self.copy_row(
-                        "ticket",
-                        ticket.clone(),
-                        "pilus-copy-ticket",
-                        cx,
-                    ));
-                }
-                _ => {
-                    output = output.child(
+        }
+        match (remote.phase, &remote.status) {
+            (connector::Phase::Off, _) => {
+                if agent_binary().is_none() {
+                    section = section.child(
                         div()
+                            .px_3()
                             .text_size(px(self.footer_font()))
                             .text_color(theme.muted)
-                            .child("Starting…"),
+                            .child("pilus-agent is not installed next to pilus."),
                     );
                 }
             }
-            section = section.child(output);
-        } else if agent_binary().is_none() {
-            section = section.child(
-                div()
-                    .px_3()
-                    .text_size(px(self.footer_font()))
-                    .text_color(theme.muted)
-                    .child("pilus-agent is not installed next to pilus."),
-            );
+            (connector::Phase::Starting, _) | (connector::Phase::Running, None) => {
+                section = section.child(
+                    div()
+                        .px_3()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(self.footer_font()))
+                        .text_color(theme.muted)
+                        .child(style::spinner(
+                            "pilus-remote-starting",
+                            self.footer_font(),
+                            theme.muted,
+                        ))
+                        .child("Starting…"),
+                );
+            }
+            (connector::Phase::Running, Some(status)) => {
+                section = section.child(self.remote_access_running(status, cx));
+            }
         }
         section
+    }
+
+    /// What the running service shows: its health, the Add device action, the
+    /// pairing card while a code is live, and the enrolled devices.
+    fn remote_access_running(
+        &self,
+        status: &pilus_client::agent_service::ServiceStatus,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = self.theme;
+        let remote = &self.remote;
+        let small = self.footer_font();
+        let health = if status.gateway_up {
+            "Running".to_string()
+        } else {
+            match &status.gateway_error {
+                Some(why) => format!("Running, waiting for Luvus ({why})"),
+                None => "Running, waiting for Luvus".to_string(),
+            }
+        };
+        let add = if remote.minting {
+            "Adding…"
+        } else if remote.code.is_some() {
+            "New code"
+        } else {
+            "Add device"
+        };
+        let mut block = div().flex().flex_col().gap_2().mx_3();
+        block = block.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .min_w(px(0.0))
+                        .text_size(px(small))
+                        .text_color(theme.muted)
+                        .child(
+                            div()
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(if status.gateway_up {
+                                    theme.accent
+                                } else {
+                                    theme.muted
+                                }),
+                        )
+                        .child(div().truncate().child(health)),
+                )
+                .when(!status.strict, |row| {
+                    row.child(
+                        style::small_button(
+                            "pilus-add-device",
+                            add,
+                            style::ButtonKind::Primary,
+                            theme,
+                            small,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            connector::mint_code(if this.pairing_operate {
+                                pilus_client::agent_service::DeviceLevel::Operate
+                            } else {
+                                pilus_client::agent_service::DeviceLevel::Control
+                            });
+                            cx.notify();
+                        })),
+                    )
+                }),
+        );
+        if !status.strict {
+            block = block.child(
+                style::checkbox(
+                    "pilus-pairing-operate",
+                    self.pairing_operate,
+                    "Allow the next device to start work (tasks, agents, workspaces)",
+                    theme,
+                    small,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.pairing_operate = !this.pairing_operate;
+                    cx.notify();
+                })),
+            );
+        }
+        if let Some(code) = &remote.code {
+            block = block.child(style::enter(
+                "pilus-pairing-card",
+                div()
+                    .px_3()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .rounded_md()
+                    .bg(theme.panel)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_3()
+                            .child(style::qr_code(&code.link, 176.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .text_size(px(small))
+                                    .text_color(theme.muted)
+                                    .child(format!(
+                                        "Scan this in the pilus companion app, or paste the link. It works once, for 10 minutes. The device will be: {}.",
+                                        code.level.label()
+                                    ))
+                                    .child(self.copy_row(
+                                        "code",
+                                        code.code.clone(),
+                                        "pilus-copy-code",
+                                        cx,
+                                    ))
+                                    .child(self.copy_row(
+                                        "link",
+                                        code.link.clone(),
+                                        "pilus-copy-link",
+                                        cx,
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div().flex().flex_row().justify_end().child(
+                            style::small_button(
+                                "pilus-pairing-done",
+                                "Done",
+                                style::ButtonKind::Ghost,
+                                theme,
+                                small,
+                            )
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                connector::dismiss_code();
+                                cx.notify();
+                            })),
+                        ),
+                    ),
+            ));
+        }
+        let mut devices = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(theme.panel_dim)
+            .border_1()
+            .border_color(theme.border);
+        devices = devices.child(style::section_label(theme, "PAIRED DEVICES", small));
+        if status.devices.is_empty() {
+            devices = devices.child(
+                div()
+                    .text_size(px(small))
+                    .text_color(theme.muted)
+                    .child("No devices yet. Add one to get a code."),
+            );
+        }
+        for (index, device) in status.devices.iter().enumerate() {
+            let name = if device.label.is_empty() {
+                format!(
+                    "Device {}",
+                    device.endpoint_id.chars().take(8).collect::<String>()
+                )
+            } else {
+                device.label.clone()
+            };
+            let id = device.endpoint_id.clone();
+            let lower_to = match device.level {
+                pilus_client::agent_service::DeviceLevel::Operate => {
+                    Some(pilus_client::agent_service::DeviceLevel::Control)
+                }
+                pilus_client::agent_service::DeviceLevel::Control => {
+                    Some(pilus_client::agent_service::DeviceLevel::View)
+                }
+                pilus_client::agent_service::DeviceLevel::View => None,
+            };
+            let limit = lower_to.filter(|_| !status.strict).map(|target| {
+                let id = id.clone();
+                style::small_button(
+                    SharedString::from(format!("pilus-limit-{index}")),
+                    format!("Limit to {}", target.label().to_lowercase()),
+                    style::ButtonKind::Ghost,
+                    theme,
+                    small,
+                )
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    connector::lower(id.clone(), target);
+                    cx.notify();
+                }))
+            });
+            let revoke = (!status.strict).then(|| {
+                style::small_button(
+                    SharedString::from(format!("pilus-revoke-{index}")),
+                    "Revoke",
+                    style::ButtonKind::Ghost,
+                    theme,
+                    small,
+                )
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    connector::revoke(id.clone());
+                    cx.notify();
+                }))
+            });
+            devices = devices.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_size(px(small))
+                    .text_color(theme.fg)
+                    .child(
+                        div().flex_1().min_w(px(0.0)).truncate().child(name).child(
+                            div()
+                                .text_color(
+                                    if device.level
+                                        == pilus_client::agent_service::DeviceLevel::Operate
+                                    {
+                                        theme.alert
+                                    } else {
+                                        theme.muted
+                                    },
+                                )
+                                .child(device.level.label()),
+                        ),
+                    )
+                    .children(limit)
+                    .children(revoke),
+            );
+        }
+        block = block.child(devices);
+        block
+            .child(self.copy_row(
+                "endpoint",
+                status.endpoint_id.clone(),
+                "pilus-copy-endpoint",
+                cx,
+            ))
+            .child(self.copy_row("ticket", status.ticket.clone(), "pilus-copy-ticket", cx))
     }
 
     /// A muted read-only value with a Copy button beside it.
@@ -6350,19 +6591,19 @@ impl PilusView {
             .child(button)
     }
 
-    /// Turn this node's connector on or off from the settings page.
+    /// Turn Remote access on or off from the settings page.
     fn toggle_connector(&mut self) {
-        if connector::running() {
-            connector::stop();
-            self.connector_status = ConnectorStatus::default();
+        if self.remote.on() {
+            connector::disable();
             self.set_connector(false);
-            self.settings_status = "Remote access disabled.".to_string();
+            self.settings_status = "Remote access off.".to_string();
+        } else if agent_binary().is_none() {
+            self.settings_status = "pilus-agent is not installed next to pilus.".to_string();
         } else {
-            match connector::start(&connector::default_options()) {
-                Ok(()) => self.set_connector(true),
-                Err(error) => self.settings_status = error,
-            }
+            connector::enable();
+            self.set_connector(true);
         }
+        self.remote = connector::snapshot();
     }
 
     /// Persist the connector choice so it restarts on the next launch.

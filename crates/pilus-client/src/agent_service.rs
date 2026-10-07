@@ -1,0 +1,362 @@
+//! The background connector service, as the window sees it.
+//!
+//! Remote access runs as a service that outlives the window (see
+//! `pilus-agent service`), so the window cannot own it as a child process or
+//! read its stdout. It does two things instead: ask `pilus-agent` to install or
+//! remove the service, and talk to the running connector over its owner-only
+//! admin socket for status, fresh pairing codes, and device revocation.
+//!
+//! Every call here blocks on a process or a socket, so callers run them off the
+//! GUI thread.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+use serde_json::{Value, json};
+
+use crate::connector::agent_binary;
+use crate::discovery::config_dir;
+use crate::error::{Error, Result};
+
+/// Where the connector keeps its identity, device list, admin socket, and log.
+pub fn agent_dir() -> PathBuf {
+    config_dir().join("agent")
+}
+
+/// The connector's admin socket.
+pub fn admin_socket() -> PathBuf {
+    agent_dir().join("agent.sock")
+}
+
+/// The service's log file.
+pub fn log_path() -> PathBuf {
+    agent_dir().join("agent.log")
+}
+
+/// How much a paired device may do, as the connector reports it.
+///
+/// The connector owns the meaning; this is only the spelling the window sends
+/// and shows. Raising a level is not something the window can do: it takes a new
+/// code at the higher level.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DeviceLevel {
+    /// Reads only.
+    View,
+    /// Prompts and interrupts agents, retries tasks, focuses things.
+    #[default]
+    Control,
+    /// Control, plus starting work: tasks, agents, workspaces.
+    Operate,
+}
+
+impl DeviceLevel {
+    /// The wire spelling.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::Control => "control",
+            Self::Operate => "operate",
+        }
+    }
+
+    /// The display name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::View => "View only",
+            Self::Control => "Control",
+            Self::Operate => "Can start work",
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        match text {
+            "view" => Self::View,
+            "operate" => Self::Operate,
+            _ => Self::Control,
+        }
+    }
+}
+
+/// One device the connector has enrolled.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EnrolledDevice {
+    /// The device's iroh `EndpointId`.
+    pub endpoint_id: String,
+    /// The label it enrolled with; may be empty.
+    pub label: String,
+    /// When it enrolled, as a Unix timestamp.
+    pub enrolled_at: u64,
+    /// What it may do.
+    pub level: DeviceLevel,
+}
+
+/// What the running connector reports.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ServiceStatus {
+    /// The name devices show for this machine.
+    pub label: String,
+    /// The connector's stable iroh `EndpointId`.
+    pub endpoint_id: String,
+    /// A current ticket, for a device that already knows to trust this host.
+    pub ticket: String,
+    /// Whether the Luvus gateway behind it is up.
+    pub gateway_up: bool,
+    /// Why the gateway is down, when it is.
+    pub gateway_error: Option<String>,
+    /// Enrolled devices.
+    pub devices: Vec<EnrolledDevice>,
+    /// `--allow` pins the device set, so enrollment and revocation are off.
+    pub strict: bool,
+}
+
+/// A freshly minted enrollment code and the link that carries it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PairingCode {
+    /// The level a device enrolled with this code gets.
+    pub level: DeviceLevel,
+    /// The human-readable code.
+    pub code: String,
+    /// When it stops working, as a Unix timestamp.
+    pub expires_at: u64,
+    /// `pilus://pair/<ticket>?code=…&name=…`, what a QR encodes.
+    pub link: String,
+}
+
+/// Whether the service definition exists and is running.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Installation {
+    /// This platform cannot run the connector as a service.
+    Unsupported,
+    /// Not installed.
+    NotInstalled,
+    /// Installed; `running` is the service manager's view.
+    Installed {
+        /// The process is up right now.
+        running: bool,
+    },
+}
+
+/// Install (or refresh) and start the service. Idempotent, and it leaves an
+/// unchanged running service alone, so it is safe to call on every launch.
+pub fn install() -> Result<()> {
+    run_agent(&["service", "install"]).map(drop)
+}
+
+/// Stop and remove the service.
+pub fn uninstall() -> Result<()> {
+    run_agent(&["service", "uninstall"]).map(drop)
+}
+
+/// The service manager's view of the service.
+pub fn installation() -> Installation {
+    let Ok(output) = run_agent(&["service", "status"]) else {
+        return Installation::Unsupported;
+    };
+    match output.trim() {
+        "installed, running" => Installation::Installed { running: true },
+        "installed, not running" => Installation::Installed { running: false },
+        "not installed" => Installation::NotInstalled,
+        _ => Installation::Unsupported,
+    }
+}
+
+fn run_agent(args: &[&str]) -> Result<String> {
+    let binary = agent_binary().ok_or_else(|| {
+        Error::Connector(
+            "pilus-agent not found; set PILUS_AGENT_BIN or install it beside pilus".to_string(),
+        )
+    })?;
+    let output = Command::new(binary).args(args).output()?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim().trim_start_matches("Error: ");
+        return Err(Error::Connector(if detail.is_empty() {
+            format!("pilus-agent {} failed ({})", args.join(" "), output.status)
+        } else {
+            detail.to_string()
+        }));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The running connector's status, or `None` when nothing answers.
+pub fn status() -> Option<ServiceStatus> {
+    let reply = admin(&json!({ "type": "status" })).ok()?;
+    parse_status(&reply)
+}
+
+/// Mint a pairing code that enrolls a device at `level`. The previous code
+/// stops working.
+pub fn new_code(level: DeviceLevel) -> Result<PairingCode> {
+    let reply = admin(&json!({ "type": "new_code", "level": level.wire() }))?;
+    parse_code(&reply)
+}
+
+/// Lower an enrolled device's level. The connector refuses to raise one.
+pub fn lower_level(endpoint_id: &str, level: DeviceLevel) -> Result<()> {
+    admin(&json!({ "type": "set_level", "endpoint_id": endpoint_id, "level": level.wire() }))
+        .map(drop)
+}
+
+/// Remove an enrolled device. Returns whether it was present.
+pub fn revoke(endpoint_id: &str) -> Result<bool> {
+    let reply = admin(&json!({ "type": "revoke", "endpoint_id": endpoint_id }))?;
+    reply
+        .get("removed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| Error::Connector("unexpected reply to revoke".to_string()))
+}
+
+fn parse_status(reply: &Value) -> Option<ServiceStatus> {
+    if reply.get("type").and_then(Value::as_str) != Some("status") {
+        return None;
+    }
+    let text = |value: &Value, key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let gateway = reply.get("gateway").cloned().unwrap_or(Value::Null);
+    Some(ServiceStatus {
+        label: text(reply, "label"),
+        endpoint_id: text(reply, "endpoint_id"),
+        ticket: text(reply, "ticket"),
+        gateway_up: gateway.get("up").and_then(Value::as_bool).unwrap_or(false),
+        gateway_error: gateway
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        devices: reply
+            .get("devices")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|device| EnrolledDevice {
+                endpoint_id: text(device, "endpoint_id"),
+                label: text(device, "label"),
+                enrolled_at: device
+                    .get("enrolled_at")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                level: DeviceLevel::parse(&text(device, "level")),
+            })
+            .collect(),
+        strict: reply
+            .get("strict")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn parse_code(reply: &Value) -> Result<PairingCode> {
+    if reply.get("type").and_then(Value::as_str) == Some("code") {
+        return Ok(PairingCode {
+            level: DeviceLevel::parse(
+                reply
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            code: reply
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            expires_at: reply.get("expires_at").and_then(Value::as_u64).unwrap_or(0),
+            link: reply
+                .get("link")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Err(Error::Connector(
+        reply
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("the connector refused the request")
+            .to_string(),
+    ))
+}
+
+#[cfg(unix)]
+fn admin(request: &Value) -> Result<Value> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let mut stream = UnixStream::connect(admin_socket())
+        .map_err(|_| Error::Connector("the connector is not running".to_string()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(stream, "{request}")?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    let reply: Value = serde_json::from_str(line.trim())
+        .map_err(|error| Error::Connector(format!("unreadable reply: {error}")))?;
+    if reply.get("type").and_then(Value::as_str) == Some("error") {
+        return Err(Error::Connector(
+            reply
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("the connector refused the request")
+                .to_string(),
+        ));
+    }
+    Ok(reply)
+}
+
+#[cfg(not(unix))]
+fn admin(_request: &Value) -> Result<Value> {
+    Err(Error::Connector(
+        "the connector service is not available on this platform".to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn reads_a_status_reply() {
+        let status = parse_status(&json!({
+            "type": "status",
+            "label": "Studio Mac",
+            "endpoint_id": "abc",
+            "ticket": "endpointxyz",
+            "gateway": { "up": false, "error": "no luvus server running" },
+            "strict": false,
+            "devices": [{ "endpoint_id": "d1", "label": "phone", "enrolled_at": 7, "level": "operate" }],
+        }))
+        .expect("status");
+        assert_eq!(status.label, "Studio Mac");
+        assert!(!status.gateway_up);
+        assert_eq!(
+            status.gateway_error.as_deref(),
+            Some("no luvus server running")
+        );
+        assert_eq!(status.devices[0].label, "phone");
+        assert_eq!(status.devices[0].level, DeviceLevel::Operate);
+    }
+
+    #[test]
+    fn an_error_reply_is_not_a_status() {
+        assert!(parse_status(&json!({ "type": "error", "message": "x" })).is_none());
+    }
+
+    #[test]
+    fn reads_a_code_and_surfaces_a_refusal() {
+        let code = parse_code(&json!({
+            "type": "code", "code": "AB12", "expires_at": 9, "link": "pilus://pair/t?code=AB12"
+        }))
+        .expect("code");
+        assert_eq!(code.link, "pilus://pair/t?code=AB12");
+        let refused = parse_code(&json!({ "type": "error", "message": "disabled" }));
+        assert!(matches!(refused, Err(Error::Connector(message)) if message == "disabled"));
+    }
+}

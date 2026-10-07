@@ -12,6 +12,17 @@
 
 use gpui::{Rgba, rgb};
 
+/// The modules of a QR code. A scanner needs dark on light whatever the
+/// theme, so these are the one pair of colors that deliberately ignore it.
+pub fn qr_dark() -> Rgba {
+    rgb(0x000000)
+}
+
+/// The plate (and quiet zone) a QR code sits on.
+pub fn qr_light() -> Rgba {
+    rgb(0xffffff)
+}
+
 /// How far translucent chrome darkens `window_bg` toward black.
 const CHROME_SHADE: f32 = 0.35;
 /// How much of the remaining transparency translucent chrome fills in, so it

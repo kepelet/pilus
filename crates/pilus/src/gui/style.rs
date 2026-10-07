@@ -1680,6 +1680,71 @@ pub(super) fn eased(started: Instant, duration: Duration, cx: &App) -> Option<f3
     (!cx.reduce_motion() && step < 1.0).then(|| ease_out_cubic(step))
 }
 
+/// The quiet zone around a QR code, in modules. The spec asks for four; three
+/// scans reliably on a phone camera and keeps the code compact in a panel.
+const QR_QUIET: usize = 3;
+
+/// A QR code for `text`, as a square plate of at most `side` pixels.
+///
+/// Modules are painted as horizontal runs, one quad per run, and snapped to
+/// whole pixels so a scanner never sees a hairline between neighbours. The
+/// plate is always light and the modules always dark, whatever the theme.
+/// `text` that does not fit a QR code paints an empty plate rather than failing.
+pub(super) fn qr_code(text: &str, side: f32) -> Div {
+    use qrcode::{Color, QrCode};
+
+    let grid = QrCode::new(text.as_bytes()).ok().map(|code| {
+        let width = code.width();
+        (width, code.to_colors())
+    });
+    let modules = grid.as_ref().map_or(1, |(width, _)| *width) + 2 * QR_QUIET;
+    // Whole pixels per module; a code too large for `side` shrinks the plate
+    // below it rather than blurring the modules.
+    let cell = (side / modules as f32).floor().max(1.0);
+    let plate = cell * modules as f32;
+    let dark: Hsla = super::theme::qr_dark().into();
+    let light: Hsla = super::theme::qr_light().into();
+    div()
+        .w(px(plate))
+        .h(px(plate))
+        .flex_shrink_0()
+        .rounded_md()
+        .overflow_hidden()
+        .bg(light)
+        .child(
+            canvas(
+                move |_bounds, _window, _cx| (),
+                move |bounds, (), window, _cx| {
+                    let Some((width, colors)) = &grid else {
+                        return;
+                    };
+                    for row in 0..*width {
+                        let mut column = 0;
+                        while column < *width {
+                            if colors[row * width + column] != Color::Dark {
+                                column += 1;
+                                continue;
+                            }
+                            let start = column;
+                            while column < *width && colors[row * width + column] == Color::Dark {
+                                column += 1;
+                            }
+                            let run = Bounds::new(
+                                point(
+                                    bounds.origin.x + px(cell * (QR_QUIET + start) as f32),
+                                    bounds.origin.y + px(cell * (QR_QUIET + row) as f32),
+                                ),
+                                gpui::size(px(cell * (column - start) as f32), px(cell)),
+                            );
+                            window.paint_quad(gpui::fill(run, dark));
+                        }
+                    }
+                },
+            )
+            .size_full(),
+        )
+}
+
 /// An empty element that asks for another frame each time it paints. A
 /// view whose layout is mid-tween (a card folding, its lines following)
 /// adds one for as long as the tween runs.

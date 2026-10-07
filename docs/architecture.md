@@ -670,13 +670,25 @@ does not**: it exists only in memory, lasts ten minutes, and is replaced after
 each enrollment. The service therefore never needs a restart to hand one out;
 `new_code` on the admin socket mints a fresh one on demand.
 
+A running service keeps the binary it started with, and an update replaces the
+file under the same path, which `install` rightly leaves alone. So `status`
+reports `restart_needed` (the executable on disk is newer than the process), and
+the window, at launch, runs `pilus-agent service restart` when it is set
+(`launchctl kickstart -k`, or `systemctl --user restart`). Devices redial by
+themselves. On Linux a user unit stops with the last login session unless
+lingering is on, so `status` also carries `linger` (from `loginctl`), and Settings
+shows `loginctl enable-linger` when it is false. Windows has no service
+implementation; Settings says so instead of showing a switch.
+
 ### The admin socket
 
 `<state root>/agent/agent.sock` (`0600` in a `0700` directory) answers one JSON
 request per connection: `status` (endpoint id, current ticket, gateway health,
 enrolled devices, never a code), `new_code` (a code plus the
-`pilus://pair/<ticket>?code=…&name=…` link a QR encodes) and `revoke`. It is the
-only way the window reads the service, and it is why the window needs no stdout.
+`pilus://pair/<ticket>?code=…&name=…` link a QR encodes), `set_level`, `revoke`,
+and `retry`, which cuts the supervisor's backoff short and starts the Luvus server
+now (the window's *Start Luvus*; a person asking overrides the once-a-minute
+limit). It is the only way the window reads the service, and it is why the window needs no stdout.
 `pilus_client::agent_service` is the client; `gui/connector.rs` caches its answer
 from a poller thread, so the GUI thread never touches the socket or runs the
 installer.
@@ -687,7 +699,8 @@ A phone should pair with the machine it trusts, not with every host that
 machine can reach. The hub (`hub.rs`, ALPN `luvus/hub/1`) is that one front
 door. An enrolled device sends `{"id","machine"?,"method","params"?}` and gets
 `{"id","result"}` or `{"id","error":{"code","message"}}`; `hub.machines` lists
-this machine plus every saved SSH machine. `local` (the default) goes to the
+this machine plus every saved SSH machine. Four more methods are the hub's own:
+`hub.agents`, `hub.folders`, `hub.run` and `hub.watch`, described below. `local` (the default) goes to the
 gateway with its delegated token. Any other id is a saved machine, reached the
 way the window reaches it: `luvus uhp proxy` over the user's own SSH. Luvus's
 `--machines` gateway flag is only the catalog (`machine.list/status/sessions`),
@@ -722,7 +735,48 @@ its own allowed methods and `level`, not the gateway token's.
 Every request, local or remote, is checked against these lists, and an empty
 gateway allowlist **fails closed** at every level. Methods that stream or block
 (`events.subscribe`, `wait.*`, `terminal.backend.observe`, …) are refused at
-every level because a stream carries one request and one reply. Every write a
+every level, because a stream carries one request and one reply, with one
+exception the hub makes itself.
+
+`hub.folders` (operate only) lists the child folders of a path on a machine (`~` by
+default), marking git repositories, so a phone can choose a workspace to open with
+`workspace.open` instead of typing a path. It uses `pilus_client::folders`, the same
+lister as the window's Open Workspace picker (locally, or one `ssh` round trip
+running a POSIX script). Opening focuses the new workspace on the Mac: `workspace.open`
+has no no-focus option, unlike `task.start`.
+
+`hub.run` (operate only) starts an agent in a workspace and gives it a prompt, in one
+request: the same steps as the window's launcher (`workspace.open` to focus it, reuse
+the idle pane, `agent.start`, `agent.prompt`) on a single control connection, with one
+audit line (`hub.run`; the prompt is never logged). The agent gets an alias of its own
+(`phone-<kind>-<workspace tail>`), and a later `hub.run` for the same kind and workspace
+prompts that agent instead of starting another. The alias is what finds it, because
+Luvus can label a process as a different kind (a Pi pane reads as `opencode`). It
+focuses the workspace on the Mac, since an agent spawns beside the focused pane.
+
+`hub.agents` (operate only) lists the agents **installed** on a machine, for a
+picker: the same probe the window's launch composer uses (`agents::local`, or
+`agents::remote` in one SSH round trip), cached for a minute. Luvus's own
+`server.agent_manifests` is not a substitute: it names every agent Luvus knows how
+to launch (23 of them), installed or not. The picked kind goes to `task.start` or
+`agent.start` as `agent`.
+
+`hub.watch` is the one method whose stream stays open (`watch.rs`). It subscribes
+to the machine's Luvus event feed and sends the device **topic signals**
+(`{"event":"changed","topics":["tasks","mission"]}`), never events: an event
+carries a task's prompt or a pane's cwd, so relaying it would be a second,
+unaudited way to read everything, whereas a topic reveals nothing and any enrolled
+device may watch. The device then refetches the affected list through the ordinary
+calls, where its level applies. Terminal output events (one per burst of output)
+become the `output` topic plus the ids of the panes that wrote (`"panes":["3"]`),
+never their text, so a device looking at one agent's screen knows when to re-read
+it with `agent.read`, which its level governs; no list is refetched for `output`.
+Signals are coalesced to one per 300 ms, an idle stream pings every
+20 s, and each ping rechecks that the device is still enrolled, so a revoked
+device's open stream is cut. A device holds at most two streams and the machine
+eight, because the gateway token's rate limit (120 requests a minute) is shared by
+every device. Only the paired machine streams: a saved SSH machine is reached one
+request at a time, so its device keeps polling. Every write a
 device makes, and every refusal of one, is logged as
 `audit: <device> [<level>] <machine> <method> <outcome>`; parameters are never
 logged because they may hold prompts. SSH calls are capped at six at a time and
@@ -736,12 +790,16 @@ The **Settings** page puts a **REMOTE ACCESS** section above **REMOTE MACHINES**
 with a `style::toggle` switch backed by `Settings.connector`, **off by default**.
 Switching it on installs and starts the service; off stops and removes it.
 Quitting pilus does **not** stop it. While it runs the section shows its health
-(`Running`, or `waiting for Luvus` with the reason), an **Add device** button
+(`Running`; a **Restart** button runs `service restart` so a new build is picked up
+without switching Remote access off and on; `Waiting for Luvus`, with what to do and a **Start Luvus** button; or
+`Luvus not found`, where retrying cannot help), an **Add device** button
 with its *Allow the next device to start work* choice (off every time), and the
 paired devices, each showing its level, with **Limit to…** and **Revoke**. Add device mints a code and shows it as a
 QR (`style::qr_code`, always dark on light whatever the theme, because a scanner
 needs the contrast), with Copy rows for the code and the link; the card hides
-itself when the code expires. Endpoint id and ticket stay below as copy rows.
+itself when the code expires. Endpoint id and ticket stay below as copy rows, followed by a **SERVICE LOG**
+disclosure that tails the last lines of `agent.log` (polled only while it is open)
+with a Copy button.
 Each machine row in that page gains an **Install agent** action that stages this
 build's `pilus-agent` under a temporary sibling beside the verified remote
 `luvus` binary and renames it into place over SSH; a remote platform that does

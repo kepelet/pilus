@@ -1669,3 +1669,155 @@ pub(super) fn field(
                 .child(body),
         )
 }
+
+/// How long a folding card takes to reach its new height.
+pub(super) const FOLD: Duration = Duration::from_millis(220);
+
+/// How far a size change started at `started` has eased over `duration`,
+/// from 0 to 1, or `None` once it has settled. Reduce motion settles it at
+/// once.
+pub(super) fn eased(started: Instant, duration: Duration, cx: &App) -> Option<f32> {
+    let step = started.elapsed().as_secs_f32() / duration.as_secs_f32();
+    (!cx.reduce_motion() && step < 1.0).then(|| ease_out_cubic(step))
+}
+
+/// An empty element that asks for another frame each time it paints. A
+/// view whose layout is mid-tween (a card folding, its lines following)
+/// adds one for as long as the tween runs.
+pub(super) fn next_frame() -> impl IntoElement {
+    canvas(
+        |_bounds, _window, _cx| (),
+        |_bounds, (), window, _cx| window.request_animation_frame(),
+    )
+    .absolute()
+    .size_0()
+}
+
+/// A card on a board: a fixed box the caller fills and places.
+///
+/// Cards are interactive content, so they outline with `theme.border`; the
+/// selected one rests on the stronger panel fill and takes an accent ring,
+/// which fades in rather than snapping on. The caller sets the size, because
+/// a board positions its cards and draws connectors to their edges.
+pub(super) fn board_card(
+    id: impl Into<SharedString>,
+    selected: bool,
+    theme: Theme,
+) -> Stateful<Div> {
+    let id = id.into();
+    let rest = if selected {
+        theme.panel
+    } else {
+        theme.panel_dim
+    };
+    div()
+        .id(ElementId::Name(id.clone()))
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .cursor_pointer()
+        .state_fill(rest, theme.panel, RADIUS_MD)
+        .children(selected.then(|| {
+            enter(
+                ElementId::Name(format!("{id}-ring").into()),
+                // Laid over the card's own border: the card clips its
+                // overflow, so a ring outside it would never show.
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.accent),
+            )
+        }))
+}
+
+/// Which way a connector leaves or enters a card.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Side {
+    Left,
+    Right,
+}
+
+impl Side {
+    /// The outward direction along x.
+    fn sign(self) -> f32 {
+        match self {
+            Self::Left => -1.0,
+            Self::Right => 1.0,
+        }
+    }
+}
+
+/// One line between two cards, in the coordinates of the board it is drawn
+/// on. It ends in an arrowhead pointing into the `to` card.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Connector {
+    pub(super) from: (f32, f32),
+    pub(super) from_side: Side,
+    pub(super) to: (f32, f32),
+    pub(super) to_side: Side,
+    pub(super) color: Hsla,
+    /// A settled link draws dashed, so the lines still holding work back
+    /// read first.
+    pub(super) dashed: bool,
+}
+
+/// How far an arrowhead reaches back from its tip, at stroke width 1.5.
+const ARROW_LENGTH: f32 = 7.0;
+
+/// Draw `connectors` over the whole parent box. Place it before the cards so
+/// the lines run beneath them.
+pub(super) fn connectors(connectors: Vec<Connector>, stroke: f32) -> gpui::Canvas<()> {
+    canvas(
+        |_bounds, _window, _cx| (),
+        move |bounds, (), window, _cx| {
+            let at = |(x, y): (f32, f32)| point(bounds.origin.x + px(x), bounds.origin.y + px(y));
+            for line in &connectors {
+                let (fx, fy) = line.from;
+                let (tx, ty) = line.to;
+                // The arrowhead takes the last stretch, so the curve stops at
+                // its base and the stroke never pokes through the tip.
+                let head = ARROW_LENGTH * (stroke / 1.5).max(1.0);
+                let base = (tx + line.to_side.sign() * head, ty);
+                // Controls reach out sideways, so every curve leaves and
+                // enters its card level; a link inside one lane bows out
+                // instead of cutting across the cards between.
+                let reach = ((tx - fx).abs() / 2.0).max(36.0);
+                let ctrl_a = (fx + line.from_side.sign() * reach, fy);
+                let ctrl_b = (base.0 + line.to_side.sign() * reach, base.1);
+                let mut curve = PathBuilder::stroke(px(stroke));
+                if line.dashed {
+                    curve = curve.dash_array(&[px(4.0), px(4.0)]);
+                }
+                curve.move_to(at(line.from));
+                curve.cubic_bezier_to(at(base), at(ctrl_a), at(ctrl_b));
+                if let Ok(path) = curve.build() {
+                    window.paint_path(path, line.color);
+                }
+                let spread = head * 0.55;
+                let mut arrow = PathBuilder::fill();
+                arrow.add_polygon(
+                    &[
+                        at(line.to),
+                        at((base.0, base.1 - spread)),
+                        at((base.0, base.1 + spread)),
+                    ],
+                    true,
+                );
+                if let Ok(path) = arrow.build() {
+                    window.paint_path(path, line.color);
+                }
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}

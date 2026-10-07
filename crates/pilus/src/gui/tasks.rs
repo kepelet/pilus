@@ -9,7 +9,7 @@
 //! the next feed update redraws.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, Context, Div, Entity, FontWeight, Hsla, KeyDownEvent, MouseButton, SharedString,
@@ -17,11 +17,12 @@ use gpui::{
 };
 use pilus_client::{NewTask, Task, TaskAction, TaskStatus};
 
+use super::orchestration::{Board, Lane, agent_name, waiting_on};
 use super::style::{self, ButtonKind, FillExt};
 use super::task_compose::{ComposeState, Fetched, Scope, TaskPicker, TasksMsg};
 use super::text_input::TextInput;
 use super::theme::Theme;
-use super::{EndpointId, PilusView, icon, terminal_inset_border};
+use super::{EndpointId, PilusView, agent_icon, icon, terminal_inset_border};
 
 /// Which slice of the queue the list shows.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -45,13 +46,22 @@ impl TaskView {
         }
     }
 
-    fn admits(self, task: &Task) -> bool {
+    pub(super) fn admits(self, task: &Task) -> bool {
         match self {
             Self::All => true,
             Self::Active => task.status().is_open(),
             Self::Closed => !task.status().is_open(),
         }
     }
+}
+
+/// How the page lays the queue out: the Tasks list or the Orchestration
+/// board. Both read the same state, so switching keeps the selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum TaskLayout {
+    #[default]
+    List,
+    Board,
 }
 
 /// The composer's fields, in Tab order.
@@ -139,12 +149,21 @@ fn ops_for(status: TaskStatus) -> &'static [TaskOp] {
 #[derive(Debug, Default)]
 pub(super) struct TasksPanel {
     open: bool,
-    view: TaskView,
+    layout: TaskLayout,
+    pub(super) view: TaskView,
     pub(super) selected: Option<String>,
     composing: bool,
     pub(super) compose_focus: ComposeField,
     pub(super) compose: ComposeState,
     collapsed: HashSet<TaskStatus>,
+    /// Board cards folded down to their title.
+    pub(super) folded: HashSet<String>,
+    /// When each card last folded or unfolded, so its height eases.
+    pub(super) fold_turned: HashMap<String, Instant>,
+    /// Board lanes folded down to a strip.
+    pub(super) folded_lanes: HashSet<Lane>,
+    /// When each lane last folded or unfolded, so its width eases.
+    pub(super) lane_turned: HashMap<Lane, Instant>,
     /// The group whose chevron was just toggled, so only it animates.
     toggled: Option<TaskStatus>,
     pub(super) confirm_delete: Option<String>,
@@ -160,14 +179,27 @@ impl TasksPanel {
         self.open
     }
 
-    pub(super) fn open(&mut self) {
+    pub(super) fn open_as(&mut self, layout: TaskLayout) {
         self.open = true;
+        self.layout = layout;
+    }
+
+    pub(super) fn layout(&self) -> TaskLayout {
+        self.layout
+    }
+
+    pub(super) fn close_composer(&mut self) {
+        self.composing = false;
     }
 
     pub(super) fn close(&mut self) {
         *self = Self {
             view: self.view,
             collapsed: std::mem::take(&mut self.collapsed),
+            folded: std::mem::take(&mut self.folded),
+            fold_turned: std::mem::take(&mut self.fold_turned),
+            folded_lanes: std::mem::take(&mut self.folded_lanes),
+            lane_turned: std::mem::take(&mut self.lane_turned),
             scope: std::mem::take(&mut self.scope),
             remote: std::mem::take(&mut self.remote),
             ..Self::default()
@@ -226,7 +258,7 @@ fn step_selection(order: &[&str], current: Option<&str>, delta: isize) -> Option
 }
 
 /// A compact age such as `now`, `5m`, `3h`, `2d`, or `6w`.
-fn age_label(now: u64, then: u64) -> String {
+pub(super) fn age_label(now: u64, then: u64) -> String {
     let secs = now.saturating_sub(then);
     match secs {
         0..=59 => "now".to_string(),
@@ -237,7 +269,7 @@ fn age_label(now: u64, then: u64) -> String {
     }
 }
 
-fn unix_now() -> u64 {
+pub(super) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
@@ -355,7 +387,7 @@ impl PilusView {
     pub(super) fn open_tasks(&mut self, cx: &mut Context<Self>) {
         self.leave_settings_page();
         self.picker.close();
-        self.tasks_panel.open();
+        self.tasks_panel.open_as(TaskLayout::List);
         cx.notify();
     }
 
@@ -520,6 +552,10 @@ impl PilusView {
             return;
         }
         let tasks = self.scope_tasks();
+        if self.tasks_panel.layout == TaskLayout::Board && self.board_key(key, &tasks) {
+            cx.notify();
+            return;
+        }
         let groups = grouped(&tasks, self.tasks_panel.view);
         let order = nav_order(&groups, &self.tasks_panel.collapsed);
         let current = self.tasks_panel.selected.as_deref();
@@ -560,6 +596,9 @@ impl PilusView {
             self.tasks_empty(cx).into_any_element()
         } else if groups.is_empty() {
             self.tasks_message("Nothing in this view")
+                .into_any_element()
+        } else if self.tasks_panel.layout == TaskLayout::Board {
+            self.task_board(&Board::build(&tasks, self.tasks_panel.view), cx)
                 .into_any_element()
         } else {
             self.tasks_list(&groups, cx).into_any_element()
@@ -606,8 +645,17 @@ impl PilusView {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let open = tasks.iter().filter(|task| task.status().is_open()).count();
+        let (title, summary) = match self.tasks_panel.layout {
+            TaskLayout::List => ("Tasks", format!("{open} open")),
+            TaskLayout::Board => match self.waiting_count(tasks) {
+                0 => ("Orchestration", format!("{open} open")),
+                waiting => ("Orchestration", format!("{open} open · {waiting} waiting")),
+            },
+        };
+        let board = self.tasks_panel.layout == TaskLayout::Board;
         let mut views = div().flex().flex_row().items_center().gap_1();
-        for view in TaskView::ALL {
+        // The board draws every lane itself, so the list's filters do not apply.
+        for view in TaskView::ALL.into_iter().filter(|_| !board) {
             let kind = if self.tasks_panel.view == view {
                 ButtonKind::Secondary
             } else {
@@ -637,12 +685,12 @@ impl PilusView {
             .px_4()
             .border_b_1()
             .border_color(terminal_inset_border())
-            .child(style::title(theme, "Tasks", fonts.title))
+            .child(style::title(theme, title, fonts.title))
             .child(
                 div()
                     .text_size(px(fonts.secondary))
                     .text_color(theme.muted)
-                    .child(format!("{open} open")),
+                    .child(summary),
             )
             .child(self.task_scope_pickers(cx))
             .child(views)
@@ -980,14 +1028,25 @@ impl PilusView {
                     .child(status.label()),
             ),
         );
-        if let Some(root) = &task.project_root {
+        if let Some(workspace) = self.task_workspace_name(task) {
+            properties = properties.child(self.task_property("Workspace", workspace));
+        } else if let Some(root) = &task.project_root {
             properties = properties.child(self.task_property("Workspace", root.clone()));
         }
         if let Some(mode) = &task.mode {
             properties = properties.child(self.task_property("Mode", mode.clone()));
         }
         if let Some(pane) = task.assignee {
-            properties = properties.child(self.task_property("Worker", format!("pane {pane}")));
+            let worker = match self.task_agent(task) {
+                Some(agent) => div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(icon(agent_icon(&agent.agent), fonts.body, theme.panel_fg))
+                    .child(format!("{} · pane {pane}", agent_name(agent))),
+                None => div().child(format!("pane {pane}")),
+            };
+            properties = properties.child(self.task_property("Agent", worker));
         }
         if let Some(branch) = &task.branch {
             properties = properties.child(self.task_property("Branch", branch.clone()));
@@ -997,6 +1056,26 @@ impl PilusView {
         }
         if !task.deps.is_empty() {
             properties = properties.child(self.task_property("After", task.deps.join(", ")));
+        }
+        let known = self.machine_tasks(&self.scope_machine());
+        let waiting = waiting_on(task, &known);
+        if !waiting.is_empty() {
+            properties = properties.child(
+                self.task_property(
+                    "Blocked by",
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_color(theme.alert)
+                        .child(icon(
+                            include_bytes!("../../assets/icons/task-blocked.svg"),
+                            fonts.body,
+                            theme.alert,
+                        ))
+                        .child(waiting.join(", ")),
+                ),
+            );
         }
         if !task.paths.is_empty() {
             let mut paths = div().flex().flex_row().flex_wrap().gap_1();

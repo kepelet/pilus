@@ -6,9 +6,15 @@
 //! the identity is a persistent Ed25519 key so a device can dial the host by a
 //! stable `EndpointId`. The relay carries the connection only when direct hole
 //! punching fails, and it cannot read the traffic.
+//!
+//! [`serve`] is the long-running entry point: it binds the persistent identity,
+//! keeps the gateway alive through [`crate::supervisor`], and serves three
+//! ALPNs (pairing, raw UHP, and the [`crate::hub`]) plus the local
+//! [`crate::admin`] socket until it is told to stop.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use iroh::endpoint::{
     AfterHandshakeOutcome, Connection, EndpointHooks, RecvStream, SendStream, Side, presets,
@@ -18,8 +24,11 @@ use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::io::AsyncWriteExt;
 
+use crate::admin::{self, Admin};
 use crate::enroll::{AuthState, CONTROL_ALPN, Control, ENROLLMENT_TTL};
-use crate::{Descriptor, Error, Result};
+use crate::hub::{HUB_ALPN, Hub};
+use crate::supervisor::{self, GatewayLink};
+use crate::{AccessOptions, Error, Result};
 
 /// The ALPN every `pilus` peer speaks.
 pub const ALPN: &[u8] = b"luvus/uhp/1";
@@ -27,7 +36,8 @@ pub const ALPN: &[u8] = b"luvus/uhp/1";
 /// How the iroh listener is configured.
 #[derive(Clone, Debug)]
 pub struct P2pOptions {
-    /// The gateway loopback address each stream is bridged to.
+    /// The gateway loopback address each stream is bridged to. Ignored by
+    /// [`serve`], which supervises its own gateway.
     pub gateway: String,
     /// Self-hosted or dedicated relay URL; `None` uses the n0 public relays.
     pub relay: Option<String>,
@@ -90,9 +100,16 @@ pub async fn bind(
 }
 
 /// Serve inbound UHP and control streams until the process is interrupted.
+///
+/// This is the fixed-gateway form the tests use: the caller owns the gateway.
 pub async fn run(endpoint: Endpoint, gateway: String, auth: Arc<AuthState>) -> Result<()> {
     let router = Router::builder(endpoint)
-        .accept(ALPN, Uhp { gateway })
+        .accept(
+            ALPN,
+            Uhp {
+                link: GatewayLink::fixed(gateway),
+            },
+        )
         .accept(CONTROL_ALPN, Control::new(auth))
         .spawn();
     tokio::signal::ctrl_c().await.map_err(Error::Io)?;
@@ -100,32 +117,151 @@ pub async fn run(endpoint: Endpoint, gateway: String, auth: Arc<AuthState>) -> R
     Ok(())
 }
 
-/// Run the iroh listener until the process is interrupted.
+/// How [`serve`] runs.
+#[derive(Clone, Debug)]
+pub struct ServeConfig {
+    /// Relay and allow-list.
+    pub p2p: P2pOptions,
+    /// Where the iroh identity lives; `devices.json` and `agent.sock` sit
+    /// beside it.
+    pub key_path: PathBuf,
+    /// The `luvus` binary, or `None` to discover it on every attempt.
+    pub binary: Option<PathBuf>,
+    /// How the gateway is started.
+    pub access: AccessOptions,
+    /// Run as a background service: never write enrollment codes to the log.
+    pub quiet: bool,
+}
+
+/// Run the connector until it receives SIGINT or SIGTERM.
 ///
-/// Pairs with the gateway once, then prints the `EndpointId`, the
-/// `EndpointTicket` a device scans, and the one-time `enroll` code that admits
-/// it.
-pub async fn serve(options: P2pOptions, key_path: &Path, descriptor: &Descriptor) -> Result<()> {
-    let token = crate::pair(descriptor)?;
-    let devices_path = key_path.with_file_name("devices.json");
+/// Prints the endpoint id and ticket (never the enrollment code in `quiet`
+/// mode; the window mints codes through the admin socket instead).
+pub async fn serve(config: ServeConfig) -> Result<()> {
+    let devices_path = config.key_path.with_file_name("devices.json");
+    // The token is empty until the supervisor pairs; the control channel
+    // refuses to hand out an empty one.
     let auth = Arc::new(AuthState::load(
-        token,
+        String::new(),
         devices_path,
-        &options.allow,
+        &config.p2p.allow,
         ENROLLMENT_TTL,
     )?);
-    let endpoint = bind(key_path, options.relay.clone(), Arc::clone(&auth)).await?;
+    let endpoint = bind(
+        &config.key_path,
+        config.p2p.relay.clone(),
+        Arc::clone(&auth),
+    )
+    .await?;
     let ticket = EndpointTicket::new(endpoint.addr());
     println!("endpoint id: {}", endpoint.id());
     println!("ticket:      {ticket}");
-    match auth.enrollment() {
-        Some((code, expires_at)) => {
-            println!("enroll:      {code}");
-            eprintln!("pilus-agent: the enrollment code expires at unix {expires_at}");
+    if !config.quiet {
+        match auth.enrollment() {
+            Some((code, expires_at)) => {
+                println!("enroll:      {code}");
+                eprintln!("pilus-agent: the enrollment code expires at unix {expires_at}");
+            }
+            None => eprintln!("pilus-agent: enrollment is disabled by --allow"),
         }
-        None => eprintln!("pilus-agent: enrollment is disabled by --allow"),
     }
-    run(endpoint, options.gateway, auth).await
+
+    let link = GatewayLink::down();
+    let stop = Arc::new(AtomicBool::new(false));
+    let supervisor = {
+        let (binary, access) = (config.binary.clone(), config.access.clone());
+        let (auth, link, stop) = (Arc::clone(&auth), Arc::clone(&link), Arc::clone(&stop));
+        std::thread::Builder::new()
+            .name("pilus-gateway-supervisor".to_string())
+            .spawn(move || supervisor::supervise(binary, access, auth, link, stop))
+            .map_err(Error::Io)?
+    };
+
+    let label = machine_label();
+    let hub = Hub::new(
+        Arc::clone(&link),
+        label.clone(),
+        Arc::clone(&auth),
+        config.access.session.clone(),
+    );
+    let router = Router::builder(endpoint.clone())
+        .accept(
+            ALPN,
+            Uhp {
+                link: Arc::clone(&link),
+            },
+        )
+        .accept(HUB_ALPN, hub)
+        .accept(
+            CONTROL_ALPN,
+            if config.quiet {
+                Control::quiet(Arc::clone(&auth))
+            } else {
+                Control::new(Arc::clone(&auth))
+            },
+        )
+        .spawn();
+
+    let admin_path = config.key_path.with_file_name("agent.sock");
+    let admin_task = tokio::spawn({
+        let admin = Admin {
+            endpoint: endpoint.clone(),
+            auth: Arc::clone(&auth),
+            link: Arc::clone(&link),
+            label,
+        };
+        let path = admin_path.clone();
+        async move {
+            if let Err(error) = admin::serve(&path, admin).await {
+                eprintln!("pilus-agent: admin socket stopped: {error}");
+            }
+        }
+    });
+
+    wait_for_shutdown().await?;
+    admin_task.abort();
+    let _ = std::fs::remove_file(&admin_path);
+    let _ = router.shutdown().await;
+    // The supervisor owns the gateway child; letting it exit drops (kills) it.
+    stop.store(true, Ordering::Relaxed);
+    let _ = tokio::task::spawn_blocking(move || supervisor.join()).await;
+    Ok(())
+}
+
+/// Resolve on SIGINT, or SIGTERM where the service manager sends it.
+async fn wait_for_shutdown() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate()).map_err(Error::Io)?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(Error::Io),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.map_err(Error::Io)
+    }
+}
+
+/// The name a phone should show for this machine.
+pub fn machine_label() -> String {
+    #[cfg(target_os = "macos")]
+    if let Some(name) = command_output("scutil", &["--get", "ComputerName"]) {
+        return name;
+    }
+    command_output("hostname", &[]).unwrap_or_else(|| "this machine".to_string())
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let text = text.trim();
+    (output.status.success() && !text.is_empty()).then(|| text.to_string())
 }
 
 /// Rejects unenrolled peers from the UHP surface.
@@ -157,15 +293,15 @@ impl EndpointHooks for Gate {
 /// One ALPN handler: each accepted bidirectional stream is one UHP connection.
 #[derive(Clone, Debug)]
 struct Uhp {
-    gateway: String,
+    link: Arc<GatewayLink>,
 }
 
 impl ProtocolHandler for Uhp {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         while let Ok((send, recv)) = connection.accept_bi().await {
-            let gateway = self.gateway.clone();
+            let link = Arc::clone(&self.link);
             tokio::spawn(async move {
-                if let Err(error) = bridge(&gateway, send, recv).await {
+                if let Err(error) = bridge(&link, send, recv).await {
                     eprintln!("pilus-agent: stream bridge failed: {error}");
                 }
             });
@@ -175,8 +311,26 @@ impl ProtocolHandler for Uhp {
 }
 
 /// Pump one QUIC bidirectional stream to one gateway connection and back.
-async fn bridge(gateway: &str, mut send: SendStream, mut recv: RecvStream) -> std::io::Result<()> {
-    let tcp = tokio::net::TcpStream::connect(gateway).await?;
+///
+/// While the gateway is down the peer gets a UHP-shaped error instead of a
+/// stalled stream, so a client can tell "host is up, Luvus is not" from "host
+/// is unreachable".
+async fn bridge(
+    link: &GatewayLink,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> std::io::Result<()> {
+    let Some(gateway) = link.address() else {
+        let why = link
+            .error()
+            .unwrap_or_else(|| "the Luvus gateway is not running".to_string());
+        let reply = serde_json::json!({ "error": { "code": "unavailable", "message": why } });
+        send.write_all(reply.to_string().as_bytes()).await?;
+        send.write_all(b"\n").await?;
+        let _ = send.finish();
+        return Ok(());
+    };
+    let tcp = tokio::net::TcpStream::connect(&gateway).await?;
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
     let upload = tokio::spawn(async move {
         let _ = tokio::io::copy(&mut recv, &mut tcp_write).await;

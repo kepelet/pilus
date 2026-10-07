@@ -107,11 +107,16 @@ const PICKER_GAP: f32 = 4.0;
 const PICKER_FIELD_H: f32 = 28.0;
 /// Grid offset from the window top: tab strip plus its top spacing.
 const HEADER_HEIGHT: f32 = 40.0;
-/// Daemon rows skipped at the top of the grid. The daemon draws its own tab
-/// strip plus a cwd breadcrumb there; the grid starts below them so only
-/// native chrome shows. Selection and click coordinates stay in daemon rows,
-/// so copy and gear clicks keep working.
+/// Daemon rows skipped at the top of the grid when it draws a title: its own
+/// tab strip plus a cwd breadcrumb, as older Luvus always did and newer Luvus
+/// does with `show_title` on. The grid starts below them so only native
+/// chrome shows. Selection and click coordinates stay in daemon rows, so copy
+/// and gear clicks keep working.
 const SKIPPED_DAEMON_ROWS: u16 = 2;
+/// Daemon rows skipped above the grid without the title row: newer Luvus
+/// draws the tab strip alone, and skipping two rows would hide the prompt a
+/// `clear` leaves on the first pane row. The "top spacing" setting picks it.
+const SKIPPED_DAEMON_ROWS_UNTITLED: u16 = 1;
 /// Daemon rows skipped at the grid bottom: its one-row status line, which the
 /// native shell omits. Assumes a single-row status line.
 const SKIPPED_DAEMON_BOTTOM_ROWS: u16 = 1;
@@ -5982,6 +5987,7 @@ impl PilusView {
             .child(self.agent_config_section_block(cx))
             .child(self.notifications_section_block(cx))
             .child(self.pi_gui_section_block(cx))
+            .child(self.terminal_section_block(cx))
             .child(self.updates_section_block(cx));
         div()
             .flex()
@@ -6656,6 +6662,65 @@ impl PilusView {
     /// Toggle the native pi view and persist the choice at once.
     fn toggle_pi_gui(&mut self, cx: &mut Context<Self>) {
         self.settings.pi_gui_auto = !self.settings.pi_gui_auto;
+        self.settings.save(&self.pilus_root);
+        *self.shared_settings.borrow_mut() = self.settings.clone();
+        cx.notify();
+    }
+
+    /// The TERMINAL section of the page: whether the grid shows the daemon
+    /// row under its tab strip, which only a titled Luvus fills. Remote
+    /// machines and the local daemon are set apart, since they can run
+    /// different Luvus versions.
+    fn terminal_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let remote = style::checkbox(
+            "pilus-terminal-top-spacing",
+            self.settings.terminal_top_spacing,
+            "Add top spacing to remote terminals",
+            theme,
+            self.footer_font(),
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.settings.terminal_top_spacing = !this.settings.terminal_top_spacing;
+            this.save_settings(cx);
+        }));
+        let local = style::checkbox(
+            "pilus-local-terminal-top-spacing",
+            self.settings.local_terminal_top_spacing,
+            "Add top spacing to the local terminal",
+            theme,
+            self.footer_font(),
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.settings.local_terminal_top_spacing = !this.settings.local_terminal_top_spacing;
+            this.save_settings(cx);
+        }));
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .px_3()
+                    .child(style::section_label(theme, "TERMINAL", self.section_font())),
+            )
+            .child(div().px_3().child(remote))
+            .child(div().px_3().child(local))
+            .child(
+                div()
+                    .px_3()
+                    .text_size(px(self.footer_font()))
+                    .text_color(theme.muted)
+                    .child(
+                        "For newer Luvus without show_title. Turn off for older Luvus \
+                         or when show_title is enabled",
+                    ),
+            )
+    }
+
+    /// Persist a settings change at once. A top-spacing change resizes the
+    /// daemon on the next render, since the skipped rows ride along.
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
         self.settings.save(&self.pilus_root);
         *self.shared_settings.borrow_mut() = self.settings.clone();
         cx.notify();
@@ -7812,18 +7877,18 @@ impl PilusView {
         };
         let layout = self.card_layout(window, self.framed());
         let skip = u32::from(self.skipped_cols());
+        let skip_rows = u32::from(self.skipped_rows());
         let paint_w = u32::from(layout.cols).min(u32::from(width).saturating_sub(skip));
-        let paint_h = u32::from(layout.rows).min(u32::from(height).saturating_sub(
-            u32::from(SKIPPED_DAEMON_ROWS) + u32::from(SKIPPED_DAEMON_BOTTOM_ROWS),
-        ));
+        let paint_h = u32::from(layout.rows).min(
+            u32::from(height).saturating_sub(skip_rows + u32::from(SKIPPED_DAEMON_BOTTOM_ROWS)),
+        );
         let y = (f32::from(position.y) - layout.origin_y) / layout.cell_h;
         let x = (f32::from(position.x) - layout.origin_x) / layout.cell_w;
         if y < 0.0 || x < 0.0 {
             return None;
         }
         let column = skip.saturating_add((x as u32).min(paint_w.saturating_sub(1)));
-        let row = u32::from(SKIPPED_DAEMON_ROWS)
-            .saturating_add((y as u32).min(paint_h.saturating_sub(1)));
+        let row = skip_rows.saturating_add((y as u32).min(paint_h.saturating_sub(1)));
         Some(Cell {
             column: column as u16,
             row: row as u16,
@@ -8117,16 +8182,15 @@ impl PilusView {
     fn select_all(&mut self, window: &Window, cx: &mut Context<Self>) {
         let layout = self.card_layout(window, self.framed());
         let skip = self.skipped_cols();
+        let skip_rows = self.skipped_rows();
         self.selection = Some(Selection {
             anchor: Cell {
                 column: skip,
-                row: SKIPPED_DAEMON_ROWS,
+                row: skip_rows,
             },
             cursor: Cell {
                 column: skip.saturating_add(layout.cols).saturating_sub(1),
-                row: SKIPPED_DAEMON_ROWS
-                    .saturating_add(layout.rows)
-                    .saturating_sub(1),
+                row: skip_rows.saturating_add(layout.rows).saturating_sub(1),
             },
         });
         cx.notify();
@@ -9568,6 +9632,17 @@ impl PilusView {
     /// `ShellDock` control message: the server updates the dock before sending
     /// the matching frame, so jumping the skip on the control message paints
     /// the old frame's blank dock cells as a black band mid-toggle.
+    /// Daemon rows above the pane for the endpoint on screen. The local
+    /// daemon and remote machines take separate settings, since they can run
+    /// different Luvus versions.
+    fn skipped_rows(&self) -> u16 {
+        let top_spacing = match self.active {
+            EndpointId::Local => self.settings.local_terminal_top_spacing,
+            EndpointId::Machine(_) => self.settings.terminal_top_spacing,
+        };
+        skipped_rows(top_spacing)
+    }
+
     fn skipped_cols(&self) -> u16 {
         if let Some((_, skip, _)) = &self.sidebar_freeze {
             return *skip;
@@ -11244,7 +11319,7 @@ impl PilusView {
         let cols = layout.cols.saturating_add(self.skipped_cols());
         let rows = layout
             .rows
-            .saturating_add(SKIPPED_DAEMON_ROWS)
+            .saturating_add(self.skipped_rows())
             .saturating_add(SKIPPED_DAEMON_BOTTOM_ROWS);
         let cell = (
             layout.cell_w.round().clamp(1.0, 65535.0) as u16,
@@ -11315,18 +11390,28 @@ fn pane_cells(frame: PaneFrame, cols: u16, rows: u16) -> PaneCells {
     }
 }
 
+/// Daemon rows above the pane: the tab strip alone when the terminal takes
+/// top spacing, the tab strip and its title row otherwise.
+fn skipped_rows(top_spacing: bool) -> u16 {
+    if top_spacing {
+        SKIPPED_DAEMON_ROWS_UNTITLED
+    } else {
+        SKIPPED_DAEMON_ROWS
+    }
+}
+
 /// A copy of `frame` with the split pi pane's cells blanked.
 ///
 /// The panel over the pane is glass under translucency, so whatever the
 /// cells beneath it hold — pi's own TUI — would read through it. Blank
 /// cells keep the grid's glass there and nothing else.
-fn mask_pane(frame: &FrameData, cells: PaneCells, skip_cols: u16) -> FrameData {
+fn mask_pane(frame: &FrameData, cells: PaneCells, skip_cols: u16, skip_rows: u16) -> FrameData {
     let mut masked = frame.clone();
     let width = usize::from(frame.width);
     let col0 = usize::from(skip_cols.saturating_add(cells.col0)).min(width);
     let col1 = usize::from(skip_cols.saturating_add(cells.col1)).min(width);
     for row in cells.row0..cells.row1 {
-        let row = usize::from(SKIPPED_DAEMON_ROWS.saturating_add(row));
+        let row = usize::from(skip_rows.saturating_add(row));
         if row >= usize::from(frame.height) {
             break;
         }
@@ -11431,7 +11516,7 @@ impl Render for PilusView {
         let sealed = match self.shown_frame() {
             Some(frame) => {
                 frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS)
-                    >= SKIPPED_DAEMON_ROWS.saturating_add(layout.rows)
+                    >= self.skipped_rows().saturating_add(layout.rows)
             }
             None => false,
         };
@@ -11467,6 +11552,7 @@ impl Render for PilusView {
                     frame,
                     pane_cells(pane, layout.cols, layout.rows),
                     self.skipped_cols(),
+                    self.skipped_rows(),
                 )
             });
         let grid = match masked.as_ref().or(self.shown_frame()) {
@@ -11479,6 +11565,7 @@ impl Render for PilusView {
                 selection,
                 cell_width,
                 self.skipped_cols(),
+                self.skipped_rows(),
                 layout.cols,
                 layout.rows,
                 glass,
@@ -11721,17 +11808,18 @@ fn render_grid(
     selection: Option<Selection>,
     cell_width: f32,
     skip_cols: u16,
+    skip_rows: u16,
     max_cols: u16,
     max_rows: u16,
     glass: f32,
     slack_x: f32,
     slack_y: f32,
 ) -> Div {
-    let end_row = SKIPPED_DAEMON_ROWS
+    let end_row = skip_rows
         .saturating_add(max_rows)
         .min(frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS));
     let mut column = div().flex().flex_col().size_full();
-    for row in SKIPPED_DAEMON_ROWS..end_row.max(SKIPPED_DAEMON_ROWS) {
+    for row in skip_rows..end_row.max(skip_rows) {
         column = column.child(render_row(
             frame,
             row,
@@ -11751,7 +11839,7 @@ fn render_grid(
     // that row's colors over it so no card-colored sliver shows. Always emit
     // it when a row painted: a zero or sub-pixel remainder still has to keep
     // the transparent card covered at fractional window heights.
-    if end_row > SKIPPED_DAEMON_ROWS {
+    if end_row > skip_rows {
         column = column.child(bottom_fill(
             frame,
             end_row - 1,
@@ -13386,6 +13474,12 @@ mod tests {
     }
 
     #[test]
+    fn top_spacing_keeps_the_row_under_the_daemon_tab_strip() {
+        assert_eq!(skipped_rows(true), 1);
+        assert_eq!(skipped_rows(false), SKIPPED_DAEMON_ROWS);
+    }
+
+    #[test]
     fn a_split_pi_pane_is_blanked_under_its_panel() {
         let mut frame = FrameData::blank(6, SKIPPED_DAEMON_ROWS + 2, 0x00ff_ffff, 0);
         for cell in &mut frame.cells {
@@ -13402,7 +13496,7 @@ mod tests {
             4,
             2,
         );
-        let masked = mask_pane(&frame, cells, 2);
+        let masked = mask_pane(&frame, cells, 2, SKIPPED_DAEMON_ROWS);
         let row = usize::from(SKIPPED_DAEMON_ROWS) * 6;
         let symbols: Vec<&str> = masked.cells[row..row + 6].iter().map(symbol).collect();
         assert_eq!(symbols, ["x", "x", "x", "x", " ", " "]);

@@ -7,8 +7,8 @@
 //! demand, so the page asks for a `mission.refresh` when it opens, when the
 //! scope changes, and when the user presses Refresh, then keeps re-reading the
 //! cheap snapshot. Every row action is a UHP call made off the GUI thread
-//! (answer, approve, interrupt, fork, close, resume, and the automation
-//! run/pause controls); the next snapshot redraws the result, so the page
+//! (answer, approve, interrupt, fork, close, and resume); the next snapshot
+//! redraws the result, so the page
 //! never edits a row locally. The one exception is dismissing a resumable
 //! session, which the daemon keeps no API for: it is hidden on this client.
 //!
@@ -23,10 +23,9 @@ use gpui::{
     Anchor, AnyElement, ClickEvent, Context, Div, Entity, FontWeight, Hsla, KeyDownEvent, Rgba,
     SharedString, anchored, deferred, div, point, prelude::*, px,
 };
-use pilus_client::{
-    AutomationDetail, AutomationHealth, AutomationRow, MissionRow, MissionScope, MissionSnapshot,
-};
+use pilus_client::{AutomationRow, MissionRow, MissionScope, MissionSnapshot};
 
+use super::automations::{automation_color, automation_label, automation_signal};
 use super::style::{self, ButtonKind, FillExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
@@ -97,15 +96,6 @@ impl Signal {
     }
 }
 
-/// What the side pane is showing.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum Selection {
-    /// An agent row, by its [`row_keys`] key.
-    Agent(String),
-    /// An automation definition, by id.
-    Automation(String),
-}
-
 /// A message from a background request.
 pub(super) enum MissionMsg {
     Snapshot {
@@ -113,10 +103,6 @@ pub(super) enum MissionMsg {
         result: Result<(MissionSnapshot, HashMap<String, String>), String>,
     },
     Budget(Option<f64>),
-    Detail {
-        id: String,
-        result: Result<AutomationDetail, String>,
-    },
     /// An action landed (or failed); re-read so the rows catch up.
     Done(String),
 }
@@ -136,7 +122,8 @@ pub(super) struct MissionPanel {
     /// Ask for a usage scan with the next read.
     rescan: bool,
     error: Option<String>,
-    selection: Option<Selection>,
+    /// The selected agent row, by its [`row_keys`] key.
+    selection: Option<String>,
     /// Whether the side pane shows the selection (the daemon's `o`).
     detail_open: bool,
     answering: bool,
@@ -147,7 +134,6 @@ pub(super) struct MissionPanel {
     hints: HashMap<String, String>,
     /// Resumable sessions hidden on this client.
     dismissed: HashSet<String>,
-    automation: Option<(String, Option<Result<AutomationDetail, String>>)>,
     status: String,
     tx: Sender<MissionMsg>,
     rx: Receiver<MissionMsg>,
@@ -173,7 +159,6 @@ impl Default for MissionPanel {
             confirm_close: None,
             hints: HashMap::new(),
             dismissed: HashSet::new(),
-            automation: None,
             status: String::new(),
             tx,
             rx,
@@ -196,7 +181,6 @@ impl MissionPanel {
         self.open = false;
         self.answering = false;
         self.confirm_close = None;
-        self.automation = None;
         self.selection = None;
         self.status.clear();
     }
@@ -216,7 +200,6 @@ impl MissionPanel {
         self.fetched_at = None;
         self.rescan = true;
         self.selection = None;
-        self.automation = None;
         self.answering = false;
         self.confirm_close = None;
     }
@@ -235,10 +218,7 @@ impl MissionPanel {
     }
 
     fn selected_key(&self) -> Option<&str> {
-        match &self.selection {
-            Some(Selection::Agent(key)) => Some(key),
-            _ => None,
-        }
+        self.selection.as_deref()
     }
 }
 
@@ -273,7 +253,7 @@ fn resume_ordinal(key: &str) -> usize {
 
 /// The key `delta` rows from `current`, clamped. With nothing selected,
 /// moving down picks the first row and moving up the last.
-fn step_key(keys: &[String], current: Option<&str>, delta: isize) -> Option<String> {
+pub(super) fn step_key(keys: &[String], current: Option<&str>, delta: isize) -> Option<String> {
     if keys.is_empty() {
         return None;
     }
@@ -349,7 +329,7 @@ fn blocked_line(output: &str) -> Option<String> {
 }
 
 /// A deadline relative to `now`: `in 4m`, `in 3h`, `in 2d`, or `due`.
-fn until_label(now: u64, at: u64) -> String {
+pub(super) fn until_label(now: u64, at: u64) -> String {
     let secs = at.saturating_sub(now);
     match secs {
         0 => "due".to_string(),
@@ -361,7 +341,7 @@ fn until_label(now: u64, at: u64) -> String {
 }
 
 /// A Unix time as `Oct 06 14:00 UTC`.
-fn utc_label(at: u64) -> String {
+pub(super) fn utc_label(at: u64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
@@ -390,42 +370,10 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-fn unix_now() -> u64 {
+pub(super) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
-}
-
-/// The tint for an automation state.
-fn automation_color(state: &str, theme: Theme) -> Rgba {
-    match state {
-        "running" => theme.accent,
-        "restoring" => theme.branch,
-        "review" | "failed" | "unavailable" | "needs_rebind" => theme.alert,
-        "scheduled" | "completed" => theme.ok,
-        _ => theme.muted,
-    }
-}
-
-/// An automation state as a label.
-fn automation_label(state: &str) -> String {
-    match state {
-        "needs_rebind" => "Needs rebind".to_string(),
-        other => super::status_label(other),
-    }
-}
-
-/// The automation strip's headline: what the scheduler needs from you.
-fn automation_signal(health: AutomationHealth, theme: Theme) -> (&'static str, Rgba) {
-    if health.review > 0 || health.failed > 0 {
-        ("Attention", theme.alert)
-    } else if health.running > 0 {
-        ("Running", theme.accent)
-    } else if health.scheduled > 0 {
-        ("Scheduled", theme.ok)
-    } else {
-        ("Idle", theme.muted)
-    }
 }
 
 /// A row action.
@@ -480,7 +428,7 @@ impl PilusView {
         let panel = &mut self.mission;
         panel.endpoint = Some(active);
         panel.open = true;
-        panel.selection = keys.first().cloned().map(Selection::Agent);
+        panel.selection = keys.first().cloned();
         panel.snapshot = Some(snapshot);
         panel.hints = hints;
         panel.budget = Some(50.0);
@@ -494,20 +442,6 @@ impl PilusView {
     #[cfg(feature = "visual-test")]
     pub(super) fn mission_show_answer(&mut self, cx: &mut Context<Self>) {
         self.mission_open_answer(cx);
-    }
-
-    /// Shot-harness entry point: show an automation's detail, canned.
-    #[cfg(feature = "visual-test")]
-    pub(super) fn mission_show_automation(
-        &mut self,
-        detail: AutomationDetail,
-        cx: &mut Context<Self>,
-    ) {
-        let panel = &mut self.mission;
-        panel.answering = false;
-        panel.selection = Some(Selection::Automation(detail.id.clone()));
-        panel.automation = Some((detail.id.clone(), Some(Ok(detail))));
-        cx.notify();
     }
 
     fn mission_fetch_budget(&self) {
@@ -577,21 +511,9 @@ impl PilusView {
                 }
             }
             MissionMsg::Budget(budget) => panel.budget = budget,
-            MissionMsg::Detail { id, result } => {
-                if let Some((open, slot)) = &mut panel.automation
-                    && *open == id
-                {
-                    *slot = Some(result);
-                }
-            }
             MissionMsg::Done(text) => {
                 panel.status = text;
                 panel.fetched_at = None;
-                // A run or pause changes the definition the pane shows.
-                if let Some((id, _)) = &panel.automation {
-                    let id = id.clone();
-                    self.mission_load_automation(id);
-                }
             }
         }
     }
@@ -645,37 +567,14 @@ impl PilusView {
         cx.notify();
     }
 
-    fn mission_select(&mut self, selection: Option<Selection>, cx: &mut Context<Self>) {
+    fn mission_select(&mut self, selection: Option<String>, cx: &mut Context<Self>) {
         let panel = &mut self.mission;
         if panel.selection != selection {
             panel.answering = false;
             panel.confirm_close = None;
         }
-        panel.automation = None;
-        if let Some(Selection::Automation(id)) = &selection {
-            panel.automation = Some((id.clone(), None));
-            let id = id.clone();
-            panel.selection = selection;
-            panel.detail_open = true;
-            self.mission_load_automation(id);
-        } else {
-            panel.selection = selection;
-        }
+        panel.selection = selection;
         cx.notify();
-    }
-
-    fn mission_load_automation(&self, id: String) {
-        let tx = self.mission.tx.clone();
-        let client = self.control_client_for_endpoint(&self.active);
-        std::thread::spawn(move || {
-            let result = match client {
-                Some(mut client) => client
-                    .automation_detail(&id)
-                    .map_err(|error| error.to_string()),
-                None => Err("Could not reach the daemon".to_string()),
-            };
-            tx.send(MissionMsg::Detail { id, result }).ok();
-        });
     }
 
     /// The selected agent row and its key.
@@ -851,34 +750,6 @@ impl PilusView {
         );
     }
 
-    fn mission_automation_op(
-        &mut self,
-        id: String,
-        run: bool,
-        enable: bool,
-        cx: &mut Context<Self>,
-    ) {
-        self.mission_spawn(
-            if run {
-                "Requesting a run…".to_string()
-            } else if enable {
-                "Enabling…".to_string()
-            } else {
-                "Pausing…".to_string()
-            },
-            move |client| {
-                if run {
-                    client.run_automation(&id)?;
-                    Ok("Run requested".to_string())
-                } else {
-                    client.set_automation_enabled(&id, enable)?;
-                    Ok(if enable { "Enabled" } else { "Paused" }.to_string())
-                }
-            },
-            cx,
-        );
-    }
-
     /// The page's keys; the answer field takes typing while it is open.
     pub(super) fn mission_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
@@ -904,7 +775,7 @@ impl PilusView {
             .map(|(key, _)| key)
             .collect();
         let current = self.mission.selected_key().map(str::to_string);
-        let step = |delta| step_key(&keys, current.as_deref(), delta).map(Selection::Agent);
+        let step = |delta| step_key(&keys, current.as_deref(), delta);
         match key {
             "down" | "j" => self.mission_select(step(1), cx),
             "up" | "k" => self.mission_select(step(-1), cx),
@@ -928,7 +799,6 @@ impl PilusView {
                 if panel.confirm_close.take().is_none() && panel.selection.take().is_none() {
                     panel.close();
                 }
-                panel.automation = None;
                 cx.notify();
             }
             _ => {}
@@ -1025,7 +895,12 @@ impl PilusView {
     fn mission_header(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let machines = self.mission_machines(cx);
+        let machines = self.machine_picker(
+            "mission",
+            self.mission.machine_menu,
+            |this| &mut this.mission.machine_menu,
+            cx,
+        );
         let refreshing = self
             .mission
             .snapshot
@@ -1066,9 +941,17 @@ impl PilusView {
             .child(refresh)
     }
 
-    /// The machine picker, the same face and list as the Tasks page's: Local
-    /// and every enabled saved machine. Absent when Local is the only one.
-    fn mission_machines(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// A page's machine picker, the same face and list as the Tasks page's:
+    /// Local and every enabled saved machine. Absent when Local is the only
+    /// one. `menu` reaches the page's own open flag; picking a machine
+    /// switches the active endpoint, and the page follows it.
+    pub(super) fn machine_picker(
+        &self,
+        page: &'static str,
+        open: bool,
+        menu: fn(&mut Self) -> &mut bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let mut endpoints = vec![EndpointId::Local];
@@ -1081,9 +964,8 @@ impl PilusView {
         if endpoints.len() < 2 {
             return None;
         }
-        let open = self.mission.machine_menu;
         let mut face = picker_face(
-            "pilus-mission-machine-picker",
+            format!("pilus-{page}-machine-picker"),
             icon(
                 include_bytes!("../../assets/icons/server.svg"),
                 14.0,
@@ -1096,16 +978,17 @@ impl PilusView {
             theme.panel,
             theme,
             fonts.secondary,
-            cx.listener(|this, _, _, cx| {
-                this.mission.machine_menu = !this.mission.machine_menu;
+            cx.listener(move |this, _, _, cx| {
+                let open = menu(this);
+                *open = !*open;
                 cx.notify();
             }),
         );
         if open {
-            let mut list = picker_menu("pilus-mission-machine-menu", theme)
+            let mut list = picker_menu(format!("pilus-{page}-machine-menu"), theme)
                 .max_h(px(PICKER_MENU_MAX_H))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.mission.machine_menu = false;
+                .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                    *menu(this) = false;
                     cx.notify();
                 }));
             for endpoint in endpoints {
@@ -1113,7 +996,7 @@ impl PilusView {
                 let target = endpoint.clone();
                 list = list.child(
                     div()
-                        .id(format!("pilus-mission-machine-{}", endpoint.key()))
+                        .id(format!("pilus-{page}-machine-{}", endpoint.key()))
                         .flex()
                         .flex_row()
                         .items_center()
@@ -1150,7 +1033,7 @@ impl PilusView {
                                 .child(self.endpoint_label(&endpoint)),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.mission.machine_menu = false;
+                            *menu(this) = false;
                             this.activate_endpoint(target.clone(), None, None, cx);
                             cx.notify();
                         })),
@@ -1163,7 +1046,7 @@ impl PilusView {
                             .anchor(Anchor::TopLeft)
                             .offset(point(px(0.0), px(PICKER_CHIP_H + 4.0)))
                             .snap_to_window_with_margin(px(8.0))
-                            .child(style::enter("pilus-mission-machine-enter", list)),
+                            .child(style::enter(format!("pilus-{page}-machine-enter"), list)),
                     )
                     .with_priority(2),
                 ),
@@ -1208,7 +1091,7 @@ impl PilusView {
             if shown {
                 el.on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.mission.selection = Some(Selection::Agent(target.clone()));
+                    this.mission.selection = Some(target.clone());
                     this.mission.detail_open = true;
                     run(this, cx);
                 }))
@@ -1320,6 +1203,8 @@ impl PilusView {
     }
 
     /// The automation strip: scheduler health and one row per definition.
+    /// A row, or All, opens the Automations page, which owns the definitions'
+    /// detail and controls.
     fn mission_automations(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
@@ -1358,6 +1243,16 @@ impl PilusView {
                     .text_size(px(fonts.secondary))
                     .text_color(theme.muted)
                     .child(summary),
+            )
+            .child(
+                style::small_button(
+                    "pilus-mission-automations-all",
+                    "All automations",
+                    ButtonKind::Ghost,
+                    theme,
+                    fonts.secondary,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.open_automations(cx))),
             );
         let header = header.px_4().pt_4().pb_2();
         let mut column = div().flex().flex_col().child(header);
@@ -1387,8 +1282,7 @@ impl PilusView {
     ) -> impl IntoElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let selected = self.mission.selection == Some(Selection::Automation(row.id.clone()));
-        let (rest, hover) = row_fills(selected, theme);
+        let (rest, hover) = row_fills(false, theme);
         let color = automation_color(&row.state, theme);
         let id = row.id.clone();
         let next = row
@@ -1422,11 +1316,6 @@ impl PilusView {
                     .truncate()
                     .text_size(px(fonts.body))
                     .text_color(theme.panel_fg)
-                    .font_weight(if selected {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
                     .child(row.name.clone()),
             )
             .child(
@@ -1446,11 +1335,7 @@ impl PilusView {
                     .text_color(theme.muted)
                     .child(next),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let pick = Selection::Automation(id.clone());
-                let next = (this.mission.selection.as_ref() != Some(&pick)).then_some(pick);
-                this.mission_select(next, cx);
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.open_automation(id.clone(), cx)))
     }
 
     /// The agent table: one row per live agent, then resumable sessions.
@@ -1710,7 +1595,7 @@ impl PilusView {
             row_el
         };
         row_el.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-            let pick = Selection::Agent(key_owned.clone());
+            let pick = key_owned.clone();
             if event.click_count() >= 2 {
                 this.mission.selection = Some(pick);
                 this.mission_go(cx);
@@ -1721,35 +1606,25 @@ impl PilusView {
         }))
     }
 
-    /// The side pane: the selected agent or automation, then the fleet's
-    /// status counts and spend by model.
+    /// The side pane: the selected agent, then the fleet's status counts and
+    /// spend by model.
     fn mission_side(&self, rows: &[&MissionRow], cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let (title, content, actions): (SharedString, AnyElement, Option<Div>) =
-            match &self.mission.selection {
-                Some(Selection::Automation(id)) => (
-                    "Automation".into(),
-                    self.mission_automation_detail(id).into_any_element(),
-                    self.mission_automation_actions(id, cx),
-                ),
-                _ => match self.mission_selected_row() {
-                    Some((_, row)) => (
-                        "Selected agent".into(),
-                        self.mission_agent_detail(&row, cx).into_any_element(),
-                        Some(self.mission_agent_actions(&row, cx)),
-                    ),
-                    None => (
-                        "Selected agent".into(),
-                        div()
-                            .text_size(px(fonts.secondary))
-                            .text_color(theme.muted)
-                            .child("Select an agent to see its usage and act on it.")
-                            .into_any_element(),
-                        None,
-                    ),
-                },
-            };
+        let (content, actions): (AnyElement, Option<Div>) = match self.mission_selected_row() {
+            Some((_, row)) => (
+                self.mission_agent_detail(&row, cx).into_any_element(),
+                Some(self.mission_agent_actions(&row, cx)),
+            ),
+            None => (
+                div()
+                    .text_size(px(fonts.secondary))
+                    .text_color(theme.muted)
+                    .child("Select an agent to see its usage and act on it.")
+                    .into_any_element(),
+                None,
+            ),
+        };
         let header = div()
             .flex()
             .flex_row()
@@ -1760,11 +1635,7 @@ impl PilusView {
             .px_4()
             .border_b_1()
             .border_color(terminal_inset_border())
-            .child(style::section_label(
-                theme,
-                title.to_uppercase(),
-                fonts.label,
-            ))
+            .child(style::section_label(theme, "SELECTED AGENT", fonts.label))
             .child(
                 style::small_button(
                     "pilus-mission-side-close",
@@ -2076,212 +1947,6 @@ impl PilusView {
         )
     }
 
-    fn mission_automation_detail(&self, id: &str) -> Div {
-        let theme = self.theme;
-        let fonts = style::Fonts::resolve(&self.shared_settings);
-        let detail = match &self.mission.automation {
-            Some((open, Some(Ok(detail)))) if open == id => detail,
-            Some((open, Some(Err(error)))) if open == id => {
-                return div()
-                    .text_size(px(fonts.secondary))
-                    .text_color(theme.alert)
-                    .child(error.clone());
-            }
-            _ => {
-                let mut column = div().flex().flex_col().gap_2();
-                for (index, width) in [0.6, 0.8, 0.5].into_iter().enumerate() {
-                    column = column.child(style::skeleton(
-                        format!("pilus-mission-automation-skeleton-{index}"),
-                        theme,
-                        gpui::relative(width),
-                        fonts.body,
-                    ));
-                }
-                return column;
-            }
-        };
-        let now = unix_now();
-        let mut properties = div()
-            .flex()
-            .flex_col()
-            .child(self.mission_property("State", if detail.enabled { "Armed" } else { "Paused" }))
-            .child(self.mission_property("Schedule", detail.schedule.clone()))
-            .child(self.mission_property("Policy", detail.policy.clone()))
-            .child(self.mission_property("Target", detail.target.clone()))
-            .child(self.mission_property("Agent", detail.agent_id.clone()));
-        if !detail.mode.is_empty() {
-            properties = properties.child(self.mission_property("Run in", detail.mode.clone()));
-        }
-        if !detail.access.is_empty() {
-            properties = properties.child(self.mission_property(
-                "Access",
-                super::status_label(&detail.access.replace('_', " ")),
-            ));
-        }
-        if !detail.paths.is_empty() {
-            let mut paths = div().flex().flex_row().flex_wrap().gap_1();
-            for path in &detail.paths {
-                paths = paths.child(style::chip(theme, path.clone(), fonts.label));
-            }
-            properties = properties.child(self.mission_property("Paths", paths));
-        }
-        let mono = SharedString::from(style::mono_family(&self.shared_settings));
-        let block = |text: String| {
-            div()
-                .p_3()
-                .rounded_md()
-                .bg(theme.panel_dim)
-                .border_1()
-                .border_color(theme.border)
-                .font_family(mono.clone())
-                .text_size(px(fonts.secondary))
-                .text_color(theme.panel_fg)
-                .child(text)
-        };
-        let section = |label: &'static str, body: Div| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(style::section_label(theme, label, fonts.label))
-                .child(body)
-        };
-        let mut column = div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(style::title(theme, detail.name.clone(), fonts.title))
-            .child(properties);
-        if !detail.occurrences.is_empty() {
-            let mut list = div().flex().flex_col().gap_1();
-            for at in &detail.occurrences {
-                list = list.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .justify_between()
-                        .text_size(px(fonts.secondary))
-                        .child(div().text_color(theme.panel_fg).child(utc_label(*at)))
-                        .child(div().text_color(theme.muted).child(until_label(now, *at))),
-                );
-            }
-            column = column.child(section("NEXT RUNS", list));
-        }
-        let task = format!(
-            "{}{}",
-            detail.title,
-            if detail.prompt.is_empty() {
-                String::new()
-            } else {
-                format!("\n\n{}", detail.prompt)
-            }
-        );
-        column = column.child(section("TASK", block(task)));
-        if let Some(gate) = &detail.gate {
-            column = column.child(section("GATE", block(gate.clone())));
-        }
-        let mut history = div().flex().flex_col().gap_1();
-        if detail.runs.is_empty() {
-            history = history.child(
-                div()
-                    .text_size(px(fonts.secondary))
-                    .text_color(theme.muted)
-                    .child("No runs yet"),
-            );
-        }
-        for run in detail.runs.iter().take(8) {
-            let color = match run.status.as_str() {
-                "succeeded" | "delivered" => theme.ok,
-                "failed" | "review" => theme.alert,
-                "running" | "starting" | "pending" => theme.accent,
-                _ => theme.muted,
-            };
-            let mut line = div().flex().flex_col().child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .text_size(px(fonts.secondary))
-                    .child(
-                        div()
-                            .text_color(color)
-                            .child(super::status_label(&run.status)),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.muted)
-                            .child(utc_label(run.scheduled_at)),
-                    ),
-            );
-            if let Some(error) = &run.error {
-                line = line.child(
-                    div()
-                        .text_size(px(fonts.label))
-                        .text_color(theme.alert)
-                        .child(error.clone()),
-                );
-            }
-            history = history.child(line);
-        }
-        column.child(section("RUN HISTORY", history))
-    }
-
-    fn mission_automation_actions(&self, id: &str, cx: &mut Context<Self>) -> Option<Div> {
-        let theme = self.theme;
-        let fonts = style::Fonts::resolve(&self.shared_settings);
-        let enabled = match &self.mission.automation {
-            Some((open, Some(Ok(detail)))) if open == id => detail.enabled,
-            _ => return None,
-        };
-        let run_id = id.to_string();
-        let toggle_id = id.to_string();
-        Some(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .p_3()
-                .border_t_1()
-                .border_color(terminal_inset_border())
-                .child(
-                    style::small_button(
-                        "pilus-mission-automation-run",
-                        "Run now",
-                        ButtonKind::Primary,
-                        theme,
-                        fonts.secondary,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.mission_automation_op(run_id.clone(), true, false, cx);
-                    })),
-                )
-                .child(
-                    style::small_button(
-                        "pilus-mission-automation-toggle",
-                        if enabled { "Pause" } else { "Enable" },
-                        ButtonKind::Secondary,
-                        theme,
-                        fonts.secondary,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.mission_automation_op(toggle_id.clone(), false, !enabled, cx);
-                    })),
-                )
-                .child(div().flex_1())
-                .child(
-                    style::small_button(
-                        "pilus-mission-automation-close",
-                        "Close",
-                        ButtonKind::Ghost,
-                        theme,
-                        fonts.secondary,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.mission_select(None, cx))),
-                ),
-        )
-    }
-
     /// Live agents per state: the daemon's AGENT STATUS matrix.
     fn mission_status_counts(&self, rows: &[&MissionRow]) -> Div {
         let theme = self.theme;
@@ -2471,7 +2136,7 @@ impl PilusView {
 
 /// A list row's resting and hover fills: the selected row holds the panel
 /// pill, like the Tasks page.
-fn row_fills(selected: bool, theme: Theme) -> (Hsla, Hsla) {
+pub(super) fn row_fills(selected: bool, theme: Theme) -> (Hsla, Hsla) {
     if selected {
         (theme.panel.into(), theme.panel.into())
     } else {

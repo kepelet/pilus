@@ -8,6 +8,7 @@
 mod about;
 mod app_icon;
 mod appearances;
+mod automations;
 mod box_drawing;
 mod connector;
 mod glass;
@@ -45,6 +46,7 @@ use std::time::{Duration, Instant};
 
 use crate::settings::{CHROME_FONT, Settings, WindowGeometry};
 use crate::update::{UpdateChannel, UpdateRequest, describe_source};
+use automations::AutomationsPanel;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
     MouseEventKind,
@@ -895,6 +897,8 @@ enum InputLayer {
     Tasks,
     /// The native Mission Control page.
     Mission,
+    /// The native Automations page.
+    Automations,
     /// The native Pi Session page.
     Session,
     /// The live terminal grid.
@@ -904,14 +908,15 @@ enum InputLayer {
 /// Resolve the keyboard owner from which surfaces are open.
 ///
 /// Overlays sit above content, so the picker beats the palette and both beat
-/// the Home composer, Settings, and the session page.
+/// the Home composer, Settings, and the session page. `page` is the native
+/// page holding the keyboard (Tasks, Mission Control, or Automations); only
+/// one is ever open.
 fn top_layer(
     picker: bool,
     palette: bool,
     home: bool,
     settings: bool,
-    tasks: bool,
-    mission: bool,
+    page: Option<InputLayer>,
     session: bool,
 ) -> InputLayer {
     if picker {
@@ -922,10 +927,8 @@ fn top_layer(
         InputLayer::Home
     } else if settings {
         InputLayer::Settings
-    } else if tasks {
-        InputLayer::Tasks
-    } else if mission {
-        InputLayer::Mission
+    } else if let Some(page) = page {
+        page
     } else if session {
         InputLayer::Session
     } else {
@@ -1575,8 +1578,11 @@ struct PilusView {
     mission: MissionPanel,
     /// Mission Control's reply field for a blocked agent.
     mission_answer: Entity<TextInput>,
-    /// The terminal sharing the card with the open Mission Control or Tasks
-    /// page. Cleared whenever neither page is open.
+    /// The native Automations page: its state and the daemon's last read of
+    /// the definitions.
+    automations_page: AutomationsPanel,
+    /// The terminal sharing the card with the open Mission Control, Tasks,
+    /// or Automations page. Cleared whenever none of them is open.
     page_split: Option<PageSplit>,
     /// The Pi Session composer's field.
     session_prompt: Entity<TextInput>,
@@ -1952,6 +1958,7 @@ impl PilusView {
             tasks_op_tx,
             mission: MissionPanel::default(),
             mission_answer,
+            automations_page: AutomationsPanel::default(),
             page_split: None,
             session_prompt,
             agent_configs: Vec::new(),
@@ -2258,6 +2265,7 @@ impl PilusView {
             changed = true;
         }
         changed |= self.mission_tick();
+        changed |= self.automations_tick();
         while let Ok(resolved) = self.home_resolve_rx.try_recv() {
             self.home_resolve_pending = false;
             for (endpoint_key, home) in resolved.homes {
@@ -3633,6 +3641,7 @@ impl PilusView {
             InputLayer::Settings => self.settings_key(event, cx),
             InputLayer::Tasks => self.tasks_key(event, cx),
             InputLayer::Mission => self.mission_key(event, cx),
+            InputLayer::Automations => self.automations_key(event, cx),
             InputLayer::Session => {
                 let input = self.session_prompt.clone();
                 if self.session.key(&event.keystroke, &input, cx) {
@@ -3659,16 +3668,33 @@ impl PilusView {
             self.palette.is_open(),
             self.home.is_open(),
             self.settings_open,
-            self.tasks_panel.is_open() && !self.terminal_beside_page(),
-            self.mission.is_open() && !self.terminal_beside_page(),
+            self.page_layer().filter(|_| !self.terminal_beside_page()),
             self.session_owns_keys(),
         )
     }
 
-    /// The split of the open Mission Control or Tasks page, if any.
+    /// The open native page's input layer, if one is open.
+    fn page_layer(&self) -> Option<InputLayer> {
+        if self.tasks_panel.is_open() {
+            Some(InputLayer::Tasks)
+        } else if self.mission.is_open() {
+            Some(InputLayer::Mission)
+        } else if self.automations_page.is_open() {
+            Some(InputLayer::Automations)
+        } else {
+            None
+        }
+    }
+
+    /// The split of the open Mission Control, Tasks, or Automations page,
+    /// if any.
     fn page_split(&self) -> Option<PageSplit> {
-        let page_open = self.tasks_panel.is_open() || self.mission.is_open();
-        self.page_split.filter(|_| page_open)
+        self.page_split.filter(|_| self.split_page_open())
+    }
+
+    /// Whether a page that can share the card with the terminal is open.
+    fn split_page_open(&self) -> bool {
+        self.page_layer().is_some()
     }
 
     /// Whether the terminal beside a split page holds the keyboard.
@@ -4122,6 +4148,7 @@ impl PilusView {
         self.settings_open = false;
         self.tasks_panel.close();
         self.mission.close();
+        self.automations_page.close();
         self.home.close();
         self.update_url_editing = false;
     }
@@ -4362,6 +4389,21 @@ impl PilusView {
                 .overflow_hidden()
                 .child(self.mission_page(cx));
             return self.page_card("pilus-page-mission", page, grid, layout, terminal_fill, cx);
+        }
+        if self.automations_page.is_open() {
+            let page = div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.automations_page(cx));
+            return self.page_card(
+                "pilus-page-automations",
+                page,
+                grid,
+                layout,
+                terminal_fill,
+                cx,
+            );
         }
         if self.settings_open {
             return style::enter("pilus-page-settings", self.settings_page(cx)).into_any_element();
@@ -5535,6 +5577,7 @@ impl PilusView {
                 Some(self.mission_answer.focus_handle(cx))
             }
             InputLayer::Mission => None,
+            InputLayer::Automations => None,
             // An open session picker takes the keyboard, so a query reaches
             // its filter field instead of the prompt the user is typing.
             InputLayer::Session => Some(
@@ -9265,11 +9308,11 @@ impl PilusView {
 
     /// Split the focused pane; `right` is side by side, `down` is stacked.
     ///
-    /// With Mission Control or Tasks open there is no pane to split: the
-    /// page shares the card with the terminal instead.
+    /// With Mission Control, Tasks, or Automations open there is no pane to
+    /// split: the page shares the card with the terminal instead.
     fn split(&mut self, direction: &str, cx: &mut Context<Self>) {
         if let Some(axis) = SplitAxis::from_direction(direction)
-            && (self.tasks_panel.is_open() || self.mission.is_open())
+            && self.split_page_open()
         {
             self.page_split = PageSplit::after(self.page_split(), axis);
             cx.notify();
@@ -10520,6 +10563,9 @@ impl PilusView {
         if self.mission.is_open() {
             return kind == NavKind::Mission;
         }
+        if self.automations_page.is_open() {
+            return kind == NavKind::Automations;
+        }
         if self.nav_sel != Some(kind) {
             return false;
         }
@@ -10660,9 +10706,12 @@ impl PilusView {
                         this.open_tasks(cx);
                         return;
                     }
-                    // Automations live on Mission Control's automation strip.
-                    NavKind::Mission | NavKind::Automations => {
+                    NavKind::Mission => {
                         this.open_mission(cx);
+                        return;
+                    }
+                    NavKind::Automations => {
+                        this.open_automations(cx);
                         return;
                     }
                     NavKind::Orchestration => {}
@@ -11531,10 +11580,9 @@ impl Render for PilusView {
         } else {
             terminal_bg.opacity(glass)
         };
-        // Tasks and Mission Control own the card only while unsplit; split,
-        // `page_card` coats each half itself.
-        let page_alone =
-            (self.tasks_panel.is_open() || self.mission.is_open()) && self.page_split().is_none();
+        // Tasks, Mission Control, and Automations own the card only while
+        // unsplit; split, `page_card` coats each half itself.
+        let page_alone = self.split_page_open() && self.page_split().is_none();
         let card_bg = if page_owns_card || page_alone {
             self.chrome_fill()
         } else if self.page_split().is_some() {
@@ -13954,38 +14002,49 @@ mod tests {
     fn overlays_own_the_keyboard_over_content() {
         // Each content page owns the keyboard on its own...
         assert_eq!(
-            top_layer(false, false, true, false, false, false, false),
+            top_layer(false, false, true, false, None, false),
             InputLayer::Home
         );
         assert_eq!(
-            top_layer(false, false, false, true, false, false, false),
+            top_layer(false, false, false, true, None, false),
             InputLayer::Settings
         );
         assert_eq!(
-            top_layer(false, false, false, false, false, false, true),
+            top_layer(false, false, false, false, None, true),
             InputLayer::Session
         );
         // ...but an overlay opened above one takes over.
         assert_eq!(
-            top_layer(false, true, true, false, false, false, false),
+            top_layer(false, true, true, false, None, false),
             InputLayer::Palette
         );
         assert_eq!(
-            top_layer(false, true, false, true, false, false, false),
+            top_layer(false, true, false, true, None, false),
             InputLayer::Palette
         );
         // The folder picker is the topmost overlay.
         assert_eq!(
-            top_layer(true, true, true, true, false, false, true),
+            top_layer(true, true, true, true, None, true),
             InputLayer::Picker
         );
         assert_eq!(
-            top_layer(false, false, false, false, false, true, true),
+            top_layer(false, false, false, false, Some(InputLayer::Mission), true),
             InputLayer::Mission
+        );
+        assert_eq!(
+            top_layer(
+                false,
+                false,
+                false,
+                false,
+                Some(InputLayer::Automations),
+                true
+            ),
+            InputLayer::Automations
         );
         // With nothing open, the grid has it.
         assert_eq!(
-            top_layer(false, false, false, false, false, false, false),
+            top_layer(false, false, false, false, None, false),
             InputLayer::Terminal
         );
     }

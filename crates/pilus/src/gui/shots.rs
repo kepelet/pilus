@@ -566,7 +566,7 @@ pub fn run() -> Result<()> {
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "tasks-scope-machine")?;
         // Mission Control on a canned dashboard: the roster with a blocked
-        // agent selected, its reply field, and an automation's detail.
+        // agent selected and its reply field.
         cx.update(|app| {
             view.update(app, |view, cx| {
                 let (snapshot, hints) = sample_mission();
@@ -578,13 +578,6 @@ pub fn run() -> Result<()> {
         cx.update(|app| view.update(app, |view, cx| view.mission_show_answer(cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "mission-answer")?;
-        cx.update(|app| {
-            view.update(app, |view, cx| {
-                view.mission_show_automation(sample_automation(), cx)
-            })
-        });
-        settle(&mut cx, 12);
-        capture(&mut cx, window.into(), "mission-automation")?;
         // The page beside the terminal, each way.
         cx.update(|app| view.update(app, |view, cx| view.page_split_show("right", cx)));
         settle(&mut cx, 12);
@@ -592,6 +585,49 @@ pub fn run() -> Result<()> {
         cx.update(|app| view.update(app, |view, cx| view.page_split_show("down", cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "mission-split-down")?;
+        // The same axis again closes the split, so the Automations page
+        // below starts whole.
+        cx.update(|app| view.update(app, |view, cx| view.page_split_show("down", cx)));
+        // The Automations page on the same canned definitions, then with
+        // one selected and its detail loaded.
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                let (snapshot, _) = sample_mission();
+                view.automations_show(snapshot.automation, snapshot.automations, None, cx);
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "automations")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                let (snapshot, _) = sample_mission();
+                view.automations_show(
+                    snapshot.automation,
+                    snapshot.automations,
+                    Some(sample_automation()),
+                    cx,
+                );
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "automations-detail")?;
+        // A saved machine beside Local, so the picker has a list to show.
+        // The machine probe replaces the catalog, so capture promptly.
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.machines.push(pilus_client::MachineInfo {
+                    id: "build-box".to_string(),
+                    display: "build-box".to_string(),
+                    destination: "dev@build-box".to_string(),
+                    enabled: true,
+                    online: Some(true),
+                    ..pilus_client::MachineInfo::default()
+                });
+                view.automations_show_machines(cx);
+            })
+        });
+        settle(&mut cx, 3);
+        capture(&mut cx, window.into(), "automations-machine")?;
     }
     Ok(())
 }
@@ -1230,7 +1266,7 @@ fn sample_tasks() -> pilus_client::TaskSummary {
 }
 
 /// A fleet with one agent per state, a resumable session, and two
-/// automations, for the Mission Control captures.
+/// automations, for the Mission Control and Automations captures.
 fn sample_mission() -> (
     pilus_client::MissionSnapshot,
     std::collections::HashMap<String, String>,
@@ -1329,7 +1365,7 @@ fn sample_mission() -> (
     (snapshot, hints)
 }
 
-/// One automation's full detail, for the Mission Control capture.
+/// One automation's full detail, for the Automations capture.
 fn sample_automation() -> pilus_client::AutomationDetail {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

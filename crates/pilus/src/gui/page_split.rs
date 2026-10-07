@@ -1,4 +1,5 @@
-//! A native page (Mission Control, Tasks) sharing the card with the terminal.
+//! A native page (Mission Control, Tasks, Automations) sharing the card with
+//! the terminal.
 //!
 //! Pi's split is the daemon's: the panel overlays one pane's frame. These
 //! pages have no pane behind them, so the split is the window's own. The page

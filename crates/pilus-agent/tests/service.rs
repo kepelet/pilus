@@ -24,6 +24,7 @@ use iroh::endpoint::presets;
 use iroh_tickets::endpoint::EndpointTicket;
 use pilus_agent::{CONTROL_ALPN, HUB_ALPN};
 use serde_json::{Value, json};
+use tokio::io::AsyncBufReadExt;
 
 /// Variables a `luvus` child inherits from a pane that point its clients at
 /// that pane's daemon. A test that keeps them would drive the developer's live
@@ -369,6 +370,141 @@ async fn service_enrolls_serves_the_hub_and_survives_a_gateway_restart() {
         "operate may open a workspace: {opened}"
     );
 
+    // Installed agents are listed for the device that may start them, no other.
+    for (device, who) in [(&client, "control"), (&view, "view")] {
+        let refused = one_line(
+            device,
+            &address,
+            HUB_ALPN,
+            &json!({ "id": "a", "method": "hub.agents" }),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], "forbidden", "{who}: {refused}");
+    }
+    let installed = one_line(
+        &operate,
+        &address,
+        HUB_ALPN,
+        &json!({ "id": "a2", "method": "hub.agents" }),
+    )
+    .await;
+    assert_eq!(installed["result"]["machine"], "local", "{installed}");
+    assert!(installed["result"]["agents"].is_array(), "{installed}");
+
+    // Live updates: even a view device may watch, and what it is told is only
+    // that a list changed. Another device's task.add must reach it, with no
+    // task content on the wire.
+    let watcher = view
+        .connect(address.clone(), HUB_ALPN)
+        .await
+        .expect("watch connection");
+    let (mut watch_send, watch_recv) = watcher.open_bi().await.expect("watch stream");
+    watch_send
+        .write_all(b"{\"id\":\"w\",\"method\":\"hub.watch\"}\n")
+        .await
+        .expect("watch request");
+    watch_send.finish().expect("finish");
+    let mut frames = tokio::io::BufReader::new(watch_recv).lines();
+    let first = tokio::time::timeout(Duration::from_secs(10), frames.next_line())
+        .await
+        .expect("the watch is acknowledged")
+        .expect("read")
+        .expect("a reply");
+    let first: Value = serde_json::from_str(&first).expect("json");
+    assert_eq!(first["result"]["watching"], "local", "{first}");
+    let added = one_line(
+        &operate,
+        &address,
+        HUB_ALPN,
+        &json!({ "id": "w1", "method": "task.add", "params": { "title": "secret title for the watch", "workspace_id": workspace_id } }),
+    )
+    .await;
+    assert!(added.get("error").is_none(), "{added}");
+    let signalled = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(line) = frames.next_line().await.expect("read") {
+            assert!(
+                !line.contains("secret title"),
+                "a signal must carry no content: {line}"
+            );
+            let frame: Value = serde_json::from_str(&line).expect("json");
+            // Shell activity in the daemon also signals `output`; wait for ours.
+            if frame["event"] == "changed"
+                && frame["topics"]
+                    .as_array()
+                    .is_some_and(|topics| topics.iter().any(|topic| topic == "tasks"))
+            {
+                return frame;
+            }
+        }
+        panic!("the watch stream ended without a signal");
+    })
+    .await
+    .expect("a task.add reaches a watching device");
+    assert!(
+        signalled["topics"]
+            .as_array()
+            .expect("topics")
+            .iter()
+            .any(|topic| topic == "tasks"),
+        "{signalled}"
+    );
+    // A machine with no event feed is told so, rather than left waiting.
+    let (mut other_send, other_recv) = watcher.open_bi().await.expect("second stream");
+    other_send
+        .write_all(b"{\"id\":\"w2\",\"machine\":\"devbox\",\"method\":\"hub.watch\"}\n")
+        .await
+        .expect("request");
+    other_send.finish().expect("finish");
+    let mut other = tokio::io::BufReader::new(other_recv).lines();
+    let refused: Value =
+        serde_json::from_str(&other.next_line().await.expect("read").expect("a reply"))
+            .expect("json");
+    assert_eq!(refused["error"]["code"], "unsupported", "{refused}");
+    drop(frames);
+    drop(watch_send);
+
+    // Choosing a folder to open: operate browses the machine's directories and
+    // opens one as a workspace; the lower levels cannot even look.
+    std::fs::create_dir_all(root.join("opened")).expect("dir");
+    let browsed = one_line(
+        &operate,
+        &address,
+        HUB_ALPN,
+        &json!({ "id": "b1", "method": "hub.folders", "params": { "path": root } }),
+    )
+    .await;
+    assert!(
+        browsed["result"]["folders"]
+            .to_string()
+            .contains("\"name\":\"opened\""),
+        "{browsed}"
+    );
+    for (device, who) in [(&client, "control"), (&view, "view")] {
+        let denied = one_line(
+            device,
+            &address,
+            HUB_ALPN,
+            &json!({ "id": "b2", "method": "hub.folders", "params": { "path": root } }),
+        )
+        .await;
+        assert_eq!(denied["error"]["code"], "forbidden", "{who}: {denied}");
+    }
+
+    // Starting an agent and prompting it is one request, operate only. An agent
+    // kind the daemon does not know fails cleanly, which also proves the sequence
+    // ran as far as `agent.start` without launching anything real.
+    let run = json!({ "id": "r", "method": "hub.run", "params": {
+        "agent": "no-such-agent", "prompt": "hello", "path": root.join("opened") } });
+    for (device, who) in [(&client, "control"), (&view, "view")] {
+        let denied = one_line(device, &address, HUB_ALPN, &run).await;
+        assert_eq!(denied["error"]["code"], "forbidden", "{who}: {denied}");
+    }
+    let failed = one_line(&operate, &address, HUB_ALPN, &run).await;
+    assert!(
+        failed["error"]["code"] != "forbidden" && failed.get("result").is_none(),
+        "an unknown agent is an error from the daemon, not a refusal or a success: {failed}"
+    );
+
     // The same calls from the lower levels are refused.
     for (device, who) in [(&client, "control"), (&view, "view")] {
         let refused = one_line(
@@ -396,6 +532,17 @@ async fn service_enrolls_serves_the_hub_and_survives_a_gateway_restart() {
     )
     .await;
     assert_eq!(view_read["result"]["type"], "workspace_list", "{view_read}");
+
+    // The window can ask the service to retry Luvus, and learns whether an update
+    // has left it running a stale binary (it has not: nothing replaced it).
+    let retry = admin(&socket, &json!({ "type": "retry" })).expect("retry");
+    assert_eq!(retry["type"], "retrying", "{retry}");
+    let health = admin(&socket, &json!({ "type": "status" })).expect("status");
+    assert_eq!(health["restart_needed"], false, "{health}");
+    assert!(
+        health.get("linger").is_some(),
+        "status always says whether the service outlives logout: {health}"
+    );
 
     // A level can be lowered from the host, never raised from it, and the change
     // applies to the very next request on a connection that is already open.

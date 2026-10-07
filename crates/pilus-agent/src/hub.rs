@@ -23,8 +23,14 @@
 //!
 //! Wire format, one JSON line each way: `{"id","machine"?,"method","params"?}`
 //! answered by `{"id","result"}` or `{"id","error":{"code","message"}}`. The
-//! one hub-only method is `hub.machines`.
+//! hub-only methods are `hub.machines`; `hub.agents` and `hub.folders` for an
+//! `Operate` device choosing what to start and where; `hub.run`, which starts an
+//! agent there and prompts it in one step; and `hub.watch`, the one method whose stream stays open
+//! (see [`crate::watch`]). Luvus's own `server.agent_manifests` lists every
+//! agent it knows how to launch; the question a picker has is which are installed
+//! on that machine, which the window answers by probing, and so does the hub.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -33,10 +39,11 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use pilus_client::{ControlClient, Error as ClientError, MachineInfo, api_socket_path_for};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::enroll::{AuthState, Level};
 use crate::supervisor::GatewayLink;
+use crate::watch::{self, Slots};
 
 /// The ALPN a paired device uses for everything except pairing.
 pub const HUB_ALPN: &[u8] = b"luvus/hub/1";
@@ -125,8 +132,15 @@ const CATALOG_TTL: Duration = Duration::from_secs(10);
 /// several machines must not be able to exhaust either.
 const SSH_PARALLELISM: usize = 6;
 
+/// How long an installed-agent probe is trusted. It can run `codex` and
+/// `opencode`, which is seconds of work for a list that changes on install.
+const AGENTS_TTL: Duration = Duration::from_secs(60);
+
 /// The saved-machine listing and when it was read.
 type Catalog = Option<(Instant, Vec<MachineInfo>)>;
+
+/// Installed-agent probes by machine id.
+type AgentCache = HashMap<String, (Instant, Value)>;
 
 /// The hub's shared state.
 #[derive(Clone)]
@@ -137,7 +151,9 @@ pub struct Hub {
     session: Option<String>,
     label: String,
     catalog: Arc<Mutex<Catalog>>,
+    installed: Arc<Mutex<AgentCache>>,
     ssh: Arc<Semaphore>,
+    watchers: Arc<Slots>,
 }
 
 impl std::fmt::Debug for Hub {
@@ -165,7 +181,9 @@ impl Hub {
             session,
             label,
             catalog: Arc::new(Mutex::new(None)),
+            installed: Arc::default(),
             ssh: Arc::new(Semaphore::new(SSH_PARALLELISM)),
+            watchers: Arc::default(),
         }
     }
 
@@ -185,6 +203,46 @@ impl Hub {
 
         if method == "hub.machines" {
             return reply(&id, Ok(self.machines().await));
+        }
+        if matches!(method, "hub.agents" | "hub.folders" | "hub.run") {
+            // These only read, but they exist to feed `agent.start`, `task.start`
+            // and `workspace.open`, so a device that cannot start work has no use
+            // for them, and a folder listing is not something to hand out freely.
+            let outcome = if level < Level::Operate {
+                Err(failure(
+                    "forbidden",
+                    &format!("{method} is not allowed for a {} device", level.as_str()),
+                ))
+            } else {
+                let work = async {
+                    match method {
+                        "hub.agents" => self.agents(machine).await,
+                        "hub.folders" => self.folders(machine, &params).await,
+                        _ => self.run(machine, &params).await,
+                    }
+                };
+                tokio::time::timeout(CALL_TIMEOUT, work)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(failure("timeout", "the machine did not answer in time"))
+                    })
+            };
+            // `hub.run` starts work, so it is audited like every other write (the
+            // prompt it carries is never logged).
+            if method == "hub.run" {
+                eprintln!(
+                    "pilus-agent: audit: {device} [{}] {machine} {method} {}",
+                    level.as_str(),
+                    match &outcome {
+                        Ok(_) => "ok".to_string(),
+                        Err(error) => format!(
+                            "error {}",
+                            error.get("code").and_then(Value::as_str).unwrap_or("?")
+                        ),
+                    }
+                );
+            }
+            return reply(&id, outcome);
         }
         if let Some(refusal) = self.refusal(level, method) {
             if !is_read(method) {
@@ -374,6 +432,300 @@ impl Hub {
         json!({ "host": self.label, "machines": machines })
     }
 
+    /// Hold `send` open and relay this machine's changes to the device as topic
+    /// signals. Only this machine has an event feed to relay: a saved SSH machine
+    /// is reached one request at a time, so its device keeps polling.
+    async fn serve_watch(
+        &self,
+        mut send: SendStream,
+        request: &Value,
+        peer: &str,
+        device: &str,
+    ) -> std::io::Result<()> {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let machine = request
+            .get("machine")
+            .and_then(Value::as_str)
+            .filter(|machine| !machine.is_empty())
+            .unwrap_or(LOCAL);
+        let refuse = |code: &str, message: &str| reply(&id, Err(failure(code, message)));
+        let opened = async {
+            if machine != LOCAL {
+                return Err(refuse(
+                    "unsupported",
+                    "live updates are only available for the machine that is paired",
+                ));
+            }
+            let slot = self
+                .watchers
+                .acquire(peer)
+                .map_err(|why| refuse("busy", why))?;
+            let events = self
+                .subscribe()
+                .await
+                .map_err(|error| reply(&id, Err(error)))?;
+            Ok((slot, events))
+        }
+        .await;
+        let (slot, events) = match opened {
+            Ok(opened) => opened,
+            Err(answer) => {
+                watch::send(&mut send, &answer).await?;
+                let _ = send.finish();
+                return Ok(());
+            }
+        };
+        watch::send(
+            &mut send,
+            &reply(
+                &id,
+                Ok(json!({ "watching": LOCAL, "heartbeat_secs": watch::HEARTBEAT.as_secs() })),
+            ),
+        )
+        .await?;
+        let stopped = send.stopped();
+        let auth = Arc::clone(&self.auth);
+        let who = peer.to_string();
+        let reason = watch::relay(
+            events,
+            &mut send,
+            watch::FLUSH,
+            watch::HEARTBEAT,
+            async {
+                let _ = stopped.await;
+            },
+            move || auth.level_of(&who).is_some(),
+        )
+        .await;
+        drop(slot);
+        eprintln!("pilus-agent: watch closed for {device}: {reason}");
+        let _ = watch::send(&mut send, &json!({ "event": "closed", "reason": reason })).await;
+        let _ = send.finish();
+        Ok(())
+    }
+
+    /// Open the gateway's event feed and hand back its lines.
+    ///
+    /// The first line is the subscription's own reply; an error there (a token
+    /// that may not subscribe, a gateway at its connection limit) is returned
+    /// as the failure rather than relayed as if it were an event.
+    async fn subscribe(&self) -> Result<mpsc::Receiver<String>, Value> {
+        let Some(address) = self.link.address() else {
+            let why = self
+                .link
+                .error()
+                .unwrap_or_else(|| "the Luvus gateway is not running".to_string());
+            return Err(failure("unavailable", &why));
+        };
+        let unavailable =
+            |error: std::io::Error| failure("unavailable", &format!("gateway: {error}"));
+        let stream = tokio::net::TcpStream::connect(&address)
+            .await
+            .map_err(unavailable)?;
+        let (read, mut write) = stream.into_split();
+        let request = json!({
+            "id": "1",
+            "method": "events.subscribe",
+            "params": {},
+            "auth": self.auth.token(),
+        });
+        write
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .map_err(unavailable)?;
+        let mut lines = BufReader::new(read);
+        let mut first = String::new();
+        let started = tokio::time::timeout(Duration::from_secs(10), lines.read_line(&mut first))
+            .await
+            .map_err(|_| failure("timeout", "the gateway did not start the event feed"))?
+            .map_err(unavailable)?;
+        let answer: Value = serde_json::from_str(first.trim()).unwrap_or(Value::Null);
+        if started == 0 || answer.get("result").is_none() {
+            return Err(answer
+                .get("error")
+                .cloned()
+                .unwrap_or_else(|| failure("unavailable", "the gateway refused the event feed")));
+        }
+        let (tx, rx) = mpsc::channel(256);
+        tokio::spawn(async move {
+            // The write half stays open for as long as the feed is read:
+            // closing it would end the subscription.
+            let _keep_open = write;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match lines.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        // A full queue means this device cannot keep up; ending
+                        // the feed makes it resync instead of seeing stale signals.
+                        if tx.try_send(std::mem::take(&mut line)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(rx)
+    }
+
+    /// Start `params.agent` in a workspace and give it `params.prompt`, or give the
+    /// prompt to the one a phone already started there.
+    ///
+    /// The window's launcher does the same steps (`launch_home_agent`): an agent
+    /// spawns beside the focused pane, so the workspace is opened (focused) first,
+    /// the idle pane is reused, and the prompt goes to the pane once it is ready.
+    /// Doing it here as one request keeps the sequence on a single connection and
+    /// one audit line, instead of four calls from a page that may drop mid-way.
+    /// The agent gets an alias of our own, so a second message finds it again
+    /// even when Luvus labels the process as another kind.
+    async fn run(&self, machine: &str, params: &Value) -> Result<Value, Value> {
+        let text = |key: &str| {
+            params
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (kind, prompt, path, workspace_id) = (
+            text("agent"),
+            params
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            text("path"),
+            text("workspace_id"),
+        );
+        let bad = |message: &str| failure("bad_request", message);
+        if kind.is_empty()
+            || !kind
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(bad(
+                "`agent` must name an agent kind, like `pi` or `claude`",
+            ));
+        }
+        if prompt.trim().is_empty() {
+            return Err(bad("`prompt` is empty"));
+        }
+        if path.is_empty() {
+            return Err(bad("`path` must be the workspace's directory"));
+        }
+        let launch = move |mut client: ControlClient| {
+            launch_agent(&mut client, &kind, &path, &workspace_id, &prompt)
+        };
+        if machine == LOCAL {
+            let socket = api_socket_path_for(self.session.as_deref());
+            return tokio::task::spawn_blocking(move || launch(ControlClient::connect(&socket)?))
+                .await
+                .map_err(|error| failure("internal", &error.to_string()))?
+                .map_err(|error| client_failure(error, "agent.start"));
+        }
+        let known = self.catalog().await;
+        let target = known
+            .into_iter()
+            .find(|info| info.id == machine && info.enabled)
+            .and_then(|info| info.ssh_target())
+            .ok_or_else(|| failure("not_found", &format!("no usable machine `{machine}`")))?;
+        let _permit = self
+            .ssh
+            .acquire()
+            .await
+            .map_err(|_| failure("unavailable", "the hub is shutting down"))?;
+        tokio::task::spawn_blocking(move || launch(ControlClient::connect_ssh(target)?))
+            .await
+            .map_err(|error| failure("internal", &error.to_string()))?
+            .map_err(|error| client_failure(error, "agent.start"))
+    }
+
+    /// The child folders of `params.path` (default `~`) on `machine`, for choosing
+    /// a workspace to open.
+    async fn folders(&self, machine: &str, params: &Value) -> Result<Value, Value> {
+        let path = params
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .unwrap_or("~")
+            .to_string();
+        let listing = if machine == LOCAL {
+            tokio::task::spawn_blocking(move || pilus_client::folders::list_local(&path))
+                .await
+                .map_err(|error| failure("internal", &error.to_string()))?
+        } else {
+            let known = self.catalog().await;
+            let target = known
+                .into_iter()
+                .find(|info| info.id == machine && info.enabled)
+                .and_then(|info| info.ssh_target())
+                .ok_or_else(|| failure("not_found", &format!("no usable machine `{machine}`")))?;
+            let _permit = self
+                .ssh
+                .acquire()
+                .await
+                .map_err(|_| failure("unavailable", "the hub is shutting down"))?;
+            tokio::task::spawn_blocking(move || pilus_client::folders::list_remote(&target, &path))
+                .await
+                .map_err(|error| failure("internal", &error.to_string()))?
+        }
+        .map_err(|why| failure("unavailable", &why))?;
+        Ok(json!({
+            "machine": machine,
+            "root": listing.root,
+            "parent": pilus_client::folders::parent_of(&listing.root),
+            "folders": listing
+                .folders
+                .iter()
+                .map(|folder| json!({ "name": folder.name, "path": folder.path, "git": folder.git }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// The agents installed on `machine`, as a picker should list them.
+    async fn agents(&self, machine: &str) -> Result<Value, Value> {
+        if let Some((at, cached)) = lock(&self.installed).get(machine)
+            && at.elapsed() < AGENTS_TTL
+        {
+            return Ok(cached.clone());
+        }
+        let found = if machine == LOCAL {
+            tokio::task::spawn_blocking(pilus_client::agents::local)
+                .await
+                .map_err(|error| failure("internal", &error.to_string()))?
+        } else {
+            let known = self.catalog().await;
+            let target = known
+                .into_iter()
+                .find(|info| info.id == machine && info.enabled)
+                .and_then(|info| info.ssh_target())
+                .ok_or_else(|| failure("not_found", &format!("no usable machine `{machine}`")))?;
+            let _permit = self
+                .ssh
+                .acquire()
+                .await
+                .map_err(|_| failure("unavailable", "the hub is shutting down"))?;
+            tokio::task::spawn_blocking(move || pilus_client::agents::remote(&target))
+                .await
+                .map_err(|error| failure("internal", &error.to_string()))?
+        };
+        let value = json!({
+            "machine": machine,
+            "agents": found
+                .iter()
+                .map(|agent| json!({
+                    "kind": agent.kind,
+                    "label": agent.label,
+                    "default_model": agent.default_model,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        lock(&self.installed).insert(machine.to_string(), (Instant::now(), value.clone()));
+        Ok(value)
+    }
+
     /// The saved machine profiles, cached briefly.
     async fn catalog(&self) -> Vec<MachineInfo> {
         if let Some((at, cached)) = lock(&self.catalog).as_ref()
@@ -404,20 +756,23 @@ impl ProtocolHandler for Hub {
             };
             let device = self.auth.device_name(&peer);
             let hub = self.clone();
+            let peer = peer.clone();
             tokio::spawn(async move {
-                let _ = serve_stream(&hub, send, recv, level, &device).await;
+                let _ = serve_stream(&hub, send, recv, level, &peer, &device).await;
             });
         }
         Ok(())
     }
 }
 
-/// One stream: read a request line, answer it, finish.
+/// One stream: read a request line, answer it, finish. A `hub.watch` request
+/// is the exception: its stream stays open and carries signals until it ends.
 async fn serve_stream(
     hub: &Hub,
     mut send: SendStream,
     recv: RecvStream,
     level: Level,
+    peer: &str,
     device: &str,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(recv.take(REQUEST_LIMIT as u64));
@@ -426,6 +781,11 @@ async fn serve_stream(
     let answer = match read {
         Ok(Ok(n)) if n > 0 && line.len() <= REQUEST_LIMIT => {
             match serde_json::from_str::<Value>(line.trim()) {
+                Ok(request)
+                    if request.get("method").and_then(Value::as_str) == Some("hub.watch") =>
+                {
+                    return hub.serve_watch(send, &request, peer, device).await;
+                }
                 Ok(request) => hub.handle(&request, level, device).await,
                 Err(error) => reply(
                     &Value::Null,
@@ -454,6 +814,53 @@ async fn serve_refusal(mut send: SendStream) -> std::io::Result<()> {
     send.write_all(b"\n").await?;
     let _ = send.finish();
     Ok(())
+}
+
+/// The alias a phone-started agent gets: stable for one kind in one workspace.
+fn phone_alias(kind: &str, workspace_id: &str, path: &str) -> String {
+    let anchor = if workspace_id.is_empty() {
+        path
+    } else {
+        workspace_id
+    };
+    let tail: String = anchor
+        .chars()
+        .rev()
+        .filter(char::is_ascii_alphanumeric)
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("phone-{kind}-{}", tail.to_lowercase())
+}
+
+/// The blocking half of [`Hub::run`], on one control connection.
+fn launch_agent(
+    client: &mut ControlClient,
+    kind: &str,
+    path: &str,
+    workspace_id: &str,
+    prompt: &str,
+) -> Result<Value, ClientError> {
+    let alias = phone_alias(kind, workspace_id, path);
+    let running = client.agents()?;
+    if let Some(agent) = running.iter().find(|agent| agent.name == alias) {
+        client.prompt_agent(&agent.pane, prompt)?;
+        return Ok(json!({ "started": false, "name": alias, "pane": agent.pane }));
+    }
+    client.open_workspace(path)?;
+    // A fresh workspace opens with one shell pane; reuse it so the launch does
+    // not split a second, empty terminal beside the agent.
+    let pane = client.idle_pane().ok().flatten();
+    client.start_agent(&alias, kind, pane.as_deref(), &[])?;
+    if let Some(pane) = pane.as_deref() {
+        client.focus_pane(pane).ok();
+    }
+    // Target the pane directly: a fresh agent's alias may not be registered yet.
+    let target = pane.unwrap_or_else(|| alias.clone());
+    client.prompt_agent(&target, prompt)?;
+    Ok(json!({ "started": true, "name": alias, "pane": target }))
 }
 
 /// `{"id","result"}` or `{"id","error"}`.
@@ -603,6 +1010,121 @@ mod tests {
                 .unwrap()
                 .contains("view")
         );
+    }
+
+    #[tokio::test]
+    async fn listing_installed_agents_is_for_devices_that_can_start_work() {
+        let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
+        for level in [Level::View, Level::Control] {
+            let denied = hub
+                .handle(&json!({ "id": "5", "method": "hub.agents" }), level, "t")
+                .await;
+            assert_eq!(denied["error"]["code"], "forbidden", "{level:?}");
+        }
+        // Operate gets an answer for this machine, whatever happens to be installed.
+        let answer = hub
+            .handle(
+                &json!({ "id": "6", "method": "hub.agents" }),
+                Level::Operate,
+                "t",
+            )
+            .await;
+        assert_eq!(answer["result"]["machine"], "local");
+        assert!(answer["result"]["agents"].is_array());
+        // A machine that was never saved is not probed.
+        let unknown = hub
+            .handle(
+                &json!({ "id": "7", "machine": "nope", "method": "hub.agents" }),
+                Level::Operate,
+                "t",
+            )
+            .await;
+        assert_eq!(unknown["error"]["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn folders_are_listed_for_operate_devices_only() {
+        let base = std::env::temp_dir().join(format!("pilus-hub-folders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("proj/.git")).expect("proj");
+        std::fs::create_dir_all(base.join("plain")).expect("plain");
+        let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
+        let ask = json!({
+            "id": "f", "method": "hub.folders", "params": { "path": base.to_str().unwrap() }
+        });
+        for level in [Level::View, Level::Control] {
+            let denied = hub.handle(&ask, level, "t").await;
+            assert_eq!(denied["error"]["code"], "forbidden", "{level:?}");
+        }
+        let listed = hub.handle(&ask, Level::Operate, "t").await;
+        assert_eq!(listed["result"]["root"], base.to_str().unwrap());
+        assert_eq!(listed["result"]["folders"][0]["name"], "plain");
+        assert_eq!(listed["result"]["folders"][1]["git"], true);
+        assert!(listed["result"]["parent"].is_string());
+        let missing = hub
+            .handle(
+                &json!({ "id": "g", "method": "hub.folders", "params": { "path": "/no/such/dir" } }),
+                Level::Operate,
+                "t",
+            )
+            .await;
+        assert_eq!(missing["error"]["code"], "unavailable");
+        let unknown = hub
+            .handle(
+                &json!({ "id": "h", "machine": "nope", "method": "hub.folders" }),
+                Level::Operate,
+                "t",
+            )
+            .await;
+        assert_eq!(unknown["error"]["code"], "not_found");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_phone_alias_is_stable_per_kind_and_workspace() {
+        let a = phone_alias("pi", "workspace_dad0a34a34adfe0658439fa000c3cde8", "/x");
+        assert_eq!(
+            a,
+            phone_alias("pi", "workspace_dad0a34a34adfe0658439fa000c3cde8", "/y")
+        );
+        assert_ne!(
+            a,
+            phone_alias("claude", "workspace_dad0a34a34adfe0658439fa000c3cde8", "/x")
+        );
+        assert_ne!(
+            a,
+            phone_alias("pi", "workspace_00000000000000000000000000000001", "/x")
+        );
+        assert!(a.starts_with("phone-pi-") && a.is_ascii());
+        assert!(phone_alias("pi", "", "/Users/me/p r").starts_with("phone-pi-"));
+    }
+
+    #[tokio::test]
+    async fn running_an_agent_is_for_operate_devices_and_needs_real_arguments() {
+        let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
+        let run = |params: Value| json!({ "id": "r", "method": "hub.run", "params": params });
+        let ok = json!({ "agent": "pi", "prompt": "hi", "path": "/tmp" });
+        for level in [Level::View, Level::Control] {
+            let denied = hub.handle(&run(ok.clone()), level, "t").await;
+            assert_eq!(denied["error"]["code"], "forbidden", "{level:?}");
+        }
+        for bad in [
+            json!({ "agent": "", "prompt": "hi", "path": "/tmp" }),
+            json!({ "agent": "p i; rm", "prompt": "hi", "path": "/tmp" }),
+            json!({ "agent": "pi", "prompt": "  ", "path": "/tmp" }),
+            json!({ "agent": "pi", "prompt": "hi" }),
+        ] {
+            let refused = hub.handle(&run(bad.clone()), Level::Operate, "t").await;
+            assert_eq!(refused["error"]["code"], "bad_request", "{bad}");
+        }
+        let unknown = hub
+            .handle(
+                &json!({ "id": "r", "machine": "nope", "method": "hub.run", "params": ok }),
+                Level::Operate,
+                "t",
+            )
+            .await;
+        assert_eq!(unknown["error"]["code"], "not_found");
     }
 
     #[test]

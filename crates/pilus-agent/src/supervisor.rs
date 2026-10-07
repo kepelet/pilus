@@ -30,6 +30,8 @@ const SERVER_START_EVERY: Duration = Duration::from_secs(60);
 #[derive(Debug, Default)]
 pub struct GatewayLink {
     state: Mutex<LinkState>,
+    /// Someone asked for an immediate retry; see [`GatewayLink::kick`].
+    kicked: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +68,21 @@ impl GatewayLink {
     /// The methods the gateway's delegated token may call. Empty when unknown.
     pub fn allowed(&self) -> Vec<String> {
         lock(&self.state).allowed.clone()
+    }
+
+    /// Ask the supervisor to stop waiting out its backoff and try now, starting
+    /// the Luvus server first if it is not answering. This is what the window's
+    /// "Start Luvus" does; nothing else shortens the wait.
+    pub fn kick(&self) {
+        self.kicked.store(true, Ordering::Relaxed);
+    }
+
+    fn is_kicked(&self) -> bool {
+        self.kicked.load(Ordering::Relaxed)
+    }
+
+    fn take_kick(&self) -> bool {
+        self.kicked.swap(false, Ordering::Relaxed)
     }
 
     /// Why the gateway is down, for the window to show.
@@ -113,7 +130,8 @@ pub fn supervise(
             .or_else(pilus_client::luvus_binary)
         else {
             link.set_down("could not find the `luvus` binary".to_string());
-            nap(&stop, delay);
+            nap(&stop, &link, delay);
+            link.take_kick();
             delay = (delay * 2).min(MAX_BACKOFF);
             continue;
         };
@@ -122,10 +140,12 @@ pub fn supervise(
                 let address = gateway.descriptor().address.clone();
                 auth.set_token(token);
                 link.set_up(address, allowed);
+                link.take_kick();
                 eprintln!("pilus-agent: gateway is up");
                 delay = Duration::from_secs(1);
                 while !stop.load(Ordering::Relaxed) && gateway.is_running() {
-                    nap(&stop, Duration::from_millis(500));
+                    nap(&stop, &link, Duration::from_millis(500));
+                    link.take_kick();
                 }
                 link.set_down("the gateway stopped; starting it again".to_string());
                 eprintln!("pilus-agent: gateway stopped");
@@ -134,11 +154,14 @@ pub fn supervise(
             Err(error) => {
                 link.set_down(error.to_string());
                 eprintln!("pilus-agent: gateway is down: {error}");
-                if last_server_start.is_none_or(|at| at.elapsed() >= SERVER_START_EVERY) {
+                // A person asking to start Luvus overrides the once-a-minute limit.
+                if link.take_kick()
+                    || last_server_start.is_none_or(|at| at.elapsed() >= SERVER_START_EVERY)
+                {
                     last_server_start = Some(Instant::now());
                     ensure_server(&path, options.session.as_deref());
                 }
-                nap(&stop, delay);
+                nap(&stop, &link, delay);
                 delay = (delay * 2).min(MAX_BACKOFF);
             }
         }
@@ -184,10 +207,10 @@ fn ensure_server(binary: &std::path::Path, session: Option<&str>) {
     }
 }
 
-/// Sleep for `total`, waking early when `stop` is set.
-fn nap(stop: &AtomicBool, total: Duration) {
+/// Sleep for `total`, waking early when `stop` is set or a retry is asked for.
+fn nap(stop: &AtomicBool, link: &GatewayLink, total: Duration) {
     let deadline = Instant::now() + total;
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && !link.is_kicked() {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
@@ -200,4 +223,24 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_retry_request_cuts_the_backoff_short() {
+        let link = GatewayLink::down();
+        let stop = AtomicBool::new(false);
+        link.kick();
+        let started = Instant::now();
+        nap(&stop, &link, Duration::from_secs(30));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a kick must not wait out the nap"
+        );
+        assert!(link.take_kick(), "the supervisor still sees the request");
+        assert!(!link.take_kick(), "and it is consumed once");
+    }
 }

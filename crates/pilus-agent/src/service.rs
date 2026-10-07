@@ -113,6 +113,22 @@ pub fn state() -> State {
     platform::state()
 }
 
+/// Restart the installed service in place, so it runs the binary on disk now.
+///
+/// [`install`] deliberately leaves an unchanged running service alone, which is
+/// right on every launch but wrong after an update replaced the binary under the
+/// same path.
+pub fn restart() -> Result<()> {
+    platform::restart()
+}
+
+/// Whether the service keeps running after the user logs out. `None` where that
+/// is not a question: only a Linux user unit stops at logout, and only when
+/// lingering is off (`loginctl enable-linger`).
+pub fn linger() -> Option<bool> {
+    platform::linger()
+}
+
 fn run(command: &mut Command) -> Result<std::process::Output> {
     let output = command.output()?;
     Ok(output)
@@ -256,6 +272,23 @@ mod platform {
         }
     }
 
+    pub(super) fn restart() -> Result<()> {
+        let output = run(Command::new("launchctl")
+            .arg("kickstart")
+            .arg("-k")
+            .arg(target()))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(failed("launchctl kickstart", &output))
+        }
+    }
+
+    /// A LaunchAgent runs from login to logout like the user's session does.
+    pub(super) fn linger() -> Option<bool> {
+        None
+    }
+
     pub(super) fn state() -> State {
         let Ok(path) = plist_path() else {
             return State::Unsupported;
@@ -390,6 +423,31 @@ StandardOutput=append:{log}\nStandardError=append:{log}\n\n\
         Ok(())
     }
 
+    pub(super) fn restart() -> Result<()> {
+        let output = systemctl(&["restart", LABEL])?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(failed("systemctl restart", &output))
+        }
+    }
+
+    /// Whether `loginctl` says this user's units outlive their last session.
+    pub(super) fn linger() -> Option<bool> {
+        let user = std::env::var("USER").ok().filter(|user| !user.is_empty())?;
+        let output = run(Command::new("loginctl").args([
+            "show-user",
+            &user,
+            "--property=Linger",
+            "--value",
+        ]))
+        .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim() == "yes")
+    }
+
     pub(super) fn state() -> State {
         let Ok(path) = unit_path() else {
             return State::Unsupported;
@@ -415,6 +473,16 @@ mod platform {
 
     pub(super) fn uninstall() -> Result<()> {
         Ok(())
+    }
+
+    pub(super) fn restart() -> Result<()> {
+        Err(Error::Service(
+            "background service is only supported on macOS and Linux".to_string(),
+        ))
+    }
+
+    pub(super) fn linger() -> Option<bool> {
+        None
     }
 
     pub(super) fn state() -> State {

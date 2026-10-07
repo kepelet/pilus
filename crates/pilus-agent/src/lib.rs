@@ -31,6 +31,7 @@ pub mod p2p;
 pub mod proxy;
 pub mod service;
 pub mod supervisor;
+pub mod watch;
 pub use enroll::{AuthState, CONTROL_ALPN, Control, DeviceStore, Enrollment, Level};
 pub use hub::HUB_ALPN;
 pub use proxy::serve;

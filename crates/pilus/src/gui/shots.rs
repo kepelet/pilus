@@ -1085,6 +1085,36 @@ pub fn run_main() -> Result<()> {
     });
     settle(&mut cx, 8);
     capture(&mut cx, window.into(), "main-settings-remote-idle")?;
+    // The service log open, with the server down: the row that says what to do.
+    let mut logged = remote_access_fixture(false);
+    logged.log_open = true;
+    logged.log = SERVICE_LOG.iter().map(|line| (*line).to_string()).collect();
+    super::connector::preview(logged);
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.remote = super::connector::snapshot();
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-settings-remote-log")?;
+    // Every warning at once: Luvus missing, an update waiting, and a Linux
+    // service that stops at logout.
+    let mut stacked = remote_access_fixture(false);
+    if let Some(status) = stacked.status.as_mut() {
+        status.gateway_error = Some("could not find the `luvus` binary".to_string());
+        status.restart_needed = true;
+        status.linger = Some(false);
+    }
+    super::connector::preview(stacked);
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.remote = super::connector::snapshot();
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-settings-remote-warnings")?;
     super::connector::preview(super::connector::RemoteAccess::default());
     cx.update(|app| {
         view.update(app, |view, cx| {
@@ -1510,6 +1540,18 @@ fn settle(cx: &mut HeadlessAppContext, ticks: usize) {
     }
 }
 
+/// What a service that cannot find Luvus writes, for the log shot.
+const SERVICE_LOG: &[&str] = &[
+    "pilus-agent: endpoint 42eb007d41f5…",
+    "pilus-agent: gateway is up",
+    "pilus-agent: gateway stopped",
+    "pilus-agent: audit: pilus companion (42eb007d) [operate] local task.add ok",
+    "pilus-agent: audit: pilus companion (42eb007d) [operate] local task.start ok",
+    "pilus-agent: watch closed for pilus companion: the device went away",
+    "pilus-agent: gateway is down: no luvus server running",
+    "pilus-agent: the Luvus server is not running; starting it",
+];
+
 /// Remote access as the service would report it, for the shots.
 fn remote_access_fixture(with_code: bool) -> super::connector::RemoteAccess {
     use pilus_client::agent_service::{DeviceLevel, EnrolledDevice, PairingCode, ServiceStatus};
@@ -1541,6 +1583,8 @@ fn remote_access_fixture(with_code: bool) -> super::connector::RemoteAccess {
                 },
             ],
             strict: false,
+            restart_needed: false,
+            linger: None,
         }),
         code: with_code.then(|| PairingCode {
             level: DeviceLevel::Operate,
@@ -1550,6 +1594,8 @@ fn remote_access_fixture(with_code: bool) -> super::connector::RemoteAccess {
         }),
         error: None,
         minting: false,
+        log_open: false,
+        log: Vec::new(),
     }
 }
 

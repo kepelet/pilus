@@ -7,6 +7,7 @@
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod agent_service;
 pub mod agents;
 pub mod ansi;
 mod autostart;
@@ -30,7 +31,7 @@ pub use agents::effort_label;
 pub use agents::thinking_level;
 pub use autostart::{ensure_server, ensure_server_for};
 pub use connection::{ClientEvent, Connection, EndpointIdentity};
-pub use connector::{Connector, ConnectorOptions, ConnectorStatus, agent_binary};
+pub use connector::agent_binary;
 pub use control::{
     Agent, AgentFeed, AgentSession, Appearance, AutomationSummary, BarSegment, BarWidget,
     ControlClient, FeedScope, FeedUpdate, PaneFrame, Tab, TaskAction, TaskSummary, ThemeInfo,
@@ -38,9 +39,9 @@ pub use control::{
 };
 pub use discovery::{
     HOME_ENV, PILUS_HOME_ENV, SessionInfo, active_session, api_socket_path_for,
-    client_socket_path_for, client_socket_path_under, config_dir, describe, generate_session_name,
-    is_provisioning_cache, list_session_infos, list_sessions, luvus_binary, pilus_config_dir,
-    pilus_workspaces_dir, session_dir_for, split_client_socket, validate_session,
+    client_socket_path_for, client_socket_path_under, config_dir, current_uid, describe,
+    generate_session_name, is_provisioning_cache, list_session_infos, list_sessions, luvus_binary,
+    pilus_config_dir, pilus_workspaces_dir, session_dir_for, split_client_socket, validate_session,
 };
 pub use error::{Error, Result};
 pub use git::{

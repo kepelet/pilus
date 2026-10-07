@@ -1063,14 +1063,37 @@ pub fn run_main() -> Result<()> {
         view.update(app, |view, _| view.home.close_dropdown());
     });
 
-    // The Settings page: machines, agent config, updates.
+    // The Settings page: machines, agent config, updates. Remote access is
+    // shown running with a live pairing code and two paired devices, the state
+    // with the most to draw.
+    super::connector::preview(remote_access_fixture(true));
     cx.update(|app| {
         view.update(app, |view, cx| {
+            view.remote = super::connector::snapshot();
             view.open_settings(cx);
         });
     });
     settle(&mut cx, 12);
     capture(&mut cx, window.into(), "main-settings")?;
+    // Remote access with the service waiting on Luvus and no code on screen.
+    super::connector::preview(remote_access_fixture(false));
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.remote = super::connector::snapshot();
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-settings-remote-idle")?;
+    super::connector::preview(super::connector::RemoteAccess::default());
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.remote = super::connector::snapshot();
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-settings-remote-off")?;
 
     // The Open Workspace folder picker. Its listing happens on a thread, so
     // give it real time before the simulated clock drains the result.
@@ -1484,6 +1507,49 @@ fn settle(cx: &mut HeadlessAppContext, ticks: usize) {
     for _ in 0..ticks {
         cx.advance_clock(Duration::from_millis(25));
         cx.run_until_parked();
+    }
+}
+
+/// Remote access as the service would report it, for the shots.
+fn remote_access_fixture(with_code: bool) -> super::connector::RemoteAccess {
+    use pilus_client::agent_service::{DeviceLevel, EnrolledDevice, PairingCode, ServiceStatus};
+
+    let ticket = "endpointac76o2igihgsjizbgpc2ttxnwmgtgpizxd3d6u3vjrcnhttxlyubsbaaenuhi5dqom5c6l3bobztcljrfzzgk3dbpexg4mbonfzg62bonruw42zof4aqazcyn4gzf2ydaealn7jqbtjrcaiaycube64s5mbq";
+    super::connector::RemoteAccess {
+        phase: super::connector::Phase::Running,
+        status: Some(ServiceStatus {
+            label: "Studio Mac".to_string(),
+            endpoint_id: "bfe7690641cd24a32133c5a9ceedb30d333d19b8f63f53754c44d3ce775e2819"
+                .to_string(),
+            ticket: ticket.to_string(),
+            gateway_up: with_code,
+            gateway_error: (!with_code).then(|| "no luvus server running".to_string()),
+            devices: vec![
+                EnrolledDevice {
+                    endpoint_id: "42eb007d41f599573bd56074118311dfc46fa72913ba3d601d8faad7bc72fd51"
+                        .to_string(),
+                    label: "pilus companion".to_string(),
+                    enrolled_at: 1_790_000_000,
+                    level: DeviceLevel::Operate,
+                },
+                EnrolledDevice {
+                    endpoint_id: "9160e4ed3762e43df37fdc3fb8c688916d11bd3eb0c121a6af69444c0000"
+                        .to_string(),
+                    label: String::new(),
+                    enrolled_at: 1_790_100_000,
+                    level: DeviceLevel::Control,
+                },
+            ],
+            strict: false,
+        }),
+        code: with_code.then(|| PairingCode {
+            level: DeviceLevel::Operate,
+            code: "832F-21EF-0E12-382C".to_string(),
+            expires_at: u64::MAX,
+            link: format!("pilus://pair/{ticket}?code=832F-21EF-0E12-382C&name=Studio%20Mac"),
+        }),
+        error: None,
+        minting: false,
     }
 }
 

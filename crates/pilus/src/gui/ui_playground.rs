@@ -587,6 +587,25 @@ impl UiPlaygroundView {
     }
 
     /// The Mission Control metrics row: one tile per headline figure.
+    /// A QR code, as the pairing card draws it.
+    fn qr_demo(&self) -> Div {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_4()
+            .child(style::qr_code(
+                "pilus://pair/endpointaaaabbbbccccddddeeeeffff?code=AB12-CD34-EF56-7890&name=Studio%20Mac",
+                176.0,
+            ))
+            .child(
+                div()
+                    .text_size(px(self.fonts().secondary))
+                    .text_color(self.theme.muted)
+                    .child("Always dark on light, whatever the theme: a scanner needs the contrast."),
+            )
+    }
+
     fn stat_tile_demo(&self) -> Div {
         let theme = self.theme;
         let fonts = self.fonts();
@@ -1877,6 +1896,7 @@ impl Render for UiPlaygroundView {
             .child(self.section("CONTEXT GAUGE", self.tray(self.context_gauge_demo())))
             .child(self.section("METER", self.tray(self.meter_demo())))
             .child(self.section("STAT TILE", self.tray(self.stat_tile_demo())))
+            .child(self.section("QR CODE", self.tray(self.qr_demo())))
             .child(
                 self.section(
                     "SIDEBAR",

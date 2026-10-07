@@ -10,6 +10,12 @@
 //! flows through it unchanged. [`proxy`] is the trusted-network TCP transport
 //! and [`p2p`] is the iroh/QUIC transport a phone uses, where [`enroll`] admits
 //! devices and hands them the gateway's delegated token.
+//!
+//! Run as a background service ([`service`]) the connector outlives the
+//! window: [`supervisor`] keeps the gateway alive and re-paired, [`hub`] gives
+//! an enrolled device one front door to this machine and every SSH machine it
+//! manages, and [`admin`] is the owner-only socket the window uses to read
+//! status and mint pairing codes.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -18,11 +24,17 @@ use std::process::{Child, Command, Stdio};
 
 use serde_json::Value;
 
+pub mod admin;
 pub mod enroll;
+pub mod hub;
 pub mod p2p;
 pub mod proxy;
-pub use enroll::{AuthState, CONTROL_ALPN, Control, DeviceStore, Enrollment};
+pub mod service;
+pub mod supervisor;
+pub use enroll::{AuthState, CONTROL_ALPN, Control, DeviceStore, Enrollment, Level};
+pub use hub::HUB_ALPN;
 pub use proxy::serve;
+pub use supervisor::GatewayLink;
 
 /// Write `bytes` to `path`, owner-only, refusing to overwrite.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -69,6 +81,10 @@ pub enum Error {
     /// The persisted device store could not be read or written.
     #[error("device store error: {0}")]
     DeviceStore(String),
+
+    /// Installing, removing, or reading the background service failed.
+    #[error("service error: {0}")]
+    Service(String),
 
     /// A bounded wait on the gateway or iroh endpoint expired.
     #[error("{0} timed out")]
@@ -277,6 +293,14 @@ impl Gateway {
                 Err(error)
             }
         }
+    }
+
+    /// Whether the gateway child is still alive.
+    ///
+    /// A gateway that exited has taken its delegated token with it, so the
+    /// supervisor treats a `false` as the cue to start and pair again.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     /// The parsed descriptor.

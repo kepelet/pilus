@@ -225,13 +225,6 @@ impl PilusView {
         cx.notify();
     }
 
-    /// Open the page with one definition selected: Mission Control's strip
-    /// links here rather than showing the definition itself.
-    pub(super) fn open_automation(&mut self, id: String, cx: &mut Context<Self>) {
-        self.open_automations(cx);
-        self.automations_select(Some(id), cx);
-    }
-
     /// Shot-harness entry point: open on canned rows, no daemon.
     #[cfg(feature = "visual-test")]
     pub(super) fn automations_show(

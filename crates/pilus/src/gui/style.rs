@@ -708,7 +708,6 @@ pub(super) fn stat_tile(
         .min_w(px(0.0))
         .px_3()
         .py_2()
-        .bg(theme.panel_dim)
         .border_r_1()
         .border_color(theme.border)
         .child(section_label(theme, label, fonts.label))

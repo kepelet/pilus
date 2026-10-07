@@ -3,7 +3,7 @@
 //!
 //! The data is the daemon's own model, read with `mission.snapshot` on the
 //! active endpoint while the page is open: live and resumable agent rows with
-//! usage, fleet totals, and automation health. Usage counters are scanned on
+//! usage and fleet totals. Usage counters are scanned on
 //! demand, so the page asks for a `mission.refresh` when it opens, when the
 //! scope changes, and when the user presses Refresh, then keeps re-reading the
 //! cheap snapshot. Every row action is a UHP call made off the GUI thread
@@ -23,9 +23,8 @@ use gpui::{
     Anchor, AnyElement, ClickEvent, Context, Div, Entity, FontWeight, Hsla, KeyDownEvent, Rgba,
     SharedString, anchored, deferred, div, point, prelude::*, px,
 };
-use pilus_client::{AutomationRow, MissionRow, MissionScope, MissionSnapshot};
+use pilus_client::{MissionRow, MissionScope, MissionSnapshot};
 
-use super::automations::{automation_color, automation_label, automation_signal};
 use super::style::{self, ButtonKind, FillExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
@@ -47,12 +46,23 @@ const HINT_LINES: u16 = 8;
 
 const DETAIL_WIDTH: f32 = 340.0;
 const ROW_HEIGHT: f32 = 34.0;
-/// Four icon buttons and the gaps between them, plus the cell padding.
-const ACTIONS_WIDTH: f32 = 128.0;
-/// The table's narrowest layout; a narrower pane scrolls it sideways.
-const TABLE_MIN_WIDTH: f32 = 776.0;
+/// The roster's column widths, in design pixels. The usage columns drop as the
+/// pane narrows (see [`MissionColumns`]), so the table fits without a
+/// sideways scroll.
+const NUMBER_WIDTH: f32 = 32.0;
+const AGENT_WIDTH: f32 = 100.0;
+const STATE_WIDTH: f32 = 78.0;
 /// The location column's floor, so the flexible column never collapses.
-const LOCATION_MIN_WIDTH: f32 = 120.0;
+const LOCATION_MIN_WIDTH: f32 = 92.0;
+const MODEL_WIDTH: f32 = 84.0;
+const TOKENS_WIDTH: f32 = 72.0;
+const CONTEXT_WIDTH: f32 = 180.0;
+/// The context column's floor: it is the one fixed column that gives up width
+/// when the pane is tight, so a meter never stretches across a wide pane.
+const CONTEXT_MIN_WIDTH: f32 = 80.0;
+const COST_WIDTH: f32 = 84.0;
+/// Four 31px icon buttons and the gaps between them, plus the cell padding.
+const ACTIONS_WIDTH: f32 = 144.0;
 
 /// The headline state the header shows: what needs you first.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +104,19 @@ impl Signal {
             Self::Standby => theme.muted,
         }
     }
+}
+
+/// Which roster columns a pane shows. The agent, location, and actions columns
+/// always stay; the rest drop from the least to the most useful as the pane
+/// narrows, so the table always fits without a sideways scroll.
+#[derive(Clone, Copy)]
+struct MissionColumns {
+    number: bool,
+    state: bool,
+    model: bool,
+    tokens: bool,
+    context: bool,
+    cost: bool,
 }
 
 /// A message from a background request.
@@ -286,7 +309,8 @@ fn fmt_cost(cost: f64) -> String {
     }
 }
 
-/// A short model tag (`opus`, `sonnet`, `gpt-5`, …), else the id cut short.
+/// A short model tag (`opus`, `sonnet`, `gpt-5`, …), else the id as is; the
+/// cell that shows it ends an overlong one with an ellipsis.
 fn short_model(model: &str) -> String {
     let lower = model.to_ascii_lowercase();
     for known in ["opus", "sonnet", "haiku", "gpt-5", "gpt-4o", "o3", "o1"] {
@@ -294,7 +318,7 @@ fn short_model(model: &str) -> String {
             return known.to_string();
         }
     }
-    model.chars().take(10).collect()
+    model.to_string()
 }
 
 /// Spend summed per model, largest first: the cost-by-model chart.
@@ -442,6 +466,13 @@ impl PilusView {
     #[cfg(feature = "visual-test")]
     pub(super) fn mission_show_answer(&mut self, cx: &mut Context<Self>) {
         self.mission_open_answer(cx);
+    }
+
+    /// Shot-harness entry point: show or hide the side pane.
+    #[cfg(feature = "visual-test")]
+    pub(super) fn mission_show_detail(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.mission.detail_open = open;
+        cx.notify();
     }
 
     fn mission_fetch_budget(&self) {
@@ -805,8 +836,9 @@ impl PilusView {
         }
     }
 
-    /// The page, drawn in place of the terminal card.
-    pub(super) fn mission_page(&mut self, cx: &mut Context<Self>) -> Div {
+    /// The page, drawn in place of the terminal card. `page_w` is the card
+    /// width the page owns, so the roster can drop columns that no longer fit.
+    pub(super) fn mission_page(&mut self, page_w: f32, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let rows: Vec<(String, MissionRow)> = self
@@ -817,6 +849,18 @@ impl PilusView {
             .collect();
         let refs: Vec<&MissionRow> = rows.iter().map(|(_, row)| row).collect();
         let loaded = self.mission.snapshot.is_some();
+        // The side pane takes its width from the roster, so a narrow page drops
+        // columns instead of clipping them behind it.
+        let side_w = if self.mission.detail_open && loaded {
+            style::scaled(&self.shared_settings, DETAIL_WIDTH)
+        } else {
+            0.0
+        };
+        let roster_w = (page_w - side_w).max(0.0);
+        // Beside a side pane the roster must still hold its essential columns;
+        // when it can't, the pane takes the page and Hide returns the roster.
+        let stacked = side_w > 0.0 && roster_w < self.mission_essential_width();
+        let roster_w = if stacked { 0.0 } else { roster_w };
 
         let mut main = div()
             .id("pilus-mission-scroll")
@@ -828,17 +872,19 @@ impl PilusView {
         if loaded {
             main = main
                 .child(self.mission_metrics(&refs))
-                .child(self.mission_automations(cx))
-                .child(self.mission_roster(&rows, cx));
+                .child(self.mission_roster(&rows, roster_w, cx));
         } else if let Some(error) = self.mission.error.clone() {
             main = main.child(self.mission_message("Mission Control is unavailable", error));
         } else {
             main = main.child(self.mission_skeleton());
         }
 
-        let mut body = div().flex().flex_row().flex_1().min_h(px(0.0)).child(main);
+        let mut body = div().flex().flex_row().flex_1().min_h(px(0.0));
+        if !stacked {
+            body = body.child(main);
+        }
         if self.mission.detail_open && loaded {
-            body = body.child(self.mission_side(&refs, cx));
+            body = body.child(self.mission_side(&refs, stacked, cx));
         }
 
         let hints = "↑↓ navigate · r refresh · ⏎ go · a answer · y approve · \
@@ -1202,149 +1248,22 @@ impl PilusView {
             ))
     }
 
-    /// The automation strip: scheduler health and one row per definition.
-    /// A row, or All, opens the Automations page, which owns the definitions'
-    /// detail and controls.
-    fn mission_automations(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let fonts = style::Fonts::resolve(&self.shared_settings);
-        let Some(snapshot) = &self.mission.snapshot else {
-            return div();
-        };
-        let health = snapshot.automation;
-        let (signal, color) = automation_signal(health, theme);
-        let now = unix_now();
-        let next = health
-            .next_run_at
-            .map(|at| format!("next {} · {}", until_label(now, at), utc_label(at)))
-            .unwrap_or_else(|| "no upcoming run".to_string());
-        let summary = format!(
-            "{} armed · {} live · {} review · {} failed · {next}",
-            health.scheduled, health.running, health.review, health.failed
-        );
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .child(style::section_label(theme, "AUTOMATIONS", fonts.label))
-            .child(
-                div()
-                    .text_size(px(fonts.label))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(color)
-                    .child(signal.to_uppercase()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(px(fonts.secondary))
-                    .text_color(theme.muted)
-                    .child(summary),
-            )
-            .child(
-                style::small_button(
-                    "pilus-mission-automations-all",
-                    "All automations",
-                    ButtonKind::Ghost,
-                    theme,
-                    fonts.secondary,
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.open_automations(cx))),
-            );
-        let header = header.px_4().pt_4().pb_2();
-        let mut column = div().flex().flex_col().child(header);
-        if snapshot.automations.is_empty() {
-            return column.pb_2();
-        }
-        let mut list = div().flex().flex_col();
-        for row in &snapshot.automations {
-            list = list.child(self.mission_automation_row(row, now, cx));
-        }
-        column = column.child(
-            div()
-                .p_1()
-                .border_t_1()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(list),
-        );
-        column
-    }
-
-    fn mission_automation_row(
+    /// The agent table: one row per live agent, then resumable sessions. The
+    /// columns that fit `width` are chosen so the table never clips or scrolls
+    /// sideways.
+    fn mission_roster(
         &self,
-        row: &AutomationRow,
-        now: u64,
+        rows: &[(String, MissionRow)],
+        width: f32,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let (rest, hover) = row_fills(false, theme);
-        let color = automation_color(&row.state, theme);
-        let id = row.id.clone();
-        let next = row
-            .next_run_at
-            .map(|at| until_label(now, at))
-            .unwrap_or_else(|| "—".to_string());
-        div()
-            .id(format!("pilus-mission-automation-{}", row.id))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .h(px(style::scaled(&self.shared_settings, 30.0)))
-            .px_2()
-            .rounded_md()
-            .cursor_pointer()
-            .state_fill(rest, hover, style::RADIUS_MD)
-            .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(color))
-            .child(
-                div()
-                    .w(px(style::scaled(&self.shared_settings, 96.0)))
-                    .flex_shrink_0()
-                    .text_size(px(fonts.secondary))
-                    .text_color(color)
-                    .child(automation_label(&row.state)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(px(fonts.body))
-                    .text_color(theme.panel_fg)
-                    .child(row.name.clone()),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(fonts.secondary))
-                    .text_color(theme.muted)
-                    .child(row.agent_id.clone()),
-            )
-            .child(
-                div()
-                    .w(px(style::scaled(&self.shared_settings, 64.0)))
-                    .flex()
-                    .justify_end()
-                    .flex_shrink_0()
-                    .text_size(px(fonts.secondary))
-                    .text_color(theme.muted)
-                    .child(next),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| this.open_automation(id.clone(), cx)))
-    }
-
-    /// The agent table: one row per live agent, then resumable sessions.
-    fn mission_roster(&self, rows: &[(String, MissionRow)], cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let columns = self.mission_columns(width);
         let label = |text: &'static str, width: Option<f32>, right: bool, last: bool| {
             let cell = self
                 .mission_cell(width, last)
+                .overflow_hidden()
                 .text_size(px(fonts.label))
                 .font_weight(FontWeight::BOLD)
                 .text_color(theme.muted);
@@ -1354,25 +1273,41 @@ impl PilusView {
                 cell.child(text)
             }
         };
-        let header = div()
+        let mut header = div()
             .flex()
             .flex_row()
             .items_stretch()
             .h(px(style::scaled(&self.shared_settings, 26.0)))
             .bg(theme.panel_dim)
             .border_b_1()
-            .border_color(theme.border)
-            .child(label("#", Some(32.0), false, false))
-            .child(label("AGENT", Some(108.0), false, false))
-            .child(label("STATE", Some(68.0), false, false))
-            .child(
-                label("LOCATION", None, false, false).min_w(self.mission_min(LOCATION_MIN_WIDTH)),
-            )
-            .child(label("MODEL", Some(60.0), false, false))
-            .child(label("TOKENS", Some(90.0), true, false))
-            .child(label("CONTEXT", Some(140.0), false, false))
-            .child(label("COST", Some(68.0), true, false))
-            .child(label("ACTIONS", Some(ACTIONS_WIDTH), false, true));
+            .border_color(theme.border);
+        if columns.number {
+            header = header.child(label("#", Some(NUMBER_WIDTH), false, false));
+        }
+        header = header.child(label("AGENT", Some(AGENT_WIDTH), false, false));
+        if columns.state {
+            header = header.child(label("STATE", Some(STATE_WIDTH), false, false));
+        }
+        header = header.child(
+            label("LOCATION", None, false, false).min_w(self.mission_min(LOCATION_MIN_WIDTH)),
+        );
+        if columns.model {
+            header = header.child(label("MODEL", Some(MODEL_WIDTH), false, false));
+        }
+        if columns.tokens {
+            header = header.child(label("TOKENS", Some(TOKENS_WIDTH), true, false));
+        }
+        if columns.context {
+            header = header.child(
+                label("CONTEXT", Some(CONTEXT_WIDTH), false, false)
+                    .flex_shrink_1()
+                    .min_w(self.mission_min(CONTEXT_MIN_WIDTH)),
+            );
+        }
+        if columns.cost {
+            header = header.child(label("COST", Some(COST_WIDTH), true, false));
+        }
+        header = header.child(label("ACTIONS", Some(ACTIONS_WIDTH), false, true));
         let column = div().flex().flex_col().child(
             style::section_label(theme, "AGENT SESSIONS", fonts.label)
                 .px_4()
@@ -1385,23 +1320,62 @@ impl PilusView {
         let mut list = div()
             .flex()
             .flex_col()
-            .min_w(self.mission_min(TABLE_MIN_WIDTH))
             .border_t_1()
             .border_color(theme.border)
             .child(header);
         for (index, (key, row)) in rows.iter().enumerate() {
-            list = list.child(self.mission_row(index + 1, key, row, index + 1 < rows.len(), cx));
+            list = list.child(self.mission_row(
+                index + 1,
+                key,
+                row,
+                columns,
+                index + 1 < rows.len(),
+                cx,
+            ));
         }
-        column.child(
-            div()
-                .id("pilus-mission-table")
-                .overflow_x_scroll()
-                .child(list),
-        )
+        column.child(list)
     }
 
     fn mission_min(&self, width: f32) -> gpui::Pixels {
         px(style::scaled(&self.shared_settings, width))
+    }
+
+    /// The narrowest roster that still shows its agent, location, and actions.
+    fn mission_essential_width(&self) -> f32 {
+        let scale = |design: f32| style::scaled(&self.shared_settings, design);
+        scale(AGENT_WIDTH) + scale(LOCATION_MIN_WIDTH) + scale(ACTIONS_WIDTH)
+    }
+
+    /// The roster columns that fit `width` pixels. The scale follows the
+    /// Interface size, so a larger setting drops columns instead of clipping
+    /// them. The agent, location, and actions columns never drop; the usage
+    /// columns go from the least to the most useful (the side pane repeats
+    /// tokens and cost).
+    fn mission_columns(&self, width: f32) -> MissionColumns {
+        let scale = |design: f32| style::scaled(&self.shared_settings, design);
+        let mut used = self.mission_essential_width();
+        let mut columns = MissionColumns {
+            number: false,
+            state: false,
+            model: false,
+            tokens: false,
+            context: false,
+            cost: false,
+        };
+        for (column, design) in [
+            (&mut columns.number, NUMBER_WIDTH),
+            (&mut columns.model, MODEL_WIDTH),
+            (&mut columns.context, CONTEXT_MIN_WIDTH),
+            (&mut columns.state, STATE_WIDTH),
+            (&mut columns.tokens, TOKENS_WIDTH),
+            (&mut columns.cost, COST_WIDTH),
+        ] {
+            if used + scale(design) <= width {
+                *column = true;
+                used += scale(design);
+            }
+        }
+        columns
     }
 
     /// One table cell: a fixed width, or the flexible column when `width` is
@@ -1426,6 +1400,7 @@ impl PilusView {
         number: usize,
         key: &str,
         row: &MissionRow,
+        columns: MissionColumns,
         rule_below: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1489,15 +1464,17 @@ impl PilusView {
             .h(px(style::scaled(&self.shared_settings, ROW_HEIGHT)))
             .cursor_pointer()
             .state_fill(rest, hover, square)
+            .when(columns.number, |el| {
+                el.child(
+                    self.mission_cell(Some(NUMBER_WIDTH), false)
+                        .font_family(mono.clone())
+                        .text_size(px(fonts.secondary))
+                        .text_color(theme.muted)
+                        .child(format!("{number:02}")),
+                )
+            })
             .child(
-                self.mission_cell(Some(32.0), false)
-                    .font_family(mono.clone())
-                    .text_size(px(fonts.secondary))
-                    .text_color(theme.muted)
-                    .child(format!("{number:02}")),
-            )
-            .child(
-                self.mission_cell(Some(108.0), false)
+                self.mission_cell(Some(AGENT_WIDTH), false)
                     .gap_2()
                     .child(
                         div()
@@ -1522,68 +1499,78 @@ impl PilusView {
                             .child(row.agent.clone()),
                     ),
             )
-            .child(
-                self.mission_cell(Some(68.0), false)
-                    .text_size(px(fonts.secondary))
-                    .text_color(state_color)
-                    .child(state),
-            )
+            .when(columns.state, |el| {
+                el.child(
+                    self.mission_cell(Some(STATE_WIDTH), false)
+                        .text_size(px(fonts.secondary))
+                        .text_color(state_color)
+                        .child(state),
+                )
+            })
             .child(
                 self.mission_cell(None, false)
                     .min_w(self.mission_min(LOCATION_MIN_WIDTH))
-                    .truncate()
                     .text_size(px(fonts.secondary))
                     .text_color(theme.muted)
-                    .child(row.location.clone()),
+                    .child(div().min_w(px(0.0)).truncate().child(row.location.clone())),
             )
-            .child(
-                self.mission_cell(Some(60.0), false)
-                    .truncate()
-                    .text_size(px(fonts.secondary))
-                    .text_color(theme.branch)
-                    .child(model),
-            )
-            .child(
-                self.mission_cell(Some(90.0), false)
-                    .justify_end()
-                    .font_family(mono.clone())
-                    .text_size(px(fonts.secondary))
-                    .text_color(theme.panel_fg)
-                    .child(tokens),
-            )
-            .child(
-                self.mission_cell(Some(140.0), false)
-                    .gap_2()
-                    .child(div().flex_1().child(style::meter(
-                        format!("pilus-mission-ctx-{key}"),
-                        context,
-                        if warns { theme.alert } else { theme.accent },
-                        theme,
-                        style::scaled(&self.shared_settings, 5.0),
-                    )))
-                    .child(
-                        div()
-                            .w(scaled(30.0))
-                            .flex()
-                            .justify_end()
-                            .font_family(mono.clone())
-                            .text_size(px(fonts.label))
-                            .text_color(if warns { theme.alert } else { theme.muted })
-                            .child(
-                                context
-                                    .map(|context| format!("{}%", (context * 100.0).round()))
-                                    .unwrap_or_else(dash),
-                            ),
-                    ),
-            )
-            .child(
-                self.mission_cell(Some(68.0), false)
-                    .justify_end()
-                    .font_family(mono)
-                    .text_size(px(fonts.secondary))
-                    .text_color(theme.ok)
-                    .child(cost),
-            )
+            .when(columns.model, |el| {
+                el.child(
+                    self.mission_cell(Some(MODEL_WIDTH), false)
+                        .text_size(px(fonts.secondary))
+                        .text_color(theme.branch)
+                        .child(div().min_w(px(0.0)).truncate().child(model)),
+                )
+            })
+            .when(columns.tokens, |el| {
+                el.child(
+                    self.mission_cell(Some(TOKENS_WIDTH), false)
+                        .justify_end()
+                        .font_family(mono.clone())
+                        .text_size(px(fonts.secondary))
+                        .text_color(theme.panel_fg)
+                        .child(tokens),
+                )
+            })
+            .when(columns.context, |el| {
+                el.child(
+                    self.mission_cell(Some(CONTEXT_WIDTH), false)
+                        .flex_shrink_1()
+                        .min_w(scaled(CONTEXT_MIN_WIDTH))
+                        .gap_2()
+                        .child(div().flex_1().child(style::meter(
+                            format!("pilus-mission-ctx-{key}"),
+                            context,
+                            if warns { theme.alert } else { theme.accent },
+                            theme,
+                            style::scaled(&self.shared_settings, 5.0),
+                        )))
+                        .child(
+                            div()
+                                .w(scaled(30.0))
+                                .flex()
+                                .justify_end()
+                                .font_family(mono.clone())
+                                .text_size(px(fonts.label))
+                                .text_color(if warns { theme.alert } else { theme.muted })
+                                .child(
+                                    context
+                                        .map(|context| format!("{}%", (context * 100.0).round()))
+                                        .unwrap_or_else(dash),
+                                ),
+                        ),
+                )
+            })
+            .when(columns.cost, |el| {
+                el.child(
+                    self.mission_cell(Some(COST_WIDTH), false)
+                        .justify_end()
+                        .font_family(mono.clone())
+                        .text_size(px(fonts.secondary))
+                        .text_color(theme.ok)
+                        .child(cost),
+                )
+            })
             .child(
                 self.mission_cell(Some(ACTIONS_WIDTH), true)
                     .px_1()
@@ -1608,7 +1595,14 @@ impl PilusView {
 
     /// The side pane: the selected agent, then the fleet's status counts and
     /// spend by model.
-    fn mission_side(&self, rows: &[&MissionRow], cx: &mut Context<Self>) -> AnyElement {
+    /// `stacked` stretches the pane over the whole page, for a page too narrow
+    /// to hold it beside the roster.
+    fn mission_side(
+        &self,
+        rows: &[&MissionRow],
+        stacked: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let (content, actions): (AnyElement, Option<Div>) = match self.mission_selected_row() {
@@ -1657,15 +1651,18 @@ impl PilusView {
             .child(content)
             .child(self.mission_status_counts(rows))
             .child(self.mission_cost_chart(rows));
-        style::enter(
-            "pilus-mission-side",
-            div()
-                .flex()
-                .flex_col()
+        let frame = div().flex().flex_col().min_h(px(0.0));
+        let frame = if stacked {
+            frame.flex_1().min_w(px(0.0))
+        } else {
+            frame
                 .w(px(style::scaled(&self.shared_settings, DETAIL_WIDTH)))
                 .flex_shrink_0()
-                .min_h(px(0.0))
                 .border_l_1()
+        };
+        style::enter(
+            "pilus-mission-side",
+            frame
                 .border_color(terminal_inset_border())
                 .child(header)
                 .child(
@@ -2258,7 +2255,7 @@ mod tests {
         assert_eq!(fmt_cost(3.2), "$3.20");
         assert_eq!(fmt_cost(17_700.0), "$17.7k");
         assert_eq!(short_model("claude-sonnet-4-5"), "sonnet");
-        assert_eq!(short_model("mystery-model-xl"), "mystery-mo");
+        assert_eq!(short_model("mystery-model-xl"), "mystery-model-xl");
     }
 
     #[test]

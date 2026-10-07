@@ -866,6 +866,9 @@ struct CardLayout {
     /// of the grid's own padding. Zero with no split.
     page_w: f32,
     page_h: f32,
+    /// The card's full inner width, before a split page takes its half. A
+    /// page that fills the card (or leads a vertical split) is this wide.
+    content_w: f32,
 }
 
 /// Which surface owns the keyboard, in stacking order.
@@ -4378,11 +4381,16 @@ impl PilusView {
             return self.page_card(id, page, grid, layout, terminal_fill, cx);
         }
         if self.mission.is_open() {
+            // The page fills the card, or the leading half of a right split.
+            let page_w = match self.page_split().map(|split| split.axis) {
+                Some(SplitAxis::Right) => layout.page_w,
+                _ => layout.content_w,
+            };
             let page = div()
                 .flex_1()
                 .min_h(px(0.0))
                 .overflow_hidden()
-                .child(self.mission_page(cx));
+                .child(self.mission_page(page_w, cx));
             return self.page_card("pilus-page-mission", page, grid, layout, terminal_fill, cx);
         }
         if self.automations_page.is_open() {
@@ -11254,6 +11262,7 @@ impl PilusView {
         let inner_h =
             f32::from(viewport.height) - HEADER_HEIGHT - gap_top - gap_bottom - 2.0 * border;
         // A split page leads the card; the grid fits what it leaves.
+        let content_w = inner_w;
         let (page_w, page_h) = match self.page_split().map(|split| split.axis) {
             Some(SplitAxis::Right) => (page_extent(inner_w), 0.0),
             Some(SplitAxis::Down) => (0.0, page_extent(inner_h)),
@@ -11312,6 +11321,7 @@ impl PilusView {
             slack_y,
             page_w,
             page_h,
+            content_w,
         }
     }
 
@@ -13479,6 +13489,7 @@ mod tests {
             slack_y: 0.0,
             page_w: 0.0,
             page_h: 0.0,
+            content_w: 640.0,
         };
         let right_half = PaneFrame {
             x: 0.5,

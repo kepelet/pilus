@@ -606,6 +606,13 @@ pub fn run() -> Result<()> {
         });
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "mission")?;
+        // The roster with the side pane closed: the widest it gets, where the
+        // context column takes the slack and location holds its width.
+        cx.update(|app| view.update(app, |view, cx| view.mission_show_detail(false, cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "mission-wide")?;
+        cx.update(|app| view.update(app, |view, cx| view.mission_show_detail(true, cx)));
+        settle(&mut cx, 12);
         cx.update(|app| view.update(app, |view, cx| view.mission_show_answer(cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "mission-answer")?;
@@ -1366,8 +1373,14 @@ fn sample_mission() -> (
             ..live("4", "claude", "blocked", 2, "core p1/2 · t3")
         },
         MissionRow {
-            usage: usage("gpt-5-codex", 2_100_000, 380_000, 0.42, 18.4),
-            ..live("6", "codex", "working", 3, "notes")
+            usage: usage("deepseek-chat-v3.1", 2_100_000, 380_000, 0.42, 18.4),
+            ..live(
+                "6",
+                "codex",
+                "working",
+                3,
+                "notes-and-research-for-the-quarterly-planning-review",
+            )
         },
         MissionRow {
             usage: usage("claude-sonnet-4-5", 640_000, 92_000, 0.28, 3.1),

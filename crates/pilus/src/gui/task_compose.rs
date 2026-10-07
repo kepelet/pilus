@@ -336,7 +336,7 @@ impl PilusView {
 
     /// `endpoint`'s tasks: the window's own feed for the machine it shows,
     /// else the last fetch.
-    fn machine_tasks(&self, endpoint: &EndpointId) -> Vec<Task> {
+    pub(super) fn machine_tasks(&self, endpoint: &EndpointId) -> Vec<Task> {
         if *endpoint == self.active {
             return self.tasks.items.clone();
         }

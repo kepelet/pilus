@@ -17,6 +17,7 @@ mod keys;
 mod machines;
 mod markdown;
 mod mission;
+mod orchestration;
 mod page_split;
 mod palette;
 mod pi_extension;
@@ -84,7 +85,7 @@ use selection::{Cell, Selection};
 use session::SessionPanel;
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
 use style::FillExt;
-use tasks::{TasksInputs, TasksPanel};
+use tasks::{TaskLayout, TasksInputs, TasksPanel};
 use text_input::{TextField, TextInput};
 use theme::Theme;
 use updater::Updater;
@@ -270,18 +271,6 @@ impl NavKind {
             NavKind::Tasks => include_bytes!("../../assets/icons/list-checks.svg"),
             NavKind::Mission => include_bytes!("../../assets/icons/layout-panel-left.svg"),
             NavKind::Orchestration => include_bytes!("../../assets/icons/workflow.svg"),
-        }
-    }
-
-    /// The `<bind>` chord that opens this destination in the daemon.
-    ///
-    /// Tasks, Mission Control, and Automations open native pages, so only
-    /// Orchestration still sends its chord; the others keep the daemon's
-    /// binding so `tab_view` can follow a chord typed in a pane.
-    fn chord(self) -> char {
-        match self {
-            NavKind::Automations | NavKind::Mission => 'm',
-            NavKind::Tasks | NavKind::Orchestration => 'o',
         }
     }
 }
@@ -4380,7 +4369,13 @@ impl PilusView {
                 .min_h(px(0.0))
                 .overflow_hidden()
                 .child(self.tasks_page(cx));
-            return self.page_card("pilus-page-tasks", page, grid, layout, terminal_fill, cx);
+            // Each layout fades in under its own id, so moving between the
+            // list and the board replays the fade like any page switch.
+            let id = match self.tasks_panel.layout() {
+                TaskLayout::List => "pilus-page-tasks",
+                TaskLayout::Board => "pilus-page-orchestration",
+            };
+            return self.page_card(id, page, grid, layout, terminal_fill, cx);
         }
         if self.mission.is_open() {
             let page = div()
@@ -10558,7 +10553,11 @@ impl PilusView {
     /// ever lights, so a click never sprays the highlight across the menu.
     fn nav_active(&self, kind: NavKind) -> bool {
         if self.tasks_panel.is_open() {
-            return kind == NavKind::Tasks;
+            return kind
+                == match self.tasks_panel.layout() {
+                    TaskLayout::List => NavKind::Tasks,
+                    TaskLayout::Board => NavKind::Orchestration,
+                };
         }
         if self.mission.is_open() {
             return kind == NavKind::Mission;
@@ -10679,7 +10678,6 @@ impl PilusView {
             None => div(),
         };
         let label = div().flex_1();
-        let chord = kind.chord();
         div()
             .id(format!("pilus-nav-{}", kind.label()))
             .flex()
@@ -10700,27 +10698,11 @@ impl PilusView {
             .child(icon(kind.icon(), SIDEBAR_GLYPH, theme.muted))
             .child(label.child(kind.label().to_string()))
             .child(badge)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                match kind {
-                    NavKind::Tasks => {
-                        this.open_tasks(cx);
-                        return;
-                    }
-                    NavKind::Mission => {
-                        this.open_mission(cx);
-                        return;
-                    }
-                    NavKind::Automations => {
-                        this.open_automations(cx);
-                        return;
-                    }
-                    NavKind::Orchestration => {}
-                }
-                this.leave_settings_page();
-                this.nav_sel = Some(kind);
-                this.nav_sel_at = Instant::now();
-                this.send_bind(chord);
-                cx.notify();
+            .on_click(cx.listener(move |this, _, _, cx| match kind {
+                NavKind::Tasks => this.open_tasks(cx),
+                NavKind::Mission => this.open_mission(cx),
+                NavKind::Automations => this.open_automations(cx),
+                NavKind::Orchestration => this.open_orchestration(cx),
             }))
     }
 

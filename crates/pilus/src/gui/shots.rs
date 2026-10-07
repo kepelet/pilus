@@ -565,6 +565,37 @@ pub fn run() -> Result<()> {
         });
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "tasks-scope-machine")?;
+        // The same queue as the Orchestration board, then a waiting card
+        // picked so its links light and the detail pane opens.
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.tasks_panel_pick(super::task_compose::TaskPicker::ScopeMachine, cx);
+                view.agents = sample_task_agents();
+                view.tasks_panel.selected = None;
+                view.open_orchestration(cx);
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "orchestration")?;
+        cx.update(|app| view.update(app, |view, cx| view.tasks_panel_select("t6", cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "orchestration-detail")?;
+        // Two cards folded to their title (the waiting one keeps its badge)
+        // and the Review lane folded to a strip.
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                for id in ["t4", "t5"] {
+                    view.tasks_panel.folded.insert(id.to_string());
+                }
+                view.tasks_panel
+                    .folded_lanes
+                    .insert(super::orchestration::Lane::Review);
+                view.tasks_panel.selected = None;
+                cx.notify();
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "orchestration-folded")?;
         // Mission Control on a canned dashboard: the roster with a blocked
         // agent selected and its reply field.
         cx.update(|app| {
@@ -1227,6 +1258,7 @@ fn sample_tasks() -> pilus_client::TaskSummary {
         updated: now.saturating_sub(age),
         created: now.saturating_sub(age + 600),
         attempt: 1,
+        project_root: Some("/Users/me/src/pilus".into()),
         ..Task::default()
     };
     let items = vec![
@@ -1247,22 +1279,53 @@ fn sample_tasks() -> pilus_client::TaskSummary {
             paths: vec!["src/api/**".into()],
             ..task("t4", "Rate-limit the public API", TaskStatus::Queued, 3_600)
         },
-        task("t5", "Document the token store", TaskStatus::Queued, 7_200),
         Task {
+            deps: vec!["t1".into()],
+            prompt: Some("Write the token store's guide: rotation, expiry, and storage.".into()),
+            ..task("t5", "Document the token store", TaskStatus::Queued, 7_200)
+        },
+        Task {
+            assignee: Some(6),
+            deps: vec!["t1".into()],
             outputs: vec!["1 test failed: auth::expiry".into()],
             gate: Some("cargo test auth".into()),
+            prompt: Some("Expiry is computed one second early; fix it and add a test.".into()),
             ..task("t2", "Fix expiry off-by-one", TaskStatus::Review, 900)
         },
         Task {
+            deps: vec!["t2".into(), "t3".into()],
+            prompt: Some("Ship the refreshed auth flow once both fixes merge.".into()),
+            ..task("t6", "Release auth 2.0", TaskStatus::Queued, 1_800)
+        },
+        Task {
             branch: Some("task/t1".into()),
-            ..task("t1", "Add token store", TaskStatus::Done, 86_400)
+            prompt: Some("Introduce a token store with pluggable backends.".into()),
+            ..task("t1", "Add token store", TaskStatus::Merged, 86_400)
         },
     ];
     pilus_client::TaskSummary {
-        open: 4,
+        open: 5,
         total: items.len() as u32,
         items,
     }
+}
+
+/// The agents working `sample_tasks`' claimed tasks.
+fn sample_task_agents() -> Vec<pilus_client::Agent> {
+    let agent = |pane: &str, kind: &str, status: &str| pilus_client::Agent {
+        pane: pane.to_string(),
+        tab: 1,
+        agent: kind.to_string(),
+        name: String::new(),
+        status: status.to_string(),
+        workspace_id: "ws1".to_string(),
+        workspace_name: "pilus".to_string(),
+        cwd: "~/src/pilus".to_string(),
+        branch: None,
+        focused: false,
+        session: None,
+    };
+    vec![agent("4", "claude", "working"), agent("6", "codex", "done")]
 }
 
 /// A fleet with one agent per state, a resumable session, and two

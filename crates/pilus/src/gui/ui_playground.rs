@@ -945,6 +945,67 @@ impl UiPlaygroundView {
             .child(style::chip(theme, "src/auth/** +2", fonts.label))
     }
 
+    /// Board cards joined by connectors: a waiting link, a settled
+    /// (dashed) one, and the selected card's accent ring.
+    fn board_demo(&self) -> Div {
+        let theme = self.theme;
+        let fonts = self.fonts();
+        let (card_w, card_h, gap) = (150.0, 56.0, 64.0);
+        let card = |id: &'static str, label: &'static str, selected: bool, x: f32, y: f32| {
+            style::board_card(id, selected, theme)
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(card_w))
+                .h(px(card_h))
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_size(px(fonts.body))
+                        .text_color(theme.panel_fg)
+                        .child(label),
+                )
+        };
+        let muted = gpui::Hsla::from(theme.muted);
+        let mid = card_h / 2.0;
+        let right = card_w + gap;
+        let link =
+            |from: (f32, f32), to: (f32, f32), color: gpui::Hsla, dashed: bool| style::Connector {
+                from,
+                from_side: style::Side::Right,
+                to,
+                to_side: style::Side::Left,
+                color,
+                dashed,
+            };
+        div()
+            .relative()
+            .w(px(2.0 * card_w + gap))
+            .h(px(2.0 * card_h + 16.0))
+            .child(style::connectors(
+                vec![
+                    link((card_w, mid), (right, mid), muted.opacity(0.75), false),
+                    link(
+                        (card_w, card_h + 16.0 + mid),
+                        (right, mid),
+                        muted.opacity(0.35),
+                        true,
+                    ),
+                ],
+                1.5,
+            ))
+            .child(card("pg-board-a", "Waiting link", false, 0.0, 0.0))
+            .child(card(
+                "pg-board-b",
+                "Settled link",
+                false,
+                0.0,
+                card_h + 16.0,
+            ))
+            .child(card("pg-board-c", "Selected", true, right, 0.0))
+    }
+
     /// The vendored icon grid.
     fn icon_grid(&self) -> Div {
         let theme = self.theme;
@@ -1840,6 +1901,7 @@ impl Render for UiPlaygroundView {
             .child(self.section("SMALL BUTTONS", self.tray(self.small_buttons(cx))))
             .child(self.section("BADGES & DOTS", self.tray(self.badges())))
             .child(self.section("TASK STATUS & CHIPS", self.tray(self.task_status_demo())))
+            .child(self.section("BOARD", self.tray(self.board_demo())))
             .child(
                 self.section(
                     "ROWS",

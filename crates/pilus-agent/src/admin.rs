@@ -10,12 +10,17 @@
 //! - `new_code` mints a code on demand and returns it with the ready-made
 //!   `pilus://pair/…` link a QR is made from.
 //! - `revoke` removes an enrolled device.
+//! - `retry` stops the gateway's backoff and starts Luvus if it is not running.
+//!
+//! `status` also says whether the service is running an older binary than the one
+//! on disk (an update replaced it) and, on Linux, whether it will survive logout.
 //!
 //! Access is the socket file's `0600` mode inside a `0700` directory, the same
 //! trust the Luvus daemon's own socket relies on.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime};
 
 use iroh::Endpoint;
 use iroh_tickets::endpoint::EndpointTicket;
@@ -23,6 +28,22 @@ use serde_json::{Value, json};
 
 use crate::enroll::{AuthState, Level};
 use crate::supervisor::GatewayLink;
+
+/// When this process started, to tell whether its binary has been replaced since.
+static STARTED: LazyLock<SystemTime> = LazyLock::new(SystemTime::now);
+
+/// Whether the file this process runs from was written after it started.
+///
+/// An update replaces the binary in place and leaves the old process running it,
+/// so the service would keep old behaviour until the next login. The window uses
+/// this to restart it. A couple of seconds of slack keeps a binary written just
+/// before launch from counting.
+fn binary_replaced() -> bool {
+    std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|modified| modified > *STARTED + Duration::from_secs(2))
+}
 
 /// What the admin socket reads from the running connector.
 #[derive(Clone)]
@@ -53,6 +74,10 @@ impl Admin {
                 }
             }
             Some("set_level") => self.set_level(request),
+            Some("retry") => {
+                self.link.kick();
+                json!({ "type": "retrying" })
+            }
             Some("revoke") => {
                 let target = request
                     .get("endpoint_id")
@@ -90,6 +115,8 @@ impl Admin {
             "ticket": self.ticket(),
             "gateway": { "up": self.link.is_up(), "error": self.link.error() },
             "strict": self.auth.is_strict(),
+            "restart_needed": binary_replaced(),
+            "linger": crate::service::linger(),
             "devices": devices,
         })
     }
@@ -188,6 +215,8 @@ pub async fn serve(path: &Path, admin: Admin) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+    // Read the clock now, not at the first status request.
+    LazyLock::force(&STARTED);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
@@ -204,18 +233,16 @@ pub async fn serve(path: &Path, admin: Admin) -> std::io::Result<()> {
             let (read, mut write) = stream.into_split();
             let mut reader = BufReader::new(read.take(64 * 1024));
             let mut line = String::new();
-            let answer = match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                reader.read_line(&mut line),
-            )
-            .await
-            {
-                Ok(Ok(n)) if n > 0 => match serde_json::from_str::<Value>(line.trim()) {
-                    Ok(request) => admin.dispatch(&request),
-                    Err(parse) => error(&parse.to_string()),
-                },
-                _ => error("no request received"),
-            };
+            let answer =
+                match tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+                    .await
+                {
+                    Ok(Ok(n)) if n > 0 => match serde_json::from_str::<Value>(line.trim()) {
+                        Ok(request) => admin.dispatch(&request),
+                        Err(parse) => error(&parse.to_string()),
+                    },
+                    _ => error("no request received"),
+                };
             let _ = write.write_all(answer.to_string().as_bytes()).await;
             let _ = write.write_all(b"\n").await;
         });

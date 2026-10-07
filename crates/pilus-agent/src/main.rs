@@ -21,6 +21,7 @@ USAGE:
     pilus-agent descriptor [--control] [--machines] [--session NAME]
     pilus-agent service install [--session NAME] [--binary PATH]
     pilus-agent service uninstall
+    pilus-agent service restart
     pilus-agent service status
 
 OPTIONS:
@@ -57,7 +58,9 @@ fn main() -> anyhow::Result<()> {
             "serve" | "descriptor" | "service" if command.is_empty() => {
                 command = args[index].clone()
             }
-            "install" | "uninstall" | "status" if command == "service" && subcommand.is_empty() => {
+            "install" | "uninstall" | "restart" | "status"
+                if command == "service" && subcommand.is_empty() =>
+            {
                 subcommand = args[index].clone();
             }
             "--service" => background = true,
@@ -193,13 +196,17 @@ fn run_service(
             service::uninstall()?;
             println!("removed");
         }
+        "restart" => {
+            service::restart()?;
+            println!("restarted");
+        }
         "status" => match service::state() {
             service::State::Unsupported => println!("unsupported"),
             service::State::NotInstalled => println!("not installed"),
             service::State::Installed { running: true } => println!("installed, running"),
             service::State::Installed { running: false } => println!("installed, not running"),
         },
-        _ => bail!("service needs install, uninstall, or status\n\n{USAGE}"),
+        _ => bail!("service needs install, uninstall, restart, or status\n\n{USAGE}"),
     }
     Ok(())
 }

@@ -6217,6 +6217,28 @@ impl PilusView {
     fn remote_access_section_block(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let remote = &self.remote;
+        if !pilus_client::agent_service::SUPPORTED {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div().px_3().child(style::section_label(
+                        theme,
+                        "REMOTE ACCESS",
+                        self.section_font(),
+                    )),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .text_size(px(self.footer_font()))
+                        .text_color(theme.muted)
+                        .child(
+                            "Remote access runs as a background service, which pilus supports on macOS and Linux. It is not available on this platform yet.",
+                        ),
+                );
+        }
         let toggle = style::toggle("pilus-remote-access-toggle", remote.on(), theme).on_click(
             cx.listener(|this, _, _, cx| {
                 this.toggle_connector();
@@ -6309,13 +6331,13 @@ impl PilusView {
         let theme = self.theme;
         let remote = &self.remote;
         let small = self.footer_font();
+        let missing = status.luvus_missing();
         let health = if status.gateway_up {
-            "Running".to_string()
+            "Running"
+        } else if missing {
+            "Luvus not found"
         } else {
-            match &status.gateway_error {
-                Some(why) => format!("Running, waiting for Luvus ({why})"),
-                None => "Running, waiting for Luvus".to_string(),
-            }
+            "Waiting for Luvus"
         };
         let add = if remote.minting {
             "Adding…"
@@ -6355,26 +6377,122 @@ impl PilusView {
                         )
                         .child(div().truncate().child(health)),
                 )
-                .when(!status.strict, |row| {
-                    row.child(
-                        style::small_button(
-                            "pilus-add-device",
-                            add,
-                            style::ButtonKind::Primary,
-                            theme,
-                            small,
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_2()
+                        // Retrying cannot conjure a binary that is not installed.
+                        .when(!status.gateway_up && !missing, |actions| {
+                            actions.child(
+                                style::small_button(
+                                    "pilus-start-luvus",
+                                    "Start Luvus",
+                                    style::ButtonKind::Secondary,
+                                    theme,
+                                    small,
+                                )
+                                .on_click(cx.listener(
+                                    |_, _, _, cx| {
+                                        connector::retry_luvus();
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        })
+                        .child(
+                            style::small_button(
+                                "pilus-restart-service",
+                                "Restart",
+                                style::ButtonKind::Ghost,
+                                theme,
+                                small,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                connector::restart_service();
+                                this.settings_status = "Restarting the service…".to_string();
+                                cx.notify();
+                            })),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            connector::mint_code(if this.pairing_operate {
-                                pilus_client::agent_service::DeviceLevel::Operate
-                            } else {
-                                pilus_client::agent_service::DeviceLevel::Control
-                            });
-                            cx.notify();
-                        })),
-                    )
-                }),
+                        .when(!status.strict, |actions| {
+                            actions.child(
+                                style::small_button(
+                                    "pilus-add-device",
+                                    add,
+                                    style::ButtonKind::Primary,
+                                    theme,
+                                    small,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        connector::mint_code(if this.pairing_operate {
+                                            pilus_client::agent_service::DeviceLevel::Operate
+                                        } else {
+                                            pilus_client::agent_service::DeviceLevel::Control
+                                        });
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        }),
+                ),
         );
+        // Say what is wrong and what to do about it, not just that it is.
+        if !status.gateway_up {
+            let advice = if missing {
+                "pilus can't find the luvus program. Install Luvus (or set LUVUS_BIN), then turn Remote access off and on."
+            } else {
+                "The Luvus server isn't running, so there is nothing to reach yet. Start it and Remote access connects by itself."
+            };
+            block = block.child(style::enter(
+                "pilus-remote-advice",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_size(px(small))
+                    .text_color(theme.muted)
+                    .child(advice)
+                    .when_some(status.gateway_error.clone(), |note, why| {
+                        note.child(div().truncate().child(why))
+                    }),
+            ));
+        }
+        if status.restart_needed {
+            block = block.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(small))
+                    .text_color(theme.muted)
+                    .child(style::spinner(
+                        "pilus-remote-restarting",
+                        small,
+                        theme.muted,
+                    ))
+                    .child("Updated. Restarting the service to use the new version…"),
+            );
+        }
+        // A Linux user service stops with the last login session unless lingering is on.
+        if status.linger == Some(false) {
+            block = block
+                .child(
+                    div()
+                        .text_size(px(small))
+                        .text_color(theme.muted)
+                        .child("This service stops when you log out. To keep it running, run:"),
+                )
+                .child(self.copy_row(
+                    "command",
+                    "loginctl enable-linger".to_string(),
+                    "pilus-copy-linger",
+                    cx,
+                ));
+        }
         if !status.strict {
             block = block.child(
                 style::checkbox(
@@ -6555,6 +6673,90 @@ impl PilusView {
                 cx,
             ))
             .child(self.copy_row("ticket", status.ticket.clone(), "pilus-copy-ticket", cx))
+            .child(self.service_log_block(cx))
+    }
+
+    /// The service's recent log, behind a disclosure: where to look when
+    /// something is off, without a trip to the file system.
+    fn service_log_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let small = self.footer_font();
+        let remote = &self.remote;
+        let open = remote.log_open;
+        let toggle = div()
+            .id("pilus-remote-log-toggle")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .text_size(px(small))
+            .font_weight(FontWeight::BOLD)
+            .text_color(theme.muted)
+            .hover(|style| style.text_color(theme.panel_fg))
+            .child(style::chevron(
+                "pilus-remote-log-chevron",
+                open,
+                self.section_toggled.is_some_and(|(last, at)| {
+                    last == "remote-log" && at.elapsed() < SECTION_TURN_WINDOW
+                }),
+                12.0,
+                theme.muted,
+            ))
+            .child("SERVICE LOG")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.section_toggled = Some(("remote-log", Instant::now()));
+                connector::toggle_log();
+                cx.notify();
+            }));
+        let mut block = div().flex().flex_col().gap_1().child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(toggle)
+                .when(open && !remote.log.is_empty(), |row| {
+                    let text = remote.log.join("\n");
+                    row.child(
+                        style::small_button(
+                            "pilus-copy-log",
+                            "Copy",
+                            style::ButtonKind::Ghost,
+                            theme,
+                            small,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                            this.settings_status = "Copied the service log.".to_string();
+                            cx.notify();
+                        })),
+                    )
+                }),
+        );
+        if open {
+            let mut lines = div()
+                .flex()
+                .flex_col()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(theme.panel_dim)
+                .border_1()
+                .border_color(theme.border)
+                .overflow_hidden()
+                .font_family(style::mono_family(&self.shared_settings))
+                .text_size(px(small))
+                .text_color(theme.muted);
+            if remote.log.is_empty() {
+                lines = lines.child("Nothing logged yet.");
+            }
+            for line in &remote.log {
+                lines = lines.child(div().truncate().child(line.clone()));
+            }
+            block = block.child(style::enter("pilus-remote-log", lines));
+        }
+        block
     }
 
     /// A muted read-only value with a Copy button beside it.

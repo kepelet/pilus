@@ -18,6 +18,11 @@ use crate::connector::agent_binary;
 use crate::discovery::config_dir;
 use crate::error::{Error, Result};
 
+/// Whether this platform can run the connector as a background service. Windows
+/// has no equivalent wired up, and the window says so rather than offering a
+/// switch that cannot work.
+pub const SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "linux"));
+
 /// Where the connector keeps its identity, device list, admin socket, and log.
 pub fn agent_dir() -> PathBuf {
     config_dir().join("agent")
@@ -107,6 +112,25 @@ pub struct ServiceStatus {
     pub devices: Vec<EnrolledDevice>,
     /// `--allow` pins the device set, so enrollment and revocation are off.
     pub strict: bool,
+    /// The binary on disk is newer than the one this service is running, because
+    /// an update replaced it. Restarting picks the new one up.
+    pub restart_needed: bool,
+    /// Whether the service survives logout. `None` where that is not a question
+    /// (everything but a Linux user unit).
+    pub linger: Option<bool>,
+}
+
+impl ServiceStatus {
+    /// Whether the gateway is down because `luvus` cannot be found at all, which
+    /// retrying will not fix, as opposed to the server simply not running.
+    #[must_use]
+    pub fn luvus_missing(&self) -> bool {
+        !self.gateway_up
+            && self
+                .gateway_error
+                .as_deref()
+                .is_some_and(|why| why.contains("could not find the `luvus` binary"))
+    }
 }
 
 /// A freshly minted enrollment code and the link that carries it.
@@ -192,6 +216,50 @@ pub fn new_code(level: DeviceLevel) -> Result<PairingCode> {
     parse_code(&reply)
 }
 
+/// Stop the service waiting out its backoff and start Luvus now if it is down.
+pub fn retry() -> Result<()> {
+    admin(&json!({ "type": "retry" })).map(drop)
+}
+
+/// Restart the installed service so it runs the binary on disk.
+pub fn restart() -> Result<()> {
+    run_agent(&["service", "restart"]).map(drop)
+}
+
+/// The last `max_lines` of the service's log, oldest first.
+///
+/// Reads only the tail of the file: the log can reach a megabyte, and the window
+/// polls this while it is open.
+pub fn log_tail(max_lines: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const WINDOW: u64 = 32 * 1024;
+    let Ok(mut file) = std::fs::File::open(log_path()) else {
+        return Vec::new();
+    };
+    let length = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let start = length.saturating_sub(WINDOW);
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    tail_lines(&String::from_utf8_lossy(&bytes), start > 0, max_lines)
+}
+
+/// The last `max_lines` of `text`. `cut` says the text begins mid-file, so its
+/// first line is a fragment and is dropped.
+fn tail_lines(text: &str, cut: bool, max_lines: usize) -> Vec<String> {
+    let mut lines: Vec<&str> = text.lines().collect();
+    if cut && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let skip = lines.len().saturating_sub(max_lines);
+    lines[skip..]
+        .iter()
+        .map(|line| line.chars().filter(|c| !c.is_control()).collect())
+        .collect()
+}
+
 /// Lower an enrolled device's level. The connector refuses to raise one.
 pub fn lower_level(endpoint_id: &str, level: DeviceLevel) -> Result<()> {
     admin(&json!({ "type": "set_level", "endpoint_id": endpoint_id, "level": level.wire() }))
@@ -248,6 +316,11 @@ fn parse_status(reply: &Value) -> Option<ServiceStatus> {
             .get("strict")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        restart_needed: reply
+            .get("restart_needed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        linger: reply.get("linger").and_then(Value::as_bool),
     })
 }
 
@@ -342,6 +415,44 @@ mod tests {
         );
         assert_eq!(status.devices[0].label, "phone");
         assert_eq!(status.devices[0].level, DeviceLevel::Operate);
+    }
+
+    #[test]
+    fn reads_the_update_and_logout_fields_and_tolerates_their_absence() {
+        let newer = parse_status(&json!({
+            "type": "status", "restart_needed": true, "linger": false,
+        }))
+        .expect("status");
+        assert!(newer.restart_needed);
+        assert_eq!(newer.linger, Some(false));
+        // An agent from before these fields existed, or a platform with no answer.
+        let older = parse_status(&json!({ "type": "status", "linger": null })).expect("status");
+        assert!(!older.restart_needed);
+        assert_eq!(older.linger, None);
+    }
+
+    #[test]
+    fn a_missing_luvus_is_told_apart_from_a_stopped_server() {
+        let down = |why: &str| ServiceStatus {
+            gateway_error: Some(why.to_string()),
+            ..ServiceStatus::default()
+        };
+        assert!(down("could not find the `luvus` binary").luvus_missing());
+        assert!(!down("no luvus server running").luvus_missing());
+        let up = ServiceStatus {
+            gateway_up: true,
+            ..down("could not find the `luvus` binary")
+        };
+        assert!(!up.luvus_missing(), "a healthy gateway is not missing");
+    }
+
+    #[test]
+    fn the_log_tail_keeps_whole_recent_lines() {
+        let text = "partial fragment\nfirst\nsecond\nthird\n";
+        assert_eq!(tail_lines(text, true, 2), ["second", "third"]);
+        assert_eq!(tail_lines(text, false, 10).len(), 4);
+        assert_eq!(tail_lines("a\u{1b}[31mb\n", false, 5), ["a[31mb"]);
+        assert!(tail_lines("", true, 5).is_empty());
     }
 
     #[test]

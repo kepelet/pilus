@@ -8,6 +8,11 @@
 //! install, removal, code mint and revocation on a short-lived thread, so the
 //! GUI thread never waits on a process or a socket.
 //!
+//! Three things keep the service honest after the user has stopped looking at it:
+//! the log tail, which the poller refreshes only while Settings shows it; a retry
+//! for a Luvus that was not running; and a restart at launch when an update
+//! replaced the binary under a service that is still running the old one.
+//!
 //! The toggle in Settings is the user's intent (`Settings.connector`); the
 //! cached state is what the service reports. Switching on is optimistic:
 //! `Starting` until the admin socket answers.
@@ -20,6 +25,11 @@ use pilus_client::agent_service::{self, DeviceLevel, PairingCode, ServiceStatus}
 
 /// How often the poller asks the service how it is.
 const POLL: Duration = Duration::from_secs(2);
+/// Log lines kept for the Settings panel.
+const LOG_LINES: usize = 14;
+/// How long a launch waits for the service to answer before judging whether an
+/// update left it stale.
+const STALE_CHECK_PATIENCE: Duration = Duration::from_secs(10);
 /// How long a switched-on service may take to answer before the window says
 /// so instead of showing "Starting" forever.
 const START_PATIENCE: Duration = Duration::from_secs(20);
@@ -49,6 +59,10 @@ pub struct RemoteAccess {
     pub error: Option<String>,
     /// A code is being minted.
     pub minting: bool,
+    /// The service log is showing.
+    pub log_open: bool,
+    /// The service log's last lines, while it is showing.
+    pub log: Vec<String>,
 }
 
 impl RemoteAccess {
@@ -87,7 +101,7 @@ pub fn snapshot() -> RemoteAccess {
 /// build or app location onto the current binary.
 pub fn ensure(enabled: bool) {
     if enabled {
-        enable();
+        start(true);
     } else {
         lock().wanted = false;
     }
@@ -95,6 +109,13 @@ pub fn ensure(enabled: bool) {
 
 /// Switch Remote access on: install and start the service.
 pub fn enable() {
+    start(false);
+}
+
+/// Install and start the service. `restart_stale` also restarts one that is
+/// already running an older binary than the one on disk: an update replaces the
+/// file in place, and installing leaves a healthy service alone on purpose.
+fn start(restart_stale: bool) {
     {
         let mut shared = lock();
         shared.wanted = true;
@@ -103,7 +124,7 @@ pub fn enable() {
         shared.view.error = None;
     }
     start_poller();
-    thread::spawn(|| {
+    thread::spawn(move || {
         if let Err(error) = agent_service::install() {
             let mut shared = lock();
             shared.wanted = false;
@@ -111,8 +132,81 @@ pub fn enable() {
                 error: Some(error.to_string()),
                 ..RemoteAccess::default()
             };
+            return;
+        }
+        if restart_stale {
+            restart_if_stale();
         }
     });
+}
+
+/// Restart the service when it is running an older binary than the one on disk.
+///
+/// Devices reconnect by themselves, so a restart at launch costs a moment, while
+/// leaving the old process would keep old behaviour until the next login.
+fn restart_if_stale() {
+    let deadline = Instant::now() + STALE_CHECK_PATIENCE;
+    while Instant::now() < deadline {
+        if let Some(status) = agent_service::status() {
+            if status.restart_needed
+                && let Err(error) = agent_service::restart()
+            {
+                lock().view.error = Some(format!("Could not restart after an update: {error}"));
+            }
+            return;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Restart the running service so it runs the binary on disk now, without
+/// switching Remote access off and on. Paired devices redial by themselves.
+pub fn restart_service() {
+    {
+        let mut shared = lock();
+        shared.view.error = None;
+        // The admin socket goes quiet for a moment; show "Starting" rather than a
+        // stale "Running" that then flickers.
+        shared.view.phase = Phase::Starting;
+        shared.since = Some(Instant::now());
+    }
+    thread::spawn(|| {
+        if let Err(error) = agent_service::restart() {
+            lock().view.error = Some(format!("Could not restart the service: {error}"));
+        }
+    });
+}
+
+/// Ask the service to stop waiting and bring Luvus up now.
+pub fn retry_luvus() {
+    thread::spawn(|| {
+        if let Err(error) = agent_service::retry() {
+            lock().view.error = Some(error.to_string());
+        }
+    });
+}
+
+/// Show or hide the service log.
+pub fn toggle_log() {
+    let open = {
+        let mut shared = lock();
+        shared.view.log_open = !shared.view.log_open;
+        if !shared.view.log_open {
+            shared.view.log.clear();
+        }
+        shared.view.log_open
+    };
+    if open {
+        thread::spawn(refresh_log);
+    }
+}
+
+fn refresh_log() {
+    let lines = agent_service::log_tail(LOG_LINES);
+    let mut shared = lock();
+    if shared.view.log_open {
+        shared.view.log = lines;
+    }
 }
 
 /// Switch Remote access off: stop and remove the service.
@@ -210,6 +304,9 @@ fn poll_forever() {
             continue;
         }
         let status = agent_service::status();
+        if lock().view.log_open {
+            refresh_log();
+        }
         let now = now_unix();
         let mut shared = lock();
         if !shared.wanted {

@@ -16,6 +16,7 @@ mod connector;
 mod control;
 mod discovery;
 mod error;
+pub mod folders;
 mod git;
 mod machines;
 mod mission;

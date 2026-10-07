@@ -8,7 +8,7 @@
 
 use std::sync::mpsc::Sender;
 
-use pilus_client::SshTarget;
+use pilus_client::{SshTarget, folders};
 
 use super::text_input::TextField;
 
@@ -403,18 +403,7 @@ impl WorkspacePicker {
     }
 }
 
-/// The parent of an absolute POSIX path, or `None` at the root.
-pub fn parent_of(path: &str) -> Option<String> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.rfind('/') {
-        Some(0) => Some("/".to_string()),
-        Some(index) => Some(trimmed[..index].to_string()),
-        None => None,
-    }
-}
+pub use pilus_client::folders::parent_of;
 
 /// List one directory on a background thread and report the result.
 pub fn spawn_list(tx: Sender<PickerEvent>, source: DirSource, path: String) {
@@ -426,120 +415,23 @@ pub fn spawn_list(tx: Sender<PickerEvent>, source: DirSource, path: String) {
 
 /// List the child directories of `path`, resolving `~` on the target host.
 pub fn list(source: &DirSource, path: &str) -> Result<Listed, String> {
-    match source {
-        DirSource::Local => list_local(path),
-        DirSource::Remote(target) => list_remote(target, path),
-    }
-}
-
-fn list_local(path: &str) -> Result<Listed, String> {
-    let root = expand_local(path);
-    let read = std::fs::read_dir(&root).map_err(|error| error.to_string())?;
-    let mut entries = Vec::new();
-    for entry in read.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        // Symlinks to directories are followed so a linked project is usable.
-        let is_dir = file_type.is_dir() || (file_type.is_symlink() && entry.path().is_dir());
-        if !is_dir {
-            continue;
-        }
-        entries.push(Entry {
-            name: entry.file_name().to_string_lossy().into_owned(),
-            path: entry.path().to_string_lossy().into_owned(),
-            is_parent: false,
-            is_home: false,
-        });
-    }
-    sort_entries(&mut entries);
-    Ok(Listed { root, entries })
-}
-
-fn list_remote(target: &SshTarget, path: &str) -> Result<Listed, String> {
-    // `cd` resolves `~`; `$PWD` reports the absolute directory; `find` prints
-    // NUL-separated relative names, so spaces survive and the root is explicit.
-    let remote = format!(
-        "cd {} && printf '%s\\0' \"$PWD\" && find . -maxdepth 1 -mindepth 1 -type d -print0",
-        remote_cd_arg(path)
-    );
-    let output = target
-        .shell(&remote)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            "remote directory listing failed".to_string()
-        } else {
-            stderr
-        });
-    }
-    let mut fields = output.stdout.split(|byte| *byte == 0);
-    let root = fields
-        .next()
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-        .unwrap_or_default();
-    if root.is_empty() {
-        return Err("remote shell did not report a directory".to_string());
-    }
-    let mut entries = Vec::new();
-    for raw in fields {
-        if raw.is_empty() {
-            continue;
-        }
-        let relative = String::from_utf8_lossy(raw);
-        let name = relative.trim_start_matches("./").to_string();
-        if name.is_empty() {
-            continue;
-        }
-        entries.push(Entry {
-            name: name.clone(),
-            path: format!("{}/{}", root.trim_end_matches('/'), name),
-            is_parent: false,
-            is_home: false,
-        });
-    }
-    sort_entries(&mut entries);
-    Ok(Listed { root, entries })
-}
-
-fn sort_entries(entries: &mut [Entry]) {
-    entries.sort_by_key(|entry| entry.name.to_lowercase());
-}
-
-/// Expand a leading `~` against this machine's home directory.
-fn expand_local(path: &str) -> String {
-    let home = || std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-    if path == "~" {
-        return home();
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return format!("{}/{}", home().trim_end_matches('/'), rest);
-    }
-    if path.starts_with('/') {
-        return path.to_string();
-    }
-    match std::env::current_dir() {
-        Ok(dir) => dir.join(path).to_string_lossy().into_owned(),
-        Err(_) => path.to_string(),
-    }
-}
-
-/// Build the remote `cd` argument, letting the remote shell expand `~`.
-fn remote_cd_arg(path: &str) -> String {
-    if path == "~" {
-        return "\"$HOME\"".to_string();
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return format!("\"$HOME\"/{}", sh_quote(rest));
-    }
-    sh_quote(path)
-}
-
-/// Quote `value` for a POSIX shell as a single argument.
-fn sh_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    let listing = match source {
+        DirSource::Local => folders::list_local(path),
+        DirSource::Remote(target) => folders::list_remote(target, path),
+    }?;
+    Ok(Listed {
+        root: listing.root,
+        entries: listing
+            .folders
+            .into_iter()
+            .map(|folder| Entry {
+                name: folder.name,
+                path: folder.path,
+                is_parent: false,
+                is_home: false,
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -547,40 +439,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parent_of_handles_roots_and_nesting() {
-        assert_eq!(parent_of("/Users/rizaldy"), Some("/Users".to_string()));
-        assert_eq!(parent_of("/Users"), Some("/".to_string()));
-        assert_eq!(parent_of("/"), None);
-        assert_eq!(parent_of(""), None);
-        assert_eq!(parent_of("/Users/rizaldy/"), Some("/Users".to_string()));
-    }
-
-    #[test]
-    fn sh_quote_escapes_single_quotes() {
-        assert_eq!(sh_quote("/a b"), "'/a b'");
-        assert_eq!(sh_quote("it's"), "'it'\\''s'");
-    }
-
-    #[test]
-    fn remote_cd_expands_tilde() {
-        assert_eq!(remote_cd_arg("~"), "\"$HOME\"");
-        assert_eq!(remote_cd_arg("~/flo"), "\"$HOME\"/'flo'");
-        assert_eq!(remote_cd_arg("/a b"), "'/a b'");
-    }
-
-    #[test]
-    fn expand_local_resolves_tilde_and_keeps_absolute_paths() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        assert_eq!(expand_local("~"), home);
-        assert_eq!(
-            expand_local("~/flo"),
-            format!("{}/flo", home.trim_end_matches('/'))
-        );
-        assert_eq!(expand_local("/already/absolute"), "/already/absolute");
-    }
-
-    #[test]
-    fn list_local_returns_child_directories_sorted() {
+    fn listing_maps_folders_to_picker_rows_in_order() {
         let base = std::env::temp_dir().join(format!("pilus-picker-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("zeta")).expect("create zeta");
@@ -594,6 +453,7 @@ mod tests {
             .map(|entry| entry.name.as_str())
             .collect();
         assert_eq!(names, vec!["alpha", "zeta"]);
+        assert!(listed.entries.iter().all(|e| !e.is_parent && !e.is_home));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

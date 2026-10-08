@@ -39,10 +39,36 @@ pub struct P2pOptions {
     /// The gateway loopback address each stream is bridged to. Ignored by
     /// [`serve`], which supervises its own gateway.
     pub gateway: String,
-    /// Self-hosted or dedicated relay URL; `None` uses the n0 public relays.
-    pub relay: Option<String>,
+    /// Which relays the endpoint uses, and how it authenticates to them.
+    pub relay: RelayConfig,
     /// Device `EndpointId`s allowed to connect; empty allows any peer.
     pub allow: Vec<String>,
+}
+
+/// Which relays the endpoint dials out through.
+///
+/// A managed relay needs both halves: the URLs say where it is, and the API
+/// secret lets the endpoint mint the relay token the server checks. The secret
+/// alone does not locate a relay, so with no URLs the endpoint keeps the n0
+/// public relays and only gains the token.
+#[derive(Clone, Debug, Default)]
+pub struct RelayConfig {
+    /// Self-hosted or dedicated relay URLs; empty uses the n0 public relays.
+    pub urls: Vec<String>,
+    /// An Iroh Services project API secret.
+    pub api_secret: Option<String>,
+}
+
+impl RelayConfig {
+    /// The `relay` block of `<root>/settings.json`, with `urls` (from
+    /// `--relay`) replacing the file's URLs when any are given.
+    pub fn load(root: &Path, urls: Vec<String>) -> Result<Self> {
+        let settings = pilus_client::RelaySettings::load(root).map_err(Error::P2p)?;
+        Ok(Self {
+            urls: if urls.is_empty() { settings.url } else { urls },
+            api_secret: settings.secret,
+        })
+    }
 }
 
 /// Load the persistent identity at `path`, creating it on first run.
@@ -74,21 +100,48 @@ pub fn load_or_create_key(path: &Path) -> Result<SecretKey> {
 ///
 /// Kept separate from [`run`] so the transport can be exercised without a
 /// signal loop.
-pub async fn bind(
-    key_path: &Path,
-    relay: Option<String>,
-    auth: Arc<AuthState>,
-) -> Result<Endpoint> {
+pub async fn bind(key_path: &Path, relay: &RelayConfig, auth: Arc<AuthState>) -> Result<Endpoint> {
     let secret_key = load_or_create_key(key_path)?;
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .hooks(Gate { auth });
-    if let Some(relay) = &relay {
-        let url: RelayUrl = relay
-            .parse()
-            .map_err(|error| Error::P2p(format!("invalid relay `{relay}`: {error}")))?;
-        builder = builder.relay_mode(RelayMode::custom([url]));
-    }
+    let hooks = Gate { auth };
+    let builder = match &relay.api_secret {
+        Some(api_secret) => {
+            // The relay token is bound to the endpoint's key, so the preset
+            // must be handed the persistent identity rather than its own.
+            let mut preset = iroh_services::preset()
+                .secret_key(secret_key)
+                .api_secret_from_str(api_secret)
+                .map_err(|error| {
+                    Error::P2p(format!("invalid relay.secret in settings.json: {error}"))
+                })?;
+            if !relay.urls.is_empty() {
+                preset = preset
+                    .relays(&relay.urls)
+                    .map_err(|error| Error::P2p(format!("invalid relay: {error}")))?;
+            }
+            let preset = preset
+                .build()
+                .map_err(|error| Error::P2p(error.to_string()))?;
+            Endpoint::builder(preset).hooks(hooks)
+        }
+        None => {
+            let mut builder = Endpoint::builder(presets::N0)
+                .secret_key(secret_key)
+                .hooks(hooks);
+            if !relay.urls.is_empty() {
+                let urls = relay
+                    .urls
+                    .iter()
+                    .map(|relay| {
+                        relay.parse::<RelayUrl>().map_err(|error| {
+                            Error::P2p(format!("invalid relay `{relay}`: {error}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                builder = builder.relay_mode(RelayMode::custom(urls));
+            }
+            builder
+        }
+    };
     let endpoint = builder
         .bind()
         .await
@@ -147,12 +200,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         &config.p2p.allow,
         ENROLLMENT_TTL,
     )?);
-    let endpoint = bind(
-        &config.key_path,
-        config.p2p.relay.clone(),
-        Arc::clone(&auth),
-    )
-    .await?;
+    let endpoint = bind(&config.key_path, &config.p2p.relay, Arc::clone(&auth)).await?;
     let ticket = EndpointTicket::new(endpoint.addr());
     println!("endpoint id: {}", endpoint.id());
     println!("ticket:      {ticket}");
@@ -368,6 +416,25 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_a_malformed_api_secret_before_touching_the_network() {
+        let dir = std::env::temp_dir().join(format!("pilus-agent-relay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let auth = Arc::new(
+            AuthState::load(String::new(), dir.join("devices.json"), &[], ENROLLMENT_TTL)
+                .expect("auth"),
+        );
+        let relay = RelayConfig {
+            urls: Vec::new(),
+            api_secret: Some("not-a-secret".to_string()),
+        };
+        let error = bind(&dir.join("identity.key"), &relay, auth)
+            .await
+            .expect_err("a malformed secret must not bind");
+        assert!(error.to_string().contains("relay.secret"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

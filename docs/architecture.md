@@ -609,7 +609,18 @@ delegated token.
   gateway connection, so one QUIC stream is one UHP request. An `EndpointHooks`
   allow-list rejects peers by `EndpointId` after the handshake, and `serve`
   prints an `EndpointTicket` a device scans to enroll. Relays default to n0's
-  public servers unless `--relay` names a self-hosted one.
+  public servers unless `relay.url` in `~/.pilus/settings.json` (or a
+  repeatable `--relay`, which wins) names a dedicated or self-hosted one. A
+  managed relay from services.iroh.computer also needs `relay.secret`, the
+  project's API secret: it is not a locator, it only lets the endpoint mint the
+  relay token its key is bound to, so the URLs are still required. A secret
+  alone keeps the n0 relays and adds the token. The file is `0600` because it
+  can hold the secret, and a `relay` block that fails to parse stops the agent
+  instead of falling back to the public relays:
+
+  ```json
+  { "relay": { "secret": "…", "url": ["https://…"] } }
+  ```
 
 `pilus-client` gained the seam this needs: `Stream::connect_tcp` and
 `ControlTransport::Tcp`, plus `UhpClient::{connect_tcp, with_auth,

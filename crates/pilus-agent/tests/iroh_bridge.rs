@@ -37,7 +37,7 @@ async fn enrolls_a_device_then_serves_uhp() {
     );
     let (code, _) = auth.enrollment().expect("enrollment is enabled");
 
-    let endpoint = p2p::bind(&key_path, None, Arc::clone(&auth))
+    let endpoint = p2p::bind(&key_path, &p2p::RelayConfig::default(), Arc::clone(&auth))
         .await
         .expect("bind");
     let ticket = EndpointTicket::new(endpoint.addr());

@@ -20,6 +20,7 @@ pub mod folders;
 mod git;
 mod machines;
 mod mission;
+mod relay;
 mod surface;
 mod tasks;
 mod transport;
@@ -58,6 +59,7 @@ pub use mission::{
     MissionSnapshot, MissionUsage,
 };
 pub use pilus_protocol as protocol;
+pub use relay::RelaySettings;
 pub use surface::{Surface, SurfaceChange};
 pub use tasks::{NewTask, Task, TaskStatus, split_list};
 pub use transport::SshTarget;

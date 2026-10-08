@@ -27,7 +27,8 @@ USAGE:
 OPTIONS:
     --listen ADDR     TCP forward address (default 127.0.0.1:7878); ignored with --iroh
     --iroh            serve over iroh/QUIC and print an enrollment ticket
-    --relay URL       self-hosted relay instead of the n0 public relays (with --iroh)
+    --relay URL       relay instead of the n0 public relays; repeatable, and
+                      overrides relay.url in ~/.pilus/settings.json (with --iroh)
     --allow ID        allow only this device EndpointId; repeatable (with --iroh)
     --identity PATH   path to the persistent iroh identity key
     --control         advertise the bounded control surface
@@ -47,7 +48,7 @@ fn main() -> anyhow::Result<()> {
     let mut binary: Option<PathBuf> = None;
     let mut identity: Option<PathBuf> = None;
     let mut iroh = false;
-    let mut relay: Option<String> = None;
+    let mut relays: Vec<String> = Vec::new();
     let mut allow: Vec<String> = Vec::new();
     let mut background = false;
     let mut subcommand = String::new();
@@ -66,7 +67,7 @@ fn main() -> anyhow::Result<()> {
             "--service" => background = true,
             "--listen" => listen = value(&args, &mut index, "--listen")?,
             "--session" => options.session = Some(value(&args, &mut index, "--session")?),
-            "--relay" => relay = Some(value(&args, &mut index, "--relay")?),
+            "--relay" => relays.push(value(&args, &mut index, "--relay")?),
             "--allow" => allow.push(value(&args, &mut index, "--allow")?),
             "--identity" => identity = Some(PathBuf::from(value(&args, &mut index, "--identity")?)),
             "--ttl" => {
@@ -133,7 +134,7 @@ fn main() -> anyhow::Result<()> {
                 let config = p2p::ServeConfig {
                     p2p: p2p::P2pOptions {
                         gateway: String::new(),
-                        relay,
+                        relay: p2p::RelayConfig::load(&pilus_client::pilus_config_dir(), relays)?,
                         allow,
                     },
                     key_path,

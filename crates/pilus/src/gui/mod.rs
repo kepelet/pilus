@@ -862,6 +862,15 @@ struct CardLayout {
     content_w: f32,
 }
 
+/// Which relay field of the Settings page owns the keyboard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayField {
+    /// The dedicated relay URLs.
+    Url,
+    /// The Iroh Services project API secret.
+    Secret,
+}
+
 /// Which surface owns the keyboard, in stacking order.
 ///
 /// Overlays sit above content; [`PilusView::input_layer`] is the single source of
@@ -1471,6 +1480,15 @@ struct PilusView {
     update_feed_input: Entity<TextInput>,
     /// Whether the update feed URL field owns the keyboard.
     update_url_editing: bool,
+    /// The relay URL and secret inputs on the Settings page, over their fields.
+    relay_url: TextField,
+    relay_url_input: Entity<TextInput>,
+    relay_secret: TextField,
+    relay_secret_input: Entity<TextInput>,
+    /// The relay field being edited, if any.
+    relay_editing: Option<RelayField>,
+    /// One line under the relay fields: a validation error or what saving did.
+    relay_status: String,
     /// Results from background `luvus update` / `server restart` runs.
     daemon_rx: Receiver<DaemonOutcome>,
     /// Sender half, handed to each background daemon command.
@@ -1763,6 +1781,31 @@ impl PilusView {
             )
         });
 
+        let relay_url = TextField::default();
+        let relay_url_input = cx.new(|cx| {
+            TextInput::from_shared(
+                relay_url.shared(),
+                "https://relay.example, https://relay2.example",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+        let relay_secret = TextField::default();
+        let relay_secret_input = cx.new(|cx| {
+            TextInput::from_shared(
+                relay_secret.shared(),
+                "Project API secret",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+
         let palette = Palette::default();
         let palette_input = cx.new(|cx| {
             TextInput::from_shared(
@@ -1906,6 +1949,12 @@ impl PilusView {
             update_feed,
             update_feed_input,
             update_url_editing: false,
+            relay_url,
+            relay_url_input,
+            relay_secret,
+            relay_secret_input,
+            relay_editing: None,
+            relay_status: String::new(),
             daemon_rx,
             daemon_tx,
             daemon_busy: false,
@@ -4137,6 +4186,7 @@ impl PilusView {
         self.automations_page.close();
         self.home.close();
         self.update_url_editing = false;
+        self.relay_editing = None;
     }
 
     /// A control client for an endpoint's control surface.
@@ -5559,7 +5609,11 @@ impl PilusView {
                 if self.update_url_editing {
                     Some(self.update_feed_input.focus_handle(cx))
                 } else {
-                    None
+                    match self.relay_editing {
+                        Some(RelayField::Url) => Some(self.relay_url_input.focus_handle(cx)),
+                        Some(RelayField::Secret) => Some(self.relay_secret_input.focus_handle(cx)),
+                        None => None,
+                    }
                 }
             }
             // The composer's text fields hold focus; its pickers leave it
@@ -5996,6 +6050,18 @@ impl PilusView {
             cx.notify();
             return;
         }
+        if self.relay_editing.is_some() {
+            match key {
+                "escape" => {
+                    self.relay_editing = None;
+                    self.relay_status.clear();
+                }
+                "enter" => self.commit_relay(cx),
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
         if key == "escape" {
             self.settings_open = false;
             cx.notify();
@@ -6023,6 +6089,7 @@ impl PilusView {
             .flex_col()
             .gap_6()
             .child(self.remote_access_section_block(cx))
+            .child(self.relay_section_block(cx))
             .child(self.machines_section_block(cx))
             .child(self.agent_config_section_block(cx))
             .child(self.notifications_section_block(cx))
@@ -7499,6 +7566,237 @@ impl PilusView {
                         ),
                     ),
             )
+    }
+
+    /// The RELAY section: where the host connector dials out, and the project
+    /// secret that lets it use a managed relay. Both live in `settings.json`
+    /// (the agent reads them there), and the agent only reads them at start.
+    fn relay_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let relay = &self.settings.relay;
+        let configured = !relay.url.is_empty() || relay.secret.is_some();
+        let url_value = relay.url.join(", ");
+        let secret_set = relay.secret.is_some();
+
+        let mut section =
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(div().px_3().child(style::section_label(
+                    theme,
+                    "RELAY",
+                    self.section_font(),
+                )));
+        let url_row = self.relay_field_row(
+            RelayField::Url,
+            "Relay URLs",
+            (!url_value.is_empty()).then_some(url_value),
+            "n0 public relays",
+            cx,
+        );
+        let secret_row = self.relay_field_row(
+            RelayField::Secret,
+            "API secret",
+            secret_set.then(|| "\u{2022}".repeat(16)),
+            "Not set",
+            cx,
+        );
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .mx_3()
+            .px_3()
+            .py_3()
+            .rounded_md()
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.border)
+            .child(url_row)
+            .child(secret_row)
+            .child(
+                div()
+                    .text_size(px(self.footer_font()))
+                    .text_color(theme.muted)
+                    .child(
+                        "A dedicated relay from services.iroh.computer needs both its URL and the project API secret. A secret alone keeps the public relays. Remote access reads these when it starts.",
+                    ),
+            );
+        if !self.relay_status.is_empty() {
+            let failed = self.relay_status.starts_with("Not saved");
+            card = card.child(
+                div()
+                    .text_size(px(self.footer_font()))
+                    .text_color(if failed { theme.alert } else { theme.muted })
+                    .child(self.relay_status.clone()),
+            );
+        }
+        if configured && self.relay_editing.is_none() {
+            card = card.child(
+                div().flex().flex_row().items_center().justify_end().child(
+                    style::small_button(
+                        "pilus-relay-clear",
+                        "Use Public Relays",
+                        style::ButtonKind::Ghost,
+                        theme,
+                        self.section_font(),
+                    )
+                    .flex_shrink_0()
+                    .text_color(theme.muted)
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_relay(cx))),
+                ),
+            );
+        }
+        section = section.child(card);
+        section
+    }
+
+    /// One relay field: the boxed value (or the live input while it is being
+    /// edited) with a Save button beside it.
+    fn relay_field_row(
+        &self,
+        which: RelayField,
+        label: &str,
+        saved: Option<String>,
+        empty: &str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = self.theme;
+        let editing = self.relay_editing == Some(which);
+        let (tag, input) = match which {
+            RelayField::Url => ("url", self.relay_url_input.clone()),
+            RelayField::Secret => ("secret", self.relay_secret_input.clone()),
+        };
+        let body = if editing {
+            input.update(cx, |input, _| {
+                input.set_style(
+                    theme,
+                    style::chrome_font(&self.shared_settings),
+                    px(self.section_font()),
+                );
+            });
+            div().flex_1().min_w(px(0.0)).child(input)
+        } else {
+            match saved {
+                Some(value) => div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_color(theme.fg)
+                    .child(value),
+                None => div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_color(theme.muted)
+                    .child(empty.to_string()),
+            }
+        };
+        let field = style::field(
+            format!("pilus-relay-{tag}"),
+            label,
+            editing,
+            theme,
+            28.0,
+            self.section_font(),
+            body,
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| this.edit_relay(which, cx)),
+        );
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_end()
+            .gap_2()
+            .child(div().flex_1().min_w(px(0.0)).child(field));
+        if editing {
+            row = row.child(
+                style::button(
+                    format!("pilus-relay-{tag}-save"),
+                    "Save",
+                    style::ButtonKind::Primary,
+                    theme,
+                    self.section_font(),
+                )
+                .flex_shrink_0()
+                .on_click(cx.listener(|this, _, _, cx| this.commit_relay(cx))),
+            );
+        }
+        row
+    }
+
+    /// Seed `which` from the saved settings and give it the keyboard. Moving
+    /// from one relay field to the other keeps what was typed in the first.
+    fn edit_relay(&mut self, which: RelayField, cx: &mut Context<Self>) {
+        if self.relay_editing == Some(which) {
+            return;
+        }
+        if self.relay_editing.is_some() {
+            self.commit_relay(cx);
+            if self.relay_editing.is_some() {
+                // The first field did not validate; stay on it.
+                return;
+            }
+        }
+        match which {
+            RelayField::Url => self.relay_url.set_value(self.settings.relay.url.join(", ")),
+            RelayField::Secret => self
+                .relay_secret
+                .set_value(self.settings.relay.secret.clone().unwrap_or_default()),
+        }
+        self.relay_status.clear();
+        self.relay_editing = Some(which);
+        cx.notify();
+    }
+
+    /// Validate and save the field being edited. A blank value unsets it.
+    fn commit_relay(&mut self, cx: &mut Context<Self>) {
+        let Some(which) = self.relay_editing else {
+            return;
+        };
+        match which {
+            RelayField::Url => {
+                match pilus_client::RelaySettings::parse_urls(&self.relay_url.value()) {
+                    Ok(urls) => self.settings.relay.url = urls,
+                    Err(error) => {
+                        self.relay_status = format!("Not saved: {error}");
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            RelayField::Secret => {
+                let secret = self.relay_secret.value().trim().to_string();
+                self.settings.relay.secret = (!secret.is_empty()).then_some(secret);
+            }
+        }
+        self.relay_editing = None;
+        self.save_relay_settings(cx);
+    }
+
+    /// Drop the relay block so the connector uses the n0 public relays again.
+    fn clear_relay(&mut self, cx: &mut Context<Self>) {
+        self.relay_editing = None;
+        self.settings.relay = pilus_client::RelaySettings::default();
+        self.save_relay_settings(cx);
+    }
+
+    /// Persist the relay block and restart Remote access if it is running, so
+    /// the agent rebinds through the new relay.
+    fn save_relay_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings.save(&self.pilus_root);
+        *self.shared_settings.borrow_mut() = self.settings.clone();
+        if self.remote.on() {
+            connector::restart_service();
+            self.relay_status = "Saved. Remote access is restarting to use it.".to_string();
+        } else {
+            self.relay_status =
+                "Saved. Remote access will use it the next time it starts.".to_string();
+        }
+        cx.notify();
     }
 
     /// One channel pill; the active one uses the accent color.

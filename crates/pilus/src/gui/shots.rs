@@ -1124,6 +1124,38 @@ pub fn run_main() -> Result<()> {
     });
     settle(&mut cx, 8);
     capture(&mut cx, window.into(), "main-settings-remote-off")?;
+    // The Relay section: a dedicated relay saved with its (fake) secret, then
+    // the secret field mid-edit.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.settings.relay = pilus_client::RelaySettings {
+                secret: Some("fixture-secret".to_string()),
+                url: vec![
+                    "https://use1-1.relay.example.iroh.link".to_string(),
+                    "https://euc1-1.relay.example.iroh.link".to_string(),
+                ],
+            };
+            *view.shared_settings.borrow_mut() = view.settings.clone();
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-settings-relay")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.edit_relay(super::RelayField::Secret, cx);
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-settings-relay-editing")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.relay_editing = None;
+            view.settings.relay = pilus_client::RelaySettings::default();
+            *view.shared_settings.borrow_mut() = view.settings.clone();
+            cx.notify();
+        });
+    });
 
     // The Open Workspace folder picker. Its listing happens on a thread, so
     // give it real time before the simulated clock drains the result.

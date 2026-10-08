@@ -96,6 +96,9 @@ pub struct Settings {
     /// The same choice for the local daemon. Off by default: the Luvus
     /// installed alongside pilus still draws its title row.
     pub local_terminal_top_spacing: bool,
+    /// Relay the host connector dials out through. Owned by the agent too, so
+    /// it is kept here to survive the window rewriting this file.
+    pub relay: pilus_client::RelaySettings,
 }
 
 impl Default for Settings {
@@ -118,6 +121,7 @@ impl Default for Settings {
             sidebar_agent_paths: false,
             terminal_top_spacing: true,
             local_terminal_top_spacing: false,
+            relay: pilus_client::RelaySettings::default(),
         }
     }
 }
@@ -149,7 +153,15 @@ impl Settings {
     pub fn save(&self, root: &Path) {
         if let Ok(text) = serde_json::to_string_pretty(self) {
             let _ = std::fs::create_dir_all(root);
-            let _ = std::fs::write(path(root), text);
+            let path = path(root);
+            let _ = std::fs::write(&path, text);
+            // The relay block can hold an API secret, and `write` keeps the
+            // mode of a file that already exists.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
         }
     }
 
@@ -260,10 +272,45 @@ mod tests {
             sidebar_agent_paths: true,
             terminal_top_spacing: false,
             local_terminal_top_spacing: true,
+            relay: pilus_client::RelaySettings {
+                secret: Some("project-secret".to_string()),
+                url: vec!["https://relay.example".to_string()],
+            },
         };
         let text = serde_json::to_string(&settings).expect("serialize");
         let back: Settings = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(back, settings);
+    }
+
+    #[test]
+    fn saving_keeps_a_hand_written_relay_block_private() {
+        // The agent reads `relay` from this file, and the window rewrites it.
+        let dir = std::env::temp_dir().join(format!("pilus-relay-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"relay":{"secret":"abc","url":["https://relay.example"]}}"#,
+        )
+        .expect("write");
+
+        let mut settings = Settings::load(&dir);
+        settings.opacity = 0.5;
+        settings.save(&dir);
+
+        let relay = pilus_client::RelaySettings::load(&dir).expect("load");
+        assert_eq!(relay.secret.as_deref(), Some("abc"));
+        assert_eq!(relay.url, ["https://relay.example"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("settings.json"))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

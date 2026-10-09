@@ -11,13 +11,16 @@ pub mod agent_service;
 pub mod agents;
 pub mod ansi;
 mod autostart;
+mod commit;
 mod connection;
 mod connector;
 mod control;
+mod diff;
 mod discovery;
 mod error;
 pub mod folders;
 mod git;
+mod git_status;
 mod machines;
 mod mission;
 mod relay;
@@ -32,12 +35,17 @@ pub use agents::effort_label;
 /// Raw pi thinking levels for display labels (`High` to `high`).
 pub use agents::thinking_level;
 pub use autostart::{ensure_server, ensure_server_for};
+pub use commit::{CommitDetail, CommitFile, show_commit};
 pub use connection::{ClientEvent, Connection, EndpointIdentity};
 pub use connector::agent_binary;
 pub use control::{
     Agent, AgentFeed, AgentSession, Appearance, AutomationSummary, BarSegment, BarWidget,
     ControlClient, FeedScope, FeedUpdate, PaneFrame, Tab, TaskAction, TaskSummary, ThemeInfo,
     WorktreeInfo, worktree_blockers,
+};
+pub use diff::{
+    DiffFile, DiffHunk, DiffLayer, DiffLine, DiffLineKind, DiffNote, DiffSnapshot, FileDiff,
+    NoteKind, NoteRange, NoteSelection, NoteSide, NoteState,
 };
 pub use discovery::{
     HOME_ENV, PILUS_HOME_ENV, SessionInfo, active_session, api_socket_path_for,
@@ -50,6 +58,7 @@ pub use git::{
     RemoteRepos, common_git_dirs_remote, discard_worktree_changes, expand_local, expand_remote,
     init_repository, worktree_is_dirty,
 };
+pub use git_status::{CommitRef, CommitRefKind, GitCommit, GitStatus};
 pub use machines::{
     MachineInfo, connect_machine, find_installed_binary, install_agent, is_behind, list_machines,
     refresh_machines, restart_remote, stop_remote,

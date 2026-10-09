@@ -206,7 +206,7 @@ fn normalize_common(cwd: &str, raw: &str) -> Option<String> {
 }
 
 /// Quote `value` for a POSIX shell as a single argument.
-fn sh_quote(value: &str) -> String {
+pub(crate) fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 

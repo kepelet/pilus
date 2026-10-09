@@ -25,6 +25,7 @@ pub enum Command {
     CloseWindow,
     CloseAllWindows,
     ToggleSidebar,
+    ToggleRightSidebar,
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,

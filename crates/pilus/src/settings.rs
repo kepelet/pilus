@@ -96,6 +96,19 @@ pub struct Settings {
     /// The same choice for the local daemon. Off by default: the Luvus
     /// installed alongside pilus still draws its title row.
     pub local_terminal_top_spacing: bool,
+    /// Whether the right sidebar (Diff and Git tabs) is open.
+    pub right_sidebar_visible: bool,
+    /// The right sidebar's width in logical pixels; 0 takes the default.
+    pub right_sidebar_width: f32,
+    /// The right sidebar's open tab, `diff` or `git`; anything else, such as
+    /// a fresh install's empty value, opens the Diff.
+    pub right_sidebar_tab: String,
+    /// Height of the Diff's file list above the patch, in logical pixels; 0
+    /// takes the default.
+    pub diff_list_height: f32,
+    /// Height of the Git tab's commit list above the open commit, in logical
+    /// pixels; 0 takes the default.
+    pub git_list_height: f32,
     /// Relay the host connector dials out through. Owned by the agent too, so
     /// it is kept here to survive the window rewriting this file.
     pub relay: pilus_client::RelaySettings,
@@ -121,6 +134,11 @@ impl Default for Settings {
             sidebar_agent_paths: false,
             terminal_top_spacing: true,
             local_terminal_top_spacing: false,
+            right_sidebar_visible: false,
+            right_sidebar_width: 0.0,
+            right_sidebar_tab: String::new(),
+            diff_list_height: 0.0,
+            git_list_height: 0.0,
             relay: pilus_client::RelaySettings::default(),
         }
     }
@@ -272,6 +290,11 @@ mod tests {
             sidebar_agent_paths: true,
             terminal_top_spacing: false,
             local_terminal_top_spacing: true,
+            right_sidebar_visible: true,
+            right_sidebar_width: 480.0,
+            right_sidebar_tab: "git".to_string(),
+            diff_list_height: 200.0,
+            git_list_height: 260.0,
             relay: pilus_client::RelaySettings {
                 secret: Some("project-secret".to_string()),
                 url: vec!["https://relay.example".to_string()],

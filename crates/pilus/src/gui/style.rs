@@ -201,6 +201,41 @@ pub(super) fn small_button(
     )
 }
 
+/// One tab of a strip: the selected tab is raised by its panel fill alone,
+/// with no border, and the others rest on the strip. Callers attach their own
+/// handler.
+pub(super) fn tab(
+    id: impl Into<ElementId>,
+    label: impl IntoElement,
+    active: bool,
+    theme: Theme,
+    text_size: f32,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .h(px(super::TAB_HEIGHT))
+        .px_3()
+        .rounded_md()
+        .text_color(if active { theme.panel_fg } else { theme.muted })
+        .text_size(px(text_size))
+        .cursor_pointer()
+        .state_fill(
+            if active {
+                theme.panel.into()
+            } else {
+                gpui::transparent_black()
+            },
+            theme.panel,
+            RADIUS_MD,
+        )
+        .hover(move |style| style.text_color(theme.panel_fg))
+        .child(label)
+}
+
 /// A compact on/off switch. Callers attach their own handler.
 ///
 /// Flipping it slides the knob and eases both colors; a switch drawn for the
@@ -913,6 +948,15 @@ impl FillState {
 
 fn ease_out_cubic(step: f32) -> f32 {
     1.0 - (1.0 - step).powi(3)
+}
+
+/// `color` at `alpha` of its own opacity: a wash that lets the surface under
+/// it show through, such as the diff's added and removed lines.
+pub(super) fn tint(color: Rgba, alpha: f32) -> Rgba {
+    Rgba {
+        a: color.a * alpha,
+        ..color
+    }
 }
 
 /// Blend two colors. A transparent end borrows the other end's hue, so a

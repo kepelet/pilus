@@ -27,6 +27,9 @@ final class AppStore {
     /// The device's level on the hub (`view`/`control`/`operate`); nil on a
     /// pre-hub connector where the token's surface is all we know.
     var level: String?
+    /// What the connector says this device may call (the hub rewrites it per
+    /// level). Empty until the first probe answers.
+    var allowedMethods: Set<String> = []
 
     private var usesHub = false
     private var watchTask: Task<Void, Never>?
@@ -34,6 +37,9 @@ final class AppStore {
     var isConnected: Bool { client != nil }
     /// `hub.run`/`hub.agents`/`hub.folders` are operate-only on the hub.
     var canRunAgents: Bool { usesHub && level == "operate" }
+    /// Diff review is read at every level; the note writes need control.
+    var canViewDiff: Bool { allowedMethods.contains("diff.list") }
+    var canReviewDiff: Bool { allowedMethods.contains("diff.note.add") }
 
     init() {
         deviceId = try? PilusClient.deviceId()
@@ -86,11 +92,13 @@ final class AppStore {
             }.value
             usesHub = true
             level = caps.access?.level
+            allowedMethods = Set(caps.access?.allowed_methods ?? [])
         } catch {
             // A connector without the hub surface only speaks UHP; the app
             // falls back to token-auth requests for everything.
             usesHub = false
             level = nil
+            allowedMethods = []
         }
         if usesHub {
             await loadMachines()
@@ -101,7 +109,7 @@ final class AppStore {
 
     /// One request routed through the hub when the connector supports it,
     /// tagged with the owning machine; plain token-auth UHP otherwise.
-    private func call<Reply: Decodable>(
+    func call<Reply: Decodable>(
         method: String,
         params: [String: Any] = [:],
         machine: String = "local"
@@ -446,6 +454,7 @@ final class AppStore {
         agents = []
         tasks = []
         level = nil
+        allowedMethods = []
         usesHub = false
         error = nil
     }

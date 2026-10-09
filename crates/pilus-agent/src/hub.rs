@@ -7,11 +7,12 @@
 //! any other id is a saved SSH machine, reached the way the window reaches it,
 //! through `luvus uhp proxy` over the user's own SSH.
 //!
-//! What a device may call depends on its [`Level`]. `Control` is exactly the
-//! gateway token's `allowed_methods`; `View` is the read-only subset of that;
-//! `Operate` adds [`OPERATE`] (add and start tasks, start agents, open
-//! workspaces), which the gateway refuses, so the hub runs them itself, on
-//! this machine through Luvus's owner socket and on a saved machine through
+//! What a device may call depends on its [`Level`]. `Control` is the gateway
+//! token's `allowed_methods` plus [`REVIEW`] (write and send diff review
+//! notes); `View` is the read-only subset of the gateway's; `Operate` adds
+//! [`OPERATE`] (add and start tasks, start agents, open workspaces). The
+//! gateway refuses both extra sets, so the hub runs them itself, on this
+//! machine through Luvus's owner socket and on a saved machine through
 //! `luvus uhp proxy`. Methods that stream or block are refused at every level
 //! because a stream carries one request and one reply. A remote machine's owner
 //! socket would accept far more than any of this, so these allowlists are the
@@ -68,6 +69,23 @@ const REFUSED: &[&str] = &[
 /// workspace), which is why the gateway token does not carry them.
 const OPERATE: &[&str] = &["task.add", "task.start", "agent.start", "workspace.open"];
 
+/// The diff review calls a `Control` device may make beyond the gateway's own
+/// list, which carries only `diff.list`, `diff.get`, and `diff.note.list`.
+///
+/// None of them runs code. Notes are plain text in the daemon's own store, and
+/// `diff.note.send` types into an agent pane exactly as `agent.prompt` does,
+/// which `Control` already has. They are audited like every write, without
+/// their parameters, since a note is as private as a prompt.
+const REVIEW: &[&str] = &[
+    "diff.refresh",
+    "diff.note.add",
+    "diff.note.edit",
+    "diff.note.resolve",
+    "diff.note.reopen",
+    "diff.note.remove",
+    "diff.note.send",
+];
+
 /// Method name endings that only read.
 const READ_SUFFIXES: &[&str] = &[
     ".list",
@@ -111,11 +129,19 @@ pub fn effective_methods(level: Level, gateway: &[String]) -> Vec<String> {
             .collect(),
         Level::Control | Level::Operate => gateway.to_vec(),
     };
-    if level == Level::Operate && !gateway.is_empty() {
-        for method in OPERATE {
-            if !methods.iter().any(|name| name == method) {
-                methods.push((*method).to_string());
-            }
+    // Nothing to extend until the gateway has said what it allows: an empty
+    // list fails closed at every level.
+    if gateway.is_empty() {
+        return methods;
+    }
+    let extras: &[&[&str]] = match level {
+        Level::View => &[],
+        Level::Control => &[REVIEW],
+        Level::Operate => &[REVIEW, OPERATE],
+    };
+    for method in extras.iter().copied().flatten() {
+        if !methods.iter().any(|name| name == method) {
+            methods.push((*method).to_string());
         }
     }
     methods
@@ -312,7 +338,7 @@ impl Hub {
         params: Value,
     ) -> Result<Value, Value> {
         if machine == LOCAL {
-            if OPERATE.contains(&method) {
+            if OPERATE.contains(&method) || REVIEW.contains(&method) {
                 return self.owner(method, params).await;
             }
             let result = self.local(method, params).await?;
@@ -376,11 +402,12 @@ impl Hub {
         }
     }
 
-    /// Run an `Operate` method as this user, through Luvus's owner socket.
+    /// Run an `Operate` or [`REVIEW`] method as this user, through Luvus's
+    /// owner socket.
     ///
     /// This is the one place the hub exercises more authority than the gateway
     /// token grants. It is reached only after [`Hub::refusal`] has confirmed the
-    /// device is at `Operate`.
+    /// device's level carries the method.
     async fn owner(&self, method: &str, params: Value) -> Result<Value, Value> {
         let socket = api_socket_path_for(self.session.as_deref());
         let called = method.to_string();
@@ -1200,7 +1227,17 @@ mod tests {
             .collect();
         let view = effective_methods(Level::View, &gateway);
         assert_eq!(view, vec!["workspace.list", "agent.read"]);
-        assert_eq!(effective_methods(Level::Control, &gateway), gateway);
+        // Control adds the review calls and nothing else.
+        let control = effective_methods(Level::Control, &gateway);
+        assert_eq!(control[..gateway.len()], gateway[..]);
+        assert_eq!(control.len(), gateway.len() + REVIEW.len());
+        for method in REVIEW {
+            assert!(control.iter().any(|name| name == method), "{method}");
+            assert!(!view.iter().any(|name| name == method), "{method}");
+        }
+        for method in OPERATE {
+            assert!(!control.iter().any(|name| name == method), "{method}");
+        }
         let operate = effective_methods(Level::Operate, &gateway);
         for method in OPERATE {
             assert!(operate.iter().any(|name| name == method), "{method}");
@@ -1208,6 +1245,43 @@ mod tests {
         assert!(operate.iter().any(|name| name == "agent.prompt"));
         // Nothing to extend until the gateway has said what it allows.
         assert!(effective_methods(Level::Operate, &[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reviewing_is_for_control_devices_and_reading_is_for_everyone() {
+        let hub = hub_allowing("127.0.0.1:1", &["diff.list", "diff.get", "diff.note.list"]);
+        for level in [Level::View, Level::Control, Level::Operate] {
+            assert!(hub.refusal(level, "diff.list").is_none(), "{level:?}");
+            assert!(hub.refusal(level, "diff.note.list").is_none(), "{level:?}");
+        }
+        for method in REVIEW {
+            let view = hub.refusal(Level::View, method).expect("view is refused");
+            assert_eq!(view["code"], "forbidden", "{method}");
+            for level in [Level::Control, Level::Operate] {
+                assert!(hub.refusal(level, method).is_none(), "{level:?} {method}");
+            }
+        }
+        // The gateway has not reported yet, so nothing is granted.
+        let waiting = Hub::new(
+            GatewayLink::fixed("127.0.0.1:1"),
+            "Mac".into(),
+            test_auth(),
+            None,
+        );
+        let refused = waiting
+            .refusal(Level::Control, "diff.note.add")
+            .expect("refused");
+        assert_eq!(refused["code"], "unavailable");
+    }
+
+    #[test]
+    fn review_writes_are_audited_as_writes_and_reads_are_not() {
+        for method in REVIEW {
+            assert!(!is_read(method), "{method}");
+        }
+        for method in ["diff.list", "diff.get", "diff.note.list"] {
+            assert!(is_read(method), "{method}");
+        }
     }
 
     #[test]

@@ -234,6 +234,9 @@ struct Machine: Decodable, Identifiable {
 /// model catalog a picker offers.
 struct HubAgents: Decodable {
     let agents: [HubAgentKind]
+    /// Kinds `hub.run` accepts beyond real agents (`terminal` opens a shell
+    /// tab); absent on connectors that predate pseudo-kinds.
+    let pseudo_kinds: [String]?
 }
 
 struct HubAgentKind: Decodable, Identifiable {

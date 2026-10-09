@@ -13,6 +13,7 @@ final class AppStore {
     var hostLabel: String?
     /// Agent-kind catalog per machine (`hub.agents` answers per machine).
     var agentKindsByMachine: [String: [HubAgentKind]] = [:]
+    var pseudoKindsByMachine: [String: [String]] = [:]
     /// Machines to merge lists over: `local` first, then usable SSH machines
     /// in `hub.machines` order.
     var machineOrder: [String] = ["local"]
@@ -124,9 +125,13 @@ final class AppStore {
 
     /// Agent kinds installed on a machine; empty while `hub.agents` is still
     /// loading or the connector predates the catalog. `terminal` is a
-    /// pseudo-kind the hub answers with a fresh shell tab.
+    /// pseudo-kind the hub answers with a fresh shell tab — only offered when
+    /// the connector advertises it, since an older one forwards it to
+    /// `agent.start` and the daemon rejects the unknown kind.
     func kinds(for machine: String) -> [HubAgentKind] {
-        (agentKindsByMachine[machine] ?? []) + [Self.terminalKind]
+        let advertised = pseudoKindsByMachine[machine] ?? []
+        return (agentKindsByMachine[machine] ?? [])
+            + (advertised.contains("terminal") ? [Self.terminalKind] : [])
     }
 
     private static let terminalKind =
@@ -154,10 +159,11 @@ final class AppStore {
     func loadAgentKinds() async {
         guard let client else { return }
         for id in machineOrder {
-            agentKindsByMachine[id] = (try? await Task.detached {
-                let reply: HubAgents = try client.hubRequest(method: "hub.agents", machine: id)
-                return reply.agents
-            }.value) ?? []
+            let reply: HubAgents? = try? await Task.detached {
+                try client.hubRequest(method: "hub.agents", machine: id)
+            }.value
+            agentKindsByMachine[id] = reply?.agents ?? []
+            pseudoKindsByMachine[id] = reply?.pseudo_kinds ?? []
         }
     }
 
@@ -434,6 +440,7 @@ final class AppStore {
         machines = []
         machineOrder = ["local"]
         agentKindsByMachine = [:]
+        pseudoKindsByMachine = [:]
         inventoryCache = [:]
         workspaces = []
         agents = []

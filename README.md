@@ -130,6 +130,8 @@ just serve-preview  # serve that payload on 127.0.0.1:8000
 | `crates/pilus-client` | Socket discovery, transport, handshake, the event stream, and the folded `Surface`. |
 | `crates/pilus-session` | The Pi session reader: parse, discover, and tail session JSONL. |
 | `crates/pilus` | The GPUI window, key mapping, and native painting. |
+| `crates/pilus-agent` | The host connector: enrollment, the `luvus/hub/1` front door phones talk to, and fan-out to SSH machines. |
+| `crates/pilus-mobile` | The phone-side client: iroh transport, UHP hub calls, enrollment persistence, C FFI for the iOS app in `ios/`. |
 
 The protocol crate is the only place that knows the wire format, and its
 declaration order is load-bearing — see [`AGENTS.md`](AGENTS.md) before editing

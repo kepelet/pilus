@@ -1,7 +1,7 @@
 # Architecture
 
-`pilus` is three crates with a one-way dependency chain, plus a fourth that
-shares the connection layer from the other side:
+`pilus` is three crates with a one-way dependency chain, plus two that share
+the connection layer from the other sides:
 
 ```
 pilus (GPUI window)
@@ -13,7 +13,9 @@ pilus-agent (host connector) ──▶ pilus-client
 
 `pilus-agent` is the host-side connector described under “Host connector”
 below; it depends on `pilus-client`'s UHP surface and is never in the desktop
-window's dependency chain.
+window's dependency chain. `pilus-mobile` sits on the phone side of that same
+door: it enrolls over iroh, speaks the hub methods below, and exposes a C FFI
+the iOS app (`ios/`) links against.
 
 `pilus-session` is the one crate outside that chain that has nothing to do with
 the daemon: it reads pi's session JSONL — parse, discover by working directory,
@@ -771,10 +773,23 @@ audit line (`hub.run`; the prompt is never logged). The agent gets an alias of i
 prompts that agent instead of starting another. The alias is what finds it, because
 Luvus can label a process as a different kind (a Pi pane reads as `opencode`). It
 focuses the workspace on the Mac, since an agent spawns beside the focused pane.
+`model` and `effort` params resolve to launch flags on the machine that owns the
+catalog (`AgentConfig::launch_args`), so a kind without one launches on its
+defaults. `terminal` is the one **pseudo-kind**: instead of `agent.start` it
+opens a fresh shell tab in the workspace and types the prompt through
+`pane.send_input`, so a device can run plain commands without pretending a kind
+exists the daemon does not know.
 
 `hub.agents` (operate only) lists the agents **installed** on a machine, for a
 picker: the same probe the window's launch composer uses (`agents::local`, or
-`agents::remote` in one SSH round trip), cached for a minute. Luvus's own
+`agents::remote` in one SSH round trip), cached for a minute. Each entry carries
+its model catalog (`models` with names, efforts, and defaults, plus
+`default_model`) so a remote picker can offer models without probing the
+machine itself; kinds that report none simply hide the picker. A separate
+`pseudo_kinds` list advertises the kinds `hub.run` accepts beyond real adapters
+(`terminal`) — a client gates its picker on it, since a connector that predates
+it would forward the name to `agent.start` and fail with an unknown-kind error.
+Luvus's own
 `server.agent_manifests` is not a substitute: it names every agent Luvus knows how
 to launch (23 of them), installed or not. The picked kind goes to `task.start` or
 `agent.start` as `agent`.

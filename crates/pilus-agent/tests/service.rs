@@ -41,7 +41,9 @@ fn isolated<'a>(command: &'a mut Command, root: &Path) -> &'a mut Command {
     for name in AMBIENT {
         command.env_remove(name);
     }
-    command.env("LUVUS_HOME", root)
+    // The agent's own state lives under PILUS_HOME, so a test that only moved
+    // LUVUS_HOME would still read and write the developer's real identity.
+    command.env("LUVUS_HOME", root).env("PILUS_HOME", root)
 }
 
 /// Kills the agent and the throwaway daemon even when an assertion fails.

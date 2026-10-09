@@ -15,7 +15,7 @@ use std::process::Command;
 use serde_json::{Value, json};
 
 use crate::connector::agent_binary;
-use crate::discovery::config_dir;
+use crate::discovery::{config_dir, pilus_config_dir};
 use crate::error::{Error, Result};
 
 /// Whether this platform can run the connector as a background service. Windows
@@ -24,8 +24,48 @@ use crate::error::{Error, Result};
 pub const SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "linux"));
 
 /// Where the connector keeps its identity, device list, admin socket, and log.
+///
+/// This is pilus's own directory, not the Luvus state root: the connector is
+/// pilus's, and a Luvus session change or `LUVUS_HOME` must not move the
+/// identity that paired phones dial.
 pub fn agent_dir() -> PathBuf {
-    config_dir().join("agent")
+    pilus_config_dir().join("agent")
+}
+
+/// Files that were once written under the Luvus state root and are the
+/// connector's durable state. The socket and log are rebuilt on every start.
+const LEGACY_FILES: &[&str] = &["identity.key", "devices.json"];
+
+/// Move the connector's durable state out of `<luvus root>/agent` into
+/// [`agent_dir`], once.
+///
+/// `identity.key` is the host's iroh `EndpointId`, which every paired phone has
+/// pinned in its ticket, and `devices.json` is who may call it. Leaving them
+/// behind would mint a new identity and an empty allowlist, silently unpairing
+/// everything, so a failure here is an error rather than a fresh start. A file
+/// already present at the destination always wins and the old one is left alone.
+pub fn adopt_legacy_state() -> Result<()> {
+    adopt_from(&config_dir().join("agent"), &agent_dir())
+}
+
+fn adopt_from(legacy: &std::path::Path, current: &std::path::Path) -> Result<()> {
+    if legacy == current {
+        return Ok(());
+    }
+    for name in LEGACY_FILES {
+        let (from, to) = (legacy.join(name), current.join(name));
+        if !from.is_file() || to.exists() {
+            continue;
+        }
+        std::fs::create_dir_all(current)?;
+        // A rename keeps the file's mode; across volumes it falls back to a
+        // copy, which `fs::copy` also gives the source's permissions.
+        if std::fs::rename(&from, &to).is_err() {
+            std::fs::copy(&from, &to)?;
+            std::fs::remove_file(&from)?;
+        }
+    }
+    Ok(())
 }
 
 /// The connector's admin socket.
@@ -394,6 +434,64 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pilus-adopt-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    #[test]
+    fn adopting_moves_identity_and_devices_but_not_the_socket_or_log() {
+        let root = scratch("moves");
+        let (legacy, current) = (root.join("luvus/agent"), root.join("pilus/agent"));
+        std::fs::create_dir_all(&legacy).expect("legacy");
+        for name in ["identity.key", "devices.json", "agent.log", "agent.sock"] {
+            std::fs::write(legacy.join(name), name).expect("seed");
+        }
+        adopt_from(&legacy, &current).expect("adopt");
+        assert_eq!(
+            std::fs::read(current.join("identity.key")).expect("key"),
+            b"identity.key"
+        );
+        assert!(current.join("devices.json").is_file());
+        assert!(!legacy.join("identity.key").exists() && !legacy.join("devices.json").exists());
+        assert!(
+            legacy.join("agent.log").exists(),
+            "ephemeral files stay put"
+        );
+        assert!(!current.join("agent.log").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adopting_never_overwrites_the_new_identity() {
+        let root = scratch("keeps");
+        let (legacy, current) = (root.join("luvus/agent"), root.join("pilus/agent"));
+        std::fs::create_dir_all(&legacy).expect("legacy");
+        std::fs::create_dir_all(&current).expect("current");
+        std::fs::write(legacy.join("identity.key"), "old").expect("old");
+        std::fs::write(current.join("identity.key"), "new").expect("new");
+        adopt_from(&legacy, &current).expect("adopt");
+        assert_eq!(
+            std::fs::read(current.join("identity.key")).expect("key"),
+            b"new"
+        );
+        assert!(
+            legacy.join("identity.key").exists(),
+            "the old copy is left alone"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adopting_with_nothing_to_move_creates_nothing() {
+        let root = scratch("empty");
+        adopt_from(&root.join("luvus/agent"), &root.join("pilus/agent")).expect("adopt");
+        assert!(!root.join("pilus").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn reads_a_status_reply() {

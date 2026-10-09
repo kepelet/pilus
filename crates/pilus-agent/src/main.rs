@@ -31,6 +31,7 @@ OPTIONS:
                       overrides relay.url in ~/.pilus/settings.json (with --iroh)
     --allow ID        allow only this device EndpointId; repeatable (with --iroh)
     --identity PATH   path to the persistent iroh identity key
+                      (default ~/.pilus/agent/identity.key)
     --control         advertise the bounded control surface
     --machines        advertise the owner-local machine catalog
     --session NAME    target a named Luvus session
@@ -117,7 +118,16 @@ fn main() -> anyhow::Result<()> {
         }
         "serve" => {
             if iroh {
-                let key_path = identity.unwrap_or_else(default_identity_path);
+                let key_path = match identity {
+                    Some(path) => path,
+                    None => {
+                        // Before the default path is read, or a fresh identity
+                        // would be minted beside the one phones have pinned.
+                        pilus_client::agent_service::adopt_legacy_state()
+                            .context("could not move the old agent state into ~/.pilus")?;
+                        default_identity_path()
+                    }
+                };
                 if background {
                     trim_log(&key_path.with_file_name("agent.log"));
                 }
@@ -177,6 +187,8 @@ fn run_service(
     match subcommand {
         "install" => {
             let agent = std::env::current_exe().context("could not find this binary's path")?;
+            pilus_client::agent_service::adopt_legacy_state()
+                .context("could not move the old agent state into ~/.pilus")?;
             let spec = service::Spec {
                 agent,
                 session,
@@ -222,11 +234,9 @@ fn trim_log(path: &std::path::Path) {
     }
 }
 
-/// The default iroh identity path, under the Luvus state root.
+/// The default iroh identity path, under pilus's own directory.
 fn default_identity_path() -> PathBuf {
-    pilus_client::config_dir()
-        .join("agent")
-        .join("identity.key")
+    pilus_client::agent_service::agent_dir().join("identity.key")
 }
 
 fn value(args: &[String], index: &mut usize, flag: &str) -> anyhow::Result<String> {

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pilus-protocol", "crates/pilus-client", "crates/pilus-session", "crates/pilus", "crates/pilus-agent"]
+members = ["crates/pilus-protocol", "crates/pilus-client", "crates/pilus-session", "crates/pilus", "crates/pilus-agent", "crates/pilus-mobile"]
 resolver = "2"
 
 [workspace.package]
@@ -45,6 +45,7 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 
 pilus-client = { path = "crates/pilus-client" }
+pilus-agent = { path = "crates/pilus-agent" }
 pilus-protocol = { path = "crates/pilus-protocol" }
 pilus-session = { path = "crates/pilus-session" }
 

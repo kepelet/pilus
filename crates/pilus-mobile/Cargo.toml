@@ -1,0 +1,29 @@
+[package]
+name = "pilus-mobile"
+description = "Device-side client: enrolls against a pilus-agent connector and speaks UHP over iroh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+# `staticlib` is what Xcode links into the iOS app; `rlib` keeps tests and
+# host tooling working.
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+iroh = "1.3.0"
+iroh-tickets = "1.0.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[dev-dependencies]
+# The live test brokers a real gateway through the connector, the same
+# harness `pilus-agent`'s own `iroh_bridge` test uses.
+pilus-agent.workspace = true
+pilus-client.workspace = true

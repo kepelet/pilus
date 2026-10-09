@@ -5597,6 +5597,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pilus-mobile"
+version = "0.1.0"
+dependencies = [
+ "iroh",
+ "iroh-tickets",
+ "pilus-agent",
+ "pilus-client",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "pilus-protocol"
 version = "0.1.0"
 dependencies = [

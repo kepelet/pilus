@@ -962,6 +962,13 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Type literal text into a pane — a shell command ends in `"\n"` so the
+    /// terminal runs it rather than leaving it on the line.
+    pub fn send_input(&mut self, pane: &str, text: &str) -> Result<()> {
+        self.request("pane.send_input", json!({ "pane": pane, "text": text }))?;
+        Ok(())
+    }
+
     /// Close the tab at `index` (1-based).
     pub fn close_tab(&mut self, index: u16) -> Result<()> {
         self.request("tab.close", json!({ "tab": index.to_string() }))?;

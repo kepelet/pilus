@@ -139,8 +139,9 @@ const AGENTS_TTL: Duration = Duration::from_secs(60);
 /// The saved-machine listing and when it was read.
 type Catalog = Option<(Instant, Vec<MachineInfo>)>;
 
-/// Installed-agent probes by machine id.
-type AgentCache = HashMap<String, (Instant, Value)>;
+/// Installed-agent probes by machine id, kept as configs so both the picker
+/// (`hub.agents`) and the launcher (`hub.run`) share one probe.
+type AgentCache = HashMap<String, (Instant, Vec<pilus_client::agents::AgentConfig>)>;
 
 /// The hub's shared state.
 #[derive(Clone)]
@@ -588,7 +589,7 @@ impl Hub {
                 .unwrap_or_default()
                 .to_string()
         };
-        let (kind, prompt, path, workspace_id) = (
+        let (kind, prompt, path, workspace_id, model, effort) = (
             text("agent"),
             params
                 .get("prompt")
@@ -597,6 +598,8 @@ impl Hub {
                 .to_string(),
             text("path"),
             text("workspace_id"),
+            text("model"),
+            text("effort"),
         );
         let bad = |message: &str| failure("bad_request", message);
         if kind.is_empty()
@@ -608,14 +611,31 @@ impl Hub {
                 "`agent` must name an agent kind, like `pi` or `claude`",
             ));
         }
-        if prompt.trim().is_empty() {
+        if prompt.trim().is_empty() && kind != "terminal" {
             return Err(bad("`prompt` is empty"));
         }
         if path.is_empty() {
             return Err(bad("`path` must be the workspace's directory"));
         }
+        // Display names become the agent's launch flags here, on the machine
+        // that knows the catalog; a kind without one launches on its defaults.
+        let args = if model.is_empty() {
+            Vec::new()
+        } else {
+            self.installed_agents(machine)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .find(|config| config.kind == kind)
+                .map(|config| config.launch_args(&model, &effort))
+                .unwrap_or_default()
+        };
         let launch = move |mut client: ControlClient| {
-            launch_agent(&mut client, &kind, &path, &workspace_id, &prompt)
+            if kind == "terminal" {
+                launch_terminal(&mut client, &path, &workspace_id, &prompt)
+            } else {
+                launch_agent(&mut client, &kind, &path, &workspace_id, &prompt, &args)
+            }
         };
         if machine == LOCAL {
             let socket = api_socket_path_for(self.session.as_deref());
@@ -686,6 +706,39 @@ impl Hub {
 
     /// The agents installed on `machine`, as a picker should list them.
     async fn agents(&self, machine: &str) -> Result<Value, Value> {
+        let found = self.installed_agents(machine).await?;
+        Ok(json!({
+            "machine": machine,
+            // Kinds `hub.run` accepts beyond real agent adapters; clients gate
+            // their picker entries on this instead of offering kinds an older
+            // connector would forward to `agent.start` and fail.
+            "pseudo_kinds": ["terminal"],
+            "agents": found
+                .iter()
+                .map(|agent| json!({
+                    "kind": agent.kind,
+                    "label": agent.label,
+                    "default_model": agent.default_model,
+                    "models": agent
+                        .models
+                        .iter()
+                        .map(|model| json!({
+                            "name": model.name,
+                            "efforts": model.efforts,
+                            "default_effort": model.default_effort,
+                            "is_default": model.is_default,
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// The installed-agent probe for `machine`, trusted for [`AGENTS_TTL`].
+    async fn installed_agents(
+        &self,
+        machine: &str,
+    ) -> Result<Vec<pilus_client::agents::AgentConfig>, Value> {
         if let Some((at, cached)) = lock(&self.installed).get(machine)
             && at.elapsed() < AGENTS_TTL
         {
@@ -711,19 +764,8 @@ impl Hub {
                 .await
                 .map_err(|error| failure("internal", &error.to_string()))?
         };
-        let value = json!({
-            "machine": machine,
-            "agents": found
-                .iter()
-                .map(|agent| json!({
-                    "kind": agent.kind,
-                    "label": agent.label,
-                    "default_model": agent.default_model,
-                }))
-                .collect::<Vec<_>>(),
-        });
-        lock(&self.installed).insert(machine.to_string(), (Instant::now(), value.clone()));
-        Ok(value)
+        lock(&self.installed).insert(machine.to_string(), (Instant::now(), found.clone()));
+        Ok(found)
     }
 
     /// The saved machine profiles, cached briefly.
@@ -842,6 +884,7 @@ fn launch_agent(
     path: &str,
     workspace_id: &str,
     prompt: &str,
+    args: &[String],
 ) -> Result<Value, ClientError> {
     let alias = phone_alias(kind, workspace_id, path);
     let running = client.agents()?;
@@ -853,7 +896,7 @@ fn launch_agent(
     // A fresh workspace opens with one shell pane; reuse it so the launch does
     // not split a second, empty terminal beside the agent.
     let pane = client.idle_pane().ok().flatten();
-    client.start_agent(&alias, kind, pane.as_deref(), &[])?;
+    client.start_agent(&alias, kind, pane.as_deref(), args)?;
     if let Some(pane) = pane.as_deref() {
         client.focus_pane(pane).ok();
     }
@@ -861,6 +904,27 @@ fn launch_agent(
     let target = pane.unwrap_or_else(|| alias.clone());
     client.prompt_agent(&target, prompt)?;
     Ok(json!({ "started": true, "name": alias, "pane": target }))
+}
+
+/// The `terminal` pseudo-kind: a fresh shell tab in the workspace, with the
+/// prompt typed as its first command when one was given.
+fn launch_terminal(
+    client: &mut ControlClient,
+    path: &str,
+    _workspace_id: &str,
+    prompt: &str,
+) -> Result<Value, ClientError> {
+    client.open_workspace(path)?;
+    client.new_tab()?;
+    // The new tab takes focus, so the current idle pane is its fresh shell.
+    let pane = client.idle_pane().ok().flatten();
+    if let Some(pane) = pane.as_deref() {
+        client.focus_pane(pane).ok();
+        if !prompt.is_empty() {
+            client.send_input(pane, &format!("{prompt}\n"))?;
+        }
+    }
+    Ok(json!({ "started": true, "name": "terminal", "pane": pane }))
 }
 
 /// `{"id","result"}` or `{"id","error"}`.
@@ -1031,6 +1095,7 @@ mod tests {
             .await;
         assert_eq!(answer["result"]["machine"], "local");
         assert!(answer["result"]["agents"].is_array());
+        assert_eq!(answer["result"]["pseudo_kinds"], json!(["terminal"]));
         // A machine that was never saved is not probed.
         let unknown = hub
             .handle(

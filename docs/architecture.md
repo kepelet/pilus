@@ -651,6 +651,13 @@ peers; when enrollment is enabled, the control ALPN stays open so a new device
 can present its code. The connector runs the gateway `--no-expiry`, because it
 pairs once and must hold that token for its whole run.
 
+The connector's own state lives in `~/.pilus/agent` (`$PILUS_HOME/agent`), never
+under the Luvus state root: `identity.key` (the host's iroh identity, which paired
+phones have pinned), `devices.json`, the admin socket `agent.sock`, and
+`agent.log`. Older builds wrote these to `<luvus root>/agent`; `serve` and
+`service install` move `identity.key` and `devices.json` across on first run and
+never overwrite a file already at the new path.
+
 ### Running as a background service
 
 Remote access is only worth having if it is there when the window is not, so

@@ -31,17 +31,76 @@ struct HomeView: View {
     @AppStorage("home.agents.expanded") private var agentsExpanded = true
     @AppStorage("home.tasks.expanded") private var tasksExpanded = true
 
+    /// A top-level workspace row plus the linked worktrees hanging under it.
+    private struct WorkspaceNode {
+        let workspace: Workspace
+        var worktrees: [Workspace] = []
+    }
+
     /// Workspaces grouped under their machine in `hub.machines` order,
-    /// each group sorted by the daemon's own display position.
-    private var machineGroups: [(machine: String, workspaces: [Workspace])] {
+    /// each group sorted by the daemon's own display position. Worktree
+    /// workspaces fold into their repo's workspace as indented children.
+    private var machineGroups: [(machine: String, workspaces: [WorkspaceNode])] {
         store.machineOrder.compactMap { id in
             let ws = store.workspaces
                 .filter { $0.machine == id && !isHomeWorkspace($0) }
                 .sorted {
                     (Int($0.display_position ?? "") ?? 0) < (Int($1.display_position ?? "") ?? 0)
                 }
-            return ws.isEmpty ? nil : (id, ws)
+            let nodes = groupWorktrees(ws)
+            return nodes.isEmpty ? nil : (id, nodes)
         }
+    }
+
+    /// The daemon's linked-worktree convention: checkouts live at
+    /// `$LUVUS_HOME/worktrees/<repo>/<branch>`, so a workspace rooted under
+    /// `.luvus*/worktrees/` is a child of the workspace holding that repo's
+    /// main checkout. Returns the repo slug, nil when it isn't a worktree.
+    private func worktreeRepo(_ workspace: Workspace) -> String? {
+        for candidate in [workspace.cwd, workspace.terminal_cwd] {
+            guard let path = candidate,
+                  // `.luvus` prefix also covers alternate homes like
+                  // `.luvus-dev`; the worktrees root sits directly under it.
+                  let home = path.range(of: "/.luvus"),
+                  let marker = path.range(of: "/worktrees/",
+                                          range: home.upperBound..<path.endIndex)
+            else { continue }
+            let tail = path[marker.upperBound...]
+            let repo = tail.prefix(while: { $0 != "/" })
+            if !repo.isEmpty, tail.count > repo.count + 1 {
+                return String(repo)
+            }
+        }
+        return nil
+    }
+
+    /// Fold worktree workspaces under their repo's workspace; a worktree whose
+    /// repo isn't open stays a top-level row so it never goes missing.
+    private func groupWorktrees(_ workspaces: [Workspace]) -> [WorkspaceNode] {
+        var nodes: [WorkspaceNode] = []
+        var children: [(workspace: Workspace, repo: String)] = []
+        for workspace in workspaces {
+            if let repo = worktreeRepo(workspace) {
+                children.append((workspace, repo))
+            } else {
+                nodes.append(WorkspaceNode(workspace: workspace))
+            }
+        }
+        for child in children {
+            if let index = nodes.firstIndex(where: { lastPathComponent($0.workspace) == child.repo }) {
+                nodes[index].worktrees.append(child.workspace)
+            } else {
+                nodes.append(WorkspaceNode(workspace: child.workspace))
+            }
+        }
+        return nodes
+    }
+
+    private func lastPathComponent(_ workspace: Workspace) -> String? {
+        (workspace.cwd ?? workspace.terminal_cwd)?
+            .split(separator: "/")
+            .last
+            .map(String.init)
     }
 
     /// Bare home directories carry no context — they clutter the list, so
@@ -115,6 +174,11 @@ struct HomeView: View {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button { navPath.append(HomeRoute.notifications) } label: {
                             Image(systemName: "bell")
+                                .padding(8)
+                                // Liquid glass circle — the same treatment
+                                // the composer buttons get — while the
+                                // wordmark stays bare over the hero.
+                                .glassEffect(.regular.interactive(), in: .circle)
                         }
                         .environment(\.colorScheme, .dark)
                         .accessibilityLabel("Notifications")
@@ -667,8 +731,11 @@ struct HomeView: View {
                             .foregroundStyle(.secondary)
                             .padding(.top, 18)
                     }
-                    ForEach(group.workspaces) { workspace in
-                        workspaceGroup(workspace)
+                    ForEach(group.workspaces, id: \.workspace.id) { node in
+                        workspaceGroup(node.workspace)
+                        ForEach(node.worktrees) { worktree in
+                            worktreeGroup(worktree)
+                        }
                     }
                 }
             }
@@ -739,6 +806,30 @@ struct HomeView: View {
         }
     }
 
+    /// A linked worktree hangs off its repo's workspace as an indented
+    /// group. No label: the daemon names the workspace after its branch, and
+    /// the agents already carry that branch in their subtitle.
+    private func worktreeGroup(_ workspace: Workspace) -> some View {
+        let rows = agents(in: workspace)
+        return VStack(alignment: .leading, spacing: 0) {
+            if rows.isEmpty {
+                // Nothing hangs under the indent — fall back to the path,
+                // like an agentless workspace's folder line.
+                Text(workspace.cwd ?? workspace.terminal_cwd ?? "")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.top, 10)
+            } else {
+                ForEach(rows) { agent in
+                    agentRow(agent)
+                }
+            }
+        }
+        .padding(.leading, 20)
+    }
+
     /// A task row opens the pane its workspace worker runs in — the task
     /// carries a `tab_id`, `tab.get` answers the pane.
     private func taskRow(_ task: OrchTask) -> some View {
@@ -790,9 +881,21 @@ struct HomeView: View {
                         .truncationMode(.middle)
                 }
                 Spacer(minLength: 8)
-                Circle()
-                    .fill(statusColor(agent.status))
-                    .frame(width: 7, height: 7)
+                // A working agent turns where the dot sits — the desktop's
+                // `style::spinner` convention — so the row says "busy"
+                // without waiting on a status push. Both states share one
+                // centered frame so switching never shifts the row.
+                if agent.status == "working" {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(statusColor(agent.status))
+                        .frame(width: 14, height: 14)
+                } else {
+                    Circle()
+                        .fill(statusColor(agent.status))
+                        .frame(width: 7, height: 7)
+                        .frame(width: 14, height: 14)
+                }
             }
             .padding(.vertical, 8)
             .contentShape(Rectangle())

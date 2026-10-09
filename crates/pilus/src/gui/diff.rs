@@ -690,8 +690,9 @@ impl PilusView {
         cx.notify();
     }
 
-    /// Open the form on `src` from its hover button. Shift extends from the
-    /// line the cursor was on, as shift-click does.
+    /// Open the form on `src` from its hover button. A line inside a range
+    /// already selected comments on that whole range; otherwise shift extends
+    /// from the line the cursor was on, as shift-click does.
     fn diff_comment_at(
         &mut self,
         src: usize,
@@ -700,9 +701,14 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) {
         let panel = &mut self.diff_panel;
-        let from = panel.cursor.src;
-        panel.cursor = Cursor { src, side };
-        panel.anchor = extend.then_some(from);
+        let in_selection = panel.anchor.is_some_and(|anchor| {
+            (anchor.min(panel.cursor.src)..=anchor.max(panel.cursor.src)).contains(&src)
+        });
+        if !in_selection {
+            let from = panel.cursor.src;
+            panel.cursor = Cursor { src, side };
+            panel.anchor = extend.then_some(from);
+        }
         self.diff_open_composer(cx);
     }
 

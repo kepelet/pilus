@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The generated keys (version, orientations, usage descriptions) come
+         from project.yml; this file only carries what INFOPLIST_KEY_* cannot
+         express. -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>CFBundleURLName</key>
+            <string>com.kepelet.pilus.pair</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>pilus</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

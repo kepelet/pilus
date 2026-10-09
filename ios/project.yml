@@ -1,0 +1,44 @@
+name: Pilus
+options:
+  bundleIdPrefix: com.kepelet
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  Pilus:
+    type: application
+    platform: iOS
+    sources:
+      - Pilus
+    dependencies:
+      # Linked statically from Rust: iroh's netdev/netwatch crates call into
+      # Network.framework and SystemConfiguration.framework.
+      - sdk: Network.framework
+      - sdk: SystemConfiguration.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kepelet.pilus
+        PRODUCT_NAME: Pilus
+        GENERATE_INFOPLIST_FILE: YES
+        # Generated keys merge with this file, which carries the keys
+        # INFOPLIST_KEY_* can't express (URL types for pilus://pair/…).
+        INFOPLIST_FILE: Pilus/Info.plist
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "39"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_CFBundleDisplayName: pilus
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: pilus reaches your Luvus machines over peer-to-peer QUIC.
+        INFOPLIST_KEY_NSCameraUsageDescription: pilus uses the camera to scan the pairing QR code your host shows.
+        # QUIC/TLS only; clears the TestFlight encryption questionnaire.
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+        SWIFT_OBJC_BRIDGING_HEADER: Pilus/pilus_mobile.h
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": $(PROJECT_DIR)/../target/aarch64-apple-ios/debug
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": $(PROJECT_DIR)/../target/aarch64-apple-ios-sim/debug
+        OTHER_LDFLAGS: -lpilus_mobile
+        ENABLE_BITCODE: NO
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]: NO
+    prebuildScripts:
+      - name: Build pilus-mobile (Rust)
+        script: ${PROJECT_DIR}/build-rust.sh
+        basedOnDependencyAnalysis: false

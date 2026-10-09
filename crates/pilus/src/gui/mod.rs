@@ -11,6 +11,9 @@ mod appearances;
 mod automations;
 mod box_drawing;
 mod connector;
+mod diff;
+mod diff_model;
+mod git_tab;
 mod glass;
 mod home;
 mod keys;
@@ -22,6 +25,7 @@ mod page_split;
 mod palette;
 mod pi_extension;
 mod picker;
+mod right_sidebar;
 mod scheme;
 mod selection;
 mod session;
@@ -52,6 +56,8 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
     MouseEventKind,
 };
+use diff::{DiffInputs, DiffPanel};
+use git_tab::GitPanel;
 use glass::Glass;
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DisplayId, Div,
@@ -81,6 +87,7 @@ use pilus_protocol::{
     CellData, ClientMessage, FrameData, ShellDockRect, ShellSidebars, ShellWorkspace,
     SurfaceInterest,
 };
+use right_sidebar::{RightSidebar, SidebarTab};
 use selection::{Cell, Selection};
 use session::SessionPanel;
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
@@ -330,6 +337,8 @@ gpui::actions!([
     ResetFontSize,
     /// Show or hide the sidebar.
     ToggleSidebar,
+    /// Show or hide the right sidebar (Diff and Git).
+    ToggleRightSidebar,
     /// Open the native Open Workspace picker.
     OpenWorkspacePicker,
     /// Open the footer session switcher.
@@ -553,6 +562,7 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
                 MenuItem::action("Reset Font Size", ResetFontSize),
                 MenuItem::separator(),
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
             ]),
             Menu::new("Window").items([
                 MenuItem::action("Minimize", MinimizeWindow),
@@ -642,6 +652,7 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd--", DecreaseFontSize, None),
         KeyBinding::new("cmd-0", ResetFontSize, None),
         KeyBinding::new("cmd-s", ToggleSidebar, None),
+        KeyBinding::new("cmd-b", ToggleRightSidebar, None),
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
         KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, None),
         KeyBinding::new("cmd-shift-s", OpenSessionMenu, None),
@@ -887,6 +898,8 @@ enum InputLayer {
     Settings,
     /// The native Tasks page.
     Tasks,
+    /// The native Diff page.
+    Diff,
     /// The native Mission Control page.
     Mission,
     /// The native Automations page.
@@ -1577,6 +1590,14 @@ struct PilusView {
     /// Daemon answers to Tasks page mutations, run off the GUI thread.
     tasks_op_rx: Receiver<task_compose::TasksMsg>,
     tasks_op_tx: Sender<task_compose::TasksMsg>,
+    /// The native Diff page: the daemon's read-only change review.
+    diff_panel: DiffPanel,
+    /// The Diff tab's note and search fields.
+    diff_inputs: DiffInputs,
+    /// The Git tab: the daemon's working-tree status and recent commits.
+    git_panel: GitPanel,
+    /// The right sidebar (Diff and Git tabs).
+    right: RightSidebar,
     /// The native Mission Control page: its state and the daemon's last
     /// dashboard snapshot.
     mission: MissionPanel,
@@ -1713,6 +1734,21 @@ impl PilusView {
             cx,
         );
         let tasks_inputs = TasksInputs::new(
+            style::chrome_font(&shared_settings),
+            initial_fonts.body,
+            initial_theme,
+            cx,
+        );
+        let mut diff_panel = DiffPanel::new();
+        diff_panel.set_list_height(settings.diff_list_height);
+        let mut git_panel = GitPanel::new();
+        git_panel.set_list_height(settings.git_list_height);
+        let right = RightSidebar::new(
+            settings.right_sidebar_visible,
+            settings.right_sidebar_width,
+            SidebarTab::from_wire(&settings.right_sidebar_tab),
+        );
+        let diff_inputs = DiffInputs::new(
             style::chrome_font(&shared_settings),
             initial_fonts.body,
             initial_theme,
@@ -1991,6 +2027,10 @@ impl PilusView {
             tasks_inputs,
             tasks_op_rx,
             tasks_op_tx,
+            diff_panel,
+            diff_inputs,
+            git_panel,
+            right,
             mission: MissionPanel::default(),
             mission_answer,
             automations_page: AutomationsPanel::default(),
@@ -2048,8 +2088,8 @@ impl PilusView {
                     // A settling tween repaints once more so a trailing
                     // resize still lands when the daemon is otherwise idle:
                     // `was_animating` covers the tick that returns settled.
-                    let was_animating = view.sidebar_anim.is_some();
-                    let settled = view.tick_sidebar_anim();
+                    let was_animating = view.sidebar_anim.is_some() || view.right.moving();
+                    let settled = view.tick_sidebar_anim() & view.right.tick();
                     let released = view.release_sidebar_freeze();
                     // The transcript glide behind the jump buttons.
                     let gliding = view.session.tick_scroll();
@@ -2299,6 +2339,8 @@ impl PilusView {
             self.tasks_receive(message);
             changed = true;
         }
+        changed |= self.diff_tick();
+        changed |= self.git_tick();
         changed |= self.mission_tick();
         changed |= self.automations_tick();
         while let Ok(resolved) = self.home_resolve_rx.try_recv() {
@@ -3675,6 +3717,7 @@ impl PilusView {
             InputLayer::Home => self.home_key(event, cx),
             InputLayer::Settings => self.settings_key(event, cx),
             InputLayer::Tasks => self.tasks_key(event, cx),
+            InputLayer::Diff => self.diff_key(event, cx),
             InputLayer::Mission => self.mission_key(event, cx),
             InputLayer::Automations => self.automations_key(event, cx),
             InputLayer::Session => {
@@ -3703,7 +3746,9 @@ impl PilusView {
             self.palette.is_open(),
             self.home.is_open(),
             self.settings_open,
-            self.page_layer().filter(|_| !self.terminal_beside_page()),
+            self.diff_focused()
+                .then_some(InputLayer::Diff)
+                .or_else(|| self.page_layer().filter(|_| !self.terminal_beside_page())),
             self.session_owns_keys(),
         )
     }
@@ -3781,6 +3826,7 @@ impl PilusView {
                     | "="
                     | "+"
                     | "a"
+                    | "b"
                     | "c"
                     | "d"
                     | "n"
@@ -3877,6 +3923,12 @@ impl PilusView {
             entry(Command::OpenAbout, "About pilus", "Application", None),
             entry(Command::Quit, "Quit pilus", "Application", Some("⌘Q")),
             entry(Command::ToggleSidebar, "Toggle Sidebar", "View", Some("⌘S")),
+            entry(
+                Command::ToggleRightSidebar,
+                "Toggle Right Sidebar",
+                "View",
+                Some("⌘B"),
+            ),
             entry(
                 Command::IncreaseFontSize,
                 "Increase Font Size",
@@ -3993,6 +4045,9 @@ impl PilusView {
             Command::CloseWindow => window.dispatch_action(CloseWindow.boxed_clone(), cx),
             Command::CloseAllWindows => window.dispatch_action(CloseAllWindows.boxed_clone(), cx),
             Command::ToggleSidebar => window.dispatch_action(ToggleSidebar.boxed_clone(), cx),
+            Command::ToggleRightSidebar => {
+                window.dispatch_action(ToggleRightSidebar.boxed_clone(), cx)
+            }
             Command::IncreaseFontSize => window.dispatch_action(IncreaseFontSize.boxed_clone(), cx),
             Command::DecreaseFontSize => window.dispatch_action(DecreaseFontSize.boxed_clone(), cx),
             Command::ResetFontSize => window.dispatch_action(ResetFontSize.boxed_clone(), cx),
@@ -5622,6 +5677,12 @@ impl PilusView {
                 .tasks_inputs
                 .focus_handle(self.tasks_panel.compose_focus(), cx),
             InputLayer::Tasks => None,
+            // The note field holds focus while it is open; otherwise the
+            // window root reads the page's shortcuts.
+            InputLayer::Diff if self.diff_panel.composing() => {
+                Some(self.diff_inputs.focus_handle(cx))
+            }
+            InputLayer::Diff => None,
             // The reply field holds focus while it is open; otherwise the
             // window root reads the page's shortcuts.
             InputLayer::Mission if self.mission.answering() => {
@@ -10234,10 +10295,17 @@ impl PilusView {
         if !self.settings_open && !self.home.is_open() {
             tab_strip = tab_strip.child(tabs).child(new_tab);
         }
+        // The right sidebar's toggle sits at the strip's far edge while the
+        // column is away; open, the column's own close button replaces it.
+        if self.right.openness() < 0.05 {
+            tab_strip = tab_strip
+                .child(div().flex_1())
+                .child(self.right_sidebar_toggle(cx));
+        }
         div()
             .absolute()
             .left(px(left))
-            .right(px(0.0))
+            .right(px(self.right.px()))
             .top(px(0.0))
             .h(px(HEADER_HEIGHT))
             .flex()
@@ -11999,7 +12067,8 @@ impl PilusView {
         let card_x = self.sidebar_px(cell_w) + gap_left;
         // The card's inner box: inside the hairline border, before the grid's
         // own breathing room.
-        let inner_w = f32::from(viewport.width) - card_x - gap_right - 2.0 * border;
+        let right_px = self.right.px();
+        let inner_w = f32::from(viewport.width) - card_x - gap_right - right_px - 2.0 * border;
         let inner_h =
             f32::from(viewport.height) - HEADER_HEIGHT - gap_top - gap_bottom - 2.0 * border;
         // A split page leads the card; the grid fits what it leaves.
@@ -12048,7 +12117,7 @@ impl PilusView {
         CardLayout {
             card_x,
             card_top: gap_top,
-            card_right: gap_right + shrink_x,
+            card_right: gap_right + right_px + shrink_x,
             card_bottom: gap_bottom + shrink_y,
             pad_x,
             pad_y,
@@ -12092,7 +12161,7 @@ impl PilusView {
     /// slide — the flicker. The card clips or pads the grid until the tween
     /// settles, and the trailing render sends any size still owed.
     fn sync_metrics(&mut self, window: &Window) {
-        if self.sidebar_anim.is_some() {
+        if self.sidebar_anim.is_some() || self.right.moving() {
             return;
         }
         let layout = self.card_layout(window, self.framed());
@@ -12402,6 +12471,7 @@ impl Render for PilusView {
                     if let Some(split) = this.page_split.as_mut() {
                         split.terminal_focused = true;
                     }
+                    this.right.focused = false;
                     this.begin_selection(event, window, cx);
                 }),
             )
@@ -12465,6 +12535,21 @@ impl Render for PilusView {
                     this.control_held = event.modifiers.control;
                 },
             ))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                let window_w = f32::from(window.viewport_size().width);
+                this.right_sidebar_drag_move(f32::from(event.position.x), window_w, cx);
+                let window_h = f32::from(window.viewport_size().height);
+                this.diff_divider_move(f32::from(event.position.y), window_h, cx);
+                this.git_divider_move(f32::from(event.position.y), window_h, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.right_sidebar_drag_end(cx);
+                    this.diff_divider_end(cx);
+                    this.git_divider_end(cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &CopySelection, _window, cx| {
                 this.copy_selection(cx);
             }))
@@ -12486,6 +12571,9 @@ impl Render for PilusView {
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
                 this.toggle_sidebar(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
+                this.toggle_right_sidebar(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
                 // The chord toggles, so pressing it again dismisses.
@@ -12568,6 +12656,7 @@ impl Render for PilusView {
             // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
             .child(self.top_chrome(cx, cell_width, fullscreen))
+            .children((self.right.openness() > 0.0).then(|| self.right_sidebar_view(cx)))
             .child(self.session_menu(cx, cell_width, fullscreen))
             .child(self.palette_overlay(cx))
             .child(self.picker_overlay(window, cx))

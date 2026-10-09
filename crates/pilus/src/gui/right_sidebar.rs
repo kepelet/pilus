@@ -1,0 +1,479 @@
+//! The right sidebar: a column beside the terminal card, toggled with Cmd+B,
+//! holding the Diff review and the Git status and history on two tabs.
+//!
+//! The daemon knows nothing of this column. The window reserves its width from
+//! the card, so the daemon sees a smaller viewport and reflows once when the
+//! column opens, closes, or finishes a drag; the width tween and the drag
+//! resize hold the viewport still until they settle, as the left sidebar's
+//! tween does. This module owns the column's state, its pure sizing rules,
+//! and the chrome (tab strip, resize handle, focus edge, footer). The open
+//! tab's body is drawn by `diff.rs` or `git_tab.rs`, which own their data;
+//! only the open tab polls the daemon.
+
+use std::time::Instant;
+
+use gpui::{Context, Div, MouseButton, MouseDownEvent, Stateful, div, prelude::*, px};
+
+use super::style::{self, FillExt};
+use super::{HEADER_HEIGHT, PilusView, SIDEBAR_ANIM_DURATION, icon, terminal_inset_border};
+
+/// Narrowest the column drags to: the Diff header still fits.
+pub(super) const MIN_WIDTH: f32 = 300.0;
+/// Most of the window the column may take, so the terminal keeps a card.
+const MAX_WINDOW_SHARE: f32 = 0.6;
+/// Width a first open gets.
+pub(super) const DEFAULT_WIDTH: f32 = 440.0;
+/// The draggable strip on the column's leading edge.
+const HANDLE_WIDTH: f32 = 6.0;
+
+/// What the column is showing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum SidebarTab {
+    #[default]
+    Diff,
+    Git,
+}
+
+impl SidebarTab {
+    pub(super) const ALL: [SidebarTab; 2] = [SidebarTab::Diff, SidebarTab::Git];
+
+    pub(super) fn wire(self) -> &'static str {
+        match self {
+            Self::Diff => "diff",
+            Self::Git => "git",
+        }
+    }
+
+    /// The saved tab; anything unrecognized opens the Diff.
+    pub(super) fn from_wire(text: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|tab| tab.wire() == text)
+            .unwrap_or_default()
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Diff => "Diff",
+            Self::Git => "Log",
+        }
+    }
+
+    /// Whether the tab reads the keyboard. Only the Diff has shortcuts, so
+    /// the keys of a column showing Git stay with the terminal.
+    fn takes_keys(self) -> bool {
+        self == Self::Diff
+    }
+}
+
+/// A width tween from the openness the column had to the one it is going to,
+/// so a mid-flight reversal glides instead of jumping.
+struct Tween {
+    started: Instant,
+    from: f32,
+    to: f32,
+}
+
+/// An edge drag in progress.
+#[derive(Clone, Copy)]
+struct Drag {
+    pointer_x: f32,
+    width: f32,
+}
+
+pub(super) struct RightSidebar {
+    pub(super) visible: bool,
+    pub(super) width: f32,
+    pub(super) tab: SidebarTab,
+    /// The keyboard is on the column rather than the terminal.
+    pub(super) focused: bool,
+    tween: Option<Tween>,
+    drag: Option<Drag>,
+}
+
+impl RightSidebar {
+    pub(super) fn new(visible: bool, width: f32, tab: SidebarTab) -> Self {
+        Self {
+            visible,
+            width: if width >= MIN_WIDTH {
+                width
+            } else {
+                DEFAULT_WIDTH
+            },
+            tab,
+            focused: false,
+            tween: None,
+            drag: None,
+        }
+    }
+
+    /// How open the column is, 0 to 1, mid-tween or settled.
+    pub(super) fn openness(&self) -> f32 {
+        match &self.tween {
+            Some(tween) => {
+                let total = SIDEBAR_ANIM_DURATION.as_secs_f32();
+                let step = (tween.started.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
+                (tween.from + (tween.to - tween.from) * style::ease_spring(step)).max(0.0)
+            }
+            None if self.visible => 1.0,
+            None => 0.0,
+        }
+    }
+
+    /// Pixels the column takes from the card right now.
+    pub(super) fn px(&self) -> f32 {
+        self.width * self.openness()
+    }
+
+    /// Whether the daemon should hold its viewport: the column is moving.
+    pub(super) fn moving(&self) -> bool {
+        self.tween.is_some() || self.drag.is_some()
+    }
+
+    /// Advance the tween; true once nothing is in flight.
+    pub(super) fn tick(&mut self) -> bool {
+        let done = self
+            .tween
+            .as_ref()
+            .is_none_or(|tween| tween.started.elapsed() >= SIDEBAR_ANIM_DURATION);
+        if done {
+            self.tween = None;
+        }
+        done
+    }
+
+    /// Show or hide the column. Showing takes the keyboard when the open tab
+    /// reads it; hiding gives it back to the terminal.
+    pub(super) fn toggle(&mut self) {
+        let from = self.openness();
+        self.visible = !self.visible;
+        self.focused = self.visible && self.tab.takes_keys();
+        self.tween = Some(Tween {
+            started: Instant::now(),
+            from,
+            to: if self.visible { 1.0 } else { 0.0 },
+        });
+    }
+
+    /// Switch tabs. Choosing one is working in the column, so the keyboard
+    /// follows when the new tab reads it and returns to the terminal when
+    /// it does not.
+    pub(super) fn select_tab(&mut self, tab: SidebarTab) {
+        self.tab = tab;
+        self.focused = self.visible && tab.takes_keys();
+    }
+
+    fn begin_drag(&mut self, pointer_x: f32) {
+        self.drag = Some(Drag {
+            pointer_x,
+            width: self.width,
+        });
+    }
+
+    /// Follow the pointer; dragging left widens the column.
+    fn drag_to(&mut self, pointer_x: f32, window_w: f32) -> bool {
+        let Some(drag) = self.drag else {
+            return false;
+        };
+        let wanted = drag.width + (drag.pointer_x - pointer_x);
+        let width = clamp_width(wanted, window_w);
+        let changed = (width - self.width).abs() >= 0.5;
+        self.width = width;
+        changed
+    }
+
+    /// End a drag; true when one was in progress, so the width gets saved.
+    fn end_drag(&mut self) -> bool {
+        self.drag.take().is_some()
+    }
+}
+
+/// `wanted` kept between the minimum and the window's share.
+pub(super) fn clamp_width(wanted: f32, window_w: f32) -> f32 {
+    let most = (window_w * MAX_WINDOW_SHARE).max(MIN_WIDTH);
+    wanted.clamp(MIN_WIDTH, most)
+}
+
+impl PilusView {
+    pub(super) fn toggle_right_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.right.toggle();
+        self.settings.right_sidebar_visible = self.right.visible;
+        self.settings.save(&self.pilus_root);
+        if self.right.visible {
+            self.mark_open_tab_stale();
+        }
+        cx.notify();
+    }
+
+    /// Open `tab`, remembering it for the next launch.
+    pub(super) fn select_right_tab(&mut self, tab: SidebarTab, cx: &mut Context<Self>) {
+        if self.right.tab == tab {
+            return;
+        }
+        self.right.select_tab(tab);
+        self.settings.right_sidebar_tab = tab.wire().to_string();
+        self.settings.save(&self.pilus_root);
+        self.mark_open_tab_stale();
+        cx.notify();
+    }
+
+    /// A tab that was off screen has gone without polls, so what it holds is
+    /// old: ask for a fresh read as it comes back.
+    fn mark_open_tab_stale(&mut self) {
+        match self.right.tab {
+            SidebarTab::Diff => self.diff_panel.mark_stale(),
+            SidebarTab::Git => self.git_panel.mark_stale(),
+        }
+    }
+
+    /// Whether the Diff is on screen, so it should poll the daemon.
+    pub(super) fn diff_visible(&self) -> bool {
+        self.right.visible && self.right.tab == SidebarTab::Diff
+    }
+
+    /// Whether Diff holds the keyboard.
+    pub(super) fn diff_focused(&self) -> bool {
+        self.diff_visible() && self.right.focused
+    }
+
+    /// Whether the Git tab is on screen, so it should poll the daemon.
+    pub(super) fn git_visible(&self) -> bool {
+        self.right.visible && self.right.tab == SidebarTab::Git
+    }
+
+    /// The toggle for the tab strip's trailing edge.
+    pub(super) fn right_sidebar_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = self.theme;
+        div()
+            .id("pilus-right-sidebar-toggle")
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .h(px(super::TAB_HEIGHT))
+            .w(px(super::SIDEBAR_TOGGLE_W))
+            .rounded_md()
+            .cursor_pointer()
+            .hover_fill(theme.panel_dim, style::RADIUS_MD)
+            .child(icon(
+                include_bytes!("../../assets/icons/panel-right.svg"),
+                14.0,
+                if self.right.visible {
+                    theme.panel_fg
+                } else {
+                    theme.muted
+                },
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx)))
+    }
+
+    /// The column: a tab strip over the open tab and its footer, with a drag
+    /// handle on its leading edge.
+    pub(super) fn right_sidebar_view(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let width = self.right.px();
+        let focused = self.right.focused;
+
+        let strip = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(HEADER_HEIGHT))
+            .flex_shrink_0()
+            .px_3()
+            .children(SidebarTab::ALL.map(|tab| {
+                style::tab(
+                    format!("pilus-right-tab-{}", tab.wire()),
+                    tab.label(),
+                    self.right.tab == tab,
+                    theme,
+                    fonts.body,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.select_right_tab(tab, cx)))
+            }))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("pilus-right-sidebar-close")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(style::scaled(&self.shared_settings, 24.0)))
+                    .h(px(style::scaled(&self.shared_settings, 24.0)))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover_fill(theme.panel_dim, style::RADIUS_MD)
+                    .child(icon(
+                        include_bytes!("../../assets/icons/x.svg"),
+                        12.0,
+                        theme.muted,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx))),
+            );
+
+        let body = div()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(match self.right.tab {
+                SidebarTab::Diff => self.diff_page(self.right.width, cx),
+                SidebarTab::Git => self.git_page(cx),
+            });
+        let footer = match self.right.tab {
+            SidebarTab::Diff => self.diff_footer(cx),
+            SidebarTab::Git => None,
+        };
+
+        let handle = div()
+            .id("pilus-right-sidebar-handle")
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .w(px(HANDLE_WIDTH))
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.right.begin_drag(f32::from(event.position.x));
+                    cx.stop_propagation();
+                }),
+            );
+
+        div()
+            .id("pilus-right-sidebar")
+            .absolute()
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .w(px(width))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(self.chrome_fill())
+            .border_l_1()
+            // Focus is the one edge accent earns here: it says which side
+            // of the window the keyboard is on.
+            .border_color(if focused {
+                theme.accent.opacity(0.55)
+            } else {
+                terminal_inset_border()
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    if !this.right.focused && this.right.tab.takes_keys() {
+                        this.right.focused = true;
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(strip)
+            .child(body)
+            .children(footer)
+            .child(handle)
+    }
+
+    /// Track an edge drag across the whole window.
+    pub(super) fn right_sidebar_drag_move(
+        &mut self,
+        x: f32,
+        window_w: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if self.right.drag_to(x, window_w) {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn right_sidebar_drag_end(&mut self, cx: &mut Context<Self>) {
+        if self.right.end_drag() {
+            self.settings.right_sidebar_width = self.right.width;
+            self.settings.save(&self.pilus_root);
+            cx.notify();
+        }
+    }
+}
+
+/// Shot-harness entry point: put the column on `tab`.
+#[cfg(feature = "visual-test")]
+impl PilusView {
+    pub(super) fn right_show_tab(&mut self, tab: SidebarTab, cx: &mut Context<Self>) {
+        self.right.visible = true;
+        self.right.select_tab(tab);
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn width_stays_between_the_minimum_and_the_window_share() {
+        assert_eq!(clamp_width(100.0, 1400.0), MIN_WIDTH);
+        assert_eq!(clamp_width(500.0, 1400.0), 500.0);
+        assert!((clamp_width(2000.0, 1400.0) - 840.0).abs() < 0.01);
+        // A window narrower than the minimum still gets the minimum.
+        assert_eq!(clamp_width(400.0, 400.0), MIN_WIDTH);
+    }
+
+    #[test]
+    fn saved_width_below_the_minimum_falls_back() {
+        let diff = SidebarTab::Diff;
+        assert_eq!(RightSidebar::new(false, 0.0, diff).width, DEFAULT_WIDTH);
+        assert_eq!(RightSidebar::new(true, 520.0, diff).width, 520.0);
+    }
+
+    #[test]
+    fn toggle_moves_toward_the_new_state_and_takes_focus() {
+        let mut side = RightSidebar::new(false, 400.0, SidebarTab::Diff);
+        assert_eq!(side.openness(), 0.0);
+        side.toggle();
+        assert!(side.visible && side.focused && side.moving());
+        side.toggle();
+        assert!(!side.visible && !side.focused);
+    }
+
+    #[test]
+    fn dragging_left_widens_and_release_reports_the_drag() {
+        let mut side = RightSidebar::new(true, 400.0, SidebarTab::Diff);
+        assert!(!side.drag_to(500.0, 1400.0), "no drag, no change");
+        side.begin_drag(1000.0);
+        assert!(side.moving());
+        assert!(side.drag_to(900.0, 1400.0));
+        assert_eq!(side.width, 500.0);
+        side.drag_to(0.0, 1400.0);
+        assert!((side.width - 840.0).abs() < 0.01);
+        assert!(side.end_drag());
+        assert!(!side.end_drag());
+    }
+
+    #[test]
+    fn saved_tab_falls_back_to_the_diff() {
+        assert_eq!(SidebarTab::from_wire("git"), SidebarTab::Git);
+        assert_eq!(SidebarTab::from_wire("diff"), SidebarTab::Diff);
+        assert_eq!(SidebarTab::from_wire(""), SidebarTab::Diff);
+        assert_eq!(SidebarTab::from_wire("terminal"), SidebarTab::Diff);
+        for tab in SidebarTab::ALL {
+            assert_eq!(SidebarTab::from_wire(tab.wire()), tab);
+        }
+    }
+
+    #[test]
+    fn only_the_diff_takes_the_keyboard() {
+        let mut side = RightSidebar::new(false, 400.0, SidebarTab::Git);
+        side.toggle();
+        assert!(side.visible && !side.focused, "Git has no shortcuts");
+        side.select_tab(SidebarTab::Diff);
+        assert!(side.focused);
+        side.select_tab(SidebarTab::Git);
+        assert!(!side.focused, "the keys go back to the terminal");
+        // A hidden column never holds the keyboard, whichever tab it names.
+        side.toggle();
+        side.select_tab(SidebarTab::Diff);
+        assert!(!side.visible && !side.focused);
+    }
+}

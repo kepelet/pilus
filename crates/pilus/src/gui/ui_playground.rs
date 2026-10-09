@@ -479,32 +479,17 @@ impl UiPlaygroundView {
 
     /// One working tab pill.
     fn tab(&self, index: usize, label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let active = self.tab == index;
-        let fg = if active { theme.panel_fg } else { theme.muted };
-        div()
-            .id(format!("pg-tab-{index}"))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .h(px(26.0))
-            .px_3()
-            .rounded_md()
-            .text_color(fg)
-            .text_size(px(self.fonts().body))
-            .cursor_pointer()
-            .state_fill(
-                if active { theme.panel } else { theme.window_bg },
-                theme.panel,
-                style::RADIUS_MD,
-            )
-            .hover(move |style| style.text_color(theme.panel_fg))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.tab = index;
-                this.note(format!("{label} tab selected"), cx);
-            }))
-            .child(label)
+        style::tab(
+            format!("pg-tab-{index}"),
+            label,
+            self.tab == index,
+            self.theme,
+            self.fonts().body,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.tab = index;
+            this.note(format!("{label} tab selected"), cx);
+        }))
     }
 
     /// A working on/off switch.

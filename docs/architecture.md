@@ -351,6 +351,84 @@ the snapshot carries no session ids. Automations open a detail pane from
 `automation.get`/`history`/`preview` with run and pause controls. Dismissing
 a resumable session has no daemon API, so it is hidden on this client only.
 
+**Right sidebar.** Cmd+B (View → Toggle Right Sidebar, or the panel button at
+the tab strip's far edge) opens a column beside the terminal card holding two
+tabs, Diff and Log (`gui/right_sidebar.rs`). The daemon knows nothing of it: the
+window reserves the column's width from the card, so the daemon sees a smaller
+viewport and reflows once when the column opens, closes, or finishes a drag.
+The width tween and the edge drag hold the viewport still until they settle,
+as the left sidebar's tween does. Opening takes the keyboard
+(`RightSidebar::focused`); a press on the terminal or Esc in the column hands
+it back, and the focused column draws the one accent edge. Only the Diff
+reads keys, so choosing the Log tab hands the keyboard back to the terminal.
+Visibility, width, and the open tab persist in `settings.json`. The column is a
+tab strip, the open tab, and (on the Diff) a footer. Only the open tab polls
+the daemon; a tab that comes back on screen asks for a fresh read.
+
+**Diff.** A native, read-only review (`gui/diff.rs`, with its layout and
+navigation rules in `gui/diff_model.rs`) over the daemon's `diff.*` methods.
+The daemon owns the Git scan, the bounded patch parser, and the notes, and
+answers for its active workspace, so the review follows the sidebar selection.
+It polls `diff.list` and `diff.note.list` every 1.5 seconds on a background
+thread while the column is open, fetches the selected file with `diff.get`
+(`include_patch`) only when that file's fingerprint changes, and folds the patch
+into source rows (hunk headers and lines) that the cursor and note anchors
+address; Split and Stack are two layouts of the same rows. Auto splits only
+while each side keeps about 56 columns, so the column normally stacks.
+
+The header has two rows: what the review holds (branch, files changed, open
+notes, with Refresh and the file filter), then the open file's folder and name
+and the layout button. Below it the file list sits above the patch, separated
+by a divider that drags vertically; its height is kept in `settings.json`. A
+bar over the patch carries the change counts, a *Viewed* checkbox, and an
+icon-only comment button. The footer shows the open file's path and, while
+there are open notes, *Send to agent (n)*. If the column is dragged wide
+enough (640px), the list moves beside the patch instead.
+
+Hovering a line's number shows a `+` that opens the comment form on that line
+(shift extends from the cursor's line); the comment icon, `n`, and Edit open it
+too. Opening the form scrolls it into view over two frames, because a row just
+inserted into the list has no measured height until it has been laid out once.
+
+The rows sit in a virtualized variable-height `list`, so a long line wraps
+inside its pane. Notes are written, edited, resolved, deleted, and handed to a
+live agent (`diff.note.send`) through UHP calls that never touch the checkout.
+The daemon has no method for the viewed flag, so Viewed is client state keyed
+by the file's fingerprint.
+
+**Log.** The Log tab, the repository's history (`gui/git_tab.rs`; data in `pilus-client`'s
+`git_status.rs` and `commit.rs`) is two panes with a divider that drags
+vertically (its height is kept in `settings.json`): the commit list on top,
+and what the picked commit changed below. What is changed but not yet
+committed is the Diff tab's, so the Log tab does not repeat it.
+
+The header names the branch with `↑ahead ↓behind` against its upstream and the
+stash count. The list is the newest 50 commits (subject, up to two branch or
+tag labels with the checked-out branch emphasised, hash, author, age), with
+*Show more* adding 50 while the last read filled the page. The picked commit
+is the panel pill, and the newest is picked when nothing is. The detail shows
+the commit's message, author, date, and totals, then each file's hunks in a
+virtualized list that reuses the Diff's gutters and line washes, read-only and
+stacked. Each file's header is a chevron that folds the file down to that header
+and opens it again; the rows are laid out again with the file's patch left out,
+and the next commit opens with every file expanded.
+
+The history comes from the daemon: a background thread polls `git.status` and
+`git.log` every 2 seconds while the tab is open, and the tab redraws only when
+the answer changed. The daemon has no call for what a commit changed (its
+`diff.*` methods describe the working tree), so a click runs `git show`
+through `pilus_client::show_commit`, off the GUI thread, in the repository
+`diff.list` reports and on the active machine: here, or over its saved SSH
+target, where every argument is quoted for the remote shell. A machine reached
+any other way says commit contents are unavailable. The read is bounded (2 MiB
+of output, 4000 changed lines, 2000 characters a line) and marks the commit
+truncated past that; a merge shows its changes against the first parent; the
+hash is checked to be hexadecimal before it reaches Git. A pick the new
+history no longer holds (another workspace) is dropped for the newest commit
+of the new one. A repository with no commits yet shows an empty list: a failed
+log read counts as an empty history. Nothing here stages, commits, or checks
+anything out.
+
 **Right-click menus.** WORKSPACES and AGENTS rows carry the daemon's native
 context menus, drawn by a floating GPUI panel mirroring the daemon's own menu
 structure: close, rename, pin, path visibility, and copy path/branch for
@@ -732,8 +810,13 @@ keep working):
 
 - **view**: the read-only subset of what the gateway allows (lists, status,
   snapshots, reads; anything the classifier has not heard of counts as a write).
-- **control**: exactly the gateway token's `allowed_methods`. Prompt and
-  interrupt agents, retry tasks, focus things.
+- **control**: the gateway token's `allowed_methods`, plus the diff review
+  writes the gateway refuses (`diff.refresh` and `diff.note.add`, `edit`,
+  `resolve`, `reopen`, `remove`, `send`), which the hub runs itself through the
+  owner socket. Prompt and interrupt agents, retry tasks, focus things, and
+  review a diff. None of the review calls runs code: a note is plain text in
+  the daemon's store, and `diff.note.send` types into an agent pane the way
+  `agent.prompt` already does.
 - **operate**: control, plus `task.add`, `task.start`, `agent.start` and
   `workspace.open`. The gateway refuses these, so the hub runs them itself: on
   this machine through Luvus's owner socket, on a saved machine through
@@ -757,6 +840,26 @@ gateway allowlist **fails closed** at every level. Methods that stream or block
 (`events.subscribe`, `wait.*`, `terminal.backend.observe`, …) are refused at
 every level, because a stream carries one request and one reply, with one
 exception the hub makes itself.
+
+**Diff review on the phone.** The daemon's gateway carries only the three
+read calls (`diff.list`, `diff.get`, `diff.note.list`), so every device sees
+the diff and `control` and `operate` devices can also write and send notes.
+The iOS app learns which from the `allowed_methods` the hub rewrites into
+`uhp.capabilities`: `AppStore.canViewDiff` shows the review button on an
+agent's screen, and `canReviewDiff` turns on tap-to-comment, resolve, edit,
+delete, and *Send to agent*. `DiffReviewView` is a native SwiftUI list of the
+changed files by layer and a per-file patch (a virtualized `LazyVStack`, long
+lines wrapping) that decodes the daemon's replies leniently, so an unknown
+layer or note kind never fails a list. A first tap on a line anchors a note
+and a second extends it on one side (deletions anchor to the old file,
+everything else to the new one); notes hang under their last line, and notes
+whose code moved show detached at the end. Like the desktop tab, the review
+follows the workspace the daemon has active, so when the agent's folder is not
+under the reviewed repo the screen says so and offers *Show this agent's
+workspace*, which runs `workspace.focus` (the Mac's own window follows, which
+is why it is a button). The screen re-reads every five seconds while it is up.
+Sending lists the machine's live agents, the one the review was opened from
+first, and covers one note, one file's open notes, or all open notes.
 
 `hub.folders` (operate only) lists the child folders of a path on a machine (`~` by
 default), marking git repositories, so a phone can choose a workspace to open with

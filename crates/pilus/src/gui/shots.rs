@@ -596,6 +596,64 @@ pub fn run() -> Result<()> {
         });
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "orchestration-folded")?;
+        // The Diff page on a canned review: stacked and split layouts, a
+        // note being written, and the agent picker.
+        cx.update(|app| view.update(app, |view, cx| view.diff_show_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-auto")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.diff_show_mode(super::diff_model::LayoutMode::Split, cx)
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-split")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.diff_show_mode(super::diff_model::LayoutMode::Stack, cx)
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-stack")?;
+        // The pointer over a line number reveals the add-comment button.
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_mouse_move(point(px(815.0), px(368.0)), cx);
+        })
+        .ok();
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-hover")?;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_mouse_move(point(px(300.0), px(600.0)), cx);
+        })
+        .ok();
+        cx.update(|app| view.update(app, |view, cx| view.diff_show_menu(false, cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-menu-layout")?;
+        cx.update(|app| view.update(app, |view, cx| view.diff_show_menu(true, cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-menu-filter")?;
+        cx.update(|app| view.update(app, |view, cx| view.diff_close_menu(cx)));
+        cx.update(|app| view.update(app, |view, cx| view.diff_show_composer(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-compose")?;
+        cx.update(|app| view.update(app, |view, cx| view.diff_show_send(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-send")?;
+        // The Git tab on a canned repository: a commit picked, with its
+        // changes below the list.
+        cx.update(|app| view.update(app, |view, cx| view.git_show_sample(Some("3e1a128"), cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "git-tab")?;
+        // The first file folded down to its header.
+        cx.update(|app| view.update(app, |view, cx| view.git_toggle_file_sample(0, cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "git-tab-collapsed")?;
+        // Later pages show the sidebar too; give it back to the Diff.
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.right_show_tab(super::right_sidebar::SidebarTab::Diff, cx)
+            })
+        });
         // Mission Control on a canned dashboard: the roster with a blocked
         // agent selected and its reply field.
         cx.update(|app| {

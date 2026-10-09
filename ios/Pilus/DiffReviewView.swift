@@ -149,6 +149,13 @@ final class DiffReviewModel {
     /// changes. The Mac's own window follows, which is why it is a button and
     /// not something the review does on its own.
     func showAgentWorkspace() async {
+        await focusAgentWorkspace()
+        await load(rescan: true)
+    }
+
+    /// Just the focus half of `showAgentWorkspace`: the open path calls this
+    /// before the first load so a mismatched review never renders.
+    private func focusAgentWorkspace() async {
         guard let id = agent?.workspace_id else { return }
         busy = true
         defer { busy = false }
@@ -158,7 +165,6 @@ final class DiffReviewModel {
                 params: ["workspace_id": id],
                 machine: machine
             )
-            await load(rescan: true)
         } catch {
             self.error = error.localizedDescription
         }
@@ -240,6 +246,7 @@ struct DiffReviewView: View {
                                 DiffFileView(model: model, file: file)
                             } label: {
                                 DiffFileLabel(file: file)
+                                    .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
                             }
                         }
                     }
@@ -254,16 +261,21 @@ struct DiffReviewView: View {
         .overlay {
             if !model.loaded { ProgressView() }
         }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                if model.canWrite && !model.openNotes.isEmpty {
-                    Button {
-                        sending = true
-                    } label: {
-                        Label("Send \(model.openNotes.count)", systemImage: "paperplane")
-                    }
+        .safeAreaInset(edge: .bottom) {
+            if model.canWrite && !model.openNotes.isEmpty {
+                Button { sending = true } label: {
+                    Text("Send to agent")
+                        .font(.title3.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .foregroundStyle(.white)
                 }
+                .modifier(LiquidGlassPanel(radius: 28, prominent: true))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 6)
             }
+        }
+        .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     Task { await model.load(rescan: true) }
@@ -279,7 +291,10 @@ struct DiffReviewView: View {
         }
         .refreshable { await model.load(rescan: true) }
         .task {
-            await model.load(rescan: true)
+            // The sheet is this agent's diff: focus its workspace first so
+            // the first load already shows its review — no wrong-folder
+            // flash, no second fetch.
+            await model.showAgentWorkspace()
             // The Mac's files change while an agent works; stay current.
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
@@ -352,6 +367,7 @@ struct DiffFileView: View {
     @State private var selection: LineSelection?
     @State private var composing: NoteDraft?
     @State private var sending: DiffNote?
+    @State private var sendingFile = false
     @State private var confirmDelete: DiffNote?
 
     var body: some View {
@@ -396,6 +412,19 @@ struct DiffFileView: View {
         }
         .safeAreaInset(edge: .bottom) {
             selectionBar
+        }
+        .toolbar {
+            if model.canWrite && model.notes(for: file).contains(where: \.isOpen) {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { sendingFile = true } label: {
+                        Image(systemName: "paperplane")
+                    }
+                    .accessibilityLabel("Send to agent")
+                }
+            }
+        }
+        .sheet(isPresented: $sendingFile) {
+            SendNotesSheet(model: model, scope: .file, note: nil, file: file)
         }
         .sheet(item: $composing) { draft in
             NoteComposerSheet(draft: draft) { kind, body in
@@ -450,13 +479,6 @@ struct DiffFileView: View {
             }
             .padding()
             .background(.bar)
-        } else if model.canWrite && !rows.isEmpty {
-            Text("Tap a line to comment. Tap a second line to select a range.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(.bar)
         }
     }
 

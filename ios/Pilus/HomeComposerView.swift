@@ -147,14 +147,19 @@ struct HomeComposerView: View {
         Menu {
             ForEach(store.workspaces) { workspace in
                 Button { workspaceID = workspace.workspace_id } label: {
-                    Label(spansMachines
-                          ? "\(workspace.title) · \(store.machineTitle(workspace.machine))"
-                          : workspace.title,
-                          systemImage: workspaceID == workspace.workspace_id ? "checkmark" : "folder")
+                    Label {
+                        Text(spansMachines
+                             ? "\(workspace.title) · \(store.machineTitle(workspace.machine))"
+                             : workspace.title)
+                    } icon: {
+                        if workspaceID == workspace.workspace_id {
+                            Image(systemName: "checkmark")
+                        }
+                    }
                 }
             }
         } label: {
-            pickerLabel(currentWorkspace?.title ?? "workspace", systemImage: "folder")
+            pickerLabel(currentWorkspace?.title ?? "workspace")
         }
     }
 

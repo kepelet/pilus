@@ -142,11 +142,12 @@ private struct ManualPairSheet: View {
                             Text("Connect")
                         }
                     }
+                    .font(.title3.weight(.semibold))
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
+                    .padding(.vertical, 14)
                     .foregroundStyle(.white)
                 }
-                .modifier(LiquidGlassPanel(radius: 26, prominent: true))
+                .modifier(LiquidGlassPanel(radius: 28, prominent: true))
                 .disabled(ticket.isEmpty || code.isEmpty || store.busy)
                 .padding(.horizontal, 20)
                 .padding(.bottom, 8)

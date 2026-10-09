@@ -71,7 +71,10 @@ struct AgentDetailView: View {
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                     if sending {
+                        // The send button's footprint, held so the capsule
+                        // does not collapse while the spinner swaps in.
                         ProgressView()
+                            .frame(width: 29, height: 29)
                     } else {
                         Button {
                             log.info("send tapped")

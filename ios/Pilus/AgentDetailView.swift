@@ -15,6 +15,7 @@ struct AgentDetailView: View {
     @State private var sendError: String?
     @State private var sending = false
     @State private var showingInfo = false
+    @State private var showingDiff = false
     /// The shortcut strip starts folded — it shares the composer row's width.
     @State private var shortcutsExpanded = false
     /// Owned here so the keyboard-down shortcut can resign the field.
@@ -128,6 +129,17 @@ struct AgentDetailView: View {
                 }
                 .buttonStyle(.plain)
             }
+            // The Mac's changed files, with notes to hand back to an agent.
+            // Only offered when the connector lets this device read a diff.
+            ToolbarItem(placement: .topBarTrailing) {
+                if store.canViewDiff {
+                    Button { showingDiff = true } label: {
+                        Image(systemName: "plusminus")
+                    }
+                    .tint(.primary)
+                    .accessibilityLabel("Review changes")
+                }
+            }
             // The full record lives behind ⋯ — title, kind, status, and cwd
             // render unclipped in a sheet.
             ToolbarItem(placement: .topBarTrailing) {
@@ -140,6 +152,9 @@ struct AgentDetailView: View {
         }
         .sheet(isPresented: $showingInfo) {
             AgentInfoSheet(agent: agent, detail: detail)
+        }
+        .sheet(isPresented: $showingDiff) {
+            DiffReviewSheet(agent: agent)
         }
         // Poll the pane while the view is up — pane.read is cheap and the
         // screen changes under us.

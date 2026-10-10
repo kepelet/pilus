@@ -30,6 +30,10 @@
 //! (see [`crate::watch`]). Luvus's own `server.agent_manifests` lists every
 //! agent it knows how to launch; the question a picker has is which are installed
 //! on that machine, which the window answers by probing, and so does the hub.
+//!
+//! `hub.run` takes an optional `idempotency_key`. A phone whose reply was lost
+//! cannot tell whether the agent started, and resending would start a second
+//! one; the same key within [`REPLAY_TTL`] returns the first outcome instead.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -40,7 +44,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use pilus_client::{ControlClient, Error as ClientError, MachineInfo, api_socket_path_for};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OnceCell, Semaphore, mpsc};
 
 use crate::enroll::{AuthState, Level};
 use crate::supervisor::GatewayLink;
@@ -158,6 +162,14 @@ const CATALOG_TTL: Duration = Duration::from_secs(10);
 /// several machines must not be able to exhaust either.
 const SSH_PARALLELISM: usize = 6;
 
+/// How long a keyed `hub.run` outcome is replayed. Long enough to outlast a
+/// phone reconnecting after a dropped reply, short enough that the map stays
+/// small.
+const REPLAY_TTL: Duration = Duration::from_secs(600);
+
+/// The longest `idempotency_key` accepted, matching the daemon's own limit.
+const REPLAY_KEY_MAX: usize = 128;
+
 /// How long an installed-agent probe is trusted. It can run `codex` and
 /// `opencode`, which is seconds of work for a list that changes on install.
 const AGENTS_TTL: Duration = Duration::from_secs(60);
@@ -168,6 +180,41 @@ type Catalog = Option<(Instant, Vec<MachineInfo>)>;
 /// Installed-agent probes by machine id, kept as configs so both the picker
 /// (`hub.agents`) and the launcher (`hub.run`) share one probe.
 type AgentCache = HashMap<String, (Instant, Vec<pilus_client::agents::AgentConfig>)>;
+
+/// Outcomes of keyed requests, so a retry with the same key shares the first
+/// attempt's result instead of running the work again.
+///
+/// Each key owns a [`OnceCell`], so a retry that arrives while the first
+/// attempt is still running waits for it rather than racing it. Failures are
+/// forgotten: a request that did not run may be tried again under its key.
+#[derive(Default)]
+struct Replays {
+    cells: Mutex<HashMap<String, (Instant, Arc<OnceCell<Result<Value, Value>>>)>>,
+}
+
+impl Replays {
+    async fn once(
+        &self,
+        key: String,
+        work: impl Future<Output = Result<Value, Value>>,
+    ) -> Result<Value, Value> {
+        let cell = {
+            let mut cells = lock(&self.cells);
+            cells.retain(|_, (at, _)| at.elapsed() < REPLAY_TTL);
+            Arc::clone(
+                &cells
+                    .entry(key.clone())
+                    .or_insert_with(|| (Instant::now(), Arc::default()))
+                    .1,
+            )
+        };
+        let outcome = cell.get_or_init(|| work).await.clone();
+        if outcome.is_err() {
+            lock(&self.cells).remove(&key);
+        }
+        outcome
+    }
+}
 
 /// The hub's shared state.
 #[derive(Clone)]
@@ -181,6 +228,7 @@ pub struct Hub {
     installed: Arc<Mutex<AgentCache>>,
     ssh: Arc<Semaphore>,
     watchers: Arc<Slots>,
+    replays: Arc<Replays>,
 }
 
 impl std::fmt::Debug for Hub {
@@ -211,6 +259,7 @@ impl Hub {
             installed: Arc::default(),
             ssh: Arc::new(Semaphore::new(SSH_PARALLELISM)),
             watchers: Arc::default(),
+            replays: Arc::default(),
         }
     }
 
@@ -245,7 +294,7 @@ impl Hub {
                     match method {
                         "hub.agents" => self.agents(machine).await,
                         "hub.folders" => self.folders(machine, &params).await,
-                        _ => self.run(machine, &params).await,
+                        _ => self.run_once(device, machine, &params).await,
                     }
                 };
                 tokio::time::timeout(CALL_TIMEOUT, work)
@@ -595,6 +644,29 @@ impl Hub {
             }
         });
         Ok(rx)
+    }
+
+    /// [`Hub::run`], once per `idempotency_key` for this device and machine.
+    async fn run_once(&self, device: &str, machine: &str, params: &Value) -> Result<Value, Value> {
+        let key = params
+            .get("idempotency_key")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty());
+        let Some(key) = key else {
+            return self.run(machine, params).await;
+        };
+        if key.len() > REPLAY_KEY_MAX {
+            return Err(failure(
+                "bad_request",
+                "`idempotency_key` is longer than 128 bytes",
+            ));
+        }
+        self.replays
+            .once(
+                format!("{device}\u{1f}{machine}\u{1f}{key}"),
+                self.run(machine, params),
+            )
+            .await
     }
 
     /// Start `params.agent` in a workspace and give it `params.prompt`, or give the
@@ -1217,6 +1289,59 @@ mod tests {
             )
             .await;
         assert_eq!(unknown["error"]["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn a_keyed_outcome_is_shared_and_a_failure_is_forgotten() {
+        let replays = Replays::default();
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let work = |outcome: Result<Value, Value>| {
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { outcome }
+        };
+        let first = replays
+            .once("k".into(), work(Ok(json!({ "pane": "7" }))))
+            .await;
+        let again = replays
+            .once("k".into(), work(Ok(json!({ "pane": "8" }))))
+            .await;
+        assert_eq!(first, Ok(json!({ "pane": "7" })));
+        assert_eq!(again, first, "the retry replays the first answer");
+
+        let other = replays
+            .once("other".into(), work(Ok(json!({ "pane": "9" }))))
+            .await;
+        assert_eq!(other, Ok(json!({ "pane": "9" })), "keys are independent");
+
+        let failed = replays
+            .once("f".into(), work(Err(failure("timeout", "slow"))))
+            .await;
+        assert!(failed.is_err());
+        let retried = replays
+            .once("f".into(), work(Ok(json!({ "pane": "1" }))))
+            .await;
+        assert_eq!(
+            retried,
+            Ok(json!({ "pane": "1" })),
+            "a failure may be tried again"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overlong_idempotency_key_is_refused() {
+        let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
+        let params = json!({
+            "agent": "pi", "prompt": "hi", "path": "/tmp",
+            "idempotency_key": "k".repeat(REPLAY_KEY_MAX + 1),
+        });
+        let refused = hub
+            .handle(
+                &json!({ "id": "r", "method": "hub.run", "params": params }),
+                Level::Operate,
+                "t",
+            )
+            .await;
+        assert_eq!(refused["error"]["code"], "bad_request");
     }
 
     #[test]

@@ -114,6 +114,9 @@ struct DiffNote: Decodable, Identifiable, Hashable {
 
 struct DiffNotesReply: Decodable {
     let notes: [DiffNote]
+    /// The daemon's state revision when the list was read — what an
+    /// `if_revision` on a note edit or delete is checked against.
+    let revision: Int?
 }
 
 struct DiffNoteReply: Decodable {

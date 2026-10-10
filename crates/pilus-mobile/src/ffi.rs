@@ -29,11 +29,22 @@ pub struct PilusClient {
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_ERROR_DETAIL: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 fn record(error: Error) -> *mut c_char {
     LAST_ERROR.with(|slot| {
         *slot.borrow_mut() = CString::new(error.to_string()).ok();
+    });
+    // The structured form lets Swift branch on the daemon's code instead of
+    // matching message text.
+    let detail = serde_json::json!({
+        "code": error.code(),
+        "message": error.to_string(),
+        "dispatch": error.dispatch(),
+    });
+    LAST_ERROR_DETAIL.with(|slot| {
+        *slot.borrow_mut() = CString::new(detail.to_string()).ok();
     });
     ptr::null_mut()
 }
@@ -338,6 +349,26 @@ pub extern "C" fn pilus_last_error() -> *mut c_char {
             return ptr::null_mut();
         };
         match CString::new(message.as_bytes()) {
+            Ok(copy) => copy.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    })
+}
+
+/// The last error on this thread as `{"code","message","dispatch"}` JSON, as a
+/// new string. `code` is the daemon's own (`revision_conflict`,
+/// `agent_not_ready`, …) or one of `transport`, `timeout`, `unconfirmed`,
+/// `not_enrolled`, … for failures that never reached it. `unconfirmed` means a
+/// write may have been applied. `NULL` when no call has failed. Free with
+/// `pilus_string_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pilus_last_error_detail() -> *mut c_char {
+    LAST_ERROR_DETAIL.with(|slot| {
+        let slot = slot.borrow();
+        let Some(detail) = slot.as_ref() else {
+            return ptr::null_mut();
+        };
+        match CString::new(detail.as_bytes()) {
             Ok(copy) => copy.into_raw(),
             Err(_) => ptr::null_mut(),
         }

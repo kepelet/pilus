@@ -32,6 +32,10 @@ final class DiffReviewModel {
     var error: String?
     /// The last write's outcome, shown until the next action.
     var status: String?
+    /// The daemon's revision when the notes were last read, sent as
+    /// `if_revision` on an edit or delete so one made from a stale view is
+    /// checked instead of silently overwriting the host's newer note.
+    private var notesRevision: Int?
 
     private let store: AppStore
 
@@ -76,6 +80,7 @@ final class DiffReviewModel {
             files = list.files
             let noted: DiffNotesReply = try await store.call(method: "diff.note.list", machine: machine)
             notes = noted.notes
+            notesRevision = noted.revision
         } catch {
             self.error = error.localizedDescription
         }
@@ -104,7 +109,7 @@ final class DiffReviewModel {
     }
 
     func editNote(_ note: DiffNote, body: String) async -> Bool {
-        await write("Note saved", method: "diff.note.edit", params: ["id": note.id, "body": body])
+        await write("Note saved", method: "diff.note.edit", params: ["id": note.id, "body": body], guarding: note)
     }
 
     func setResolved(_ note: DiffNote, _ resolved: Bool) async {
@@ -116,7 +121,7 @@ final class DiffReviewModel {
     }
 
     func delete(_ note: DiffNote) async {
-        _ = await write("Note deleted", method: "diff.note.remove", params: ["id": note.id])
+        _ = await write("Note deleted", method: "diff.note.remove", params: ["id": note.id], guarding: note)
     }
 
     /// Hand notes to a live agent as one grouped message. Sending never
@@ -171,15 +176,50 @@ final class DiffReviewModel {
     }
 
     /// Run a note write, then reload so the screen shows the daemon's truth.
-    private func write(_ done: String, method: String, params: [String: Any]) async -> Bool {
+    ///
+    /// `guarding` names the note an edit or delete was made from. The write
+    /// carries the revision the notes were read at; if anything changed on the
+    /// host since, the daemon refuses with `revision_conflict` before running
+    /// it. Most changes are unrelated (the revision moves with every event), so
+    /// the notes are reloaded and the write goes again, with a new request,
+    /// only when this note is still as the user saw it. A note that changed
+    /// under the user is shown to them instead of being overwritten.
+    ///
+    /// A write whose reply was lost is never resent: the reload shows whether
+    /// it landed.
+    private func write(
+        _ done: String,
+        method: String,
+        params: [String: Any],
+        guarding note: DiffNote? = nil
+    ) async -> Bool {
         status = nil
+        var params = params
+        if note != nil, let notesRevision { params["if_revision"] = notesRevision }
         do {
-            let _: EmptyReply = try await store.call(method: method, params: params, machine: machine)
+            do {
+                let _: EmptyReply = try await store.call(method: method, params: params, machine: machine)
+            } catch let conflict as PilusError where conflict.isRevisionConflict {
+                guard let note else { throw conflict }
+                await load()
+                guard let current = notes.first(where: { $0.id == note.id }) else {
+                    // Gone already: a delete has nothing left to do.
+                    status = method == "diff.note.remove" ? "Note was already deleted" : "That note no longer exists"
+                    return method == "diff.note.remove"
+                }
+                guard current.body == note.body, current.state == note.state else {
+                    status = "That note changed on the host and was reloaded. Review it and try again."
+                    return false
+                }
+                params["if_revision"] = notesRevision
+                let _: EmptyReply = try await store.call(method: method, params: params, machine: machine)
+            }
             status = done
             await load()
             return true
         } catch {
             status = error.localizedDescription
+            if let lost = error as? PilusError, lost.isUnconfirmed { await load() }
             return false
         }
     }

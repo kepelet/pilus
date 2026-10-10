@@ -48,6 +48,10 @@ struct Agent: Decodable, Identifiable, Hashable {
     /// Which hub machine the pane lives on, stamped client-side after decode.
     /// Pane ids are only unique per daemon, so the identity tags it too.
     var machine = "local"
+    /// The PTY this row described. A pane id can outlive its terminal, so
+    /// writes carry this and the daemon refuses a replaced one instead of
+    /// typing into whatever now sits in the pane.
+    var terminal_id: String?
 
     var id: String { "\(machine):\(pane)" }
     /// The session's own title when the agent reports one, else the pane's
@@ -88,7 +92,7 @@ extension Workspace {
 extension Agent {
     private enum CodingKeys: String, CodingKey {
         case pane, agent, name, agent_session_title, status
-        case workspace_id, workspace_name, cwd, branch, focused, machine
+        case workspace_id, workspace_name, cwd, branch, focused, machine, terminal_id
     }
 
     init(from decoder: Decoder) throws {
@@ -104,6 +108,7 @@ extension Agent {
         branch = try c.decodeIfPresent(String.self, forKey: .branch)
         focused = try c.decodeIfPresent(Bool.self, forKey: .focused)
         machine = try c.decodeIfPresent(String.self, forKey: .machine) ?? "local"
+        terminal_id = try c.decodeIfPresent(String.self, forKey: .terminal_id)
     }
 }
 
@@ -290,6 +295,9 @@ struct Capabilities: Decodable {
         let allowed_methods: [String]?
     }
     let access: Access?
+    /// What the daemon itself implements — the server catalog, not what this
+    /// device may call. A saved SSH machine can run an older Luvus.
+    let methods: [String]?
 }
 
 /// Write-method replies (`{"type":"ok","revision":…}`) whose body we ignore.

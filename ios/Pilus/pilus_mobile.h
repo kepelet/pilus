@@ -50,6 +50,11 @@ void pilus_client_free(PilusClient *client);
 /* A fresh copy of this thread's last error message, or NULL. */
 char *pilus_last_error(void);
 
+/* The last error as {"code","message","dispatch"} JSON, or NULL. `code` is the
+   daemon's own (revision_conflict, agent_not_ready, ...) or transport, timeout,
+   unconfirmed (a write that may have been applied), not_enrolled, ... */
+char *pilus_last_error_detail(void);
+
 void pilus_string_free(char *string);
 
 #endif /* pilus_mobile_h */

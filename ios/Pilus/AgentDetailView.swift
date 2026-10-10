@@ -34,6 +34,8 @@ struct AgentDetailView: View {
     /// Pins the pane to the bottom only while live-tailing; scrolled up, the
     /// offset is preserved instead of snapping to live on every poll.
     @State private var atBottom = true
+    @State private var readingOutput = false
+    @State private var outputPending = false
     private static let maxCaptureLines = 16384
 
     var body: some View {
@@ -76,21 +78,7 @@ struct AgentDetailView: View {
                         ProgressView()
                             .frame(width: 29, height: 29)
                     } else {
-                        Button {
-                            log.info("send tapped")
-                            Task { await send() }
-                        } label: {
-                            Image(systemName: "arrow.up")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(Color(.systemBackground))
-                                .padding(7)
-                                .background(
-                                    canSend ? Color.primary : Color.secondary.opacity(0.3),
-                                    in: Circle()
-                                )
-                        }
-                        .disabled(!canSend)
-                        .accessibilityLabel("Send")
+                        sendButton
                     }
                 }
                 .padding(.leading, 14)
@@ -159,15 +147,78 @@ struct AgentDetailView: View {
         .sheet(isPresented: $showingDiff) {
             DiffReviewSheet(agent: agent)
         }
-        // Poll the pane while the view is up — pane.read is cheap and the
-        // screen changes under us.
+        // The paired host's watch says when this pane wrote output, so the
+        // screen is re-read then. The timer is only a safety net while the
+        // watch is up; without it (no hub, or a saved SSH machine, which has no
+        // event feed) it is the way the screen stays current.
         .task {
             await refresh()
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(4))
+                try? await Task.sleep(for: .seconds(watchDriven ? 20 : 4))
                 await refresh()
             }
         }
+        .onChange(of: store.outputSignals[agent.id]) {
+            Task { await refreshOnOutput() }
+        }
+    }
+
+    /// Output signals arrive for the paired host's panes while its watch is up.
+    private var watchDriven: Bool {
+        store.watchLive && agent.machine == "local"
+    }
+
+    /// Re-read after an output signal, at most one read in flight: signals that
+    /// land during a read collapse into one more read afterwards.
+    private func refreshOnOutput() async {
+        guard !readingOutput else {
+            outputPending = true
+            return
+        }
+        readingOutput = true
+        defer { readingOutput = false }
+        repeat {
+            outputPending = false
+            await refresh(silent: true)
+        } while outputPending && !Task.isCancelled
+    }
+
+    /// Tap sends the reply as a prompt. Holding offers the literal terminal
+    /// inputs for when the agent is not at a prompt: type it as is, paste it
+    /// without Enter, or submit it as typed text.
+    private var sendButton: some View {
+        Menu {
+            Button("Type into terminal and press Enter", systemImage: "return") {
+                Task { await send(.submitText(trimmedReply)) }
+            }
+            .disabled(!store.canSend(.submitText(""), to: agent))
+            Button("Type without Enter", systemImage: "keyboard") {
+                Task { await send(.typeLiteral(trimmedReply)) }
+            }
+            .disabled(!store.canSend(.typeLiteral(""), to: agent))
+            Button("Paste without Enter", systemImage: "doc.on.clipboard") {
+                Task { await send(.pasteText(trimmedReply)) }
+            }
+            .disabled(!store.canSend(.pasteText(""), to: agent))
+        } label: {
+            Image(systemName: "arrow.up")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color(.systemBackground))
+                .padding(7)
+                .background(
+                    canSend ? Color.primary : Color.secondary.opacity(0.3),
+                    in: Circle()
+                )
+        } primaryAction: {
+            log.info("send tapped")
+            Task { await send() }
+        }
+        .disabled(!canSend)
+        .accessibilityLabel("Send")
+    }
+
+    private var trimmedReply: String {
+        reply.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private var canSend: Bool {
@@ -257,7 +308,10 @@ struct AgentDetailView: View {
         }
     }
 
-    private func send() async {
+    /// Send the reply as a prompt, or as literal terminal `input` when the
+    /// user chose that. The text stays in the field on any failure — after a
+    /// dropped connection it may or may not have landed, and the error says so.
+    private func send(_ input: AppStore.TerminalInput? = nil) async {
         let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending else {
             log.info("send guarded out (empty=\(text.isEmpty) sending=\(self.sending))")
@@ -266,7 +320,11 @@ struct AgentDetailView: View {
         sending = true
         defer { sending = false }
         do {
-            try await store.sendPrompt(pane: agent.pane, machine: agent.machine, text: text)
+            if let input {
+                try await store.terminalInput(agent: agent, input)
+            } else {
+                try await store.sendPrompt(agent: agent, text: text)
+            }
             log.info("send delivered")
             reply = ""
             sendError = nil
@@ -276,6 +334,7 @@ struct AgentDetailView: View {
         } catch {
             log.error("send failed: \(error.localizedDescription)")
             sendError = error.localizedDescription
+            if (error as? PilusError)?.isUnconfirmed == true { await refresh(silent: true) }
         }
     }
 }
@@ -339,7 +398,14 @@ extension AgentDetailView {
 
     private func shortcutKey(_ label: String, keys: [String]) -> some View {
         Button {
-            Task { try? await store.sendKeys(pane: agent.pane, machine: agent.machine, keys: keys) }
+            Task {
+                do {
+                    try await store.sendKeys(agent: agent, keys: keys)
+                    sendError = nil
+                } catch {
+                    sendError = error.localizedDescription
+                }
+            }
         } label: {
             Text(label)
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
@@ -358,6 +424,10 @@ private struct AgentInfoSheet: View {
     let agent: Agent
     let detail: AgentDetail?
     @Environment(\.dismiss) private var dismiss
+    @Environment(AppStore.self) private var store
+    @State private var alias = ""
+    @State private var savingAlias = false
+    @State private var aliasError: String?
 
     var body: some View {
         NavigationStack {
@@ -384,6 +454,9 @@ private struct AgentInfoSheet: View {
                 if let session = detail?.session {
                     LabeledContent("Session", value: session)
                 }
+                if store.supports("pane.rename", on: agent.machine) {
+                    aliasSection
+                }
             }
             .navigationTitle("Session")
             .navigationBarTitleDisplayMode(.inline)
@@ -394,5 +467,39 @@ private struct AgentInfoSheet: View {
             }
         }
         .presentationDetents([.medium, .large])
+        .onAppear { alias = detail?.name ?? agent.name ?? "" }
+    }
+
+    /// The host's operator alias for this pane — how a named agent is found
+    /// again from a script or another device.
+    private var aliasSection: some View {
+        Section {
+            TextField("e.g. reviewer", text: $alias)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(.system(.body, design: .monospaced))
+            Button("Save alias") {
+                Task { await saveAlias() }
+            }
+            .disabled(savingAlias || !AppStore.isValidAlias(alias))
+            if let aliasError {
+                Text(aliasError).font(.footnote).foregroundStyle(.red)
+            }
+        } header: {
+            Text("Alias")
+        } footer: {
+            Text("Lowercase letters, digits, - and _, starting with a letter. Empty clears it.")
+        }
+    }
+
+    private func saveAlias() async {
+        savingAlias = true
+        defer { savingAlias = false }
+        do {
+            try await store.renameAgent(agent, to: alias)
+            aliasError = nil
+        } catch {
+            aliasError = error.localizedDescription
+        }
     }
 }

@@ -10,7 +10,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, presets};
@@ -21,8 +21,18 @@ use serde_json::{Value, json};
 use crate::store::{self, Enrollment};
 use crate::{CONTROL_ALPN, HUB_ALPN, UHP_ALPN};
 
-/// The deadline for one connect, one write, or one reply.
+/// The deadline for one connect, or one pairing/token exchange.
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The deadline for one UHP or hub request. The hub gives a call 25 seconds
+/// (SSH setup included) before it answers `timeout`, so the device must wait
+/// longer than that or it gives up on calls the hub is still running.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a `hub.watch` stream may stay silent. The hub pings every 20
+/// seconds while idle, so three missed beats means the stream is dead; a
+/// shorter limit would tear down a healthy idle stream on every heartbeat.
+const WATCH_IDLE: Duration = Duration::from_secs(60);
 
 /// Largest reply the client will buffer. UHP frames are bounded server-side;
 /// this only needs to clear `uhp.capabilities`, the biggest payload.
@@ -47,9 +57,20 @@ pub enum Error {
     #[error("{0}")]
     Control(String),
 
-    /// The gateway answered a UHP request with an error.
-    #[error("{0}")]
-    Uhp(String),
+    /// The gateway answered a UHP request with an error. `code` is the
+    /// daemon's own (`revision_conflict`, `agent_not_ready`, …); `dispatch`
+    /// says whether a rejected terminal input was ever queued.
+    #[error("{message}")]
+    Uhp {
+        code: String,
+        message: String,
+        dispatch: Option<String>,
+    },
+
+    /// The connection failed after the request was sent, so the peer may have
+    /// run it. Callers reconcile with a read instead of resending a write.
+    #[error("the connection dropped after the request was sent ({0}); it may have been applied")]
+    Unconfirmed(String),
 
     /// A reply could not be decoded.
     #[error("bad reply: {0}")]
@@ -66,6 +87,128 @@ pub enum Error {
     /// A bounded wait expired.
     #[error("{0} timed out")]
     Timeout(&'static str),
+}
+
+impl Error {
+    /// A stable machine-readable code: the daemon's own for [`Error::Uhp`],
+    /// a fixed word for every other failure.
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Io(_) => "io",
+            Self::Ticket(_) => "ticket",
+            Self::Transport(_) => "transport",
+            Self::Control(_) => "control",
+            Self::Uhp { code, .. } => code,
+            Self::Unconfirmed(_) => "unconfirmed",
+            Self::Reply(_) => "reply",
+            Self::NotEnrolled => "not_enrolled",
+            Self::Store(_) => "store",
+            Self::Timeout(_) => "timeout",
+        }
+    }
+
+    /// The daemon's `dispatch` verdict (`rejected`, `not_started`, `started`)
+    /// on a refused terminal input.
+    pub fn dispatch(&self) -> Option<&str> {
+        match self {
+            Self::Uhp { dispatch, .. } => dispatch.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Failures of the connection itself rather than an answer from the peer.
+    fn is_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(_) | Self::Timeout(_) | Self::Unconfirmed(_)
+        )
+    }
+
+    /// Fold a reply's `error` object, keeping the daemon's code.
+    fn from_reply(error: &Value, fallback: &str) -> Self {
+        let text = |key: &str| error.get(key).and_then(Value::as_str);
+        Self::Uhp {
+            code: text("code").unwrap_or("error").to_string(),
+            message: text("message").unwrap_or(fallback).to_string(),
+            dispatch: text("dispatch").map(str::to_string),
+        }
+    }
+}
+
+/// Whether sending `method` twice is harmless: it only reads, or the caller
+/// attached an `idempotency_key` the peer deduplicates on.
+///
+/// Mirrors the hub's classifier (`pilus_agent::hub::is_read`): anything it has
+/// not heard of counts as a write, because resending a prompt or a launch the
+/// peer already ran does the work twice.
+pub fn is_idempotent(method: &str, params: &Value) -> bool {
+    const READ_SUFFIXES: &[&str] = &[
+        ".list",
+        ".get",
+        ".status",
+        ".snapshot",
+        ".read",
+        ".capabilities",
+        ".layout",
+        ".edges",
+        ".neighbor",
+        ".current",
+        ".explain",
+        ".tree",
+        ".log",
+        ".branches",
+        ".query",
+        ".capture",
+        ".inventory",
+        ".processes",
+        ".validate",
+        ".sessions",
+        ".stats",
+        ".health",
+        ".wait",
+        ".history",
+        ".preview",
+    ];
+    let keyed = params
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.is_empty());
+    keyed
+        || matches!(
+            method,
+            "ping" | "search" | "mission.refresh" | "hub.machines" | "hub.agents" | "hub.folders"
+        )
+        || READ_SUFFIXES.iter().any(|suffix| method.ends_with(suffix))
+}
+
+/// Run `call`, and once more after `redial` when the connection itself failed.
+///
+/// A failure after the request was sent ([`Error::Unconfirmed`]) is only
+/// retried when `idempotent`: the peer may have run it, and a second prompt,
+/// launch, or note would be a duplicate. The caller reconciles with a read
+/// instead. A daemon refusal is never retried; it did not run.
+fn retry(
+    idempotent: bool,
+    call: impl Fn() -> Result<Value, Error>,
+    redial: impl FnOnce(),
+) -> Result<Value, Error> {
+    let first = match call() {
+        Ok(result) => return Ok(result),
+        Err(error) if error.is_transport() => error,
+        Err(error) => return Err(error),
+    };
+    redial();
+    if matches!(first, Error::Unconfirmed(_)) && !idempotent {
+        return Err(first);
+    }
+    call().map_err(|second| {
+        // The second attempt's verdict is the more truthful one for a write.
+        if matches!(second, Error::Unconfirmed(_)) {
+            second
+        } else {
+            first
+        }
+    })
 }
 
 /// Which of the connector's surfaces a call travels on.
@@ -302,17 +445,26 @@ impl Client {
 
     /// Send one ordinary UHP request and return its `result` value.
     ///
-    /// Errors inside the reply's `error` object surface as [`Error::Uhp`].
-    /// A transport failure drops the cached connection and retries once on a
-    /// fresh one, since a restarted host leaves dead QUIC sessions behind.
+    /// Errors inside the reply's `error` object surface as [`Error::Uhp`] with
+    /// the daemon's code. A connection that fails before the request left is
+    /// retried once on a fresh one, since a restarted host leaves dead QUIC
+    /// sessions behind; a write that may already have arrived is not (see
+    /// [`Client::retrying`]).
     pub fn request(&self, method: &str, params: Value) -> Result<Value, Error> {
-        match self.uhp_request(method, &params) {
-            Ok(result) => Ok(result),
-            Err(error) => {
-                self.drop_connection(Channel::Uhp);
-                self.uhp_request(method, &params).map_err(|_| error)
-            }
-        }
+        self.retrying(Channel::Uhp, is_idempotent(method, &params), || {
+            self.uhp_request(method, &params)
+        })
+    }
+
+    /// Run `call`, redialing once when the connection itself failed; see
+    /// [`retry`] for when a second attempt is allowed.
+    fn retrying(
+        &self,
+        channel: Channel,
+        idempotent: bool,
+        call: impl Fn() -> Result<Value, Error>,
+    ) -> Result<Value, Error> {
+        retry(idempotent, call, || self.drop_connection(channel))
     }
 
     fn uhp_request(&self, method: &str, params: &Value) -> Result<Value, Error> {
@@ -328,13 +480,7 @@ impl Client {
         let value: Value =
             serde_json::from_slice(&reply).map_err(|error| Error::Reply(error.to_string()))?;
         if let Some(error) = value.get("error") {
-            return Err(Error::Uhp(
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("uhp error")
-                    .to_string(),
-            ));
+            return Err(Error::from_reply(error, "uhp error"));
         }
         Ok(value.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -344,15 +490,12 @@ impl Client {
     /// The hub authenticates by `EndpointId`, so the frame carries no token.
     /// On an old connector with no hub ALPN the connect fails and the caller
     /// falls back to [`Client::request`]; anything else retries once on a
-    /// fresh connection like [`Client::request`] does.
+    /// fresh connection like [`Client::request`] does, under the same rule for
+    /// writes whose delivery is unknown.
     pub fn hub_request(&self, method: &str, machine: &str, params: Value) -> Result<Value, Error> {
-        match self.hub_call(method, machine, &params) {
-            Ok(result) => Ok(result),
-            Err(error) => {
-                self.drop_connection(Channel::Hub);
-                self.hub_call(method, machine, &params).map_err(|_| error)
-            }
-        }
+        self.retrying(Channel::Hub, is_idempotent(method, &params), || {
+            self.hub_call(method, machine, &params)
+        })
     }
 
     fn hub_call(&self, method: &str, machine: &str, params: &Value) -> Result<Value, Error> {
@@ -367,13 +510,7 @@ impl Client {
         let value: Value =
             serde_json::from_slice(&reply).map_err(|error| Error::Reply(error.to_string()))?;
         if let Some(error) = value.get("error") {
-            return Err(Error::Uhp(
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("hub error")
-                    .to_string(),
-            ));
+            return Err(Error::from_reply(error, "hub error"));
         }
         Ok(value.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -414,13 +551,7 @@ impl Client {
             Ok::<(Value, Watch), Error>((value, Watch { reader, send }))
         })?;
         if let Some(error) = value.get("error") {
-            return Err(Error::Uhp(
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("watch was refused")
-                    .to_string(),
-            ));
+            return Err(Error::from_reply(error, "watch was refused"));
         }
         *self
             .watch
@@ -445,12 +576,13 @@ impl Client {
             };
             let mut line = String::new();
             let read = self.runtime.block_on(async {
-                timeout("watch signal", async {
-                    tokio::io::AsyncBufReadExt::read_line(&mut watch.reader, &mut line)
-                        .await
-                        .map_err(|error| Error::Transport(error.to_string()))
-                })
+                tokio::time::timeout(
+                    WATCH_IDLE,
+                    tokio::io::AsyncBufReadExt::read_line(&mut watch.reader, &mut line),
+                )
                 .await
+                .map_err(|_| Error::Timeout("watch signal"))?
+                .map_err(|error| Error::Transport(error.to_string()))
             });
             match read {
                 Ok(0) | Err(_) => {
@@ -501,10 +633,20 @@ impl Client {
     }
 
     /// Write one LF-terminated frame on a fresh stream and read to EOF.
+    ///
+    /// A failure after the frame's terminating newline was written comes back
+    /// as [`Error::Unconfirmed`]: the peer may have run the request even though
+    /// its reply never arrived.
     fn round_trip(&self, channel: Channel, frame: &[u8]) -> Result<Vec<u8>, Error> {
+        let deadline = match channel {
+            Channel::Control => IO_TIMEOUT,
+            Channel::Uhp | Channel::Hub => REQUEST_TIMEOUT,
+        };
         self.runtime.block_on(async {
             let connection = self.connection(channel).await?;
-            let result = timeout("request", async {
+            // Set just before the newline: a line without it is never run.
+            let sent = AtomicBool::new(false);
+            let result = timeout_after(deadline, "request", async {
                 let (mut send, mut recv) = connection
                     .open_bi()
                     .await
@@ -512,6 +654,7 @@ impl Client {
                 send.write_all(frame)
                     .await
                     .map_err(|error| Error::Transport(error.to_string()))?;
+                sent.store(true, Ordering::Relaxed);
                 send.write_all(b"\n")
                     .await
                     .map_err(|error| Error::Transport(error.to_string()))?;
@@ -526,7 +669,11 @@ impl Client {
                 Ok(bytes) => Ok(bytes),
                 Err(error) => {
                     self.drop_connection(channel);
-                    Err(error)
+                    if sent.load(Ordering::Relaxed) {
+                        Err(Error::Unconfirmed(error.to_string()))
+                    } else {
+                        Err(error)
+                    }
                 }
             }
         })
@@ -611,7 +758,162 @@ async fn timeout<T, F>(what: &'static str, future: F) -> Result<T, Error>
 where
     F: Future<Output = Result<T, Error>>,
 {
-    tokio::time::timeout(IO_TIMEOUT, future)
+    timeout_after(IO_TIMEOUT, what, future).await
+}
+
+/// Await `future`, returning [`Error::Timeout`] past `limit`.
+async fn timeout_after<T, F>(limit: Duration, what: &'static str, future: F) -> Result<T, Error>
+where
+    F: Future<Output = Result<T, Error>>,
+{
+    tokio::time::timeout(limit, future)
         .await
         .map_err(|_| Error::Timeout(what))?
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use std::cell::Cell;
+
+    use super::*;
+
+    fn refusal(code: &str) -> Error {
+        Error::Uhp {
+            code: code.to_string(),
+            message: "no".to_string(),
+            dispatch: None,
+        }
+    }
+
+    #[test]
+    fn reads_and_keyed_calls_are_safe_to_resend_and_the_rest_are_not() {
+        let none = json!({});
+        for read in [
+            "agent.list",
+            "workspace.list",
+            "terminal.backend.capture",
+            "terminal.backend.inventory",
+            "uhp.capabilities",
+            "agent.wait",
+            "hub.machines",
+            "hub.agents",
+            "diff.note.list",
+        ] {
+            assert!(is_idempotent(read, &none), "{read}");
+        }
+        for write in [
+            "agent.prompt",
+            "agent.keys",
+            "hub.run",
+            "workspace.open",
+            "terminal.backend.submit_text",
+            "diff.note.add",
+            "an.unknown.method",
+        ] {
+            assert!(!is_idempotent(write, &none), "{write}");
+        }
+        let keyed = json!({ "idempotency_key": "k1" });
+        assert!(is_idempotent("automation.create", &keyed));
+        assert!(!is_idempotent(
+            "automation.create",
+            &json!({ "idempotency_key": "" })
+        ));
+    }
+
+    #[test]
+    fn a_reply_error_keeps_the_daemons_code_and_dispatch() {
+        let error = Error::from_reply(
+            &json!({ "code": "stale_server", "message": "generation moved", "dispatch": "rejected" }),
+            "fallback",
+        );
+        assert_eq!(error.code(), "stale_server");
+        assert_eq!(error.dispatch(), Some("rejected"));
+        assert_eq!(error.to_string(), "generation moved");
+
+        let bare = Error::from_reply(&json!({}), "fallback");
+        assert_eq!(
+            (bare.code(), bare.to_string().as_str()),
+            ("error", "fallback")
+        );
+        assert_eq!(Error::Timeout("request").code(), "timeout");
+        assert_eq!(Error::Unconfirmed("x".into()).code(), "unconfirmed");
+    }
+
+    #[test]
+    fn a_write_that_may_have_arrived_is_not_sent_twice() {
+        let calls = Cell::new(0);
+        let redialed = Cell::new(false);
+        let outcome = retry(
+            false,
+            || {
+                calls.set(calls.get() + 1);
+                Err(Error::Unconfirmed("reset".into()))
+            },
+            || redialed.set(true),
+        );
+        assert_eq!(outcome.unwrap_err().code(), "unconfirmed");
+        assert_eq!(calls.get(), 1, "the write must not be resent");
+        assert!(redialed.get(), "the dead connection is still dropped");
+    }
+
+    #[test]
+    fn a_read_or_a_write_that_never_left_is_retried_once() {
+        for (idempotent, first) in [
+            (true, Error::Unconfirmed("reset".into())),
+            (false, Error::Transport("no route".into())),
+            (false, Error::Timeout("connect")),
+        ] {
+            let calls = Cell::new(0);
+            let outcome = retry(
+                idempotent,
+                || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 1 {
+                        Err(match &first {
+                            Error::Unconfirmed(m) => Error::Unconfirmed(m.clone()),
+                            Error::Transport(m) => Error::Transport(m.clone()),
+                            _ => Error::Timeout("connect"),
+                        })
+                    } else {
+                        Ok(json!({ "ok": true }))
+                    }
+                },
+                || {},
+            );
+            assert_eq!(outcome.expect("second attempt"), json!({ "ok": true }));
+            assert_eq!(calls.get(), 2);
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_final_and_a_second_unconfirmed_attempt_wins() {
+        let calls = Cell::new(0);
+        let outcome = retry(
+            true,
+            || {
+                calls.set(calls.get() + 1);
+                Err(refusal("revision_conflict"))
+            },
+            || {},
+        );
+        assert_eq!(outcome.unwrap_err().code(), "revision_conflict");
+        assert_eq!(calls.get(), 1, "the daemon said no; resending cannot help");
+
+        let attempts = Cell::new(0);
+        let outcome = retry(
+            true,
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(Error::Transport("dead".into()))
+                } else {
+                    Err(Error::Unconfirmed("reset".into()))
+                }
+            },
+            || {},
+        );
+        assert_eq!(outcome.unwrap_err().code(), "unconfirmed");
+    }
 }

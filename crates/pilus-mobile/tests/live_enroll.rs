@@ -82,6 +82,17 @@ async fn enrolls_then_lists_workspaces_and_agents() {
             "agent.list returned {agents}"
         );
 
+        // A refusal arrives with the gateway's own code, not just its text:
+        // the app branches on codes like `revision_conflict`, and this token
+        // may not rename workspaces, so the refusal is `forbidden`.
+        let refused = client
+            .request(
+                "workspace.rename",
+                serde_json::json!({ "workspace_id": "nope", "name": "x" }),
+            )
+            .expect_err("a method outside the token's scope must be refused");
+        assert_eq!(refused.code(), "forbidden", "{refused:?}");
+
         // Resuming rebuilds the client from the enrollment file alone.
         let resumed = Client::resume(&device_dir, "", "").expect("resume");
         let workspaces = resumed

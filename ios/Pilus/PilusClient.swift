@@ -1,13 +1,33 @@
 import Foundation
 
-enum PilusError: LocalizedError {
-    case bridge(String)
+/// A failed call, with the daemon's own error code when it answered.
+///
+/// `code` is what the retry rules branch on: the daemon's (`revision_conflict`,
+/// `agent_not_ready`, `stale_server`, …) or one of `transport`, `timeout`,
+/// `unconfirmed` (the request may have been applied), `client` (raised here).
+struct PilusError: LocalizedError {
+    let code: String
+    let message: String
+    /// The daemon's verdict on a refused terminal input: `rejected` means
+    /// nothing was queued.
+    var dispatch: String?
 
-    var errorDescription: String? {
-        switch self {
-        case .bridge(let message): message
-        }
+    var errorDescription: String? { message }
+
+    /// A client-side failure that never reached the host.
+    static func bridge(_ message: String) -> PilusError {
+        PilusError(code: "client", message: message)
     }
+
+    /// The connection dropped after the request was sent; a write may have
+    /// been applied, so reconcile with a read instead of resending.
+    var isUnconfirmed: Bool { code == "unconfirmed" }
+    var isRevisionConflict: Bool { code == "revision_conflict" }
+    /// The daemon refused an identity (`server_generation`) that moved on; the
+    /// input was rejected before it was queued, so refreshing and retrying is
+    /// safe.
+    var isStaleRuntime: Bool { code == "stale_server" || (dispatch == "rejected" && code.hasPrefix("stale")) }
+    var isUnknownMethod: Bool { code == "invalid_request" && message.hasPrefix("unknown method") }
 }
 
 /// Thin, blocking wrapper over the pilus-mobile FFI. Call every method from a
@@ -52,7 +72,7 @@ final class PilusClient: @unchecked Sendable {
                 }
             }
         }) else {
-            throw PilusError.bridge(Self.takeLastError())
+            throw Self.lastError()
         }
         self.init(handle: handle)
     }
@@ -86,7 +106,7 @@ final class PilusClient: @unchecked Sendable {
                 pilus_client_enroll(handle, code, label)
             }
         }
-        guard ok == 0 else { throw PilusError.bridge(Self.takeLastError()) }
+        guard ok == 0 else { throw Self.lastError() }
     }
 
     /// The saved enrollment summary, or nil when this device is not enrolled.
@@ -155,14 +175,25 @@ final class PilusClient: @unchecked Sendable {
     /// Take ownership of a heap string the Rust side returned, or throw the
     /// recorded last error when it came back NULL.
     private static func takeString(_ raw: UnsafeMutablePointer<CChar>?) throws -> String {
-        guard let raw else { throw PilusError.bridge(takeLastError()) }
+        guard let raw else { throw lastError() }
         defer { pilus_string_free(raw) }
         return String(cString: raw)
     }
 
-    private static func takeLastError() -> String {
-        guard let raw = pilus_last_error() else { return "unknown error" }
+    /// The structured error the last failed call recorded on this thread.
+    private static func lastError() -> PilusError {
+        guard let raw = pilus_last_error_detail() else {
+            return PilusError(code: "client", message: "unknown error")
+        }
         defer { pilus_string_free(raw) }
-        return String(cString: raw)
+        struct Detail: Decodable {
+            let code: String
+            let message: String
+            let dispatch: String?
+        }
+        guard let detail = try? JSONDecoder().decode(Detail.self, from: Data(String(cString: raw).utf8)) else {
+            return PilusError(code: "client", message: String(cString: raw))
+        }
+        return PilusError(code: detail.code, message: detail.message, dispatch: detail.dispatch)
     }
 }

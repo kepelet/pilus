@@ -38,6 +38,9 @@ struct SettingsView: View {
                         LabeledContent("Access", value: level)
                     }
                     LabeledContent("Machines", value: "\(store.machines.count)")
+                    if store.supports("mission.snapshot") {
+                        NavigationLink("Fleet usage") { MissionView() }
+                    }
                 } header: {
                     Text("pilus Host")
                 }

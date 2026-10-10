@@ -858,6 +858,23 @@ follows the workspace the daemon has active, so when the agent's folder is not
 under the reviewed repo the screen says so and offers *Show this agent's
 workspace*, which runs `workspace.focus` (the Mac's own window follows, which
 is why it is a button). The screen re-reads every five seconds while it is up.
+Editing or deleting a note sends the revision the notes were read at as
+`if_revision`; on `revision_conflict` the app reloads, and goes again only when
+that note is unchanged, so a note edited on the Mac is shown instead of
+overwritten.
+
+**Lost replies on the phone.** A connection can drop after a request was sent,
+and the phone cannot tell whether it ran. `pilus-mobile` reports that as
+`unconfirmed` and resends only reads and calls carrying an `idempotency_key`
+(`hub.run`, which the hub dedupes for ten minutes, `automation.create` and
+`automation.run`). A prompt, key press, note, or workspace open is never
+resent: the app keeps the user's text, says it may have landed, and reads the
+state back. Errors reach Swift as `{code, message, dispatch}` so the app
+branches on the daemon's codes (`revision_conflict`, `agent_not_ready`,
+`stale_server`) rather than on message text. Terminal writes carry the
+`server_generation`/`terminal_id`/`pane_id` identity, `agent.prompt` carries
+`terminal_id`, and a pane that now holds another terminal is refused, never
+followed.
 Sending lists the machine's live agents, the one the review was opened from
 first, and covers one note, one file's open notes, or all open notes.
 
@@ -907,6 +924,10 @@ calls, where its level applies. Terminal output events (one per burst of output)
 become the `output` topic plus the ids of the panes that wrote (`"panes":["3"]`),
 never their text, so a device looking at one agent's screen knows when to re-read
 it with `agent.read`, which its level governs; no list is refetched for `output`.
+The iOS app refetches only the lists a signal names, for the paired machine only
+(saved SSH machines refresh on a 45 s timer), re-reads an agent's screen when its
+pane is named, resyncs everything on reconnect or when `seq` goes backwards (the
+daemon restarted), and waits 60 s for a frame before calling the stream dead.
 Signals are coalesced to one per 300 ms, an idle stream pings every
 20 s, and each ping rechecks that the device is still enrolled, so a revoked
 device's open stream is cut. A device holds at most two streams and the machine

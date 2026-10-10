@@ -18,7 +18,7 @@
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
@@ -36,6 +36,10 @@ use super::theme::Theme;
 const LINE_LEADING: f32 = 1.45;
 /// Caret width, in logical pixels.
 const CARET_WIDTH: f32 = 1.5;
+/// How long after a Command chord the field refuses incoming text. The glyph
+/// of an unclaimed chord lands within a frame or two; typing cannot follow
+/// a chord that quickly.
+const COMMAND_CHORD_WINDOW: Duration = Duration::from_millis(150);
 /// Half of the on/off caret blink cycle, in milliseconds.
 const CARET_BLINK: Duration = Duration::from_millis(530);
 
@@ -559,6 +563,10 @@ pub(super) struct TextInput {
     /// Whether the blink task has been started for this field.
     blink_started: bool,
     last: Rc<RefCell<Option<LastLayout>>>,
+    /// When a Command chord last reached this field's key handler. The
+    /// platform delivers an unclaimed chord's glyph a moment later as text,
+    /// by which time the modifier state can already be stale.
+    command_chord_at: Option<Instant>,
 }
 
 impl Focusable for TextInput {
@@ -602,6 +610,7 @@ impl TextInput {
         Self {
             buffer,
             marked: None,
+            command_chord_at: None,
             multiline,
             placeholder: placeholder.into(),
             focus_handle: cx.focus_handle(),
@@ -677,6 +686,7 @@ impl TextInput {
         let key = keystroke.key.as_str();
 
         if modifiers.platform {
+            self.command_chord_at = Some(Instant::now());
             match key {
                 "a" => {
                     self.buffer.borrow_mut().select_all();
@@ -964,9 +974,19 @@ impl EntityInputHandler for TextInput {
         &mut self,
         range_utf16: Option<Range<usize>>,
         text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A Command chord the window did not claim (Cmd+Shift+. in a window
+        // without that action, Cmd+` for the OS window switch) still reaches
+        // the input method, which would type its glyph. Command never
+        // composes text, so drop it here and let the chord stay a shortcut.
+        let chord_pending = self
+            .command_chord_at
+            .is_some_and(|at| at.elapsed() < COMMAND_CHORD_WINDOW);
+        if window.modifiers().platform || chord_pending {
+            return;
+        }
         let range = self.resolve_range(range_utf16);
         self.buffer
             .borrow_mut()

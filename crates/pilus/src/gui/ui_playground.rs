@@ -20,7 +20,7 @@ use crate::settings::Settings;
 use super::style::{self, ButtonKind, FillExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
-use super::{CloseTab, CloseWindow, icon, terminal_inset_border};
+use super::{CloseTab, CloseWindow, icon};
 
 /// Width and height of the playground window.
 const WINDOW_SIZE: (f32, f32) = (820.0, 740.0);
@@ -440,7 +440,7 @@ impl UiPlaygroundView {
             .rounded_lg()
             .bg(theme.bg)
             .border_1()
-            .border_color(terminal_inset_border());
+            .border_color(theme.border);
         for (option_index, option) in options.into_iter().enumerate() {
             let active = option_index == selected;
             list = list.child(
@@ -690,7 +690,7 @@ impl UiPlaygroundView {
     /// The color swatch grid.
     fn colors(&self) -> Div {
         let theme = self.theme;
-        let entries: [(&str, gpui::Rgba); 16] = [
+        let entries: [(&str, gpui::Rgba); 15] = [
             ("window_bg", theme.window_bg),
             ("bg", theme.bg),
             ("sidebar_bg", theme.sidebar_bg),
@@ -706,7 +706,6 @@ impl UiPlaygroundView {
             ("alert", theme.alert),
             ("selection_bg", theme.selection_bg),
             ("selection_fg", theme.selection_fg),
-            ("inset_border", terminal_inset_border()),
         ];
         let mut grid = div().flex().flex_row().flex_wrap().gap_3();
         for (name, color) in entries {
@@ -1062,7 +1061,7 @@ impl UiPlaygroundView {
                             .rounded_md()
                             .bg(theme.window_bg)
                             .border_1()
-                            .border_color(terminal_inset_border()),
+                            .border_color(theme.border),
                     ),
             )
             .child(
@@ -1093,7 +1092,7 @@ impl UiPlaygroundView {
                                     .border_t_1()
                                     .border_l_1()
                                     .border_r_1()
-                                    .border_color(terminal_inset_border())
+                                    .border_color(theme.border)
                                     .child(
                                         div()
                                             .text_size(px(self.fonts().label))
@@ -1112,7 +1111,7 @@ impl UiPlaygroundView {
                                     .border_l_1()
                                     .border_r_1()
                                     .border_b_1()
-                                    .border_color(terminal_inset_border())
+                                    .border_color(theme.border)
                                     .rounded_b_lg()
                                     .child(
                                         div()
@@ -1165,9 +1164,9 @@ impl UiPlaygroundView {
                     .font_weight(FontWeight::BOLD)
                     .text_color(theme.muted)
                     .child("SECTION")
-                    .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border())),
+                    .child(div().flex_1().h(px(1.0)).bg(theme.border)),
             )
-            .child(div().w_full().h(px(1.0)).bg(terminal_inset_border()))
+            .child(div().w_full().h(px(1.0)).bg(theme.border))
             .child(div().w_full().h(px(1.0)).bg(theme.border))
     }
 
@@ -1206,7 +1205,7 @@ impl UiPlaygroundView {
                         theme.muted,
                     ))
                     .child("WORKSPACES")
-                    .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border()))
+                    .child(div().flex_1().h(px(1.0)).bg(theme.border))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.collapsed = !this.collapsed;
                         cx.notify();
@@ -1387,7 +1386,7 @@ impl UiPlaygroundView {
             .rounded_lg()
             .bg(theme.sidebar_bg)
             .border_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .overflow_hidden()
             .child(
                 div()
@@ -1397,7 +1396,7 @@ impl UiPlaygroundView {
                     .h(px(40.0))
                     .px_3()
                     .border_b_1()
-                    .border_color(terminal_inset_border())
+                    .border_color(theme.border)
                     .text_size(px(self.fonts().body))
                     .child(div().w(px(1.5)).h(px(16.0)).bg(theme.accent))
                     .child(
@@ -1448,7 +1447,7 @@ impl UiPlaygroundView {
             .rounded_lg()
             .bg(theme.bg)
             .border_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .overflow_hidden()
             .child(
                 div()
@@ -1457,7 +1456,7 @@ impl UiPlaygroundView {
                     .h(px(38.0))
                     .px_3()
                     .border_b_1()
-                    .border_color(terminal_inset_border())
+                    .border_color(theme.border)
                     .text_size(px(self.fonts().body))
                     .text_color(theme.fg)
                     .child("~/Developer"),
@@ -1491,7 +1490,7 @@ impl UiPlaygroundView {
                     .px_3()
                     .py_2()
                     .border_t_1()
-                    .border_color(terminal_inset_border())
+                    .border_color(theme.border)
                     .child(
                         div()
                             .text_size(px(self.fonts().secondary))
@@ -1603,7 +1602,7 @@ impl UiPlaygroundView {
             .rounded_md()
             .bg(theme.sidebar_bg)
             .border_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(
                 div()
                     .text_size(px(self.fonts().secondary))

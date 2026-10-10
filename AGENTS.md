@@ -56,11 +56,11 @@ is missing, add it to `style.rs` and to the playground first, then use it.
   large floating panels. The Home composer's `rounded_t_lg`/`rounded_b_lg`
   follows that rule rather than excepting it.
 - **Color** comes from `Theme` roles; literals belong in `theme.rs` and
-  `scheme.rs` only. Chrome and floating-panel frames use
-  `terminal_inset_border()`, the terminal card's low-contrast hairline;
-  interactive content (fields, rows, buttons, badges) outlines with
-  `theme.border`. The selected tab is raised by its panel fill alone; it takes
-  no border. Accent means progress or focus, not a panel edge.
+  `scheme.rs` only. Every border and hairline, chrome frames and interactive
+  content alike, is `theme.border`: the color scheme owns it, so never
+  hardcode a frame color. The selected tab is raised by its panel fill alone; it takes
+  no border. Accent means progress or focus, not a panel edge; the edge of a focused
+  field, panel, or card is `theme.border_focus`.
 - **Selection** in the sidebar (workspace, worktree, agent) is the `theme.panel`
   pill with `panel_fg`/`muted` text and a bold name. `selection_bg`/`selection_fg`
   belong to text selection and list highlighting, not sidebar rows.

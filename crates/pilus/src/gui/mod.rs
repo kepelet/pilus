@@ -15,6 +15,7 @@ mod diff;
 mod diff_model;
 mod git_tab;
 mod glass;
+mod highlight;
 mod home;
 mod keys;
 mod machines;
@@ -3812,6 +3813,8 @@ impl PilusView {
                 keystroke.key.to_ascii_lowercase().as_str(),
                 "," | "comma"
                     | "."
+                    // The OS window switch, Cmd+` and Cmd+Shift+`.
+                    | "`"
                     | "-"
                     | "0"
                     | "1"
@@ -4374,9 +4377,11 @@ impl PilusView {
         }
         // Shift+`.` toggles hidden entries; GPUI may report `.`, `>`, or a
         // `key_char` of `>` depending on layout.
-        if key == ">"
-            || event.keystroke.key_char.as_deref() == Some(">")
-            || (event.keystroke.modifiers.shift && key == ".")
+        // Command chords belong to the menu: Cmd+Shift+. opens Settings.
+        if !event.keystroke.modifiers.platform
+            && (key == ">"
+                || event.keystroke.key_char.as_deref() == Some(">")
+                || (event.keystroke.modifiers.shift && key == "."))
         {
             self.picker.toggle_hidden();
             cx.notify();
@@ -4562,7 +4567,7 @@ impl PilusView {
             // The card is clear beside a page, so each half carries its own
             // coat: the page the chrome's, the terminal the grid's.
             .bg(self.chrome_fill())
-            .border_color(terminal_inset_border())
+            .border_color(self.theme.border)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -4628,9 +4633,9 @@ impl PilusView {
             // Focus is the one edge accent earns here: it says which side
             // of the split the keyboard is on.
             .border_color(if self.pi_focused {
-                theme.accent.opacity(0.55)
+                theme.border_focus
             } else {
-                terminal_inset_border()
+                theme.border
             })
             .on_mouse_down(
                 MouseButton::Left,
@@ -5828,7 +5833,7 @@ impl PilusView {
             .border_l_1()
             .border_r_1()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .overflow_hidden()
             .child(self.home_prompt_area(cx))
             .child(
@@ -7392,7 +7397,11 @@ impl PilusView {
             .rounded_md()
             .bg(theme.panel_dim)
             .border_1()
-            .border_color(if editing { theme.accent } else { theme.border })
+            .border_color(if editing {
+                theme.border_focus
+            } else {
+                theme.border
+            })
             .cursor_pointer()
             .child(line)
             .on_mouse_down(
@@ -7943,7 +7952,7 @@ impl PilusView {
             .h(px(38.0))
             .px_3()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .child(line)
@@ -7990,7 +7999,7 @@ impl PilusView {
             .h(px(42.0))
             .px_3()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(style::title(
                 theme,
                 "Open Workspace",
@@ -8080,7 +8089,7 @@ impl PilusView {
                     .rounded_md()
                     .bg(theme.sidebar_bg)
                     .border_1()
-                    .border_color(terminal_inset_border())
+                    .border_color(theme.border)
                     .child(list),
             )
             .into_any_element()
@@ -8212,7 +8221,7 @@ impl PilusView {
             .px_3()
             .flex_shrink_0()
             .border_t_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(hidden_toggle)
             .child(
                 div()
@@ -8248,7 +8257,7 @@ impl PilusView {
                         .rounded_lg()
                         .bg(theme.sidebar_bg)
                         .border_1()
-                        .border_color(terminal_inset_border())
+                        .border_color(theme.border)
                         .overflow_hidden()
                         .child(header)
                         .child(path_field)
@@ -9993,7 +10002,7 @@ impl PilusView {
                     .bottom(px(0.0))
                     .right(px(0.0))
                     .w(px(1.0))
-                    .bg(terminal_inset_border()),
+                    .bg(self.theme.border),
             );
         }
         panel
@@ -10708,7 +10717,7 @@ impl PilusView {
                         .rounded_md()
                         .bg(theme.sidebar_bg)
                         .border_1()
-                        .border_color(terminal_inset_border())
+                        .border_color(theme.border)
                         .p_2()
                         .child(items)
                         .on_mouse_down(
@@ -10813,7 +10822,7 @@ impl PilusView {
             .rounded_md()
             .bg(theme.sidebar_bg)
             .border_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .p_1()
             .child(items)
             .on_mouse_down(
@@ -10895,7 +10904,7 @@ impl PilusView {
             .rounded_md()
             .bg(theme.sidebar_bg)
             .border_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(style::title(
                 theme,
                 prompt.title,
@@ -11099,7 +11108,7 @@ impl PilusView {
             .h(px(44.0))
             .px_3()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .text_size(px(self.chrome_font()))
             .child(palette_input);
 
@@ -11125,7 +11134,7 @@ impl PilusView {
                         .rounded_lg()
                         .bg(theme.sidebar_bg)
                         .border_1()
-                        .border_color(terminal_inset_border())
+                        .border_color(theme.border)
                         .overflow_hidden()
                         .child(field)
                         .child(rows)
@@ -11588,7 +11597,7 @@ impl PilusView {
                             )),
                     )
                     .child(label)
-                    .child(div().flex_1().h(px(1.0)).bg(terminal_inset_border()))
+                    .child(div().flex_1().h(px(1.0)).bg(theme.border))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.section_toggled = Some((id, Instant::now()));
                         toggle(this, cx);
@@ -12645,10 +12654,7 @@ impl Render for PilusView {
                 // and rounding; a translucent terminal runs frameless to
                 // the window edges.
                 if framed {
-                    card = card
-                        .border_1()
-                        .border_color(terminal_inset_border())
-                        .rounded_md();
+                    card = card.border_1().border_color(theme.border).rounded_md();
                 }
                 card.child(self.card_content(cx, grid, &layout, terminal_fill))
             }))
@@ -13341,12 +13347,6 @@ fn cursor_at(frame: &FrameData, column: u16, row: u16) -> bool {
     frame.cursor_visible && frame.cursor == Some((column, row))
 }
 
-/// The terminal card's frame, independent of the color scheme: a low-contrast
-/// hairline so the inset reads subtly against any theme.
-fn terminal_inset_border() -> gpui::Rgba {
-    gpui::rgb(0x24242c)
-}
-
 /// Tint alpha for `blur` (0.0..=1.0): the constant glass floor at full
 /// blur, deepening toward [`FROST_MAX`] more as the backdrop sharpens — a
 /// sharper desktop fights grid text more, so it asks for a deeper tint.
@@ -13565,7 +13565,7 @@ fn picker_menu(id: impl Into<ElementId>, theme: Theme) -> Stateful<Div> {
         .rounded_lg()
         .bg(theme.bg)
         .border_1()
-        .border_color(terminal_inset_border())
+        .border_color(theme.border)
 }
 
 /// One option row in a composer picker menu. The active row (Home's cursor,
@@ -13889,7 +13889,7 @@ impl Render for SidebarTip {
             .py_2()
             .rounded_md()
             .border_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .bg(theme.panel)
             .text_size(px(SECTION_FONT))
             .child(

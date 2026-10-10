@@ -22,7 +22,7 @@ use super::style::{self, ButtonKind, FillExt};
 use super::task_compose::{ComposeState, Fetched, Scope, TaskPicker, TasksMsg};
 use super::text_input::TextInput;
 use super::theme::Theme;
-use super::{EndpointId, PilusView, agent_icon, icon, terminal_inset_border};
+use super::{EndpointId, PilusView, agent_icon, icon};
 
 /// Which slice of the queue the list shows.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -624,7 +624,7 @@ impl PilusView {
                 .flex()
                 .items_center()
                 .border_t_1()
-                .border_color(terminal_inset_border())
+                .border_color(theme.border)
                 .text_size(px(fonts.secondary))
                 .text_color(theme.muted)
                 .child(self.tasks_panel.status.clone())
@@ -684,7 +684,7 @@ impl PilusView {
             .flex_shrink_0()
             .px_4()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(style::title(theme, title, fonts.title))
             .child(
                 div()
@@ -1121,7 +1121,7 @@ impl PilusView {
             .gap_2()
             .p_3()
             .border_t_1()
-            .border_color(terminal_inset_border());
+            .border_color(theme.border);
         for (index, op) in ops_for(status).iter().copied().enumerate() {
             let id = task.id.clone();
             let kind = if index == 0 {
@@ -1178,7 +1178,7 @@ impl PilusView {
             .flex_shrink_0()
             .px_4()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(
                 div()
                     .font_family(SharedString::from(style::mono_family(
@@ -1208,7 +1208,7 @@ impl PilusView {
                 .flex_shrink_0()
                 .min_h(px(0.0))
                 .border_l_1()
-                .border_color(terminal_inset_border())
+                .border_color(theme.border)
                 .child(header)
                 .child(
                     div()
@@ -1295,7 +1295,7 @@ impl PilusView {
             .flex_shrink_0()
             .px_4()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(style::title(theme, "New task", fonts.title))
             .child(
                 style::small_button(
@@ -1318,7 +1318,7 @@ impl PilusView {
             .gap_2()
             .p_3()
             .border_t_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(
                 style::small_button(
                     "pilus-task-compose-cancel",
@@ -1351,7 +1351,7 @@ impl PilusView {
                 .flex_shrink_0()
                 .min_h(px(0.0))
                 .border_l_1()
-                .border_color(terminal_inset_border())
+                .border_color(theme.border)
                 .child(header)
                 .child(
                     div()

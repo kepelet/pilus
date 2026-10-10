@@ -48,6 +48,8 @@ pub struct Theme {
     pub composer_footer: Rgba,
     /// Borders and dividers.
     pub border: Rgba,
+    /// The edge of whatever holds focus: a focused field, panel, or card.
+    pub border_focus: Rgba,
     /// Accent for the connection indicator and links.
     pub accent: Rgba,
     /// Branch names in the sidebar.
@@ -81,6 +83,7 @@ impl Default for Theme {
             panel_dim: rgb(0x141419),
             composer_footer: rgb(0x181818),
             border: rgb(0x26262e),
+            border_focus: rgb(0x8c8c96),
             accent: rgb(0x7aa2f7),
             branch: rgb(0xbb9af7),
             muted: rgb(0x8e8e9e),
@@ -109,6 +112,7 @@ impl Theme {
             panel_dim: p.base,
             composer_footer: p.surface0,
             border: p.border,
+            border_focus: p.border_focus,
             accent: p.accent,
             branch: p.green,
             muted: p.subtext0,
@@ -180,6 +184,9 @@ impl Theme {
             panel_dim: c(chrome.rule, base.panel_dim),
             composer_footer: c(chrome.surface, base.composer_footer),
             border: c(chrome.border, base.border), // border_focus
+            // The projection carries one border; its brighter role stands in
+            // for the focus edge, as it does for `border` itself.
+            border_focus: c(chrome.border, base.border_focus),
             accent: c(chrome.accent, base.accent),
             branch: base.branch,
             muted: c(chrome.subtext0, base.muted),

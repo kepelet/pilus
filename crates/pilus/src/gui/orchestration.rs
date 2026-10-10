@@ -18,7 +18,7 @@ use pilus_client::{Agent, Task, TaskStatus};
 
 use super::style::{self, Connector, Side};
 use super::tasks::{TaskLayout, TaskView, age_label, status_glyph, unix_now};
-use super::{PilusView, agent_icon, icon, terminal_inset_border};
+use super::{PilusView, agent_icon, icon};
 
 /// A column of the board. Several statuses share one, so the board reads as
 /// a handful of stages rather than the daemon's full state machine; each card
@@ -775,7 +775,7 @@ impl PilusView {
             .rounded_md()
             .bg(Hsla::from(theme.panel_dim).opacity(0.45))
             .border_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(content);
         if folded {
             return backdrop

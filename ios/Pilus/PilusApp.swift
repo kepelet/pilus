@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct PilusApp: App {
     @State private var store = AppStore()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -20,5 +21,8 @@ struct PilusApp: App {
             }
         }
         .environment(store)
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background { BackgroundGrace.begin() } else { BackgroundGrace.end() }
+        }
     }
 }

@@ -7,6 +7,7 @@ struct SettingsView: View {
     @Environment(AppStore.self) private var store
     @AppStorage("relayUrl") private var relayUrl = ""
     @AppStorage("apiSecret") private var apiSecret = ""
+    @AppStorage(Notifier.enabledKey) private var notifyBlocked = true
 
     var body: some View {
         NavigationStack {
@@ -25,6 +26,16 @@ struct SettingsView: View {
                     Text("Relay")
                 } footer: {
                     Text("Leave empty for the default relays. Applies on next connect.")
+                }
+                Section {
+                    Toggle("Agent needs input", isOn: $notifyBlocked)
+                        .onChange(of: notifyBlocked) { _, on in
+                            if on { Task { await Notifier.requestAuthorization() } }
+                        }
+                } header: {
+                    Text("Notifications")
+                } footer: {
+                    Text("Notify me when an agent starts waiting on me. Alerts arrive while pilus is open or just after you leave it; iOS suspends the connection after that.")
                 }
                 Section {
                     LabeledContent("Name", value: store.hostLabel ?? "—")

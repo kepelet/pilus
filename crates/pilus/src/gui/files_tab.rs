@@ -14,6 +14,18 @@
 //! marks changed files and the folders above them; a click on a changed file
 //! opens it in the Diff instead.
 //!
+//! The daemon never writes files, so the tab uploads itself, as it reads
+//! documents itself: a local file is copied straight to disk, or piped over the
+//! machine's SSH profile (see `pilus_client::upload_file`). The header's upload
+//! button picks files, and files dropped on the tab, or on a folder row, go in
+//! too. An upload never replaces a file.
+//!
+//! The same route serves the tree's right-click menu: create a file or folder,
+//! rename, delete (see `pilus_client::create_entry`). Each asks its question in
+//! the shared menu prompt, runs on a thread, and reports an [`Edit`] that the
+//! tab settles: a renamed or deleted file closes or follows the document open
+//! on it, and the tree is re-read from disk.
+//!
 //! Every call blocks on the daemon, so each runs on a background thread and
 //! reports through a channel, as the Git tab does. Answers carry a sequence
 //! number so a slow poll cannot overwrite the tree a later action returned.
@@ -22,20 +34,25 @@ use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use std::path::PathBuf;
+
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, ListAlignment, ListState, SharedString, div, list,
-    prelude::*, px, relative,
+    AnyElement, ClickEvent, Context, Div, ExternalPaths, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString, div, list, prelude::*, px,
+    relative,
 };
 use pilus_client::{
-    ControlClient, Error, FileChanges, FileRow, FileTree, OpenTarget, TextFile, Version, read_text,
-    visible_rows,
+    ControlClient, Error, FileChanges, FileRow, FileTree, OpenTarget, SshTarget, TextFile, Version,
+    create_entry, delete_entry, parent_of, read_text, rename_entry, upload_file, visible_rows,
 };
 
 use super::diff::status_glyph;
 use super::md_view::{self, MdDoc, Page};
 use super::right_sidebar::SidebarTab;
+use super::sidebar_menu::{Item, MenuTarget};
 use super::style::{self, TreeEntry, TreeMark};
-use super::{EndpointId, PilusView, icon};
+use super::toast::ToastKind;
+use super::{EndpointId, PilusView, PromptAction, icon};
 
 /// How often the open tab asks the daemon for a fresh tree, so a change made
 /// in the TUI shows up here.
@@ -83,6 +100,86 @@ pub(super) enum FilesMsg {
         seq: u32,
         result: Result<TextFile, String>,
     },
+    Uploaded {
+        endpoint: EndpointId,
+        outcome: Upload,
+    },
+    Edited {
+        endpoint: EndpointId,
+        result: Result<Edit, String>,
+    },
+}
+
+/// What one create, rename, or delete did to the tree.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum Edit {
+    /// A new entry, and the folder it went into.
+    Created {
+        path: String,
+        dir: String,
+    },
+    Renamed {
+        from: String,
+        to: String,
+    },
+    Deleted {
+        path: String,
+    },
+}
+
+impl Edit {
+    fn toast(&self) -> String {
+        match self {
+            Self::Created { path, .. } => format!("Created {}", base_name(path)),
+            Self::Renamed { to, .. } => format!("Renamed to {}", base_name(to)),
+            Self::Deleted { path } => format!("Deleted {}", base_name(path)),
+        }
+    }
+}
+
+fn base_name(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+}
+
+/// Whether `path` is `dir` or sits anywhere below it.
+fn within(path: &str, dir: &str) -> bool {
+    path == dir
+        || path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Where `path` lands when `from` becomes `to`, or `None` when it is not
+/// `from` or below it.
+fn moved(path: &str, from: &str, to: &str) -> Option<String> {
+    within(path, from).then(|| format!("{to}{}", &path[from.len()..]))
+}
+
+/// What a batch of uploads came to: the names stored, and why the rest were not.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(super) struct Upload {
+    stored: Vec<String>,
+    failed: Vec<String>,
+}
+
+impl Upload {
+    /// The toasts this batch earns: a success line for what went through and
+    /// an error line for what did not.
+    fn toasts(&self) -> Vec<(ToastKind, String)> {
+        let mut toasts = Vec::new();
+        match self.stored.as_slice() {
+            [] => {}
+            [name] => toasts.push((ToastKind::Success, format!("Uploaded {name}"))),
+            many => toasts.push((ToastKind::Success, format!("Uploaded {} files", many.len()))),
+        }
+        if !self.failed.is_empty() {
+            toasts.push((ToastKind::Error, self.failed.join("\n")));
+        }
+        toasts
+    }
 }
 
 /// A markdown file open in the tab, in place of the tree.
@@ -426,6 +523,29 @@ impl PilusView {
                     }
                     changed |= self.files_panel.apply_doc(seq, result);
                 }
+                FilesMsg::Uploaded { endpoint, outcome } => {
+                    for (kind, text) in outcome.toasts() {
+                        self.toast(kind, text);
+                    }
+                    changed = true;
+                    if current.is_some_and(|current| current != endpoint) {
+                        continue;
+                    }
+                    // Show what landed without waiting for the next poll.
+                    self.files_request(Prelude::Refresh);
+                }
+                FilesMsg::Edited { endpoint, result } => {
+                    changed = true;
+                    match result {
+                        Err(error) => self.toast(ToastKind::Error, error),
+                        Ok(edit) => {
+                            self.toast(ToastKind::Success, edit.toast());
+                            if current.is_none_or(|current| current == endpoint) {
+                                self.files_settle(&edit);
+                            }
+                        }
+                    }
+                }
             }
         }
         if !self.files_visible() {
@@ -447,6 +567,43 @@ impl PilusView {
         }
         self.files_request(Prelude::Poll);
         changed
+    }
+
+    /// Bring the tab in line with an edit that went through: move or close the
+    /// document open on the entry, then read the tree back from disk.
+    fn files_settle(&mut self, edit: &Edit) {
+        let panel = &mut self.files_panel;
+        let prelude = match edit {
+            Edit::Created { dir, .. } => {
+                // A new entry in a folder the daemon has closed only shows once
+                // the folder opens.
+                let closed = panel.tree.as_ref().is_some_and(|tree| {
+                    tree.rows
+                        .iter()
+                        .any(|row| row.dir && !row.expanded && row.path == *dir)
+                });
+                if closed {
+                    panel.folded.remove(dir);
+                    Prelude::Expand(dir.clone())
+                } else {
+                    Prelude::Refresh
+                }
+            }
+            Edit::Renamed { from, to } => {
+                let reopen = panel.doc_path().and_then(|open| moved(open, from, to));
+                if let Some(path) = reopen {
+                    self.files_read_doc(path);
+                }
+                Prelude::Refresh
+            }
+            Edit::Deleted { path } => {
+                if panel.doc_path().is_some_and(|open| within(open, path)) {
+                    panel.close_doc();
+                }
+                Prelude::Refresh
+            }
+        };
+        self.files_request(prelude);
     }
 
     /// Run `prelude` on the daemon, then read the tree back.
@@ -556,6 +713,193 @@ impl PilusView {
         });
     }
 
+    /// Ask for files with the system picker and upload them to the tree's root.
+    fn files_pick_upload(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Upload".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = picked.await {
+                this.update(cx, |this, cx| this.files_upload(paths, None, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Copy `paths` into `dir`, or the tree's root, off the GUI thread.
+    fn files_upload(&mut self, paths: Vec<PathBuf>, dir: Option<String>, cx: &mut Context<Self>) {
+        let Some(dir) = dir.or_else(|| self.files_panel.tree.as_ref().map(|t| t.root.clone()))
+        else {
+            self.toast(ToastKind::Error, "The file tree has not loaded yet");
+            cx.notify();
+            return;
+        };
+        let endpoint = self.active.clone();
+        let target = match self.read_target(&endpoint) {
+            Ok(target) => target,
+            Err(error) => {
+                self.toast(ToastKind::Error, error);
+                cx.notify();
+                return;
+            }
+        };
+        let tx = self.files_panel.tx.clone();
+        std::thread::spawn(move || {
+            let outcome = upload_all(target.as_ref(), &paths, &dir);
+            tx.send(FilesMsg::Uploaded { endpoint, outcome }).ok();
+        });
+    }
+
+    /// Open the tree's context menu on the entry at `path`, or on the tree's
+    /// own folder when `root`.
+    pub(super) fn files_open_menu(
+        &mut self,
+        path: String,
+        dir: bool,
+        root: bool,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_context_menu(
+            MenuTarget::File {
+                endpoint: self.active.key(),
+                path,
+                dir,
+                root,
+            },
+            position,
+            cx,
+        );
+    }
+
+    /// Open the prompt a Files-menu row asks its question in.
+    pub(super) fn files_menu_item(
+        &mut self,
+        target: &MenuTarget,
+        item: Item,
+        cx: &mut Context<Self>,
+    ) {
+        let MenuTarget::File {
+            endpoint,
+            path,
+            dir,
+            ..
+        } = target
+        else {
+            return;
+        };
+        let endpoint = self.endpoint_by_key(endpoint);
+        match item {
+            Item::NewFile | Item::NewFolder => {
+                let folder = item == Item::NewFolder;
+                // A folder's new entry goes inside it; a file's goes beside it.
+                let into = if *dir {
+                    path.clone()
+                } else {
+                    parent_of(path).unwrap_or(path).to_string()
+                };
+                self.open_menu_prompt(
+                    PromptAction::CreateEntry {
+                        endpoint,
+                        dir: into,
+                        folder,
+                    },
+                    if folder { "New folder" } else { "New file" },
+                    "Name",
+                    "",
+                    cx,
+                );
+            }
+            Item::Rename => self.open_menu_prompt(
+                PromptAction::RenameEntry {
+                    endpoint,
+                    path: path.clone(),
+                },
+                "Rename",
+                "Name",
+                base_name(path),
+                cx,
+            ),
+            Item::Delete => self.open_menu_prompt(
+                PromptAction::DeleteEntry {
+                    endpoint,
+                    path: path.clone(),
+                    folder: *dir,
+                },
+                if *dir { "Delete folder" } else { "Delete file" },
+                "",
+                "",
+                cx,
+            ),
+            _ => {}
+        }
+    }
+
+    pub(super) fn files_create(
+        &mut self,
+        endpoint: &EndpointId,
+        dir: String,
+        name: String,
+        folder: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.files_edit(endpoint, cx, move |target| {
+            create_entry(target, &dir, &name, folder).map(|path| Edit::Created { path, dir })
+        });
+    }
+
+    pub(super) fn files_rename(
+        &mut self,
+        endpoint: &EndpointId,
+        from: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.files_edit(endpoint, cx, move |target| {
+            let to = rename_entry(target, &from, &name)?;
+            Ok(Edit::Renamed { from, to })
+        });
+    }
+
+    pub(super) fn files_delete(
+        &mut self,
+        endpoint: &EndpointId,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.files_edit(endpoint, cx, move |target| {
+            delete_entry(target, &path).map(|()| Edit::Deleted { path })
+        });
+    }
+
+    /// Run `job` against the endpoint's machine off the GUI thread and report
+    /// what it did.
+    fn files_edit(
+        &mut self,
+        endpoint: &EndpointId,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(Option<&SshTarget>) -> Result<Edit, String> + Send + 'static,
+    ) {
+        let target = match self.read_target(endpoint) {
+            Ok(target) => target,
+            Err(error) => {
+                self.toast(ToastKind::Error, error);
+                cx.notify();
+                return;
+            }
+        };
+        let tx = self.files_panel.tx.clone();
+        let endpoint = endpoint.clone();
+        std::thread::spawn(move || {
+            let result = job(target.as_ref());
+            tx.send(FilesMsg::Edited { endpoint, result }).ok();
+        });
+    }
+
     fn files_refresh_now(&mut self, cx: &mut Context<Self>) {
         self.files_request(Prelude::Refresh);
         cx.notify();
@@ -626,11 +970,41 @@ impl PilusView {
         });
     }
 
-    /// The tab: the root and refresh control above the tree.
+    /// The tab: the tree, or the open document, with files dropped on it
+    /// uploaded to the root.
     pub(super) fn files_page(&mut self, cx: &mut Context<Self>) -> Div {
         if self.files_panel.doc.is_some() {
             return self.files_doc_page(cx);
         }
+        let edge = self.theme.border_focus;
+        let tree = self.files_tree_page(cx);
+        div().size_full().min_h(px(0.0)).child(
+            div()
+                .id("pilus-files-drop")
+                .size_full()
+                .min_h(px(0.0))
+                .border_1()
+                .border_color(self.theme.panel.opacity(0.0))
+                .drag_over::<ExternalPaths>(move |style, _, _, _| style.border_color(edge))
+                .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                    this.files_upload(paths.paths().to_vec(), None, cx);
+                    cx.notify();
+                }))
+                // Rows stop the press, so this is the blank area and the header.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        if let Some(root) = this.files_panel.tree.as_ref().map(|t| t.root.clone()) {
+                            this.files_open_menu(root, true, true, event.position, cx);
+                        }
+                    }),
+                )
+                .child(tree),
+        )
+    }
+
+    /// The host and root above the file tree.
+    fn files_tree_page(&mut self, cx: &mut Context<Self>) -> Div {
         let page = div()
             .relative()
             .flex()
@@ -811,16 +1185,53 @@ impl PilusView {
                 false,
             )
             .on_click(cx.listener(|this, _, _, cx| this.files_refresh_now(cx)));
-        div()
+        let new = self
+            .diff_icon_button(
+                "pilus-files-new",
+                include_bytes!("../../assets/icons/plus.svg"),
+                "New file or folder".to_string(),
+                false,
+                false,
+            )
+            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                if let Some(root) = this.files_panel.tree.as_ref().map(|t| t.root.clone()) {
+                    this.files_open_menu(root, true, true, event.position(), cx);
+                }
+            }));
+        let upload = self
+            .diff_icon_button(
+                "pilus-files-upload",
+                include_bytes!("../../assets/icons/upload.svg"),
+                "Upload files".to_string(),
+                false,
+                false,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.files_pick_upload(cx)));
+        let host = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .flex_shrink_0()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
+            .child(icon(
+                include_bytes!("../../assets/icons/server.svg"),
+                fonts.body,
+                theme.muted,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(fonts.secondary))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(theme.panel_fg)
+                    .child(self.endpoint_label(&self.active)),
+            );
+        let directory = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
             .child(icon(
                 include_bytes!("../../assets/icons/folder.svg"),
                 fonts.body,
@@ -835,7 +1246,20 @@ impl PilusView {
                     .text_color(theme.muted)
                     .child(root),
             )
-            .child(refresh)
+            .child(new)
+            .child(upload)
+            .child(refresh);
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .flex_shrink_0()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(host)
+            .child(directory)
     }
 
     /// One virtualized row of the tree.
@@ -859,13 +1283,36 @@ impl PilusView {
             mark: self.files_mark(row),
         };
         let row = row.clone();
+        let menu_entry = (row.path.clone(), row.dir);
         style::tree_row(
             SharedString::from(format!("pilus-files-row-{}", row.path)),
             entry,
             self.theme,
             &self.shared_settings,
         )
+        .on_drop(cx.listener({
+            let (dir, path) = (row.dir, row.path.clone());
+            move |this, paths: &ExternalPaths, _, cx| {
+                // A file row has no inside: the drop falls through to the tab,
+                // which uploads to the root.
+                let into = dir.then(|| path.clone());
+                this.files_upload(paths.paths().to_vec(), into, cx);
+                cx.notify();
+            }
+        }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                let (path, dir) = menu_entry.clone();
+                this.files_open_menu(path, dir, false, event.position, cx);
+            }),
+        )
         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            // A right click opens the menu, not the entry.
+            if !event.standard_click() {
+                return;
+            }
             if row.dir {
                 // The second press of a double click would undo the first.
                 if event.click_count() < 2 {
@@ -927,6 +1374,19 @@ impl PilusView {
             .p_2()
             .children(self.git_skeleton("pilus-files-skeleton"))
     }
+}
+
+/// Upload each of `paths` into `dir`, collecting what went through and what
+/// did not rather than stopping at the first failure.
+fn upload_all(target: Option<&SshTarget>, paths: &[PathBuf], dir: &str) -> Upload {
+    let mut outcome = Upload::default();
+    for path in paths {
+        match upload_file(target, path, dir) {
+            Ok(name) => outcome.stored.push(name),
+            Err(error) => outcome.failed.push(error),
+        }
+    }
+    outcome
 }
 
 /// Run `prelude`, then read the tree and what changed in it.
@@ -1068,6 +1528,74 @@ impl PilusView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn a_rename_carries_the_paths_below_it() {
+        assert_eq!(
+            moved("/w/docs/a.md", "/w/docs", "/w/guide"),
+            Some("/w/guide/a.md".to_string())
+        );
+        assert_eq!(
+            moved("/w/a.md", "/w/a.md", "/w/b.md"),
+            Some("/w/b.md".to_string())
+        );
+        // A sibling that shares the prefix is not inside the folder.
+        assert_eq!(moved("/w/docs2/a.md", "/w/docs", "/w/guide"), None);
+        assert!(within("/w/docs/a.md", "/w/docs"));
+        assert!(!within("/w/docs2", "/w/docs"));
+    }
+
+    #[test]
+    fn an_edit_says_what_it_did_by_name() {
+        let created = Edit::Created {
+            path: "/w/src/new.rs".into(),
+            dir: "/w/src".into(),
+        };
+        assert_eq!(created.toast(), "Created new.rs");
+        let renamed = Edit::Renamed {
+            from: "/w/a".into(),
+            to: "/w/b".into(),
+        };
+        assert_eq!(renamed.toast(), "Renamed to b");
+        assert_eq!(
+            Edit::Deleted {
+                path: "/w/b/".into()
+            }
+            .toast(),
+            "Deleted b"
+        );
+    }
+
+    #[test]
+    fn an_upload_reports_what_went_through_and_what_did_not() {
+        let one = Upload {
+            stored: names(&["a.txt"]),
+            failed: Vec::new(),
+        };
+        assert_eq!(
+            one.toasts(),
+            vec![(ToastKind::Success, "Uploaded a.txt".to_string())]
+        );
+        let mixed = Upload {
+            stored: names(&["a.txt", "b.txt"]),
+            failed: names(&["c.txt already exists", "d.txt: denied"]),
+        };
+        assert_eq!(
+            mixed.toasts(),
+            vec![
+                (ToastKind::Success, "Uploaded 2 files".to_string()),
+                (
+                    ToastKind::Error,
+                    "c.txt already exists\nd.txt: denied".to_string()
+                ),
+            ]
+        );
+        assert!(Upload::default().toasts().is_empty());
+    }
 
     fn row(path: &str, depth: u16, dir: bool, expanded: bool) -> FileRow {
         FileRow {

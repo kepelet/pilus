@@ -17,6 +17,7 @@ mod connector;
 mod control;
 mod diff;
 mod discovery;
+mod entries;
 mod error;
 mod files;
 pub mod folders;
@@ -30,6 +31,7 @@ mod surface;
 mod tasks;
 mod transport;
 mod uhp;
+mod upload;
 pub use agents::AgentConfig;
 pub use agents::AgentModel;
 /// Display labels for pi thinking levels (`high` to `High`).
@@ -55,6 +57,7 @@ pub use discovery::{
     generate_session_name, is_provisioning_cache, list_session_infos, list_sessions, luvus_binary,
     pilus_config_dir, pilus_workspaces_dir, session_dir_for, split_client_socket, validate_session,
 };
+pub use entries::{create_entry, delete_entry, name_problem, parent_of, rename_entry};
 pub use error::{Error, Result};
 pub use files::{FileChange, FileChanges, FileRow, FileTree, OpenTarget, visible_rows};
 pub use git::{
@@ -77,6 +80,7 @@ pub use surface::{Surface, SurfaceChange};
 pub use tasks::{NewTask, Task, TaskStatus, split_list};
 pub use transport::SshTarget;
 pub use uhp::{Capabilities, Event, EventStream, Frame, Observer, Terminal, UhpClient};
+pub use upload::upload_file;
 
 use std::path::PathBuf;
 

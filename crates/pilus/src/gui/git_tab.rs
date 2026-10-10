@@ -829,20 +829,26 @@ impl PilusView {
             div()
                 .flex()
                 .flex_row()
-                .gap_2()
+                .justify_between()
                 .pt_1()
                 .text_size(px(fonts.secondary))
                 .text_color(theme.muted)
                 .child(files_label(detail.files.len()))
                 .child(
                     div()
-                        .text_color(theme.ok)
-                        .child(format!("+{}", detail.additions())),
-                )
-                .child(
-                    div()
-                        .text_color(theme.alert)
-                        .child(format!("−{}", detail.deletions())),
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_color(theme.ok)
+                                .child(format!("+{}", detail.additions())),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme.alert)
+                                .child(format!("−{}", detail.deletions())),
+                        ),
                 ),
         )
         .into_any_element()

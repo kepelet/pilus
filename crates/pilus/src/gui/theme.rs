@@ -28,6 +28,19 @@ const CHROME_SHADE: f32 = 0.35;
 /// How much of the remaining transparency translucent chrome fills in, so it
 /// reads denser than the grid at every opacity.
 const CHROME_DENSITY: f32 = 0.45;
+/// The opacity every border and hairline is drawn at. The schemes' border
+/// roles are tuned as solid fills, which read heavier than a 1px line wants.
+const BORDER_ALPHA: f32 = 0.55;
+
+/// `border` at the shared line opacity. Sets the alpha rather than scaling it,
+/// so a color that passes through twice (a projected theme falling back to the
+/// default's) is not softened twice.
+fn soften(border: Rgba) -> Rgba {
+    Rgba {
+        a: BORDER_ALPHA,
+        ..border
+    }
+}
 
 /// The client's own chrome palette.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -82,7 +95,7 @@ impl Default for Theme {
             panel: rgb(0x1e1e24),
             panel_dim: rgb(0x141419),
             composer_footer: rgb(0x181818),
-            border: rgb(0x26262e),
+            border: soften(rgb(0x26262e)),
             border_focus: rgb(0x8c8c96),
             accent: rgb(0x7aa2f7),
             branch: rgb(0xbb9af7),
@@ -111,7 +124,7 @@ impl Theme {
             panel: p.surface0,
             panel_dim: p.base,
             composer_footer: p.surface0,
-            border: p.border,
+            border: soften(p.border),
             border_focus: p.border_focus,
             accent: p.accent,
             branch: p.green,
@@ -189,7 +202,7 @@ impl Theme {
             panel: c(chrome.surface, base.panel), // surface0
             panel_dim: c(chrome.rule, base.panel_dim),
             composer_footer: c(chrome.surface, base.composer_footer),
-            border: c(chrome.border, base.border), // border_focus
+            border: soften(c(chrome.border, base.border)), // border_focus
             // The projection carries one border; its brighter role stands in
             // for the focus edge, as it does for `border` itself.
             border_focus: c(chrome.border, base.border_focus),

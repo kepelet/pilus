@@ -669,6 +669,26 @@ pub fn run() -> Result<()> {
         capture(&mut cx, window.into(), "git-tab-expanded")?;
         cx.update(|app| view.update(app, |view, cx| view.toggle_right_expanded(cx)));
         settle(&mut cx, 30);
+        // The Files tab on a canned tree, then with a folder folded here.
+        cx.update(|app| view.update(app, |view, cx| view.files_show_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.files_fold_sample("/work/pilus/crates/pilus-client/src", cx)
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-folded")?;
+        // A folder still opening: placeholders stand in for its children.
+        cx.update(|app| view.update(app, |view, cx| view.files_show_sample(cx)));
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.files_loading_sample("/work/pilus/docs", cx)
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-loading")?;
         // Later pages show the sidebar too; give it back to the Diff.
         cx.update(|app| {
             view.update(app, |view, cx| {

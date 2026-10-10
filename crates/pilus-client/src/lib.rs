@@ -18,6 +18,7 @@ mod control;
 mod diff;
 mod discovery;
 mod error;
+mod files;
 pub mod folders;
 mod git;
 mod git_status;
@@ -54,6 +55,7 @@ pub use discovery::{
     pilus_config_dir, pilus_workspaces_dir, session_dir_for, split_client_socket, validate_session,
 };
 pub use error::{Error, Result};
+pub use files::{FileChange, FileChanges, FileRow, FileTree, OpenTarget, visible_rows};
 pub use git::{
     RemoteRepos, common_git_dirs_remote, discard_worktree_changes, expand_local, expand_remote,
     init_repository, worktree_is_dirty,

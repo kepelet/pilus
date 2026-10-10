@@ -951,7 +951,7 @@ impl PilusView {
     }
 
     /// Placeholder rows while the first read is in flight.
-    fn git_skeleton(&self, id: &'static str) -> Vec<Div> {
+    pub(super) fn git_skeleton(&self, id: &'static str) -> Vec<Div> {
         let fonts = style::Fonts::resolve(&self.shared_settings);
         [0.7, 0.55, 0.8]
             .into_iter()

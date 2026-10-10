@@ -1,5 +1,6 @@
 //! The right sidebar: a column beside the terminal card, toggled with Cmd+B,
-//! holding the Diff review and the Git status and history on two tabs.
+//! holding the Diff review, the Git status and history, and the file tree on
+//! three tabs.
 //!
 //! The daemon knows nothing of this column. The window reserves its width from
 //! the card, so the daemon sees a smaller viewport and reflows once when the
@@ -7,7 +8,7 @@
 //! resize hold the viewport still until they settle, as the left sidebar's
 //! tween does. This module owns the column's state, its pure sizing rules,
 //! and the chrome (tab strip, resize handle, focus edge, footer). The open
-//! tab's body is drawn by `diff.rs` or `git_tab.rs`, which own their data;
+//! tab's body is drawn by `diff.rs`, `git_tab.rs`, or `files_tab.rs`, which own their data;
 //! only the open tab polls the daemon.
 
 use std::time::Instant;
@@ -32,15 +33,17 @@ pub(super) enum SidebarTab {
     #[default]
     Diff,
     Git,
+    Files,
 }
 
 impl SidebarTab {
-    pub(super) const ALL: [SidebarTab; 2] = [SidebarTab::Diff, SidebarTab::Git];
+    pub(super) const ALL: [SidebarTab; 3] = [SidebarTab::Diff, SidebarTab::Git, SidebarTab::Files];
 
     pub(super) fn wire(self) -> &'static str {
         match self {
             Self::Diff => "diff",
             Self::Git => "git",
+            Self::Files => "files",
         }
     }
 
@@ -56,11 +59,12 @@ impl SidebarTab {
         match self {
             Self::Diff => "Diff",
             Self::Git => "Log",
+            Self::Files => "Files",
         }
     }
 
     /// Whether the tab reads the keyboard. Only the Diff has shortcuts, so
-    /// the keys of a column showing Git stay with the terminal.
+    /// the keys of a column showing Git or Files stay with the terminal.
     fn takes_keys(self) -> bool {
         self == Self::Diff
     }
@@ -293,6 +297,7 @@ impl PilusView {
         match self.right.tab {
             SidebarTab::Diff => self.diff_panel.mark_stale(),
             SidebarTab::Git => self.git_panel.mark_stale(),
+            SidebarTab::Files => self.files_panel.mark_stale(),
         }
     }
 
@@ -309,6 +314,11 @@ impl PilusView {
     /// Whether the Git tab is on screen, so it should poll the daemon.
     pub(super) fn git_visible(&self) -> bool {
         self.right.visible && self.right.tab == SidebarTab::Git
+    }
+
+    /// Whether the Files tab is on screen, so it should poll the daemon.
+    pub(super) fn files_visible(&self) -> bool {
+        self.right.visible && self.right.tab == SidebarTab::Files
     }
 
     /// The toggle for the tab strip's trailing edge.
@@ -427,10 +437,11 @@ impl PilusView {
             .child(match self.right.tab {
                 SidebarTab::Diff => self.diff_page(self.right.shown_width(), cx),
                 SidebarTab::Git => self.git_page(cx),
+                SidebarTab::Files => self.files_page(cx),
             });
         let footer = match self.right.tab {
             SidebarTab::Diff => self.diff_footer(cx),
-            SidebarTab::Git => None,
+            SidebarTab::Git | SidebarTab::Files => None,
         };
 
         let handle = div()

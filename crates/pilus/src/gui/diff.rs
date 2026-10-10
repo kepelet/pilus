@@ -543,6 +543,13 @@ impl PilusView {
         });
     }
 
+    /// Point the Diff at one changed file, as the Files tab does when a click
+    /// lands on a file Git reports changed. The selection holds across the
+    /// next snapshot because the file is in it.
+    pub(super) fn diff_reveal(&mut self, layer: DiffLayer, path: &str, cx: &mut Context<Self>) {
+        self.diff_select((layer, path.to_string()), cx);
+    }
+
     fn diff_select(&mut self, key: FileKey, cx: &mut Context<Self>) {
         if self.diff_panel.selected.as_ref() == Some(&key) {
             return;

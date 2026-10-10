@@ -352,8 +352,8 @@ the snapshot carries no session ids. Automations open a detail pane from
 a resumable session has no daemon API, so it is hidden on this client only.
 
 **Right sidebar.** Cmd+B (View → Toggle Right Sidebar, or the panel button at
-the tab strip's far edge) opens a column beside the terminal card holding two
-tabs, Diff and Log (`gui/right_sidebar.rs`). The daemon knows nothing of it: the
+the tab strip's far edge) opens a column beside the terminal card holding three
+tabs, Diff, Log, and Files (`gui/right_sidebar.rs`). The daemon knows nothing of it: the
 window reserves the column's width from the card, so the daemon sees a smaller
 viewport and reflows once when the column opens, closes, or finishes a drag.
 The width tween and the edge drag hold the viewport still until they settle,
@@ -428,6 +428,42 @@ history no longer holds (another workspace) is dropped for the newest commit
 of the new one. A repository with no commits yet shows an empty list: a failed
 log read counts as an empty history. Nothing here stages, commits, or checks
 anything out.
+
+**Files.** The Files tab (`gui/files_tab.rs`; data in `pilus-client`'s `files.rs`)
+draws the tree the Luvus TUI shows. The daemon owns one tree per active node and
+shares it with the TUI: `files.tree` returns the visible rows already flattened
+with a depth, so the tab follows the sidebar's selection and is native on
+remote machines too. A background thread polls it every 2 seconds while the tab
+is open, so a change made in the TUI appears here.
+
+The daemon can open a folder but not close one. `files.reveal` expands only the
+*ancestors* of a path, so opening a closed folder reveals a child name no real
+file carries (the daemon does not check the path exists). Opening therefore
+changes the TUI's tree too. Closing is this window's own state: a set of folded
+paths that hides the rows below a folder (`visible_rows`) and never reaches the
+daemon. A fold is forgotten once the daemon shows the folder closed, so a
+folder the TUI closes and reopens comes back open, and a folder the daemon has
+closed always expands on click. A click on a file calls `files.open` with the
+`preview` target (a double click uses `pane`); the file shows in the terminal
+card, and the tab never reads file contents. A folder being opened shows three
+skeleton rows under it, with its chevron already turned. The daemon answers an
+expand before it has read the folder, so the first reply has the folder open
+and empty: the rows stay, and the tab asks again every 120 ms, until the
+children arrive, the daemon reports the folder closed, an error lands, or 3
+seconds pass (an empty folder). Clicking the folder meanwhile does nothing.
+
+The tree rows carry no Git state, so each read also calls `diff.list` (the
+Diff's own change list; a failure reads as nothing changed) and
+`pilus-client`'s `FileChanges` keys it by absolute path. A changed file shows
+its status letter at the trailing edge, colored as in the Diff
+(`diff::status_glyph`), and every folder above a change shows a dot. A click
+on a changed file opens the Diff tab on that file instead of previewing it.
+The header names the whole directory, `~`-shortened against the endpoint's
+home, ahead of the refresh button.
+Each answer carries a sequence
+number so a slow poll cannot overwrite the tree an expand returned. Rows are
+drawn with `style::tree_row` (catalogued in the playground) in a virtualized
+list.
 
 **Right-click menus.** WORKSPACES and AGENTS rows carry the daemon's native
 context menus, drawn by a floating GPUI panel mirroring the daemon's own menu
@@ -1009,8 +1045,8 @@ Selection lives in `gui/selection.rs`: it normalizes a reversed drag, answers
 
 ## Not implemented yet
 
-- Native file tree and Git views: the daemon still renders these into the grid,
-  so they are visible but not client-native.
+- Creating, renaming, or deleting files from the Files tab; it browses and
+  opens only.
 - Double-click to select a word, and triple-click to select a line.
 - Named-pipe transport on Windows.
 - Daemon upgrades: **Settings → UPDATES → Luvus daemon** checks

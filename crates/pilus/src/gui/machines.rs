@@ -23,13 +23,16 @@ use pilus_client::{
 
 use crate::settings::Settings;
 
-use super::style::{self, ButtonKind};
+use super::style::{self, ButtonKind, RadiusExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, MachineSignal};
 
 /// Width and height of the machines window.
 const WINDOW_SIZE: (f32, f32) = (820.0, 600.0);
+/// The smallest the window can be dragged to: below this its rows and
+/// controls start to clip.
+const WINDOW_MIN_SIZE: (f32, f32) = (640.0, 420.0);
 
 /// One editable field in the add form.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -769,7 +772,7 @@ impl MachineManagerView {
             .gap_3()
             .px_2()
             .py_2()
-            .rounded_md()
+            .radius_md()
             .bg(theme.panel)
             .border_1()
             .border_color(theme.border)
@@ -1217,6 +1220,7 @@ pub fn open(
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
             titlebar: Some(gpui::TitlebarOptions {
                 title: Some("Remote Machines".into()),
                 appears_transparent: false,

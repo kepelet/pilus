@@ -17,13 +17,16 @@ use gpui::{
 };
 use pilus_client::{Appearance, ControlClient, ThemeInfo};
 
-use super::style::{self, ButtonKind, FillExt};
+use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, scheme};
-use crate::settings::Settings;
+use crate::settings::{CORNER_RADIUS_MAX, Settings};
 
 /// Width and height of the appearances window.
 const WINDOW_SIZE: (f32, f32) = (640.0, 600.0);
+/// The smallest the window can be dragged to: below this its rows and
+/// controls start to clip.
+const WINDOW_MIN_SIZE: (f32, f32) = (520.0, 440.0);
 
 /// Smallest and largest selectable font size.
 const FONT_SIZE_RANGE: (f32, f32) = (9.0, 32.0);
@@ -210,14 +213,19 @@ impl AppearancesView {
     /// the opacity slider stages every step live and commits on mouse-up,
     /// so a sweep does not rewrite the settings file on every tick.
     fn stage(&mut self, cx: &mut Context<Self>) {
+        // Every window builds its rounded elements from this, so publish it
+        // before any of them renders again.
+        style::sync_corner_radius(&self.settings);
         *self.shared_settings.borrow_mut() = self.settings.clone();
         cx.notify();
     }
 
     /// Stage an opacity step from the slider; the mouse-up commit persists it.
     fn set_opacity(&mut self, value: f32, cx: &mut Context<Self>) {
-        // The top zone stops at 97.5%; snapping it restores fully opaque so
-        // the inset card can come back.
+        if self.theme.is_light() {
+            return;
+        }
+        // The top zone stops at 97.5%; snapping it restores fully opaque.
         self.settings.opacity = if value >= 0.975 {
             1.0
         } else {
@@ -229,6 +237,9 @@ impl AppearancesView {
     /// Step the opacity by `delta`, reaching both ends exactly so 100% is
     /// always one tap away no matter where the slider zones land.
     fn adjust_opacity(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if self.theme.is_light() {
+            return;
+        }
         self.settings.opacity = (self.settings.glass_opacity() + delta).clamp(0.1, 1.0);
         self.publish(cx);
     }
@@ -248,6 +259,27 @@ impl AppearancesView {
     /// blur view so the desktop shows sharp.
     fn adjust_blur(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.settings.blur = (self.settings.blur.clamp(0.0, 1.0) + delta).clamp(0.0, 1.0);
+        self.publish(cx);
+    }
+
+    /// Stage a corner radius from the slider, in whole pixels; the mouse-up
+    /// commit persists it.
+    fn set_corner_radius(&mut self, value: f32, cx: &mut Context<Self>) {
+        self.settings.corner_radius = (value * CORNER_RADIUS_MAX).round();
+        self.stage(cx);
+    }
+
+    /// Step the corner radius by `delta` pixels, reaching both ends exactly.
+    fn adjust_corner_radius(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.settings.corner_radius =
+            (self.settings.radius() + delta).clamp(0.0, CORNER_RADIUS_MAX);
+        self.publish(cx);
+    }
+
+    /// Flip the inset card. A file that never chose reads as the opacity's
+    /// own answer, so the first click flips that.
+    fn toggle_inset(&mut self, cx: &mut Context<Self>) {
+        self.settings.inset = Some(!self.settings.inset_card());
         self.publish(cx);
     }
 
@@ -300,14 +332,14 @@ impl AppearancesView {
         let mut swatches = div().flex().flex_row().gap_1();
         if let Some(p) = palette {
             for color in [p.crust, p.mantle, p.surface0, p.accent, p.text] {
-                swatches = swatches.child(div().w(px(14.0)).h(px(14.0)).rounded_sm().bg(color));
+                swatches = swatches.child(div().w(px(14.0)).h(px(14.0)).radius_sm().bg(color));
             }
         } else {
             swatches = swatches.child(
                 div()
                     .w(px(70.0))
                     .h(px(14.0))
-                    .rounded_sm()
+                    .radius_sm()
                     .bg(theme.panel_dim),
             );
         }
@@ -315,7 +347,7 @@ impl AppearancesView {
         let badge = div()
             .px_2()
             .py(px(1.0))
-            .rounded_sm()
+            .radius_sm()
             .bg(theme.panel_dim)
             .text_size(px(self.fonts().label))
             .text_color(theme.muted)
@@ -329,7 +361,7 @@ impl AppearancesView {
             .gap_3()
             .px_3()
             .py_2()
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .state_fill(bg, theme.panel, style::RADIUS_MD)
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -417,7 +449,7 @@ impl AppearancesView {
             .flex_1()
             .h(px(style::CONTROL_HEIGHT_SMALL))
             .px_2()
-            .rounded_md()
+            .radius_md()
             .border_1()
             .border_color(theme.border)
             .cursor_pointer()
@@ -511,8 +543,16 @@ impl AppearancesView {
     }
 
     /// The window-opacity row: a slider with steppers and a live percentage.
+    ///
+    /// A light scheme is always opaque (the frost behind it is dark), so the
+    /// row reads 100% and dims instead of taking input.
     fn opacity_row(&self, cx: &mut Context<Self>) -> Div {
-        let value = self.settings.glass_opacity();
+        let locked = self.theme.is_light();
+        let value = if locked {
+            1.0
+        } else {
+            self.settings.glass_opacity()
+        };
         let smaller = self.step_button(
             "pilus-opacity-smaller".to_string(),
             "−".to_string(),
@@ -561,6 +601,7 @@ impl AppearancesView {
                     .child(format!("{:.0}%", value * 100.0)),
             )
             .child(larger)
+            .when(locked, |row| row.opacity(0.4))
     }
 
     /// The blur-strength row: a slider with steppers and a live percentage.
@@ -617,6 +658,64 @@ impl AppearancesView {
             .child(larger)
     }
 
+    /// The corner-radius row: a slider with steppers and a live pixel value.
+    /// Zero squares every rounded element.
+    fn corner_radius_row(&self, cx: &mut Context<Self>) -> Div {
+        let radius = self.settings.radius();
+        let smaller = self.step_button(
+            "pilus-radius-smaller".to_string(),
+            "−".to_string(),
+            cx,
+            |this, cx| this.adjust_corner_radius(-1.0, cx),
+        );
+        let larger = self.step_button(
+            "pilus-radius-larger".to_string(),
+            "+".to_string(),
+            cx,
+            |this, cx| this.adjust_corner_radius(1.0, cx),
+        );
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .text_size(px(self.fonts().secondary))
+            .text_color(self.theme.fg)
+            .child(
+                div()
+                    .w(px(84.0))
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .text_color(self.theme.muted)
+                    .child("Corners".to_string()),
+            )
+            .child(
+                div().flex_1().child(
+                    style::slider(
+                        "pilus-radius",
+                        radius / CORNER_RADIUS_MAX,
+                        self.theme,
+                        cx,
+                        |this, step, cx| this.set_corner_radius(step, cx),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.publish(cx)),
+                    ),
+                ),
+            )
+            .child(smaller)
+            .child(
+                div()
+                    .w(px(44.0))
+                    .text_center()
+                    .child(format!("{radius:.0}px")),
+            )
+            .child(larger)
+    }
+
     /// A section title, matching the weight of the list headings below.
     fn section_heading(&self, label: &str) -> Div {
         style::section_label(self.theme, label.to_string(), self.fonts().label)
@@ -647,7 +746,7 @@ impl AppearancesView {
                     .id(format!("pilus-font-option-{name}"))
                     .px_2()
                     .py_1()
-                    .rounded_sm()
+                    .radius_sm()
                     .cursor_pointer()
                     .text_size(px(self.fonts().secondary))
                     .text_color(if selected { theme.accent } else { theme.fg })
@@ -698,7 +797,7 @@ impl AppearancesView {
                         .id("pilus-font-picker")
                         .w(px(panel_w))
                         .max_h(px(max_h))
-                        .rounded_md()
+                        .radius_md()
                         .bg(theme.sidebar_bg)
                         .border_1()
                         .border_color(theme.border)
@@ -816,6 +915,22 @@ impl Render for AppearancesView {
             .child(self.opacity_row(cx))
             .child(self.blur_row(cx));
 
+        list = list
+            .child(self.section_heading("WINDOW"))
+            .child(
+                div().px_3().py_1().child(
+                    style::checkbox(
+                        "pilus-inset",
+                        self.settings.inset_card(),
+                        "Inset terminal card",
+                        theme,
+                        self.fonts().secondary,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_inset(cx))),
+                ),
+            )
+            .child(self.corner_radius_row(cx));
+
         let root = div()
             .id("pilus-appearances")
             .relative()
@@ -849,6 +964,7 @@ pub fn open(
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
             // A real (opaque) titlebar, so the window title is the system one
             // instead of a heading we paint ourselves.
             titlebar: Some(gpui::TitlebarOptions {

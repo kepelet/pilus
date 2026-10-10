@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use gpui::{Context, Div, MouseButton, MouseDownEvent, Stateful, div, prelude::*, px};
 
-use super::style::{self, FillExt};
+use super::style::{self, FillExt, RadiusExt};
 use super::{HEADER_HEIGHT, PilusView, SIDEBAR_ANIM_DURATION, icon};
 
 /// Narrowest the column drags to: the Diff header still fits.
@@ -89,6 +89,13 @@ pub(super) struct RightSidebar {
     pub(super) focused: bool,
     tween: Option<Tween>,
     drag: Option<Drag>,
+    /// The column is stretched to fill the window beside the left sidebar.
+    /// A view state, not a preference: it never outlives the column.
+    expanded: bool,
+    spread_tween: Option<Tween>,
+    /// The width the column fills when expanded, kept current by the
+    /// window each frame.
+    full: f32,
 }
 
 impl RightSidebar {
@@ -104,42 +111,97 @@ impl RightSidebar {
             focused: false,
             tween: None,
             drag: None,
+            expanded: false,
+            spread_tween: None,
+            full: 0.0,
         }
     }
 
-    /// How open the column is, 0 to 1, mid-tween or settled.
-    pub(super) fn openness(&self) -> f32 {
-        match &self.tween {
+    /// Where `tween` has got to, or `rest` once it has settled.
+    fn eased(tween: Option<&Tween>, rest: f32) -> f32 {
+        match tween {
             Some(tween) => {
                 let total = SIDEBAR_ANIM_DURATION.as_secs_f32();
                 let step = (tween.started.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
                 (tween.from + (tween.to - tween.from) * style::ease_spring(step)).max(0.0)
             }
-            None if self.visible => 1.0,
-            None => 0.0,
+            None => rest,
         }
+    }
+
+    /// How open the column is, 0 to 1, mid-tween or settled.
+    pub(super) fn openness(&self) -> f32 {
+        Self::eased(self.tween.as_ref(), if self.visible { 1.0 } else { 0.0 })
+    }
+
+    /// How far the column has stretched toward the full width, 0 to 1.
+    pub(super) fn spread(&self) -> f32 {
+        Self::eased(
+            self.spread_tween.as_ref(),
+            if self.expanded { 1.0 } else { 0.0 },
+        )
+    }
+
+    /// The column's width at its current stretch.
+    pub(super) fn shown_width(&self) -> f32 {
+        let full = self.full.max(self.width);
+        self.width + (full - self.width) * self.spread().min(1.0)
     }
 
     /// Pixels the column takes from the card right now.
     pub(super) fn px(&self) -> f32 {
-        self.width * self.openness()
+        self.shown_width() * self.openness()
+    }
+
+    /// Whether the column fills the window, hiding the terminal behind it.
+    pub(super) fn expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// Record the width the column fills when expanded.
+    pub(super) fn set_full(&mut self, width: f32) {
+        self.full = width.max(0.0);
+    }
+
+    /// Stretch the column to the full width, or let it back to its own.
+    pub(super) fn toggle_expanded(&mut self) {
+        self.set_expanded(!self.expanded);
+    }
+
+    fn set_expanded(&mut self, expanded: bool) {
+        if self.expanded == expanded {
+            return;
+        }
+        let from = self.spread();
+        self.expanded = expanded;
+        self.spread_tween = Some(Tween {
+            started: Instant::now(),
+            from,
+            to: if expanded { 1.0 } else { 0.0 },
+        });
     }
 
     /// Whether the daemon should hold its viewport: the column is moving.
     pub(super) fn moving(&self) -> bool {
-        self.tween.is_some() || self.drag.is_some()
+        self.tween.is_some() || self.spread_tween.is_some() || self.drag.is_some()
     }
 
-    /// Advance the tween; true once nothing is in flight.
+    /// Advance the tweens; true once nothing is in flight.
     pub(super) fn tick(&mut self) -> bool {
-        let done = self
-            .tween
-            .as_ref()
-            .is_none_or(|tween| tween.started.elapsed() >= SIDEBAR_ANIM_DURATION);
-        if done {
+        let finished = |tween: &Option<Tween>| {
+            tween
+                .as_ref()
+                .is_none_or(|t| t.started.elapsed() >= SIDEBAR_ANIM_DURATION)
+        };
+        let opened = finished(&self.tween);
+        if opened {
             self.tween = None;
         }
-        done
+        let spread = finished(&self.spread_tween);
+        if spread {
+            self.spread_tween = None;
+        }
+        opened && spread
     }
 
     /// Show or hide the column. Showing takes the keyboard when the open tab
@@ -147,6 +209,9 @@ impl RightSidebar {
     pub(super) fn toggle(&mut self) {
         let from = self.openness();
         self.visible = !self.visible;
+        if !self.visible {
+            self.set_expanded(false);
+        }
         self.focused = self.visible && self.tab.takes_keys();
         self.tween = Some(Tween {
             started: Instant::now(),
@@ -195,6 +260,11 @@ pub(super) fn clamp_width(wanted: f32, window_w: f32) -> f32 {
 }
 
 impl PilusView {
+    pub(super) fn toggle_right_expanded(&mut self, cx: &mut Context<Self>) {
+        self.right.toggle_expanded();
+        cx.notify();
+    }
+
     pub(super) fn toggle_right_sidebar(&mut self, cx: &mut Context<Self>) {
         self.right.toggle();
         self.settings.right_sidebar_visible = self.right.visible;
@@ -252,7 +322,7 @@ impl PilusView {
             .flex_shrink_0()
             .h(px(super::TAB_HEIGHT))
             .w(px(super::SIDEBAR_TOGGLE_W))
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .hover_fill(theme.panel_dim, style::RADIUS_MD)
             .child(icon(
@@ -269,11 +339,25 @@ impl PilusView {
 
     /// The column: a tab strip over the open tab and its footer, with a drag
     /// handle on its leading edge.
-    pub(super) fn right_sidebar_view(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
+    pub(super) fn right_sidebar_view(
+        &mut self,
+        fullscreen: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let width = self.right.px();
         let focused = self.right.focused;
+        let expanded = self.right.expanded();
+        // Stretched under the floating traffic lights when the left sidebar
+        // is away, the strip starts past them.
+        let lights = if fullscreen {
+            0.0
+        } else {
+            (super::TRAFFIC_LIGHT_CLEARANCE - 12.0)
+                * (1.0 - self.sidebar_open)
+                * self.right.spread()
+        };
 
         let strip = div()
             .flex()
@@ -283,6 +367,7 @@ impl PilusView {
             .h(px(HEADER_HEIGHT))
             .flex_shrink_0()
             .px_3()
+            .pl(px(12.0 + lights))
             .children(SidebarTab::ALL.map(|tab| {
                 style::tab(
                     format!("pilus-right-tab-{}", tab.wire()),
@@ -296,13 +381,35 @@ impl PilusView {
             .child(div().flex_1())
             .child(
                 div()
+                    .id("pilus-right-sidebar-expand")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(style::scaled(&self.shared_settings, 24.0)))
+                    .h(px(style::scaled(&self.shared_settings, 24.0)))
+                    .radius_md()
+                    .cursor_pointer()
+                    .hover_fill(theme.panel_dim, style::RADIUS_MD)
+                    .child(icon(
+                        if expanded {
+                            include_bytes!("../../assets/icons/minimize.svg")
+                        } else {
+                            include_bytes!("../../assets/icons/maximize.svg")
+                        },
+                        12.0,
+                        theme.muted,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_right_expanded(cx))),
+            )
+            .child(
+                div()
                     .id("pilus-right-sidebar-close")
                     .flex()
                     .items_center()
                     .justify_center()
                     .w(px(style::scaled(&self.shared_settings, 24.0)))
                     .h(px(style::scaled(&self.shared_settings, 24.0)))
-                    .rounded_md()
+                    .radius_md()
                     .cursor_pointer()
                     .hover_fill(theme.panel_dim, style::RADIUS_MD)
                     .child(icon(
@@ -318,7 +425,7 @@ impl PilusView {
             .min_h(px(0.0))
             .overflow_hidden()
             .child(match self.right.tab {
-                SidebarTab::Diff => self.diff_page(self.right.width, cx),
+                SidebarTab::Diff => self.diff_page(self.right.shown_width(), cx),
                 SidebarTab::Git => self.git_page(cx),
             });
         let footer = match self.right.tab {
@@ -373,7 +480,7 @@ impl PilusView {
             .child(strip)
             .child(body)
             .children(footer)
-            .child(handle)
+            .children((!expanded).then_some(handle))
     }
 
     /// Track an edge drag across the whole window.
@@ -449,6 +556,28 @@ mod tests {
         assert!((side.width - 840.0).abs() < 0.01);
         assert!(side.end_drag());
         assert!(!side.end_drag());
+    }
+
+    #[test]
+    fn expanding_fills_the_window_and_hiding_lets_go() {
+        let mut side = RightSidebar::new(true, 400.0, SidebarTab::Diff);
+        side.set_full(1000.0);
+        assert_eq!(side.px(), 400.0);
+        side.toggle_expanded();
+        assert!(side.expanded() && side.moving());
+        // Settled, the column is as wide as the window leaves it.
+        side.spread_tween = None;
+        assert_eq!(side.shown_width(), 1000.0);
+        assert_eq!(side.px(), 1000.0);
+        // A window narrower than the column never shrinks it.
+        side.set_full(200.0);
+        assert_eq!(side.shown_width(), 400.0);
+        side.set_full(1000.0);
+        side.toggle();
+        assert!(
+            !side.expanded(),
+            "a hidden column comes back at its own width"
+        );
     }
 
     #[test]

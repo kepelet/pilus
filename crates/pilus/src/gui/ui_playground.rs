@@ -17,13 +17,16 @@ use gpui::{
 
 use crate::settings::Settings;
 
-use super::style::{self, ButtonKind, FillExt};
+use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, icon};
 
 /// Width and height of the playground window.
 const WINDOW_SIZE: (f32, f32) = (820.0, 740.0);
+/// The smallest the window can be dragged to: below this its rows and
+/// controls start to clip.
+const WINDOW_MIN_SIZE: (f32, f32) = (640.0, 480.0);
 
 /// Every icon the app vendors, so the gallery renders the real set.
 const ICONS: &[(&str, &[u8])] = &[
@@ -266,7 +269,7 @@ impl UiPlaygroundView {
             .gap_3()
             .w_full()
             .p_4()
-            .rounded_md()
+            .radius_md()
             .bg(theme.panel)
             .border_1()
             .border_color(theme.border)
@@ -310,7 +313,7 @@ impl UiPlaygroundView {
             .justify_center()
             .w(px(30.0))
             .h(px(30.0))
-            .rounded_full()
+            .radius_full()
             .cursor_pointer()
             .state_fill(theme.panel, theme.border, style::RADIUS_FULL)
             .on_click(cx.listener(|this, _, _, cx| this.note("Send clicked".to_string(), cx)))
@@ -376,7 +379,7 @@ impl UiPlaygroundView {
             .gap_2()
             .h(px(24.0))
             .px_2()
-            .rounded_md()
+            .radius_md()
             .text_color(fg)
             .cursor_pointer()
             .state_fill(
@@ -437,7 +440,7 @@ impl UiPlaygroundView {
                 }
                 cx.notify();
             }))
-            .rounded_lg()
+            .radius_lg()
             .bg(theme.bg)
             .border_1()
             .border_color(theme.border);
@@ -451,7 +454,7 @@ impl UiPlaygroundView {
                     .items_center()
                     .h(px(28.0))
                     .px_3()
-                    .rounded_md()
+                    .radius_md()
                     .text_color(theme.panel_fg)
                     .text_size(px(self.fonts().body))
                     .font_weight(if active {
@@ -719,7 +722,7 @@ impl UiPlaygroundView {
                         div()
                             .w_full()
                             .h(px(36.0))
-                            .rounded_md()
+                            .radius_md()
                             .bg(color)
                             .border_1()
                             .border_color(theme.border),
@@ -768,7 +771,7 @@ impl UiPlaygroundView {
                         div()
                             .w_full()
                             .h(px(36.0))
-                            .rounded_md()
+                            .radius_md()
                             .bg(theme.ansi[index])
                             .border_1()
                             .border_color(theme.border),
@@ -795,7 +798,7 @@ impl UiPlaygroundView {
             .w_full()
             .px_2()
             .py_2()
-            .rounded_md()
+            .radius_md()
             .bg(theme.panel)
             .border_1()
             .border_color(theme.border)
@@ -849,7 +852,7 @@ impl UiPlaygroundView {
             .w_full()
             .px_2()
             .py_1()
-            .rounded_md()
+            .radius_md()
             .bg(if active {
                 theme.panel
             } else {
@@ -874,7 +877,7 @@ impl UiPlaygroundView {
             .justify_center()
             .w(px(20.0))
             .h(px(20.0))
-            .rounded_sm()
+            .radius_sm()
             .bg(theme.border)
             .text_size(px(self.fonts().label))
             .font_weight(FontWeight::SEMIBOLD)
@@ -887,7 +890,7 @@ impl UiPlaygroundView {
             .h(px(16.0))
             .min_w(px(16.0))
             .px_1()
-            .rounded_full()
+            .radius_full()
             .bg(theme.accent)
             .text_size(px(self.fonts().label))
             .text_color(theme.window_bg)
@@ -1058,7 +1061,7 @@ impl UiPlaygroundView {
                         div()
                             .h(px(64.0))
                             .w_full()
-                            .rounded_md()
+                            .radius_md()
                             .bg(theme.window_bg)
                             .border_1()
                             .border_color(theme.border),
@@ -1087,7 +1090,7 @@ impl UiPlaygroundView {
                                     .items_center()
                                     .h(px(40.0))
                                     .px_3()
-                                    .rounded_t_lg()
+                                    .radius_t_lg()
                                     .bg(theme.panel.opacity(0.0))
                                     .border_t_1()
                                     .border_l_1()
@@ -1112,7 +1115,7 @@ impl UiPlaygroundView {
                                     .border_r_1()
                                     .border_b_1()
                                     .border_color(theme.border)
-                                    .rounded_b_lg()
+                                    .radius_b_lg()
                                     .child(
                                         div()
                                             .text_size(px(self.fonts().label))
@@ -1138,7 +1141,7 @@ impl UiPlaygroundView {
                         div()
                             .h(px(64.0))
                             .w_full()
-                            .rounded_md()
+                            .radius_md()
                             .bg(theme.panel)
                             .border_1()
                             .border_color(theme.border),
@@ -1219,7 +1222,7 @@ impl UiPlaygroundView {
                     .justify_center()
                     .h(px(22.0))
                     .w(px(22.0))
-                    .rounded_md()
+                    .radius_md()
                     .cursor_pointer()
                     .hover_fill(theme.panel, style::RADIUS_MD)
                     .child(icon(
@@ -1243,7 +1246,7 @@ impl UiPlaygroundView {
             .w_full()
             .px_2()
             .py_1()
-            .rounded_md()
+            .radius_md()
             .bg(if active {
                 theme.panel
             } else {
@@ -1302,7 +1305,7 @@ impl UiPlaygroundView {
             .w_full()
             .px_2()
             .py_1()
-            .rounded_md()
+            .radius_md()
             .child(icon(
                 include_bytes!("../../assets/icons/agents/pi.svg"),
                 14.0,
@@ -1357,7 +1360,7 @@ impl UiPlaygroundView {
                 .gap_3()
                 .h(px(30.0))
                 .px_3()
-                .rounded_md()
+                .radius_md()
                 .bg(bg)
                 .child(
                     div()
@@ -1383,7 +1386,7 @@ impl UiPlaygroundView {
             .flex()
             .flex_col()
             .w(px(360.0))
-            .rounded_lg()
+            .radius_lg()
             .bg(theme.sidebar_bg)
             .border_1()
             .border_color(theme.border)
@@ -1433,7 +1436,7 @@ impl UiPlaygroundView {
                 .gap_2()
                 .h(px(28.0))
                 .px_2()
-                .rounded_md()
+                .radius_md()
                 .bg(bg)
                 .text_size(px(self.fonts().body))
                 .text_color(fg)
@@ -1444,7 +1447,7 @@ impl UiPlaygroundView {
             .flex()
             .flex_col()
             .w(px(360.0))
-            .rounded_lg()
+            .radius_lg()
             .bg(theme.bg)
             .border_1()
             .border_color(theme.border)
@@ -1504,7 +1507,7 @@ impl UiPlaygroundView {
                             .justify_center()
                             .h(px(26.0))
                             .px_3()
-                            .rounded_md()
+                            .radius_md()
                             .bg(theme.accent)
                             .text_color(theme.window_bg)
                             .text_size(px(self.fonts().secondary))
@@ -1525,7 +1528,7 @@ impl UiPlaygroundView {
                 .justify_center()
                 .h(px(28.0))
                 .w(px(28.0))
-                .rounded_md()
+                .radius_md()
                 .child(icon(bytes, 14.0, theme.muted))
         };
         div()
@@ -1572,7 +1575,7 @@ impl UiPlaygroundView {
                             .items_center()
                             .h(px(28.0))
                             .px_2()
-                            .rounded_md()
+                            .radius_md()
                             .text_color(theme.accent)
                             .child("Update available"),
                     )
@@ -1599,7 +1602,7 @@ impl UiPlaygroundView {
             .w(px(260.0))
             .px_3()
             .py_2()
-            .rounded_md()
+            .radius_md()
             .bg(theme.sidebar_bg)
             .border_1()
             .border_color(theme.border)
@@ -1677,7 +1680,7 @@ impl UiPlaygroundView {
                     .justify_center()
                     .h(px(20.0))
                     .px_2()
-                    .rounded_sm()
+                    .radius_sm()
                     .bg(theme.panel_dim)
                     .border_1()
                     .border_color(theme.border)
@@ -1712,7 +1715,7 @@ impl UiPlaygroundView {
                     .justify_center()
                     .h(px(24.0))
                     .w(px(24.0))
-                    .rounded_md()
+                    .radius_md()
                     .bg(theme.panel_dim)
                     .border_1()
                     .border_color(theme.border)
@@ -1750,7 +1753,7 @@ impl UiPlaygroundView {
                     .items_center()
                     .h(px(24.0))
                     .px_2()
-                    .rounded_md()
+                    .radius_md()
                     .text_size(px(fonts.label))
                     .text_color(theme.fg)
                     .child("Disable"),
@@ -2014,6 +2017,7 @@ pub fn open(theme: Theme, settings: Rc<RefCell<Settings>>, cx: &mut App) {
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
             titlebar: Some(gpui::TitlebarOptions {
                 title: Some("UI Playground".into()),
                 appears_transparent: false,

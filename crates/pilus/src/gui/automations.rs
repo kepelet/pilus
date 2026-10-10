@@ -23,7 +23,7 @@ use gpui::{
 use pilus_client::{AutomationDetail, AutomationHealth, AutomationRow, MissionScope};
 
 use super::mission::{row_fills, step_key, unix_now, until_label, utc_label};
-use super::style::{self, ButtonKind, FillExt};
+use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::theme::Theme;
 use super::{EndpointId, PilusView};
 
@@ -532,7 +532,7 @@ impl PilusView {
             .border_r_1()
             .border_color(theme.border)
             .text_color(color)
-            .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(color))
+            .child(div().w(px(8.0)).h(px(8.0)).radius_full().bg(color))
             .child(signal);
         let footer = div()
             .px_4()
@@ -794,7 +794,7 @@ impl PilusView {
             .min_h(scaled(ROW_HEIGHT))
             .px_3()
             .py_1()
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .state_fill(rest, hover, style::RADIUS_MD)
             .child(
@@ -807,7 +807,7 @@ impl PilusView {
                     .flex_shrink_0()
                     .text_size(px(fonts.secondary))
                     .text_color(color)
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(color))
+                    .child(div().w(px(8.0)).h(px(8.0)).radius_full().bg(color))
                     .child(automation_label(&row.state)),
             )
             .child(name)
@@ -967,7 +967,7 @@ impl PilusView {
         let block = |text: String| {
             div()
                 .p_3()
-                .rounded_md()
+                .radius_md()
                 .bg(theme.panel_dim)
                 .border_1()
                 .border_color(theme.border)

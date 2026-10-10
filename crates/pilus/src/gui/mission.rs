@@ -25,7 +25,7 @@ use gpui::{
 };
 use pilus_client::{MissionRow, MissionScope, MissionSnapshot};
 
-use super::style::{self, ButtonKind, FillExt};
+use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
 use super::{
@@ -910,7 +910,7 @@ impl PilusView {
                 div()
                     .w(px(8.0))
                     .h(px(8.0))
-                    .rounded_full()
+                    .radius_full()
                     .bg(signal.color(theme)),
             )
             .child(signal.label());
@@ -1049,7 +1049,7 @@ impl PilusView {
                         .gap_2()
                         .h(px(30.0))
                         .px_3()
-                        .rounded_md()
+                        .radius_md()
                         .text_size(px(fonts.body))
                         .text_color(theme.panel_fg)
                         .cursor_pointer()
@@ -1442,7 +1442,7 @@ impl PilusView {
             div()
                 .w(px(8.0))
                 .h(px(8.0))
-                .rounded_full()
+                .radius_full()
                 .border_1()
                 .border_color(state_color)
                 .into_any_element()
@@ -1450,12 +1450,12 @@ impl PilusView {
             div()
                 .w(px(8.0))
                 .h(px(8.0))
-                .rounded_full()
+                .radius_full()
                 .bg(state_color)
                 .into_any_element()
         };
         let key_owned = key.to_string();
-        let square = gpui::AbsoluteLength::Pixels(px(0.0));
+        let square = style::Radius::None;
         let row_el = div()
             .id(format!("pilus-mission-row-{key}"))
             .flex()
@@ -1820,7 +1820,7 @@ impl PilusView {
                     .flex_col()
                     .gap_1()
                     .p_3()
-                    .rounded_md()
+                    .radius_md()
                     .bg(theme.panel_dim)
                     .border_1()
                     .border_color(theme.border)
@@ -1963,11 +1963,11 @@ impl PilusView {
                     .gap_2()
                     .px_2()
                     .h(px(style::scaled(&self.shared_settings, 24.0)))
-                    .rounded_md()
+                    .radius_md()
                     .border_1()
                     .border_color(theme.border)
                     .text_size(px(fonts.secondary))
-                    .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(color))
+                    .child(div().w(px(7.0)).h(px(7.0)).radius_full().bg(color))
                     .child(
                         div()
                             .text_color(theme.panel_fg)
@@ -2047,7 +2047,7 @@ impl PilusView {
             .items_center()
             .gap_3()
             .py_8()
-            .rounded_md()
+            .radius_md()
             .border_1()
             .border_color(theme.border)
             .child(icon(
@@ -2099,7 +2099,7 @@ impl PilusView {
                 div()
                     .flex_1()
                     .h(px(style::scaled(&self.shared_settings, 76.0)))
-                    .rounded_md()
+                    .radius_md()
                     .border_1()
                     .border_color(theme.border)
                     .p_3()

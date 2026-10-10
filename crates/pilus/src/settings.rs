@@ -19,6 +19,12 @@ pub const CHROME_FONT: f32 = 13.0;
 pub const OPACITY: f32 = 0.85;
 /// Default blur strength over the desktop: full system blur.
 pub const BLUR: f32 = 1.0;
+/// Default corner radius in logical pixels: what `rounded_md` drew before the
+/// radius became a setting. Controls, cards, and overlays use it directly;
+/// the dense and large steps scale from it.
+pub const CORNER_RADIUS: f32 = 6.0;
+/// The largest corner radius the Appearances slider offers.
+pub const CORNER_RADIUS_MAX: f32 = 16.0;
 
 /// The main window's frame when it was last seen, so the next launch reopens
 /// it where the user left it.
@@ -78,6 +84,13 @@ pub struct Settings {
     /// the control existed keep full blur via the default.
     #[serde(default = "default_blur")]
     pub blur: f32,
+    /// Whether the terminal floats in an inset card with a gap and hairline,
+    /// instead of running to the window edges. `None` keeps what files
+    /// written before the checkbox did: inset only while fully opaque.
+    pub inset: Option<bool>,
+    /// Corner radius of controls, cards, and overlays, in logical pixels.
+    /// Every rounded element scales from it, and zero squares them all.
+    pub corner_radius: f32,
     /// Replace a focused pi pane's terminal with the native conversation
     /// view. On by default.
     pub pi_gui_auto: bool,
@@ -129,6 +142,8 @@ impl Default for Settings {
             notifications: true,
             opacity: OPACITY,
             blur: BLUR,
+            inset: None,
+            corner_radius: CORNER_RADIUS,
             pi_gui_auto: true,
             sidebar_workspace_paths: false,
             sidebar_agent_paths: false,
@@ -188,6 +203,20 @@ impl Settings {
     pub fn glass_opacity(&self) -> f32 {
         self.opacity.clamp(0.1, 1.0)
     }
+
+    /// Whether the terminal keeps its floating inset card.
+    pub fn inset_card(&self) -> bool {
+        self.inset.unwrap_or(self.glass_opacity() >= 1.0)
+    }
+
+    /// The corner radius, clamped so a stray value cannot draw blobs.
+    pub fn radius(&self) -> f32 {
+        if self.corner_radius.is_finite() {
+            self.corner_radius.clamp(0.0, CORNER_RADIUS_MAX)
+        } else {
+            CORNER_RADIUS
+        }
+    }
 }
 
 fn path(root: &Path) -> PathBuf {
@@ -246,6 +275,45 @@ mod tests {
     }
 
     #[test]
+    fn legacy_inset_follows_opacity() {
+        // Files written before the checkbox inset only while fully opaque.
+        let mut settings = Settings::default();
+        assert!(!settings.inset_card());
+        settings.opacity = 1.0;
+        assert!(settings.inset_card());
+    }
+
+    #[test]
+    fn explicit_inset_ignores_opacity() {
+        let mut settings = Settings {
+            inset: Some(true),
+            ..Settings::default()
+        };
+        assert!(settings.inset_card());
+        settings.inset = Some(false);
+        settings.opacity = 1.0;
+        assert!(!settings.inset_card());
+    }
+
+    #[test]
+    fn missing_corner_radius_keeps_the_old_look() {
+        let back: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert_eq!(back.radius(), CORNER_RADIUS);
+    }
+
+    #[test]
+    fn radius_clamps_to_the_slider_range() {
+        let mut settings = Settings::default();
+        settings.corner_radius = -3.0;
+        assert_eq!(settings.radius(), 0.0);
+        settings.corner_radius = 99.0;
+        assert_eq!(settings.radius(), CORNER_RADIUS_MAX);
+        settings.corner_radius = f32::NAN;
+        assert_eq!(settings.radius(), CORNER_RADIUS);
+    }
+
+    #[test]
     fn glass_opacity_clamps_to_a_usable_range() {
         let mut settings = Settings::default();
         assert_eq!(settings.glass_opacity(), OPACITY);
@@ -285,6 +353,8 @@ mod tests {
             notifications: false,
             opacity: 0.7,
             blur: 0.5,
+            inset: Some(true),
+            corner_radius: 0.0,
             pi_gui_auto: true,
             sidebar_workspace_paths: true,
             sidebar_agent_paths: true,

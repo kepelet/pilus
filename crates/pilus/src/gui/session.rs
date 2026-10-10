@@ -41,7 +41,7 @@ use serde_json::Value;
 use crate::settings::Settings;
 
 use super::PilusView;
-use super::style::{self, FillExt, Fonts};
+use super::style::{self, FillExt, Fonts, RadiusExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
 
@@ -2509,7 +2509,7 @@ impl SessionPanel {
             .gap_1()
             .px_2()
             .py(px(1.0))
-            .rounded_md()
+            .radius_md()
             .bg(theme.panel_dim)
             .text_size(px(fonts.label))
             .text_color(color)
@@ -2526,7 +2526,7 @@ impl SessionPanel {
             .gap_2()
             .px_4()
             .py_3()
-            .rounded_lg()
+            .radius_lg()
             .bg(theme.panel)
             .text_size(px(fonts.body))
             .text_color(theme.panel_fg)
@@ -3367,7 +3367,7 @@ impl SessionPanel {
                     .gap_1()
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .radius_md()
                     .bg(theme.panel_dim)
                     .child(
                         div()
@@ -3407,7 +3407,7 @@ impl SessionPanel {
         let mut bar = div()
             .flex()
             .flex_col()
-            .rounded_lg()
+            .radius_lg()
             .bg(theme.panel)
             .child(
                 div().flex().flex_row().px_3().pt_3().child(
@@ -3576,7 +3576,7 @@ impl SessionPanel {
             // could spare.
             .p_1()
             .flex_shrink_0()
-            .rounded_full()
+            .radius_full()
             .bg(theme.bg);
         // The fill goes in before the glyph so it paints beneath it.
         if active {
@@ -3610,7 +3610,7 @@ impl SessionPanel {
                 .w(px(30.0))
                 .h(px(30.0))
                 .flex_shrink_0()
-                .rounded_full()
+                .radius_full()
                 .cursor_pointer()
                 .state_fill(theme.panel, theme.border, style::RADIUS_FULL)
                 .child(super::icon(glyph, 15.0, theme.panel_fg))
@@ -5288,7 +5288,7 @@ fn header_icon_button(id: &'static str, glyph: &'static [u8], theme: Theme) -> S
         .w(px(28.0))
         .h(px(28.0))
         .flex_shrink_0()
-        .rounded_md()
+        .radius_md()
         .cursor_pointer()
         .hover_fill(theme.border, style::RADIUS_MD)
         .child(super::icon(glyph, 15.0, theme.muted))

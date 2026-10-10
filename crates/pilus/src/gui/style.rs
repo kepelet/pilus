@@ -7,18 +7,18 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AbsoluteLength, Animation, AnimationElement, AnimationExt, AnyElement, App, Bounds, Context,
-    Corners, DispatchPhase, Div, Edges, Element, ElementId, Font, FontWeight, GlobalElementId,
-    Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, Length,
-    MouseMoveEvent, Path, PathBuilder, Pixels, Point, Position, Rems, Render, Rgba, SharedString,
-    Stateful, Style, Transformation, Window, canvas, div, font, percentage, point, prelude::*, px,
-    svg,
+    Animation, AnimationElement, AnimationExt, AnyElement, App, Bounds, Context, Corners,
+    DispatchPhase, Div, Edges, Element, ElementId, Font, FontWeight, GlobalElementId, Hitbox,
+    HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, Length, MouseMoveEvent, Path,
+    PathBuilder, Pixels, Point, Position, Render, Rgba, SharedString, Stateful, Style,
+    Transformation, Window, canvas, div, font, percentage, point, prelude::*, px, svg,
 };
 
-use crate::settings::{CHROME_FONT, Settings};
+use crate::settings::{CHROME_FONT, CORNER_RADIUS, Settings};
 
 use super::theme::Theme;
 
@@ -40,12 +40,97 @@ const METER_EASE: Duration = Duration::from_millis(420);
 /// How long a selection pill takes to glide to its new target. A touch
 /// longer than a fill fade: the spring's settle needs room to read.
 const GLIDE: Duration = Duration::from_millis(340);
-/// `rounded_sm`'s radius, for a fill under a dense list row.
-pub(super) const RADIUS_SM: AbsoluteLength = AbsoluteLength::Rems(Rems(0.25));
-/// `rounded_md`'s radius, for a fill under a control, row, or card.
-pub(super) const RADIUS_MD: AbsoluteLength = AbsoluteLength::Rems(Rems(0.375));
-/// `rounded_full`'s radius, for a fill under a pill or round button.
-pub(super) const RADIUS_FULL: AbsoluteLength = AbsoluteLength::Pixels(px(9999.0));
+/// A radius step, resolved against the user's corner-radius setting when it
+/// is drawn: never a fixed length, so every rounded element follows the
+/// Appearances slider and zero squares them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Radius {
+    /// Square whatever the setting: a row that meets its neighbours flush.
+    None,
+    /// A fill under a dense list row.
+    Sm,
+    /// A control, row, card, or overlay.
+    Md,
+    /// A large floating panel.
+    Lg,
+    /// A pill, status dot, or round button: fully round whatever the
+    /// setting, since a square one stops reading as what it is.
+    Full,
+    /// A tab or the inset card: never squarer than the default radius, so
+    /// zero corners leave the strip and the terminal's frame soft.
+    Soft,
+}
+
+/// The corner radius in logical pixels, as `f32` bits so any window can read
+/// it without threading the settings through every builder. The windows
+/// share one thread and one setting, and [`sync_corner_radius`] writes it
+/// before they build their trees.
+static CORNER_RADIUS_PX: AtomicU32 = AtomicU32::new(CORNER_RADIUS.to_bits());
+
+/// Publish the user's corner radius for [`Radius`] to resolve against.
+pub(super) fn sync_corner_radius(settings: &Settings) {
+    CORNER_RADIUS_PX.store(settings.radius().to_bits(), Ordering::Relaxed);
+}
+
+impl Radius {
+    /// This step's radius, scaled from the `Md` base the setting names.
+    pub(super) fn pixels(self) -> Pixels {
+        let base = f32::from_bits(CORNER_RADIUS_PX.load(Ordering::Relaxed));
+        match self {
+            Self::None => px(0.0),
+            Self::Sm => px(base * 2.0 / 3.0),
+            Self::Md => px(base),
+            Self::Lg => px(base * 4.0 / 3.0),
+            Self::Full => px(9999.0),
+            Self::Soft => px(base.max(CORNER_RADIUS)),
+        }
+    }
+}
+
+/// `Radius::Sm`, for a fill under a dense list row.
+pub(super) const RADIUS_SM: Radius = Radius::Sm;
+/// `Radius::Md`, for a fill under a control, row, or card.
+pub(super) const RADIUS_MD: Radius = Radius::Md;
+/// `Radius::Full`, for a fill under a pill or round button.
+pub(super) const RADIUS_FULL: Radius = Radius::Full;
+/// `Radius::Soft`, for a fill under a tab.
+pub(super) const RADIUS_SOFT: Radius = Radius::Soft;
+
+/// The `rounded_*` family, resolved through [`Radius`] instead of GPUI's fixed
+/// rems. Chrome calls these so the corner-radius setting reaches it; a fixed
+/// `rounded_md()` is a bug even when the default happens to match.
+pub(super) trait RadiusExt: Styled + Sized {
+    fn radius_sm(self) -> Self {
+        self.rounded(Radius::Sm.pixels())
+    }
+
+    fn radius_md(self) -> Self {
+        self.rounded(Radius::Md.pixels())
+    }
+
+    fn radius_lg(self) -> Self {
+        self.rounded(Radius::Lg.pixels())
+    }
+
+    fn radius_soft(self) -> Self {
+        self.rounded(Radius::Soft.pixels())
+    }
+
+    fn radius_full(self) -> Self {
+        self.rounded(Radius::Full.pixels())
+    }
+
+    fn radius_t_lg(self) -> Self {
+        self.rounded_t(Radius::Lg.pixels())
+    }
+
+    fn radius_b_lg(self) -> Self {
+        self.rounded_b(Radius::Lg.pixels())
+    }
+}
+
+impl<E: Styled> RadiusExt for E {}
+
 /// How long a disclosure chevron takes to turn between its two states.
 const CHEVRON_TURN: Duration = Duration::from_millis(160);
 /// One full turn of the working spinner.
@@ -143,7 +228,7 @@ pub(super) fn chip(theme: Theme, text: impl IntoElement, size: f32) -> Div {
         .flex_shrink_0()
         .h(px(size * 1.7))
         .px(px(6.0))
-        .rounded_sm()
+        .radius_sm()
         .border_1()
         .border_color(theme.border)
         .text_size(px(size))
@@ -221,7 +306,7 @@ pub(super) fn tab(
         .gap_2()
         .h(px(super::TAB_HEIGHT))
         .px_3()
-        .rounded_md()
+        .radius_md()
         .text_color(if active { theme.panel_fg } else { theme.muted })
         .text_size(px(text_size))
         .cursor_pointer()
@@ -248,7 +333,7 @@ pub(super) fn toggle(id: impl Into<ElementId>, on: bool, theme: Theme) -> Statef
         .id(id)
         .w(px(38.0))
         .h(px(20.0))
-        .rounded_full()
+        .radius_full()
         .cursor_pointer()
         .state_fill(track, track, RADIUS_FULL)
         .child(Knob {
@@ -431,7 +516,9 @@ impl Element for Knob {
         );
         let knob = Bounds::new(origin, gpui::size(px(KNOB), px(KNOB)));
         let color = mix(self.off_color.into(), self.on_color.into(), position);
-        window.paint_quad(gpui::fill(knob, color).corner_radii(px(KNOB / 2.0)));
+        // Round like the track around it, so a square toggle keeps a square knob.
+        let radius = Radius::Full.pixels().min(px(KNOB / 2.0));
+        window.paint_quad(gpui::fill(knob, color).corner_radii(radius));
     }
 }
 
@@ -465,7 +552,7 @@ pub(super) fn slider<V: Render>(
         .items_center()
         .flex_1()
         .h(px(6.0))
-        .rounded_full()
+        .radius_full()
         .bg(theme.panel_dim)
         .child(
             div()
@@ -474,14 +561,14 @@ pub(super) fn slider<V: Render>(
                 .flex_row()
                 .items_center()
                 .justify_end()
-                .rounded_full()
+                .radius_full()
                 .bg(theme.accent)
                 .flex_grow(value)
                 .child(
                     div()
                         .w(px(10.0))
                         .h(px(10.0))
-                        .rounded_full()
+                        .radius_full()
                         .bg(theme.panel_fg)
                         .mr(px(2.0)),
                 ),
@@ -588,7 +675,7 @@ pub(super) fn meter(
         .w_full()
         .h(px(height))
         .flex_shrink_0()
-        .rounded_full()
+        .radius_full()
         .bg(Hsla::from(theme.muted).opacity(0.18))
         .child(Meter {
             fraction: fraction.unwrap_or(0.0).clamp(0.0, 1.0),
@@ -703,13 +790,9 @@ impl Element for Meter {
                 bounds.size.height,
             ),
         );
-        window.paint_quad(
-            gpui::fill(fill, self.color).corner_radii(Corners::all(px(bounds
-                .size
-                .height
-                .as_f32()
-                / 2.0))),
-        );
+        window.paint_quad(gpui::fill(fill, self.color).corner_radii(Corners::all(
+            Radius::Full.pixels().min(bounds.size.height / 2.0),
+        )));
     }
 }
 
@@ -827,7 +910,7 @@ fn button_at(
         // The accent button has no border to dim alongside its fill, so it
         // takes the border's width as padding to stay as wide as its siblings.
         .px(if primary { padding + px(1.0) } else { padding })
-        .rounded_md()
+        .radius_md()
         .text_color(fg)
         .when(!primary, |button| button.border_1().border_color(border))
         .text_size(px(text_size))
@@ -874,7 +957,7 @@ pub(super) fn skeleton(
     div()
         .w(width)
         .h(px(height))
-        .rounded_full()
+        .radius_full()
         .bg(theme.panel_dim)
         .with_animation(
             id,
@@ -911,19 +994,14 @@ pub(super) fn enter<E: IntoElement + Styled + 'static>(
 /// must be the first child to sit beneath them.
 pub(super) trait FillExt: ParentElement + Styled + Sized {
     /// Ease the background to `hover` while the pointer is over it.
-    fn hover_fill(self, hover: impl Into<Hsla>, radius: AbsoluteLength) -> Self {
+    fn hover_fill(self, hover: impl Into<Hsla>, radius: Radius) -> Self {
         self.state_fill(gpui::transparent_black(), hover, radius)
     }
 
     /// Ease between a resting fill and `hover`. The resting fill animates
     /// too, so a row whose selection changes slides its pill in and out.
     /// It replaces the element's own `.bg()`, which would snap underneath.
-    fn state_fill(
-        self,
-        rest: impl Into<Hsla>,
-        hover: impl Into<Hsla>,
-        radius: AbsoluteLength,
-    ) -> Self {
+    fn state_fill(self, rest: impl Into<Hsla>, hover: impl Into<Hsla>, radius: Radius) -> Self {
         self.relative().child(Fill {
             rest: rest.into(),
             hover: hover.into(),
@@ -938,7 +1016,7 @@ impl<E: ParentElement + Styled> FillExt for E {}
 struct Fill {
     rest: Hsla,
     hover: Hsla,
-    radius: AbsoluteLength,
+    radius: Radius,
 }
 
 /// A fill's transition, kept across frames under the layer's element id.
@@ -1070,7 +1148,7 @@ impl Element for Fill {
             None => target,
         };
         if color.a > 0.0 {
-            let radius = self.radius.to_pixels(window.rem_size());
+            let radius = self.radius.pixels();
             window.paint_quad(
                 gpui::fill(bounds, color)
                     .corner_radii(Corners::all(radius).clamp_radii_for_quad_size(bounds.size)),
@@ -1134,13 +1212,15 @@ pub(super) fn glide(
     id: impl Into<ElementId>,
     slot: &GlideSlot,
     color: Rgba,
-    radius: AbsoluteLength,
+    radius: Radius,
+    bleed: f32,
 ) -> impl IntoElement {
     Glide {
         id: id.into(),
         slot: slot.clone(),
         color,
         radius,
+        bleed,
     }
 }
 
@@ -1166,13 +1246,15 @@ pub(super) fn hover_glide(
     id: impl Into<ElementId>,
     slot: &HoverSlot,
     color: Rgba,
-    radius: AbsoluteLength,
+    radius: Radius,
+    bleed: f32,
 ) -> impl IntoElement {
     HoverGlide {
         id: id.into(),
         slot: slot.clone(),
         color,
         radius,
+        bleed,
     }
 }
 
@@ -1238,7 +1320,8 @@ struct HoverGlide {
     id: ElementId,
     slot: HoverSlot,
     color: Rgba,
-    radius: AbsoluteLength,
+    radius: Radius,
+    bleed: f32,
 }
 
 /// The pill's flight and fade, in coordinates relative to the pill layer's
@@ -1383,11 +1466,14 @@ impl Element for HoverGlide {
             ((pill, alpha), state)
         });
         if alpha > 0.0 {
-            let pill = Bounds {
-                origin: pill.origin + bounds.origin,
-                size: pill.size,
-            };
-            let radius = self.radius.to_pixels(window.rem_size());
+            let pill = bled(
+                Bounds {
+                    origin: pill.origin + bounds.origin,
+                    size: pill.size,
+                },
+                self.bleed,
+            );
+            let radius = self.radius.pixels();
             let color = Rgba {
                 a: self.color.a * alpha,
                 ..self.color
@@ -1478,7 +1564,8 @@ struct Glide {
     id: ElementId,
     slot: GlideSlot,
     color: Rgba,
-    radius: AbsoluteLength,
+    radius: Radius,
+    bleed: f32,
 }
 
 /// A glide's flight, in coordinates relative to the pill layer's origin so
@@ -1603,15 +1690,31 @@ impl Element for Glide {
             };
             (pill, state)
         });
-        let pill = Bounds {
-            origin: pill.origin + bounds.origin,
-            size: pill.size,
-        };
-        let radius = self.radius.to_pixels(window.rem_size());
+        let pill = bled(
+            Bounds {
+                origin: pill.origin + bounds.origin,
+                size: pill.size,
+            },
+            self.bleed,
+        );
+        let radius = self.radius.pixels();
         window.paint_quad(
             gpui::fill(pill, self.color)
                 .corner_radii(Corners::all(radius).clamp_radii_for_quad_size(pill.size)),
         );
+    }
+}
+
+/// A pill widened by `bleed` on both sides while the corner radius is zero,
+/// so a square selection or hover fill runs flush to the edge of the list it
+/// sits in instead of leaving the rounded pill's gap.
+fn bled(pill: Bounds<Pixels>, bleed: f32) -> Bounds<Pixels> {
+    if bleed <= 0.0 || Radius::Md.pixels() > px(0.0) {
+        return pill;
+    }
+    Bounds {
+        origin: point(pill.origin.x - px(bleed), pill.origin.y),
+        size: gpui::size(pill.size.width + px(2.0 * bleed), pill.size.height),
     }
 }
 
@@ -1713,7 +1816,7 @@ pub(super) fn field(
                 .items_center()
                 .min_h(px(height))
                 .px_2()
-                .rounded_md()
+                .radius_md()
                 .bg(theme.panel_dim)
                 .border_1()
                 .border_color(if focused {
@@ -1765,7 +1868,7 @@ pub(super) fn qr_code(text: &str, side: f32) -> Div {
         .w(px(plate))
         .h(px(plate))
         .flex_shrink_0()
-        .rounded_md()
+        .radius_md()
         .overflow_hidden()
         .bg(light)
         .child(
@@ -1836,7 +1939,7 @@ pub(super) fn board_card(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .rounded_md()
+        .radius_md()
         .border_1()
         .border_color(theme.border)
         .cursor_pointer()
@@ -1851,7 +1954,7 @@ pub(super) fn board_card(
                     .top_0()
                     .left_0()
                     .size_full()
-                    .rounded_md()
+                    .radius_md()
                     .border_1()
                     .border_color(theme.border_focus),
             )

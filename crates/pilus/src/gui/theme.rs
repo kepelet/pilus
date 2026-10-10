@@ -125,6 +125,12 @@ impl Theme {
         }
     }
 
+    /// Whether this is a light scheme: a lighter ground than its text.
+    /// Translucency is dark-glass only, so light schemes stay opaque.
+    pub fn is_light(self) -> bool {
+        luminance(self.window_bg) > luminance(self.fg)
+    }
+
     /// The glass fill behind the sidebar, the tab strip, and any native page
     /// that owns the card, at window opacity `glass`.
     ///

@@ -21,7 +21,7 @@ use markdown::mdast::Node;
 
 use crate::settings::Settings;
 
-use super::style::{self, Fonts};
+use super::style::{self, Fonts, RadiusExt};
 use super::theme::Theme;
 
 /// Render `source` as a vertical stack of blocks.
@@ -310,7 +310,7 @@ fn block(
                 .flex_col()
                 .gap_1()
                 .mx_1()
-                .rounded_md()
+                .radius_md()
                 .bg(theme.panel_dim)
                 .px_3()
                 .py_2()
@@ -342,7 +342,7 @@ fn block(
                     div()
                         .w(px(2.0))
                         .flex_shrink_0()
-                        .rounded_full()
+                        .radius_full()
                         .bg(theme.border),
                 )
                 .child(inner)
@@ -504,7 +504,7 @@ fn inline(
                 Atom::Code { value, trailing } => {
                     let chip = div()
                         .px_1()
-                        .rounded_sm()
+                        .radius_sm()
                         .bg(theme.panel_dim)
                         .font_family(mono.to_string())
                         .child(value);

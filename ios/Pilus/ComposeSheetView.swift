@@ -218,12 +218,7 @@ struct ComposeSheetView: View {
                 ProgressView()
                     .frame(width: 32, height: 32)
             } else {
-                Image(systemName: "arrow.up")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(canSend ? .primary : .secondary)
-                    .frame(width: 36, height: 36)
-                    .modifier(GlassCircle())
-                    .opacity(canSend ? 1 : 0.45)
+                SendArrow(enabled: canSend, size: 36)
             }
         }
         .disabled(!canSend || running)

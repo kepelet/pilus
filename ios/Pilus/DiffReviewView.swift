@@ -708,6 +708,7 @@ private struct NoteComposerSheet: View {
                                 if saved { dismiss() }
                             }
                         }
+                        .buttonStyle(.borderedProminent)
                         .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }

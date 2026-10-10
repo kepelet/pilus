@@ -16,6 +16,7 @@ struct AgentDetailView: View {
     @State private var sending = false
     @State private var showingInfo = false
     @State private var showingDiff = false
+    @State private var showingLog = false
     /// The shortcut strip starts folded — it shares the composer row's width.
     @State private var shortcutsExpanded = false
     /// Owned here so the keyboard-down shortcut can resign the field.
@@ -37,6 +38,9 @@ struct AgentDetailView: View {
     @State private var readingOutput = false
     @State private var outputPending = false
     private static let maxCaptureLines = 16384
+    /// The send button's diameter, and the height of one line of the reply.
+    private static let sendSize: CGFloat = 30
+    private static let lineHeight: CGFloat = 22
 
     var body: some View {
         VStack(spacing: 0) {
@@ -63,7 +67,9 @@ struct AgentDetailView: View {
                     shortcutToggle
                 }
                 .padding(.horizontal, 2)
-                HStack(spacing: 8) {
+                // Bottom-aligned so the send button stays at the corner as the
+                // field grows upward.
+                HStack(alignment: .bottom, spacing: 8) {
                     TextField("Reply to \(agent.title)…", text: $reply, axis: .vertical)
                         .lineLimit(1...5)
                         .textFieldStyle(.plain)
@@ -72,19 +78,25 @@ struct AgentDetailView: View {
                         // commands and flags.
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
+                        // Centers one line on the send button; more lines grow
+                        // the field from there.
+                        .padding(.vertical, (Self.sendSize - Self.lineHeight) / 2)
                     if sending {
-                        // The send button's footprint, held so the capsule
+                        // The send button's footprint, held so the field
                         // does not collapse while the spinner swaps in.
                         ProgressView()
-                            .frame(width: 29, height: 29)
+                            .frame(width: Self.sendSize, height: Self.sendSize)
                     } else {
                         sendButton
                     }
                 }
-                .padding(.leading, 14)
+                .padding(.leading, 16)
                 .padding(.trailing, 6)
                 .padding(.vertical, 6)
-                .modifier(GlassCapsule())
+                // A capsule's radius is half its height, so a tall field
+                // balloons into an oval. One fixed radius is a capsule at one
+                // line and a rounded rectangle after.
+                .modifier(GlassRounded(radius: Self.sendSize / 2 + 6))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -120,6 +132,16 @@ struct AgentDetailView: View {
                 }
                 .buttonStyle(.plain)
             }
+            // The host's commit history for the workspace it has open.
+            ToolbarItem(placement: .topBarTrailing) {
+                if store.supports("git.log", on: agent.machine) {
+                    Button { showingLog = true } label: {
+                        Image(systemName: "clock.arrow.circlepath")
+                    }
+                    .tint(.primary)
+                    .accessibilityLabel("Git log")
+                }
+            }
             // The Mac's changed files, with notes to hand back to an agent.
             // Only offered when the connector lets this device read a diff.
             ToolbarItem(placement: .topBarTrailing) {
@@ -146,6 +168,9 @@ struct AgentDetailView: View {
         }
         .sheet(isPresented: $showingDiff) {
             DiffReviewSheet(agent: agent)
+        }
+        .sheet(isPresented: $showingLog) {
+            GitLogSheet(agent: agent)
         }
         // The paired host's watch says when this pane wrote output, so the
         // screen is re-read then. The timer is only a safety net while the
@@ -201,14 +226,7 @@ struct AgentDetailView: View {
             }
             .disabled(!store.canSend(.pasteText(""), to: agent))
         } label: {
-            Image(systemName: "arrow.up")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Color(.systemBackground))
-                .padding(7)
-                .background(
-                    canSend ? Color.primary : Color.secondary.opacity(0.3),
-                    in: Circle()
-                )
+            SendArrow(enabled: canSend, size: Self.sendSize)
         } primaryAction: {
             log.info("send tapped")
             Task { await send() }
@@ -335,6 +353,23 @@ struct AgentDetailView: View {
             log.error("send failed: \(error.localizedDescription)")
             sendError = error.localizedDescription
             if (error as? PilusError)?.isUnconfirmed == true { await refresh(silent: true) }
+        }
+    }
+}
+
+/// Liquid Glass rounded rectangle where available, material + hairline
+/// elsewhere — the reply field's shape, which a capsule cannot hold once the
+/// text wraps.
+private struct GlassRounded: ViewModifier {
+    var radius: CGFloat
+
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: .rect(cornerRadius: radius))
+        } else {
+            content
+                .background(.regularMaterial, in: .rect(cornerRadius: radius))
+                .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(.quaternary))
         }
     }
 }
@@ -481,6 +516,8 @@ private struct AgentInfoSheet: View {
             Button("Save alias") {
                 Task { await saveAlias() }
             }
+            .buttonStyle(.borderedProminent)
+            .frame(maxWidth: .infinity)
             .disabled(savingAlias || !AppStore.isValidAlias(alias))
             if let aliasError {
                 Text(aliasError).font(.footnote).foregroundStyle(.red)

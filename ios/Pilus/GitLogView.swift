@@ -109,16 +109,10 @@ final class GitLogModel {
 struct GitLogSheet: View {
     let agent: Agent
     @Environment(AppStore.self) private var store
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             GitLogView(model: GitLogModel(store: store, machine: agent.machine))
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("Done") { dismiss() }
-                    }
-                }
         }
     }
 }

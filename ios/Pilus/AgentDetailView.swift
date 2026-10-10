@@ -70,7 +70,7 @@ struct AgentDetailView: View {
                 // Bottom-aligned so the send button stays at the corner as the
                 // field grows upward.
                 HStack(alignment: .bottom, spacing: 8) {
-                    TextField("Reply to \(agent.title)…", text: $reply, axis: .vertical)
+                    TextField("Reply to \(agent.title)", text: $reply, axis: .vertical)
                         .lineLimit(1...5)
                         .textFieldStyle(.plain)
                         .focused($replyFocused)
@@ -132,35 +132,24 @@ struct AgentDetailView: View {
                 }
                 .buttonStyle(.plain)
             }
-            // The host's commit history for the workspace it has open.
+            // Everything about the session lives behind ⋯: the record itself,
+            // the Mac's changed files (with notes to hand back to an agent,
+            // offered only when the connector lets this device read a diff),
+            // and the host's commit history for the workspace it has open.
             ToolbarItem(placement: .topBarTrailing) {
-                if store.supports("git.log", on: agent.machine) {
-                    Button { showingLog = true } label: {
-                        Image(systemName: "clock.arrow.circlepath")
+                Menu {
+                    Button("Session Info", systemImage: "info.circle") { showingInfo = true }
+                    if store.canViewDiff {
+                        Button("Changes", systemImage: "plusminus") { showingDiff = true }
                     }
-                    .tint(.primary)
-                    .accessibilityLabel("Git log")
-                }
-            }
-            // The Mac's changed files, with notes to hand back to an agent.
-            // Only offered when the connector lets this device read a diff.
-            ToolbarItem(placement: .topBarTrailing) {
-                if store.canViewDiff {
-                    Button { showingDiff = true } label: {
-                        Image(systemName: "plusminus")
+                    if store.supports("git.log", on: agent.machine) {
+                        Button("History", systemImage: "clock.arrow.circlepath") { showingLog = true }
                     }
-                    .tint(.primary)
-                    .accessibilityLabel("Review changes")
-                }
-            }
-            // The full record lives behind ⋯ — title, kind, status, and cwd
-            // render unclipped in a sheet.
-            ToolbarItem(placement: .topBarTrailing) {
-                Button { showingInfo = true } label: {
+                } label: {
                     Image(systemName: "ellipsis")
                 }
                 .tint(.primary)
-                .accessibilityLabel("Details")
+                .accessibilityLabel("More")
             }
         }
         .sheet(isPresented: $showingInfo) {
@@ -168,9 +157,11 @@ struct AgentDetailView: View {
         }
         .sheet(isPresented: $showingDiff) {
             DiffReviewSheet(agent: agent)
+                .presentationDragIndicator(.hidden)
         }
         .sheet(isPresented: $showingLog) {
             GitLogSheet(agent: agent)
+                .presentationDragIndicator(.hidden)
         }
         // The paired host's watch says when this pane wrote output, so the
         // screen is re-read then. The timer is only a safety net while the
@@ -281,7 +272,7 @@ struct AgentDetailView: View {
                 }
                 Spacer(minLength: 0)
                 Text(content.isEmpty
-                     ? AttributedString("Reading pane…")
+                     ? AttributedString("Reading pane")
                      : ANSIRenderer.attributed(content))
                     .font(.system(.caption, design: .monospaced))
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -458,7 +449,6 @@ extension AgentDetailView {
 private struct AgentInfoSheet: View {
     let agent: Agent
     let detail: AgentDetail?
-    @Environment(\.dismiss) private var dismiss
     @Environment(AppStore.self) private var store
     @State private var alias = ""
     @State private var savingAlias = false
@@ -495,37 +485,34 @@ private struct AgentInfoSheet: View {
             }
             .navigationTitle("Session")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
-                }
-            }
         }
         .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.hidden)
         .onAppear { alias = detail?.name ?? agent.name ?? "" }
     }
 
     /// The host's operator alias for this pane — how a named agent is found
-    /// again from a script or another device.
+    /// again from a script or another device. Whatever is typed is folded
+    /// into a name the daemon accepts, so there is no rule to explain.
     private var aliasSection: some View {
-        Section {
-            TextField("e.g. reviewer", text: $alias)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .font(.system(.body, design: .monospaced))
-            Button("Save alias") {
-                Task { await saveAlias() }
+        Section("Alias") {
+            HStack(spacing: 12) {
+                TextField("e.g. reviewer", text: $alias)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .onChange(of: alias) { _, typed in
+                        let folded = AppStore.normalizedAlias(typed)
+                        if folded != typed { alias = folded }
+                    }
+                Button("Save") {
+                    Task { await saveAlias() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(savingAlias)
             }
-            .buttonStyle(.borderedProminent)
-            .frame(maxWidth: .infinity)
-            .disabled(savingAlias || !AppStore.isValidAlias(alias))
             if let aliasError {
                 Text(aliasError).font(.footnote).foregroundStyle(.red)
             }
-        } header: {
-            Text("Alias")
-        } footer: {
-            Text("Lowercase letters, digits, - and _, starting with a letter. Empty clears it.")
         }
     }
 

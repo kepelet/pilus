@@ -639,9 +639,22 @@ final class AppStore {
         await refresh(topics: ["agents"], machines: [agent.machine])
     }
 
-    /// Whether `name` is an alias the daemon accepts; empty clears it.
-    static func isValidAlias(_ name: String) -> Bool {
-        name.isEmpty || name.range(of: "^[a-z][a-z0-9_-]{0,31}$", options: .regularExpression) != nil
+    /// `input` folded into the shape the daemon accepts: lowercase, spaces
+    /// and dashes as `-`, everything else outside `a-z 0-9 _ -` dropped, a
+    /// letter first, at most 32 characters. Empty stays empty, which clears
+    /// the alias.
+    static func normalizedAlias(_ input: String) -> String {
+        var folded = ""
+        for character in input.lowercased() {
+            if character.isWhitespace || character == "-" {
+                folded.append("-")
+            } else if character == "_" || (character.isASCII && (character.isLetter || character.isNumber)) {
+                folded.append(character)
+            }
+        }
+        // The first character must be a letter.
+        let start = folded.firstIndex(where: { $0.isLetter }) ?? folded.endIndex
+        return String(folded[start...].prefix(32))
     }
 
     /// Whether `input` can be sent to `agent`'s machine.

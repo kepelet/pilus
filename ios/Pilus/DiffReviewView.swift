@@ -231,16 +231,10 @@ final class DiffReviewModel {
 struct DiffReviewSheet: View {
     let agent: Agent
     @Environment(AppStore.self) private var store
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             DiffReviewView(model: DiffReviewModel(store: store, machine: agent.machine, agent: agent))
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("Done") { dismiss() }
-                    }
-                }
         }
     }
 }
@@ -686,7 +680,7 @@ private struct NoteComposerSheet: View {
                     }
                     .pickerStyle(.segmented)
                 }
-                TextField("Leave a note for this change…", text: $text, axis: .vertical)
+                TextField("Leave a note for this change", text: $text, axis: .vertical)
                     .lineLimit(3...10)
                     .focused($focused)
             }
@@ -716,6 +710,7 @@ private struct NoteComposerSheet: View {
             .onAppear { focused = true }
         }
         .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.hidden)
     }
 }
 
@@ -792,6 +787,7 @@ struct SendNotesSheet: View {
             }
         }
         .presentationDetents([.medium])
+        .presentationDragIndicator(.hidden)
     }
 
     private func send(to target: Agent) {

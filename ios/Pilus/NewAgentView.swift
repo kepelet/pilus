@@ -74,7 +74,7 @@ struct NewAgentView: View {
                 Section("Workspace") {
                     Picker("Target", selection: $newWorkspace) {
                         Text("Existing workspace").tag(false)
-                        Text("New workspace…").tag(true)
+                        Text("New workspace").tag(true)
                     }
                     .pickerStyle(.segmented)
                     if newWorkspace {

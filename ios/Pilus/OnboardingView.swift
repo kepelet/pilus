@@ -154,6 +154,7 @@ private struct ManualPairSheet: View {
             }
         }
         .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.hidden)
     }
 
     /// Pasting a `pilus://pair/…` link into the ticket field fills all three

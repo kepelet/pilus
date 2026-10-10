@@ -36,7 +36,7 @@ struct HomeComposerView: View {
                     .padding(.bottom, 2)
             }
             VStack(alignment: .leading, spacing: 8) {
-                TextField("Plan, ask, build…", text: draft, axis: .vertical)
+                TextField("Plan, ask, build", text: draft, axis: .vertical)
                     .lineLimit(3...5)
                     .textFieldStyle(.plain)
                     .focused(promptFocused)
@@ -131,8 +131,13 @@ struct HomeComposerView: View {
             Menu {
                 ForEach(models) { entry in
                     Button { model = entry.name } label: {
-                        Label(entry.name,
-                              systemImage: model == entry.name ? "checkmark" : "cpu")
+                        Label {
+                            Text(entry.name)
+                        } icon: {
+                            if model == entry.name {
+                                Image(systemName: "checkmark")
+                            }
+                        }
                     }
                 }
             } label: {

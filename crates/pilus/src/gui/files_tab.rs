@@ -713,8 +713,9 @@ impl PilusView {
         });
     }
 
-    /// Ask for files with the system picker and upload them to the tree's root.
-    fn files_pick_upload(&mut self, cx: &mut Context<Self>) {
+    /// Ask for files with the system picker and upload them to `into`, or the
+    /// tree's root.
+    fn files_pick_upload(&mut self, into: Option<String>, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -723,7 +724,7 @@ impl PilusView {
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = picked.await {
-                this.update(cx, |this, cx| this.files_upload(paths, None, cx))
+                this.update(cx, |this, cx| this.files_upload(paths, into, cx))
                     .ok();
             }
         })
@@ -835,6 +836,15 @@ impl PilusView {
                 "",
                 cx,
             ),
+            Item::Upload => {
+                // Like a drop: a folder takes the files, a file's neighbours do.
+                let into = if *dir {
+                    path.clone()
+                } else {
+                    parent_of(path).unwrap_or(path).to_string()
+                };
+                self.files_pick_upload(Some(into), cx);
+            }
             _ => {}
         }
     }
@@ -1206,7 +1216,7 @@ impl PilusView {
                 false,
                 false,
             )
-            .on_click(cx.listener(|this, _, _, cx| this.files_pick_upload(cx)));
+            .on_click(cx.listener(|this, _, _, cx| this.files_pick_upload(None, cx)));
         let host = div()
             .flex()
             .flex_row()

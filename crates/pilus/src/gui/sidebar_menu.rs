@@ -95,6 +95,8 @@ pub enum Item {
     NewFile,
     /// Create a folder in the folder the menu is on.
     NewFolder,
+    /// Pick local files to upload into the folder the menu is on.
+    Upload,
     /// Delete a file, or a folder and its contents. Destructive.
     Delete,
     /// Send the clipboard to the focused pane.
@@ -156,6 +158,7 @@ impl Item {
             }
             Self::NewFile => "New File",
             Self::NewFolder => "New Folder",
+            Self::Upload => "Upload Files…",
             Self::Delete => "Delete",
             Self::CopySelection => "Copy",
             Self::Paste => "Paste",
@@ -307,7 +310,7 @@ fn terminal_rows(selection: bool) -> Vec<Item> {
 /// destructive row alone at the end. The root keeps only the rows that make
 /// sense for the folder the tree is showing.
 fn file_rows(root: bool) -> Vec<Item> {
-    let mut items = vec![Item::NewFile, Item::NewFolder, Item::Divider];
+    let mut items = vec![Item::NewFile, Item::NewFolder, Item::Upload, Item::Divider];
     if !root {
         items.push(Item::Rename);
     }
@@ -418,6 +421,7 @@ mod tests {
             vec![
                 Item::NewFile,
                 Item::NewFolder,
+                Item::Upload,
                 Item::Divider,
                 Item::CopyPath
             ]

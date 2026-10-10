@@ -20,6 +20,7 @@ use pilus_client::Task;
 
 use super::picker::{self, DirSource};
 use super::style::{self, FillExt, RadiusExt};
+use super::toast::ToastKind;
 use super::{
     EndpointId, PICKER_CHIP_H, PICKER_MENU_MAX_H, PilusView, icon, picker_face, picker_menu,
 };
@@ -154,8 +155,8 @@ const DEP_REFRESH: Duration = Duration::from_secs(60);
 
 /// What a background load reports back to the window.
 pub(super) enum TasksMsg {
-    /// A line for the page footer.
-    Status(String),
+    /// An operation's outcome, shown as a toast.
+    Status(Result<String, String>),
     Folders {
         key: (EndpointId, String),
         result: Result<Vec<String>, String>,
@@ -467,8 +468,12 @@ impl PilusView {
     /// Fold one background answer into the page.
     pub(super) fn tasks_receive(&mut self, message: TasksMsg) {
         match message {
-            TasksMsg::Status(text) => {
-                self.tasks_panel.status = text;
+            TasksMsg::Status(result) => {
+                self.tasks_panel.status.clear();
+                match result {
+                    Ok(text) => self.toast(ToastKind::Success, text),
+                    Err(error) => self.toast(ToastKind::Error, error),
+                }
                 // The daemon changed a task: re-read a machine we poll.
                 let machine = self.scope_machine();
                 if let Some(fetched) = self.tasks_panel.remote.get_mut(&machine) {

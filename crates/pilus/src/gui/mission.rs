@@ -28,6 +28,7 @@ use pilus_client::{MissionRow, MissionScope, MissionSnapshot};
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
+use super::toast::ToastKind;
 use super::{
     EndpointId, PICKER_CHIP_H, PICKER_MENU_MAX_H, PilusView, agent_icon, icon, picker_face,
     picker_menu, status_color,
@@ -126,8 +127,9 @@ pub(super) enum MissionMsg {
         result: Result<(MissionSnapshot, HashMap<String, String>), String>,
     },
     Budget(Option<f64>),
-    /// An action landed (or failed); re-read so the rows catch up.
-    Done(String),
+    /// An action landed (or failed); re-read so the rows catch up, and toast
+    /// the outcome.
+    Done(Result<String, String>),
 }
 
 /// The page's own state; the rows live on the last snapshot.
@@ -542,9 +544,13 @@ impl PilusView {
                 }
             }
             MissionMsg::Budget(budget) => panel.budget = budget,
-            MissionMsg::Done(text) => {
-                panel.status = text;
+            MissionMsg::Done(result) => {
+                panel.status.clear();
                 panel.fetched_at = None;
+                match result {
+                    Ok(text) => self.toast(ToastKind::Success, text),
+                    Err(error) => self.toast(ToastKind::Error, error),
+                }
             }
         }
     }
@@ -622,7 +628,9 @@ impl PilusView {
     fn mission_spawn(
         &mut self,
         pending: String,
-        call: impl FnOnce(&mut pilus_client::ControlClient) -> pilus_client::Result<String>
+        call: impl FnOnce(
+            &mut pilus_client::ControlClient,
+        ) -> pilus_client::Result<Result<String, String>>
         + Send
         + 'static,
         cx: &mut Context<Self>,
@@ -631,11 +639,13 @@ impl PilusView {
         let client = self.control_client_for_endpoint(&self.active);
         self.mission.status = pending;
         std::thread::spawn(move || {
-            let text = match client {
-                Some(mut client) => call(&mut client).unwrap_or_else(|error| error.to_string()),
-                None => "Could not reach the daemon".to_string(),
+            let result = match client {
+                Some(mut client) => call(&mut client)
+                    .map_err(|error| error.to_string())
+                    .and_then(|outcome| outcome),
+                None => Err("Could not reach the daemon".to_string()),
             };
-            tx.send(MissionMsg::Done(text)).ok();
+            tx.send(MissionMsg::Done(result)).ok();
         });
         cx.notify();
     }
@@ -668,7 +678,7 @@ impl PilusView {
             .find(|workspace| workspace.id == row.workspace_id)
             .map(|workspace| workspace.cwd.clone());
         let Some(cwd) = cwd else {
-            self.mission.status = "That session's workspace is not open".to_string();
+            self.toast(ToastKind::Error, "That session's workspace is not open");
             cx.notify();
             return;
         };
@@ -695,9 +705,9 @@ impl PilusView {
                 match session {
                     Some(session) => {
                         client.resume_agent(&session.session_id)?;
-                        Ok(format!("Resumed {agent}"))
+                        Ok(Ok(format!("Resumed {agent}")))
                     }
-                    None => Ok(format!("Could not find that {agent} session")),
+                    None => Ok(Err(format!("Could not find that {agent} session"))),
                 }
             },
             cx,
@@ -713,7 +723,7 @@ impl PilusView {
             if op == RowOp::Close {
                 self.mission.dismissed.insert(key);
                 self.mission.selection = None;
-                self.mission.status = format!("Dismissed {} session", row.agent);
+                self.toast(ToastKind::Info, format!("Dismissed {} session", row.agent));
                 cx.notify();
             }
             return;
@@ -734,12 +744,12 @@ impl PilusView {
                     RowOp::Fork => client.fork_agent(&pane)?,
                     RowOp::Close => client.close_pane(&pane)?,
                 }
-                Ok(match op {
+                Ok(Ok(match op {
                     RowOp::Approve => format!("Approved {agent}"),
                     RowOp::Stop => format!("Interrupted {agent}"),
                     RowOp::Fork => format!("Forked {agent}"),
                     RowOp::Close => format!("Closed {agent}"),
-                })
+                }))
             },
             cx,
         );
@@ -775,7 +785,7 @@ impl PilusView {
             format!("Answering {agent}…"),
             move |client| {
                 client.prompt_agent(&pane, &text)?;
-                Ok(format!("Answered {agent}"))
+                Ok(Ok(format!("Answered {agent}")))
             },
             cx,
         );

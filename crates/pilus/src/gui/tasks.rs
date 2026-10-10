@@ -22,6 +22,7 @@ use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::task_compose::{ComposeState, Fetched, Scope, TaskPicker, TasksMsg};
 use super::text_input::TextInput;
 use super::theme::Theme;
+use super::toast::ToastKind;
 use super::{EndpointId, PilusView, agent_icon, icon};
 
 /// Which slice of the queue the list shows.
@@ -450,7 +451,7 @@ impl PilusView {
         };
         let title = read(ComposeField::Title, self).trim().to_string();
         if title.is_empty() {
-            self.tasks_panel.status = "A task needs a title".to_string();
+            self.toast(ToastKind::Info, "A task needs a title");
             cx.notify();
             return;
         }
@@ -463,7 +464,7 @@ impl PilusView {
             gate: read(ComposeField::Gate, self).trim().to_string(),
         };
         let Some(workspace) = self.compose_workspace() else {
-            self.tasks_panel.status = "Open a workspace to queue a task".to_string();
+            self.toast(ToastKind::Info, "Open a workspace to queue a task");
             cx.notify();
             return;
         };
@@ -474,10 +475,10 @@ impl PilusView {
         let client = self.control_client_for_endpoint(&machine);
         std::thread::spawn(move || {
             let message = match client.map(|mut client| client.add_task(&task, &workspace.id)) {
-                Some(Ok(Some(task))) => format!("Added {}", task.id),
-                Some(Ok(None)) => "Added task".to_string(),
-                Some(Err(error)) => format!("Could not add task: {error}"),
-                None => "Could not reach the daemon".to_string(),
+                Some(Ok(Some(task))) => Ok(format!("Added {}", task.id)),
+                Some(Ok(None)) => Ok("Added task".to_string()),
+                Some(Err(error)) => Err(format!("Could not add task: {error}")),
+                None => Err("Could not reach the daemon".to_string()),
             };
             tx.send(TasksMsg::Status(message)).ok();
         });
@@ -495,7 +496,7 @@ impl PilusView {
             .and_then(|task| task.workspace_id.clone())
             .or_else(|| self.active_workspace_id());
         if op == TaskOp::Start && workspace_id.is_none() {
-            self.tasks_panel.status = "Open a workspace to start a task".to_string();
+            self.toast(ToastKind::Info, "Open a workspace to start a task");
             cx.notify();
             return;
         }
@@ -513,9 +514,9 @@ impl PilusView {
                 TaskOp::Lifecycle(action) => client.task_action(action, &id),
             });
             let message = match result {
-                Some(Ok(())) => op.done_text(&id),
-                Some(Err(error)) => format!("{} failed: {error}", op.label()),
-                None => "Could not reach the daemon".to_string(),
+                Some(Ok(())) => Ok(op.done_text(&id)),
+                Some(Err(error)) => Err(format!("{} failed: {error}", op.label())),
+                None => Err("Could not reach the daemon".to_string()),
             };
             tx.send(TasksMsg::Status(message)).ok();
         });

@@ -1,9 +1,13 @@
-//! Markdown rendering for the Pi Session transcript.
+//! Markdown rendering for the Pi Session transcript and for documents.
 //!
 //! Pi mostly replies in Markdown (CommonMark plus GFM). This module parses a
 //! reply with `markdown` (the markdown-rs crate) and paints its mdast as GPUI
 //! elements: paragraphs and inline runs (bold, italic, code, links), headings,
 //! fenced code blocks, lists, block quotes, tables, and rules.
+//!
+//! A file is drawn the same way, a block at a time: [`Document`] keeps the
+//! parsed blocks with the source lines each covers, so the viewer can virtualize
+//! the list and set a review note under the block its lines fall in.
 //!
 //! Inline styling rides one [`Text`] per paragraph, so wrapping stays natural;
 //! each run carries its own font and color. A paragraph with inline code lays
@@ -24,6 +28,82 @@ use crate::settings::Settings;
 use super::style::{self, Fonts, RadiusExt};
 use super::theme::Theme;
 
+/// Parse `source` into its top-level nodes.
+///
+/// Front matter is only read for a file: in a chat reply a leading `---` is a
+/// rule, and treating it as front matter would swallow the text after it.
+fn parse(source: &str, front_matter: bool) -> Vec<Node> {
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.frontmatter = front_matter;
+    match markdown::to_mdast(source, &options) {
+        Ok(Node::Root(root)) => root.children,
+        Ok(node) => vec![node],
+        // A parse failure falls back to the raw text, never a blank reply.
+        Err(_) => vec![Node::Text(markdown::mdast::Text {
+            value: source.to_string(),
+            position: None,
+        })],
+    }
+}
+
+/// One top-level block of a [`Document`] and the source lines it covers.
+pub(super) struct Block {
+    node: Node,
+    /// First and last source line, 1-based, as a review note counts them.
+    pub(super) first_line: u32,
+    pub(super) last_line: u32,
+}
+
+impl Block {
+    pub(super) fn is_heading(&self) -> bool {
+        matches!(self.node, Node::Heading(_))
+    }
+}
+
+/// A parsed file: its blocks in source order.
+pub(super) struct Document {
+    blocks: Vec<Block>,
+}
+
+impl Document {
+    pub(super) fn parse(source: &str) -> Self {
+        let mut line = 1;
+        let blocks = parse(source, true)
+            .into_iter()
+            .map(|node| {
+                let (first_line, last_line) = node
+                    .position()
+                    .map(|at| (at.start.line as u32, at.end.line as u32))
+                    // A node without a position sits where the last one ended.
+                    .unwrap_or((line, line));
+                line = last_line;
+                Block {
+                    node,
+                    first_line,
+                    last_line,
+                }
+            })
+            .collect();
+        Self { blocks }
+    }
+
+    pub(super) fn blocks(&self) -> &[Block] {
+        &self.blocks
+    }
+}
+
+/// Paint one block of a document at the body size.
+pub(super) fn render_block(
+    block: &Block,
+    theme: Theme,
+    fonts: Fonts,
+    settings: &Rc<RefCell<Settings>>,
+) -> AnyElement {
+    let chrome: SharedString = style::chrome_font(settings).family;
+    let mono = style::mono_family(settings);
+    self::block(&block.node, theme, fonts, &chrome, &mono, fonts.body)
+}
+
 /// Render `source` as a vertical stack of blocks.
 pub(super) fn render(
     source: &str,
@@ -34,15 +114,7 @@ pub(super) fn render(
     let chrome = style::chrome_font(settings);
     let chrome_family: SharedString = chrome.family.clone();
     let mono = style::mono_family(settings);
-    let nodes = match markdown::to_mdast(source, &markdown::ParseOptions::gfm()) {
-        Ok(Node::Root(root)) => root.children,
-        Ok(node) => vec![node],
-        // A parse failure falls back to the raw text, never a blank reply.
-        Err(_) => vec![Node::Text(markdown::mdast::Text {
-            value: source.to_string(),
-            position: None,
-        })],
-    };
+    let nodes = parse(source, false);
     let mut column = div().flex().flex_col().gap_2();
     for node in &nodes {
         column = column.child(block(node, theme, fonts, &chrome_family, &mono, fonts.body));
@@ -169,7 +241,9 @@ impl<'a> Inline<'a> {
     /// Walk one inline node, threading `style` into its children.
     fn walk(&mut self, node: &Node, style: Style) {
         match node {
-            Node::Text(text) => self.push(&text.value, style),
+            // A newline inside a paragraph is a soft break: it reads as a
+            // space, and only a `Break` node is a line break.
+            Node::Text(text) => self.push(&text.value.replace('\n', " "), style),
             Node::InlineCode(code) => self.push(
                 &code.value,
                 Style {
@@ -304,31 +378,15 @@ fn block(
                 Some(FontWeight::BOLD),
             )
         }
-        Node::Code(code) => {
-            let mut card = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .mx_1()
-                .radius_md()
-                .bg(theme.panel_dim)
-                .px_3()
-                .py_2()
-                .overflow_hidden()
-                .text_size(px(fonts.secondary))
-                .text_color(theme.fg)
-                .whitespace_normal()
-                .font_family(mono.to_string());
-            if let Some(lang) = code.lang.as_deref().filter(|lang| !lang.is_empty()) {
-                card = card.child(
-                    div()
-                        .text_size(px(fonts.label))
-                        .text_color(theme.muted)
-                        .child(lang.to_string()),
-                );
-            }
-            card.child(code.value.clone()).into_any_element()
-        }
+        Node::Code(code) => code_card(
+            code.lang.as_deref().filter(|lang| !lang.is_empty()),
+            &code.value,
+            theme,
+            fonts,
+            mono,
+        ),
+        Node::Yaml(front) => code_card(Some("front matter"), &front.value, theme, fonts, mono),
+        Node::Toml(front) => code_card(Some("front matter"), &front.value, theme, fonts, mono),
         Node::Blockquote(quote) => {
             let mut inner = div().flex().flex_col().gap_2().flex_1().min_w(px(0.0));
             for child in &quote.children {
@@ -367,11 +425,16 @@ fn block(
             .into_any_element(),
         Node::Table(table) => {
             let mut column = div().flex().flex_col().gap_1();
-            for row in &table.children {
+            for (index, row) in table.children.iter().enumerate() {
                 let Node::TableRow(row) = row else {
                     continue;
                 };
+                // The first row names the columns, so it reads as a header.
+                let header = index == 0;
                 let mut line = div().flex().flex_row().gap_3();
+                if header {
+                    line = line.pb_1().border_b_1().border_color(theme.border);
+                }
                 for cell in &row.children {
                     let Node::TableCell(cell) = cell else {
                         continue;
@@ -382,7 +445,7 @@ fn block(
                         chrome,
                         mono,
                         size,
-                        None,
+                        header.then_some(FontWeight::BOLD),
                     )));
                 }
                 column = column.child(line);
@@ -411,6 +474,40 @@ fn block(
             None => div().into_any_element(),
         },
     }
+}
+
+/// A monospace card for code or front matter, with its language or kind
+/// above it.
+fn code_card(
+    label: Option<&str>,
+    value: &str,
+    theme: Theme,
+    fonts: Fonts,
+    mono: &str,
+) -> AnyElement {
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .mx_1()
+        .radius_md()
+        .bg(theme.panel_dim)
+        .px_3()
+        .py_2()
+        .overflow_hidden()
+        .text_size(px(fonts.secondary))
+        .text_color(theme.fg)
+        .whitespace_normal()
+        .font_family(mono.to_string());
+    if let Some(label) = label {
+        card = card.child(
+            div()
+                .text_size(px(fonts.label))
+                .text_color(theme.muted)
+                .child(label.to_string()),
+        );
+    }
+    card.child(value.to_string()).into_any_element()
 }
 
 /// One list item: a marker beside its first block, with later blocks aligned.
@@ -575,6 +672,46 @@ mod tests {
         // The space rides with the comma, so no prose atom starts with
         // whitespace and a wrap cannot indent the continuation.
         assert!(matches!(&atoms[2], Atom::Prose { text, .. } if text == "then read the output."));
+    }
+
+    #[test]
+    fn a_document_keeps_each_blocks_source_lines() {
+        let source = "# Title\n\nFirst paragraph\nstill first.\n\n- one\n- two\n";
+        let document = Document::parse(source);
+        let lines: Vec<(u32, u32)> = document
+            .blocks()
+            .iter()
+            .map(|block| (block.first_line, block.last_line))
+            .collect();
+        assert_eq!(lines, vec![(1, 1), (3, 4), (6, 7)]);
+        assert!(document.blocks()[0].is_heading());
+        assert!(!document.blocks()[1].is_heading());
+    }
+
+    #[test]
+    fn a_file_reads_front_matter_but_a_chat_reply_does_not() {
+        let source = "---\ntitle: Notes\n---\n\nBody\n";
+        let file = Document::parse(source);
+        assert!(matches!(file.blocks()[0].node, Node::Yaml(_)));
+        assert_eq!(
+            (file.blocks()[0].first_line, file.blocks()[0].last_line),
+            (1, 3)
+        );
+        // As a reply, the leading rule stays a rule.
+        assert!(matches!(parse(source, false)[0], Node::ThematicBreak(_)));
+    }
+
+    #[test]
+    fn a_soft_line_break_reads_as_a_space() {
+        let soft = atoms("first line\nsecond line");
+        assert!(matches!(&soft[0], Atom::Prose { text, .. } if text == "first line second line"));
+        let hard = atoms("first  \nsecond");
+        assert!(matches!(&hard[0], Atom::Prose { text, .. } if text.contains('\n')));
+    }
+
+    #[test]
+    fn an_empty_file_has_no_blocks() {
+        assert!(Document::parse("").blocks().is_empty());
     }
 
     #[test]

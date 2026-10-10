@@ -20,13 +20,14 @@ use gpui::{
 };
 use pilus_client::{
     Agent, ControlClient, DiffFile, DiffLayer, DiffNote, DiffSnapshot, FileDiff, NoteKind,
-    NoteRange, NoteSelection, NoteSide, NoteState,
+    NoteRange, NoteSelection, NoteSide, NoteState, TextFile, Version, read_text,
 };
 
 use super::diff_model::{
     self as model, Cursor, Display, FileFilter, Flat, LayoutMode, Row, Src, SrcKind,
 };
 use super::highlight::Token;
+use super::md_view::{self, Composing, MdDoc, Page};
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
@@ -61,8 +62,22 @@ pub(super) enum DiffMsg {
         fingerprint: String,
         result: Result<FileDiff, String>,
     },
+    /// A markdown file's text, read for the rendered view.
+    Text {
+        key: FileKey,
+        fingerprint: String,
+        result: Result<TextFile, String>,
+    },
     /// A note operation finished; the text becomes a toast.
     Done(Result<String, String>),
+}
+
+/// A changed markdown file's rendered form, for the version of it the
+/// fingerprint names.
+struct MdText {
+    key: FileKey,
+    fingerprint: String,
+    state: Result<MdDoc, String>,
 }
 
 /// A file's diff, flattened and laid out.
@@ -127,6 +142,9 @@ const MENU_DISMISS_WINDOW: Duration = Duration::from_millis(250);
 struct Sending {
     scope: SendScope,
     pick: usize,
+    /// The note a card's Send button named, which the picker sends instead of
+    /// the one under the cursor.
+    note: Option<String>,
 }
 
 /// The page's own state.
@@ -143,6 +161,10 @@ pub(super) struct DiffPanel {
     loading: Option<(FileKey, String)>,
     filter: FileFilter,
     mode: LayoutMode,
+    /// Show a markdown file rendered rather than as a patch.
+    rendered: bool,
+    md: Option<MdText>,
+    md_loading: Option<(FileKey, String)>,
     cursor: Cursor,
     /// Set while a range is being selected for a note.
     anchor: Option<usize>,
@@ -187,6 +209,9 @@ impl DiffPanel {
             loading: None,
             filter: FileFilter::default(),
             mode: LayoutMode::default(),
+            rendered: true,
+            md: None,
+            md_loading: None,
             cursor: Cursor::start(),
             anchor: None,
             composer: None,
@@ -235,6 +260,7 @@ impl DiffPanel {
         *self = Self {
             filter: self.filter,
             mode: self.mode,
+            rendered: self.rendered,
             viewed: std::mem::take(&mut self.viewed),
             list_h: self.list_h,
             tx,
@@ -261,6 +287,42 @@ impl DiffPanel {
         self.files()
             .iter()
             .find(|file| file.layer == *layer && file.path == *path)
+    }
+
+    /// Whether the open file is shown as a rendered document: a markdown file
+    /// that still exists, with the preview on.
+    fn previewing(&self) -> bool {
+        self.rendered && self.selected_file().is_some_and(previewable)
+    }
+
+    /// The rendered document of the open file, once its text has arrived.
+    pub(super) fn md_view(&self) -> Option<&MdDoc> {
+        let md = self.md.as_ref()?;
+        (self.selected.as_ref() == Some(&md.key))
+            .then(|| md.state.as_ref().ok())
+            .flatten()
+    }
+
+    /// The open file, by layer and path.
+    pub(super) fn selected_key(&self) -> Option<(DiffLayer, String)> {
+        self.selected.clone()
+    }
+
+    pub(super) fn file_note(&self, index: usize) -> Option<&DiffNote> {
+        self.file_notes.get(index)
+    }
+
+    /// The note an open agent picker would send for the Note scope: the one
+    /// a card named, else the one under the cursor.
+    fn note_for_send(&self) -> Option<&DiffNote> {
+        match self
+            .sending
+            .as_ref()
+            .and_then(|sending| sending.note.as_deref())
+        {
+            Some(id) => self.file_notes.iter().find(|note| note.id == id),
+            None => self.note_at_cursor(),
+        }
     }
 
     /// The note under the cursor, if one covers the cursor's line.
@@ -351,6 +413,12 @@ pub(super) fn status_glyph(theme: Theme, layer: DiffLayer, status: &str) -> (&st
         (_, "A") => ("A", theme.ok),
         _ => (status, theme.branch),
     }
+}
+
+/// Whether a changed file has a rendered form: markdown text that exists on
+/// disk or in the index.
+fn previewable(file: &DiffFile) -> bool {
+    md_view::is_markdown(&file.path) && !file.binary && file.status != "D"
 }
 
 pub(super) fn split_path(path: &str) -> (&str, &str) {
@@ -447,6 +515,30 @@ impl PilusView {
                     }
                 }
             }
+            DiffMsg::Text {
+                key,
+                fingerprint,
+                result,
+            } => {
+                let panel = &mut self.diff_panel;
+                if panel.md_loading.as_ref() == Some(&(key.clone(), fingerprint.clone())) {
+                    panel.md_loading = None;
+                }
+                // An answer for a file that is no longer open, or an older
+                // version of it, would paint the wrong document.
+                let current = panel.selected_file().is_some_and(|file| {
+                    (file.layer, file.path.as_str()) == (key.0, key.1.as_str())
+                        && file.fingerprint == fingerprint
+                });
+                if !current {
+                    return;
+                }
+                panel.md = Some(MdText {
+                    key,
+                    fingerprint,
+                    state: result.map(|file| MdDoc::new(&file)),
+                });
+            }
             DiffMsg::Done(result) => {
                 self.diff_panel.status.clear();
                 match result {
@@ -474,6 +566,8 @@ impl PilusView {
             let first = panel.visible().first().map(|&at| panel.files()[at].key());
             panel.selected = first.map(|(layer, path)| (layer, path.to_string()));
             panel.loaded = None;
+            panel.md = None;
+            panel.md_loading = None;
             panel.refresh_file_notes();
         }
         self.diff_fetch_if_stale();
@@ -482,6 +576,7 @@ impl PilusView {
     /// Request the selected file's diff when the loaded one is missing or
     /// out of date.
     fn diff_fetch_if_stale(&mut self) {
+        self.diff_fetch_text_if_stale();
         let panel = &self.diff_panel;
         let Some(file) = panel.selected_file() else {
             return;
@@ -506,6 +601,61 @@ impl PilusView {
                     .map_err(|error| error.to_string()),
             };
             tx.send(DiffMsg::File {
+                key,
+                fingerprint,
+                result,
+            })
+            .ok();
+        });
+    }
+
+    /// Read the open markdown file's text when the preview wants a version of
+    /// it that is not loaded or on its way. The patch carries only the hunks,
+    /// so the document is read where the file lives.
+    fn diff_fetch_text_if_stale(&mut self) {
+        let panel = &self.diff_panel;
+        if !panel.previewing() {
+            return;
+        }
+        let (Some(file), Some(snapshot)) = (panel.selected_file(), panel.snapshot.as_ref()) else {
+            return;
+        };
+        let want = ((file.layer, file.path.clone()), file.fingerprint.clone());
+        let current = panel
+            .md
+            .as_ref()
+            .is_some_and(|md| md.key == want.0 && md.fingerprint == want.1);
+        if current || panel.md_loading.as_ref() == Some(&want) {
+            return;
+        }
+        let (repo, layer) = (snapshot.repo.clone(), file.layer);
+        let target = match self.read_target(&self.active) {
+            Ok(target) => target,
+            Err(error) => {
+                self.diff_panel.md = Some(MdText {
+                    key: want.0,
+                    fingerprint: want.1,
+                    state: Err(error),
+                });
+                return;
+            }
+        };
+        self.diff_panel.md_loading = Some(want.clone());
+        let tx = self.diff_panel.tx.clone();
+        std::thread::spawn(move || {
+            let (key, fingerprint) = want;
+            let absolute = format!("{}/{}", repo.trim_end_matches('/'), key.1);
+            let version = match layer {
+                // A staged file's diff describes the index, which the working
+                // copy may have moved on from.
+                DiffLayer::Staged => Version::Index {
+                    repo: &repo,
+                    path: &key.1,
+                },
+                _ => Version::Disk(&absolute),
+            };
+            let result = read_text(target.as_ref(), version);
+            tx.send(DiffMsg::Text {
                 key,
                 fingerprint,
                 result,
@@ -558,6 +708,8 @@ impl PilusView {
         panel.selected = Some(key);
         panel.loaded = None;
         panel.loading = None;
+        panel.md = None;
+        panel.md_loading = None;
         panel.composer = None;
         panel.anchor = None;
         panel.confirm_delete = None;
@@ -584,7 +736,24 @@ impl PilusView {
         };
         let file = &panel.files()[visible[next]];
         let key = (file.layer, file.path.clone());
-        self.diff_select(key, cx);
+        self.diff_pick(key, cx);
+    }
+
+    /// Open a file the user chose, as a step the column's Back returns from.
+    fn diff_pick(&mut self, key: FileKey, cx: &mut Context<Self>) {
+        self.right_navigate(cx, |this, cx| this.diff_select(key, cx));
+    }
+
+    /// Flip between the rendered document and the patch for a markdown file.
+    fn diff_toggle_rendered(&mut self, cx: &mut Context<Self>) {
+        let panel = &mut self.diff_panel;
+        panel.rendered = !panel.rendered;
+        // The form's place means a patch row in one view and a block in the
+        // other, so it does not survive the switch.
+        panel.composer = None;
+        panel.anchor = None;
+        self.diff_fetch_text_if_stale();
+        cx.notify();
     }
 
     /// Bring the laid-out rows up to date with the width and the notes.
@@ -634,6 +803,29 @@ impl PilusView {
             }
         }
         again
+    }
+
+    /// Bring the rendered document's rows up to date with the notes and the
+    /// form. Returns whether another frame is wanted to finish a scroll.
+    fn diff_sync_preview(&mut self) -> bool {
+        use std::hash::{Hash, Hasher};
+
+        let panel = &mut self.diff_panel;
+        if !panel.previewing() {
+            return false;
+        }
+        let composing = panel.composer.as_ref().map(|composer| Composing {
+            end: composer.range.end,
+            editing: composer.editing.as_deref(),
+        });
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        panel.notes_gen.hash(&mut hasher);
+        composing.hash(&mut hasher);
+        let stamp = hasher.finish();
+        let Some(md) = panel.md.as_mut().and_then(|md| md.state.as_mut().ok()) else {
+            return false;
+        };
+        md.sync(stamp, &panel.file_notes, composing)
     }
 
     fn diff_move(&mut self, cursor: Cursor, cx: &mut Context<Self>) {
@@ -728,10 +920,51 @@ impl PilusView {
         self.diff_open_composer(cx);
     }
 
+    /// Open the form over `first..=last` of the rendered file, from a block's
+    /// comment button. The notes are on the new side: the rendered text is the
+    /// file as it now stands.
+    pub(super) fn diff_comment_on_lines(&mut self, first: u32, last: u32, cx: &mut Context<Self>) {
+        let panel = &mut self.diff_panel;
+        panel.sending = None;
+        panel.composer = Some(Composer {
+            range: NoteRange {
+                side: NoteSide::New,
+                start: first,
+                end: last,
+            },
+            // Only the patch view reads this, and the form is dropped on the
+            // way back to it.
+            after: 0,
+            kind: NoteKind::default(),
+            editing: None,
+        });
+        if let Some(md) = panel.md.as_mut().and_then(|md| md.state.as_mut().ok()) {
+            md.reveal_composer();
+        }
+        self.diff_inputs
+            .note
+            .update(cx, |input, cx| input.clear(cx));
+        cx.notify();
+    }
+
     fn diff_edit_note(&mut self, cx: &mut Context<Self>) {
-        let Some(note) = self.diff_panel.note_at_cursor().cloned() else {
+        let Some(id) = self.diff_panel.note_at_cursor().map(|note| note.id.clone()) else {
             self.toast(ToastKind::Info, "No note on this line");
             cx.notify();
+            return;
+        };
+        self.diff_edit_note_id(&id, cx);
+    }
+
+    /// Edit the note `id`, from its card or from the cursor.
+    fn diff_edit_note_id(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(note) = self
+            .diff_panel
+            .file_notes
+            .iter()
+            .find(|note| note.id == id)
+            .cloned()
+        else {
             return;
         };
         let after = self.diff_panel.loaded.as_ref().map_or(0, |loaded| {
@@ -759,6 +992,14 @@ impl PilusView {
             editing: Some(note.id.clone()),
         });
         self.diff_panel.reveal_composer = 2;
+        if let Some(md) = self
+            .diff_panel
+            .md
+            .as_mut()
+            .and_then(|md| md.state.as_mut().ok())
+        {
+            md.reveal_composer();
+        }
         self.diff_inputs
             .note
             .update(cx, |input, cx| input.set_value(note.body, cx));
@@ -884,7 +1125,7 @@ impl PilusView {
             return;
         };
         let selection = match sending.scope {
-            SendScope::Note => match self.diff_panel.note_at_cursor() {
+            SendScope::Note => match self.diff_panel.note_for_send() {
                 Some(note) => NoteSelection::Ids(vec![note.id.clone()]),
                 None => {
                     self.toast(ToastKind::Info, "Put the cursor on a note first");
@@ -953,6 +1194,10 @@ impl PilusView {
             (Some(text), 1) => text.as_str(),
             _ => key,
         };
+        if self.diff_panel.previewing() {
+            self.diff_preview_key(ch, cx);
+            return;
+        }
         let cursor = self.diff_panel.cursor;
         let (Some(loaded), selecting) = (self.diff_panel.loaded.as_ref(), self.diff_panel.anchor)
         else {
@@ -1014,6 +1259,9 @@ impl PilusView {
             }
             "]" | "[" => self.diff_jump_note(ch == "]", cx),
             "m" => self.diff_toggle_viewed(cx),
+            "p" if self.diff_panel.selected_file().is_some_and(previewable) => {
+                self.diff_toggle_rendered(cx);
+            }
             "f" => {
                 self.diff_panel.filter = self.diff_panel.filter.next();
                 cx.notify();
@@ -1034,6 +1282,48 @@ impl PilusView {
             }
             _ => {}
         }
+    }
+
+    /// Keys while a markdown file is shown as a document. There is no cursor
+    /// line to move, so the motion keys scroll; the file-level keys are the
+    /// patch's own.
+    fn diff_preview_key(&mut self, ch: &str, cx: &mut Context<Self>) {
+        const LINE: f32 = 48.0;
+        const PAGE: f32 = 320.0;
+        if let Some(md) = self
+            .diff_panel
+            .md
+            .as_ref()
+            .and_then(|md| md.state.as_ref().ok())
+        {
+            match ch {
+                "j" | "down" => md.scroll_by(LINE),
+                "k" | "up" => md.scroll_by(-LINE),
+                "d" => md.scroll_by(PAGE),
+                "u" => md.scroll_by(-PAGE),
+                "g" | "home" => md.scroll_to_edge(false),
+                "G" | "end" => md.scroll_to_edge(true),
+                _ => {}
+            }
+        }
+        match ch {
+            "J" => self.diff_step_file(1, cx),
+            "K" => self.diff_step_file(-1, cx),
+            "p" => self.diff_toggle_rendered(cx),
+            "m" => self.diff_toggle_viewed(cx),
+            "f" => {
+                self.diff_panel.filter = self.diff_panel.filter.next();
+                cx.notify();
+            }
+            "r" => self.diff_refresh_now(cx),
+            "a" => self.diff_open_send(SendScope::Review, cx),
+            "escape" | "q" => {
+                self.right.focused = false;
+                cx.notify();
+            }
+            _ => {}
+        }
+        cx.notify();
     }
 
     /// Keys while no file is open: moving through the list and leaving.
@@ -1086,7 +1376,22 @@ impl PilusView {
     /// reason there is nothing to send to is on screen rather than in a footer.
     fn diff_open_send(&mut self, scope: SendScope, cx: &mut Context<Self>) {
         self.diff_panel.composer = None;
-        self.diff_panel.sending = Some(Sending { scope, pick: 0 });
+        self.diff_panel.sending = Some(Sending {
+            scope,
+            pick: 0,
+            note: None,
+        });
+        cx.notify();
+    }
+
+    /// Open the agent picker for the note `id` alone, from its card.
+    fn diff_send_note(&mut self, id: String, cx: &mut Context<Self>) {
+        self.diff_panel.composer = None;
+        self.diff_panel.sending = Some(Sending {
+            scope: SendScope::Note,
+            pick: 0,
+            note: Some(id),
+        });
         cx.notify();
     }
 
@@ -1097,7 +1402,7 @@ impl PilusView {
     fn send_scopes(&self) -> Vec<(SendScope, usize)> {
         let panel = &self.diff_panel;
         let mut scopes = Vec::new();
-        if panel.note_at_cursor().is_some() {
+        if panel.note_for_send().is_some() {
             scopes.push((SendScope::Note, 1));
         }
         let in_file = panel
@@ -1118,7 +1423,7 @@ impl PilusView {
         let panel = &self.diff_panel;
         let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
         match scope {
-            SendScope::Note => match panel.note_at_cursor() {
+            SendScope::Note => match panel.note_for_send() {
                 Some(note) => format!("The note on {}", range_label(note)),
                 None => "No note selected".to_string(),
             },
@@ -1202,7 +1507,7 @@ impl PilusView {
                 px(fonts.body),
             );
         });
-        if self.diff_sync(split) {
+        if self.diff_sync(split) | self.diff_sync_preview() {
             cx.notify();
         }
 
@@ -1730,7 +2035,7 @@ impl PilusView {
                     ),
             )
             .child(meta)
-            .on_click(cx.listener(move |this, _, _, cx| this.diff_select(key.clone(), cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.diff_pick(key.clone(), cx)))
     }
 
     fn diff_viewer(&self, split: bool, cx: &mut Context<Self>) -> Div {
@@ -1773,6 +2078,9 @@ impl PilusView {
             return column.child(self.diff_message("Nothing matches this filter"));
         };
         let head = self.diff_file_head(file, cx);
+        if panel.previewing() {
+            return column.child(head).child(self.diff_preview(cx));
+        }
         let Some(loaded) = &panel.loaded else {
             return column.child(head).child(self.diff_message(if file.binary {
                 "Binary file".to_string()
@@ -1819,6 +2127,39 @@ impl PilusView {
         .min_h(px(0.0))
         .w_full();
         column.child(head).child(body.child(rows))
+    }
+
+    /// The open markdown file as a document, with its review notes in place.
+    fn diff_preview(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let body = div().flex().flex_col().flex_1().min_h(px(0.0));
+        let Some(md) = &self.diff_panel.md else {
+            return body.child(self.diff_message("Loading preview…"));
+        };
+        let wrong_file = self.diff_panel.selected.as_ref() != Some(&md.key);
+        let doc = match &md.state {
+            _ if wrong_file => return body.child(self.diff_message("Loading preview…")),
+            Err(error) => {
+                return body.child(self.diff_message(format!("Could not read this file: {error}")));
+            }
+            Ok(doc) => doc,
+        };
+        body.children(doc.truncated.then(|| {
+            div()
+                .px_4()
+                .py_1()
+                .flex_shrink_0()
+                .text_size(px(fonts.label))
+                .text_color(theme.alert)
+                .child("TRUNCATED: only the start of this file is shown")
+        }))
+        .child(
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .child(self.md_list(Page::Diff, cx)),
+        )
     }
 
     /// The bar over the patch: the open file, how much changed, whether it was
@@ -1885,6 +2226,52 @@ impl PilusView {
             // when none is selected; starting a selection here would drop a
             // range made with shift-click.
             .on_click(cx.listener(|this, _, _, cx| this.diff_open_composer(cx)));
+        // A markdown file reads either way; a document has its own comment
+        // button on every block, so the patch's is left out there.
+        let rendering = previewable(file).then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .gap_1()
+                .flex_shrink_0()
+                .child(
+                    style::small_button(
+                        "pilus-diff-view-preview",
+                        "Preview",
+                        if panel.rendered {
+                            ButtonKind::Secondary
+                        } else {
+                            ButtonKind::Ghost
+                        },
+                        theme,
+                        fonts.secondary,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.diff_panel.rendered {
+                            this.diff_toggle_rendered(cx);
+                        }
+                    })),
+                )
+                .child(
+                    style::small_button(
+                        "pilus-diff-view-patch",
+                        "Diff",
+                        if panel.rendered {
+                            ButtonKind::Ghost
+                        } else {
+                            ButtonKind::Secondary
+                        },
+                        theme,
+                        fonts.secondary,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.diff_panel.rendered {
+                            this.diff_toggle_rendered(cx);
+                        }
+                    })),
+                )
+        });
+        let showing_document = panel.previewing();
         div()
             .flex()
             .flex_row()
@@ -1897,6 +2284,7 @@ impl PilusView {
             .border_color(theme.border)
             .child(title)
             .child(counts)
+            .children(rendering)
             .child(
                 style::checkbox(
                     "pilus-diff-viewed",
@@ -1907,7 +2295,7 @@ impl PilusView {
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.diff_toggle_viewed(cx))),
             )
-            .child(comment)
+            .children((!showing_document).then_some(comment))
     }
 
     /// One virtualized row of the open diff.
@@ -1925,10 +2313,16 @@ impl PilusView {
             Row::Stack(src) => self.diff_stack_row(ix, src, cx),
             Row::Split { left, right } => self.diff_split_row(ix, left, right, cx),
             Row::Note(index) => match panel.file_notes.get(index) {
-                Some(note) => self.diff_note_card(note, cx),
+                Some(note) => self.diff_note_card(
+                    note,
+                    style::scaled(&self.shared_settings, GUTTER) * 2.0,
+                    cx,
+                ),
                 None => div().into_any_element(),
             },
-            Row::Composer => self.diff_composer(cx),
+            Row::Composer => {
+                self.diff_composer(style::scaled(&self.shared_settings, GUTTER) * 2.0, cx)
+            }
         }
     }
 
@@ -2242,7 +2636,14 @@ impl PilusView {
             .into_any_element()
     }
 
-    fn diff_note_card(&self, note: &DiffNote, cx: &mut Context<Self>) -> AnyElement {
+    /// A note's card, set in by `indent` so it lines up under the code of a
+    /// patch; a document has no gutter and passes 0.
+    pub(super) fn diff_note_card(
+        &self,
+        note: &DiffNote,
+        indent: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let id = note.id.clone();
@@ -2290,8 +2691,7 @@ impl PilusView {
                     fonts.secondary,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.diff_focus_note(&send_id);
-                    this.diff_open_send(SendScope::Note, cx);
+                    this.diff_send_note(send_id.clone(), cx);
                 })),
             )
             .child(
@@ -2303,8 +2703,7 @@ impl PilusView {
                     fonts.secondary,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.diff_focus_note(&edit_id);
-                    this.diff_edit_note(cx);
+                    this.diff_edit_note_id(&edit_id, cx);
                 })),
             )
             .child(
@@ -2348,7 +2747,7 @@ impl PilusView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .ml(px(style::scaled(&self.shared_settings, GUTTER) * 2.0))
+                    .ml(px(indent))
                     .p_2()
                     .radius_md()
                     .border_1()
@@ -2368,30 +2767,7 @@ impl PilusView {
             .into_any_element()
     }
 
-    /// Put the cursor on the note `id`'s first line so a card button acts on it.
-    fn diff_focus_note(&mut self, id: &str) {
-        let panel = &mut self.diff_panel;
-        let (Some(loaded), Some(note)) = (
-            panel.loaded.as_ref(),
-            panel.file_notes.iter().find(|note| note.id == id),
-        ) else {
-            return;
-        };
-        if let Some(src) = loaded.flat.src.iter().position(|src| {
-            src.kind != SrcKind::Hunk
-                && match note.side {
-                    NoteSide::Old => src.old_line,
-                    NoteSide::New => src.new_line,
-                } == Some(note.start_line)
-        }) {
-            panel.cursor = Cursor {
-                src,
-                side: note.side,
-            };
-        }
-    }
-
-    fn diff_composer(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn diff_composer(&self, indent: f32, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let Some(composer) = &self.diff_panel.composer else {
@@ -2437,7 +2813,7 @@ impl PilusView {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .ml(px(style::scaled(&self.shared_settings, GUTTER) * 2.0))
+                    .ml(px(indent))
                     .p_2()
                     .radius_md()
                     .border_1()
@@ -2833,6 +3209,91 @@ impl PilusView {
         panel.refresh_file_notes();
         self.diff_install((selected.layer, selected.path), selected.fingerprint, diff);
         cx.notify();
+    }
+
+    /// The canned review with a markdown file open as a document, a note on
+    /// two of its blocks, and one left on a line the file no longer has.
+    pub(super) fn diff_show_markdown_sample(&mut self, cx: &mut Context<Self>) {
+        self.diff_show_sample(cx);
+        let panel = &mut self.diff_panel;
+        let path = "docs/review-guide.md";
+        let file = DiffFile {
+            path: path.to_string(),
+            old_path: path.to_string(),
+            layer: DiffLayer::Worktree,
+            status: "M".to_string(),
+            additions: Some(18),
+            deletions: Some(2),
+            binary: false,
+            notes: 2,
+            viewed: false,
+            modified_since_review: false,
+            fingerprint: "fp-guide".to_string(),
+        };
+        if let Some(snapshot) = panel.snapshot.as_mut() {
+            snapshot.files.insert(0, file);
+        }
+        let note = |id: &str, side, start, end, kind, body: &str| DiffNote {
+            id: id.to_string(),
+            path: path.to_string(),
+            layer: DiffLayer::Worktree,
+            side,
+            start_line: start,
+            end_line: end,
+            kind,
+            state: NoteState::Open,
+            body: body.to_string(),
+            deliveries: 0,
+        };
+        panel.notes.extend([
+            note(
+                "md1",
+                NoteSide::New,
+                8,
+                9,
+                NoteKind::Suggestion,
+                "Name the tab and the key together, so the reader can find both.",
+            ),
+            note(
+                "md2",
+                NoteSide::New,
+                14,
+                14,
+                NoteKind::Question,
+                "Does `n` also work while a range is selected?",
+            ),
+            note(
+                "md3",
+                NoteSide::Old,
+                4,
+                4,
+                NoteKind::Issue,
+                "The old intro promised a screenshot here.",
+            ),
+        ]);
+        let key = (DiffLayer::Worktree, path.to_string());
+        panel.selected = Some(key.clone());
+        panel.loaded = None;
+        panel.sending = None;
+        panel.composer = None;
+        panel.rendered = true;
+        panel.refresh_file_notes();
+        panel.md = Some(MdText {
+            key,
+            fingerprint: "fp-guide".to_string(),
+            state: Ok(MdDoc::new(&TextFile {
+                text: md_view::SAMPLE.to_string(),
+                truncated: false,
+            })),
+        });
+        cx.notify();
+    }
+
+    /// Switch a markdown file between its document and its patch.
+    pub(super) fn diff_show_mode_rendered(&mut self, rendered: bool, cx: &mut Context<Self>) {
+        if self.diff_panel.rendered != rendered {
+            self.diff_toggle_rendered(cx);
+        }
     }
 
     pub(super) fn diff_show_menu(&mut self, filter: bool, cx: &mut Context<Self>) {

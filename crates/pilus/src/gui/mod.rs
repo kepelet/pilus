@@ -23,6 +23,7 @@ mod home;
 mod keys;
 mod machines;
 mod markdown;
+mod md_view;
 mod mission;
 mod orchestration;
 mod page_split;
@@ -33,6 +34,7 @@ mod right_sidebar;
 mod scheme;
 mod selection;
 mod session;
+mod session_ops;
 #[cfg(feature = "visual-test")]
 pub(crate) mod shots;
 mod sidebar_menu;
@@ -97,6 +99,7 @@ use pilus_protocol::{
 use right_sidebar::{RightSidebar, SidebarTab};
 use selection::{Cell, Selection};
 use session::SessionPanel;
+use session_ops::SessionVerb;
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
 use style::{FillExt, RadiusExt};
 use tasks::{TaskLayout, TasksInputs, TasksPanel};
@@ -332,6 +335,10 @@ gpui::actions!([
     ToggleSidebar,
     /// Show or hide the right sidebar (Diff and Git).
     ToggleRightSidebar,
+    /// Step back through the right sidebar's history.
+    RightSidebarBack,
+    /// Step forward through the right sidebar's history.
+    RightSidebarForward,
     /// Open the native Open Workspace picker.
     OpenWorkspacePicker,
     /// Open the footer session switcher.
@@ -424,7 +431,13 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
             let settings = settings.clone();
             let root = pilus_root.clone();
             move |_: &OpenAppearances, cx: &mut App| {
-                appearances::open(api.clone(), settings.clone(), root.clone(), cx)
+                // The frontmost window may have left the session this process
+                // launched in, and appearance belongs to the session's daemon.
+                let api = frontmost_window(cx)
+                    .and_then(|handle| handle.downcast::<PilusView>())
+                    .and_then(|handle| handle.read(cx).ok().map(PilusView::api_socket))
+                    .unwrap_or_else(|| api.clone());
+                appearances::open(api, settings.clone(), root.clone(), cx)
             }
         });
         cx.on_action({
@@ -557,6 +570,8 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
                 MenuItem::separator(),
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
                 MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
+                MenuItem::action("Right Sidebar Back", RightSidebarBack),
+                MenuItem::action("Right Sidebar Forward", RightSidebarForward),
             ]),
             Menu::new("Window").items([
                 MenuItem::action("Minimize", MinimizeWindow),
@@ -647,6 +662,8 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-0", ResetFontSize, None),
         KeyBinding::new("cmd-s", ToggleSidebar, None),
         KeyBinding::new("cmd-b", ToggleRightSidebar, None),
+        KeyBinding::new("cmd-[", RightSidebarBack, None),
+        KeyBinding::new("cmd-]", RightSidebarForward, None),
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
         KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, None),
         KeyBinding::new("cmd-shift-s", OpenSessionMenu, None),
@@ -1298,6 +1315,11 @@ struct PilusView {
     last_session_poll: Instant,
     /// Whether the session menu is open.
     session_menu_open: bool,
+    /// The row waiting on a second press before it stops or deletes.
+    session_confirm: Option<(String, SessionVerb)>,
+    /// Sessions with a start, stop, or delete in flight, so a second press
+    /// does not run the same command twice.
+    session_working: HashSet<String>,
     /// The ⌘⇧P command palette's query and selection.
     palette: Palette,
     /// The palette's query field, an IME-capable field over `palette`'s buffer.
@@ -1889,6 +1911,8 @@ impl PilusView {
             sessions,
             last_session_poll: Instant::now(),
             session_menu_open: false,
+            session_confirm: None,
+            session_working: HashSet::new(),
             palette,
             palette_input,
             palette_scroll: ScrollHandle::new(),
@@ -2258,11 +2282,25 @@ impl PilusView {
         while let Ok(op) = self.session_rx.try_recv() {
             match op {
                 SessionOpResult::Started(name) => {
+                    self.session_working.remove(&name);
                     self.sessions = list_session_infos(&self.session_root);
                     self.switch_session(&name);
                 }
                 SessionOpResult::StartFailed(name, error) => {
+                    self.session_working.remove(&name);
                     self.toast(ToastKind::Error, format!("couldn't start {name}: {error}"));
+                }
+                SessionOpResult::Done(name, verb) => {
+                    self.session_working.remove(&name);
+                    self.sessions = list_session_infos(&self.session_root);
+                    self.toast(ToastKind::Success, format!("{} {name}", verb.done()));
+                }
+                SessionOpResult::Failed(name, verb, error) => {
+                    self.session_working.remove(&name);
+                    self.toast(
+                        ToastKind::Error,
+                        format!("couldn't {} {name}: {error}", verb.verb()),
+                    );
                 }
             }
             changed = true;
@@ -3753,7 +3791,7 @@ impl PilusView {
         // An open context menu owns up/down/enter/escape until one runs or it
         // closes; an open prompt owns Enter (submit) and Escape (cancel).
         if self.context_menu.is_some() {
-            self.context_menu_key(event, cx);
+            self.context_menu_key(event, window, cx);
             return;
         }
         if self.menu_prompt.is_some() {
@@ -3895,7 +3933,7 @@ impl PilusView {
         }
         // An open session menu owns Escape; the daemon never sees it.
         if self.session_menu_open && keystroke.key == "escape" {
-            self.session_menu_open = false;
+            self.close_session_menu();
             cx.notify();
             return;
         }
@@ -8354,10 +8392,15 @@ impl PilusView {
             Some(named) => self.session_root.join("sessions").join(named),
             None => self.session_root.clone(),
         };
-        self.session_name = session;
-        self.target = ConnectTarget::socket(dir.join("luvus-client.sock"));
-        match pilus_client::connect(&self.target, self.cols, self.rows) {
+        // Only a successful attach moves the window: every feed, poll, and
+        // control call derives its socket from `session_name`, so changing it
+        // first would point them at a session the surface is not showing.
+        let target = ConnectTarget::socket(dir.join("luvus-client.sock"));
+        match pilus_client::connect(&target, self.cols, self.rows) {
             Ok(connection) => {
+                self.session_name = session;
+                self.target = target;
+                self.forget_session_scoped_state();
                 let _ = connection.request_workspace_dock();
                 self.connection = Some(connection);
                 // Machine profiles are owner-local to a named session, so a
@@ -8410,6 +8453,32 @@ impl PilusView {
         }
     }
 
+    /// Drop what was learned about the session the window is leaving.
+    ///
+    /// Pane and workspace ids restart in every daemon, so a cache keyed by
+    /// one would answer for the wrong session: a parked Pi panel would reopen
+    /// another session's conversation on a pane of the same number, and a
+    /// remembered linked-worktree path would offer to delete it.
+    fn forget_session_scoped_state(&mut self) {
+        self.pi_view = None;
+        self.session.close();
+        self.session.set_pinned(false);
+        for (_, mut panel, _) in self.pi_parked.drain(..) {
+            panel.close();
+        }
+        self.pi_released = None;
+        self.pi_optimistic = None;
+        self.pi_candidate = None;
+        self.pi_frame = None;
+        self.pi_focused = false;
+        self.pi_blurred_at = None;
+        self.recent_launches.clear();
+        self.workspace_focus.clear();
+        self.tab_focus.clear();
+        self.worktree_linked.clear();
+        self.worktree_probing.clear();
+    }
+
     /// Create a fresh session and attach to it once its socket appears.
     ///
     /// The name is generated docker-style; creation runs off the GUI thread
@@ -8417,13 +8486,75 @@ impl PilusView {
     fn start_new_session(&mut self) {
         let existing: Vec<String> = self.sessions.iter().map(|info| info.name.clone()).collect();
         let name = generate_session_name(&existing);
+        self.close_session_menu();
+        self.start_session(name);
+    }
+
+    /// Start `name`'s daemon off the GUI thread and attach once it is up.
+    ///
+    /// Attaching straight to a stopped session would start it inside
+    /// `pilus_client::connect`, on this thread, for as long as the daemon takes.
+    fn start_session(&mut self, name: String) {
+        if !self.session_working.insert(name.clone()) {
+            return;
+        }
         self.status = format!("starting {name}…");
-        self.session_menu_open = false;
         let root = self.session_root.clone();
         let tx = self.session_tx.clone();
         std::thread::spawn(move || {
             tx.send(start_session_blocking(&root, &name)).ok();
         });
+    }
+
+    /// Stop or delete `name` off the GUI thread.
+    ///
+    /// Stopping the session the window is attached to first moves the window
+    /// to another running one: a dropped local daemon is restarted by the
+    /// reconnect loop, which would undo the stop.
+    fn run_session_verb(&mut self, name: &str, verb: SessionVerb) {
+        self.session_confirm = None;
+        if !self.session_working.insert(name.to_string()) {
+            return;
+        }
+        if verb == SessionVerb::Stop && name == self.current_session_name() {
+            match session_ops::fallback(&self.sessions, name) {
+                Some(next) => self.switch_session(&next),
+                None => {
+                    self.session_working.remove(name);
+                    self.toast(
+                        ToastKind::Info,
+                        format!("{name} is the only running session"),
+                    );
+                    return;
+                }
+            }
+            // A failed attach leaves the window where it was; stopping from
+            // here would strand it on a dead session.
+            if self.current_session_name() == name {
+                self.session_working.remove(name);
+                return;
+            }
+        }
+        let root = self.session_root.clone();
+        let name = name.to_string();
+        let tx = self.session_tx.clone();
+        std::thread::spawn(move || {
+            let result = match verb {
+                SessionVerb::Stop => pilus_client::stop_session(&root, &name),
+                SessionVerb::Delete => pilus_client::delete_session(&root, &name),
+            };
+            tx.send(match result {
+                Ok(()) => SessionOpResult::Done(name, verb),
+                Err(error) => SessionOpResult::Failed(name, verb, error.to_string()),
+            })
+            .ok();
+        });
+    }
+
+    /// Close the session menu and forget a half-confirmed stop or delete.
+    fn close_session_menu(&mut self) {
+        self.session_menu_open = false;
+        self.session_confirm = None;
     }
 
     /// Check the public Luvus release manifest off the GUI thread.
@@ -9152,7 +9283,7 @@ impl PilusView {
                 *index,
                 target.clone(),
             )),
-            SidebarMenuTarget::Agent { .. } => None,
+            SidebarMenuTarget::Agent { .. } | SidebarMenuTarget::Terminal { .. } => None,
         };
         self.context_menu = Some(SidebarMenu::new(
             target,
@@ -9187,7 +9318,7 @@ impl PilusView {
         };
         let expanded = match target {
             SidebarMenuTarget::Workspace { cwd, .. } => self.expand_cwd(endpoint_key, cwd),
-            SidebarMenuTarget::Agent { .. } => return,
+            SidebarMenuTarget::Agent { .. } | SidebarMenuTarget::Terminal { .. } => return,
         };
         let workspace_id = workspace_id.to_string();
         self.worktree_probing.insert(key.clone());
@@ -9231,13 +9362,13 @@ impl PilusView {
                 .worktree_linked
                 .get(&(endpoint.clone(), workspace_id.clone()))
                 .is_some_and(Option::is_some),
-            SidebarMenuTarget::Agent { .. } => false,
+            SidebarMenuTarget::Agent { .. } | SidebarMenuTarget::Terminal { .. } => false,
         };
         menu.rows(linked)
     }
 
     /// Drive the open context menu from the keyboard.
-    fn context_menu_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn context_menu_key(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let rows = self.menu_rows();
         let quick_open = self
@@ -9296,7 +9427,7 @@ impl PilusView {
                     .filter(|index| rows.get(*index).is_some_and(|item| item.selectable()))
                     .or_else(|| rows.iter().position(|item| item.selectable()));
                 if let Some(index) = row {
-                    self.run_context_item(rows[index], cx);
+                    self.run_context_item(rows[index], window, cx);
                 }
             }
             _ => {}
@@ -9306,7 +9437,7 @@ impl PilusView {
     /// Run one hit context-menu row. The menu is cloned so the Quick Actions
     /// parent row can swap the submenu open in place; everything else closes
     /// it and runs the action.
-    fn run_context_item(&mut self, item: SidebarItem, cx: &mut Context<Self>) {
+    fn run_context_item(&mut self, item: SidebarItem, window: &Window, cx: &mut Context<Self>) {
         let Some(menu) = self.context_menu.as_ref() else {
             return;
         };
@@ -9415,11 +9546,52 @@ impl PilusView {
                 self.agents_this_workspace = !self.agents_this_workspace;
                 cx.notify();
             }
+            (SidebarMenuTarget::Terminal { .. }, item) => {
+                self.close_context_menu();
+                self.run_terminal_item(item, window, cx);
+            }
             (_, SidebarItem::Divider) => {}
             // Copy rows only exist on a WORKSPACES target; the arms above
             // cover every row the builders can emit.
             _ => {}
         }
+    }
+
+    /// Run one row of the terminal's menu. Every row is something the client
+    /// already does from a chord, so the menu is only a second way in.
+    fn run_terminal_item(&mut self, item: SidebarItem, window: &Window, cx: &mut Context<Self>) {
+        match item {
+            SidebarItem::CopySelection => self.copy_selection(cx),
+            SidebarItem::Paste => self.paste_clipboard(cx),
+            SidebarItem::SelectAll => self.select_all(window, cx),
+            SidebarItem::SplitRight => self.split("right", cx),
+            SidebarItem::SplitDown => self.split("down", cx),
+            SidebarItem::NewTab => self.new_tab(),
+            SidebarItem::CloseTab => self.close_active_tab(),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Open the terminal's own menu where the pointer is, in place of the
+    /// one the daemon would draw into the grid.
+    fn open_terminal_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hit_chrome(window, event.position) {
+            return;
+        }
+        let selection = self
+            .selection
+            .is_some_and(|selection| !selection.is_collapsed());
+        self.open_context_menu(
+            SidebarMenuTarget::Terminal { selection },
+            event.position,
+            cx,
+        );
     }
 
     /// Close a workspace from its context menu, reporting through the menu
@@ -10676,9 +10848,118 @@ impl PilusView {
                 theme.muted,
             ))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.session_menu_open = !this.session_menu_open;
+                if this.session_menu_open {
+                    this.close_session_menu();
+                } else {
+                    this.session_menu_open = true;
+                }
                 cx.notify();
             }))
+    }
+
+    /// The trailing end of a session row: its status, or the stop/delete
+    /// control, which asks for a second press before it acts.
+    fn session_row_tail(
+        &self,
+        session: &SessionInfo,
+        action: Option<SessionVerb>,
+        confirming: Option<SessionVerb>,
+        working: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = self.theme;
+        let label = |text: &'static str, color| {
+            div()
+                .text_size(px(self.footer_font()))
+                .text_color(color)
+                .child(text)
+        };
+        if working {
+            return div().child(label("working…", theme.muted));
+        }
+        let Some(verb) = action else {
+            return div().child(label(
+                if session.running {
+                    "running"
+                } else {
+                    "stopped"
+                },
+                theme.muted,
+            ));
+        };
+        let name = session.name.clone();
+        let run = cx.listener(move |this, _, _, cx| {
+            this.run_session_verb(&name, verb);
+            cx.stop_propagation();
+            cx.notify();
+        });
+        if confirming == Some(verb) {
+            return div().child(
+                style::small_button(
+                    format!("pilus-menu-session-confirm-{}", session.name),
+                    match verb {
+                        SessionVerb::Stop => "Stop?",
+                        SessionVerb::Delete => "Delete?",
+                    },
+                    style::ButtonKind::Danger,
+                    theme,
+                    self.footer_font(),
+                )
+                .on_click(run),
+            );
+        }
+        let name = session.name.clone();
+        let (glyph, tip): (&'static [u8], &str) = match verb {
+            SessionVerb::Stop => (
+                include_bytes!("../../assets/icons/square-fill.svg"),
+                "Stop session",
+            ),
+            SessionVerb::Delete => (
+                include_bytes!("../../assets/icons/trash-2.svg"),
+                "Delete session",
+            ),
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(label(
+                if session.running {
+                    "running"
+                } else {
+                    "stopped"
+                },
+                theme.muted,
+            ))
+            .child(
+                div()
+                    .id(format!(
+                        "pilus-menu-session-{}-{}",
+                        verb.verb(),
+                        session.name
+                    ))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .radius_md()
+                    .cursor_pointer()
+                    .hover_fill(theme.panel_dim, style::RADIUS_MD)
+                    .child(icon(glyph, 13.0, theme.muted))
+                    .tooltip(row_tooltip(
+                        tip.to_string(),
+                        theme.panel_fg,
+                        Vec::new(),
+                        theme,
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.session_confirm = Some((name.clone(), verb));
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
+            )
     }
 
     /// The session menu: switch sessions or start a fresh one.
@@ -10701,62 +10982,78 @@ impl PilusView {
         let pad = self.strip_pad(fullscreen);
         let menu_left = strip_left + pad + 28.0 + 4.0;
         let mut items = div().flex().flex_col().gap_1();
+        let current = self.current_session_name().to_string();
         for session in &self.sessions {
             let name = session.name.clone();
-            let is_current = session.name == self.current_session_name();
+            let is_current = session.name == current;
+            let working = self.session_working.contains(&session.name);
             let bg = if is_current {
                 theme.panel
             } else {
                 theme.sidebar_bg
             };
-            items = items.child(
-                div()
-                    .id(format!("pilus-menu-session-{}", session.name))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .h(px(28.0))
-                    .px_2()
-                    .radius_md()
-                    .cursor_pointer()
-                    .state_fill(bg, theme.panel, style::RADIUS_MD)
-                    .text_size(px(self.chrome_font()))
-                    .child(icon(
-                        if session.running {
-                            include_bytes!("../../assets/icons/cloud.svg")
+            let confirming = self
+                .session_confirm
+                .as_ref()
+                .filter(|(pending, _)| *pending == session.name)
+                .map(|(_, verb)| *verb);
+            let action = session_ops::offered(session, &current, &self.sessions);
+            let mut row = div()
+                .id(format!("pilus-menu-session-{}", session.name))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .h(px(28.0))
+                .px_2()
+                .radius_md()
+                .cursor_pointer()
+                .state_fill(bg, theme.panel, style::RADIUS_MD)
+                .text_size(px(self.chrome_font()))
+                .child(icon(
+                    if session.running {
+                        include_bytes!("../../assets/icons/cloud.svg")
+                    } else {
+                        include_bytes!("../../assets/icons/circle.svg")
+                    },
+                    14.0,
+                    theme.muted,
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_color(if session.running {
+                            theme.panel_fg
                         } else {
-                            include_bytes!("../../assets/icons/circle.svg")
-                        },
-                        14.0,
-                        theme.muted,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_color(if session.running {
-                                theme.panel_fg
-                            } else {
-                                theme.muted
-                            })
-                            .child(session.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(self.footer_font()))
-                            .text_color(theme.muted)
-                            .child(if session.running {
-                                "running"
-                            } else {
-                                "stopped"
-                            }),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.session_menu_open = false;
-                        this.switch_session(&name);
-                        cx.notify();
-                    })),
+                            theme.muted
+                        })
+                        .child(session.name.clone()),
+                );
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .child(self.session_row_tail(session, action, confirming, working, cx)),
             );
+            items = items.child(row.on_click(cx.listener(move |this, _, _, cx| {
+                // A press away from a pending confirmation only cancels it.
+                if this.session_confirm.take().is_some() {
+                    cx.notify();
+                    return;
+                }
+                let running = this
+                    .sessions
+                    .iter()
+                    .any(|session| session.name == name && session.running);
+                this.close_session_menu();
+                if running {
+                    this.switch_session(&name);
+                } else {
+                    this.start_session(name.clone());
+                }
+                cx.notify();
+            })));
         }
         items = items.child(
             div()
@@ -10811,7 +11108,7 @@ impl PilusView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
-                        this.session_menu_open = false;
+                        this.close_session_menu();
                         cx.notify();
                     }),
                 ),
@@ -10837,6 +11134,7 @@ impl PilusView {
             SidebarMenuTarget::Agent { .. } => {
                 (self.sidebar_agent_paths, self.agents_this_workspace)
             }
+            SidebarMenuTarget::Terminal { .. } => (false, false),
         };
 
         let mut items = div().flex().flex_col().gap_0();
@@ -10876,8 +11174,8 @@ impl PilusView {
                     .text_color(color)
                     .child(icon(sidebar_menu_icon(item), 15.0, color))
                     .child(div().flex_1().min_w_0().truncate().child(label))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.run_context_item(item, cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_context_item(item, window, cx);
                     })),
             );
         }
@@ -12588,8 +12886,16 @@ impl Render for PilusView {
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(|this, event: &MouseDownEvent, window, _| {
-                    this.press(event, TerminalMouseButton::Right, window);
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    // Ctrl+click is the daemon's link open, which macOS
+                    // delivers as a right click; every other right click is
+                    // this window's own menu, so the daemon never draws its
+                    // own over the grid.
+                    if this.control_held {
+                        this.press(event, TerminalMouseButton::Right, window);
+                    } else {
+                        this.open_terminal_menu(event, window, cx);
+                    }
                 }),
             )
             .on_mouse_down(
@@ -12607,7 +12913,11 @@ impl Render for PilusView {
             .on_mouse_up(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseUpEvent, window, _| {
-                    this.release(event, TerminalMouseButton::Right, window);
+                    // The press never reached the daemon unless it was a
+                    // Ctrl+click, so only that release does.
+                    if this.control_held {
+                        this.release(event, TerminalMouseButton::Right, window);
+                    }
                 }),
             )
             .on_mouse_up(
@@ -12685,6 +12995,16 @@ impl Render for PilusView {
             }))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
                 this.toggle_right_sidebar(cx);
+            }))
+            .on_action(cx.listener(|this, _: &RightSidebarBack, _window, cx| {
+                if this.right.visible {
+                    this.right_back(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RightSidebarForward, _window, cx| {
+                if this.right.visible {
+                    this.right_forward(cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
                 // The chord toggles, so pressing it again dismisses.
@@ -13807,6 +14127,13 @@ fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
         SidebarItem::OpenBoard => include_bytes!("../../assets/icons/list-checks.svg"),
         SidebarItem::OpenMission => include_bytes!("../../assets/icons/gauge.svg"),
         SidebarItem::ToggleScope => include_bytes!("../../assets/icons/monitor.svg"),
+        SidebarItem::CopySelection => include_bytes!("../../assets/icons/copy.svg"),
+        SidebarItem::Paste => include_bytes!("../../assets/icons/clipboard.svg"),
+        SidebarItem::SelectAll => include_bytes!("../../assets/icons/square-dashed.svg"),
+        SidebarItem::SplitRight => include_bytes!("../../assets/icons/columns-2.svg"),
+        SidebarItem::SplitDown => include_bytes!("../../assets/icons/rows-2.svg"),
+        SidebarItem::NewTab => include_bytes!("../../assets/icons/plus.svg"),
+        SidebarItem::CloseTab => include_bytes!("../../assets/icons/x.svg"),
         SidebarItem::Divider => include_bytes!("../../assets/icons/plus.svg"),
     }
 }
@@ -14027,10 +14354,14 @@ fn row_tooltip(
     }
 }
 
-/// Outcome of a background `luvus server start` for a fresh session.
+/// Outcome of a background session start, stop, or delete.
 enum SessionOpResult {
     Started(String),
     StartFailed(String, String),
+    /// A stop or delete finished.
+    Done(String, SessionVerb),
+    /// A stop or delete failed, with the CLI's reason.
+    Failed(String, SessionVerb, String),
 }
 
 /// Start a named session's server and wait for its socket, off-thread.

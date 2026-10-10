@@ -51,6 +51,48 @@ pub fn ensure_server_for(root: &Path, session: Option<&str>) -> Result<()> {
     start_and_wait(&binary, root, session, &socket)
 }
 
+/// Stop one named session and its panes, leaving its state on disk.
+///
+/// The daemon's own CLI does the work, so it applies the same checks as
+/// `luvus session stop`. `name` is validated first because it becomes an
+/// argument.
+pub fn stop_session(root: &Path, name: &str) -> Result<()> {
+    run_session_verb(root, "stop", name)
+}
+
+/// Delete a stopped named session's state. The CLI refuses a running session
+/// and the default one, and its message is returned as the error.
+pub fn delete_session(root: &Path, name: &str) -> Result<()> {
+    run_session_verb(root, "delete", name)
+}
+
+fn run_session_verb(root: &Path, verb: &str, name: &str) -> Result<()> {
+    crate::discovery::validate_session(name)?;
+    let binary = luvus_binary().ok_or_else(|| Error::NotFound {
+        path: root.to_path_buf(),
+    })?;
+    session_verb(&binary, root, verb, name)
+}
+
+/// Run `binary session <verb> <name>` under `root`. Split out so tests can
+/// drive the failure paths with a binary that never touches a session.
+fn session_verb(binary: &Path, root: &Path, verb: &str, name: &str) -> Result<()> {
+    let output = std::process::Command::new(binary)
+        .args(["session", verb, name])
+        .env(HOME_ENV, root)
+        .output()
+        .map_err(|error| Error::Control(error.to_string()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(Error::Control(if detail.is_empty() {
+        format!("session {verb} failed")
+    } else {
+        detail
+    }))
+}
+
 /// Run `binary server start` for `session` under `root`, then wait for
 /// `socket`. Split out so tests can drive the failure paths with a binary
 /// that never starts anything.
@@ -151,6 +193,21 @@ mod tests {
         )
         .expect_err("false always fails");
         assert!(matches!(error, Error::ServerStart(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_failed_session_verb_is_a_control_error() {
+        let error = session_verb(Path::new("/usr/bin/false"), Path::new("/tmp"), "stop", "x")
+            .expect_err("false always fails");
+        assert!(matches!(error, Error::Control(_)), "{error:?}");
+        session_verb(Path::new("/usr/bin/true"), Path::new("/tmp"), "stop", "x")
+            .expect("true always succeeds");
+    }
+
+    #[test]
+    fn an_invalid_session_name_never_reaches_the_cli() {
+        let error = stop_session(Path::new("/tmp"), "../escape").expect_err("invalid name");
+        assert!(matches!(error, Error::InvalidSession(_)), "{error:?}");
     }
 
     #[test]

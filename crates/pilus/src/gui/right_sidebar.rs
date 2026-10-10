@@ -10,10 +10,17 @@
 //! and the chrome (tab strip, resize handle, focus edge, footer). The open
 //! tab's body is drawn by `diff.rs`, `git_tab.rs`, or `files_tab.rs`, which own their data;
 //! only the open tab polls the daemon.
+//!
+//! The column keeps a browser-style history of where it has been: a tab, and
+//! the Diff's open file or the Files tab's open document. A click in the Files
+//! tab that lands in the Diff is one step, so Back returns to the tree. Pages
+//! record a step through [`PilusView::right_navigate`], and the strip's Back and
+//! Forward walk it.
 
 use std::time::Instant;
 
 use gpui::{Context, Div, MouseButton, MouseDownEvent, Stateful, div, prelude::*, px};
+use pilus_client::DiffLayer;
 
 use super::style::{self, FillExt, RadiusExt};
 use super::{HEADER_HEIGHT, PilusView, SIDEBAR_ANIM_DURATION, icon};
@@ -70,6 +77,92 @@ impl SidebarTab {
     }
 }
 
+/// Where the column was, enough to put it back.
+///
+/// Only the part its tab uses is kept, so a step on the Files tab does not
+/// differ from another by the Diff's selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct Place {
+    pub(super) tab: SidebarTab,
+    /// The Diff's open file.
+    pub(super) diff: Option<(DiffLayer, String)>,
+    /// The Files tab's open document.
+    pub(super) doc: Option<String>,
+}
+
+impl Place {
+    /// `tab` with what it shows, dropping what belongs to the other tabs.
+    pub(super) fn new(
+        tab: SidebarTab,
+        diff: Option<(DiffLayer, String)>,
+        doc: Option<String>,
+    ) -> Self {
+        Self {
+            tab,
+            diff: diff.filter(|_| tab == SidebarTab::Diff),
+            doc: doc.filter(|_| tab == SidebarTab::Files),
+        }
+    }
+}
+
+/// How many steps the history keeps.
+const HISTORY_LIMIT: usize = 64;
+
+/// The places the column has been, with the one it is at.
+pub(super) struct History {
+    places: Vec<Place>,
+    at: usize,
+}
+
+impl History {
+    pub(super) fn new(first: Place) -> Self {
+        Self {
+            places: vec![first],
+            at: 0,
+        }
+    }
+
+    pub(super) fn can_back(&self) -> bool {
+        self.at > 0
+    }
+
+    pub(super) fn can_forward(&self) -> bool {
+        self.at + 1 < self.places.len()
+    }
+
+    /// Record a move from `before` to `after`. What the history held for
+    /// "here" is replaced by `before`, since the page can drift without a step
+    /// (the Diff picks its first file by itself), and a move that lands where
+    /// it started is no step. Going somewhere new drops the forward steps.
+    pub(super) fn visit(&mut self, before: Place, after: Place) {
+        self.places[self.at] = before.clone();
+        if after == before {
+            return;
+        }
+        self.places.truncate(self.at + 1);
+        self.places.push(after);
+        if self.places.len() > HISTORY_LIMIT {
+            self.places.remove(0);
+        }
+        self.at = self.places.len() - 1;
+    }
+
+    /// Step back, returning where that is.
+    pub(super) fn back(&mut self) -> Option<Place> {
+        self.can_back().then(|| {
+            self.at -= 1;
+            self.places[self.at].clone()
+        })
+    }
+
+    pub(super) fn forward(&mut self) -> Option<Place> {
+        self.can_forward().then(|| {
+            self.at += 1;
+            self.places[self.at].clone()
+        })
+    }
+}
+
 /// A width tween from the openness the column had to the one it is going to,
 /// so a mid-flight reversal glides instead of jumping.
 struct Tween {
@@ -89,6 +182,7 @@ pub(super) struct RightSidebar {
     pub(super) visible: bool,
     pub(super) width: f32,
     pub(super) tab: SidebarTab,
+    pub(super) history: History,
     /// The keyboard is on the column rather than the terminal.
     pub(super) focused: bool,
     tween: Option<Tween>,
@@ -112,6 +206,7 @@ impl RightSidebar {
                 DEFAULT_WIDTH
             },
             tab,
+            history: History::new(Place::new(tab, None, None)),
             focused: false,
             tween: None,
             drag: None,
@@ -284,11 +379,115 @@ impl PilusView {
         if self.right.tab == tab {
             return;
         }
-        self.right.select_tab(tab);
-        self.settings.right_sidebar_tab = tab.wire().to_string();
+        self.right_navigate(cx, |this, _| this.right.select_tab(tab));
+    }
+
+    /// Where the column is now.
+    fn right_here(&self) -> Place {
+        Place::new(
+            self.right.tab,
+            self.diff_panel.selected_key(),
+            self.files_panel.doc_path().map(str::to_string),
+        )
+    }
+
+    /// Run `change`, which moves the column, and record it as one step.
+    ///
+    /// Everything a click can do to the column's place goes through here, so
+    /// a click that touches two things (open the Files tab's changed file in
+    /// the Diff) is still one step back.
+    pub(super) fn right_navigate(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut Self, &mut Context<Self>),
+    ) {
+        let before = self.right_here();
+        change(self, cx);
+        let after = self.right_here();
+        self.right.history.visit(before.clone(), after.clone());
+        if after.tab != before.tab {
+            self.remember_right_tab();
+        }
+        cx.notify();
+    }
+
+    /// Persist the open tab and ask it for a fresh read, as it was off screen.
+    fn remember_right_tab(&mut self) {
+        self.settings.right_sidebar_tab = self.right.tab.wire().to_string();
         self.settings.save(&self.pilus_root);
         self.mark_open_tab_stale();
+    }
+
+    /// Put the column back where `place` says, without recording a step.
+    fn right_restore(&mut self, place: Place, cx: &mut Context<Self>) {
+        let changed_tab = self.right.tab != place.tab;
+        self.right.select_tab(place.tab);
+        match place.tab {
+            SidebarTab::Diff => {
+                if let Some((layer, path)) = place.diff {
+                    self.diff_reveal(layer, &path, cx);
+                }
+            }
+            SidebarTab::Files => match place.doc {
+                Some(path) if self.files_panel.doc_path() != Some(path.as_str()) => {
+                    self.files_read_doc(path);
+                }
+                Some(_) => {}
+                None => self.files_panel.close_doc(),
+            },
+            SidebarTab::Git => {}
+        }
+        if changed_tab {
+            self.remember_right_tab();
+        }
         cx.notify();
+    }
+
+    pub(super) fn right_back(&mut self, cx: &mut Context<Self>) {
+        if let Some(place) = self.right.history.back() {
+            self.right_restore(place, cx);
+        }
+    }
+
+    pub(super) fn right_forward(&mut self, cx: &mut Context<Self>) {
+        if let Some(place) = self.right.history.forward() {
+            self.right_restore(place, cx);
+        }
+    }
+
+    /// One of the strip's step buttons. A step with nowhere to go dims and
+    /// ignores the pointer.
+    fn right_step_button(
+        &self,
+        id: &'static str,
+        glyph: &'static [u8],
+        tip: &'static str,
+        enabled: bool,
+    ) -> Stateful<Div> {
+        let theme = self.theme;
+        let size = style::scaled(&self.shared_settings, 24.0);
+        let button = div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .w(px(size))
+            .h(px(size))
+            .radius_md()
+            .child(icon(glyph, 14.0, theme.muted));
+        if !enabled {
+            return button.opacity(0.35);
+        }
+        button
+            .cursor_pointer()
+            .hover_fill(theme.panel_dim, style::RADIUS_MD)
+            .tooltip(super::row_tooltip(
+                tip.to_string(),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
     }
 
     /// A tab that was off screen has gone without polls, so what it holds is
@@ -378,6 +577,24 @@ impl PilusView {
             .flex_shrink_0()
             .px_3()
             .pl(px(12.0 + lights))
+            .child(
+                self.right_step_button(
+                    "pilus-right-back",
+                    include_bytes!("../../assets/icons/chevron-left.svg"),
+                    "Back",
+                    self.right.history.can_back(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.right_back(cx))),
+            )
+            .child(
+                self.right_step_button(
+                    "pilus-right-forward",
+                    include_bytes!("../../assets/icons/chevron-right.svg"),
+                    "Forward",
+                    self.right.history.can_forward(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.right_forward(cx))),
+            )
             .children(SidebarTab::ALL.map(|tab| {
                 style::tab(
                     format!("pilus-right-tab-{}", tab.wire()),
@@ -589,6 +806,89 @@ mod tests {
             !side.expanded(),
             "a hidden column comes back at its own width"
         );
+    }
+
+    fn diff_place(path: &str) -> Place {
+        Place::new(
+            SidebarTab::Diff,
+            Some((DiffLayer::Worktree, path.to_string())),
+            None,
+        )
+    }
+
+    fn files_place(doc: Option<&str>) -> Place {
+        Place::new(SidebarTab::Files, None, doc.map(str::to_string))
+    }
+
+    #[test]
+    fn a_place_keeps_only_what_its_tab_shows() {
+        let place = Place::new(
+            SidebarTab::Files,
+            Some((DiffLayer::Staged, "a.rs".to_string())),
+            Some("/repo/README.md".to_string()),
+        );
+        assert_eq!(place.diff, None);
+        assert_eq!(place.doc.as_deref(), Some("/repo/README.md"));
+        let git = Place::new(
+            SidebarTab::Git,
+            Some((DiffLayer::Staged, "a".into())),
+            Some("b".into()),
+        );
+        assert_eq!((git.diff, git.doc), (None, None));
+    }
+
+    #[test]
+    fn opening_a_changed_file_from_the_tree_is_one_step_back_to_the_tree() {
+        let mut history = History::new(files_place(None));
+        history.visit(files_place(None), diff_place("src/lib.rs"));
+        assert!(history.can_back() && !history.can_forward());
+        assert_eq!(history.back(), Some(files_place(None)));
+        assert!(!history.can_back() && history.can_forward());
+        assert_eq!(history.forward(), Some(diff_place("src/lib.rs")));
+        assert_eq!(history.forward(), None);
+    }
+
+    #[test]
+    fn a_move_that_lands_where_it_started_is_no_step() {
+        let mut history = History::new(files_place(None));
+        history.visit(files_place(None), files_place(None));
+        assert!(!history.can_back());
+    }
+
+    #[test]
+    fn going_somewhere_new_drops_the_forward_steps() {
+        let mut history = History::new(files_place(None));
+        history.visit(files_place(None), diff_place("a.rs"));
+        history.visit(diff_place("a.rs"), diff_place("b.rs"));
+        assert_eq!(history.back(), Some(diff_place("a.rs")));
+        history.visit(diff_place("a.rs"), files_place(Some("/r/README.md")));
+        assert!(!history.can_forward());
+        assert_eq!(history.back(), Some(diff_place("a.rs")));
+        assert_eq!(history.back(), Some(files_place(None)));
+    }
+
+    #[test]
+    fn drift_is_folded_into_the_current_place_rather_than_made_a_step() {
+        // The Diff picked its first file by itself since the last step.
+        let mut history = History::new(Place::new(SidebarTab::Diff, None, None));
+        history.visit(diff_place("first.rs"), files_place(None));
+        assert_eq!(history.back(), Some(diff_place("first.rs")));
+    }
+
+    #[test]
+    fn history_is_bounded() {
+        let mut history = History::new(files_place(None));
+        let mut here = files_place(None);
+        for n in 0..(HISTORY_LIMIT * 2) {
+            let next = diff_place(&format!("f{n}.rs"));
+            history.visit(here, next.clone());
+            here = next;
+        }
+        let mut steps = 0;
+        while history.back().is_some() {
+            steps += 1;
+        }
+        assert_eq!(steps, HISTORY_LIMIT - 1);
     }
 
     #[test]

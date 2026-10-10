@@ -24,6 +24,7 @@ mod git;
 mod git_status;
 mod machines;
 mod mission;
+mod read;
 mod relay;
 mod surface;
 mod tasks;
@@ -35,7 +36,7 @@ pub use agents::AgentModel;
 pub use agents::effort_label;
 /// Raw pi thinking levels for display labels (`High` to `high`).
 pub use agents::thinking_level;
-pub use autostart::{ensure_server, ensure_server_for};
+pub use autostart::{delete_session, ensure_server, ensure_server_for, stop_session};
 pub use commit::{CommitDetail, CommitFile, show_commit};
 pub use connection::{ClientEvent, Connection, EndpointIdentity};
 pub use connector::agent_binary;
@@ -70,6 +71,7 @@ pub use mission::{
     MissionSnapshot, MissionUsage,
 };
 pub use pilus_protocol as protocol;
+pub use read::{MAX_TEXT_BYTES, TextFile, Version, read_text};
 pub use relay::RelaySettings;
 pub use surface::{Surface, SurfaceChange};
 pub use tasks::{NewTask, Task, TaskStatus, split_list};

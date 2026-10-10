@@ -191,14 +191,7 @@ struct HomeComposerView: View {
                 ProgressView()
                     .frame(width: 28, height: 28)
             } else {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Color(.systemBackground))
-                    .frame(width: 28, height: 28)
-                    .background(
-                        canSend ? Color.primary : Color.secondary.opacity(0.3),
-                        in: Circle()
-                    )
+                SendArrow(enabled: canSend, size: 28)
             }
         }
         .disabled(!canSend || running)
@@ -270,5 +263,21 @@ struct LiquidGlassPanel: ViewModifier {
                             in: .rect(cornerRadius: radius))
                 .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(.quaternary))
         }
+    }
+}
+
+/// The round send button every composer shares: blue like the other primary
+/// actions while there is something to send, a quiet glass disc otherwise.
+struct SendArrow: View {
+    var enabled: Bool
+    var size: CGFloat
+
+    var body: some View {
+        Image(systemName: "arrow.up")
+            .font(.system(size: size * 0.46, weight: .semibold))
+            .foregroundStyle(enabled ? Color.white : Color.secondary)
+            .frame(width: size, height: size)
+            .modifier(LiquidGlassPanel(radius: size / 2, prominent: enabled))
+            .opacity(enabled ? 1 : 0.5)
     }
 }

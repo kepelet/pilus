@@ -45,6 +45,7 @@ struct OpenWorkspaceView: View {
                         ProgressView()
                     } else {
                         Button("Open") { open() }
+                            .buttonStyle(.borderedProminent)
                     }
                 }
             }

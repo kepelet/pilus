@@ -114,6 +114,7 @@ struct NewAgentView: View {
                         ProgressView()
                     } else {
                         Button("Run") { send() }
+                            .buttonStyle(.borderedProminent)
                             .disabled(!canSend)
                     }
                 }

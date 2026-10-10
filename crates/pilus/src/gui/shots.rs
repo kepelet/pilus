@@ -57,7 +57,7 @@ fn shot_width() -> f32 {
 /// Fresh settings for one captured window. `PILUS_SHOT_FONT_SIZE` overrides the
 /// Interface size so scaling can be reviewed without editing the app;
 /// `PILUS_SHOT_RADIUS` does the same for the corner radius, and
-/// `PILUS_SHOT_INSET` (`1` or `0`) and `PILUS_SHOT_OPACITY` for the window.
+/// `PILUS_SHOT_OPACITY` for the window.
 fn settings() -> Rc<RefCell<Settings>> {
     let mut settings = Settings::default();
     if let Some(size) = std::env::var("PILUS_SHOT_FONT_SIZE")
@@ -71,9 +71,6 @@ fn settings() -> Rc<RefCell<Settings>> {
         .and_then(|value| value.parse().ok())
     {
         settings.corner_radius = radius;
-    }
-    if let Ok(inset) = std::env::var("PILUS_SHOT_INSET") {
-        settings.inset = Some(inset == "1");
     }
     if let Some(opacity) = std::env::var("PILUS_SHOT_OPACITY")
         .ok()

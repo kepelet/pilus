@@ -1055,28 +1055,6 @@ impl UiPlaygroundView {
                         div()
                             .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
-                            .child("Inset terminal card"),
-                    )
-                    .child(
-                        div()
-                            .h(px(64.0))
-                            .w_full()
-                            .radius_md()
-                            .bg(theme.window_bg)
-                            .border_1()
-                            .border_color(theme.border),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .w(px(210.0))
-                    .child(
-                        div()
-                            .text_size(px(self.fonts().label))
-                            .text_color(theme.muted)
                             .child("Composer card + footer"),
                     )
                     .child(

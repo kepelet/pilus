@@ -276,13 +276,6 @@ impl AppearancesView {
         self.publish(cx);
     }
 
-    /// Flip the inset card. A file that never chose reads as the opacity's
-    /// own answer, so the first click flips that.
-    fn toggle_inset(&mut self, cx: &mut Context<Self>) {
-        self.settings.inset = Some(!self.settings.inset_card());
-        self.publish(cx);
-    }
-
     fn families(&self, field: FontField) -> &[String] {
         match field {
             FontField::Ui => &self.ui_fonts,
@@ -917,18 +910,6 @@ impl Render for AppearancesView {
 
         list = list
             .child(self.section_heading("WINDOW"))
-            .child(
-                div().px_3().py_1().child(
-                    style::checkbox(
-                        "pilus-inset",
-                        self.settings.inset_card(),
-                        "Inset terminal card",
-                        theme,
-                        self.fonts().secondary,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_inset(cx))),
-                ),
-            )
             .child(self.corner_radius_row(cx));
 
         let root = div()

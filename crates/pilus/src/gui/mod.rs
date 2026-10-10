@@ -131,15 +131,13 @@ const SKIPPED_DAEMON_ROWS_UNTITLED: u16 = 1;
 /// Daemon rows skipped at the grid bottom: its one-row status line, which the
 /// native shell omits. Assumes a single-row status line.
 const SKIPPED_DAEMON_BOTTOM_ROWS: u16 = 1;
-/// Gap around the floating terminal card: left, right, and bottom.
-const CARD_GAP: f32 = 8.0;
+/// Gap around the floating terminal card: left, right, and bottom. Matches
+/// the sidebar's row edge, so the card sits as close to the window as the
+/// rows do.
+const CARD_GAP: f32 = 4.0;
 /// Gap between the tab strip and the card. The card hugs the header tighter
 /// than it does the other three sides, which stay at `CARD_GAP`.
 const CARD_GAP_TOP: f32 = 2.0;
-/// Slides the sidebar's first row down so it lands on the top edge of the
-/// inset terminal card: the header spacer ends at `HEADER_HEIGHT` and the
-/// card starts `CARD_GAP_TOP` below it.
-const SIDEBAR_TOP_INSET: f32 = CARD_GAP_TOP;
 /// Bottom padding of the sidebar list.
 const SIDEBAR_LIST_PAD: f32 = 12.0;
 /// Inset between the panel edge and a row's box, so a selection pill and a
@@ -9923,7 +9921,6 @@ impl PilusView {
             .gap_1()
             .w(px(panel_w))
             .px(px(SIDEBAR_ROW_EDGE))
-            .pt(px(SIDEBAR_TOP_INSET))
             .pb(px(SIDEBAR_LIST_PAD));
 
         // One hover pill glides between rows, the way the tab strip's
@@ -12108,20 +12105,15 @@ impl PilusView {
         let breathing = if framed { TERMINAL_PAD } else { 0.0 };
         let cols = ((inner_w - 2.0 * breathing) / cell_w).clamp(20.0, 500.0) as u16;
         let rows = ((inner_h - 2.0 * breathing) / cell_h).clamp(5.0, 300.0) as u16;
-        // The framed card snaps to the cell grid: the sub-cell remainder
-        // leaves the card (widening its right and bottom gaps to the window)
-        // instead of padding the grid, so all four insets stay exactly
-        // `TERMINAL_PAD`. Full-bleed pins the grid to the top-left instead,
-        // so the terminal truly reaches the edges.
+        // The framed card keeps its gaps to the window exact, so the sub-cell
+        // remainder goes inside it: the whole-cell grid centers in the inner
+        // box and each side's padding grows by half of what is left over.
+        // Full-bleed pins the grid to the top-left instead, so the terminal
+        // truly reaches the edges.
         let (pad_x, pad_y) = if framed {
-            (TERMINAL_PAD, TERMINAL_PAD)
-        } else {
-            (0.0, 0.0)
-        };
-        let (shrink_x, shrink_y) = if framed {
             (
-                (inner_w - 2.0 * breathing - f32::from(cols) * cell_w).max(0.0),
-                (inner_h - 2.0 * breathing - f32::from(rows) * cell_h).max(0.0),
+                breathing + ((inner_w - 2.0 * breathing - f32::from(cols) * cell_w) / 2.0).max(0.0),
+                breathing + ((inner_h - 2.0 * breathing - f32::from(rows) * cell_h) / 2.0).max(0.0),
             )
         } else {
             (0.0, 0.0)
@@ -12141,8 +12133,8 @@ impl PilusView {
         CardLayout {
             card_x,
             card_top: gap_top,
-            card_right: gap_right + right_px + shrink_x,
-            card_bottom: gap_bottom + shrink_y,
+            card_right: gap_right + right_px,
+            card_bottom: gap_bottom,
             pad_x,
             pad_y,
             origin_x: card_x + border + page_w + pad_x,
@@ -12674,9 +12666,22 @@ impl Render for PilusView {
         // both.
         root = apply_chrome_font(root, &self.shared_settings);
 
+        // The strip around the floating card takes the hairline's color, so
+        // the card reads as a panel in a frame. It spans the card's gaps
+        // exactly (the card's offsets minus its own margins) and fades with
+        // the window like the rest of the chrome.
+        let frame = framed.then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(layout.card_x - CARD_GAP))
+                .right(px(layout.card_right - CARD_GAP_RIGHT))
+                .bg(theme.border.opacity(glass))
+        });
         root.child(coat)
             .child(header)
-            .child(div().relative().flex_1().child({
+            .child(div().relative().flex_1().children(frame).child({
                 let mut card = div()
                     .absolute()
                     .left(px(layout.card_x))

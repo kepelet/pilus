@@ -64,8 +64,8 @@ impl SidebarTab {
 
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Diff => "Diff",
-            Self::Git => "Log",
+            Self::Diff => "Changes",
+            Self::Git => "History",
             Self::Files => "Files",
         }
     }

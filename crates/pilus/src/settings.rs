@@ -106,7 +106,7 @@ pub struct Settings {
     /// The same choice for the local daemon. Off by default: the Luvus
     /// installed alongside pilus still draws its title row.
     pub local_terminal_top_spacing: bool,
-    /// Whether the right sidebar (Diff and Git tabs) is open.
+    /// Whether the right sidebar (Changes and History tabs) is open.
     pub right_sidebar_visible: bool,
     /// The right sidebar's width in logical pixels; 0 takes the default.
     pub right_sidebar_width: f32,

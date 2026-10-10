@@ -353,19 +353,19 @@ a resumable session has no daemon API, so it is hidden on this client only.
 
 **Right sidebar.** Cmd+B (View → Toggle Right Sidebar, or the panel button at
 the tab strip's far edge) opens a column beside the terminal card holding three
-tabs, Diff, Log, and Files (`gui/right_sidebar.rs`). The daemon knows nothing of it: the
+tabs, Changes, History, and Files (`gui/right_sidebar.rs`). The daemon knows nothing of it: the
 window reserves the column's width from the card, so the daemon sees a smaller
 viewport and reflows once when the column opens, closes, or finishes a drag.
 The width tween and the edge drag hold the viewport still until they settle,
 as the left sidebar's tween does. Opening takes the keyboard
 (`RightSidebar::focused`); a press on the terminal or Esc in the column hands
-it back, and the focused column draws the one accent edge. Only the Diff
-reads keys, so choosing the Log tab hands the keyboard back to the terminal.
+it back, and the focused column draws the one accent edge. Only Changes
+reads keys, so choosing the History tab hands the keyboard back to the terminal.
 Visibility, width, and the open tab persist in `settings.json`. The column is a
-tab strip, the open tab, and (on the Diff) a footer. Only the open tab polls
+tab strip, the open tab, and (on Changes) a footer. Only the open tab polls
 the daemon; a tab that comes back on screen asks for a fresh read.
 
-**Diff.** A native, read-only review (`gui/diff.rs`, with its layout and
+**Changes.** A native, read-only review (`gui/diff.rs`, with its layout and
 navigation rules in `gui/diff_model.rs`) over the daemon's `diff.*` methods.
 The daemon owns the Git scan, the bounded patch parser, and the notes, and
 answers for its active workspace, so the review follows the sidebar selection.
@@ -396,11 +396,11 @@ live agent (`diff.note.send`) through UHP calls that never touch the checkout.
 The daemon has no method for the viewed flag, so Viewed is client state keyed
 by the file's fingerprint.
 
-**Log.** The Log tab, the repository's history (`gui/git_tab.rs`; data in `pilus-client`'s
+**History.** The History tab, the repository's history (`gui/git_tab.rs`; data in `pilus-client`'s
 `git_status.rs` and `commit.rs`) is two panes with a divider that drags
 vertically (its height is kept in `settings.json`): the commit list on top,
 and what the picked commit changed below. What is changed but not yet
-committed is the Diff tab's, so the Log tab does not repeat it.
+committed is Changes', so the History tab does not repeat it.
 
 The header names the branch with `↑ahead ↓behind` against its upstream and the
 stash count. The list is the newest 50 commits (subject, up to two branch or
@@ -408,7 +408,7 @@ tag labels with the checked-out branch emphasised, hash, author, age), with
 *Show more* adding 50 while the last read filled the page. The picked commit
 is the panel pill, and the newest is picked when nothing is. The detail shows
 the commit's message, author, date, and totals, then each file's hunks in a
-virtualized list that reuses the Diff's gutters and line washes, read-only and
+virtualized list that reuses Changes' gutters and line washes, read-only and
 stacked. Each file's header is a chevron that folds the file down to that header
 and opens it again; the rows are laid out again with the file's patch left out,
 and the next commit opens with every file expanded.
@@ -455,9 +455,9 @@ seconds pass (an empty folder). Clicking the folder meanwhile does nothing.
 The tree rows carry no Git state, so each read also calls `diff.list` (the
 Diff's own change list; a failure reads as nothing changed) and
 `pilus-client`'s `FileChanges` keys it by absolute path. A changed file shows
-its status letter at the trailing edge, colored as in the Diff
+its status letter at the trailing edge, colored as in Changes
 (`diff::status_glyph`), and every folder above a change shows a dot. A click
-on a changed file opens the Diff tab on that file instead of previewing it.
+on a changed file opens the Changes tab on that file instead of previewing it.
 The header names the whole directory, `~`-shortened against the endpoint's
 home, ahead of the refresh button.
 Each answer carries a sequence

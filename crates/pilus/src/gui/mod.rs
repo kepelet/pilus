@@ -333,7 +333,7 @@ gpui::actions!([
     ResetFontSize,
     /// Show or hide the sidebar.
     ToggleSidebar,
-    /// Show or hide the right sidebar (Diff and Git).
+    /// Show or hide the right sidebar (Changes and History).
     ToggleRightSidebar,
     /// Step back through the right sidebar's history.
     RightSidebarBack,
@@ -1087,6 +1087,10 @@ enum PromptAction {
     },
     /// Give a live agent's pane an addressable alias (`agent.name`).
     RenameAgent { endpoint: EndpointId, pane: String },
+    /// Name the focused terminal pane, resolved when the prompt is answered.
+    RenamePane { endpoint: EndpointId },
+    /// Move the focused terminal pane to a tab, resolved when answered.
+    MovePane { endpoint: EndpointId },
     /// Create a linked worktree of the right-clicked workspace's repo.
     NewWorktree { endpoint: EndpointId, index: u16 },
     /// Create an empty file, or a folder, inside `dir` in the Files tab.
@@ -1625,7 +1629,7 @@ struct PilusView {
     /// The Git tab: the daemon's working-tree status and recent commits.
     git_panel: GitPanel,
     files_panel: FilesPanel,
-    /// The right sidebar (Diff and Git tabs).
+    /// The right sidebar (Changes and History tabs).
     right: RightSidebar,
     /// The native Mission Control page: its state and the daemon's last
     /// dashboard snapshot.
@@ -9600,11 +9604,81 @@ impl PilusView {
             SidebarItem::SelectAll => self.select_all(window, cx),
             SidebarItem::SplitRight => self.split("right", cx),
             SidebarItem::SplitDown => self.split("down", cx),
+            SidebarItem::ForkPane => self.fork_focused_pane(cx),
+            SidebarItem::Rename => self.open_menu_prompt(
+                PromptAction::RenamePane {
+                    endpoint: self.active.clone(),
+                },
+                "Rename pane",
+                "Alias ([a-z][a-z0-9_-]{0,31}); empty clears it",
+                "",
+                cx,
+            ),
+            SidebarItem::MoveToTab => self.open_menu_prompt(
+                PromptAction::MovePane {
+                    endpoint: self.active.clone(),
+                },
+                "Move to tab",
+                "Tab number; empty for a new tab",
+                "",
+                cx,
+            ),
             SidebarItem::NewTab => self.new_tab(),
             SidebarItem::CloseTab => self.close_active_tab(),
             _ => {}
         }
         cx.notify();
+    }
+
+    /// Run `op` against the focused pane on a background thread and toast the
+    /// outcome. The pane is resolved there, not at click time, so the GUI
+    /// thread never waits on the socket and the answer is the pane that has
+    /// focus when the daemon gets the request.
+    fn pane_op(
+        &mut self,
+        endpoint: &EndpointId,
+        ok: String,
+        op: impl FnOnce(&mut ControlClient, &str) -> pilus_client::Result<()> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut client) = self.control_client_for_endpoint(endpoint) else {
+            self.toast(
+                ToastKind::Error,
+                "no control connection for the selected endpoint",
+            );
+            cx.notify();
+            return;
+        };
+        let tx = self.menu_tx.clone();
+        std::thread::spawn(move || {
+            let error = client
+                .focused_pane()
+                .and_then(|pane| op(&mut client, &pane))
+                .err()
+                .map(|error| error.to_string());
+            tx.send(MenuOpResult {
+                ok,
+                error,
+                renamed_workspace: None,
+                renamed_agent: None,
+                worktree_probe: None,
+                worktree_cleared: None,
+                worktree_escalated: None,
+            })
+            .ok();
+        });
+    }
+
+    /// Fork the focused agent's session into a sibling pane. A pane that runs
+    /// no agent has nothing to fork, which the daemon reports as an error.
+    fn fork_focused_pane(&mut self, cx: &mut Context<Self>) {
+        let endpoint = self.active.clone();
+        self.pane_op(
+            &endpoint,
+            "forked into a new pane".to_string(),
+            |client, pane| client.fork_agent(pane),
+            cx,
+        );
     }
 
     /// Open the terminal's own menu where the pointer is, in place of the
@@ -9986,6 +10060,46 @@ impl PilusView {
                         .ok();
                     }
                 });
+            }
+            PromptAction::RenamePane { endpoint } => {
+                let ok = if trimmed.is_empty() {
+                    "cleared the pane's name".to_string()
+                } else {
+                    format!("renamed to {trimmed}")
+                };
+                self.pane_op(
+                    &endpoint,
+                    ok,
+                    move |client, pane| {
+                        if trimmed.is_empty() {
+                            client.clear_agent_name(pane)
+                        } else {
+                            client.name_agent(pane, &trimmed)
+                        }
+                    },
+                    cx,
+                );
+            }
+            PromptAction::MovePane { endpoint } => {
+                let tab = if trimmed.is_empty() {
+                    None
+                } else if let Ok(tab @ 1..) = trimmed.parse::<u16>() {
+                    Some(tab)
+                } else {
+                    self.toast(ToastKind::Error, "a tab number starts at 1");
+                    cx.notify();
+                    return;
+                };
+                let ok = match tab {
+                    Some(tab) => format!("moved to tab {tab}"),
+                    None => "moved to a new tab".to_string(),
+                };
+                self.pane_op(
+                    &endpoint,
+                    ok,
+                    move |client, pane| client.move_pane(pane, tab),
+                    cx,
+                );
             }
             PromptAction::CreateEntry {
                 endpoint,
@@ -14194,6 +14308,8 @@ fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
         SidebarItem::SelectAll => include_bytes!("../../assets/icons/square-dashed.svg"),
         SidebarItem::SplitRight => include_bytes!("../../assets/icons/columns-2.svg"),
         SidebarItem::SplitDown => include_bytes!("../../assets/icons/rows-2.svg"),
+        SidebarItem::ForkPane => include_bytes!("../../assets/icons/git-fork.svg"),
+        SidebarItem::MoveToTab => include_bytes!("../../assets/icons/corner-down-right.svg"),
         SidebarItem::NewTab => include_bytes!("../../assets/icons/plus.svg"),
         SidebarItem::CloseTab => include_bytes!("../../assets/icons/x.svg"),
         SidebarItem::Divider => include_bytes!("../../assets/icons/plus.svg"),

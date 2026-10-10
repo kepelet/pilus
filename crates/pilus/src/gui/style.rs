@@ -21,6 +21,7 @@ use gpui::{
 use crate::settings::{CHROME_FONT, CORNER_RADIUS, Settings};
 
 use super::theme::Theme;
+use super::toast::ToastKind;
 
 /// How long a skeleton takes to fade from dim to lit and back. Long enough to
 /// read as breathing rather than a blink, and it respects reduce motion
@@ -964,6 +965,86 @@ pub(super) fn skeleton(
             Animation::new(SKELETON_PULSE).repeat(),
             |this, phase| this.opacity(0.55 + 0.45 * phase),
         )
+}
+
+/// Width of a toast card: wide enough for a sentence on two lines, narrow
+/// enough to leave the terminal readable beside it.
+pub(super) const TOAST_WIDTH: f32 = 320.0;
+
+/// An in-app notice: a glyph for what happened, an optional bold title, and
+/// the message, clamped to four lines.
+///
+/// A toast floats over content, so it rests on the sidebar fill with the
+/// scheme's border, and its kind shows only in the glyph color. The caller
+/// attaches the dismissing click handler and the fade, which belong to the
+/// queue that owns the toast.
+pub(super) fn toast(
+    id: impl Into<ElementId>,
+    kind: ToastKind,
+    title: Option<&str>,
+    body: &str,
+    theme: Theme,
+    fonts: Fonts,
+) -> Stateful<Div> {
+    let (icon, tone): (&'static [u8], Rgba) = match kind {
+        ToastKind::Info => (include_bytes!("../../assets/icons/info.svg"), theme.muted),
+        ToastKind::Success => (include_bytes!("../../assets/icons/check.svg"), theme.ok),
+        ToastKind::Error => (
+            include_bytes!("../../assets/icons/circle-alert.svg"),
+            theme.alert,
+        ),
+    };
+    let glyph = |bytes: &'static [u8], size: f32, color: Rgba| {
+        svg()
+            .data(bytes)
+            .w(px(size))
+            .h(px(size))
+            .flex_shrink_0()
+            .text_color(color)
+    };
+    let mut text = div().flex().flex_col().gap_1().flex_1().min_w_0();
+    if let Some(title) = title {
+        text = text.child(
+            div()
+                .text_size(px(fonts.secondary))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.panel_fg)
+                .child(title.to_string()),
+        );
+    }
+    text = text.child(
+        div()
+            .text_size(px(fonts.secondary))
+            .text_color(if title.is_some() {
+                theme.muted
+            } else {
+                theme.panel_fg
+            })
+            .line_clamp(4)
+            .child(body.to_string()),
+    );
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap_2()
+        .w(px(TOAST_WIDTH))
+        .px_3()
+        .py_2()
+        .radius_md()
+        .bg(theme.sidebar_bg)
+        .border_1()
+        .border_color(theme.border)
+        .cursor_pointer()
+        .hover_fill(theme.panel, RADIUS_MD)
+        .child(glyph(icon, fonts.body, tone))
+        .child(text)
+        .child(glyph(
+            include_bytes!("../../assets/icons/x.svg"),
+            fonts.label,
+            theme.muted,
+        ))
 }
 
 /// Fade a floating panel in as it opens: menus, pickers, the palette,

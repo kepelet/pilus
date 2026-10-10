@@ -13,6 +13,7 @@ mod box_drawing;
 mod connector;
 mod diff;
 mod diff_model;
+mod dock;
 mod git_tab;
 mod glass;
 mod highlight;
@@ -39,6 +40,7 @@ mod task_compose;
 mod tasks;
 mod text_input;
 mod theme;
+mod toast;
 mod ui_playground;
 mod update_window;
 mod updater;
@@ -58,6 +60,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use diff::{DiffInputs, DiffPanel};
+use dock::Dock;
 use git_tab::GitPanel;
 use glass::Glass;
 use gpui::{
@@ -65,9 +68,9 @@ use gpui::{
     ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu,
     MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    Stateful, SystemNotification, TextRun, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, anchored, canvas, deferred, div, font, img, linear_color_stop,
-    linear_gradient, point, prelude::*, px, relative, size, svg,
+    Stateful, TextRun, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, anchored, canvas, deferred, div, font, img, linear_color_stop, linear_gradient,
+    point, prelude::*, px, relative, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::{Release, UpdateStatus, Version};
@@ -96,6 +99,7 @@ use style::{FillExt, RadiusExt};
 use tasks::{TaskLayout, TasksInputs, TasksPanel};
 use text_input::{TextField, TextInput};
 use theme::Theme;
+use toast::{ToastKind, Toasts};
 use updater::Updater;
 
 /// Line height as a fraction of the font size.
@@ -797,14 +801,6 @@ fn bump_font(settings: &Rc<RefCell<Settings>>, root: &Path, delta: f32, cx: &mut
     cx.refresh_windows();
 }
 
-/// A process-unique tag so a native notification is not replaced by the next
-/// one the daemon pushes.
-fn notification_tag() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    format!("pilus-notify-{}", NEXT.fetch_add(1, Ordering::Relaxed))
-}
-
 /// Move pilus's own stores out of the Luvus state root the first time the
 /// `~/.pilus` layout is used, so existing settings are not lost.
 fn migrate_legacy_stores(luvus_root: &Path, pilus_root: &Path) {
@@ -1112,10 +1108,10 @@ struct DeleteEscalation {
     blockers: Option<String>,
 }
 
-/// One background context-menu operation's outcome, folded into the status
-/// line so a slow SSH round trip never blocks the window.
+/// One background context-menu operation's outcome, surfaced as a toast so a
+/// slow SSH round trip never blocks the window.
 struct MenuOpResult {
-    /// Status-line text when the operation finished.
+    /// Toast text when the operation finished; empty for a silent probe.
     ok: String,
     /// Error text, or `None` when it succeeded.
     error: Option<String>,
@@ -1254,9 +1250,14 @@ struct PilusView {
     cols: u16,
     rows: u16,
     status: String,
-    /// Whether this window is frontmost, tracked each render so a daemon push
-    /// can skip a banner the user is already looking at.
+    /// Whether this window is frontmost, tracked each render so toasts only
+    /// run their clock while someone can read them.
     window_active: bool,
+    /// Every notice pilus raises: daemon pushes and action outcomes.
+    toasts: Toasts,
+    /// Dock bounce and badge for pushes that arrive while pilus is behind
+    /// another app.
+    dock: Dock,
     /// Measured monospace advance width, resolved once from the font.
     cell_width: Option<f32>,
     /// Last cell size pushed to the daemon, so a font change re-sends it even
@@ -1864,6 +1865,8 @@ impl PilusView {
             rows: 40,
             status: "connecting…".to_string(),
             window_active: false,
+            toasts: Toasts::new(),
+            dock: Dock::new(),
             cell_width: None,
             sent_cell: (0, 0),
             selection: None,
@@ -2165,6 +2168,10 @@ impl PilusView {
             changed = true;
         }
         changed |= self.poll_active(cx);
+        changed |= self
+            .toasts
+            .tick(Instant::now(), self.window_active, cx.reduce_motion());
+        self.dock.sync();
         changed |= self.poll_endpoints();
         changed |= self.poll_machine_connects();
         self.pump_reconnects();
@@ -2245,7 +2252,7 @@ impl PilusView {
                     self.switch_session(&name);
                 }
                 SessionOpResult::StartFailed(name, error) => {
-                    self.status = format!("couldn't start {name}: {error}");
+                    self.toast(ToastKind::Error, format!("couldn't start {name}: {error}"));
                 }
             }
             changed = true;
@@ -2308,7 +2315,7 @@ impl PilusView {
             if self.settings_open {
                 self.settings_status = message;
             } else {
-                self.status = message;
+                self.toast(ToastKind::Info, message);
             }
             changed = true;
         }
@@ -2407,26 +2414,39 @@ impl PilusView {
                 }
                 PickerEvent::Opened(result) => {
                     match result {
-                        Ok(()) => self.status = "opened the workspace".to_string(),
-                        Err(error) => self.status = format!("couldn't open workspace: {error}"),
+                        Ok(()) => self.toast(ToastKind::Success, "Opened the workspace"),
+                        Err(error) => {
+                            self.toast(
+                                ToastKind::Error,
+                                format!("Couldn't open workspace: {error}"),
+                            );
+                        }
                     }
                     changed = true;
                 }
                 PickerEvent::WorktreeOpened(result) => {
                     match result {
-                        Ok(()) => self.status = "created a new worktree".to_string(),
-                        Err(error) => self.status = format!("couldn't create worktree: {error}"),
+                        Ok(()) => self.toast(ToastKind::Success, "Created a new worktree"),
+                        Err(error) => {
+                            self.toast(
+                                ToastKind::Error,
+                                format!("Couldn't create worktree: {error}"),
+                            );
+                        }
                     }
                     changed = true;
                 }
                 PickerEvent::LocalTerminalOpened(result) => {
                     match result {
                         Ok(()) => {
-                            self.status = "opened a local terminal".to_string();
+                            self.toast(ToastKind::Success, "Opened a local terminal");
                             self.activate_opened_endpoint(None, None, cx);
                         }
                         Err(error) => {
-                            self.status = format!("couldn't open a local terminal: {error}");
+                            self.toast(
+                                ToastKind::Error,
+                                format!("Couldn't open a local terminal: {error}"),
+                            );
                         }
                     }
                     changed = true;
@@ -2438,7 +2458,7 @@ impl PilusView {
                             // composer, so no empty terminal flashes first.
                             self.home_launching = false;
                             self.home.close();
-                            self.status = message;
+                            self.toast(ToastKind::Success, message);
                             // `agent.list` will not list the pane for a
                             // reconcile or two; the launch's own record
                             // lets `focus_agent` pin a pi right away.
@@ -2467,8 +2487,9 @@ impl PilusView {
         }
         while let Ok(op) = self.menu_rx.try_recv() {
             match op.error {
-                Some(error) => self.status = error,
-                None => self.status = op.ok,
+                Some(error) => self.toast(ToastKind::Error, error),
+                None if !op.ok.is_empty() => self.toast(ToastKind::Success, op.ok),
+                None => {}
             }
             if let Some((workspace_id, name)) = op.renamed_workspace {
                 self.rename_local_workspace_label(&workspace_id, &name);
@@ -2506,7 +2527,10 @@ impl PilusView {
                         }
                     }
                     Err(error) => {
-                        self.status = format!("couldn't check worktree: {error}");
+                        self.toast(
+                            ToastKind::Error,
+                            format!("couldn't check worktree: {error}"),
+                        );
                     }
                 }
             }
@@ -2571,8 +2595,7 @@ impl PilusView {
                         changed = true;
                     }
                     if let Some(text) = self.surface.take_notify() {
-                        self.notify_desktop(&text, cx);
-                        self.status = text;
+                        self.notify_daemon(text);
                         changed = true;
                     }
                     // The daemon copies through us when it cannot reach the
@@ -2618,27 +2641,22 @@ impl PilusView {
         changed
     }
 
-    /// Raise a native notification for a daemon push.
+    /// Show a daemon push as a toast titled with the session it came from.
     ///
-    /// Skipped when the user turned notifications off or is already looking at
-    /// this window, where the status line carries the same text. The tag is
-    /// unique so the Notification Center keeps every push rather than
-    /// replacing the last one.
-    fn notify_desktop(&self, text: &str, cx: &mut Context<Self>) {
-        if !self.settings.notifications || self.window_active {
+    /// The Notifications setting gates only this path: a daemon can chatter,
+    /// but the outcome of something the user just did always surfaces.
+    fn notify_daemon(&mut self, text: String) {
+        if !self.settings.notifications {
             return;
         }
-        let session = self.active_session();
-        let title = match session.as_str() {
-            "" => "pilus".to_string(),
-            session => format!("pilus · {session}"),
-        };
-        cx.show_system_notification(SystemNotification {
-            tag: SharedString::from(notification_tag()),
-            title: SharedString::from(title),
-            body: SharedString::from(text.to_string()),
-            actions: Vec::new(),
-        });
+        let title = Some(self.active_session()).filter(|session| !session.is_empty());
+        self.toasts.push(ToastKind::Info, title, text);
+        self.dock.alert();
+    }
+
+    /// Raise an in-app toast for something that just happened or failed.
+    fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
+        self.toasts.push(kind, None, text.into());
     }
 
     /// Re-read the machine catalog without probing, off the GUI thread.
@@ -2833,7 +2851,7 @@ impl PilusView {
             let endpoint = self.endpoints.remove(&id);
             if pending_switch {
                 self.pending_switch = None;
-                self.status = format!("{} · lost connection to {label}", self.active_session());
+                self.toast(ToastKind::Error, format!("lost connection to {label}"));
             }
             match &id {
                 EndpointId::Machine(machine_id) => {
@@ -3077,7 +3095,7 @@ impl PilusView {
             .map(|pending| self.endpoint_label(&pending.target))
             .unwrap_or_default();
         self.cancel_pending_switch();
-        self.status = format!("timed out switching to {label}");
+        self.toast(ToastKind::Error, format!("timed out switching to {label}"));
     }
 
     /// Commit a prepared handoff: the target's candidate frame has arrived, so
@@ -3257,7 +3275,7 @@ impl PilusView {
             .find(|machine| machine.id == machine_id)
             .cloned()
         else {
-            self.status = format!("unknown machine `{machine_id}`");
+            self.toast(ToastKind::Error, format!("unknown machine `{machine_id}`"));
             return;
         };
         self.status = format!("connecting to {}…", machine.display());
@@ -3445,7 +3463,7 @@ impl PilusView {
         });
         self.push_sidebar_layout();
         self.agent_feed = Some(self.spawn_feed_for_active());
-        self.status = "reconnected".to_string();
+        self.toast(ToastKind::Success, "reconnected");
     }
 
     /// Install a freshly connected endpoint that is not taking the window.
@@ -3508,7 +3526,7 @@ impl PilusView {
         });
         self.push_sidebar_layout();
         self.agent_feed = Some(self.spawn_feed_for_active());
-        self.status = "reconnected".to_string();
+        self.toast(ToastKind::Success, "reconnected");
     }
 
     /// The workspace catalog of an endpoint, active or stashed.
@@ -4274,7 +4292,10 @@ impl PilusView {
     fn open_workspace_path(&mut self, path: String, cx: &mut Context<Self>) {
         let source = self.picker.source().clone();
         let Some(mut client) = self.control_client_for(&source) else {
-            self.status = "no control connection for the selected endpoint".to_string();
+            self.toast(
+                ToastKind::Error,
+                "no control connection for the selected endpoint",
+            );
             return;
         };
         self.close_picker();
@@ -4298,7 +4319,10 @@ impl PilusView {
     fn open_new_worktree(&mut self, cx: &mut Context<Self>) {
         let source = self.picker.source().clone();
         let Some(mut client) = self.control_client_for(&source) else {
-            self.status = "no control connection for the selected endpoint".to_string();
+            self.toast(
+                ToastKind::Error,
+                "no control connection for the selected endpoint",
+            );
             return;
         };
         let branch = generate_session_name(&[]);
@@ -5057,7 +5081,10 @@ impl PilusView {
             .find(|workspace| workspace.active)
             .cloned()
         else {
-            self.status = "no active workspace to read a session from".to_string();
+            self.toast(
+                ToastKind::Error,
+                "no active workspace to read a session from",
+            );
             cx.notify();
             return;
         };
@@ -5077,13 +5104,18 @@ impl PilusView {
             })
             .cloned()
         else {
-            self.status = "no pi agent in this workspace to read a session from".to_string();
+            self.toast(
+                ToastKind::Error,
+                "no pi agent in this workspace to read a session from",
+            );
             cx.notify();
             return;
         };
         let Some(session_id) = agent.session.clone() else {
-            self.status =
-                "pi hasn't reported its session yet — restart pi or run /reload in it".to_string();
+            self.toast(
+                ToastKind::Error,
+                "pi hasn't reported its session yet — restart pi or run /reload in it",
+            );
             cx.notify();
             return;
         };
@@ -5101,7 +5133,7 @@ impl PilusView {
             }
             EndpointId::Machine(id) => {
                 let Some(target) = self.machine_target_by_key(&id) else {
-                    self.status = format!("no SSH target for `{id}`");
+                    self.toast(ToastKind::Error, format!("no SSH target for `{id}`"));
                     cx.notify();
                     return;
                 };
@@ -7202,7 +7234,7 @@ impl PilusView {
                     .px_3()
                     .text_size(px(self.footer_font()))
                     .text_color(theme.muted)
-                    .child("Show a desktop notification when the daemon pushes one"),
+                    .child("Show a toast when the daemon pushes a notification"),
             )
     }
 
@@ -8319,7 +8351,10 @@ impl PilusView {
                 self.status = format!("connecting to {name}…");
             }
             Err(error) => {
-                self.status = format!("couldn't attach to {name}: {error}");
+                self.toast(
+                    ToastKind::Error,
+                    format!("couldn't attach to {name}: {error}"),
+                );
             }
         }
     }
@@ -9285,7 +9320,7 @@ impl PilusView {
                 let Some(path) = self.worktree_linked.get(&key).and_then(|path| path.clone())
                 else {
                     self.close_context_menu();
-                    self.status = "worktree status is still being checked".to_string();
+                    self.toast(ToastKind::Info, "worktree status is still being checked");
                     cx.notify();
                     return;
                 };
@@ -9350,7 +9385,10 @@ impl PilusView {
         };
         let Some(mut client) = self.control_client_for_endpoint(&self.endpoint_by_key(endpoint))
         else {
-            self.status = "no control connection for the selected endpoint".to_string();
+            self.toast(
+                ToastKind::Error,
+                "no control connection for the selected endpoint",
+            );
             cx.notify();
             return;
         };
@@ -9465,7 +9503,10 @@ impl PilusView {
         };
         let Some(mut client) = self.control_client_for_endpoint(&self.endpoint_by_key(endpoint))
         else {
-            self.status = "no control connection for the selected endpoint".to_string();
+            self.toast(
+                ToastKind::Error,
+                "no control connection for the selected endpoint",
+            );
             cx.notify();
             return;
         };
@@ -9601,17 +9642,23 @@ impl PilusView {
                 workspace_id,
             } => {
                 if trimmed.is_empty() {
-                    self.status = "a workspace name is required".to_string();
+                    self.toast(ToastKind::Error, "a workspace name is required");
                     cx.notify();
                     return;
                 }
                 if trimmed.chars().count() > 40 {
-                    self.status = "workspace names are capped at 40 characters".to_string();
+                    self.toast(
+                        ToastKind::Error,
+                        "workspace names are capped at 40 characters",
+                    );
                     cx.notify();
                     return;
                 }
                 let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
-                    self.status = "no control connection for the selected endpoint".to_string();
+                    self.toast(
+                        ToastKind::Error,
+                        "no control connection for the selected endpoint",
+                    );
                     cx.notify();
                     return;
                 };
@@ -9637,7 +9684,10 @@ impl PilusView {
             }
             PromptAction::RenameAgent { endpoint, pane } => {
                 let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
-                    self.status = "no control connection for the selected endpoint".to_string();
+                    self.toast(
+                        ToastKind::Error,
+                        "no control connection for the selected endpoint",
+                    );
                     cx.notify();
                     return;
                 };
@@ -9723,13 +9773,18 @@ impl PilusView {
                     }
                 }
                 if let Some(name) = blocker {
-                    self.status =
-                        format!("close {name} first — it uses files inside this worktree");
+                    self.toast(
+                        ToastKind::Error,
+                        format!("close {name} first — it uses files inside this worktree"),
+                    );
                     cx.notify();
                     return;
                 }
                 let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
-                    self.status = "no control connection for the selected endpoint".to_string();
+                    self.toast(
+                        ToastKind::Error,
+                        "no control connection for the selected endpoint",
+                    );
                     cx.notify();
                     return;
                 };
@@ -9803,12 +9858,15 @@ impl PilusView {
             }
             PromptAction::NewWorktree { endpoint, index } => {
                 if trimmed.is_empty() {
-                    self.status = "a branch name is required".to_string();
+                    self.toast(ToastKind::Error, "a branch name is required");
                     cx.notify();
                     return;
                 }
                 let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
-                    self.status = "no control connection for the selected endpoint".to_string();
+                    self.toast(
+                        ToastKind::Error,
+                        "no control connection for the selected endpoint",
+                    );
                     cx.notify();
                     return;
                 };
@@ -10128,7 +10186,7 @@ impl PilusView {
     /// last tab is held back until explicit workspace close/delete exists.
     fn close_tab(&mut self, index: u16) {
         if self.tabs.len() <= 1 {
-            self.status = "Can't close the last tab".to_string();
+            self.toast(ToastKind::Info, "Can't close the last tab");
             return;
         }
         if let Some(feed) = self.agent_feed.as_ref() {
@@ -10982,6 +11040,51 @@ impl PilusView {
     ///
     /// A transparent catcher covers the window so a click outside the panel
     /// dismisses it; the panel stops propagation so its own clicks land.
+    /// The toasts, stacked newest-last at the window's bottom-right.
+    ///
+    /// The stack hugs its cards, so the margin around them stays clickable.
+    /// Each card fades in through `style::enter` keyed by its id, and fades
+    /// out through the queue's own exit opacity (the enter animation would
+    /// otherwise pin the card's opacity), so the wrapper carries the exit.
+    fn toast_stack(&self, cx: &mut Context<Self>) -> AnyElement {
+        let items = self.toasts.items();
+        if items.is_empty() {
+            return div().into_any_element();
+        }
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let now = Instant::now();
+        let mut stack = div()
+            .absolute()
+            .right(px(12.0))
+            .bottom(px(12.0))
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap_2();
+        for toast in items {
+            let id = toast.id;
+            let card = style::toast(
+                SharedString::from(format!("pilus-toast-{id}")),
+                toast.kind,
+                toast.title.as_deref(),
+                &toast.body,
+                theme,
+                fonts,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toasts.dismiss(id, Instant::now());
+                cx.notify();
+            }));
+            stack = stack.child(
+                div()
+                    .opacity(toast.exit_opacity(now))
+                    .child(style::enter(format!("pilus-toast-enter-{id}"), card)),
+            );
+        }
+        stack.into_any_element()
+    }
+
     fn palette_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
         if !self.palette.is_open() {
             return div().into_any_element();
@@ -12614,6 +12717,7 @@ impl Render for PilusView {
             .child(self.picker_overlay(window, cx))
             .child(self.context_menu_overlay(cx, window))
             .child(self.menu_prompt_overlay(cx))
+            .child(self.toast_stack(cx))
     }
 }
 

@@ -30,6 +30,7 @@ use super::highlight::Token;
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
+use super::toast::ToastKind;
 use super::{EndpointId, PilusView, agent_icon, icon};
 
 /// How often the open page asks the daemon for a fresh snapshot.
@@ -60,8 +61,8 @@ pub(super) enum DiffMsg {
         fingerprint: String,
         result: Result<FileDiff, String>,
     },
-    /// A note operation finished; the text is the footer line.
-    Done(String),
+    /// A note operation finished; the text becomes a toast.
+    Done(Result<String, String>),
 }
 
 /// A file's diff, flattened and laid out.
@@ -439,12 +440,19 @@ impl PilusView {
                     Ok(diff) => self.diff_install(key, fingerprint, diff),
                     Err(error) => {
                         panel.loaded = None;
-                        panel.status = format!("Could not load {}: {error}", key.1);
+                        self.toast(
+                            ToastKind::Error,
+                            format!("Could not load {}: {error}", key.1),
+                        );
                     }
                 }
             }
-            DiffMsg::Done(text) => {
-                self.diff_panel.status = text;
+            DiffMsg::Done(result) => {
+                self.diff_panel.status.clear();
+                match result {
+                    Ok(text) => self.toast(ToastKind::Success, text),
+                    Err(error) => self.toast(ToastKind::Error, error),
+                }
                 // Pick the daemon's new truth up now rather than next poll.
                 self.diff_panel.last_poll = None;
             }
@@ -639,11 +647,11 @@ impl PilusView {
         let client = self.control_client_for_endpoint(&self.active);
         self.diff_panel.status = pending;
         std::thread::spawn(move || {
-            let text = match client {
-                Some(mut client) => call(&mut client).unwrap_or_else(|error| error.to_string()),
-                None => "Could not reach the daemon".to_string(),
+            let result = match client {
+                Some(mut client) => call(&mut client).map_err(|error| error.to_string()),
+                None => Err("Could not reach the daemon".to_string()),
             };
-            tx.send(DiffMsg::Done(text)).ok();
+            tx.send(DiffMsg::Done(result)).ok();
         });
         cx.notify();
     }
@@ -657,7 +665,7 @@ impl PilusView {
             .and_then(|loaded| loaded.flat.src.get(panel.cursor.src))
             .is_some_and(|src| src.kind != SrcKind::Hunk);
         if !on_line {
-            panel.status = "Move onto a line to leave a note".to_string();
+            self.toast(ToastKind::Info, "Move onto a line to leave a note");
         } else {
             panel.anchor = Some(panel.cursor.src);
             panel.status = "Extend with j/k, Enter to write, Esc to cancel".to_string();
@@ -673,7 +681,7 @@ impl PilusView {
         };
         let anchor = panel.anchor.take().unwrap_or(panel.cursor.src);
         let Some(range) = model::note_range(&loaded.flat, anchor, panel.cursor) else {
-            panel.status = "Move onto a line to leave a note".to_string();
+            self.toast(ToastKind::Info, "Move onto a line to leave a note");
             cx.notify();
             return;
         };
@@ -715,7 +723,7 @@ impl PilusView {
 
     fn diff_edit_note(&mut self, cx: &mut Context<Self>) {
         let Some(note) = self.diff_panel.note_at_cursor().cloned() else {
-            self.diff_panel.status = "No note on this line".to_string();
+            self.toast(ToastKind::Info, "No note on this line");
             cx.notify();
             return;
         };
@@ -753,7 +761,7 @@ impl PilusView {
     fn diff_save_note(&mut self, cx: &mut Context<Self>) {
         let body = self.diff_inputs.note.read(cx).value().trim().to_string();
         if body.is_empty() {
-            self.diff_panel.status = "A note needs some text".to_string();
+            self.toast(ToastKind::Info, "A note needs some text");
             cx.notify();
             return;
         }
@@ -808,7 +816,7 @@ impl PilusView {
     fn diff_delete_note(&mut self, id: String, cx: &mut Context<Self>) {
         if self.diff_panel.confirm_delete.as_ref() != Some(&id) {
             self.diff_panel.confirm_delete = Some(id);
-            self.diff_panel.status = "Press D again to delete this note".to_string();
+            self.toast(ToastKind::Info, "Press D again to delete this note");
             cx.notify();
             return;
         }
@@ -864,7 +872,7 @@ impl PilusView {
         };
         let agents = self.diff_agents();
         let Some(agent) = agents.get(sending.pick) else {
-            self.diff_panel.status = "No agent to send to".to_string();
+            self.toast(ToastKind::Error, "No agent to send to");
             cx.notify();
             return;
         };
@@ -872,7 +880,7 @@ impl PilusView {
             SendScope::Note => match self.diff_panel.note_at_cursor() {
                 Some(note) => NoteSelection::Ids(vec![note.id.clone()]),
                 None => {
-                    self.diff_panel.status = "Put the cursor on a note first".to_string();
+                    self.toast(ToastKind::Info, "Put the cursor on a note first");
                     cx.notify();
                     return;
                 }
@@ -888,7 +896,7 @@ impl PilusView {
             SendScope::Review => NoteSelection::AllOpen,
         };
         if matches!(&selection, NoteSelection::Ids(ids) if ids.is_empty()) {
-            self.diff_panel.status = "No open notes to send".to_string();
+            self.toast(ToastKind::Info, "No open notes to send");
             cx.notify();
             return;
         }

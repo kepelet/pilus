@@ -20,6 +20,7 @@ use crate::settings::Settings;
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
+use super::toast::ToastKind;
 use super::{CloseTab, CloseWindow, icon};
 
 /// Width and height of the playground window.
@@ -1668,6 +1669,44 @@ impl UiPlaygroundView {
             )
     }
 
+    /// The in-app toast in each kind, with and without a title. Real toasts
+    /// stack at the window's bottom-right and fade out on their own; here they
+    /// rest so the card can be judged.
+    fn toast_demos(&self) -> Div {
+        let theme = self.theme;
+        let fonts = self.fonts();
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap_3()
+            .child(style::toast(
+                "pg-toast-info",
+                ToastKind::Info,
+                Some("quiet-comet"),
+                "Build finished in 42s",
+                theme,
+                fonts,
+            ))
+            .child(style::toast(
+                "pg-toast-success",
+                ToastKind::Success,
+                None,
+                "Opened the workspace",
+                theme,
+                fonts,
+            ))
+            .child(style::toast(
+                "pg-toast-error",
+                ToastKind::Error,
+                None,
+                "Couldn't open workspace: the folder no longer exists on this machine",
+                theme,
+                fonts,
+            ))
+    }
+
     /// Small icon and text action buttons, including a two-step confirm.
     fn small_buttons(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
@@ -1883,6 +1922,7 @@ impl Render for UiPlaygroundView {
             .child(self.section("STATUS BAR", self.tray(self.status_bar_demo())))
             .child(self.section("TOOLTIP", self.tray(self.tooltip_demo())))
             .child(self.section("FEEDBACK", self.tray(self.feedback_demos())))
+            .child(self.section("TOAST", self.tray(self.toast_demos())))
             .child(self.section("SMALL BUTTONS", self.tray(self.small_buttons(cx))))
             .child(self.section("BADGES & DOTS", self.tray(self.badges())))
             .child(self.section("TASK STATUS & CHIPS", self.tray(self.task_status_demo())))

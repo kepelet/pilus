@@ -871,6 +871,33 @@ pub fn run_main() -> Result<()> {
     });
     settle(&mut cx, 4);
     capture(&mut cx, window.into(), "main-palette")?;
+    cx.update(|app| {
+        view.update(app, |view, _| view.palette.close());
+    });
+
+    // Toasts stack at the bottom-right: a daemon push with its session as the
+    // title, a success, and a long error that clamps. The test window is never
+    // frontmost, so their clocks stay frozen for the capture.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.toasts.push(
+                super::toast::ToastKind::Info,
+                Some("quiet-comet".to_string()),
+                "Build finished in 42s".to_string(),
+            );
+            view.toast(super::toast::ToastKind::Success, "Opened the workspace");
+            view.toast(
+                super::toast::ToastKind::Error,
+                "Couldn't open workspace: the folder no longer exists on this machine",
+            );
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 30);
+    capture(&mut cx, window.into(), "main-toasts")?;
+    cx.update(|app| {
+        view.update(app, |view, _| view.toasts = super::toast::Toasts::new());
+    });
 
     // The WORKSPACES row context menu, with the keyboard cursor on Close,
     // and its Quick Actions submenu underneath.

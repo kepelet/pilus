@@ -25,7 +25,7 @@ use pilus_client::{
 use super::diff::{split_path, status_glyph};
 use super::diff_model::{self as model, Src, SrcKind};
 use super::highlight;
-use super::style::{self, ButtonKind, FillExt};
+use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::{EndpointId, PilusView, icon};
 
 /// How often the open tab asks the daemon for a fresh answer.
@@ -634,7 +634,7 @@ impl PilusView {
             .gap(px(2.0))
             .px_2()
             .py(px(6.0))
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .state_fill(rest, hover, style::RADIUS_MD)
             .child(
@@ -922,11 +922,7 @@ impl PilusView {
             .px_3()
             .h(px(style::scaled(&self.shared_settings, 30.0)))
             .cursor_pointer()
-            .state_fill(
-                theme.panel_dim,
-                theme.panel,
-                gpui::AbsoluteLength::Pixels(px(0.0)),
-            )
+            .state_fill(theme.panel_dim, theme.panel, style::Radius::None)
             .child(style::chevron(
                 format!("pilus-git-file-chevron-{index}"),
                 open,

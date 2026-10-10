@@ -16,7 +16,7 @@ use gpui::{
 };
 use pilus_client::{Agent, Task, TaskStatus};
 
-use super::style::{self, Connector, Side};
+use super::style::{self, Connector, RadiusExt, Side};
 use super::tasks::{TaskLayout, TaskView, age_label, status_glyph, unix_now};
 use super::{PilusView, agent_icon, icon};
 
@@ -772,7 +772,7 @@ impl PilusView {
             .bottom(px(geometry.pad))
             .w(px(width))
             .overflow_hidden()
-            .rounded_md()
+            .radius_md()
             .bg(Hsla::from(theme.panel_dim).opacity(0.45))
             .border_1()
             .border_color(theme.border)

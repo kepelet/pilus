@@ -35,7 +35,8 @@ with only the command-line tools can build the app.
   thread; writes go through an unbounded channel to a writer thread.
 - The macOS backdrop is `gui/glass.rs`'s own `NSVisualEffectView`, not GPUI's
   `Blurred` appearance (a weak, desaturated material by design). The window
-  stays `Transparent`; the blur slider drives the view's `alphaValue`.
+  stays `Transparent`; the blur slider drives the view's `alphaValue`. The view is pinned to the dark
+  appearance, so a light-mode Mac still frosts dark under the chrome.
 
 ## UI
 

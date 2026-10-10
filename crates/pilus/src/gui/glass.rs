@@ -14,9 +14,11 @@ mod imp {
     use gpui::Window;
     use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
     use objc2_app_kit::{
-        NSAutoresizingMaskOptions, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-        NSVisualEffectState, NSVisualEffectView, NSWindowOrderingMode,
+        NSAppearance, NSAppearanceCustomization, NSAutoresizingMaskOptions, NSView,
+        NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+        NSVisualEffectView, NSWindowOrderingMode,
     };
+    use objc2_foundation::NSString;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     /// The effect view under the content view, dropped while the desktop
@@ -85,6 +87,13 @@ mod imp {
         // not lose its frost.
         effect.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
         effect.setState(NSVisualEffectState::Active);
+        // The material follows the system appearance, so a light-mode Mac
+        // frosts the window white and washes out the dark chrome above it.
+        // Pin the dark one.
+        effect.setAppearance(
+            NSAppearance::appearanceNamed(&NSString::from_str("NSAppearanceNameDarkAqua"))
+                .as_deref(),
+        );
         effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
         effect.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable

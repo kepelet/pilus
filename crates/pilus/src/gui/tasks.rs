@@ -18,7 +18,7 @@ use gpui::{
 use pilus_client::{NewTask, Task, TaskAction, TaskStatus};
 
 use super::orchestration::{Board, Lane, agent_name, waiting_on};
-use super::style::{self, ButtonKind, FillExt};
+use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::task_compose::{ComposeState, Fetched, Scope, TaskPicker, TasksMsg};
 use super::text_input::TextInput;
 use super::theme::Theme;
@@ -748,7 +748,7 @@ impl PilusView {
             .gap_2()
             .h(px(style::scaled(&self.shared_settings, GROUP_HEIGHT)))
             .px_2()
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .hover_fill(theme.panel_dim, style::RADIUS_MD)
             .child(style::chevron(
@@ -857,7 +857,7 @@ impl PilusView {
             .gap_3()
             .h(px(style::scaled(&self.shared_settings, ROW_HEIGHT)))
             .px_2()
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .state_fill(rest, hover, style::RADIUS_MD)
             .child(status_glyph(task.status(), fonts.body, theme))
@@ -1001,7 +1001,7 @@ impl PilusView {
         let fonts = style::Fonts::resolve(&self.shared_settings);
         div()
             .p_3()
-            .rounded_md()
+            .radius_md()
             .bg(theme.panel_dim)
             .border_1()
             .border_color(theme.border)

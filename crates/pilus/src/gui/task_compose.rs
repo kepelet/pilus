@@ -19,7 +19,7 @@ use gpui::{
 use pilus_client::Task;
 
 use super::picker::{self, DirSource};
-use super::style::{self, FillExt};
+use super::style::{self, FillExt, RadiusExt};
 use super::{
     EndpointId, PICKER_CHIP_H, PICKER_MENU_MAX_H, PilusView, icon, picker_face, picker_menu,
 };
@@ -825,7 +825,7 @@ impl PilusView {
                     .gap_2()
                     .h(px(30.0))
                     .px_3()
-                    .rounded_md()
+                    .radius_md()
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.panel_fg)
                     .cursor_pointer()

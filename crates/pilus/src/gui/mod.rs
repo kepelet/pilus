@@ -92,7 +92,7 @@ use right_sidebar::{RightSidebar, SidebarTab};
 use selection::{Cell, Selection};
 use session::SessionPanel;
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
-use style::FillExt;
+use style::{FillExt, RadiusExt};
 use tasks::{TaskLayout, TasksInputs, TasksPanel};
 use text_input::{TextField, TextInput};
 use theme::Theme;
@@ -404,6 +404,7 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
     migrate_legacy_stores(&config_root, &pilus_root);
     let new_window_target = target.clone();
     let settings = Rc::new(RefCell::new(Settings::load(&pilus_root)));
+    style::sync_corner_radius(&settings.borrow());
     let machine_signal = Rc::new(RefCell::new(MachineSignal::default()));
     let shared_theme = Rc::new(RefCell::new(Theme::default()));
 
@@ -4629,7 +4630,7 @@ impl PilusView {
             .occlude()
             .bg(self.chrome_fill())
             .border_1()
-            .rounded_md()
+            .radius_md()
             // Focus is the one edge accent earns here: it says which side
             // of the split the keyboard is on.
             .border_color(if self.pi_focused {
@@ -5827,7 +5828,7 @@ impl PilusView {
             .flex()
             .flex_col()
             .w_full()
-            .rounded_lg()
+            .radius_lg()
             .bg(theme.panel.opacity(0.0))
             .border_t_1()
             .border_l_1()
@@ -5886,7 +5887,7 @@ impl PilusView {
                 .justify_center()
                 .w(px(30.0))
                 .h(px(30.0))
-                .rounded_full()
+                .radius_full()
                 .cursor_pointer()
                 .state_fill(theme.panel, theme.border, style::RADIUS_FULL)
                 .on_click(cx.listener(|this, _, _, cx| this.home_send(cx)))
@@ -6020,7 +6021,7 @@ impl PilusView {
                     .gap_2()
                     .h(px(30.0))
                     .px_3()
-                    .rounded_md()
+                    .radius_md()
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.panel_fg)
                     .cursor_pointer()
@@ -6286,7 +6287,7 @@ impl PilusView {
             .mx_3()
             .px_2()
             .py_2()
-            .rounded_md()
+            .radius_md()
             .bg(theme.panel)
             .border_1()
             .border_color(theme.border)
@@ -6501,7 +6502,7 @@ impl PilusView {
                                 .w(px(7.0))
                                 .h(px(7.0))
                                 .flex_shrink_0()
-                                .rounded_full()
+                                .radius_full()
                                 .bg(if status.gateway_up {
                                     theme.accent
                                 } else {
@@ -6650,7 +6651,7 @@ impl PilusView {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .rounded_md()
+                    .radius_md()
                     .bg(theme.panel)
                     .border_1()
                     .border_color(theme.border)
@@ -6710,7 +6711,7 @@ impl PilusView {
             .gap_1()
             .px_3()
             .py_2()
-            .rounded_md()
+            .radius_md()
             .bg(theme.panel_dim)
             .border_1()
             .border_color(theme.border);
@@ -6873,7 +6874,7 @@ impl PilusView {
                 .flex_col()
                 .px_3()
                 .py_2()
-                .rounded_md()
+                .radius_md()
                 .bg(theme.panel_dim)
                 .border_1()
                 .border_color(theme.border)
@@ -7011,7 +7012,7 @@ impl PilusView {
             .mx_3()
             .px_2()
             .py_2()
-            .rounded_md()
+            .radius_md()
             .bg(theme.panel)
             .border_1()
             .border_color(theme.border)
@@ -7368,10 +7369,12 @@ impl PilusView {
         if editing {
             let input = self.update_feed_input.clone();
             input.update(cx, |input, _| {
+                // The saved value beside it inherits the body size, so the
+                // live input matches or the text jumps when focus moves.
                 input.set_style(
                     theme,
                     style::chrome_font(&self.shared_settings),
-                    px(self.section_font()),
+                    px(style::Fonts::resolve(&self.shared_settings).body),
                 );
             });
             line = line.child(input);
@@ -7394,7 +7397,7 @@ impl PilusView {
             .items_center()
             .h(px(28.0))
             .px_2()
-            .rounded_md()
+            .radius_md()
             .bg(theme.panel_dim)
             .border_1()
             .border_color(if editing {
@@ -7537,7 +7540,7 @@ impl PilusView {
                     .mx_3()
                     .px_3()
                     .py_3()
-                    .rounded_md()
+                    .radius_md()
                     .bg(theme.panel)
                     .border_1()
                     .border_color(theme.border)
@@ -7679,7 +7682,7 @@ impl PilusView {
             .mx_3()
             .px_3()
             .py_3()
-            .rounded_md()
+            .radius_md()
             .bg(theme.panel)
             .border_1()
             .border_color(theme.border)
@@ -7740,10 +7743,12 @@ impl PilusView {
         };
         let body = if editing {
             input.update(cx, |input, _| {
+                // The saved value beside it inherits the body size, so the
+                // live input matches or the text jumps when focus moves.
                 input.set_style(
                     theme,
                     style::chrome_font(&self.shared_settings),
-                    px(self.section_font()),
+                    px(style::Fonts::resolve(&self.shared_settings).body),
                 );
             });
             div().flex_1().min_w(px(0.0)).child(input)
@@ -7881,7 +7886,7 @@ impl PilusView {
                 .justify_center()
                 .h(px(22.0))
                 .px_3()
-                .rounded_md()
+                .radius_md()
                 .border_1()
                 .border_color(if active { theme.accent } else { theme.border })
                 .text_color(if active { theme.window_bg } else { theme.fg })
@@ -7970,7 +7975,7 @@ impl PilusView {
             .gap_2()
             .h(px(26.0))
             .px_2()
-            .rounded_md()
+            .radius_md()
             .text_size(px(self.footer_font()))
             .text_color(theme.fg)
             .cursor_pointer()
@@ -8026,7 +8031,7 @@ impl PilusView {
                         .gap_2()
                         .h(px(28.0))
                         .px_2()
-                        .rounded_md()
+                        .radius_md()
                         .text_size(px(self.chrome_font()))
                         .text_color(if active {
                             theme.selection_fg
@@ -8086,7 +8091,7 @@ impl PilusView {
                     .top(px(44.0))
                     .right(px(8.0))
                     .w(px(240.0))
-                    .rounded_md()
+                    .radius_md()
                     .bg(theme.sidebar_bg)
                     .border_1()
                     .border_color(theme.border)
@@ -8153,7 +8158,7 @@ impl PilusView {
                     .gap_2()
                     .h(px(28.0))
                     .px_2()
-                    .rounded_md()
+                    .radius_md()
                     .text_color(fg)
                     .cursor_pointer()
                     .text_size(px(self.chrome_font()))
@@ -8254,7 +8259,7 @@ impl PilusView {
                         .relative()
                         .flex()
                         .flex_col()
-                        .rounded_lg()
+                        .radius_lg()
                         .bg(theme.sidebar_bg)
                         .border_1()
                         .border_color(theme.border)
@@ -9927,16 +9932,18 @@ impl PilusView {
             "pilus-sidebar-hover",
             &self.sidebar_hover,
             self.theme
-                .sidebar_raise(self.settings.glass_opacity(), SIDEBAR_HOVER_WEIGHT),
+                .sidebar_raise(self.glass_opacity(), SIDEBAR_HOVER_WEIGHT),
             style::RADIUS_MD,
+            SIDEBAR_ROW_EDGE,
         ));
         // The selected row's raised fill is a second pill under the rows, so
         // changing the selection reads as motion, like the tab strip's.
         content = content.child(style::glide(
             "pilus-sidebar-selection",
             &self.sidebar_selection,
-            self.theme.sidebar_raise(self.settings.glass_opacity(), 1.0),
+            self.theme.sidebar_raise(self.glass_opacity(), 1.0),
             style::RADIUS_MD,
+            SIDEBAR_ROW_EDGE,
         ));
         content = content.child(self.new_workspace_row(cx));
         // Auto mode replaces focused pi panes itself, so the manual toggle
@@ -10178,7 +10185,7 @@ impl PilusView {
     /// hidden so the sidebar can always come back.
     fn sidebar_toggle(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let glass = self.settings.glass_opacity();
+        let glass = self.glass_opacity();
         div()
             .id(id)
             .flex()
@@ -10187,7 +10194,7 @@ impl PilusView {
             .flex_shrink_0()
             .h(px(TAB_HEIGHT))
             .w(px(SIDEBAR_TOGGLE_W))
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .hover_fill(
                 theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT),
@@ -10205,7 +10212,7 @@ impl PilusView {
 
     fn top_chrome(&self, cx: &mut Context<Self>, cell_width: f32, fullscreen: bool) -> Div {
         let theme = self.theme;
-        let glass = self.settings.glass_opacity();
+        let glass = self.glass_opacity();
         // Beside the sidebar when it is open; full width when it is hidden.
         // The left inset only clears the floating traffic lights, which
         // fullscreen hides, so the strip runs to the edge there.
@@ -10229,7 +10236,8 @@ impl PilusView {
             "pilus-tab-glide",
             &selection,
             theme.panel.opacity(glass),
-            style::RADIUS_MD,
+            style::RADIUS_SOFT,
+            0.0,
         ));
         for tab in &self.tabs {
             tabs = tabs.child(self.tab_item(tab, &selection, cx));
@@ -10256,11 +10264,11 @@ impl PilusView {
             .flex_shrink_0()
             .h(px(TAB_HEIGHT))
             .w(px(28.0))
-            .rounded_md()
+            .radius_soft()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.muted)
-            .hover_fill(theme.panel.opacity(glass), style::RADIUS_MD)
+            .hover_fill(theme.panel.opacity(glass), style::RADIUS_SOFT)
             .hover(move |style| style.text_color(theme.panel_fg))
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
@@ -10311,12 +10319,19 @@ impl PilusView {
                 .child(div().flex_1())
                 .child(self.right_sidebar_toggle(cx));
         }
+        // An expanded right column covers the strip entirely.
+        if self.right.expanded() && self.right.spread() >= 1.0 {
+            return div();
+        }
         div()
             .absolute()
             .left(px(left))
             .right(px(self.right.px()))
             .top(px(0.0))
             .h(px(HEADER_HEIGHT))
+            // Clip only while the column is stretching over the strip, so
+            // the tab menus still reach outside it the rest of the time.
+            .when(self.right.spread() > 0.0, |strip| strip.overflow_hidden())
             .flex()
             .flex_col()
             .justify_center()
@@ -10332,7 +10347,7 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
-        let glass = self.settings.glass_opacity();
+        let glass = self.glass_opacity();
         let active = self.tab_active(tab);
         let index = tab.index;
         let close_index = tab.index;
@@ -10394,7 +10409,7 @@ impl PilusView {
             .min_w(px(140.0))
             .max_w(px(280.0))
             .px_3()
-            .rounded_md()
+            .radius_soft()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             // The selected tab's raised fill is the strip's glide pill;
@@ -10405,7 +10420,7 @@ impl PilusView {
                 } else {
                     theme.panel.opacity(glass * 0.5)
                 },
-                style::RADIUS_MD,
+                style::RADIUS_SOFT,
             )
             .text_color(fg)
             .hover(move |style| style.text_color(theme.panel_fg))
@@ -10439,7 +10454,7 @@ impl PilusView {
                     div()
                         .w(px(5.0))
                         .h(px(5.0))
-                        .rounded_full()
+                        .radius_full()
                         .bg(status)
                         .into_any_element()
                 };
@@ -10453,7 +10468,7 @@ impl PilusView {
                         .justify_center()
                         .w(px(8.0))
                         .h(px(8.0))
-                        .rounded_full()
+                        .radius_full()
                         .bg(theme.panel.opacity(0.0))
                         .child(indicator),
                 );
@@ -10568,7 +10583,7 @@ impl PilusView {
     /// chevron, opening the session menu below it.
     fn session_picker(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
-        let glass = self.settings.glass_opacity();
+        let glass = self.glass_opacity();
         div()
             .id("pilus-session-button")
             .flex()
@@ -10578,10 +10593,10 @@ impl PilusView {
             .h(px(TAB_HEIGHT))
             .pl(px(6.0))
             .pr_2()
-            .rounded_md()
+            .radius_soft()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            .hover_fill(theme.panel.opacity(glass), style::RADIUS_MD)
+            .hover_fill(theme.panel.opacity(glass), style::RADIUS_SOFT)
             .child(
                 div()
                     .text_color(theme.panel_fg)
@@ -10635,7 +10650,7 @@ impl PilusView {
                     .gap_2()
                     .h(px(28.0))
                     .px_2()
-                    .rounded_md()
+                    .radius_md()
                     .cursor_pointer()
                     .state_fill(bg, theme.panel, style::RADIUS_MD)
                     .text_size(px(self.chrome_font()))
@@ -10684,7 +10699,7 @@ impl PilusView {
                 .gap_2()
                 .h(px(28.0))
                 .px_2()
-                .rounded_md()
+                .radius_md()
                 .cursor_pointer()
                 .hover_fill(theme.panel, style::RADIUS_MD)
                 .text_size(px(self.chrome_font()))
@@ -10714,7 +10729,7 @@ impl PilusView {
                         .left(px(menu_left))
                         .top(px(HEADER_HEIGHT))
                         .w(px(264.0))
-                        .rounded_md()
+                        .radius_md()
                         .bg(theme.sidebar_bg)
                         .border_1()
                         .border_color(theme.border)
@@ -10778,7 +10793,7 @@ impl PilusView {
                     .gap_2()
                     .h(px(26.0))
                     .px_2()
-                    .rounded_md()
+                    .radius_md()
                     .cursor_pointer()
                     .state_fill(
                         if active {
@@ -10819,7 +10834,7 @@ impl PilusView {
             .left(px(left))
             .top(px(top))
             .w(px(width))
-            .rounded_md()
+            .radius_md()
             .bg(theme.sidebar_bg)
             .border_1()
             .border_color(theme.border)
@@ -10901,7 +10916,7 @@ impl PilusView {
             .flex_col()
             .gap_2()
             .p_3()
-            .rounded_md()
+            .radius_md()
             .bg(theme.sidebar_bg)
             .border_1()
             .border_color(theme.border)
@@ -11058,7 +11073,7 @@ impl PilusView {
                     .gap_3()
                     .h(px(30.0))
                     .px_3()
-                    .rounded_md()
+                    .radius_md()
                     .state_fill(
                         bg,
                         if active {
@@ -11131,7 +11146,7 @@ impl PilusView {
                         .max_h(px(420.0))
                         .flex()
                         .flex_col()
-                        .rounded_lg()
+                        .radius_lg()
                         .bg(theme.sidebar_bg)
                         .border_1()
                         .border_color(theme.border)
@@ -11222,7 +11237,7 @@ impl PilusView {
                             .border_l_1()
                             .border_b_1()
                             .border_color(theme.muted.opacity(0.5))
-                            .rounded_bl(px(3.0)),
+                            .rounded_bl(style::Radius::Sm.pixels() * 0.75),
                     )
                     .into_any_element()
             } else if remote {
@@ -11236,7 +11251,7 @@ impl PilusView {
                 glyph(
                     include_bytes!("../../assets/icons/folder.svg"),
                     SIDEBAR_GLYPH,
-                    theme.panel_fg,
+                    theme.muted,
                 )
                 .into_any_element()
             });
@@ -11294,7 +11309,7 @@ impl PilusView {
             // The branch and host badges keep the row's content inset.
             .pr(px(SIDEBAR_ROW_PAD))
             .py_1()
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
             .child(style::hover_target(&self.sidebar_hover))
@@ -11424,7 +11439,7 @@ impl PilusView {
             .h(px(SIDEBAR_ROW_HEIGHT))
             .pl(px(SIDEBAR_ROW_PAD))
             .pr(px(SIDEBAR_ROW_PAD))
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
@@ -11453,7 +11468,7 @@ impl PilusView {
             .h(px(SIDEBAR_ROW_HEIGHT))
             .pl(px(SIDEBAR_ROW_PAD))
             .pr(px(SIDEBAR_ROW_PAD))
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
@@ -11515,7 +11530,7 @@ impl PilusView {
             // The badge keeps the row's content inset, so it reads as a
             // column rather than a number touching the panel edge.
             .pr(px(SIDEBAR_ROW_PAD))
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
@@ -11937,7 +11952,7 @@ impl PilusView {
             // The status dot and branch keep the row's content inset.
             .pr(px(SIDEBAR_ROW_PAD))
             .py_1()
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
             .child(style::hover_target(&self.sidebar_hover))
@@ -11977,7 +11992,7 @@ impl PilusView {
                                 div()
                                     .w(px(8.0))
                                     .h(px(8.0))
-                                    .rounded_full()
+                                    .radius_full()
                                     .bg(status)
                                     .into_any_element()
                             }),
@@ -12148,13 +12163,29 @@ impl PilusView {
     /// shade denser than the terminal under translucency, so the chrome
     /// frames the grid and a page's text never sits on the bare desktop.
     fn chrome_fill(&self) -> gpui::Rgba {
-        self.theme.chrome_glass(self.settings.glass_opacity())
+        self.theme.chrome_glass(self.glass_opacity())
     }
 
-    /// Whether the terminal keeps its floating inset card: only the opaque
-    /// window frames the grid, so any translucency runs full-bleed.
+    /// Whether the terminal keeps its floating inset card. The Inset
+    /// checkbox owns it, independent of opacity.
     fn framed(&self) -> bool {
-        self.settings.glass_opacity() >= 1.0
+        self.settings.inset_card()
+    }
+
+    /// The window opacity in effect: the setting, except that a light scheme
+    /// is always opaque, since the frost behind it is dark.
+    fn glass_opacity(&self) -> f32 {
+        if self.theme.is_light() {
+            1.0
+        } else {
+            self.settings.glass_opacity()
+        }
+    }
+
+    /// Whether the window is fully opaque, so the blur and the glass coat
+    /// would never show.
+    fn opaque(&self) -> bool {
+        self.glass_opacity() >= 1.0
     }
 
     /// Recompute the cell grid size and tell the daemon when it changes.
@@ -12170,7 +12201,9 @@ impl PilusView {
     /// slide — the flicker. The card clips or pads the grid until the tween
     /// settles, and the trailing render sends any size still owed.
     fn sync_metrics(&mut self, window: &Window) {
-        if self.sidebar_anim.is_some() || self.right.moving() {
+        // A column stretched over the terminal leaves it nothing to fit, and
+        // sizing the daemon to that would reflow it for no one to see.
+        if self.sidebar_anim.is_some() || self.right.moving() || self.right.expanded() {
             return;
         }
         let layout = self.card_layout(window, self.framed());
@@ -12330,26 +12363,31 @@ impl Render for PilusView {
         if self.page_split.is_some() && self.page_split().is_none() {
             self.page_split = None;
         }
+        // What an expanded right column fills: the window beside the left
+        // sidebar.
+        let cell_width = self.cell_width(window);
+        let beside = f32::from(window.viewport_size().width) - self.sidebar_px(cell_width);
+        self.right.set_full(beside);
         self.sync_metrics(window);
         self.sync_home();
         self.sync_focus(window, cx);
 
         let theme = self.theme;
-        let glass = self.settings.glass_opacity();
+        let glass = self.glass_opacity();
         let framed = self.framed();
         // The blur slider drives the frosted backdrop view itself: full blur
         // is vibrant frost, weaker settings crossfade toward the sharp
-        // desktop, and an explicit zero drops the view entirely. A framed
-        // window is opaque — nothing would show — so it keeps it off.
+        // desktop, and an explicit zero drops the view entirely. An opaque
+        // window shows nothing through, so it keeps the view off.
         let blur = self.settings.blur.clamp(0.0, 1.0);
-        self.glass.apply(window, if framed { 0.0 } else { blur });
+        let opaque = self.opaque();
+        self.glass.apply(window, if opaque { 0.0 } else { blur });
         // A handler-less coat behind everything: it never intercepts clicks.
-        // The framed card floats with a gap on every side, and that gap must
-        // read as window base — the root is transparent so a translucent
-        // window can show the backdrop, which would otherwise leak the
-        // desktop through the margins. Only the translucent window leans on
-        // the coat.
-        let coat = glass_coat(theme, blur, framed);
+        // The root is transparent so a translucent window can show the
+        // backdrop, which would otherwise leak the desktop through the inset
+        // card's margins. Only the translucent window leans on the coat; an
+        // opaque one paints its flat base.
+        let coat = glass_coat(theme, blur, opaque);
         let cell_height = self.cell_height();
         let cell_width = self.cell_width(window);
         let layout = self.card_layout(window, framed);
@@ -12386,10 +12424,14 @@ impl Render for PilusView {
         let page_owns_card = self.home.is_open()
             || self.settings_open
             || (self.session.is_open() && self.pi_split().is_none());
+        // The inset card is solid whatever the opacity: it floats over the
+        // glass as a surface of its own, and its padding must match its
+        // cells. Only the full-bleed terminal lets the window show through.
+        let terminal_glass = if framed { 1.0 } else { glass };
         let terminal_fill = if sealed && !framed {
             terminal_bg.opacity(0.0)
         } else {
-            terminal_bg.opacity(glass)
+            terminal_bg.opacity(terminal_glass)
         };
         // Tasks, Mission Control, and Automations own the card only while
         // unsplit; split, `page_card` coats each half itself.
@@ -12427,7 +12469,7 @@ impl Render for PilusView {
                 self.skipped_rows(),
                 layout.cols,
                 layout.rows,
-                glass,
+                terminal_glass,
                 layout.slack_x,
                 layout.slack_y,
             ),
@@ -12520,8 +12562,8 @@ impl Render for PilusView {
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, _| {
                 this.scroll(event, window);
             }));
-        let sidebar = self.sidebar(cx, cell_width, f32::from(window.viewport_size().height));
         let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
+        let sidebar = self.sidebar(cx, cell_width, f32::from(window.viewport_size().height));
 
         // A bare spacer: the sidebar, tab strip, and card each paint their
         // own background, so the root stays transparent and no chrome layer
@@ -12654,7 +12696,7 @@ impl Render for PilusView {
                 // and rounding; a translucent terminal runs frameless to
                 // the window edges.
                 if framed {
-                    card = card.border_1().border_color(theme.border).rounded_md();
+                    card = card.border_1().border_color(theme.border).radius_soft();
                 }
                 card.child(self.card_content(cx, grid, &layout, terminal_fill))
             }))
@@ -12662,7 +12704,9 @@ impl Render for PilusView {
             // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
             .child(self.top_chrome(cx, cell_width, fullscreen))
-            .children((self.right.openness() > 0.0).then(|| self.right_sidebar_view(cx)))
+            .children(
+                (self.right.openness() > 0.0).then(|| self.right_sidebar_view(fullscreen, cx)),
+            )
             .child(self.session_menu(cx, cell_width, fullscreen))
             .child(self.palette_overlay(cx))
             .child(self.picker_overlay(window, cx))
@@ -13356,10 +13400,10 @@ fn coat_tint(blur: f32) -> f32 {
 
 /// The window's glass coat, painted behind every surface: a tint gradient
 /// deepening toward the bottom plus a sheen band under the top edge, which
-/// is what turns the frosted backdrop into a lit pane. The framed (opaque)
-/// window only needs its flat base under the card margins.
-fn glass_coat(theme: Theme, blur: f32, framed: bool) -> Div {
-    if framed {
+/// is what turns the frosted backdrop into a lit pane. The opaque window
+/// only needs its flat base.
+fn glass_coat(theme: Theme, blur: f32, opaque: bool) -> Div {
+    if opaque {
         return div().absolute().inset_0().bg(theme.window_bg);
     }
     let tint = coat_tint(blur);
@@ -13390,6 +13434,7 @@ fn glass_coat(theme: Theme, blur: f32, framed: bool) -> Div {
 /// every native surface starts from the same chrome type.
 fn apply_chrome_font<T: Styled>(root: T, settings: &Rc<RefCell<Settings>>) -> T {
     let settings = settings.borrow();
+    style::sync_corner_radius(&settings);
     let root = root.text_size(px(settings.ui_font_size));
     match settings.ui_font.as_ref() {
         Some(font) => root.font_family(font.clone()),
@@ -13519,7 +13564,7 @@ fn picker_face(
         .gap_2()
         .h(px(PICKER_CHIP_H))
         .px_2()
-        .rounded_md()
+        .radius_md()
         .text_color(fg)
         .cursor_pointer()
         .state_fill(
@@ -13562,7 +13607,7 @@ fn picker_menu(id: impl Into<ElementId>, theme: Theme) -> Stateful<Div> {
         .w(px(PICKER_MENU_W))
         .overflow_y_scroll()
         .occlude()
-        .rounded_lg()
+        .radius_lg()
         .bg(theme.bg)
         .border_1()
         .border_color(theme.border)
@@ -13602,7 +13647,7 @@ fn picker_option_row(
         .w_full()
         .h(px(PICKER_ROW_H))
         .px_3()
-        .rounded_md()
+        .radius_md()
         .text_color(theme.panel_fg)
         .font_weight(if active {
             FontWeight::BOLD
@@ -13648,7 +13693,7 @@ fn picker_filter_field(
         .gap_2()
         .h(px(PICKER_FIELD_H))
         .px_2()
-        .rounded_md()
+        .radius_md()
         .border_1()
         .border_color(theme.border)
         .child(input)
@@ -13887,7 +13932,7 @@ impl Render for SidebarTip {
             .max_w(px(420.0))
             .px_3()
             .py_2()
-            .rounded_md()
+            .radius_md()
             .border_1()
             .border_color(theme.border)
             .bg(theme.panel)
@@ -14094,7 +14139,7 @@ fn agent_config_empty(theme: Theme, message: &str, text_size: f32) -> Div {
         .mx_3()
         .px_3()
         .py_3()
-        .rounded_md()
+        .radius_md()
         .border_1()
         .border_color(theme.border)
         .text_size(px(text_size))

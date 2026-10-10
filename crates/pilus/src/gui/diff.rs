@@ -27,7 +27,7 @@ use super::diff_model::{
     self as model, Cursor, Display, FileFilter, Flat, LayoutMode, Row, Src, SrcKind,
 };
 use super::highlight::Token;
-use super::style::{self, ButtonKind, FillExt};
+use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
 use super::{EndpointId, PilusView, agent_icon, icon};
@@ -1328,7 +1328,7 @@ impl PilusView {
             .h(px(height))
             .min_w(px(height))
             .flex_shrink_0()
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .hover_fill(theme.panel_dim, style::RADIUS_MD)
             .child(icon(
@@ -1671,7 +1671,7 @@ impl PilusView {
             .gap_2()
             .h(px(style::scaled(&self.shared_settings, 32.0)))
             .px_2()
-            .rounded_md()
+            .radius_md()
             .cursor_pointer()
             .state_fill(rest, hover, style::RADIUS_MD)
             .child(
@@ -2076,7 +2076,7 @@ impl PilusView {
             .flex()
             .items_center()
             .justify_center()
-            .rounded_sm()
+            .radius_sm()
             .bg(theme.accent)
             .cursor_pointer()
             .opacity(0.0)
@@ -2111,7 +2111,7 @@ impl PilusView {
             .state_fill(
                 self.cursor_fill(&[src]),
                 style::tint(self.theme.panel_fg, 0.05),
-                gpui::AbsoluteLength::Pixels(px(0.0)),
+                style::Radius::None,
             )
             .child(self.line_number(line.old_line))
             .child(self.line_number(line.new_line))
@@ -2205,7 +2205,7 @@ impl PilusView {
             .state_fill(
                 self.range_fill(&covers),
                 style::tint(theme.panel_fg, 0.03),
-                gpui::AbsoluteLength::Pixels(px(0.0)),
+                style::Radius::None,
             )
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                 // A press lands on the half it is over; without hit-testing
@@ -2335,7 +2335,7 @@ impl PilusView {
                     .gap_1()
                     .ml(px(style::scaled(&self.shared_settings, GUTTER) * 2.0))
                     .p_2()
-                    .rounded_md()
+                    .radius_md()
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.panel_dim)
@@ -2424,7 +2424,7 @@ impl PilusView {
                     .gap_2()
                     .ml(px(style::scaled(&self.shared_settings, GUTTER) * 2.0))
                     .p_2()
-                    .rounded_md()
+                    .radius_md()
                     .border_1()
                     .border_color(theme.border_focus)
                     .bg(theme.panel_dim)
@@ -2534,7 +2534,7 @@ impl PilusView {
                     .gap_2()
                     .h(px(style::scaled(&self.shared_settings, 28.0)))
                     .px_2()
-                    .rounded_md()
+                    .radius_md()
                     .cursor_pointer()
                     .state_fill(rest, theme.panel_dim, style::RADIUS_MD)
                     .child(icon(agent_icon(&agent.agent), fonts.body, theme.muted))
@@ -2596,7 +2596,7 @@ impl PilusView {
                     .flex_col()
                     .gap_2()
                     .p_3()
-                    .rounded_lg()
+                    .radius_lg()
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.panel)

@@ -22,6 +22,9 @@ use super::{CloseTab, CloseWindow, human_bytes};
 
 /// Width and height of the update window.
 const WINDOW_SIZE: (f32, f32) = (460.0, 240.0);
+/// The smallest the window can be dragged to: below this its rows and
+/// controls start to clip.
+const WINDOW_MIN_SIZE: (f32, f32) = (380.0, 200.0);
 
 /// Which action the primary button performs for the current status.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -223,6 +226,7 @@ pub fn open(updater: Entity<Updater>, theme: Theme, settings: Rc<RefCell<Setting
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
             titlebar: Some(gpui::TitlebarOptions {
                 title: Some("Updates".into()),
                 appears_transparent: false,

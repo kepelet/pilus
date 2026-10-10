@@ -15,6 +15,9 @@ use super::{CloseTab, CloseWindow};
 
 /// Titlebar inset, matching the Appearances window.
 const WINDOW_SIZE: (f32, f32) = (420.0, 360.0);
+/// The smallest the window can be dragged to: below this its rows and
+/// controls start to clip.
+const WINDOW_MIN_SIZE: (f32, f32) = (360.0, 280.0);
 
 /// One credit line: a name and what it is.
 struct Credit {
@@ -233,6 +236,7 @@ pub fn open(theme: Theme, settings: Rc<RefCell<crate::settings::Settings>>, cx: 
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
             titlebar: Some(gpui::TitlebarOptions {
                 title: Some("About pilus".into()),
                 appears_transparent: false,

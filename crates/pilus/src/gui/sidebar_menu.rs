@@ -10,7 +10,7 @@
 //! toggle, scope) are client state, exactly as they are in the daemon's
 //! own TUI. The terminal's menu replaces the one the daemon draws into the grid
 //! on a right click: it offers the clipboard and the pane/tab actions a client
-//! can reach, so the click never reaches the daemon. The Files tab's menu
+//! can reach (split, fork, rename, move to a tab), so the click never reaches the daemon. The Files tab's menu
 //! creates, renames, and deletes the entries under the daemon's tree, which
 //! the client does over disk or SSH since the daemon never writes. This module owns the
 //! menu's state machine and item order; the window renders it and performs
@@ -107,6 +107,10 @@ pub enum Item {
     SplitRight,
     /// Split the focused pane stacked.
     SplitDown,
+    /// Fork the focused agent's session into a sibling pane.
+    ForkPane,
+    /// Move the focused pane to another tab, or to a tab of its own.
+    MoveToTab,
     NewTab,
     /// Close the active tab. Destructive: it ends every pane in it.
     CloseTab,
@@ -165,6 +169,8 @@ impl Item {
             Self::SelectAll => "Select All",
             Self::SplitRight => "Split Right",
             Self::SplitDown => "Split Down",
+            Self::ForkPane => "Fork to New Pane",
+            Self::MoveToTab => "Move to Tab",
             Self::NewTab => "New Tab",
             Self::CloseTab => "Close Tab",
             Self::Divider => "",
@@ -285,8 +291,8 @@ fn agent_rows() -> Vec<Item> {
     ]
 }
 
-/// The terminal's rows: the clipboard first, then the pane and tab actions
-/// below a divider. Copy needs a highlight, so it is left out without one
+/// The terminal's rows: the clipboard first, then the pane actions, the
+/// pane's name and tab, and the tab actions, each group below a divider. Copy needs a highlight, so it is left out without one
 /// rather than shown dead.
 fn terminal_rows(selection: bool) -> Vec<Item> {
     let mut items = Vec::new();
@@ -299,6 +305,10 @@ fn terminal_rows(selection: bool) -> Vec<Item> {
         Item::Divider,
         Item::SplitRight,
         Item::SplitDown,
+        Item::ForkPane,
+        Item::Divider,
+        Item::Rename,
+        Item::MoveToTab,
         Item::NewTab,
         Item::Divider,
         Item::CloseTab,
@@ -405,6 +415,9 @@ mod tests {
         assert_eq!(without.last(), Some(&Item::CloseTab));
         assert_eq!(without[without.len() - 2], Item::Divider);
         assert!(Item::CloseTab.destructive());
+        for item in [Item::ForkPane, Item::Rename, Item::MoveToTab] {
+            assert!(without.contains(&item));
+        }
     }
 
     #[test]

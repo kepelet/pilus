@@ -806,6 +806,27 @@ impl ControlClient {
         Ok(())
     }
 
+    /// The focused pane's id, whatever it runs.
+    pub fn focused_pane(&mut self) -> Result<String> {
+        let result = self.request("pane.current", json!({}))?;
+        result
+            .get("pane")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| Error::Control("pane.current: no focused pane".to_string()))
+    }
+
+    /// Move a pane to the 1-based tab `tab` of its workspace, or into a tab of
+    /// its own when `tab` is `None`.
+    pub fn move_pane(&mut self, pane: &str, tab: Option<u16>) -> Result<()> {
+        let params = match tab {
+            Some(tab) => json!({ "pane": pane, "tab": tab }),
+            None => json!({ "pane": pane, "new_tab": true }),
+        };
+        self.request("pane.move", params)?;
+        Ok(())
+    }
+
     /// The focused pane's id when it runs no agent, so a launch can reuse it
     /// instead of splitting a second pane beside a shell.
     ///

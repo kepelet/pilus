@@ -65,7 +65,7 @@ struct ComposeSheetView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .overlay(alignment: .topLeading) {
                     if draft.wrappedValue.isEmpty {
-                        Text("Plan, ask, build…")
+                        Text("Plan, ask, build")
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 19)
                             .padding(.vertical, 8)
@@ -74,6 +74,7 @@ struct ComposeSheetView: View {
                 }
         }
         .presentationDetents([.large])
+        .presentationDragIndicator(.hidden)
         .onAppear {
             applyDefaults()
             Task { editorFocused = true }
@@ -151,8 +152,13 @@ struct ComposeSheetView: View {
                 Menu {
                     ForEach(models) { entry in
                         Button { model.wrappedValue = entry.name } label: {
-                            Label(entry.name,
-                                  systemImage: model.wrappedValue == entry.name ? "checkmark" : "cpu")
+                            Label {
+                                Text(entry.name)
+                            } icon: {
+                                if model.wrappedValue == entry.name {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
                         }
                     }
                 } label: {
@@ -173,8 +179,6 @@ struct ComposeSheetView: View {
                     } icon: {
                         if workspaceID.wrappedValue == workspace.workspace_id {
                             Image(systemName: "checkmark")
-                        } else {
-                            Image("lucide-server")
                         }
                     }
                 }

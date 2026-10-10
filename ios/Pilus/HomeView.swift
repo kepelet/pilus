@@ -203,15 +203,19 @@ struct HomeView: View {
             }
             .sheet(isPresented: $showingNewTask) {
                 NewTaskView()
+                    .presentationDragIndicator(.hidden)
             }
             .sheet(isPresented: $showingOpenWorkspace) {
                 OpenWorkspaceView()
+                    .presentationDragIndicator(.hidden)
             }
             .sheet(isPresented: $showingPairing) {
                 OnboardingView(onPaired: { showingPairing = false })
+                    .presentationDragIndicator(.hidden)
             }
             .sheet(isPresented: $showingSettings) {
                 SettingsView()
+                    .presentationDragIndicator(.hidden)
             }
             .sheet(isPresented: $showingCompose) {
                 ComposeSheetView(draft: $composerDraft,
@@ -298,7 +302,7 @@ struct HomeView: View {
             }
             VStack(alignment: .leading, spacing: composerFocused ? 10 : 0) {
                 HStack(alignment: composerFocused ? .top : .center, spacing: 8) {
-                    TextField("Plan, ask, build…", text: $composerDraft, axis: .vertical)
+                    TextField("Plan, ask, build", text: $composerDraft, axis: .vertical)
                         .lineLimit(composerFocused ? 2...6 : 1...1)
                         .textFieldStyle(.plain)
                         .focused($composerFocused)
@@ -354,16 +358,7 @@ struct HomeView: View {
                 ProgressView()
                     .frame(width: 28, height: 28)
             } else {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Color(.systemBackground))
-                    .frame(width: 28, height: 28)
-                    .background(
-                        canSendComposer
-                            ? Color.primary
-                            : Color.secondary.opacity(0.3),
-                        in: Circle()
-                    )
+                SendArrow(enabled: canSendComposer, size: 28)
             }
         }
         .disabled(!canSendComposer || composerSending)
@@ -441,8 +436,13 @@ struct HomeView: View {
             Menu {
                 ForEach(models) { entry in
                     Button { composerModel = entry.name } label: {
-                        Label(entry.name,
-                              systemImage: composerModel == entry.name ? "checkmark" : "cpu")
+                        Label {
+                            Text(entry.name)
+                        } icon: {
+                            if composerModel == entry.name {
+                                Image(systemName: "checkmark")
+                            }
+                        }
                     }
                 }
             } label: {
@@ -472,8 +472,6 @@ struct HomeView: View {
                     } icon: {
                         if composerWorkspaceID == workspace.workspace_id {
                             Image(systemName: "checkmark")
-                        } else {
-                            Image("lucide-server")
                         }
                     }
                 }

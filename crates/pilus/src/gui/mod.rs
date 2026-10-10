@@ -15,6 +15,7 @@ mod connector;
 mod diff;
 mod diff_model;
 mod dock;
+mod files_tab;
 mod git_tab;
 mod glass;
 mod highlight;
@@ -62,6 +63,7 @@ use crossterm::event::{
 };
 use diff::{DiffInputs, DiffPanel};
 use dock::Dock;
+use files_tab::FilesPanel;
 use git_tab::GitPanel;
 use glass::Glass;
 use gpui::{
@@ -1580,6 +1582,7 @@ struct PilusView {
     diff_inputs: DiffInputs,
     /// The Git tab: the daemon's working-tree status and recent commits.
     git_panel: GitPanel,
+    files_panel: FilesPanel,
     /// The right sidebar (Diff and Git tabs).
     right: RightSidebar,
     /// The native Mission Control page: its state and the daemon's last
@@ -2017,6 +2020,7 @@ impl PilusView {
             diff_panel,
             diff_inputs,
             git_panel,
+            files_panel: FilesPanel::new(),
             right,
             mission: MissionPanel::default(),
             mission_answer,
@@ -2334,6 +2338,7 @@ impl PilusView {
         }
         changed |= self.diff_tick();
         changed |= self.git_tick();
+        changed |= self.files_tick();
         changed |= self.mission_tick();
         changed |= self.automations_tick();
         while let Ok(resolved) = self.home_resolve_rx.try_recv() {

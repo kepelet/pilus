@@ -324,6 +324,125 @@ pub(super) fn tab(
         .child(label)
 }
 
+/// How far each level of a tree steps in.
+pub(super) const TREE_INDENT: f32 = 14.0;
+const TREE_DISCLOSURE: f32 = 12.0;
+const TREE_GLYPH: f32 = 14.0;
+/// Space between the chevron, the glyph, and the name.
+const TREE_GAP: f32 = 4.0;
+/// Extra room before the name, so it does not crowd its glyph.
+const TREE_NAME_PAD: f32 = 4.0;
+const TREE_EDGE: f32 = 8.0;
+
+/// Where a row's name starts, so a placeholder under it lines up.
+pub(super) fn tree_name_x(depth: u16) -> f32 {
+    TREE_EDGE
+        + f32::from(depth) * TREE_INDENT
+        + TREE_DISCLOSURE
+        + TREE_GAP
+        + TREE_GLYPH
+        + TREE_GAP
+        + TREE_NAME_PAD
+}
+
+/// What a tree row says about Git, at its trailing edge.
+pub(super) enum TreeMark {
+    /// A file's status letter.
+    Status(SharedString, Rgba),
+    /// A folder with a changed file somewhere below it.
+    Dot(Rgba),
+}
+
+/// What [`tree_row`] draws.
+pub(super) struct TreeEntry {
+    pub(super) depth: u16,
+    pub(super) name: SharedString,
+    /// `None` for a file, `Some(open)` for a folder.
+    pub(super) folder: Option<bool>,
+    /// Turn the chevron; only for the row the user just toggled, as for
+    /// [`chevron`].
+    pub(super) animate: bool,
+    pub(super) mark: Option<TreeMark>,
+}
+
+/// One row of a file tree: indent, a disclosure chevron for a folder (a file
+/// keeps the slot empty so names line up), a glyph, the name, and any Git
+/// mark. Callers attach their own handler.
+pub(super) fn tree_row(
+    id: impl Into<ElementId>,
+    entry: TreeEntry,
+    theme: Theme,
+    settings: &Rc<RefCell<Settings>>,
+) -> Stateful<Div> {
+    let fonts = Fonts::resolve(settings);
+    let TreeEntry {
+        depth,
+        name,
+        folder,
+        animate,
+        mark,
+    } = entry;
+    let disclosure = match folder {
+        Some(open) => chevron(
+            format!("pilus-tree-chevron-{depth}-{name}"),
+            open,
+            animate,
+            TREE_DISCLOSURE,
+            theme.muted,
+        ),
+        None => div()
+            .w(px(TREE_DISCLOSURE))
+            .flex_shrink_0()
+            .into_any_element(),
+    };
+    let glyph = if folder.is_some() {
+        include_bytes!("../../assets/icons/folder.svg").as_slice()
+    } else {
+        include_bytes!("../../assets/icons/file.svg").as_slice()
+    };
+    let mark = mark.map(|mark| match mark {
+        TreeMark::Status(letter, color) => div()
+            .flex_shrink_0()
+            .text_size(px(fonts.label))
+            .font_weight(FontWeight::BOLD)
+            .text_color(color)
+            .child(letter)
+            .into_any_element(),
+        TreeMark::Dot(color) => div()
+            .flex_shrink_0()
+            .size(px(6.0))
+            .radius_full()
+            .bg(color)
+            .into_any_element(),
+    });
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(TREE_GAP))
+        .w_full()
+        .h(px(scaled(settings, 24.0)))
+        .pl(px(TREE_EDGE + f32::from(depth) * TREE_INDENT))
+        .pr_2()
+        .radius_md()
+        .cursor_pointer()
+        .hover_fill(theme.panel_dim, RADIUS_MD)
+        .child(disclosure)
+        .child(super::icon(glyph, TREE_GLYPH, theme.muted))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .pl(px(TREE_NAME_PAD))
+                .truncate()
+                .text_size(px(fonts.body))
+                .text_color(theme.panel_fg)
+                .child(name),
+        )
+        .children(mark)
+}
+
 /// A compact on/off switch. Callers attach their own handler.
 ///
 /// Flipping it slides the knob and eases both colors; a switch drawn for the

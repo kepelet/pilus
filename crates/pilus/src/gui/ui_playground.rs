@@ -1272,6 +1272,66 @@ impl UiPlaygroundView {
             )
     }
 
+    /// A file tree: an open folder with a nested closed one, then files, with
+    /// the Git marks a changed file and the folders above it carry.
+    fn tree_demo(&self) -> Div {
+        let theme = self.theme;
+        let row = |id: &'static str,
+                   depth: u16,
+                   name: &'static str,
+                   folder: Option<bool>,
+                   mark: Option<style::TreeMark>| {
+            style::tree_row(
+                id,
+                style::TreeEntry {
+                    depth,
+                    name: name.into(),
+                    folder,
+                    animate: false,
+                    mark,
+                },
+                theme,
+                &self.settings,
+            )
+        };
+        let status = |letter: &'static str, color| style::TreeMark::Status(letter.into(), color);
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .max_w(px(280.0))
+            .child(row(
+                "pg-tree-crates",
+                0,
+                "crates",
+                Some(true),
+                Some(style::TreeMark::Dot(theme.branch)),
+            ))
+            .child(row("pg-tree-client", 1, "pilus-client", Some(false), None))
+            .child(row(
+                "pg-tree-gui",
+                1,
+                "pilus",
+                Some(true),
+                Some(style::TreeMark::Dot(theme.branch)),
+            ))
+            .child(row(
+                "pg-tree-main",
+                2,
+                "main.rs",
+                None,
+                Some(status("M", theme.branch)),
+            ))
+            .child(row(
+                "pg-tree-new",
+                2,
+                "files_tab.rs",
+                None,
+                Some(status("?", theme.ok)),
+            ))
+            .child(row("pg-tree-readme", 0, "README.md", None, None))
+    }
+
     /// An agent row with its brand icon and status. A working agent's
     /// spinner turns on its own clock wherever the status is drawn.
     fn agent_row_demo(&self) -> Div {
@@ -1917,6 +1977,7 @@ impl Render for UiPlaygroundView {
                     ),
                 ),
             )
+            .child(self.section("FILE TREE", self.tray(self.tree_demo())))
             .child(self.section("COMMAND PALETTE", self.tray(self.palette_demo())))
             .child(self.section("WORKSPACE PICKER", self.tray(self.picker_demo())))
             .child(self.section("STATUS BAR", self.tray(self.status_bar_demo())))

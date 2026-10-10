@@ -1130,6 +1130,12 @@ impl PromptAction {
             Self::DeleteWorktree { dirty, blockers, .. } if *dirty || blockers.is_some()
         )
     }
+
+    /// Whether the prompt is a yes/no confirm with no field, so the keyboard
+    /// stays on the window root, which routes its Enter and Escape.
+    fn is_confirm(&self) -> bool {
+        matches!(self, Self::DeleteWorktree { .. } | Self::DeleteEntry { .. })
+    }
 }
 
 /// What the first delete confirm found that needs a second, explicit yes.
@@ -5742,7 +5748,7 @@ impl PilusView {
         // destructive confirm has no field — keys stay on the root, which
         // already routes Enter and Escape to it.
         if let Some(prompt) = self.menu_prompt.as_ref()
-            && !matches!(prompt.action, PromptAction::DeleteWorktree { .. })
+            && !prompt.action.is_confirm()
         {
             let handle = self.menu_prompt_input.focus_handle(cx);
             if !handle.is_focused(window) {
@@ -11293,10 +11299,7 @@ impl PilusView {
         let theme = self.theme;
         // A destructive confirm swaps the field for the target path, a warning,
         // and the Enter/Esc hint, so nobody deletes by typing past it.
-        let confirm = matches!(
-            prompt.action,
-            PromptAction::DeleteWorktree { .. } | PromptAction::DeleteEntry { .. }
-        );
+        let confirm = prompt.action.is_confirm();
         // What a Files-tab delete takes with it, since it has no worktree to
         // name: a folder takes everything inside.
         let entry_note = match &prompt.action {
@@ -14184,6 +14187,7 @@ fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
         SidebarItem::ToggleScope => include_bytes!("../../assets/icons/monitor.svg"),
         SidebarItem::NewFile => include_bytes!("../../assets/icons/file-plus.svg"),
         SidebarItem::NewFolder => include_bytes!("../../assets/icons/folder-plus.svg"),
+        SidebarItem::Upload => include_bytes!("../../assets/icons/upload.svg"),
         SidebarItem::Delete => include_bytes!("../../assets/icons/trash-2.svg"),
         SidebarItem::CopySelection => include_bytes!("../../assets/icons/copy.svg"),
         SidebarItem::Paste => include_bytes!("../../assets/icons/clipboard.svg"),

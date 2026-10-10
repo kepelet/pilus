@@ -221,8 +221,10 @@ type AgentCache = HashMap<String, (Instant, Vec<pilus_client::agents::AgentConfi
 /// forgotten: a request that did not run may be tried again under its key.
 #[derive(Default)]
 struct Replays {
-    cells: Mutex<HashMap<String, (Instant, Arc<OnceCell<Result<Value, Value>>>)>>,
+    cells: Mutex<ReplayCells>,
 }
+
+type ReplayCells = HashMap<String, (Instant, Arc<OnceCell<Result<Value, Value>>>)>;
 
 impl Replays {
     async fn once(
@@ -461,7 +463,7 @@ impl Hub {
         })
         .await
         .map_err(|error| failure("internal", &error.to_string()))?
-        .map_err(|error| client_failure(error, method))
+        .map_err(|error| client_failure(&error, method))
     }
 
     async fn local(&self, method: &str, params: Value) -> Result<Value, Value> {
@@ -502,7 +504,7 @@ impl Hub {
         })
         .await
         .map_err(|error| failure("internal", &error.to_string()))?
-        .map_err(|error| client_failure(error, method))
+        .map_err(|error| client_failure(&error, method))
     }
 
     /// Rewrite the gateway's capabilities so the device sees what *it* may do:
@@ -705,16 +707,12 @@ impl Hub {
             .await
     }
 
-    /// Start `params.agent` in a workspace and give it `params.prompt`, or give the
-    /// prompt to the one a phone already started there.
+    /// Start `params.agent` in a new workspace tab and give it `params.prompt`
+    /// after the daemon reports that the agent is ready.
     ///
-    /// The window's launcher does the same steps (`launch_home_agent`): an agent
-    /// spawns beside the focused pane, so the workspace is opened (focused) first,
-    /// the idle pane is reused, and the prompt goes to the pane once it is ready.
-    /// Doing it here as one request keeps the sequence on a single connection and
-    /// one audit line, instead of four calls from a page that may drop mid-way.
-    /// The agent gets an alias of our own, so a second message finds it again
-    /// even when Luvus labels the process as another kind.
+    /// The prompt retry continues on the same blocking control connection after
+    /// the started result has reached the phone, so a slow agent does not make
+    /// `hub.run` look hung.
     async fn run(&self, machine: &str, params: &Value) -> Result<Value, Value> {
         let text = |key: &str| {
             params
@@ -746,9 +744,6 @@ impl Hub {
                 "`agent` must name an agent kind, like `pi` or `claude`",
             ));
         }
-        if prompt.trim().is_empty() && kind != "terminal" {
-            return Err(bad("`prompt` is empty"));
-        }
         if path.is_empty() {
             return Err(bad("`path` must be the workspace's directory"));
         }
@@ -765,19 +760,30 @@ impl Hub {
                 .map(|config| config.launch_args(&model, &effort))
                 .unwrap_or_default()
         };
-        let launch = move |mut client: ControlClient| {
-            if kind == "terminal" {
-                launch_terminal(&mut client, &path, &workspace_id, &prompt)
-            } else {
-                launch_agent(&mut client, &kind, &path, &workspace_id, &prompt, &args)
-            }
-        };
+        let launch_params = (kind, path, workspace_id, prompt, args);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         if machine == LOCAL {
             let socket = api_socket_path_for(self.session.as_deref());
-            return tokio::task::spawn_blocking(move || launch(ControlClient::connect(&socket)?))
+            let (kind, path, workspace_id, prompt, args) = launch_params;
+            drop(tokio::task::spawn_blocking(
+                move || match ControlClient::connect(&socket) {
+                    Ok(client) => launch_for_hub(
+                        client,
+                        &kind,
+                        &path,
+                        &workspace_id,
+                        &prompt,
+                        &args,
+                        ready_tx,
+                    ),
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(client_failure(&error, "agent.start")));
+                    }
+                },
+            ));
+            return ready_rx
                 .await
-                .map_err(|error| failure("internal", &error.to_string()))?
-                .map_err(|error| client_failure(error, "agent.start"));
+                .map_err(|_| failure("internal", "hub.run launch task ended early"))?;
         }
         let known = self.catalog().await;
         let target = known
@@ -785,15 +791,35 @@ impl Hub {
             .find(|info| info.id == machine && info.enabled)
             .and_then(|info| info.ssh_target())
             .ok_or_else(|| failure("not_found", &format!("no usable machine `{machine}`")))?;
-        let _permit = self
+        let permit = self
             .ssh
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| failure("unavailable", "the hub is shutting down"))?;
-        tokio::task::spawn_blocking(move || launch(ControlClient::connect_ssh(target)?))
+        let (kind, path, workspace_id, prompt, args) = launch_params;
+        drop(tokio::task::spawn_blocking(move || {
+            // Keep the SSH slot through prompt retries so a slow agent cannot
+            // let a phone exhaust the hub's process and connection budget.
+            let _permit = permit;
+            match ControlClient::connect_ssh(target) {
+                Ok(client) => launch_for_hub(
+                    client,
+                    &kind,
+                    &path,
+                    &workspace_id,
+                    &prompt,
+                    &args,
+                    ready_tx,
+                ),
+                Err(error) => {
+                    let _ = ready_tx.send(Err(client_failure(&error, "agent.start")));
+                }
+            }
+        }));
+        ready_rx
             .await
-            .map_err(|error| failure("internal", &error.to_string()))?
-            .map_err(|error| client_failure(error, "agent.start"))
+            .map_err(|_| failure("internal", "hub.run launch task ended early"))?
     }
 
     /// The child folders of `params.path` (default `~`) on `machine`, for choosing
@@ -1195,7 +1221,7 @@ impl GhCall {
     }
 }
 
-/// The alias a phone-started agent gets: stable for one kind in one workspace.
+/// The base alias a phone-started agent gets before collision allocation.
 fn phone_alias(kind: &str, workspace_id: &str, path: &str) -> String {
     let anchor = if workspace_id.is_empty() {
         path
@@ -1214,33 +1240,159 @@ fn phone_alias(kind: &str, workspace_id: &str, path: &str) -> String {
     format!("phone-{kind}-{}", tail.to_lowercase())
 }
 
+const ALIAS_MAX_LEN: usize = 32;
+
+/// Pick a daemon-valid alias that is not already in `taken`.
+fn unique_alias(base: &str, taken: &[String]) -> String {
+    let mut normalized: String = base
+        .chars()
+        .map(|character| character.to_ascii_lowercase())
+        .filter(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || *character == '-'
+                || *character == '_'
+        })
+        .collect();
+    while normalized
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_ascii_lowercase())
+    {
+        normalized.remove(0);
+    }
+    if normalized.is_empty() {
+        normalized.push_str("phone");
+    }
+    normalized.truncate(ALIAS_MAX_LEN);
+    if !taken.iter().any(|name| name == &normalized) {
+        return normalized;
+    }
+    for suffix in 2.. {
+        let suffix = format!("-{suffix}");
+        let prefix_len = ALIAS_MAX_LEN.saturating_sub(suffix.len());
+        let prefix: String = normalized.chars().take(prefix_len).collect();
+        let candidate = format!("{prefix}{suffix}");
+        if !taken.iter().any(|name| name == &candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("the alias suffix search has an unbounded counter")
+}
+
 /// The blocking half of [`Hub::run`], on one control connection.
+///
+/// It always opens a new tab and returns before the separate prompt retry
+/// begins, so the phone can navigate to the started pane immediately.
 fn launch_agent(
     client: &mut ControlClient,
     kind: &str,
     path: &str,
     workspace_id: &str,
-    prompt: &str,
     args: &[String],
 ) -> Result<Value, ClientError> {
-    let alias = phone_alias(kind, workspace_id, path);
-    let running = client.agents()?;
-    if let Some(agent) = running.iter().find(|agent| agent.name == alias) {
-        client.prompt_agent(&agent.pane, prompt)?;
-        return Ok(json!({ "started": false, "name": alias, "pane": agent.pane }));
-    }
+    let taken = client
+        .agents()?
+        .into_iter()
+        .map(|agent| agent.name)
+        .collect::<Vec<_>>();
+    let alias = unique_alias(&phone_alias(kind, workspace_id, path), &taken);
     client.open_workspace(path)?;
-    // A fresh workspace opens with one shell pane; reuse it so the launch does
-    // not split a second, empty terminal beside the agent.
-    let pane = client.idle_pane().ok().flatten();
+    client.new_tab()?;
+    let pane = client.idle_pane()?;
     client.start_agent(&alias, kind, pane.as_deref(), args)?;
     if let Some(pane) = pane.as_deref() {
-        client.focus_pane(pane).ok();
+        client.focus_pane(pane)?;
     }
-    // Target the pane directly: a fresh agent's alias may not be registered yet.
     let target = pane.unwrap_or_else(|| alias.clone());
-    client.prompt_agent(&target, prompt)?;
     Ok(json!({ "started": true, "name": alias, "pane": target }))
+}
+
+/// Launch an agent, report its pane, then keep the connection for readiness
+/// retries without delaying the response that tells the phone it started.
+fn launch_for_hub(
+    mut client: ControlClient,
+    kind: &str,
+    path: &str,
+    workspace_id: &str,
+    prompt: &str,
+    args: &[String],
+    ready_tx: tokio::sync::oneshot::Sender<Result<Value, Value>>,
+) {
+    let launch = if kind == "terminal" {
+        launch_terminal(&mut client, path, workspace_id)
+    } else {
+        launch_agent(&mut client, kind, path, workspace_id, args)
+    };
+    let mut result = match launch {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = ready_tx.send(Err(client_failure(&error, "agent.start")));
+            return;
+        }
+    };
+    result["prompt"] = json!(if prompt.is_empty() { "none" } else { "queued" });
+    let target = result
+        .get("pane")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if ready_tx.send(Ok(result)).is_err() {
+        return;
+    }
+    if prompt.is_empty() {
+        return;
+    }
+    let delivery = if kind == "terminal" {
+        client.send_input(&target, &format!("{prompt}\n"))
+    } else {
+        retry_agent_prompt(
+            || client.prompt_agent(&target, prompt),
+            std::thread::sleep,
+            Instant::now,
+        )
+    };
+    if let Err(error) = delivery {
+        let failure = client_failure(&error, "agent.prompt");
+        let code = failure
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unavailable")
+            .to_string();
+        eprintln!("pilus-agent: hub.run prompt for {target} not delivered: {code}");
+    }
+}
+
+const PROMPT_RETRY_INTERVAL: Duration = Duration::from_millis(750);
+const PROMPT_RETRY_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Retry only readiness failures, with injectable time for daemon-free tests.
+fn retry_agent_prompt<F, S, C>(mut prompt: F, mut sleep: S, mut now: C) -> Result<(), ClientError>
+where
+    F: FnMut() -> Result<(), ClientError>,
+    S: FnMut(Duration),
+    C: FnMut() -> Instant,
+{
+    let deadline = now() + PROMPT_RETRY_DEADLINE;
+    loop {
+        match prompt() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let failure = client_failure(&error, "agent.prompt");
+                let code = failure
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unavailable");
+                if code != "agent_not_ready" || now() >= deadline {
+                    return Err(error);
+                }
+                sleep(PROMPT_RETRY_INTERVAL);
+                if now() >= deadline {
+                    return Err(error);
+                }
+            }
+        }
+    }
 }
 
 /// The `terminal` pseudo-kind: a fresh shell tab in the workspace, with the
@@ -1249,17 +1401,13 @@ fn launch_terminal(
     client: &mut ControlClient,
     path: &str,
     _workspace_id: &str,
-    prompt: &str,
 ) -> Result<Value, ClientError> {
     client.open_workspace(path)?;
     client.new_tab()?;
     // The new tab takes focus, so the current idle pane is its fresh shell.
-    let pane = client.idle_pane().ok().flatten();
+    let pane = client.idle_pane()?;
     if let Some(pane) = pane.as_deref() {
-        client.focus_pane(pane).ok();
-        if !prompt.is_empty() {
-            client.send_input(pane, &format!("{prompt}\n"))?;
-        }
+        client.focus_pane(pane)?;
     }
     Ok(json!({ "started": true, "name": "terminal", "pane": pane }))
 }
@@ -1281,7 +1429,7 @@ fn failure(code: &str, message: &str) -> Value {
 /// The control client reports a daemon refusal as `code: message`, but also
 /// reports timeouts and SSH stderr as `method: detail`. A prefix equal to the
 /// method that was called is therefore a transport failure, not a code.
-fn client_failure(error: ClientError, method: &str) -> Value {
+fn client_failure(error: &ClientError, method: &str) -> Value {
     let ClientError::Control(text) = error else {
         return failure("unavailable", &error.to_string());
     };
@@ -1294,7 +1442,7 @@ fn client_failure(error: ClientError, method: &str) -> Value {
             failure(code, message)
         }
         Some((_, message)) => failure("unavailable", message),
-        None => failure("unavailable", &text),
+        None => failure("unavailable", text),
     }
 }
 
@@ -1585,6 +1733,40 @@ mod tests {
         assert!(phone_alias("pi", "", "/Users/me/p r").starts_with("phone-pi-"));
     }
 
+    #[test]
+    fn unique_alias_keeps_a_free_base() {
+        assert_eq!(unique_alias("phone-pi-abcd", &[]), "phone-pi-abcd");
+    }
+
+    #[test]
+    fn unique_alias_adds_a_collision_suffix() {
+        let taken = vec!["phone-pi-abcd".to_string(), "phone-pi-abcd-2".to_string()];
+        assert_eq!(unique_alias("phone-pi-abcd", &taken), "phone-pi-abcd-3");
+    }
+
+    #[test]
+    fn unique_alias_truncates_before_a_suffix_and_stays_valid() {
+        let base = "phone-claude-this-is-a-very-long-agent-alias";
+        let alias = unique_alias(base, &[]);
+        assert!(alias.len() <= ALIAS_MAX_LEN);
+        assert!(
+            alias
+                .chars()
+                .enumerate()
+                .all(|(index, character)| if index == 0 {
+                    character.is_ascii_lowercase()
+                } else {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || character == '_'
+                        || character == '-'
+                })
+        );
+        let collision = unique_alias(base, std::slice::from_ref(&alias));
+        assert!(collision.len() <= ALIAS_MAX_LEN);
+        assert!(collision.ends_with("-2"));
+    }
+
     #[tokio::test]
     async fn running_an_agent_is_for_operate_devices_and_needs_real_arguments() {
         let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
@@ -1597,7 +1779,6 @@ mod tests {
         for bad in [
             json!({ "agent": "", "prompt": "hi", "path": "/tmp" }),
             json!({ "agent": "p i; rm", "prompt": "hi", "path": "/tmp" }),
-            json!({ "agent": "pi", "prompt": "  ", "path": "/tmp" }),
             json!({ "agent": "pi", "prompt": "hi" }),
         ] {
             let refused = hub.handle(&run(bad.clone()), Level::Operate, "t").await;
@@ -1668,10 +1849,17 @@ mod tests {
 
     #[test]
     fn effective_methods_by_level() {
-        let gateway: Vec<String> = ["workspace.list", "agent.prompt", "task.retry", "agent.read"]
-            .iter()
-            .map(|m| m.to_string())
-            .collect();
+        let gateway: Vec<String> = [
+            "workspace.list",
+            "agent.prompt",
+            "task.retry",
+            "agent.read",
+            "terminal.backend.type_literal",
+            "terminal.backend.send_key",
+        ]
+        .iter()
+        .map(|m| m.to_string())
+        .collect();
         let view = effective_methods(Level::View, &gateway);
         assert_eq!(view, vec!["workspace.list", "agent.read"]);
         // Control adds the review calls and the GitHub reads, nothing else.
@@ -1697,6 +1885,10 @@ mod tests {
             assert!(operate.iter().any(|name| name == method), "{method}");
         }
         assert!(operate.iter().any(|name| name == "agent.prompt"));
+        for method in ["terminal.backend.type_literal", "terminal.backend.send_key"] {
+            assert!(operate.iter().any(|name| name == method));
+            assert!(!OPERATE.contains(&method));
+        }
         // Nothing to extend until the gateway has said what it allows.
         assert!(effective_methods(Level::Operate, &[]).is_empty());
     }
@@ -1815,17 +2007,81 @@ mod tests {
     #[test]
     fn client_errors_keep_their_daemon_code() {
         let refusal = client_failure(
-            ClientError::Control("forbidden: nope".to_string()),
+            &ClientError::Control("forbidden: nope".to_string()),
             "task.add",
         );
         assert_eq!(refusal["code"], "forbidden");
         assert_eq!(refusal["message"], "nope");
         // Timeouts and SSH stderr are prefixed with the method, not a code.
         let transport = client_failure(
-            ClientError::Control("workspace.list: ssh: connection refused".to_string()),
+            &ClientError::Control("workspace.list: ssh: connection refused".to_string()),
             "workspace.list",
         );
         assert_eq!(transport["code"], "unavailable");
         assert_eq!(transport["message"], "ssh: connection refused");
+    }
+
+    #[test]
+    fn prompt_retry_succeeds_after_transient_not_ready_errors() {
+        let origin = Instant::now();
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut attempts = 0;
+        let result = retry_agent_prompt(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(ClientError::Control(
+                        "agent_not_ready: still starting".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            |delay| {
+                assert_eq!(delay, PROMPT_RETRY_INTERVAL);
+                elapsed.set(elapsed.get() + delay);
+            },
+            || origin + elapsed.get(),
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn prompt_retry_stops_on_non_retryable_error() {
+        let mut attempts = 0;
+        let result = retry_agent_prompt(
+            || {
+                attempts += 1;
+                Err(ClientError::Control("forbidden: no".to_string()))
+            },
+            |_| panic!("non-retryable errors must not sleep"),
+            Instant::now,
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn prompt_retry_stops_at_its_deadline() {
+        let origin = Instant::now();
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut attempts = 0;
+        let result = retry_agent_prompt(
+            || {
+                attempts += 1;
+                Err(ClientError::Control(
+                    "agent_not_ready: still starting".to_string(),
+                ))
+            },
+            |delay| {
+                assert_eq!(delay, PROMPT_RETRY_INTERVAL);
+                elapsed.set(elapsed.get() + Duration::from_secs(30).max(delay));
+            },
+            || origin + elapsed.get(),
+        );
+        assert!(result.is_err());
+        assert!(attempts >= 3);
+        assert!(elapsed.get() >= PROMPT_RETRY_DEADLINE);
     }
 }

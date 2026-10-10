@@ -131,13 +131,6 @@ const SKIPPED_DAEMON_ROWS_UNTITLED: u16 = 1;
 /// Daemon rows skipped at the grid bottom: its one-row status line, which the
 /// native shell omits. Assumes a single-row status line.
 const SKIPPED_DAEMON_BOTTOM_ROWS: u16 = 1;
-/// Gap around the floating terminal card: left, right, and bottom. Matches
-/// the sidebar's row edge, so the card sits as close to the window as the
-/// rows do.
-const CARD_GAP: f32 = 4.0;
-/// Gap between the tab strip and the card. The card hugs the header tighter
-/// than it does the other three sides, which stay at `CARD_GAP`.
-const CARD_GAP_TOP: f32 = 2.0;
 /// Bottom padding of the sidebar list.
 const SIDEBAR_LIST_PAD: f32 = 12.0;
 /// Inset between the panel edge and a row's box, so a selection pill and a
@@ -169,9 +162,6 @@ const SIDEBAR_BAND_HEIGHT: f32 = 24.0;
 const SECTION_TURN_WINDOW: Duration = Duration::from_millis(400);
 /// Space above a section header, on top of the list's row gap.
 const SIDEBAR_SECTION_GAP: f32 = 12.0;
-/// Breathing room between the terminal grid and the card's inset border.
-/// The card snaps to whole cells, so all four gaps stay exactly this.
-const TERMINAL_PAD: f32 = 6.0;
 /// How long the sidebar takes to collapse or expand: long enough for its
 /// spring to overshoot and settle, short enough to stay out of the way.
 const SIDEBAR_ANIM_DURATION: Duration = Duration::from_millis(460);
@@ -203,9 +193,6 @@ const TINT_TOP: f32 = 0.55;
 /// off across: the specular highlight a pane catches from light above.
 const SHEEN_MAX: f32 = 0.055;
 const SHEEN_HEIGHT: f32 = 0.32;
-/// Right margin on the card. Matches the other sides so the terminal sits
-/// centered between the sidebar and the window edge.
-const CARD_GAP_RIGHT: f32 = CARD_GAP;
 /// Width of the sidebar collapse/expand button.
 const SIDEBAR_TOGGLE_W: f32 = 28.0;
 /// Height of a tab pill in the top chrome.
@@ -835,21 +822,14 @@ fn migrate_legacy_stores(luvus_root: &Path, pilus_root: &Path) {
     }
 }
 
-/// Geometry of the inset terminal card: grid origin, visible cells, and the
+/// Geometry of the terminal card: grid origin, visible cells, and the
 /// measurements behind them, so painting, pointer mapping, and the daemon
 /// viewport stay pixel-true to one another.
 struct CardLayout {
-    /// Card's left edge in window pixels (sidebar plus gap, or just gap).
+    /// Card's left edge in window pixels: the sidebar's width.
     card_x: f32,
-    /// Card's top, right, and bottom offsets: the inset gaps when framed,
-    /// zero when the terminal runs full-bleed.
-    card_top: f32,
+    /// Card's right offset from the window edge: the right column's width.
     card_right: f32,
-    card_bottom: f32,
-    /// Inset of the first cell from the border, after centering the
-    /// whole-cell grid in the card's inner box.
-    pad_x: f32,
-    pad_y: f32,
     /// First visible cell's top-left corner in window pixels.
     origin_x: f32,
     origin_y: f32,
@@ -859,9 +839,9 @@ struct CardLayout {
     /// Measured cell size in pixels.
     cell_w: f32,
     cell_h: f32,
-    /// Sub-cell remainder pooled at the right and bottom edges in full-bleed
-    /// (zero when framed, where centering absorbs it). The grid paints its
-    /// edge colors over this strip so no card-colored sliver shows.
+    /// Sub-cell remainder pooled at the right and bottom edges. The grid
+    /// paints its edge colors over this strip so no card-colored sliver
+    /// shows.
     slack_x: f32,
     slack_y: f32,
     /// Pixels a split page takes from the card's leading edge or top, ahead
@@ -4444,7 +4424,7 @@ impl PilusView {
     }
 
     /// The card's content: the Settings page while it is open, else the
-    /// terminal grid. Sharing the card keeps the page inset exactly like
+    /// terminal grid. Sharing the card keeps the page sized exactly like
     /// the terminal, with the sidebar still showing beside it.
     ///
     /// Each page fades in under its own id, so switching pages replays it.
@@ -4457,7 +4437,6 @@ impl PilusView {
         layout: &CardLayout,
         terminal_fill: gpui::Rgba,
     ) -> AnyElement {
-        let (pad_x, pad_y) = (layout.pad_x, layout.pad_y);
         if self.home.is_open() {
             return style::enter(
                 "pilus-page-home",
@@ -4531,8 +4510,6 @@ impl PilusView {
         div()
             .flex_1()
             .overflow_hidden()
-            .pl(px(pad_x))
-            .pt(px(pad_y))
             .child(grid)
             .into_any_element()
     }
@@ -4588,8 +4565,6 @@ impl PilusView {
             .min_h(px(0.0))
             .overflow_hidden()
             .bg(terminal_fill)
-            .pl(px(layout.pad_x))
-            .pt(px(layout.pad_y))
             .child(grid);
         let row = div()
             .flex()
@@ -4662,13 +4637,7 @@ impl PilusView {
             .flex_1()
             .min_h(px(0.0))
             .overflow_hidden()
-            .child(
-                div()
-                    .size_full()
-                    .pl(px(layout.pad_x))
-                    .pt(px(layout.pad_y))
-                    .child(grid),
-            )
+            .child(div().size_full().child(grid))
             .child(style::enter(
                 "pilus-split-session-enter",
                 panel.child(self.session_render(cx)),
@@ -5719,7 +5688,7 @@ impl PilusView {
         }
     }
 
-    /// The Home screen: the launch composer that fills the inset card.
+    /// The Home screen: the launch composer that fills the card.
     ///
     /// The app mark sits to the left of the card.
     fn home_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6140,9 +6109,8 @@ impl PilusView {
 
     /// The Settings page, drawn in place of the terminal card.
     ///
-    /// It fills the same inset card the grid lives in — same gaps, border,
-    /// and rounding — so it reads as a native surface with the sidebar still
-    /// showing. A Back button at the top left closes it; there is no close
+    /// It fills the same card the grid lives in, so it reads as a native
+    /// surface with the sidebar still showing. A Back button at the top left closes it; there is no close
     /// button by design.
     fn settings_page(&self, cx: &mut Context<Self>) -> Div {
         if !self.settings_open {
@@ -8719,9 +8687,7 @@ impl PilusView {
                 return true;
             }
         }
-        // The gap ring around the floating card belongs to no pane.
-        // Full-bleed has no ring: every point in the card is grid.
-        let layout = self.card_layout(window, self.framed());
+        let layout = self.card_layout(window);
         let grid_right = layout.origin_x + f32::from(layout.cols) * layout.cell_w;
         let grid_bottom = layout.origin_y + f32::from(layout.rows) * layout.cell_h;
         if x < layout.origin_x || y < layout.origin_y || x >= grid_right || y >= grid_bottom {
@@ -8735,7 +8701,7 @@ impl PilusView {
             Some(frame) if frame.width > 0 && frame.height > 0 => (frame.width, frame.height),
             _ => return None,
         };
-        let layout = self.card_layout(window, self.framed());
+        let layout = self.card_layout(window);
         let skip = u32::from(self.skipped_cols());
         let skip_rows = u32::from(self.skipped_rows());
         let paint_w = u32::from(layout.cols).min(u32::from(width).saturating_sub(skip));
@@ -9040,7 +9006,7 @@ impl PilusView {
 
     /// Select the whole visible grid, so Cmd+A followed by Cmd+C copies it.
     fn select_all(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let layout = self.card_layout(window, self.framed());
+        let layout = self.card_layout(window);
         let skip = self.skipped_cols();
         let skip_rows = self.skipped_rows();
         self.selection = Some(Selection {
@@ -9968,7 +9934,7 @@ impl PilusView {
         // The panel starts on row 0, covering the daemon's `« session Menu`
         // chrome so the sidebar shows only native sections, and runs the
         // full viewport height.
-        let mut panel = div()
+        let panel = div()
             .absolute()
             .left(px(f32::from(dock.x) * cell_width))
             .top(px(0.0))
@@ -9993,23 +9959,19 @@ impl PilusView {
                     .child(self.sidebar_toggle("pilus-sidebar-toggle", cx)),
             )
             .child(list);
-        // A translucent sidebar parts from the terminal with the inset
-        // hairline; the opaque one meets it seamlessly.
-        // It is an overlay rather than a border: a border would take a pixel
-        // from the panel's content box and leave the rows' right inset one
-        // short of their left, but only while the window is translucent.
-        if !self.framed() {
-            panel = panel.child(
-                div()
-                    .absolute()
-                    .top(px(0.0))
-                    .bottom(px(0.0))
-                    .right(px(0.0))
-                    .w(px(1.0))
-                    .bg(self.theme.border),
-            );
-        }
-        panel
+        // The sidebar parts from the terminal with a hairline. It is an
+        // overlay rather than a border: a border would take a pixel from the
+        // panel's content box and leave the rows' right inset one short of
+        // their left.
+        panel.child(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .right(px(0.0))
+                .w(px(1.0))
+                .bg(self.theme.border),
+        )
     }
 
     /// Focus a workspace tab.
@@ -12069,29 +12031,19 @@ impl PilusView {
         )
     }
 
-    /// Measure the inset card and the grid that fits inside it.
+    /// Measure the terminal card and the grid that fits inside it.
     ///
-    /// The card floats below the tab strip with a gap on top, right, and
-    /// bottom, starting past the sidebar. The grid keeps a border on every
-    /// side.
-    fn card_layout(&mut self, window: &Window, framed: bool) -> CardLayout {
+    /// The card runs from the sidebar to the right column and from the tab
+    /// strip to the window's bottom edge, with no gap or border: the grid
+    /// spends every pixel on cells.
+    fn card_layout(&mut self, window: &Window) -> CardLayout {
         let cell_w = self.cell_width(window);
         let cell_h = self.cell_height();
         let viewport = window.viewport_size();
-        // A translucent terminal drops the inset card and runs to the window
-        // edges; the opaque one keeps its gaps, hairline, and rounding.
-        let gap_left = if framed { CARD_GAP } else { 0.0 };
-        let gap_top = if framed { CARD_GAP_TOP } else { 0.0 };
-        let gap_right = if framed { CARD_GAP_RIGHT } else { 0.0 };
-        let gap_bottom = if framed { CARD_GAP } else { 0.0 };
-        let border = if framed { 1.0 } else { 0.0 };
-        let card_x = self.sidebar_px(cell_w) + gap_left;
-        // The card's inner box: inside the hairline border, before the grid's
-        // own breathing room.
+        let card_x = self.sidebar_px(cell_w);
         let right_px = self.right.px();
-        let inner_w = f32::from(viewport.width) - card_x - gap_right - right_px - 2.0 * border;
-        let inner_h =
-            f32::from(viewport.height) - HEADER_HEIGHT - gap_top - gap_bottom - 2.0 * border;
+        let inner_w = f32::from(viewport.width) - card_x - right_px;
+        let inner_h = f32::from(viewport.height) - HEADER_HEIGHT;
         // A split page leads the card; the grid fits what it leaves.
         let content_w = inner_w;
         let (page_w, page_h) = match self.page_split().map(|split| split.axis) {
@@ -12100,45 +12052,18 @@ impl PilusView {
             None => (0.0, 0.0),
         };
         let (inner_w, inner_h) = (inner_w - page_w, inner_h - page_h);
-        // The framed card reserves breathing room around the grid; full-bleed
-        // spends every pixel on cells instead.
-        let breathing = if framed { TERMINAL_PAD } else { 0.0 };
-        let cols = ((inner_w - 2.0 * breathing) / cell_w).clamp(20.0, 500.0) as u16;
-        let rows = ((inner_h - 2.0 * breathing) / cell_h).clamp(5.0, 300.0) as u16;
-        // The framed card keeps its gaps to the window exact, so the sub-cell
-        // remainder goes inside it: the whole-cell grid centers in the inner
-        // box and each side's padding grows by half of what is left over.
-        // Full-bleed pins the grid to the top-left instead, so the terminal
-        // truly reaches the edges.
-        let (pad_x, pad_y) = if framed {
-            (
-                breathing + ((inner_w - 2.0 * breathing - f32::from(cols) * cell_w) / 2.0).max(0.0),
-                breathing + ((inner_h - 2.0 * breathing - f32::from(rows) * cell_h) / 2.0).max(0.0),
-            )
-        } else {
-            (0.0, 0.0)
-        };
-        // Full-bleed pools the leftover fraction at the far edges; the grid
-        // extends its edge colors over it below.
-        let slack_x = if framed {
-            0.0
-        } else {
-            (inner_w - f32::from(cols) * cell_w).max(0.0)
-        };
-        let slack_y = if framed {
-            0.0
-        } else {
-            (inner_h - f32::from(rows) * cell_h).max(0.0)
-        };
+        let cols = (inner_w / cell_w).clamp(20.0, 500.0) as u16;
+        let rows = (inner_h / cell_h).clamp(5.0, 300.0) as u16;
+        // The grid pins to the top-left so the terminal truly reaches the
+        // edges; the leftover fraction pools at the far edges, where the grid
+        // extends its edge colors over it.
+        let slack_x = (inner_w - f32::from(cols) * cell_w).max(0.0);
+        let slack_y = (inner_h - f32::from(rows) * cell_h).max(0.0);
         CardLayout {
             card_x,
-            card_top: gap_top,
-            card_right: gap_right + right_px,
-            card_bottom: gap_bottom,
-            pad_x,
-            pad_y,
-            origin_x: card_x + border + page_w + pad_x,
-            origin_y: HEADER_HEIGHT + gap_top + border + page_h + pad_y,
+            card_right: right_px,
+            origin_x: card_x + page_w,
+            origin_y: HEADER_HEIGHT + page_h,
             cols,
             rows,
             cell_w,
@@ -12156,12 +12081,6 @@ impl PilusView {
     /// frames the grid and a page's text never sits on the bare desktop.
     fn chrome_fill(&self) -> gpui::Rgba {
         self.theme.chrome_glass(self.glass_opacity())
-    }
-
-    /// Whether the terminal keeps its floating inset card. The Inset
-    /// checkbox owns it, independent of opacity.
-    fn framed(&self) -> bool {
-        self.settings.inset_card()
     }
 
     /// The window opacity in effect: the setting, except that a light scheme
@@ -12198,7 +12117,7 @@ impl PilusView {
         if self.sidebar_anim.is_some() || self.right.moving() || self.right.expanded() {
             return;
         }
-        let layout = self.card_layout(window, self.framed());
+        let layout = self.card_layout(window);
         // The daemon lays out its whole chrome (docks included); we only show
         // the pane area, so the skipped rows and columns ride along.
         let cols = layout.cols.saturating_add(self.skipped_cols());
@@ -12317,18 +12236,18 @@ fn pane_place(frame: PaneFrame, layout: &CardLayout) -> PanePlace {
     let left = if col0 <= 0.0 {
         0.0
     } else {
-        layout.pad_x + col0 * layout.cell_w
+        col0 * layout.cell_w
     };
     let top = if row0 <= 0.0 {
         0.0
     } else {
-        layout.pad_y + row0 * layout.cell_h
+        row0 * layout.cell_h
     };
     PanePlace {
         left,
         top,
-        width: (!to_right).then_some(layout.pad_x + col1 * layout.cell_w - left),
-        height: (!to_bottom).then_some(layout.pad_y + row1 * layout.cell_h - top),
+        width: (!to_right).then_some(col1 * layout.cell_w - left),
+        height: (!to_bottom).then_some(row1 * layout.cell_h - top),
     }
 }
 
@@ -12366,7 +12285,6 @@ impl Render for PilusView {
 
         let theme = self.theme;
         let glass = self.glass_opacity();
-        let framed = self.framed();
         // The blur slider drives the frosted backdrop view itself: full blur
         // is vibrant frost, weaker settings crossfade toward the sharp
         // desktop, and an explicit zero drops the view entirely. An opaque
@@ -12382,7 +12300,7 @@ impl Render for PilusView {
         let coat = glass_coat(theme, blur, opaque);
         let cell_height = self.cell_height();
         let cell_width = self.cell_width(window);
-        let layout = self.card_layout(window, framed);
+        let layout = self.card_layout(window);
         let line_height = px(cell_height);
         let selection = self.selection;
         // The terminal shares the sidebar's background: one uniform base
@@ -12394,7 +12312,7 @@ impl Render for PilusView {
             bg: terminal_bg,
             ..theme
         };
-        // One glass layer exactly: full-bleed has no padding and its edge
+        // One glass layer exactly: the grid has no padding and its edge
         // fillers seal every pixel, so when the frame seals the card the
         // cells carry the opacity and the card stays clear — otherwise two
         // stacked layers would read near-solid instead of the setting. Only
@@ -12402,7 +12320,7 @@ impl Render for PilusView {
         // frame's missing columns are padded by each row's right-edge filler,
         // so requiring them here would flip the card opaque mid-resize and
         // double-blend every cell for a frame (a visible blink). The card
-        // still backs the framed pad ring and any short frame.
+        // still backs any short frame.
         let sealed = match self.shown_frame() {
             Some(frame) => {
                 frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS)
@@ -12416,14 +12334,10 @@ impl Render for PilusView {
         let page_owns_card = self.home.is_open()
             || self.settings_open
             || (self.session.is_open() && self.pi_split().is_none());
-        // The inset card is solid whatever the opacity: it floats over the
-        // glass as a surface of its own, and its padding must match its
-        // cells. Only the full-bleed terminal lets the window show through.
-        let terminal_glass = if framed { 1.0 } else { glass };
-        let terminal_fill = if sealed && !framed {
+        let terminal_fill = if sealed {
             terminal_bg.opacity(0.0)
         } else {
-            terminal_bg.opacity(terminal_glass)
+            terminal_bg.opacity(glass)
         };
         // Tasks, Mission Control, and Automations own the card only while
         // unsplit; split, `page_card` coats each half itself.
@@ -12461,7 +12375,7 @@ impl Render for PilusView {
                 self.skipped_rows(),
                 layout.cols,
                 layout.rows,
-                terminal_glass,
+                glass,
                 layout.slack_x,
                 layout.slack_y,
             ),
@@ -12666,45 +12580,28 @@ impl Render for PilusView {
         // both.
         root = apply_chrome_font(root, &self.shared_settings);
 
-        // The strip around the floating card takes the hairline's color, so
-        // the card reads as a panel in a frame. It spans the card's gaps
-        // exactly (the card's offsets minus its own margins) and fades with
-        // the window like the rest of the chrome.
-        let frame = framed.then(|| {
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left(px(layout.card_x - CARD_GAP))
-                .right(px(layout.card_right - CARD_GAP_RIGHT))
-                .bg(theme.border.opacity(glass))
-        });
         root.child(coat)
             .child(header)
-            .child(div().relative().flex_1().children(frame).child({
-                let mut card = div()
-                    .absolute()
-                    .left(px(layout.card_x))
-                    // Content already starts below the header spacer, so the
-                    // top is just the gap (counting HEADER_HEIGHT twice
-                    // pushes the whole grid down and clips its bottom).
-                    .top(px(layout.card_top))
-                    .right(px(layout.card_right))
-                    // Fixed bottom: any floor slack stays inside the card
-                    // on the grid's own background, invisible.
-                    .bottom(px(layout.card_bottom))
-                    .flex()
-                    .flex_col()
-                    .bg(card_bg)
-                    .overflow_hidden();
-                // The opaque window keeps the floating card's hairline
-                // and rounding; a translucent terminal runs frameless to
-                // the window edges.
-                if framed {
-                    card = card.border_1().border_color(theme.border).radius_soft();
-                }
-                card.child(self.card_content(cx, grid, &layout, terminal_fill))
-            }))
+            .child(
+                div().relative().flex_1().child(
+                    div()
+                        .absolute()
+                        .left(px(layout.card_x))
+                        // Content already starts below the header spacer, so
+                        // the top is flush (counting HEADER_HEIGHT twice
+                        // pushes the whole grid down and clips its bottom).
+                        .top(px(0.0))
+                        .right(px(layout.card_right))
+                        // Fixed bottom: any floor slack stays inside the card
+                        // on the grid's own background, invisible.
+                        .bottom(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .bg(card_bg)
+                        .overflow_hidden()
+                        .child(self.card_content(cx, grid, &layout, terminal_fill)),
+                ),
+            )
             // Chrome layers live at the root so they paint above the content
             // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
@@ -14354,11 +14251,7 @@ mod tests {
     fn a_split_pane_maps_onto_whole_cells_and_meets_the_card_edges() {
         let layout = CardLayout {
             card_x: 0.0,
-            card_top: 0.0,
             card_right: 0.0,
-            card_bottom: 0.0,
-            pad_x: 6.0,
-            pad_y: 4.0,
             origin_x: 0.0,
             origin_y: 0.0,
             cols: 80,
@@ -14378,7 +14271,7 @@ mod tests {
             height: 1.0,
         };
         let place = pane_place(right_half, &layout);
-        assert_eq!(place.left, 6.0 + 40.0 * 8.0);
+        assert_eq!(place.left, 40.0 * 8.0);
         assert_eq!(place.top, 0.0);
         // Its right and bottom edges are the card's.
         assert_eq!((place.width, place.height), (None, None));
@@ -14390,8 +14283,8 @@ mod tests {
         };
         let place = pane_place(top_left, &layout);
         assert_eq!((place.left, place.top), (0.0, 0.0));
-        assert_eq!(place.width, Some(6.0 + 40.0 * 8.0));
-        assert_eq!(place.height, Some(4.0 + 12.0 * 16.0));
+        assert_eq!(place.width, Some(40.0 * 8.0));
+        assert_eq!(place.height, Some(12.0 * 16.0));
     }
 
     #[test]

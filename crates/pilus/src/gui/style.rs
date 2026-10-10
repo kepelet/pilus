@@ -56,8 +56,8 @@ pub(super) enum Radius {
     /// A pill, status dot, or round button: fully round whatever the
     /// setting, since a square one stops reading as what it is.
     Full,
-    /// A tab or the inset card: never squarer than the default radius, so
-    /// zero corners leave the strip and the terminal's frame soft.
+    /// A tab: never squarer than the default radius, so zero corners leave
+    /// the strip soft.
     Soft,
 }
 

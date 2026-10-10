@@ -84,10 +84,6 @@ pub struct Settings {
     /// the control existed keep full blur via the default.
     #[serde(default = "default_blur")]
     pub blur: f32,
-    /// Whether the terminal floats in an inset card with a gap and hairline,
-    /// instead of running to the window edges. `None` keeps what files
-    /// written before the checkbox did: inset only while fully opaque.
-    pub inset: Option<bool>,
     /// Corner radius of controls, cards, and overlays, in logical pixels.
     /// Every rounded element scales from it, and zero squares them all.
     pub corner_radius: f32,
@@ -142,7 +138,6 @@ impl Default for Settings {
             notifications: true,
             opacity: OPACITY,
             blur: BLUR,
-            inset: None,
             corner_radius: CORNER_RADIUS,
             pi_gui_auto: true,
             sidebar_workspace_paths: false,
@@ -202,11 +197,6 @@ impl Settings {
     /// the file cannot turn the window invisible.
     pub fn glass_opacity(&self) -> f32 {
         self.opacity.clamp(0.1, 1.0)
-    }
-
-    /// Whether the terminal keeps its floating inset card.
-    pub fn inset_card(&self) -> bool {
-        self.inset.unwrap_or(self.glass_opacity() >= 1.0)
     }
 
     /// The corner radius, clamped so a stray value cannot draw blobs.
@@ -275,27 +265,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_inset_follows_opacity() {
-        // Files written before the checkbox inset only while fully opaque.
-        let mut settings = Settings::default();
-        assert!(!settings.inset_card());
-        settings.opacity = 1.0;
-        assert!(settings.inset_card());
-    }
-
-    #[test]
-    fn explicit_inset_ignores_opacity() {
-        let mut settings = Settings {
-            inset: Some(true),
-            ..Settings::default()
-        };
-        assert!(settings.inset_card());
-        settings.inset = Some(false);
-        settings.opacity = 1.0;
-        assert!(!settings.inset_card());
-    }
-
-    #[test]
     fn missing_corner_radius_keeps_the_old_look() {
         let back: Settings =
             serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
@@ -353,7 +322,6 @@ mod tests {
             notifications: false,
             opacity: 0.7,
             blur: 0.5,
-            inset: Some(true),
             corner_radius: 0.0,
             pi_gui_auto: true,
             sidebar_workspace_paths: true,

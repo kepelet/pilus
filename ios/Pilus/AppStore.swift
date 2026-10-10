@@ -39,6 +39,7 @@ final class AppStore {
     private(set) var outputSignals: [String: Int] = [:]
 
     private var usesHub = false
+    private var attention = AttentionWatch()
     private var watchTask: Task<Void, Never>?
     private var remoteTask: Task<Void, Never>?
     /// The newest `seq` the watch reported. It is the daemon's event counter,
@@ -398,6 +399,7 @@ final class AppStore {
                 }
                 if let replacement = fetched.agents {
                     lists.agents = replacement.agents.map { var row = $0; row.machine = id; return row }
+                    Notifier.handle(attention.observe(machine: id, agents: lists.agents))
                 }
                 if let replacement = fetched.tasks {
                     lists.tasks = replacement.tasks.map { var row = $0; row.machine = id; return row }
@@ -417,6 +419,7 @@ final class AppStore {
         tasks = order.flatMap { listsByMachine[$0]?.tasks ?? [] }
         let failures = order.compactMap { listsByMachine[$0]?.failure }
         error = failures.isEmpty ? nil : failures.joined(separator: "\n")
+        if !loaded { Task { await Notifier.requestAuthorization() } }
         loaded = true
     }
 
@@ -867,6 +870,8 @@ final class AppStore {
         workspaces = []
         agents = []
         tasks = []
+        attention.reset()
+        Notifier.withdrawAll()
         level = nil
         allowedMethods = []
         usesHub = false

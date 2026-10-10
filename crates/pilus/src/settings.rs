@@ -71,8 +71,9 @@ pub struct Settings {
     /// Run the host connector ("this node" remote access) while pilus is open.
     /// Off by default; the Remote Machines window toggles it.
     pub connector: bool,
-    /// Raise a native desktop notification when the daemon pushes one, unless
-    /// this window is already in front. On by default.
+    /// Tell the user when an agent starts waiting on them (a native
+    /// notification while pilus is behind another app, a toast in front) and
+    /// when the daemon pushes a notice. On by default.
     pub notifications: bool,
     /// Window opacity for glass surfaces (terminal, sidebar, tab strip);
     /// 1.0 is opaque. Files written before the control existed stay

@@ -7,7 +7,9 @@
 //! open a folder (`files.reveal`) but not close one, so folding is this
 //! window's own state: a set of folded paths that hides rows without touching
 //! the daemon. Clicking a file hands it to the daemon (`files.open`), which
-//! shows it in the terminal card; this tab never reads file contents. The rows
+//! shows it in the terminal card. The one exception is a markdown file Git has
+//! no change for: the tab reads it itself and draws it as a document in place of
+//! the tree (see `md_view`), since the card can only show it as source. The rows
 //! carry no Git state, so each read also asks for the Diff's change list and
 //! marks changed files and the folders above them; a click on a changed file
 //! opens it in the Diff instead.
@@ -25,10 +27,12 @@ use gpui::{
     prelude::*, px, relative,
 };
 use pilus_client::{
-    ControlClient, Error, FileChanges, FileRow, FileTree, OpenTarget, visible_rows,
+    ControlClient, Error, FileChanges, FileRow, FileTree, OpenTarget, TextFile, Version, read_text,
+    visible_rows,
 };
 
 use super::diff::status_glyph;
+use super::md_view::{self, MdDoc, Page};
 use super::right_sidebar::SidebarTab;
 use super::style::{self, TreeEntry, TreeMark};
 use super::{EndpointId, PilusView, icon};
@@ -74,6 +78,25 @@ pub(super) enum FilesMsg {
         endpoint: EndpointId,
         result: Result<(), String>,
     },
+    Doc {
+        endpoint: EndpointId,
+        seq: u32,
+        result: Result<TextFile, String>,
+    },
+}
+
+/// A markdown file open in the tab, in place of the tree.
+struct FileDoc {
+    path: String,
+    /// The read this document waits on or came from: only its answer lands.
+    seq: u32,
+    state: DocState,
+}
+
+enum DocState {
+    Loading,
+    Ready(MdDoc),
+    Failed(String),
 }
 
 /// What a request does to the daemon before it reads the tree back.
@@ -124,6 +147,10 @@ pub(super) struct FilesPanel {
     /// children arrive.
     loading: Option<Loading>,
     changes: FileChanges,
+    /// The file shown instead of the tree, if one is open.
+    doc: Option<FileDoc>,
+    /// Document reads sent so far.
+    doc_reads: u32,
     /// Where the loading folder sits in `visible`, when it shows.
     loading_at: Option<usize>,
     list: ListState,
@@ -149,6 +176,8 @@ impl FilesPanel {
             toggled: None,
             loading: None,
             changes: FileChanges::default(),
+            doc: None,
+            doc_reads: 0,
             loading_at: None,
             list: ListState::new(0, ListAlignment::Top, px(600.0)),
             error: None,
@@ -167,9 +196,41 @@ impl FilesPanel {
         self.last_poll = None;
     }
 
+    /// The open document's path, if the tab is showing one.
+    pub(super) fn doc_path(&self) -> Option<&str> {
+        self.doc.as_ref().map(|doc| doc.path.as_str())
+    }
+
+    /// Drop the open document, which shows the tree again.
+    pub(super) fn close_doc(&mut self) {
+        self.doc = None;
+    }
+
+    /// The open document, once its text has been read.
+    pub(super) fn doc_view(&self) -> Option<&MdDoc> {
+        match &self.doc.as_ref()?.state {
+            DocState::Ready(doc) => Some(doc),
+            _ => None,
+        }
+    }
+
+    /// Fold a finished document read in. An answer for a read the user has
+    /// since replaced is dropped.
+    fn apply_doc(&mut self, seq: u32, result: Result<TextFile, String>) -> bool {
+        let Some(doc) = self.doc.as_mut().filter(|doc| doc.seq == seq) else {
+            return false;
+        };
+        doc.state = match result {
+            Ok(file) => DocState::Ready(MdDoc::new(&file)),
+            Err(error) => DocState::Failed(error),
+        };
+        true
+    }
+
     /// Drop everything read from the daemon: another machine answers for
     /// other trees.
     fn reset(&mut self) {
+        self.doc = None;
         self.tree = None;
         self.folded.clear();
         self.visible.clear();
@@ -194,8 +255,12 @@ impl FilesPanel {
             Ok(Read { tree, changes }) => {
                 let mut changed = self.error.take().is_some();
                 if self.tree.as_ref().map(|old| &old.root) != Some(&tree.root) {
-                    // Another node: its folders are not the ones folded here.
+                    // Another node: its folders are not the ones folded here,
+                    // and its tree does not hold the open document.
                     self.folded.clear();
+                    if self.tree.is_some() {
+                        self.doc = None;
+                    }
                 }
                 let open: HashSet<&str> = tree
                     .rows
@@ -351,6 +416,16 @@ impl PilusView {
                         changed = true;
                     }
                 }
+                FilesMsg::Doc {
+                    endpoint,
+                    seq,
+                    result,
+                } => {
+                    if current.is_some_and(|current| current != endpoint) {
+                        continue;
+                    }
+                    changed |= self.files_panel.apply_doc(seq, result);
+                }
             }
         }
         if !self.files_visible() {
@@ -400,6 +475,87 @@ impl PilusView {
         });
     }
 
+    /// Show the markdown file at `path` in place of the tree, reading it off
+    /// the GUI thread.
+    pub(super) fn files_open_doc(&mut self, path: &str, cx: &mut Context<Self>) {
+        let path = path.to_string();
+        self.right_navigate(cx, |this, _| {
+            this.right.select_tab(SidebarTab::Files);
+            this.files_read_doc(path);
+        });
+    }
+
+    /// Start (or restart) the read of the document at `path`.
+    pub(super) fn files_read_doc(&mut self, path: String) {
+        let endpoint = self.active.clone();
+        let target = match self.read_target(&endpoint) {
+            Ok(target) => target,
+            Err(error) => {
+                self.files_panel.doc_reads += 1;
+                self.files_panel.doc = Some(FileDoc {
+                    path,
+                    seq: self.files_panel.doc_reads,
+                    state: DocState::Failed(error),
+                });
+                return;
+            }
+        };
+        let panel = &mut self.files_panel;
+        panel.doc_reads += 1;
+        let seq = panel.doc_reads;
+        // A reload keeps the text on screen until the new read lands.
+        let keep = panel.doc.take().filter(|doc| doc.path == path);
+        panel.doc = Some(FileDoc {
+            path: path.clone(),
+            seq,
+            state: match keep.map(|doc| doc.state) {
+                Some(DocState::Ready(doc)) => DocState::Ready(doc),
+                _ => DocState::Loading,
+            },
+        });
+        let tx = panel.tx.clone();
+        std::thread::spawn(move || {
+            let result = read_text(target.as_ref(), Version::Disk(&path));
+            tx.send(FilesMsg::Doc {
+                endpoint,
+                seq,
+                result,
+            })
+            .ok();
+        });
+    }
+
+    /// Put the tree back where the open document was.
+    pub(super) fn files_close_doc(&mut self, cx: &mut Context<Self>) {
+        self.right_navigate(cx, |this, _| this.files_panel.close_doc());
+    }
+
+    fn files_reload_doc(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.files_panel.doc_path().map(str::to_string) {
+            self.files_read_doc(path);
+            cx.notify();
+        }
+    }
+
+    /// Hand the open document to the daemon, which shows it in a pane.
+    fn files_doc_in_pane(&mut self) {
+        let Some(path) = self.files_panel.doc_path().map(str::to_string) else {
+            return;
+        };
+        let endpoint = self.active.clone();
+        let tx = self.files_panel.tx.clone();
+        let client = self.control_client_for_endpoint(&endpoint);
+        std::thread::spawn(move || {
+            let result = match client {
+                None => Err("Could not reach the daemon".to_string()),
+                Some(mut client) => client
+                    .files_open(&path, OpenTarget::Pane)
+                    .map_err(|error| error.to_string()),
+            };
+            tx.send(FilesMsg::Opened { endpoint, result }).ok();
+        });
+    }
+
     fn files_refresh_now(&mut self, cx: &mut Context<Self>) {
         self.files_request(Prelude::Refresh);
         cx.notify();
@@ -445,8 +601,14 @@ impl PilusView {
     /// any other is a preview, or a pane on a double click.
     fn files_click_file(&mut self, row: &FileRow, target: OpenTarget, cx: &mut Context<Self>) {
         if let Some(change) = self.files_panel.changes.file(&row.path).cloned() {
-            self.select_right_tab(SidebarTab::Diff, cx);
-            self.diff_reveal(change.layer, &change.path, cx);
+            self.right_navigate(cx, |this, cx| {
+                this.right.select_tab(SidebarTab::Diff);
+                this.diff_reveal(change.layer, &change.path, cx);
+            });
+            return;
+        }
+        if md_view::is_markdown(&row.path) {
+            self.files_open_doc(&row.path, cx);
             return;
         }
         let endpoint = self.active.clone();
@@ -466,6 +628,9 @@ impl PilusView {
 
     /// The tab: the root and refresh control above the tree.
     pub(super) fn files_page(&mut self, cx: &mut Context<Self>) -> Div {
+        if self.files_panel.doc.is_some() {
+            return self.files_doc_page(cx);
+        }
         let page = div()
             .relative()
             .flex()
@@ -509,6 +674,120 @@ impl PilusView {
             ),
         )
         .children(footer)
+    }
+
+    /// The open document: its name over the rendered text.
+    fn files_doc_page(&mut self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let Some(doc) = self.files_panel.doc.as_ref() else {
+            return div();
+        };
+        let (dir, name) = super::diff::split_path(&doc.path);
+        let dir = self.shorten_cwd(&self.active.key(), dir);
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(icon(
+                include_bytes!("../../assets/icons/file.svg"),
+                fonts.body,
+                theme.muted,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .font_family(SharedString::from(style::mono_family(
+                        &self.shared_settings,
+                    )))
+                    .text_size(px(fonts.secondary))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_color(theme.muted)
+                            .child(format!("{dir}/")),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme.panel_fg)
+                            .child(name.to_string()),
+                    ),
+            )
+            .child(
+                self.diff_icon_button(
+                    "pilus-files-doc-pane",
+                    include_bytes!("../../assets/icons/terminal.svg"),
+                    "Open in a pane".to_string(),
+                    false,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.files_doc_in_pane();
+                    cx.notify();
+                })),
+            )
+            .child(
+                self.diff_icon_button(
+                    "pilus-files-doc-reload",
+                    include_bytes!("../../assets/icons/refresh-cw.svg"),
+                    "Reload".to_string(),
+                    false,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.files_reload_doc(cx))),
+            )
+            .child(
+                self.diff_icon_button(
+                    "pilus-files-doc-close",
+                    include_bytes!("../../assets/icons/x.svg"),
+                    "Back to the file tree".to_string(),
+                    false,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.files_close_doc(cx))),
+            );
+        let truncated = self
+            .files_panel
+            .doc_view()
+            .is_some_and(|doc| doc.truncated)
+            .then(|| {
+                div()
+                    .px_3()
+                    .py_1()
+                    .flex_shrink_0()
+                    .text_size(px(fonts.label))
+                    .text_color(theme.alert)
+                    .child("TRUNCATED: only the start of this file is shown")
+            });
+        let body = match &self.files_panel.doc.as_ref().map(|doc| &doc.state) {
+            Some(DocState::Loading) | None => self.diff_message("Loading…").into_any_element(),
+            Some(DocState::Failed(error)) => self
+                .diff_message(format!("Could not read this file: {error}"))
+                .into_any_element(),
+            Some(DocState::Ready(_)) => self.md_list(Page::Files, cx),
+        };
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .child(header)
+            .children(truncated)
+            .child(div().flex_1().min_h(px(0.0)).child(body))
     }
 
     /// One row: the root's name and the refresh control.
@@ -750,6 +1029,22 @@ impl PilusView {
     }
 
     /// Show the sample folder at `path` as still opening.
+    /// Open `text` as the document at `path`, as a finished read would.
+    pub(super) fn files_show_doc(&mut self, path: &str, text: &str, cx: &mut Context<Self>) {
+        self.files_show_sample(cx);
+        let panel = &mut self.files_panel;
+        panel.doc_reads += 1;
+        panel.doc = Some(FileDoc {
+            path: path.to_string(),
+            seq: panel.doc_reads,
+            state: DocState::Ready(MdDoc::new(&TextFile {
+                text: text.to_string(),
+                truncated: false,
+            })),
+        });
+        cx.notify();
+    }
+
     pub(super) fn files_loading_sample(&mut self, path: &str, cx: &mut Context<Self>) {
         self.files_panel.loading = Some(Loading {
             path: path.to_string(),

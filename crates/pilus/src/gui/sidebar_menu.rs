@@ -1,5 +1,5 @@
 //! The native right-click context menus for the sidebar's WORKSPACES and
-//! AGENTS rows.
+//! AGENTS rows, and for the terminal grid.
 //!
 //! Luvus opens a context menu on a WORKSPACES row (close, rename, path
 //! visibility, copy path/branch, new worktree, and the git/task/mission
@@ -8,8 +8,11 @@
 //! client can reach ride the control API (`workspace.*`, `agent.name`,
 //! `pane.close`, `worktree.create`), and the purely presentational ones (path
 //! toggle, scope) are client state, exactly as they are in the daemon's
-//! own TUI. This module owns the menu's state machine and item order; the
-//! window renders it and performs the actions, so nothing here knows GPUI.
+//! own TUI. The terminal's menu replaces the one the daemon draws into the grid
+//! on a right click: it offers the clipboard and the pane/tab actions a client
+//! can reach, so the click never reaches the daemon. This module owns the
+//! menu's state machine and item order; the window renders it and performs
+//! the actions, so nothing here knows GPUI.
 
 /// The sidebar row an open menu is anchored to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +42,9 @@ pub enum MenuTarget {
         /// The label the row is currently showing, pre-filling a rename.
         name: String,
     },
+    /// The terminal grid. `selection` is whether text is highlighted, which
+    /// is what Copy needs, so the row only appears when it can work.
+    Terminal { selection: bool },
 }
 
 /// One row of the open context menu, in render order.
@@ -69,6 +75,19 @@ pub enum Item {
     OpenMission,
     /// Show only the active workspace's agents in the AGENTS dock.
     ToggleScope,
+    /// Copy the terminal's highlighted text.
+    CopySelection,
+    /// Send the clipboard to the focused pane.
+    Paste,
+    /// Highlight the whole visible grid.
+    SelectAll,
+    /// Split the focused pane side by side.
+    SplitRight,
+    /// Split the focused pane stacked.
+    SplitDown,
+    NewTab,
+    /// Close the active tab. Destructive: it ends every pane in it.
+    CloseTab,
     Divider,
 }
 
@@ -78,10 +97,10 @@ impl Item {
         self != Self::Divider
     }
 
-    /// Whether the row is destructive (Close, Delete Worktree), painted in
+    /// Whether the row is destructive (Close, Delete Worktree, Close Tab), painted in
     /// the alert color.
     pub fn destructive(self) -> bool {
-        matches!(self, Self::Close | Self::DeleteWorktree)
+        matches!(self, Self::Close | Self::DeleteWorktree | Self::CloseTab)
     }
 
     /// The label, resolved against the state the row toggles: `paths_visible`
@@ -112,6 +131,13 @@ impl Item {
                     "Show Workspace Only"
                 }
             }
+            Self::CopySelection => "Copy",
+            Self::Paste => "Paste",
+            Self::SelectAll => "Select All",
+            Self::SplitRight => "Split Right",
+            Self::SplitDown => "Split Down",
+            Self::NewTab => "New Tab",
+            Self::CloseTab => "Close Tab",
             Self::Divider => "",
         }
     }
@@ -157,6 +183,7 @@ impl SidebarMenu {
                 workspace_rows(branch.as_deref().is_some(), linked)
             }
             MenuTarget::Agent { .. } => agent_rows(),
+            MenuTarget::Terminal { selection } => terminal_rows(*selection),
         }
     }
 
@@ -226,6 +253,27 @@ fn agent_rows() -> Vec<Item> {
         Item::Divider,
         Item::ToggleScope,
     ]
+}
+
+/// The terminal's rows: the clipboard first, then the pane and tab actions
+/// below a divider. Copy needs a highlight, so it is left out without one
+/// rather than shown dead.
+fn terminal_rows(selection: bool) -> Vec<Item> {
+    let mut items = Vec::new();
+    if selection {
+        items.push(Item::CopySelection);
+    }
+    items.extend([
+        Item::Paste,
+        Item::SelectAll,
+        Item::Divider,
+        Item::SplitRight,
+        Item::SplitDown,
+        Item::NewTab,
+        Item::Divider,
+        Item::CloseTab,
+    ]);
+    items
 }
 
 #[cfg(test)]
@@ -299,6 +347,25 @@ mod tests {
         );
         assert_eq!(Item::ToggleScope.label(true, true), "Show All Workspaces");
         assert_eq!(Item::ToggleScope.label(false, false), "Show Workspace Only");
+    }
+
+    #[test]
+    fn terminal_rows_offer_copy_only_over_a_selection() {
+        let with = terminal_rows(true);
+        assert_eq!(with[0], Item::CopySelection);
+        let without = terminal_rows(false);
+        assert!(!without.contains(&Item::CopySelection));
+        assert_eq!(without[0], Item::Paste);
+        // Closing the tab sits alone at the end, away from the safe rows.
+        assert_eq!(without.last(), Some(&Item::CloseTab));
+        assert_eq!(without[without.len() - 2], Item::Divider);
+        assert!(Item::CloseTab.destructive());
+    }
+
+    #[test]
+    fn the_terminal_target_builds_its_own_rows() {
+        let menu = SidebarMenu::new(MenuTarget::Terminal { selection: false }, 0.0, 0.0);
+        assert_eq!(menu.rows(true), terminal_rows(false));
     }
 
     #[test]

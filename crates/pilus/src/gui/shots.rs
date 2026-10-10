@@ -654,6 +654,18 @@ pub fn run() -> Result<()> {
         cx.update(|app| view.update(app, |view, cx| view.diff_show_send(cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "diff-send")?;
+        // A markdown file in the review: rendered with its notes in place,
+        // then the form on a block, then the patch it stands for.
+        cx.update(|app| view.update(app, |view, cx| view.diff_show_markdown_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-markdown")?;
+        cx.update(|app| view.update(app, |view, cx| view.diff_comment_on_lines(21, 21, cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-markdown-compose")?;
+        cx.update(|app| view.update(app, |view, cx| view.diff_show_mode_rendered(false, cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-markdown-patch")?;
+        cx.update(|app| view.update(app, |view, cx| view.diff_show_mode_rendered(true, cx)));
         // The Git tab on a canned repository: a commit picked, with its
         // changes below the list.
         cx.update(|app| view.update(app, |view, cx| view.git_show_sample(Some("3e1a128"), cx)));
@@ -680,6 +692,18 @@ pub fn run() -> Result<()> {
         });
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "files-tab-folded")?;
+        // A markdown file open as a document in place of the tree, with
+        // Back lit once the column has somewhere to go back to.
+        cx.update(|app| view.update(app, |view, cx| view.files_show_doc_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.select_right_tab(super::right_sidebar::SidebarTab::Git, cx)
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "right-sidebar-back-lit")?;
         // A folder still opening: placeholders stand in for its children.
         cx.update(|app| view.update(app, |view, cx| view.files_show_sample(cx)));
         cx.update(|app| {
@@ -918,6 +942,64 @@ pub fn run_main() -> Result<()> {
     cx.update(|app| {
         view.update(app, |view, _| view.toasts = super::toast::Toasts::new());
     });
+
+    // The terminal's own right-click menu, over a selection and without one.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.palette.close();
+            view.open_context_menu(
+                super::sidebar_menu::MenuTarget::Terminal { selection: true },
+                point(px(520.0), px(260.0)),
+                cx,
+            );
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-terminal-menu")?;
+    cx.update(|app| view.update(app, |view, _| view.close_context_menu()));
+
+    // The session menu: a running session with its stop control, a stopped
+    // one with delete, and a delete waiting on its second press.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sessions = vec![
+                pilus_client::SessionInfo {
+                    name: "default".to_string(),
+                    running: true,
+                },
+                pilus_client::SessionInfo {
+                    name: "brave-falcon".to_string(),
+                    running: true,
+                },
+                pilus_client::SessionInfo {
+                    name: "quiet-otter".to_string(),
+                    running: false,
+                },
+                pilus_client::SessionInfo {
+                    name: "lucky-comet".to_string(),
+                    running: false,
+                },
+            ];
+            view.session_menu_open = true;
+            // Hold the slow disk poll off so the canned list stands.
+            view.last_session_poll = std::time::Instant::now();
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-session-menu")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.session_confirm = Some((
+                "quiet-otter".to_string(),
+                super::session_ops::SessionVerb::Delete,
+            ));
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-session-menu-confirm")?;
+    cx.update(|app| view.update(app, |view, _| view.close_session_menu()));
 
     // The WORKSPACES row context menu, with the keyboard cursor on Close,
     // and its Quick Actions submenu underneath.

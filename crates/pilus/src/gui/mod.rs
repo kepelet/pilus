@@ -1089,6 +1089,20 @@ enum PromptAction {
     RenameAgent { endpoint: EndpointId, pane: String },
     /// Create a linked worktree of the right-clicked workspace's repo.
     NewWorktree { endpoint: EndpointId, index: u16 },
+    /// Create an empty file, or a folder, inside `dir` in the Files tab.
+    CreateEntry {
+        endpoint: EndpointId,
+        dir: String,
+        folder: bool,
+    },
+    /// Rename a Files-tab entry within its folder.
+    RenameEntry { endpoint: EndpointId, path: String },
+    /// Delete a Files-tab entry after the confirm prompt.
+    DeleteEntry {
+        endpoint: EndpointId,
+        path: String,
+        folder: bool,
+    },
     /// Delete a linked worktree (and its files) after the confirm prompt.
     DeleteWorktree {
         endpoint: EndpointId,
@@ -9283,7 +9297,9 @@ impl PilusView {
                 *index,
                 target.clone(),
             )),
-            SidebarMenuTarget::Agent { .. } | SidebarMenuTarget::Terminal { .. } => None,
+            SidebarMenuTarget::Agent { .. }
+            | SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::File { .. } => None,
         };
         self.context_menu = Some(SidebarMenu::new(
             target,
@@ -9318,7 +9334,9 @@ impl PilusView {
         };
         let expanded = match target {
             SidebarMenuTarget::Workspace { cwd, .. } => self.expand_cwd(endpoint_key, cwd),
-            SidebarMenuTarget::Agent { .. } | SidebarMenuTarget::Terminal { .. } => return,
+            SidebarMenuTarget::Agent { .. }
+            | SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::File { .. } => return,
         };
         let workspace_id = workspace_id.to_string();
         self.worktree_probing.insert(key.clone());
@@ -9362,7 +9380,9 @@ impl PilusView {
                 .worktree_linked
                 .get(&(endpoint.clone(), workspace_id.clone()))
                 .is_some_and(Option::is_some),
-            SidebarMenuTarget::Agent { .. } | SidebarMenuTarget::Terminal { .. } => false,
+            SidebarMenuTarget::Agent { .. }
+            | SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::File { .. } => false,
         };
         menu.rows(linked)
     }
@@ -9549,6 +9569,14 @@ impl PilusView {
             (SidebarMenuTarget::Terminal { .. }, item) => {
                 self.close_context_menu();
                 self.run_terminal_item(item, window, cx);
+            }
+            (SidebarMenuTarget::File { path, .. }, SidebarItem::CopyPath) => {
+                self.close_context_menu();
+                self.menu_copy(path, cx);
+            }
+            (SidebarMenuTarget::File { .. }, item) => {
+                self.close_context_menu();
+                self.files_menu_item(&target, item, cx);
             }
             (_, SidebarItem::Divider) => {}
             // Copy rows only exist on a WORKSPACES target; the arms above
@@ -9952,6 +9980,17 @@ impl PilusView {
                         .ok();
                     }
                 });
+            }
+            PromptAction::CreateEntry {
+                endpoint,
+                dir,
+                folder,
+            } => self.files_create(&endpoint, dir, trimmed, folder, cx),
+            PromptAction::RenameEntry { endpoint, path } => {
+                self.files_rename(&endpoint, path, trimmed, cx)
+            }
+            PromptAction::DeleteEntry { endpoint, path, .. } => {
+                self.files_delete(&endpoint, path, cx)
             }
             PromptAction::DeleteWorktree {
                 endpoint,
@@ -11134,7 +11173,7 @@ impl PilusView {
             SidebarMenuTarget::Agent { .. } => {
                 (self.sidebar_agent_paths, self.agents_this_workspace)
             }
-            SidebarMenuTarget::Terminal { .. } => (false, false),
+            SidebarMenuTarget::Terminal { .. } | SidebarMenuTarget::File { .. } => (false, false),
         };
 
         let mut items = div().flex().flex_col().gap_0();
@@ -11254,7 +11293,19 @@ impl PilusView {
         let theme = self.theme;
         // A destructive confirm swaps the field for the target path, a warning,
         // and the Enter/Esc hint, so nobody deletes by typing past it.
-        let confirm = matches!(prompt.action, PromptAction::DeleteWorktree { .. });
+        let confirm = matches!(
+            prompt.action,
+            PromptAction::DeleteWorktree { .. } | PromptAction::DeleteEntry { .. }
+        );
+        // What a Files-tab delete takes with it, since it has no worktree to
+        // name: a folder takes everything inside.
+        let entry_note = match &prompt.action {
+            PromptAction::DeleteEntry { folder: true, .. } => {
+                Some("Deletes the folder and everything in it. This can't be undone.")
+            }
+            PromptAction::DeleteEntry { .. } => Some("Deletes the file. This can't be undone."),
+            _ => None,
+        };
         let confirm_escalated = prompt.action.escalated();
         let confirm_dirty = matches!(
             prompt.action,
@@ -11265,7 +11316,9 @@ impl PilusView {
             _ => None,
         };
         let confirm_path = match &prompt.action {
-            PromptAction::DeleteWorktree { path, .. } => Some(path.clone()),
+            PromptAction::DeleteWorktree { path, .. } | PromptAction::DeleteEntry { path, .. } => {
+                Some(path.clone())
+            }
             _ => None,
         };
         let input = self.menu_prompt_input.clone();
@@ -11291,12 +11344,12 @@ impl PilusView {
                 prompt.title,
                 style::Fonts::resolve(&self.shared_settings).title,
             ))
-            .child(
+            .children((!prompt.placeholder.is_empty()).then(|| {
                 div()
                     .text_size(px(self.section_font()))
                     .text_color(theme.muted)
-                    .child(prompt.placeholder),
-            );
+                    .child(prompt.placeholder)
+            }));
         if confirm {
             panel = panel
                 .child(match confirm_path {
@@ -11324,10 +11377,12 @@ impl PilusView {
                     div()
                         .text_size(px(self.chrome_font()))
                         .text_color(theme.alert)
-                        .child(if confirm_escalated {
-                            "This can't be undone."
-                        } else {
-                            "Removes the checkout and its files. This can't be undone."
+                        .child(match (entry_note, confirm_escalated) {
+                            (Some(note), _) => note,
+                            (None, true) => "This can't be undone.",
+                            (None, false) => {
+                                "Removes the checkout and its files. This can't be undone."
+                            }
                         }),
                 )
                 .child(
@@ -14127,6 +14182,9 @@ fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
         SidebarItem::OpenBoard => include_bytes!("../../assets/icons/list-checks.svg"),
         SidebarItem::OpenMission => include_bytes!("../../assets/icons/gauge.svg"),
         SidebarItem::ToggleScope => include_bytes!("../../assets/icons/monitor.svg"),
+        SidebarItem::NewFile => include_bytes!("../../assets/icons/file-plus.svg"),
+        SidebarItem::NewFolder => include_bytes!("../../assets/icons/folder-plus.svg"),
+        SidebarItem::Delete => include_bytes!("../../assets/icons/trash-2.svg"),
         SidebarItem::CopySelection => include_bytes!("../../assets/icons/copy.svg"),
         SidebarItem::Paste => include_bytes!("../../assets/icons/clipboard.svg"),
         SidebarItem::SelectAll => include_bytes!("../../assets/icons/square-dashed.svg"),

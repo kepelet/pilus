@@ -1,5 +1,5 @@
 //! The native right-click context menus for the sidebar's WORKSPACES and
-//! AGENTS rows, and for the terminal grid.
+//! AGENTS rows, for the terminal grid, and for the Files tab's tree.
 //!
 //! Luvus opens a context menu on a WORKSPACES row (close, rename, path
 //! visibility, copy path/branch, new worktree, and the git/task/mission
@@ -10,7 +10,9 @@
 //! toggle, scope) are client state, exactly as they are in the daemon's
 //! own TUI. The terminal's menu replaces the one the daemon draws into the grid
 //! on a right click: it offers the clipboard and the pane/tab actions a client
-//! can reach, so the click never reaches the daemon. This module owns the
+//! can reach, so the click never reaches the daemon. The Files tab's menu
+//! creates, renames, and deletes the entries under the daemon's tree, which
+//! the client does over disk or SSH since the daemon never writes. This module owns the
 //! menu's state machine and item order; the window renders it and performs
 //! the actions, so nothing here knows GPUI.
 
@@ -45,6 +47,18 @@ pub enum MenuTarget {
     /// The terminal grid. `selection` is whether text is highlighted, which
     /// is what Copy needs, so the row only appears when it can work.
     Terminal { selection: bool },
+    /// A row of the Files tab's tree, or its blank area (`root`), which acts
+    /// on the tree's own folder.
+    File {
+        /// Endpoint key (`local` or a machine id).
+        endpoint: String,
+        /// Absolute path on that endpoint's machine.
+        path: String,
+        /// The entry is a folder: new entries go inside it, not beside it.
+        dir: bool,
+        /// The tree's root, which can be added to but not renamed or deleted.
+        root: bool,
+    },
 }
 
 /// One row of the open context menu, in render order.
@@ -77,6 +91,12 @@ pub enum Item {
     ToggleScope,
     /// Copy the terminal's highlighted text.
     CopySelection,
+    /// Create an empty file in the folder the menu is on.
+    NewFile,
+    /// Create a folder in the folder the menu is on.
+    NewFolder,
+    /// Delete a file, or a folder and its contents. Destructive.
+    Delete,
     /// Send the clipboard to the focused pane.
     Paste,
     /// Highlight the whole visible grid.
@@ -100,7 +120,10 @@ impl Item {
     /// Whether the row is destructive (Close, Delete Worktree, Close Tab), painted in
     /// the alert color.
     pub fn destructive(self) -> bool {
-        matches!(self, Self::Close | Self::DeleteWorktree | Self::CloseTab)
+        matches!(
+            self,
+            Self::Close | Self::DeleteWorktree | Self::CloseTab | Self::Delete
+        )
     }
 
     /// The label, resolved against the state the row toggles: `paths_visible`
@@ -131,6 +154,9 @@ impl Item {
                     "Show Workspace Only"
                 }
             }
+            Self::NewFile => "New File",
+            Self::NewFolder => "New Folder",
+            Self::Delete => "Delete",
             Self::CopySelection => "Copy",
             Self::Paste => "Paste",
             Self::SelectAll => "Select All",
@@ -184,6 +210,7 @@ impl SidebarMenu {
             }
             MenuTarget::Agent { .. } => agent_rows(),
             MenuTarget::Terminal { selection } => terminal_rows(*selection),
+            MenuTarget::File { root, .. } => file_rows(*root),
         }
     }
 
@@ -273,6 +300,21 @@ fn terminal_rows(selection: bool) -> Vec<Item> {
         Item::Divider,
         Item::CloseTab,
     ]);
+    items
+}
+
+/// A tree entry's rows: where to add, what to do to the entry, then the one
+/// destructive row alone at the end. The root keeps only the rows that make
+/// sense for the folder the tree is showing.
+fn file_rows(root: bool) -> Vec<Item> {
+    let mut items = vec![Item::NewFile, Item::NewFolder, Item::Divider];
+    if !root {
+        items.push(Item::Rename);
+    }
+    items.push(Item::CopyPath);
+    if !root {
+        items.extend([Item::Divider, Item::Delete]);
+    }
     items
 }
 
@@ -366,6 +408,25 @@ mod tests {
     fn the_terminal_target_builds_its_own_rows() {
         let menu = SidebarMenu::new(MenuTarget::Terminal { selection: false }, 0.0, 0.0);
         assert_eq!(menu.rows(true), terminal_rows(false));
+    }
+
+    #[test]
+    fn the_trees_root_cannot_be_renamed_or_deleted() {
+        let root = file_rows(true);
+        assert_eq!(
+            root,
+            vec![
+                Item::NewFile,
+                Item::NewFolder,
+                Item::Divider,
+                Item::CopyPath
+            ]
+        );
+        let entry = file_rows(false);
+        assert!(entry.contains(&Item::Rename));
+        assert_eq!(entry.last(), Some(&Item::Delete));
+        assert_eq!(entry[entry.len() - 2], Item::Divider);
+        assert!(Item::Delete.destructive());
     }
 
     #[test]

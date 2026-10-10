@@ -685,6 +685,47 @@ pub fn run() -> Result<()> {
         cx.update(|app| view.update(app, |view, cx| view.files_show_sample(cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "files-tab")?;
+        // The tree's right-click menu on a file, then its delete confirm and
+        // its rename prompt.
+        let file = "/work/pilus/crates/pilus-client/src/lib.rs";
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.files_open_menu(
+                    file.to_string(),
+                    false,
+                    false,
+                    point(px(930.0), px(330.0)),
+                    cx,
+                )
+            })
+        });
+        settle(&mut cx, 8);
+        capture(&mut cx, window.into(), "files-tab-menu")?;
+        let target = super::sidebar_menu::MenuTarget::File {
+            endpoint: "local".to_string(),
+            path: file.to_string(),
+            dir: false,
+            root: false,
+        };
+        for (item, name) in [
+            (super::sidebar_menu::Item::Delete, "files-tab-delete"),
+            (super::sidebar_menu::Item::Rename, "files-tab-rename"),
+        ] {
+            cx.update(|app| {
+                view.update(app, |view, cx| {
+                    view.close_context_menu();
+                    view.files_menu_item(&target, item, cx)
+                })
+            });
+            settle(&mut cx, 8);
+            capture(&mut cx, window.into(), name)?;
+        }
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.menu_prompt = None;
+                cx.notify();
+            })
+        });
         cx.update(|app| {
             view.update(app, |view, cx| {
                 view.files_fold_sample("/work/pilus/crates/pilus-client/src", cx)

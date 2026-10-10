@@ -15,7 +15,7 @@ use std::time::Instant;
 use gpui::{Context, Div, MouseButton, MouseDownEvent, Stateful, div, prelude::*, px};
 
 use super::style::{self, FillExt};
-use super::{HEADER_HEIGHT, PilusView, SIDEBAR_ANIM_DURATION, icon, terminal_inset_border};
+use super::{HEADER_HEIGHT, PilusView, SIDEBAR_ANIM_DURATION, icon};
 
 /// Narrowest the column drags to: the Diff header still fits.
 pub(super) const MIN_WIDTH: f32 = 300.0;
@@ -357,9 +357,9 @@ impl PilusView {
             // Focus is the one edge accent earns here: it says which side
             // of the window the keyboard is on.
             .border_color(if focused {
-                theme.accent.opacity(0.55)
+                theme.border_focus
             } else {
-                terminal_inset_border()
+                theme.border
             })
             .on_mouse_down(
                 MouseButton::Left,

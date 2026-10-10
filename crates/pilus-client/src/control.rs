@@ -417,6 +417,9 @@ pub struct Agent {
     /// The session id the pane's agent reported via `pane.report_session`,
     /// if it runs an integration that reports one (pi's extension does).
     pub session: Option<String>,
+    /// The session's own title, when the agent reports one (`agent.list`'s
+    /// `agent_session_title`).
+    pub session_title: Option<String>,
 }
 
 impl Agent {
@@ -467,11 +470,21 @@ impl Agent {
                 .and_then(Value::as_str)
                 .filter(|session| !session.is_empty())
                 .map(str::to_string),
+            session_title: value
+                .get("agent_session_title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_string),
         })
     }
 
-    /// The label to show first: the alias, else the pane's directory name.
+    /// The label to show first: the session's title, else the alias, else
+    /// the pane's directory name.
     pub fn label(&self) -> &str {
+        if let Some(title) = self.session_title.as_deref() {
+            return title;
+        }
         if !self.name.is_empty() {
             return &self.name;
         }
@@ -1523,6 +1536,23 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_session_title_leads_the_label_then_the_alias_then_the_directory() {
+        let at = |extra: serde_json::Value| {
+            let mut value = json!({"pane": "7", "agent": "pi", "cwd": "/repo/api"});
+            value
+                .as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            Agent::from_json(&value).expect("agent")
+        };
+        let titled = at(json!({"name": "reviewer", "agent_session_title": " Fix the parser "}));
+        assert_eq!(titled.label(), "Fix the parser");
+        let aliased = at(json!({"name": "reviewer", "agent_session_title": ""}));
+        assert_eq!(aliased.label(), "reviewer");
+        assert_eq!(at(json!({})).label(), "api");
+    }
 
     #[test]
     fn pane_frame_maps_the_logical_rect_to_fractions() {

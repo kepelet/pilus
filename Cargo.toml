@@ -41,6 +41,9 @@ thiserror = "2"
 # Reads the public Luvus release manifest for the daemon update check.
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "json"] }
 tracing = "0.1"
+# Pure-Rust regex backend: the macOS build stays buildable with only the
+# command-line tools, with no onig C library to compile.
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 unicode-segmentation = "1"
 unicode-width = "0.2"
 

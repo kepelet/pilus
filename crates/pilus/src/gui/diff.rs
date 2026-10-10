@@ -14,9 +14,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Anchor, AnyElement, Context, Div, Entity, FontWeight, KeyDownEvent, ListAlignment, ListState,
-    MouseButton, MouseDownEvent, SharedString, Stateful, anchored, deferred, div, list, point,
-    prelude::*, px,
+    Anchor, AnyElement, Context, Div, Entity, FontStyle, FontWeight, HighlightStyle, KeyDownEvent,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, SharedString, Stateful, StyledText,
+    anchored, deferred, div, list, point, prelude::*, px,
 };
 use pilus_client::{
     Agent, ControlClient, DiffFile, DiffLayer, DiffNote, DiffSnapshot, FileDiff, NoteKind,
@@ -26,10 +26,11 @@ use pilus_client::{
 use super::diff_model::{
     self as model, Cursor, Display, FileFilter, Flat, LayoutMode, Row, Src, SrcKind,
 };
+use super::highlight::Token;
 use super::style::{self, ButtonKind, FillExt};
 use super::text_input::TextInput;
 use super::theme::Theme;
-use super::{EndpointId, PilusView, agent_icon, icon, terminal_inset_border};
+use super::{EndpointId, PilusView, agent_icon, icon};
 
 /// How often the open page asks the daemon for a fresh snapshot.
 const POLL: Duration = Duration::from_millis(1500);
@@ -1210,7 +1211,7 @@ impl PilusView {
                 .items_center()
                 .flex_shrink_0()
                 .border_t_1()
-                .border_color(terminal_inset_border())
+                .border_color(theme.border)
                 .text_size(px(fonts.secondary))
                 .text_color(theme.muted)
                 .child(self.diff_panel.status.clone())
@@ -1290,7 +1291,7 @@ impl PilusView {
             .px_3()
             .py_2()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(
                 div()
                     .flex_1()
@@ -1461,7 +1462,7 @@ impl PilusView {
                 .flex_shrink_0()
                 .px_3()
                 .border_t_1()
-                .border_color(terminal_inset_border())
+                .border_color(theme.border)
                 .child(
                     style::button(
                         "pilus-diff-send",
@@ -1489,7 +1490,7 @@ impl PilusView {
             .flex_shrink_0()
             .cursor_row_resize()
             .hover_fill(theme.panel_dim, style::RADIUS_SM)
-            .child(div().h(px(1.0)).w_full().bg(terminal_inset_border()))
+            .child(div().h(px(1.0)).w_full().bg(theme.border))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -1600,7 +1601,7 @@ impl PilusView {
             // divider draws the hairline below it.
             None => list.w_full().h(px(panel.list_h)),
         };
-        list.border_color(terminal_inset_border()).child(column)
+        list.border_color(theme.border).child(column)
     }
 
     fn diff_file_row(&self, file: &DiffFile, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1878,7 +1879,7 @@ impl PilusView {
             .flex_shrink_0()
             .px_3()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(title)
             .child(counts)
             .child(
@@ -1998,11 +1999,35 @@ impl PilusView {
                 .min_w(px(0.0))
                 // An empty line still takes a full row.
                 .child(if src.text.is_empty() {
-                    "\u{a0}".to_string()
+                    StyledText::new("\u{a0}")
                 } else {
-                    src.text.clone()
+                    StyledText::new(src.text.clone()).with_highlights(
+                        src.spans
+                            .iter()
+                            .map(|span| (span.range.clone(), self.token_style(span.token))),
+                    )
                 }),
         )
+    }
+
+    /// The text style a syntax role takes in the active theme. Roles reuse
+    /// the theme's ANSI colors, which each scheme already tunes for code on
+    /// its own background.
+    fn token_style(&self, token: Token) -> HighlightStyle {
+        let theme = self.theme;
+        let color = match token {
+            Token::Keyword => theme.ansi[5],
+            Token::String => theme.ansi[2],
+            Token::Number => theme.ansi[3],
+            Token::Function => theme.ansi[4],
+            Token::Type => theme.ansi[6],
+            Token::Comment => theme.muted,
+        };
+        HighlightStyle {
+            color: Some(color.into()),
+            font_style: (token == Token::Comment).then_some(FontStyle::Italic),
+            ..HighlightStyle::default()
+        }
     }
 
     /// The wash for rows inside the range being selected for a note.
@@ -2174,7 +2199,7 @@ impl PilusView {
                     .w(px(1.0))
                     .flex_shrink_0()
                     .self_stretch()
-                    .bg(terminal_inset_border()),
+                    .bg(theme.border),
             )
             .child(half(right, NoteSide::New, |src| src.new_line, cx))
             .state_fill(
@@ -2401,7 +2426,7 @@ impl PilusView {
                     .p_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(theme.accent)
+                    .border_color(theme.border_focus)
                     .bg(theme.panel_dim)
                     .child(
                         div()
@@ -2573,7 +2598,7 @@ impl PilusView {
                     .p_3()
                     .rounded_lg()
                     .border_1()
-                    .border_color(terminal_inset_border())
+                    .border_color(theme.border)
                     .bg(theme.panel)
                     .child(style::section_label(theme, "WHAT TO SEND", fonts.label))
                     .child(scopes)

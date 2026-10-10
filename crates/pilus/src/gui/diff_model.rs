@@ -15,6 +15,8 @@ use pilus_client::{
     DiffFile, DiffLineKind, DiffNote, FileDiff, NoteKind, NoteRange, NoteSide, NoteState,
 };
 
+use super::highlight::{self, Span};
+
 /// Fewest columns each side of a Split row needs to stay readable.
 const SPLIT_MIN_COLUMNS: f32 = 56.0;
 
@@ -35,6 +37,8 @@ pub(super) struct Src {
     pub(super) new_line: Option<u32>,
     /// The line's text, or a hunk's header.
     pub(super) text: String,
+    /// Syntax-colored runs of `text`; empty for headers and plain files.
+    pub(super) spans: Vec<Span>,
 }
 
 impl Src {
@@ -56,6 +60,7 @@ pub(super) struct Flat {
 
 pub(super) fn flatten(diff: &FileDiff) -> Flat {
     let mut flat = Flat::default();
+    let mut colored = highlight::hunks(&diff.file.path, &diff.hunks).into_iter();
     for hunk in &diff.hunks {
         flat.hunk_starts.push(flat.src.len());
         flat.src.push(Src {
@@ -63,7 +68,9 @@ pub(super) fn flatten(diff: &FileDiff) -> Flat {
             old_line: None,
             new_line: None,
             text: hunk.header.clone(),
+            spans: Vec::new(),
         });
+        let mut spans = colored.next().unwrap_or_default().into_iter();
         for line in &hunk.lines {
             flat.src.push(Src {
                 kind: match line.kind {
@@ -75,6 +82,7 @@ pub(super) fn flatten(diff: &FileDiff) -> Flat {
                 new_line: line.new_line,
                 // Tabs would collapse to one cell in a proportional layout.
                 text: line.text.replace('\t', "    "),
+                spans: spans.next().unwrap_or_default(),
             });
         }
     }

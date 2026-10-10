@@ -25,7 +25,7 @@ use pilus_client::{AutomationDetail, AutomationHealth, AutomationRow, MissionSco
 use super::mission::{row_fills, step_key, unix_now, until_label, utc_label};
 use super::style::{self, ButtonKind, FillExt};
 use super::theme::Theme;
-use super::{EndpointId, PilusView, terminal_inset_border};
+use super::{EndpointId, PilusView};
 
 /// How often an open page re-reads the rows.
 const REFRESH: Duration = Duration::from_secs(3);
@@ -530,7 +530,7 @@ impl PilusView {
             .pr_3()
             .mr_3()
             .border_r_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .text_color(color)
             .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(color))
             .child(signal);
@@ -541,7 +541,7 @@ impl PilusView {
             .items_center()
             .flex_shrink_0()
             .border_t_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .text_size(px(fonts.secondary))
             .text_color(theme.muted)
             .child(status)
@@ -596,7 +596,7 @@ impl PilusView {
             .flex_shrink_0()
             .px_4()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(style::title(theme, "Automations", fonts.title))
             .child(div().flex_1())
             .children(machines)
@@ -849,7 +849,7 @@ impl PilusView {
             .flex_shrink_0()
             .px_4()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(style::section_label(theme, "AUTOMATION", fonts.label))
             .child(
                 style::small_button(
@@ -870,7 +870,7 @@ impl PilusView {
                 .flex_shrink_0()
                 .min_h(px(0.0))
                 .border_l_1()
-                .border_color(terminal_inset_border())
+                .border_color(theme.border)
                 .child(header)
                 .child(
                     div()
@@ -1074,7 +1074,7 @@ impl PilusView {
                 .gap_2()
                 .p_3()
                 .border_t_1()
-                .border_color(terminal_inset_border())
+                .border_color(theme.border)
                 .child(
                     style::small_button(
                         "pilus-automations-detail-run",

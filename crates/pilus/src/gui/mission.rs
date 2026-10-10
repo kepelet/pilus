@@ -30,7 +30,7 @@ use super::text_input::TextInput;
 use super::theme::Theme;
 use super::{
     EndpointId, PICKER_CHIP_H, PICKER_MENU_MAX_H, PilusView, agent_icon, icon, picker_face,
-    picker_menu, status_color, terminal_inset_border,
+    picker_menu, status_color,
 };
 
 /// How often an open page re-reads the snapshot.
@@ -904,7 +904,7 @@ impl PilusView {
             .pr_3()
             .mr_3()
             .border_r_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .text_color(signal.color(theme))
             .child(
                 div()
@@ -921,7 +921,7 @@ impl PilusView {
             .items_center()
             .flex_shrink_0()
             .border_t_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .text_size(px(fonts.secondary))
             .text_color(theme.muted)
             .child(status)
@@ -980,7 +980,7 @@ impl PilusView {
             .flex_shrink_0()
             .px_4()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(style::title(theme, "Mission Control", fonts.title))
             .child(div().flex_1())
             .children(machines)
@@ -1628,7 +1628,7 @@ impl PilusView {
             .flex_shrink_0()
             .px_4()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(style::section_label(theme, "SELECTED AGENT", fonts.label))
             .child(
                 style::small_button(
@@ -1663,7 +1663,7 @@ impl PilusView {
         style::enter(
             "pilus-mission-side",
             frame
-                .border_color(terminal_inset_border())
+                .border_color(theme.border)
                 .child(header)
                 .child(
                     div()
@@ -1870,7 +1870,7 @@ impl PilusView {
             .gap_2()
             .p_3()
             .border_t_1()
-            .border_color(terminal_inset_border());
+            .border_color(theme.border);
         if row.resumable() {
             return actions
                 .child(

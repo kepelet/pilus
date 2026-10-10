@@ -32,6 +32,8 @@ const ENTER: Duration = Duration::from_millis(140);
 /// How long a background fill takes to ease into a new hover or selection
 /// state. Short enough that a pointer sweeping down a list never trails.
 const FILL_EASE: Duration = Duration::from_millis(120);
+/// How much of the accent a hovered primary button keeps.
+const PRIMARY_HOVER_ALPHA: f32 = 0.82;
 /// How long a meter's fill takes to slide to a new reading: slow enough to
 /// see which way a value moved.
 const METER_EASE: Duration = Duration::from_millis(420);
@@ -801,7 +803,11 @@ fn button_at(
     padding: Pixels,
 ) -> Stateful<Div> {
     let (bg, fg, border) = button_colors(kind, theme);
+    let primary = kind == ButtonKind::Primary;
+    // The accent fill dims in place: swapping to a panel color would change
+    // the button's identity, not just acknowledge the pointer.
     let hover_bg = match kind {
+        ButtonKind::Primary => tint(theme.accent, PRIMARY_HOVER_ALPHA),
         ButtonKind::Ghost => theme.panel_dim,
         _ => theme.panel,
     };
@@ -809,7 +815,7 @@ fn button_at(
         ButtonKind::Danger => theme.alert,
         _ => theme.panel_fg,
     };
-    let bold = matches!(kind, ButtonKind::Primary);
+    let bold = primary;
     div()
         .id(id)
         .flex()
@@ -818,11 +824,12 @@ fn button_at(
         .justify_center()
         .gap_2()
         .h(px(height))
-        .px(padding)
+        // The accent button has no border to dim alongside its fill, so it
+        // takes the border's width as padding to stay as wide as its siblings.
+        .px(if primary { padding + px(1.0) } else { padding })
         .rounded_md()
         .text_color(fg)
-        .border_1()
-        .border_color(border)
+        .when(!primary, |button| button.border_1().border_color(border))
         .text_size(px(text_size))
         .font_weight(if bold {
             FontWeight::BOLD
@@ -831,7 +838,9 @@ fn button_at(
         })
         .cursor_pointer()
         .state_fill(bg, hover_bg, RADIUS_MD)
-        .hover(move |style| style.text_color(hover_fg))
+        .when(!primary, |button| {
+            button.hover(move |style| style.text_color(hover_fg))
+        })
         .child(label)
 }
 
@@ -1707,7 +1716,11 @@ pub(super) fn field(
                 .rounded_md()
                 .bg(theme.panel_dim)
                 .border_1()
-                .border_color(if focused { theme.accent } else { theme.border })
+                .border_color(if focused {
+                    theme.border_focus
+                } else {
+                    theme.border
+                })
                 .cursor_pointer()
                 .child(body),
         )
@@ -1840,7 +1853,7 @@ pub(super) fn board_card(
                     .size_full()
                     .rounded_md()
                     .border_1()
-                    .border_color(theme.accent),
+                    .border_color(theme.border_focus),
             )
         }))
 }

@@ -24,8 +24,9 @@ use pilus_client::{
 
 use super::diff::{split_path, status_glyph};
 use super::diff_model::{self as model, Src, SrcKind};
+use super::highlight;
 use super::style::{self, ButtonKind, FillExt};
-use super::{EndpointId, PilusView, icon, terminal_inset_border};
+use super::{EndpointId, PilusView, icon};
 
 /// How often the open tab asks the daemon for a fresh answer.
 const POLL: Duration = Duration::from_millis(2000);
@@ -240,8 +241,10 @@ fn detail_rows(detail: &CommitDetail, collapsed: &HashSet<usize>) -> Vec<DetailR
         } else if file.hunks.is_empty() {
             rows.push(DetailRow::Note("No textual changes".to_string()));
         }
+        let mut colored = highlight::hunks(&file.path, &file.hunks).into_iter();
         for hunk in &file.hunks {
             rows.push(DetailRow::Hunk(hunk.header.clone()));
+            let mut spans = colored.next().unwrap_or_default().into_iter();
             rows.extend(hunk.lines.iter().map(|line| {
                 DetailRow::Line(Src {
                     kind: match line.kind {
@@ -253,6 +256,7 @@ fn detail_rows(detail: &CommitDetail, collapsed: &HashSet<usize>) -> Vec<DetailR
                     new_line: line.new_line,
                     // Tabs would collapse to one cell in a proportional layout.
                     text: line.text.replace('\t', "    "),
+                    spans: spans.next().unwrap_or_default(),
                 })
             }));
         }
@@ -455,7 +459,7 @@ impl PilusView {
                     .items_center()
                     .flex_shrink_0()
                     .border_t_1()
-                    .border_color(terminal_inset_border())
+                    .border_color(self.theme.border)
                     .text_size(px(style::Fonts::resolve(&self.shared_settings).secondary))
                     .text_color(self.theme.alert)
                     .truncate()
@@ -496,7 +500,7 @@ impl PilusView {
             .px_3()
             .py_2()
             .border_b_1()
-            .border_color(terminal_inset_border())
+            .border_color(theme.border)
             .child(icon(
                 include_bytes!("../../assets/icons/git-branch.svg"),
                 fonts.body,
@@ -698,7 +702,7 @@ impl PilusView {
             .flex_shrink_0()
             .cursor_row_resize()
             .hover_fill(theme.panel_dim, style::RADIUS_SM)
-            .child(div().h(px(1.0)).w_full().bg(terminal_inset_border()))
+            .child(div().h(px(1.0)).w_full().bg(theme.border))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {

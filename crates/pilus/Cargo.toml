@@ -36,6 +36,7 @@ serde_json.workspace = true
 tracing.workspace = true
 ureq.workspace = true
 unicode-segmentation.workspace = true
+syntect.workspace = true
 gpui = { workspace = true, optional = true }
 image.workspace = true
 gpui_platform = { workspace = true, optional = true }

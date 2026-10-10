@@ -8,6 +8,7 @@
 mod about;
 mod app_icon;
 mod appearances;
+mod attention;
 mod automations;
 mod box_drawing;
 mod connector;
@@ -68,9 +69,9 @@ use gpui::{
     ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu,
     MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    Stateful, TextRun, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowOptions, anchored, canvas, deferred, div, font, img, linear_color_stop, linear_gradient,
-    point, prelude::*, px, relative, size, svg,
+    Stateful, SystemNotification, TextRun, TitlebarOptions, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, anchored, canvas, deferred, div, font, img, linear_color_stop,
+    linear_gradient, point, prelude::*, px, relative, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::{Release, UpdateStatus, Version};
@@ -1258,6 +1259,8 @@ struct PilusView {
     /// Dock bounce and badge for pushes that arrive while pilus is behind
     /// another app.
     dock: Dock,
+    /// Spots agents that start waiting on the user, across every endpoint.
+    attention: attention::Watch,
     /// Measured monospace advance width, resolved once from the font.
     cell_width: Option<f32>,
     /// Last cell size pushed to the daemon, so a font change re-sends it even
@@ -1867,6 +1870,7 @@ impl PilusView {
             window_active: false,
             toasts: Toasts::new(),
             dock: Dock::new(),
+            attention: attention::Watch::default(),
             cell_width: None,
             sent_cell: (0, 0),
             selection: None,
@@ -2184,6 +2188,7 @@ impl PilusView {
             .map(|feed| std::iter::from_fn(|| feed.try_recv()).collect())
             .unwrap_or_default();
         for update in updates {
+            self.attention.observe(&self.active.key(), &update.agents);
             self.bar_widgets = update.bar;
             self.adopt_tabs(update.tabs);
             self.agents = update.agents;
@@ -2196,6 +2201,7 @@ impl PilusView {
         if tabs_changed {
             self.reconcile_nav();
         }
+        changed |= self.raise_attention(cx);
         changed |= self.poll_pi_frame(tabs_changed);
         changed |= self.sync_pi_view(cx);
         self.poll_parked_sessions(cx);
@@ -2654,6 +2660,45 @@ impl PilusView {
         self.dock.alert();
     }
 
+    /// Tell the user about agents that started or stopped waiting on them.
+    ///
+    /// Behind another app a toast cannot be seen, so the notification goes to
+    /// the OS (with a Dock bounce); in front it would only duplicate what the
+    /// sidebar's blocked dot already shows, so it is a toast. The
+    /// Notifications setting gates both, and a cleared banner is withdrawn
+    /// either way so Notification Center never lists a stale ask.
+    fn raise_attention(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        for event in self.attention.drain() {
+            match event {
+                attention::Event::Cleared(tag) => cx.dismiss_system_notification(&tag),
+                attention::Event::Blocked(_) if !self.settings.notifications => {}
+                attention::Event::Blocked(blocked) => {
+                    let body = format!("{} is waiting on you", blocked.agent);
+                    let in_front = dock::app_active().unwrap_or(self.window_active);
+                    if in_front {
+                        let title = Some(blocked.workspace).filter(|name| !name.is_empty());
+                        self.toasts.push(ToastKind::Info, title, body);
+                        changed = true;
+                    } else {
+                        let title = match blocked.workspace.as_str() {
+                            "" => "pilus".to_string(),
+                            workspace => format!("pilus · {workspace}"),
+                        };
+                        cx.show_system_notification(SystemNotification {
+                            tag: SharedString::from(blocked.tag),
+                            title: SharedString::from(title),
+                            body: SharedString::from(body),
+                            actions: Vec::new(),
+                        });
+                        self.dock.alert();
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     /// Raise an in-app toast for something that just happened or failed.
     fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
         self.toasts.push(kind, None, text.into());
@@ -2809,6 +2854,7 @@ impl PilusView {
             // change costs a repaint.
             while let Some(update) = endpoint.feed.try_recv() {
                 if !endpoint.agents_loaded || update.agents != endpoint.agents {
+                    self.attention.observe(&id.key(), &update.agents);
                     endpoint.agents = update.agents;
                     endpoint.agents_loaded = true;
                     changed = true;
@@ -7234,7 +7280,7 @@ impl PilusView {
                     .px_3()
                     .text_size(px(self.footer_font()))
                     .text_color(theme.muted)
-                    .child("Show a toast when the daemon pushes a notification"),
+                    .child("Notify me when an agent is waiting on me or the daemon pushes one"),
             )
     }
 

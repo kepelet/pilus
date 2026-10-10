@@ -8,12 +8,20 @@
 //! Activity comes from `NSApplication` itself rather than the window's
 //! render-time flag, because an occluded window may not render and that flag
 //! would go stale. Other platforms have no equivalent, so they do nothing.
+//! [`app_active`] exposes the same signal to callers deciding between a toast
+//! and a native notification.
 
 #[cfg(target_os = "macos")]
 mod imp {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSRequestUserAttentionType};
     use objc2_foundation::NSString;
+
+    /// Whether the app is frontmost, or `None` off the main thread.
+    pub fn app_active() -> Option<bool> {
+        let mtm = MainThreadMarker::new()?;
+        Some(NSApplication::sharedApplication(mtm).isActive())
+    }
 
     /// Pushes counted since the app was last in front.
     pub struct Dock {
@@ -63,6 +71,10 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
+    pub fn app_active() -> Option<bool> {
+        None
+    }
+
     pub struct Dock;
 
     impl Dock {
@@ -76,4 +88,4 @@ mod imp {
     }
 }
 
-pub use imp::Dock;
+pub use imp::{Dock, app_active};

@@ -936,6 +936,38 @@ opens a fresh shell tab in the workspace and types the prompt through
 `pane.send_input`, so a device can run plain commands without pretending a kind
 exists the daemon does not know.
 
+**GitHub.** Luvus has a GitHub screen of its own (prefix + g) but exposes none of it over UHP: of
+its methods only `git.status`, `git.branches`, `git.log` and `git.open` touch git, and
+none lists an issue or a pull request. So `pilus` asks the GitHub CLI itself, on the
+machine that owns the checkout, as it already asks `git`, `lsof` and `ssh`.
+`pilus_client::GhRepo` is the one implementation: a checkout directory plus an optional
+`SshTarget`, and every call is one `gh` process run from a small POSIX script (so the
+login shell does not matter, `~` expands on the host, and `PATH` gains the usual install
+directories that a Dock-launched app or a non-interactive SSH shell lacks). Text a
+person typed reaches `gh` on stdin through `--body-file -`, never on a command line.
+`probe` says which setup step is missing (`missing`, `signed_out`, `no_repo`) as a
+sentence, rather than failing; the host needs nothing but a signed-in `gh`.
+
+- **Window.** The GitHub tab in the right column (`gui/github_tab.rs`) follows the active
+  workspace's directory: issues and pull requests (open, closed, merged), each with its
+  description and comments, a comment field, and **Submit this branch…**, which proposes a
+  title from the commits and pushes only that branch if the remote lacks its commits
+  (the form says so). A branch that already has an open pull request shows it instead of
+  creating a second. The Home composer's **Issue** chip lists the target workspace's open
+  issues, read when the picker opens, and attaches one: `Issue::attach_to` appends it to
+  the prompt (`GitHub issue #n: title`, url, body to 8,000 characters), and an attached
+  issue makes the prompt optional. That function is the seam for a later "Send to agent"
+  on an issue or pull request.
+- **Phone.** `pilus-agent`'s hub answers `hub.gh.status`, `hub.gh.issues`, `hub.gh.issue`,
+  `hub.gh.pulls`, `hub.gh.pull`, `hub.gh.pull_draft` (a **Control** device may read) and
+  `hub.gh.issue_comment`, `hub.gh.pull_comment`, `hub.gh.pull_create` (an **Operate**
+  device only: they act as the host's GitHub account, and every one is audited without its
+  text). All take the checkout's `path` and a `machine`, locally or over SSH like
+  `hub.folders`. They are advertised in the level's method list, which is how the app
+  decides whether to show GitHub at all. The mobile client retries only the reads, because
+  a resent comment would be posted twice. The iOS app has a GitHub sheet on an agent's
+  screen and an issue picker in both launch composers.
+
 `hub.agents` (operate only) lists the agents **installed** on a machine, for a
 picker: the same probe the window's launch composer uses (`agents::local`, or
 `agents::remote` in one SSH round trip), cached for a minute. Each entry carries

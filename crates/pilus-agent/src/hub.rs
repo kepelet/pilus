@@ -41,7 +41,10 @@ use std::time::{Duration, Instant};
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use pilus_client::{ControlClient, Error as ClientError, MachineInfo, api_socket_path_for};
+use pilus_client::{
+    ControlClient, Error as ClientError, GhRepo, MachineInfo, NewPull, StateFilter,
+    api_socket_path_for,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{OnceCell, Semaphore, mpsc};
@@ -72,6 +75,33 @@ const REFUSED: &[&str] = &[
 /// code (a task's agent and its gate command, an agent, a shell in a new
 /// workspace), which is why the gateway token does not carry them.
 const OPERATE: &[&str] = &["task.add", "task.start", "agent.start", "workspace.open"];
+
+/// The GitHub reads, run with `gh` in a checkout on the machine. A `Control`
+/// device may call them: they show what the host's own GitHub login can see in
+/// a repository the device already reaches, and change nothing.
+const GH_READS: &[&str] = &[
+    "hub.gh.status",
+    "hub.gh.issues",
+    "hub.gh.issue",
+    "hub.gh.pulls",
+    "hub.gh.pull",
+    "hub.gh.pull_draft",
+];
+
+/// The GitHub writes. They act as the host's GitHub account (a comment, or a
+/// pull request after pushing the branch), which is more than the gateway
+/// token grants, so like `hub.run` they need an `Operate` device and are
+/// audited without their text.
+const GH_WRITES: &[&str] = &[
+    "hub.gh.issue_comment",
+    "hub.gh.pull_comment",
+    "hub.gh.pull_create",
+];
+
+/// How long a pull request creation may take: a push, then `gh pr create`.
+const GH_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Most items a list call returns.
+const GH_LIST_MAX: u64 = 100;
 
 /// The diff review calls a `Control` device may make beyond the gateway's own
 /// list, which carries only `diff.list`, `diff.get`, and `diff.note.list`.
@@ -138,10 +168,12 @@ pub fn effective_methods(level: Level, gateway: &[String]) -> Vec<String> {
     if gateway.is_empty() {
         return methods;
     }
+    // The `hub.gh.*` methods are answered by the hub itself, never forwarded;
+    // they are listed so a device can tell which of them its level carries.
     let extras: &[&[&str]] = match level {
         Level::View => &[],
-        Level::Control => &[REVIEW],
-        Level::Operate => &[REVIEW, OPERATE],
+        Level::Control => &[REVIEW, GH_READS],
+        Level::Operate => &[REVIEW, OPERATE, GH_READS, GH_WRITES],
     };
     for method in extras.iter().copied().flatten() {
         if !methods.iter().any(|name| name == method) {
@@ -279,6 +311,10 @@ impl Hub {
 
         if method == "hub.machines" {
             return reply(&id, Ok(self.machines().await));
+        }
+        if method.starts_with("hub.gh.") {
+            let outcome = self.gh_call(level, device, machine, method, &params).await;
+            return reply(&id, outcome);
         }
         if matches!(method, "hub.agents" | "hub.folders" | "hub.run") {
             // These only read, but they exist to feed `agent.start`, `task.start`
@@ -803,6 +839,87 @@ impl Hub {
         }))
     }
 
+    /// One `hub.gh.*` call: check the device's level, run `gh` on `machine`,
+    /// and audit a write.
+    async fn gh_call(
+        &self,
+        level: Level,
+        device: &str,
+        machine: &str,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, Value> {
+        let write = GH_WRITES.contains(&method);
+        if !write && !GH_READS.contains(&method) {
+            return Err(failure("unsupported", &format!("unknown method {method}")));
+        }
+        let needed = if write {
+            Level::Operate
+        } else {
+            Level::Control
+        };
+        if level < needed {
+            return Err(failure(
+                "forbidden",
+                &format!("{method} is not allowed for a {} device", level.as_str()),
+            ));
+        }
+        let timeout = if method == "hub.gh.pull_create" {
+            GH_CREATE_TIMEOUT
+        } else {
+            CALL_TIMEOUT
+        };
+        let outcome = tokio::time::timeout(timeout, self.gh_run(machine, method, params))
+            .await
+            .unwrap_or_else(|_| Err(failure("timeout", "GitHub did not answer in time")));
+        if write {
+            eprintln!(
+                "pilus-agent: audit: {device} [{}] {machine} {method} {}",
+                level.as_str(),
+                match &outcome {
+                    Ok(_) => "ok".to_string(),
+                    Err(error) => format!(
+                        "error {}",
+                        error.get("code").and_then(Value::as_str).unwrap_or("?")
+                    ),
+                }
+            );
+        }
+        outcome
+    }
+
+    async fn gh_run(&self, machine: &str, method: &str, params: &Value) -> Result<Value, Value> {
+        let path = params
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| failure("bad_request", "`path` must be the checkout's directory"))?
+            .to_string();
+        // Fail on the request's shape before a process or an SSH hop is spent.
+        let call = GhCall::parse(method, params)?;
+        let (target, _permit) = if machine == LOCAL {
+            (None, None)
+        } else {
+            let known = self.catalog().await;
+            let target = known
+                .into_iter()
+                .find(|info| info.id == machine && info.enabled)
+                .and_then(|info| info.ssh_target())
+                .ok_or_else(|| failure("not_found", &format!("no usable machine `{machine}`")))?;
+            let permit = self
+                .ssh
+                .acquire()
+                .await
+                .map_err(|_| failure("unavailable", "the hub is shutting down"))?;
+            (Some(target), Some(permit))
+        };
+        let repo = GhRepo::new(target, path);
+        tokio::task::spawn_blocking(move || call.run(&repo))
+            .await
+            .map_err(|error| failure("internal", &error.to_string()))?
+    }
+
     /// The agents installed on `machine`, as a picker should list them.
     async fn agents(&self, machine: &str) -> Result<Value, Value> {
         let found = self.installed_agents(machine).await?;
@@ -955,6 +1072,127 @@ async fn serve_refusal(mut send: SendStream) -> std::io::Result<()> {
     send.write_all(b"\n").await?;
     let _ = send.finish();
     Ok(())
+}
+
+/// A validated `hub.gh.*` request, ready to run on a blocking thread.
+enum GhCall {
+    Status,
+    Issues(StateFilter, u32),
+    Issue(u64),
+    IssueComment(u64, String),
+    Pulls(StateFilter, u32),
+    Pull(u64),
+    PullComment(u64, String),
+    PullDraft,
+    PullCreate(NewPull),
+}
+
+impl GhCall {
+    fn parse(method: &str, params: &Value) -> Result<Self, Value> {
+        let bad = |message: &str| failure("bad_request", message);
+        let text = |key: &str| {
+            params
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let number = || {
+            params
+                .get("number")
+                .and_then(Value::as_u64)
+                .filter(|number| *number > 0)
+                .ok_or_else(|| bad("`number` must be an issue or pull request number"))
+        };
+        let filter = StateFilter::from_wire(&text("state"));
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .clamp(1, GH_LIST_MAX) as u32;
+        let comment = || {
+            let body = text("body");
+            if body.trim().is_empty() {
+                Err(bad("`body` is empty"))
+            } else {
+                Ok(body)
+            }
+        };
+        Ok(match method {
+            "hub.gh.status" => Self::Status,
+            "hub.gh.issues" => Self::Issues(filter, limit),
+            "hub.gh.issue" => Self::Issue(number()?),
+            "hub.gh.issue_comment" => Self::IssueComment(number()?, comment()?),
+            "hub.gh.pulls" => Self::Pulls(filter, limit),
+            "hub.gh.pull" => Self::Pull(number()?),
+            "hub.gh.pull_comment" => Self::PullComment(number()?, comment()?),
+            "hub.gh.pull_draft" => Self::PullDraft,
+            "hub.gh.pull_create" => {
+                let (title, base) = (text("title"), text("base"));
+                if title.trim().is_empty() {
+                    return Err(bad("`title` is empty"));
+                }
+                if base.trim().is_empty() {
+                    return Err(bad("`base` must name the branch to merge into"));
+                }
+                Self::PullCreate(NewPull {
+                    title,
+                    body: text("body"),
+                    base,
+                    draft: params
+                        .get("draft")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            }
+            other => return Err(failure("unsupported", &format!("unknown method {other}"))),
+        })
+    }
+
+    /// Run it. `gh`'s own refusals come back as `gh_failed` with its message,
+    /// so a phone can show why.
+    fn run(self, repo: &GhRepo) -> Result<Value, Value> {
+        let failed = |message: String| failure("gh_failed", &message);
+        match self {
+            Self::Status => {
+                let state = repo.probe();
+                Ok(json!({
+                    "state": state.wire(),
+                    "repo": state.repo(),
+                    "advice": state.advice(),
+                }))
+            }
+            Self::Issues(filter, limit) => repo
+                .issues(filter, limit)
+                .map(|issues| json!({ "issues": issues }))
+                .map_err(failed),
+            Self::Issue(number) => repo
+                .issue(number)
+                .map(|detail| json!(detail))
+                .map_err(failed),
+            Self::IssueComment(number, body) => repo
+                .comment_issue(number, &body)
+                .map(|url| json!({ "url": url }))
+                .map_err(failed),
+            Self::Pulls(filter, limit) => repo
+                .pulls(filter, limit)
+                .map(|pulls| json!({ "pulls": pulls }))
+                .map_err(failed),
+            Self::Pull(number) => repo
+                .pull(number)
+                .map(|detail| json!(detail))
+                .map_err(failed),
+            Self::PullComment(number, body) => repo
+                .comment_pull(number, &body)
+                .map(|url| json!({ "url": url }))
+                .map_err(failed),
+            Self::PullDraft => repo.pull_draft().map(|draft| json!(draft)).map_err(failed),
+            Self::PullCreate(new) => repo
+                .create_pull(&new)
+                .map(|created| json!(created))
+                .map_err(failed),
+        }
+    }
 }
 
 /// The alias a phone-started agent gets: stable for one kind in one workspace.
@@ -1207,6 +1445,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_reads_need_control_and_writes_need_operate() {
+        let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
+        let ask =
+            |method: &str, params: Value| json!({ "id": "g", "method": method, "params": params });
+        let code = |reply: &Value| reply["error"]["code"].as_str().unwrap_or("").to_string();
+
+        let read = ask("hub.gh.issues", json!({ "path": "/" }));
+        assert_eq!(
+            code(&hub.handle(&read, Level::View, "t").await),
+            "forbidden"
+        );
+
+        let write = ask(
+            "hub.gh.issue_comment",
+            json!({ "path": "/", "number": 1, "body": "hi" }),
+        );
+        for level in [Level::View, Level::Control] {
+            assert_eq!(
+                code(&hub.handle(&write, level, "t").await),
+                "forbidden",
+                "{level:?}"
+            );
+        }
+
+        // A Control device gets past the gate to the request's own checks.
+        for (method, params) in [
+            ("hub.gh.issues", json!({})),
+            ("hub.gh.issue", json!({ "path": "/" })),
+            ("hub.gh.pull", json!({ "path": "/", "number": 0 })),
+        ] {
+            let reply = hub.handle(&ask(method, params), Level::Control, "t").await;
+            assert_eq!(code(&reply), "bad_request", "{method}");
+        }
+        // Operate: an empty comment and an untitled pull request are refused
+        // before anything runs.
+        let empty = ask(
+            "hub.gh.pull_comment",
+            json!({ "path": "/", "number": 1, "body": "  " }),
+        );
+        assert_eq!(
+            code(&hub.handle(&empty, Level::Operate, "t").await),
+            "bad_request"
+        );
+        let untitled = ask(
+            "hub.gh.pull_create",
+            json!({ "path": "/", "base": "main", "title": " " }),
+        );
+        assert_eq!(
+            code(&hub.handle(&untitled, Level::Operate, "t").await),
+            "bad_request"
+        );
+
+        let unknown = hub
+            .handle(
+                &json!({ "id": "h", "machine": "nope", "method": "hub.gh.status", "params": { "path": "/" } }),
+                Level::Control,
+                "t",
+            )
+            .await;
+        assert_eq!(code(&unknown), "not_found");
+    }
+
+    #[tokio::test]
+    async fn github_status_explains_a_folder_that_is_not_a_repo() {
+        let dir = std::env::temp_dir().join(format!("pilus-hub-gh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
+        let reply = hub
+            .handle(
+                &json!({ "id": "s", "method": "hub.gh.status", "params": { "path": dir.to_str().unwrap() } }),
+                Level::Control,
+                "t",
+            )
+            .await;
+        // A machine without `gh` answers `missing`; one with it answers `no_repo`.
+        // Either way the phone gets a state and a sentence, not an error.
+        let state = reply["result"]["state"].as_str().unwrap_or_default();
+        assert!(matches!(state, "missing" | "no_repo"), "{reply}");
+        assert!(reply["result"]["advice"].is_string(), "{reply}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn folders_are_listed_for_operate_devices_only() {
         let base = std::env::temp_dir().join(format!("pilus-hub-folders-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -1352,10 +1674,17 @@ mod tests {
             .collect();
         let view = effective_methods(Level::View, &gateway);
         assert_eq!(view, vec!["workspace.list", "agent.read"]);
-        // Control adds the review calls and nothing else.
+        // Control adds the review calls and the GitHub reads, nothing else.
         let control = effective_methods(Level::Control, &gateway);
         assert_eq!(control[..gateway.len()], gateway[..]);
-        assert_eq!(control.len(), gateway.len() + REVIEW.len());
+        assert_eq!(control.len(), gateway.len() + REVIEW.len() + GH_READS.len());
+        for method in GH_READS {
+            assert!(control.iter().any(|name| name == method), "{method}");
+            assert!(!view.iter().any(|name| name == method), "{method}");
+        }
+        for method in GH_WRITES {
+            assert!(!control.iter().any(|name| name == method), "{method}");
+        }
         for method in REVIEW {
             assert!(control.iter().any(|name| name == method), "{method}");
             assert!(!view.iter().any(|name| name == method), "{method}");
@@ -1364,7 +1693,7 @@ mod tests {
             assert!(!control.iter().any(|name| name == method), "{method}");
         }
         let operate = effective_methods(Level::Operate, &gateway);
-        for method in OPERATE {
+        for method in OPERATE.iter().chain(GH_READS).chain(GH_WRITES) {
             assert!(operate.iter().any(|name| name == method), "{method}");
         }
         assert!(operate.iter().any(|name| name == "agent.prompt"));

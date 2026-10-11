@@ -17,6 +17,7 @@ mod diff_model;
 mod dock;
 mod files_tab;
 mod git_tab;
+mod github_tab;
 mod glass;
 mod highlight;
 mod home;
@@ -68,6 +69,7 @@ use diff::{DiffInputs, DiffPanel};
 use dock::Dock;
 use files_tab::FilesPanel;
 use git_tab::GitPanel;
+use github_tab::{GithubInputs, GithubPanel, HomeIssues};
 use glass::Glass;
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DisplayId, Div,
@@ -898,6 +900,8 @@ enum InputLayer {
     Tasks,
     /// The native Diff page.
     Diff,
+    /// A text field of the GitHub tab.
+    Github,
     /// The native Mission Control page.
     Mission,
     /// The native Automations page.
@@ -1643,6 +1647,10 @@ struct PilusView {
     diff_inputs: DiffInputs,
     /// The Git tab: the daemon's working-tree status and recent commits.
     git_panel: GitPanel,
+    github_panel: GithubPanel,
+    github_inputs: GithubInputs,
+    /// The issues the Home composer offers to attach.
+    home_issues: HomeIssues,
     files_panel: FilesPanel,
     ports_panel: PortsPanel,
     /// The right sidebar (Changes and History tabs).
@@ -1791,6 +1799,12 @@ impl PilusView {
         );
         let mut diff_panel = DiffPanel::new();
         diff_panel.set_list_height(settings.diff_list_height);
+        let github_inputs = GithubInputs::new(
+            style::chrome_font(&shared_settings),
+            initial_fonts.body,
+            initial_theme,
+            cx,
+        );
         let mut git_panel = GitPanel::new();
         git_panel.set_list_height(settings.git_list_height);
         let right = RightSidebar::new(
@@ -2085,6 +2099,9 @@ impl PilusView {
             diff_panel,
             diff_inputs,
             git_panel,
+            github_panel: GithubPanel::new(),
+            github_inputs,
+            home_issues: HomeIssues::default(),
             files_panel: FilesPanel::new(),
             ports_panel: PortsPanel::new(),
             right,
@@ -2418,6 +2435,7 @@ impl PilusView {
         }
         changed |= self.diff_tick();
         changed |= self.git_tick();
+        changed |= self.github_tick(cx);
         changed |= self.files_tick();
         changed |= self.ports_tick();
         changed |= self.mission_tick();
@@ -2549,6 +2567,7 @@ impl PilusView {
                             // The agent is up and focused; only now leave the
                             // composer, so no empty terminal flashes first.
                             self.home_launching = false;
+                            self.home_issue_clear();
                             self.home.close();
                             self.toast(ToastKind::Success, message);
                             // `agent.list` will not list the pane for a
@@ -3848,6 +3867,7 @@ impl PilusView {
             InputLayer::Settings => self.settings_key(event, cx),
             InputLayer::Tasks => self.tasks_key(event, cx),
             InputLayer::Diff => self.diff_key(event, cx),
+            InputLayer::Github => self.github_key(event, cx),
             InputLayer::Mission => self.mission_key(event, cx),
             InputLayer::Automations => self.automations_key(event, cx),
             InputLayer::Session => {
@@ -3878,6 +3898,7 @@ impl PilusView {
             self.settings_open,
             self.diff_focused()
                 .then_some(InputLayer::Diff)
+                .or(self.github_focused().then_some(InputLayer::Github))
                 .or_else(|| self.page_layer().filter(|_| !self.terminal_beside_page())),
             self.session_owns_keys(),
         )
@@ -5459,6 +5480,7 @@ impl PilusView {
         if !self.home.is_open() {
             return;
         }
+        self.home_issues_sync();
         // The composer follows the target workspace's machine, so a
         // workspace switch has to re-point the catalog before it paints.
         self.ensure_home_agent_configs();
@@ -5638,6 +5660,7 @@ impl PilusView {
             "enter" | "space" => {
                 if let Some(field) = self.home.focused_picker() {
                     self.home.open_dropdown(field);
+                    self.home_dropdown_opened(field);
                 }
             }
             _ => {}
@@ -5654,7 +5677,14 @@ impl PilusView {
         if self.home_launching {
             return;
         }
-        let prompt = self.home.prompt().value().trim().to_string();
+        let mut prompt = self.home.prompt().value().trim().to_string();
+        // An attached issue is the work, so a prompt is optional beside it.
+        if let Some(issue) = self.home_attached_issue() {
+            if prompt.is_empty() {
+                prompt = "Work on this GitHub issue.".to_string();
+            }
+            prompt = issue.attach_to(&prompt);
+        }
         if prompt.is_empty() {
             self.home.set_status("Write a prompt to send.".to_string());
             cx.notify();
@@ -5820,6 +5850,11 @@ impl PilusView {
                 Some(self.diff_inputs.focus_handle(cx))
             }
             InputLayer::Diff => None,
+            // The open comment or pull request field holds focus.
+            InputLayer::Github => self
+                .github_panel
+                .focus()
+                .map(|focus| self.github_inputs.focus_handle(focus, cx)),
             // The reply field holds focus while it is open; otherwise the
             // window root reads the page's shortcuts.
             InputLayer::Mission if self.mission.answering() => {
@@ -5986,6 +6021,7 @@ impl PilusView {
                             .items_center()
                             .gap_2()
                             .child(self.home_chip(HomeField::Workspace, cx))
+                            .child(self.home_chip(HomeField::Issue, cx))
                             .child(self.home_chip(HomeField::Model, cx))
                             .child(self.home_chip(HomeField::Effort, cx)),
                     )
@@ -6000,6 +6036,8 @@ impl PilusView {
         // open one, and sending falls back to a fresh scratch workspace.
         let value = if field == HomeField::Workspace && selected.is_empty() {
             "Open a workspace".to_string()
+        } else if field == HomeField::Issue {
+            self.home_issue_chip_label()
         } else {
             selected.to_string()
         };
@@ -6047,6 +6085,7 @@ impl PilusView {
         match field {
             HomeField::Agent => glyph(agent_icon(value)),
             HomeField::Workspace => glyph(include_bytes!("../../assets/icons/folder.svg")),
+            HomeField::Issue => glyph(include_bytes!("../../assets/icons/circle-dot.svg")),
             HomeField::Model => glyph(include_bytes!("../../assets/icons/cpu.svg")),
             HomeField::Effort => glyph(include_bytes!("../../assets/icons/gauge.svg")),
         }
@@ -6094,8 +6133,17 @@ impl PilusView {
             self.home.close_dropdown();
         } else {
             self.home.open_dropdown(field);
+            self.home_dropdown_opened(field);
         }
         cx.notify();
+    }
+
+    /// A picker's list just opened: the Issue list is read from GitHub only
+    /// now, since most launches never look at it.
+    fn home_dropdown_opened(&mut self, field: HomeField) {
+        if field == HomeField::Issue {
+            self.home_issues_load();
+        }
     }
 
     /// A zero-size anchor at the chip's top-left corner.

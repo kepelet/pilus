@@ -23,6 +23,7 @@ mod files;
 pub mod folders;
 mod git;
 mod git_status;
+mod github;
 mod machines;
 mod mission;
 mod ports;
@@ -66,6 +67,10 @@ pub use git::{
     init_repository, worktree_is_dirty,
 };
 pub use git_status::{CommitRef, CommitRefKind, GitCommit, GitStatus};
+pub use github::{
+    Checks, Comment, CreatedPull, GhRepo, GhState, Issue, IssueDetail, Label, NewPull, Pull,
+    PullDetail, PullDraft, RepoInfo, StateFilter, unix_seconds,
+};
 pub use machines::{
     MachineInfo, connect_machine, find_installed_binary, install_agent, is_behind, list_machines,
     refresh_machines, restart_remote, stop_remote,

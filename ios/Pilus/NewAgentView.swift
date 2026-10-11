@@ -21,6 +21,8 @@ struct NewAgentView: View {
     @State private var prompt = ""
     @State private var running = false
     @State private var sendError: String?
+    @State private var issue: GHIssue?
+    @State private var choosingIssue = false
 
     /// The machine the run targets: the workspace's own when one is picked,
     /// the browse selection otherwise.
@@ -42,8 +44,18 @@ struct NewAgentView: View {
     private var canSend: Bool {
         !agent.isEmpty
             && (newWorkspace ? !path.isEmpty : workspaceID != nil)
-            && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (issue != nil || !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             && !running
+    }
+
+    /// The checkout whose issues can be attached: an existing workspace's.
+    /// A new workspace has no repository to ask yet.
+    private var issuePath: String? {
+        guard !newWorkspace,
+              let workspace = store.workspaces.first(where: { $0.workspace_id == workspaceID })
+        else { return nil }
+        let path = workspace.cwd ?? workspace.terminal_cwd ?? ""
+        return path.isEmpty ? nil : path
     }
 
     var body: some View {
@@ -101,6 +113,20 @@ struct NewAgentView: View {
                     TextField("What should the agent do?", text: $prompt, axis: .vertical)
                         .autocorrectionDisabled()
                         .lineLimit(3...6)
+                    if let path = issuePath, store.supports("hub.gh.issues", on: targetMachine) {
+                        Button {
+                            choosingIssue = true
+                        } label: {
+                            Label(
+                                issue.map { "#\($0.number) \($0.title)" } ?? "Attach a GitHub issue",
+                                systemImage: "circle.circle"
+                            )
+                            .lineLimit(1)
+                        }
+                        .sheet(isPresented: $choosingIssue) {
+                            IssuePickerSheet(machine: targetMachine, path: path, selection: $issue)
+                        }
+                    }
                 }
             }
             .navigationTitle("New Agent")
@@ -131,6 +157,8 @@ struct NewAgentView: View {
                 }
                 Task { await browse(path) }
             }
+            .onChange(of: workspaceID) { issue = nil }
+            .onChange(of: newWorkspace) { issue = nil }
             .onChange(of: browseMachine) {
                 listing = nil
                 path = "~"
@@ -198,7 +226,7 @@ struct NewAgentView: View {
                 _ = try await store.runAgent(
                     agent: agent,
                     path: newWorkspace ? path : (workspace?.cwd ?? workspace?.terminal_cwd ?? "~"),
-                    prompt: prompt.trimmingCharacters(in: .whitespacesAndNewlines),
+                    prompt: issue?.attach(to: prompt) ?? prompt.trimmingCharacters(in: .whitespacesAndNewlines),
                     workspaceID: newWorkspace ? nil : workspaceID,
                     model: model ?? currentKind?.defaultModel,
                     machine: targetMachine

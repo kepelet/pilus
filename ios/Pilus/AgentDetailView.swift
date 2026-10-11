@@ -17,6 +17,7 @@ struct AgentDetailView: View {
     @State private var showingInfo = false
     @State private var showingDiff = false
     @State private var showingLog = false
+    @State private var showingGitHub = false
     /// The shortcut strip starts folded — it shares the composer row's width.
     @State private var shortcutsExpanded = false
     /// Owned here so the keyboard-down shortcut can resign the field.
@@ -145,6 +146,11 @@ struct AgentDetailView: View {
                     if store.supports("git.log", on: agent.machine) {
                         Button("History", systemImage: "clock.arrow.circlepath") { showingLog = true }
                     }
+                    // Issues and pull requests come from `gh` on the host, so
+                    // they need the connector's `hub.gh.*` and a known checkout.
+                    if store.supports("hub.gh.issues", on: agent.machine), agent.cwd?.isEmpty == false {
+                        Button("GitHub", systemImage: "arrow.triangle.pull") { showingGitHub = true }
+                    }
                 } label: {
                     Image(systemName: "ellipsis")
                 }
@@ -161,6 +167,10 @@ struct AgentDetailView: View {
         }
         .sheet(isPresented: $showingLog) {
             GitLogSheet(agent: agent)
+                .presentationDragIndicator(.hidden)
+        }
+        .sheet(isPresented: $showingGitHub) {
+            GitHubSheet(agent: agent)
                 .presentationDragIndicator(.hidden)
         }
         // The paired host's watch says when this pane wrote output, so the

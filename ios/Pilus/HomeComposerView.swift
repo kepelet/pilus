@@ -25,6 +25,9 @@ struct HomeComposerView: View {
     @State private var workspaceID: String?
     @State private var running = false
     @State private var sendError: String?
+    /// The GitHub issue attached to the prompt, if any.
+    @State private var issue: GHIssue?
+    @State private var choosingIssue = false
 
     var body: some View {
         VStack(spacing: 4) {
@@ -47,6 +50,7 @@ struct HomeComposerView: View {
                     agentPicker
                     modelPicker
                     workspacePicker
+                    issueButton
                     Spacer()
                     sendButton
                 }
@@ -61,7 +65,12 @@ struct HomeComposerView: View {
         .onChange(of: availableKinds.map(\.kind)) { applyDefaults() }
         .onChange(of: store.workspaces.count) { applyDefaults() }
         .onChange(of: agent) { model = currentKind?.defaultModel }
+        .sheet(isPresented: $choosingIssue) {
+            IssuePickerSheet(machine: currentMachine, path: workspacePath, selection: $issue)
+        }
         .onChange(of: workspaceID) {
+            // An issue belongs to one workspace's repository.
+            issue = nil
             // The workspace choice pins the machine the run and the kind
             // catalog both come from; re-pick the kind if the machine
             // changed it away.
@@ -168,6 +177,24 @@ struct HomeComposerView: View {
         }
     }
 
+    private var workspacePath: String {
+        currentWorkspace?.cwd ?? currentWorkspace?.terminal_cwd ?? ""
+    }
+
+    /// Attach one of the workspace's open GitHub issues to the prompt. Only
+    /// offered where the connector can read issues and the checkout is known.
+    @ViewBuilder
+    private var issueButton: some View {
+        if store.supports("hub.gh.issues", on: currentMachine), !workspacePath.isEmpty {
+            Button {
+                choosingIssue = true
+            } label: {
+                pickerLabel(issue.map { "#\($0.number)" } ?? "issue", systemImage: "circle.circle")
+            }
+            .accessibilityLabel(issue.map { "Attached issue \($0.number)" } ?? "Attach an issue")
+        }
+    }
+
     private var spansMachines: Bool {
         Set(store.workspaces.map(\.machine)).count > 1
     }
@@ -204,11 +231,14 @@ struct HomeComposerView: View {
     }
 
     private var canSend: Bool {
-        !agent.isEmpty && !draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // An attached issue is the work, so a prompt is optional beside it.
+        !agent.isEmpty
+            && (issue != nil || !draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     private func send() {
-        let text = draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let typed = draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = issue?.attach(to: typed) ?? typed
         guard canSend, !running else { return }
         running = true
         sendError = nil
@@ -224,6 +254,7 @@ struct HomeComposerView: View {
                     machine: currentMachine
                 )
                 draft.wrappedValue = ""
+                issue = nil
                 await store.refresh()
                 if let pane = result.pane {
                     onLaunched(Agent(

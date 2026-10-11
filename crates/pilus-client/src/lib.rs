@@ -25,6 +25,7 @@ mod git;
 mod git_status;
 mod machines;
 mod mission;
+mod ports;
 mod read;
 mod relay;
 mod surface;
@@ -74,6 +75,7 @@ pub use mission::{
     MissionSnapshot, MissionUsage,
 };
 pub use pilus_protocol as protocol;
+pub use ports::{ListeningPort, PortForward, free_local_port, kill_process, list_ports};
 pub use read::{MAX_TEXT_BYTES, TextFile, Version, read_text};
 pub use relay::RelaySettings;
 pub use surface::{Surface, SurfaceChange};

@@ -745,6 +745,46 @@ pub fn run() -> Result<()> {
         });
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "right-sidebar-back-lit")?;
+        // The Ports tab on a machine, with a forward starting and one failed.
+        cx.update(|app| view.update(app, |view, cx| view.ports_show_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "ports-tab")?;
+        // The confirm that guards killing the process behind a port.
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.open_menu_prompt(
+                    super::PromptAction::KillProcess {
+                        endpoint: super::EndpointId::Local,
+                        pid: 5302,
+                        port: 8080,
+                        name: "python3".to_string(),
+                        label: "pid 5302 · python3 -m http.server 8080".to_string(),
+                    },
+                    "Kill process",
+                    "",
+                    "",
+                    cx,
+                )
+            })
+        });
+        settle(&mut cx, 8);
+        capture(&mut cx, window.into(), "ports-kill-confirm")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.menu_prompt = None;
+                cx.notify();
+            })
+        });
+        // The narrowest column: the tabs scroll, the buttons stay.
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.right.width = super::right_sidebar::MIN_WIDTH;
+                cx.notify();
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "ports-tab-narrow")?;
+        cx.update(|app| view.update(app, |view, cx| view.ports_clear_sample(cx)));
         // A folder still opening: placeholders stand in for its children.
         cx.update(|app| view.update(app, |view, cx| view.files_show_sample(cx)));
         cx.update(|app| {

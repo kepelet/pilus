@@ -51,6 +51,15 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../../assets/icons/corner-down-right.svg"),
     ),
     ("cpu", include_bytes!("../../assets/icons/cpu.svg")),
+    (
+        "external-link",
+        include_bytes!("../../assets/icons/external-link.svg"),
+    ),
+    ("forward", include_bytes!("../../assets/icons/forward.svg")),
+    (
+        "ethernet-port",
+        include_bytes!("../../assets/icons/ethernet-port.svg"),
+    ),
     ("folder", include_bytes!("../../assets/icons/folder.svg")),
     (
         "folder-git",
@@ -305,6 +314,39 @@ impl UiPlaygroundView {
     }
 
     /// The circular icon-only send button.
+    /// The icon-only controls of a dense row: a quiet one, a plain one, and
+    /// the destructive one.
+    fn icon_buttons(&self) -> impl IntoElement {
+        let theme = self.theme;
+        let size = style::scaled(&self.settings, 24.0);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(style::icon_button(
+                "pg-icon-ghost",
+                include_bytes!("../../assets/icons/external-link.svg"),
+                ButtonKind::Ghost,
+                theme,
+                size,
+            ))
+            .child(style::icon_button(
+                "pg-icon-secondary",
+                include_bytes!("../../assets/icons/forward.svg"),
+                ButtonKind::Secondary,
+                theme,
+                size,
+            ))
+            .child(style::icon_button(
+                "pg-icon-danger",
+                include_bytes!("../../assets/icons/trash-2.svg"),
+                ButtonKind::Danger,
+                theme,
+                size,
+            ))
+    }
+
     fn circle_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         div()
@@ -1871,6 +1913,7 @@ impl Render for UiPlaygroundView {
                             .child(self.button("pg-ghost", "Ghost", ButtonKind::Ghost, cx))
                             .child(self.button("pg-danger", "Danger", ButtonKind::Danger, cx))
                             .child(self.circle_button(cx))
+                            .child(self.icon_buttons())
                             .child(
                                 div()
                                     .text_size(px(self.fonts().label))

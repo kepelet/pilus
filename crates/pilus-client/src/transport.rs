@@ -121,6 +121,53 @@ impl SshTarget {
         command
     }
 
+    /// [`Self::shell`] over the shared master, for a command that repeats: a
+    /// poll then costs a round trip instead of a handshake.
+    pub fn shell_multiplexed(&self, remote_command: &str) -> Command {
+        let Some(control_path) = control_dir() else {
+            return self.shell(remote_command);
+        };
+        let mut command = self.base_with_control_path(Some(&control_path));
+        command.arg(posix_command(remote_command));
+        command
+    }
+
+    /// The `ssh -N -L` invocation that carries `127.0.0.1:local_port` here to
+    /// `remote_host:remote_port` as the host sees it.
+    ///
+    /// `ControlPath=none` keeps it a process of its own: riding a master a
+    /// user's `ssh_config` enables would leave the forward alive after this
+    /// process is killed. `ExitOnForwardFailure` makes a refused listener end
+    /// the process, which is how a failed forward is noticed.
+    pub(crate) fn forward_command(
+        &self,
+        local_port: u16,
+        remote_host: &str,
+        remote_port: u16,
+    ) -> Command {
+        let mut command = Command::new(ssh_binary());
+        command
+            .arg("-N")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-o")
+            .arg("ServerAliveInterval=15")
+            .arg("-o")
+            .arg("ServerAliveCountMax=3")
+            .arg("-o")
+            .arg("ExitOnForwardFailure=yes")
+            .arg("-o")
+            .arg("ControlPath=none")
+            .arg("-L")
+            .arg(format!(
+                "127.0.0.1:{local_port}:{remote_host}:{remote_port}"
+            ))
+            .arg(&self.destination);
+        command
+    }
+
     /// Ask OpenSSH to close the shared master without blocking the caller.
     pub fn release_control_master(&self) {
         let destination = self.destination.clone();

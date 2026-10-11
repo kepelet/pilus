@@ -231,9 +231,7 @@ struct HomeComposerView: View {
     }
 
     private var canSend: Bool {
-        // An attached issue is the work, so a prompt is optional beside it.
-        !agent.isEmpty
-            && (issue != nil || !draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        !running && currentKind != nil
     }
 
     private func send() {

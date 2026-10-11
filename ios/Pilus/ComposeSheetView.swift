@@ -230,7 +230,7 @@ struct ComposeSheetView: View {
     }
 
     private var canSend: Bool {
-        !agent.wrappedValue.isEmpty && !draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !running && currentKind != nil
     }
 
     private func send() {

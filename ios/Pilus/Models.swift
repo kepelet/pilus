@@ -286,6 +286,7 @@ struct HubRunResult: Decodable {
     let started: Bool?
     let name: String?
     let pane: String?
+    let prompt: String?
 }
 
 /// `uhp.capabilities` through the hub: the device's own effective access.

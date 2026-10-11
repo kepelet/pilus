@@ -176,7 +176,19 @@ pub fn is_idempotent(method: &str, params: &Value) -> bool {
     keyed
         || matches!(
             method,
-            "ping" | "search" | "mission.refresh" | "hub.machines" | "hub.agents" | "hub.folders"
+            "ping"
+                | "search"
+                | "mission.refresh"
+                | "hub.machines"
+                | "hub.agents"
+                | "hub.folders"
+                // GitHub reads only; a resent comment or pull request would be posted twice.
+                | "hub.gh.status"
+                | "hub.gh.issues"
+                | "hub.gh.issue"
+                | "hub.gh.pulls"
+                | "hub.gh.pull"
+                | "hub.gh.pull_draft"
         )
         || READ_SUFFIXES.iter().any(|suffix| method.ends_with(suffix))
 }
@@ -799,6 +811,8 @@ mod tests {
             "agent.wait",
             "hub.machines",
             "hub.agents",
+            "hub.gh.issues",
+            "hub.gh.pull_draft",
             "diff.note.list",
         ] {
             assert!(is_idempotent(read, &none), "{read}");
@@ -807,6 +821,9 @@ mod tests {
             "agent.prompt",
             "agent.keys",
             "hub.run",
+            "hub.gh.issue_comment",
+            "hub.gh.pull_comment",
+            "hub.gh.pull_create",
             "workspace.open",
             "terminal.backend.submit_text",
             "diff.note.add",

@@ -1,6 +1,7 @@
 //! The right sidebar: a column beside the terminal card, toggled with Cmd+B,
-//! holding the Diff review, the Git status and history, the file tree, and the
-//! machine's listening ports on four tabs.
+//! holding the Diff review, the Git status and history, the file tree, the
+//! workspace's GitHub issues and pull requests, and the machine's listening
+//! ports on five tabs.
 //!
 //! The daemon knows nothing of this column. The window reserves its width from
 //! the card, so the daemon sees a smaller viewport and reflows once when the
@@ -8,7 +9,7 @@
 //! resize hold the viewport still until they settle, as the left sidebar's
 //! tween does. This module owns the column's state, its pure sizing rules,
 //! and the chrome (tab strip, resize handle, focus edge, footer). The open
-//! tab's body is drawn by `diff.rs`, `git_tab.rs`, `files_tab.rs`, or `ports_tab.rs`, which own their data;
+//! tab's body is drawn by `diff.rs`, `git_tab.rs`, `files_tab.rs`, `github_tab.rs`, or `ports_tab.rs`, which own their data;
 //! only the open tab polls the daemon.
 //!
 //! The column keeps a browser-style history of where it has been: a tab, and
@@ -30,7 +31,7 @@ pub(super) const MIN_WIDTH: f32 = 300.0;
 /// Most of the window the column may take, so the terminal keeps a card.
 const MAX_WINDOW_SHARE: f32 = 0.6;
 /// Width a first open gets.
-pub(super) const DEFAULT_WIDTH: f32 = 440.0;
+pub(super) const DEFAULT_WIDTH: f32 = 480.0;
 /// The draggable strip on the column's leading edge.
 const HANDLE_WIDTH: f32 = 6.0;
 
@@ -41,27 +42,34 @@ pub(super) enum SidebarTab {
     Diff,
     Git,
     Files,
+    Github,
     Ports,
 }
 
 impl SidebarTab {
-    pub(super) const ALL: [SidebarTab; 4] = [
+    pub(super) const ALL: [SidebarTab; 5] = [
         SidebarTab::Diff,
         SidebarTab::Git,
         SidebarTab::Files,
+        SidebarTab::Github,
         SidebarTab::Ports,
     ];
 
     /// The tabs the strip draws. Ports is opened by its own button, in the
     /// window's header while the column is closed and in the strip once open.
-    pub(super) const STRIP: [SidebarTab; 3] =
-        [SidebarTab::Diff, SidebarTab::Git, SidebarTab::Files];
+    pub(super) const STRIP: [SidebarTab; 4] = [
+        SidebarTab::Diff,
+        SidebarTab::Git,
+        SidebarTab::Files,
+        SidebarTab::Github,
+    ];
 
     pub(super) fn wire(self) -> &'static str {
         match self {
             Self::Diff => "diff",
             Self::Git => "git",
             Self::Files => "files",
+            Self::Github => "github",
             Self::Ports => "ports",
         }
     }
@@ -79,6 +87,7 @@ impl SidebarTab {
             Self::Diff => "Changes",
             Self::Git => "History",
             Self::Files => "Files",
+            Self::Github => "GitHub",
             Self::Ports => "Ports",
         }
     }
@@ -461,7 +470,7 @@ impl PilusView {
                 Some(_) => {}
                 None => self.files_panel.close_doc(),
             },
-            SidebarTab::Git | SidebarTab::Ports => {}
+            SidebarTab::Git | SidebarTab::Github | SidebarTab::Ports => {}
         }
         if changed_tab {
             self.remember_right_tab();
@@ -523,6 +532,7 @@ impl PilusView {
             SidebarTab::Diff => self.diff_panel.mark_stale(),
             SidebarTab::Git => self.git_panel.mark_stale(),
             SidebarTab::Files => self.files_panel.mark_stale(),
+            SidebarTab::Github => self.github_panel.mark_stale(),
             SidebarTab::Ports => self.ports_panel.mark_stale(),
         }
     }
@@ -545,6 +555,18 @@ impl PilusView {
     /// Whether the Files tab is on screen, so it should poll the daemon.
     pub(super) fn files_visible(&self) -> bool {
         self.right.visible && self.right.tab == SidebarTab::Files
+    }
+
+    /// Whether the GitHub tab is on screen, so it should poll `gh`.
+    pub(super) fn github_visible(&self) -> bool {
+        self.right.visible && self.right.tab == SidebarTab::Github
+    }
+
+    /// Whether a GitHub text field holds the keyboard. The tab has no
+    /// shortcuts of its own, so until a field is open its keys stay with the
+    /// terminal.
+    pub(super) fn github_focused(&self) -> bool {
+        self.github_visible() && self.right.focused && self.github_panel.composing()
     }
 
     /// Whether the Ports tab is on screen, so it should poll the machine.
@@ -780,11 +802,12 @@ impl PilusView {
                 SidebarTab::Diff => self.diff_page(self.right.shown_width(), cx),
                 SidebarTab::Git => self.git_page(cx),
                 SidebarTab::Files => self.files_page(cx),
+                SidebarTab::Github => self.github_page(cx),
                 SidebarTab::Ports => self.ports_page(cx),
             });
         let footer = match self.right.tab {
             SidebarTab::Diff => self.diff_footer(cx),
-            SidebarTab::Git | SidebarTab::Files | SidebarTab::Ports => None,
+            SidebarTab::Git | SidebarTab::Files | SidebarTab::Github | SidebarTab::Ports => None,
         };
 
         let handle = div()

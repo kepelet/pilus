@@ -1,6 +1,6 @@
 //! The right sidebar: a column beside the terminal card, toggled with Cmd+B,
-//! holding the Diff review, the Git status and history, and the file tree on
-//! three tabs.
+//! holding the Diff review, the Git status and history, the file tree, and the
+//! machine's listening ports on four tabs.
 //!
 //! The daemon knows nothing of this column. The window reserves its width from
 //! the card, so the daemon sees a smaller viewport and reflows once when the
@@ -8,7 +8,7 @@
 //! resize hold the viewport still until they settle, as the left sidebar's
 //! tween does. This module owns the column's state, its pure sizing rules,
 //! and the chrome (tab strip, resize handle, focus edge, footer). The open
-//! tab's body is drawn by `diff.rs`, `git_tab.rs`, or `files_tab.rs`, which own their data;
+//! tab's body is drawn by `diff.rs`, `git_tab.rs`, `files_tab.rs`, or `ports_tab.rs`, which own their data;
 //! only the open tab polls the daemon.
 //!
 //! The column keeps a browser-style history of where it has been: a tab, and
@@ -41,16 +41,28 @@ pub(super) enum SidebarTab {
     Diff,
     Git,
     Files,
+    Ports,
 }
 
 impl SidebarTab {
-    pub(super) const ALL: [SidebarTab; 3] = [SidebarTab::Diff, SidebarTab::Git, SidebarTab::Files];
+    pub(super) const ALL: [SidebarTab; 4] = [
+        SidebarTab::Diff,
+        SidebarTab::Git,
+        SidebarTab::Files,
+        SidebarTab::Ports,
+    ];
+
+    /// The tabs the strip draws. Ports is opened by its own button, in the
+    /// window's header while the column is closed and in the strip once open.
+    pub(super) const STRIP: [SidebarTab; 3] =
+        [SidebarTab::Diff, SidebarTab::Git, SidebarTab::Files];
 
     pub(super) fn wire(self) -> &'static str {
         match self {
             Self::Diff => "diff",
             Self::Git => "git",
             Self::Files => "files",
+            Self::Ports => "ports",
         }
     }
 
@@ -67,6 +79,7 @@ impl SidebarTab {
             Self::Diff => "Changes",
             Self::Git => "History",
             Self::Files => "Files",
+            Self::Ports => "Ports",
         }
     }
 
@@ -382,6 +395,19 @@ impl PilusView {
         self.right_navigate(cx, |this, _| this.right.select_tab(tab));
     }
 
+    /// The Ports button: open the column on Ports, or close it when Ports is
+    /// already showing, as the sidebar toggle would.
+    pub(super) fn toggle_ports(&mut self, cx: &mut Context<Self>) {
+        if self.right.visible && self.right.tab == SidebarTab::Ports {
+            self.toggle_right_sidebar(cx);
+            return;
+        }
+        if !self.right.visible {
+            self.toggle_right_sidebar(cx);
+        }
+        self.select_right_tab(SidebarTab::Ports, cx);
+    }
+
     /// Where the column is now.
     fn right_here(&self) -> Place {
         Place::new(
@@ -435,7 +461,7 @@ impl PilusView {
                 Some(_) => {}
                 None => self.files_panel.close_doc(),
             },
-            SidebarTab::Git => {}
+            SidebarTab::Git | SidebarTab::Ports => {}
         }
         if changed_tab {
             self.remember_right_tab();
@@ -497,6 +523,7 @@ impl PilusView {
             SidebarTab::Diff => self.diff_panel.mark_stale(),
             SidebarTab::Git => self.git_panel.mark_stale(),
             SidebarTab::Files => self.files_panel.mark_stale(),
+            SidebarTab::Ports => self.ports_panel.mark_stale(),
         }
     }
 
@@ -518,6 +545,67 @@ impl PilusView {
     /// Whether the Files tab is on screen, so it should poll the daemon.
     pub(super) fn files_visible(&self) -> bool {
         self.right.visible && self.right.tab == SidebarTab::Files
+    }
+
+    /// Whether the Ports tab is on screen, so it should poll the machine.
+    pub(super) fn ports_visible(&self) -> bool {
+        self.right.visible && self.right.tab == SidebarTab::Ports
+    }
+
+    /// The Ports icon, with a green dot while a forward of ours is running, so
+    /// the button says so even with the column on another tab or closed.
+    fn ports_glyph(&self, lit: bool) -> Div {
+        let theme = self.theme;
+        let glyph = div().relative().flex().child(icon(
+            include_bytes!("../../assets/icons/ethernet-port.svg"),
+            14.0,
+            if lit { theme.panel_fg } else { theme.muted },
+        ));
+        if !self.ports_forwarding() {
+            return glyph;
+        }
+        glyph.child(
+            div()
+                .absolute()
+                .top(px(-2.0))
+                .right(px(-2.0))
+                .size(px(6.0))
+                .rounded_full()
+                .bg(theme.ok),
+        )
+    }
+
+    /// The tooltip of the Ports buttons.
+    fn ports_tip(&self) -> String {
+        match self.ports_forwarded_count() {
+            0 => "Ports".to_string(),
+            1 => "Ports · 1 forwarded".to_string(),
+            n => format!("Ports · {n} forwarded"),
+        }
+    }
+
+    /// The Ports button beside the sidebar toggle, lit while Ports is open.
+    pub(super) fn right_ports_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = self.theme;
+        div()
+            .id("pilus-right-ports-toggle")
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .h(px(super::TAB_HEIGHT))
+            .w(px(super::SIDEBAR_TOGGLE_W))
+            .radius_md()
+            .cursor_pointer()
+            .hover_fill(theme.panel_dim, style::RADIUS_MD)
+            .tooltip(super::row_tooltip(
+                self.ports_tip(),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
+            .child(self.ports_glyph(self.right.visible && self.right.tab == SidebarTab::Ports))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_ports(cx)))
     }
 
     /// The toggle for the tab strip's trailing edge.
@@ -595,21 +683,57 @@ impl PilusView {
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.right_forward(cx))),
             )
-            .children(SidebarTab::ALL.map(|tab| {
-                style::tab(
-                    format!("pilus-right-tab-{}", tab.wire()),
-                    tab.label(),
-                    self.right.tab == tab,
-                    theme,
-                    fonts.body,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.select_right_tab(tab, cx)))
-            }))
-            .child(div().flex_1())
+            // The tabs scroll when the column is narrow; the buttons around
+            // them stay put.
+            .child(
+                div()
+                    .id("pilus-right-tabs-scroll")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .overflow_y_hidden()
+                    .children(SidebarTab::STRIP.map(|tab| {
+                        style::tab(
+                            format!("pilus-right-tab-{}", tab.wire()),
+                            tab.label(),
+                            self.right.tab == tab,
+                            theme,
+                            fonts.body,
+                        )
+                        .flex_shrink_0()
+                        .on_click(cx.listener(move |this, _, _, cx| this.select_right_tab(tab, cx)))
+                    })),
+            )
+            .child(
+                div()
+                    .id("pilus-right-sidebar-ports")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(style::scaled(&self.shared_settings, 24.0)))
+                    .h(px(style::scaled(&self.shared_settings, 24.0)))
+                    .radius_md()
+                    .cursor_pointer()
+                    .hover_fill(theme.panel_dim, style::RADIUS_MD)
+                    .flex_shrink_0()
+                    .tooltip(super::row_tooltip(
+                        self.ports_tip(),
+                        theme.panel_fg,
+                        Vec::new(),
+                        theme,
+                    ))
+                    .child(self.ports_glyph(self.right.tab == SidebarTab::Ports))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_ports(cx))),
+            )
             .child(
                 div()
                     .id("pilus-right-sidebar-expand")
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .justify_center()
                     .w(px(style::scaled(&self.shared_settings, 24.0)))
@@ -632,6 +756,7 @@ impl PilusView {
                 div()
                     .id("pilus-right-sidebar-close")
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .justify_center()
                     .w(px(style::scaled(&self.shared_settings, 24.0)))
@@ -655,10 +780,11 @@ impl PilusView {
                 SidebarTab::Diff => self.diff_page(self.right.shown_width(), cx),
                 SidebarTab::Git => self.git_page(cx),
                 SidebarTab::Files => self.files_page(cx),
+                SidebarTab::Ports => self.ports_page(cx),
             });
         let footer = match self.right.tab {
             SidebarTab::Diff => self.diff_footer(cx),
-            SidebarTab::Git | SidebarTab::Files => None,
+            SidebarTab::Git | SidebarTab::Files | SidebarTab::Ports => None,
         };
 
         let handle = div()

@@ -289,6 +289,44 @@ pub(super) fn small_button(
     )
 }
 
+/// A square icon-only control for a dense row. The treatment sets the icon's
+/// tone: `Danger` is alert-red at rest and washes red under the pointer, the
+/// rest are muted and wash to the panel fill. Callers attach the tooltip, which
+/// the label would otherwise carry, and their own handler.
+pub(super) fn icon_button(
+    id: impl Into<ElementId>,
+    glyph: &'static [u8],
+    kind: ButtonKind,
+    theme: Theme,
+    size: f32,
+) -> Stateful<Div> {
+    let (fg, hover_bg) = match kind {
+        ButtonKind::Danger => (theme.alert, tint(theme.alert, 0.16)),
+        ButtonKind::Primary => (theme.accent, theme.panel_dim),
+        ButtonKind::Secondary => (theme.panel_fg, theme.panel_dim),
+        ButtonKind::Ghost => (theme.muted, theme.panel_dim),
+    };
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .w(px(size))
+        .h(px(size))
+        .radius_md()
+        .cursor_pointer()
+        .hover_fill(hover_bg, RADIUS_MD)
+        .child(
+            svg()
+                .data(glyph)
+                .w(px(size * 0.58))
+                .h(px(size * 0.58))
+                .flex_shrink_0()
+                .text_color(fg),
+        )
+}
+
 /// One tab of a strip: the selected tab is raised by its panel fill alone,
 /// with no border, and the others rest on the strip. Callers attach their own
 /// handler.

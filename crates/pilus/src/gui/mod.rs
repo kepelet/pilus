@@ -30,6 +30,7 @@ mod page_split;
 mod palette;
 mod pi_extension;
 mod picker;
+mod ports_tab;
 mod right_sidebar;
 mod scheme;
 mod selection;
@@ -96,6 +97,7 @@ use pilus_protocol::{
     CellData, ClientMessage, FrameData, ShellDockRect, ShellSidebars, ShellWorkspace,
     SurfaceInterest,
 };
+use ports_tab::PortsPanel;
 use right_sidebar::{RightSidebar, SidebarTab};
 use selection::{Cell, Selection};
 use session::SessionPanel;
@@ -1107,6 +1109,16 @@ enum PromptAction {
         path: String,
         folder: bool,
     },
+    /// Stop the process holding a listening port, after the confirm prompt.
+    KillProcess {
+        endpoint: EndpointId,
+        pid: u32,
+        port: u16,
+        /// The process's name, for the result toast.
+        name: String,
+        /// What the confirm shows: the pid and the command line.
+        label: String,
+    },
     /// Delete a linked worktree (and its files) after the confirm prompt.
     DeleteWorktree {
         endpoint: EndpointId,
@@ -1138,7 +1150,10 @@ impl PromptAction {
     /// Whether the prompt is a yes/no confirm with no field, so the keyboard
     /// stays on the window root, which routes its Enter and Escape.
     fn is_confirm(&self) -> bool {
-        matches!(self, Self::DeleteWorktree { .. } | Self::DeleteEntry { .. })
+        matches!(
+            self,
+            Self::DeleteWorktree { .. } | Self::DeleteEntry { .. } | Self::KillProcess { .. }
+        )
     }
 }
 
@@ -1629,6 +1644,7 @@ struct PilusView {
     /// The Git tab: the daemon's working-tree status and recent commits.
     git_panel: GitPanel,
     files_panel: FilesPanel,
+    ports_panel: PortsPanel,
     /// The right sidebar (Changes and History tabs).
     right: RightSidebar,
     /// The native Mission Control page: its state and the daemon's last
@@ -1700,6 +1716,7 @@ impl PilusView {
         // A quit flushes the frame without waiting for the debounce.
         cx.on_app_quit(|view, _cx| {
             view.settings.save(&view.pilus_root);
+            view.ports_stop_all();
             async {}
         })
         .detach();
@@ -2069,6 +2086,7 @@ impl PilusView {
             diff_inputs,
             git_panel,
             files_panel: FilesPanel::new(),
+            ports_panel: PortsPanel::new(),
             right,
             mission: MissionPanel::default(),
             mission_answer,
@@ -2401,6 +2419,7 @@ impl PilusView {
         changed |= self.diff_tick();
         changed |= self.git_tick();
         changed |= self.files_tick();
+        changed |= self.ports_tick();
         changed |= self.mission_tick();
         changed |= self.automations_tick();
         while let Ok(resolved) = self.home_resolve_rx.try_recv() {
@@ -10112,6 +10131,13 @@ impl PilusView {
             PromptAction::DeleteEntry { endpoint, path, .. } => {
                 self.files_delete(&endpoint, path, cx)
             }
+            PromptAction::KillProcess {
+                endpoint,
+                pid,
+                port,
+                name,
+                ..
+            } => self.ports_kill(&endpoint, pid, port, name, cx),
             PromptAction::DeleteWorktree {
                 endpoint,
                 path,
@@ -10716,6 +10742,7 @@ impl PilusView {
         if self.right.openness() < 0.05 {
             tab_strip = tab_strip
                 .child(div().flex_1())
+                .child(self.right_ports_toggle(cx))
                 .child(self.right_sidebar_toggle(cx));
         }
         // An expanded right column covers the strip entirely.
@@ -11421,6 +11448,9 @@ impl PilusView {
                 Some("Deletes the folder and everything in it. This can't be undone.")
             }
             PromptAction::DeleteEntry { .. } => Some("Deletes the file. This can't be undone."),
+            PromptAction::KillProcess { .. } => {
+                Some("Stops the process. Anything it hasn't saved is lost.")
+            }
             _ => None,
         };
         let confirm_escalated = prompt.action.escalated();
@@ -11436,6 +11466,7 @@ impl PilusView {
             PromptAction::DeleteWorktree { path, .. } | PromptAction::DeleteEntry { path, .. } => {
                 Some(path.clone())
             }
+            PromptAction::KillProcess { label, .. } => Some(label.clone()),
             _ => None,
         };
         let input = self.menu_prompt_input.clone();
@@ -11506,10 +11537,10 @@ impl PilusView {
                     div()
                         .text_size(px(self.section_font()))
                         .text_color(theme.muted)
-                        .child(if confirm_escalated {
-                            "⏎ Delete anyway · Esc Cancel"
-                        } else {
-                            "⏎ Delete · Esc Cancel"
+                        .child(match (&prompt.action, confirm_escalated) {
+                            (PromptAction::KillProcess { .. }, _) => "⏎ Kill · Esc Cancel",
+                            (_, true) => "⏎ Delete anyway · Esc Cancel",
+                            (_, false) => "⏎ Delete · Esc Cancel",
                         }),
                 );
         } else {

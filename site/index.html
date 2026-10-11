@@ -1436,6 +1436,17 @@
       border-bottom: 1px solid var(--blueprint-line);
     }
 
+    /* Mission control keeps its full table width and scrolls sideways instead
+       of clipping columns on narrow screens. */
+    .explainer-panel {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .explainer-panel .mc {
+      min-width: 620px;
+    }
+
     .architecture-grid {
       grid-template-columns: 1fr;
     }
@@ -1516,8 +1527,10 @@
 
     .hero-shot {
       width: 100%;
-      aspect-ratio: 4 / 3;
-      border-radius: 12px 12px 0 0;
+      /* Match the screenshot's native ratio so the wide app window is never
+         cropped on narrow screens. */
+      aspect-ratio: 2903 / 1707;
+      border-radius: 0;
     }
 
     .architecture {
@@ -1658,8 +1671,50 @@
       padding: 0 0 105px;
     }
 
+    /* The mission control reads as a code block; keep its type compact on a
+       phone. */
+    .mc {
+      font-size: 10px;
+    }
+
+    .mc-value {
+      font-size: 15px;
+    }
+
+    .mc-label,
+    .mc-panel-title,
+    .mc-tr,
+    .mc-th {
+      font-size: 9px;
+    }
+
+    /* Agent marks in the live feed are dimmed on desktop; on a phone they need
+       to read as solid white. */
+    .diagram-feed-logo {
+      opacity: 1;
+    }
+
+    /* The desktop mark is large enough to sit behind the card's top-right
+       corner; at phone widths it would swallow the heading, so shrink it and
+       tuck it behind the card's edge. */
+    .faq-mark-above {
+      margin-bottom: 0;
+    }
+
+    .faq-mark {
+      display: block;
+      width: 150px;
+      height: 150px;
+      margin: 0 0 -48px auto;
+    }
+
     .faq-inner {
       border-radius: 18px;
+    }
+
+    .footer-marquee {
+      font-size: 9px;
+      letter-spacing: 0.1em;
     }
 
     .footer-brand {
@@ -1734,7 +1789,7 @@
 
     <div class="hero-scene">
       <div class="hero-shot" aria-label="pilus running a four-pane workspace">
-        <img src="assets/hero.jpeg" alt="pilus workspace showing request logs, git history, live agent output, a build, and system activity across four panes" width="1600" height="1200" fetchpriority="high">
+        <img src="assets/hero.jpeg" alt="pilus workspace showing request logs, git history, live agent output, a build, and system activity across four panes" width="2903" height="1707" fetchpriority="high">
       </div>
     </div>
   </section>

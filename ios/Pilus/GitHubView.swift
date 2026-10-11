@@ -319,23 +319,21 @@ struct GitHubView: View {
     @ViewBuilder
     private var content: some View {
         if let status = model.status, status.state != "ready" {
-            ContentUnavailableView(
-                "GitHub isn't set up here",
-                systemImage: "exclamationmark.triangle",
-                description: Text(status.advice ?? "GitHub CLI isn't working on this machine."),
-                actions: {
-                    Button("Check again") { Task { await model.load() } }
-                }
-            )
+            ContentUnavailableView {
+                Label("GitHub isn't set up here", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(status.advice ?? "GitHub CLI isn't working on this machine.")
+            } actions: {
+                Button("Check again") { Task { await model.load() } }
+            }
         } else if let error = model.error, currentCount == nil {
-            ContentUnavailableView(
-                "Couldn't load GitHub",
-                systemImage: "exclamationmark.triangle",
-                description: Text(error),
-                actions: {
-                    Button("Try again") { Task { await model.load() } }
-                }
-            )
+            ContentUnavailableView {
+                Label("Couldn't load GitHub", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(error)
+            } actions: {
+                Button("Try again") { Task { await model.load() } }
+            }
         } else {
             list
         }

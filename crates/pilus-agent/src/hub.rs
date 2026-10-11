@@ -1668,10 +1668,12 @@ mod tests {
                 "t",
             )
             .await;
-        // A machine without `gh` answers `missing`; one with it answers `no_repo`.
-        // Either way the phone gets a state and a sentence, not an error.
+        // `gh` reports its auth state before it can resolve the directory.
         let state = reply["result"]["state"].as_str().unwrap_or_default();
-        assert!(matches!(state, "missing" | "no_repo"), "{reply}");
+        assert!(
+            matches!(state, "missing" | "no_repo" | "signed_out"),
+            "{reply}"
+        );
         assert!(reply["result"]["advice"].is_string(), "{reply}");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -17,8 +17,9 @@ struct HomeView: View {
     @State private var showingSettings = false
     @State private var showingCompose = false
     @State private var openingTaskID: String?
-    /// The floating composer's three states ride on this: unfocused (one
-    /// line), focused (taller), maximized (the compose sheet).
+    /// Focus opens the composer; this state stays expanded when the keyboard
+    /// dismisses so picker menus remain available.
+    @State private var composerExpanded = false
     @FocusState private var composerFocused: Bool
     @State private var composerSending = false
     @State private var composerError: String?
@@ -148,9 +149,9 @@ struct HomeView: View {
             .refreshable { await store.refresh() }
             // A tap anywhere outside the composer resigns it — rows and
             // section headers keep their own handlers.
-            .onTapGesture { composerFocused = false }
+            .onTapGesture { collapseComposer() }
             // Pushing a page (agent, notifications) drops the keyboard.
-            .onChange(of: navPath.count) { composerFocused = false }
+            .onChange(of: navPath.count) { collapseComposer() }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 // The brand mark doubles as the menu trigger — tapping it
@@ -300,20 +301,20 @@ struct HomeView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.bottom, 4)
             }
-            VStack(alignment: .leading, spacing: composerFocused ? 10 : 0) {
-                HStack(alignment: composerFocused ? .top : .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: composerExpanded ? 10 : 0) {
+                HStack(alignment: composerExpanded ? .top : .center, spacing: 8) {
                     TextField("Plan, ask, build", text: $composerDraft, axis: .vertical)
-                        .lineLimit(composerFocused ? 2...6 : 1...1)
+                        .lineLimit(composerExpanded ? 2...6 : 1...1)
                         .textFieldStyle(.plain)
                         .focused($composerFocused)
                         // Prompts reach the agent verbatim.
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                    if !composerFocused {
+                    if !composerExpanded {
                         composerSendButton
                     }
                 }
-                if composerFocused {
+                if composerExpanded {
                     HStack(spacing: 16) {
                         if composerKinds.isEmpty && !store.loaded {
                             pickerSkeleton
@@ -336,15 +337,22 @@ struct HomeView: View {
                 }
             }
             .padding(.leading, 16)
-            .padding(.trailing, composerFocused ? 12 : 8)
-            .padding(.vertical, composerFocused ? 12 : 8)
-            .modifier(LiquidGlassPanel(radius: composerFocused ? 22 : 26))
+            .padding(.trailing, composerExpanded ? 12 : 8)
+            .padding(.vertical, composerExpanded ? 12 : 8)
+            .modifier(LiquidGlassPanel(radius: composerExpanded ? 22 : 26))
         }
         // High priority so a flick over the text field is the composer's
         // swipe, not the field's own scroll/selection gesture.
+        .contentShape(Rectangle())
+        .onTapGesture { composerFocused = true }
         .highPriorityGesture(composerGesture)
-        .animation(.easeInOut(duration: 0.2), value: composerFocused)
+        .animation(.easeInOut(duration: 0.2), value: composerExpanded)
         .onAppear(perform: applyComposerDefaults)
+        .onChange(of: composerFocused) { _, focused in
+            if focused {
+                composerExpanded = true
+            }
+        }
         .onChange(of: composerKinds.map(\.kind)) { applyComposerDefaults() }
         .onChange(of: store.workspaces.count) { applyComposerDefaults() }
         .onChange(of: composerAgent) { composerModel = composerKind?.defaultModel }
@@ -520,19 +528,23 @@ struct HomeView: View {
     private var composerGesture: some Gesture {
         DragGesture(minimumDistance: 28)
             .onEnded { value in
-                guard composerFocused else { return }
+                guard composerExpanded else { return }
                 if value.translation.height < 0 {
-                    composerFocused = false
+                    collapseComposer()
                     showingCompose = true
                 } else {
-                    composerFocused = false
+                    collapseComposer()
                 }
             }
     }
 
     private var canSendComposer: Bool {
-        !composerSending
-            && !composerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !composerSending && composerKind != nil
+    }
+
+    private func collapseComposer() {
+        composerExpanded = false
+        composerFocused = false
     }
 
     /// Sends the draft to the pickers' selection — unfocused sends fall
@@ -548,7 +560,7 @@ struct HomeView: View {
         guard let kind = composerKind ?? store.kinds(for: machine).first else { return }
         composerSending = true
         composerError = nil
-        composerFocused = false
+        collapseComposer()
         do {
             let result = try await store.runAgent(
                 agent: kind.kind,
@@ -995,5 +1007,4 @@ private struct SkeletonBar: View {
             .frame(height: height)
     }
 }
-
 

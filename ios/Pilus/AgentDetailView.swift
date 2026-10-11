@@ -209,9 +209,8 @@ struct AgentDetailView: View {
         } while outputPending && !Task.isCancelled
     }
 
-    /// Tap sends the reply as a prompt. Holding offers the literal terminal
-    /// inputs for when the agent is not at a prompt: type it as is, paste it
-    /// without Enter, or submit it as typed text.
+    /// Tap sends the reply as a prompt. A blocked or not-yet-ready agent falls
+    /// back to `agent.keys`; holding still offers terminal input actions.
     private var sendButton: some View {
         Menu {
             Button("Type into terminal and press Enter", systemImage: "return") {
@@ -242,6 +241,10 @@ struct AgentDetailView: View {
 
     private var canSend: Bool {
         !sending && !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var canAnswer: Bool {
+        store.supports("agent.keys", on: agent.machine)
     }
 
     /// iOS 18+ tracks whether the viewport is at the live edge so the bottom
@@ -327,9 +330,10 @@ struct AgentDetailView: View {
         }
     }
 
-    /// Send the reply as a prompt, or as literal terminal `input` when the
-    /// user chose that. The text stays in the field on any failure — after a
-    /// dropped connection it may or may not have landed, and the error says so.
+    /// Send through `agent.prompt`, falling back to `agent.keys` for a blocked
+    /// or not-ready agent. A held-button selection still uses terminal input.
+    /// The text stays in the field on any failure because delivery may be
+    /// uncertain after a dropped connection.
     private func send(_ input: AppStore.TerminalInput? = nil) async {
         let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending else {
@@ -341,8 +345,15 @@ struct AgentDetailView: View {
         do {
             if let input {
                 try await store.terminalInput(agent: agent, input)
+            } else if (detail?.status ?? agent.status) == "blocked", canAnswer {
+                try await store.answer(agent: agent, text: text)
             } else {
-                try await store.sendPrompt(agent: agent, text: text)
+                do {
+                    try await store.sendPrompt(agent: agent, text: text)
+                } catch let error as PilusError
+                    where error.code == "agent_not_ready" && canAnswer {
+                    try await store.answer(agent: agent, text: text)
+                }
             }
             log.info("send delivered")
             reply = ""

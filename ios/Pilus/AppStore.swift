@@ -574,8 +574,9 @@ final class AppStore {
     /// A prompt is never resent on its own: after a dropped connection it may
     /// already be in the agent's composer, so the error says so and the caller
     /// keeps the text. An agent sitting at a startup, sign-in, or approval
-    /// screen refuses with `agent_not_ready`; typing into it is the user's
-    /// explicit choice (`terminalInput`), not a silent fallback.
+    /// screen refuses with `agent_not_ready`; callers fall back to
+    /// `answer(agent:text:)` when `agent.keys` is available. Hold-to-type
+    /// guidance is included only when a terminal input action is available.
     func sendPrompt(agent: Agent, text: String) async throws {
         var params: [String: Any] = ["target": agent.pane, "text": text]
         if let terminal = agent.terminal_id { params["terminal_id"] = terminal }
@@ -590,12 +591,39 @@ final class AppStore {
                     code: error.code,
                     message: "This session was restarted on the host. Reopen it from the list.")
             case "agent_not_ready":
+                let terminalInputAvailable = [
+                    TerminalInput.typeLiteral(""),
+                    .pasteText(""),
+                    .submitText(""),
+                ].contains { canSend($0, to: agent) }
                 throw PilusError(
                     code: error.code,
-                    message: error.message + " Hold the send button to type it into the terminal anyway.")
+                    message: error.message + (terminalInputAvailable
+                        ? " Hold the send button to type it into the terminal anyway."
+                        : ""))
             default:
                 throw error
             }
+        }
+    }
+
+    /// Type one scalar at a time through `agent.keys`, then submit the reply.
+    func answer(agent: Agent, text: String) async throws {
+        guard supports("agent.keys", on: agent.machine) else {
+            throw PilusError(
+                code: "unsupported",
+                message: "This host's Luvus can't send keys to agents.")
+        }
+        var keys = text.unicodeScalars.map { scalar in
+            CharacterSet.controlCharacters.contains(scalar) ? " " : String(scalar)
+        }
+        keys.append("enter")
+        for start in stride(from: 0, to: keys.count, by: 400) {
+            let end = min(start + 400, keys.count)
+            let _: EmptyReply = try await call(
+                method: "agent.keys",
+                params: ["target": agent.pane, "keys": Array(keys[start..<end])],
+                machine: agent.machine)
         }
     }
 
@@ -716,8 +744,9 @@ final class AppStore {
         return fresh
     }
 
-    /// `hub.run`: open (or reuse) a workspace, start the agent there, prompt
-    /// it — one audited request on the connector. Operate-level only.
+    /// `hub.run`: open the workspace, start a new agent in a new tab, and
+    /// queue its prompt after startup — one audited request on the connector.
+    /// Operate-level only.
     ///
     /// The request carries an `idempotency_key`. If the reply is lost, tapping
     /// again sends the same key and the host answers with the first outcome

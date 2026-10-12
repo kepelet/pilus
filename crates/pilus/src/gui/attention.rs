@@ -73,6 +73,23 @@ impl Watch {
         self.seen.insert(endpoint.to_string(), current);
     }
 
+    /// Forget every endpoint, as when the window moves to another session.
+    ///
+    /// Pane ids restart in every daemon, so the old statuses would answer for
+    /// the new panes. Banners still up for the old panes are cleared, and the
+    /// next snapshot seeds again instead of alerting on what is already blocked.
+    pub(super) fn forget_all(&mut self) {
+        self.seeded.clear();
+        for (endpoint, panes) in std::mem::take(&mut self.seen) {
+            for (pane, status) in panes {
+                if status == "blocked" {
+                    self.events
+                        .push(Event::Cleared(format!("pilus-blocked-{endpoint}-{pane}")));
+                }
+            }
+        }
+    }
+
     /// Take the transitions queued since the last call.
     pub(super) fn drain(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
@@ -145,6 +162,22 @@ mod tests {
             watch.drain(),
             vec![Event::Cleared("pilus-blocked-local-1".to_string())]
         );
+    }
+
+    #[test]
+    fn forgetting_every_endpoint_clears_its_banners_and_seeds_again() {
+        let mut watch = Watch::default();
+        watch.observe("local", &[agent("1", "working")]);
+        watch.observe("local", &[agent("1", "blocked")]);
+        watch.drain();
+        watch.forget_all();
+        assert_eq!(
+            watch.drain(),
+            vec![Event::Cleared("pilus-blocked-local-1".to_string())]
+        );
+        // Another daemon's pane 1 is already blocked: old news, not an alert.
+        watch.observe("local", &[agent("1", "blocked")]);
+        assert!(watch.drain().is_empty());
     }
 
     #[test]

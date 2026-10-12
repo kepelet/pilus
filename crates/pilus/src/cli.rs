@@ -259,7 +259,7 @@ fn run_ui_shots(main: bool) -> Result<()> {
 /// the catalog the remote server projects.
 fn run_probe_machine(id: String) -> Result<()> {
     let root = pilus_client::config_dir();
-    let machine = pilus_client::list_machines(&root)
+    let machine = pilus_client::list_machines(&root, pilus_client::active_session().as_deref())
         .into_iter()
         .find(|machine| machine.id == id)
         .ok_or_else(|| anyhow::anyhow!("no saved machine `{id}`"))?;

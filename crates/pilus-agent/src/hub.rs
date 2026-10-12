@@ -1017,12 +1017,12 @@ impl Hub {
         {
             return cached.clone();
         }
-        let fresh =
-            tokio::task::spawn_blocking(
-                || pilus_client::list_machines(&pilus_client::config_dir()),
-            )
-            .await
-            .unwrap_or_default();
+        let session = self.session.clone();
+        let fresh = tokio::task::spawn_blocking(move || {
+            pilus_client::list_machines(&pilus_client::config_dir(), session.as_deref())
+        })
+        .await
+        .unwrap_or_default();
         *lock(&self.catalog) = Some((Instant::now(), fresh.clone()));
         fresh
     }

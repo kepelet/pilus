@@ -42,6 +42,7 @@ pub enum Command {
     FocusTab(u16),
     SwitchSession(String),
     NewSession,
+    RenameSession,
     FocusWorkspace(String),
     FocusAgent(String),
 }

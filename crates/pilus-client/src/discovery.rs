@@ -99,6 +99,21 @@ fn socket_path_for(session: Option<&str>, file_name: &str, role: &str) -> PathBu
     alias_for(logical, "luvus", role)
 }
 
+/// A `luvus` CLI invocation scoped to `session` under `root`.
+///
+/// Machine profiles are owner-local to a session, so a command that omits the
+/// session reads the default session's catalog. `$LUVUS_SESSION` is cleared
+/// for the same reason: a pilus launched from a pane would otherwise inherit
+/// a session the window has since left.
+pub fn luvus_command(binary: &Path, root: &Path, session: Option<&str>) -> std::process::Command {
+    let mut command = std::process::Command::new(binary);
+    if let Some(name) = session {
+        command.arg("--session").arg(name);
+    }
+    command.env(HOME_ENV, root).env_remove(SESSION_ENV);
+    command
+}
+
 /// Validate a session name the way the daemon does.
 pub fn validate_session(name: &str) -> Result<()> {
     if name == DEFAULT_SESSION {
@@ -360,6 +375,19 @@ mod tests {
         assert!(default.ends_with("luvus-client.sock"));
         let named = client_socket_path_for(Some("work"));
         assert!(named.to_string_lossy().contains("sessions/work"));
+    }
+
+    #[test]
+    fn luvus_command_scopes_to_the_session_and_drops_the_inherited_one() {
+        let named = luvus_command(Path::new("luvus"), Path::new("/root"), Some("work"));
+        let args: Vec<_> = named.get_args().collect();
+        assert_eq!(args, ["--session", "work"]);
+        let default = luvus_command(Path::new("luvus"), Path::new("/root"), None);
+        assert_eq!(default.get_args().count(), 0);
+        for command in [&named, &default] {
+            let session_env = command.get_envs().find(|(key, _)| *key == SESSION_ENV);
+            assert_eq!(session_env, Some((std::ffi::OsStr::new(SESSION_ENV), None)));
+        }
     }
 
     #[test]

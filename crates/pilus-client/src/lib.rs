@@ -59,7 +59,8 @@ pub use discovery::{
     HOME_ENV, PILUS_HOME_ENV, SessionInfo, active_session, api_socket_path_for,
     client_socket_path_for, client_socket_path_under, config_dir, current_uid, describe,
     generate_session_name, is_provisioning_cache, list_session_infos, list_sessions, luvus_binary,
-    pilus_config_dir, pilus_workspaces_dir, session_dir_for, split_client_socket, validate_session,
+    luvus_command, pilus_config_dir, pilus_workspaces_dir, session_dir_for, split_client_socket,
+    validate_session,
 };
 pub use entries::{create_entry, delete_entry, name_problem, parent_of, rename_entry};
 pub use error::{Error, Result};

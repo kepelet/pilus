@@ -266,22 +266,23 @@ pub fn is_behind(remote: &str, local: &str) -> bool {
 ///
 /// Probes run in parallel with an overall deadline; anything unanswered in
 /// time keeps `online: None`. The local machine always comes first: its
-/// control plane answers over the root's own socket.
-pub fn refresh_machines(root: &Path) -> Vec<MachineInfo> {
-    let mut machines = list_machines(root);
+/// control plane answers over `session`'s own socket.
+pub fn refresh_machines(root: &Path, session: Option<&str>) -> Vec<MachineInfo> {
+    let mut machines = list_machines(root, session);
     machines.insert(0, local_machine());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     let (tx, rx) = std::sync::mpsc::channel();
     for (index, machine) in machines.iter().enumerate() {
         let tx = tx.clone();
         let root = root.to_path_buf();
+        let session = session.map(str::to_string);
         let id = machine.id.clone();
         let local = index == 0;
         std::thread::spawn(move || {
             let (online, latency_ms, version) = if local {
-                probe_local(&root)
+                probe_local(&root, session.as_deref())
             } else {
-                probe_remote(&root, &id)
+                probe_remote(&root, session.as_deref(), &id)
             };
             tx.send((index, online, latency_ms, version)).ok();
         });
@@ -338,9 +339,12 @@ fn local_hostname() -> String {
         .unwrap_or_else(|| "this machine".to_string())
 }
 
-/// Time a control round trip on the root's own socket and read its version.
-fn probe_local(root: &Path) -> (bool, Option<u64>, Option<String>) {
-    let socket = root.join("luvus.sock");
+/// Time a control round trip on the session's own socket and read its version.
+fn probe_local(root: &Path, session: Option<&str>) -> (bool, Option<u64>, Option<String>) {
+    let socket = match session {
+        Some(name) => root.join("sessions").join(name).join("luvus.sock"),
+        None => root.join("luvus.sock"),
+    };
     let start = std::time::Instant::now();
     let ping = crate::control::ControlClient::connect(&socket)
         .and_then(|mut client| client.request("ping", serde_json::json!({})));
@@ -359,16 +363,19 @@ fn probe_local(root: &Path) -> (bool, Option<u64>, Option<String>) {
 }
 
 /// Time a bounded `machine status` probe over SSH and read its version.
-fn probe_remote(root: &Path, id: &str) -> (bool, Option<u64>, Option<String>) {
+fn probe_remote(
+    root: &Path,
+    session: Option<&str>,
+    id: &str,
+) -> (bool, Option<u64>, Option<String>) {
     let Some(binary) = crate::discovery::luvus_binary() else {
         return (false, None, None);
     };
     let start = std::time::Instant::now();
-    let output = std::process::Command::new(binary)
+    let output = crate::discovery::luvus_command(&binary, root, session)
         .arg("machine")
         .arg("status")
         .arg(id)
-        .env(crate::discovery::HOME_ENV, root)
         .output();
     let value = match output {
         Ok(output) if output.status.success() => {
@@ -396,18 +403,18 @@ fn probe_remote(root: &Path, id: &str) -> (bool, Option<u64>, Option<String>) {
     )
 }
 
-/// List machine profiles under `root` via the CLI, without probing.
+/// List `session`'s machine profiles under `root` via the CLI, without
+/// probing. `None` is the default session.
 ///
 /// Fast enough for first paint; [`refresh_machines`] adds reachability.
-pub fn list_machines(root: &Path) -> Vec<MachineInfo> {
+pub fn list_machines(root: &Path, session: Option<&str>) -> Vec<MachineInfo> {
     let Some(binary) = crate::discovery::luvus_binary() else {
         return Vec::new();
     };
-    let output = std::process::Command::new(binary)
+    let output = crate::discovery::luvus_command(&binary, root, session)
         .arg("machine")
         .arg("list")
         .arg("--json")
-        .env(crate::discovery::HOME_ENV, root)
         .output();
     let Ok(output) = output else {
         return Vec::new();

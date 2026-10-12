@@ -177,7 +177,9 @@ pub fn run() -> Result<()> {
         |window, cx| {
             cx.new(|cx| {
                 super::appearances::AppearancesView::new(
-                    pilus_client::api_socket_path_for(None::<&str>),
+                    pilus_client::ControlTransport::Socket(pilus_client::api_socket_path_for(
+                        None::<&str>,
+                    )),
                     pilus_client::config_dir(),
                     settings(),
                     window,
@@ -1325,6 +1327,7 @@ impl Render for GlyphGridView {
                 1.0,
                 0.0,
                 0.0,
+                true,
             ))
     }
 }

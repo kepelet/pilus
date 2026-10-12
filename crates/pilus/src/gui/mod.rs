@@ -4372,7 +4372,15 @@ impl PilusView {
             );
         }
         if self.settings_open {
-            return style::enter("pilus-page-settings", self.settings_page(cx)).into_any_element();
+            return style::enter(
+                "pilus-page-settings",
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .child(self.settings_page(cx)),
+            )
+            .into_any_element();
         }
         div()
             .flex_1()
@@ -5483,7 +5491,7 @@ impl PilusView {
         let theme = self.theme;
         // The relay only matters to the connector, so it appears with it.
         let relay = self.remote.on().then(|| {
-            style::section_card(theme).child(style::enter(
+            style::section_card_tab(theme, "IROH RELAY", self.section_font()).child(style::enter(
                 "pilus-settings-relay",
                 self.relay_section_block(cx),
             ))
@@ -5494,21 +5502,35 @@ impl PilusView {
             .as_ref()
             .filter(|_| self.remote.on())
             .map(|status| {
-                style::section_card(theme).child(style::enter(
-                    "pilus-settings-iroh-identity",
-                    self.iroh_identity_section_block(status, cx),
-                ))
+                style::section_card_tab(theme, "IROH IDENTITY", self.section_font()).child(
+                    style::enter(
+                        "pilus-settings-iroh-identity",
+                        self.iroh_identity_section_block(status, cx),
+                    ),
+                )
             });
         let body = div()
             .flex()
             .flex_col()
             .gap_6()
-            .child(style::section_card(theme).child(self.remote_access_section_block(cx)))
+            .child(
+                style::section_card_tab(theme, "REMOTE ACCESS", self.section_font())
+                    .child(self.remote_access_section_block(cx)),
+            )
             .children(identity)
             .children(relay)
-            .child(style::section_card(theme).child(self.machines_section_block(cx)))
-            .child(style::section_card(theme).child(self.about_pilus_section_block(cx)))
-            .child(style::section_card(theme).child(self.about_luvus_section_block(cx)));
+            .child(
+                style::section_card_tab(theme, "REMOTE MACHINES", self.section_font())
+                    .child(self.machines_section_block(cx)),
+            )
+            .child(
+                style::section_card_tab(theme, "ABOUT PILUS", self.section_font())
+                    .child(self.about_pilus_section_block(cx)),
+            )
+            .child(
+                style::section_card_tab(theme, "ABOUT LUVUS", self.section_font())
+                    .child(self.about_luvus_section_block(cx)),
+            );
         div()
             .flex()
             .flex_col()
@@ -5571,13 +5593,6 @@ impl PilusView {
                 .flex_col()
                 .gap_2()
                 .child(
-                    div().px_3().child(style::section_label(
-                        theme,
-                        "REMOTE ACCESS",
-                        self.section_font(),
-                    )),
-                )
-                .child(
                     div()
                         .px_3()
                         .text_size(px(self.footer_font()))
@@ -5598,31 +5613,24 @@ impl PilusView {
         } else {
             "Reach this machine, and every machine it manages, from your phone. Keeps running after pilus closes."
         };
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .child(style::section_label(
-                        theme,
-                        "REMOTE ACCESS",
-                        self.section_font(),
-                    ))
-                    .child(toggle),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .text_size(px(self.footer_font()))
-                    .text_color(theme.muted)
-                    .child(blurb),
-            );
+        let mut section = div().flex().flex_col().gap_2().child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .pb_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(self.footer_font()))
+                        .text_color(theme.muted)
+                        .child(blurb),
+                )
+                .child(toggle),
+        );
         if let Some(error) = &remote.error {
             section = section.child(
                 div()
@@ -5702,6 +5710,7 @@ impl PilusView {
                 .items_center()
                 .justify_between()
                 .gap_2()
+                .pb_2()
                 .child(
                     div()
                         .flex()
@@ -5754,7 +5763,7 @@ impl PilusView {
                             style::small_button(
                                 "pilus-restart-service",
                                 "Restart",
-                                style::ButtonKind::Ghost,
+                                style::ButtonKind::Secondary,
                                 theme,
                                 small,
                             )
@@ -5890,47 +5899,42 @@ impl PilusView {
                                         code.link.clone(),
                                         "pilus-copy-link",
                                         cx,
+                                    ))
+                                    // The level is part of the code, so changing it mints a new one.
+                                    .child(
+                                        style::checkbox(
+                                            "pilus-pairing-operate",
+                                            self.pairing_operate,
+                                            "Allow this device to start work (tasks, agents, workspaces)",
+                                            theme,
+                                            small,
+                                        )
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if this.remote.minting {
+                                                return;
+                                            }
+                                            this.pairing_operate = !this.pairing_operate;
+                                            connector::mint_code(if this.pairing_operate {
+                                                pilus_client::agent_service::DeviceLevel::Operate
+                                            } else {
+                                                pilus_client::agent_service::DeviceLevel::Control
+                                            });
+                                            cx.notify();
+                                        })),
+                                    )
+                                    .child(format!(
+                                        "Expires in {}:{:02}",
+                                        remaining / 60,
+                                        remaining % 60
                                     )),
                             ),
-                    )
-                    // The level is part of the code, so changing it mints a new one.
-                    .child(
-                        style::checkbox(
-                            "pilus-pairing-operate",
-                            self.pairing_operate,
-                            "Allow this device to start work (tasks, agents, workspaces)",
-                            theme,
-                            small,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if this.remote.minting {
-                                return;
-                            }
-                            this.pairing_operate = !this.pairing_operate;
-                            connector::mint_code(if this.pairing_operate {
-                                pilus_client::agent_service::DeviceLevel::Operate
-                            } else {
-                                pilus_client::agent_service::DeviceLevel::Control
-                            });
-                            cx.notify();
-                        })),
                     )
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(small))
-                                    .text_color(theme.muted)
-                                    .child(format!(
-                                        "Expires in {}:{:02}",
-                                        remaining / 60,
-                                        remaining % 60
-                                    )),
-                            )
+                            .justify_end()
                             .child(
                                 style::small_button(
                                     "pilus-pairing-done",
@@ -6011,7 +6015,7 @@ impl PilusView {
                 style::small_button(
                     SharedString::from(format!("pilus-revoke-{index}")),
                     "Unpair",
-                    style::ButtonKind::Ghost,
+                    style::ButtonKind::Secondary,
                     theme,
                     small,
                 )
@@ -6072,89 +6076,6 @@ impl PilusView {
             );
         }
         block = block.child(devices);
-        block.child(self.service_log_block(cx))
-    }
-
-    /// The service's recent log, behind a disclosure: where to look when
-    /// something is off, without a trip to the file system.
-    fn service_log_block(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let small = self.footer_font();
-        let remote = &self.remote;
-        let open = remote.log_open;
-        let toggle = div()
-            .id("pilus-remote-log-toggle")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .cursor_pointer()
-            .text_size(px(small))
-            .font_weight(FontWeight::BOLD)
-            .text_color(theme.muted)
-            .hover(|style| style.text_color(theme.panel_fg))
-            .child(style::chevron(
-                "pilus-remote-log-chevron",
-                open,
-                self.section_toggled.is_some_and(|(last, at)| {
-                    last == "remote-log" && at.elapsed() < SECTION_TURN_WINDOW
-                }),
-                12.0,
-                theme.muted,
-            ))
-            .child("SERVICE LOG")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.section_toggled = Some(("remote-log", Instant::now()));
-                connector::toggle_log();
-                cx.notify();
-            }));
-        let mut block = div().flex().flex_col().gap_1().child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .child(toggle)
-                .when(open && !remote.log.is_empty(), |row| {
-                    let text = remote.log.join("\n");
-                    row.child(
-                        style::small_button(
-                            "pilus-copy-log",
-                            "Copy",
-                            style::ButtonKind::Ghost,
-                            theme,
-                            small,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                            this.settings_status = "Copied the service log.".to_string();
-                            cx.notify();
-                        })),
-                    )
-                }),
-        );
-        if open {
-            let mut lines = div()
-                .flex()
-                .flex_col()
-                .px_3()
-                .py_2()
-                .radius_md()
-                .bg(theme.panel_dim)
-                .border_1()
-                .border_color(theme.border)
-                .overflow_hidden()
-                .font_family(style::mono_family(&self.shared_settings))
-                .text_size(px(small))
-                .text_color(theme.muted);
-            if remote.log.is_empty() {
-                lines = lines.child("Nothing logged yet.");
-            }
-            for line in &remote.log {
-                lines = lines.child(div().truncate().child(line.clone()));
-            }
-            block = block.child(style::enter("pilus-remote-log", lines));
-        }
         block
     }
 
@@ -6166,8 +6087,7 @@ impl PilusView {
         id: &'static str,
         cx: &mut Context<Self>,
     ) -> Div {
-        let shown = format!("{label}: {value}");
-        self.copy_shown(label, shown, value, id, cx)
+        self.copy_shown(label, Some(label), value, id, cx)
     }
 
     /// A muted read-only value with a Copy button beside it, for a row whose
@@ -6179,21 +6099,23 @@ impl PilusView {
         id: &'static str,
         cx: &mut Context<Self>,
     ) -> Div {
-        self.copy_shown(label, value.clone(), value, id, cx)
+        self.copy_shown(label, None, value, id, cx)
     }
 
-    /// `shown` beside a Copy button that puts `value` on the clipboard.
+    /// `value` in monospace, behind an optional `prefix:` in the chrome font,
+    /// beside a Copy button that puts `value` on the clipboard.
     fn copy_shown(
         &self,
         label: &'static str,
-        shown: String,
+        prefix: Option<&'static str>,
         value: String,
         id: &'static str,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = self.theme;
         let size = self.section_font();
-        let button = style::small_button(id, "Copy", style::ButtonKind::Ghost, theme, size)
+        let shown = value.clone();
+        let button = style::small_button(id, "Copy", style::ButtonKind::Secondary, theme, size)
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
                 this.settings_status = format!("Copied {label}.");
@@ -6211,7 +6133,12 @@ impl PilusView {
                     .truncate()
                     .text_size(px(size))
                     .text_color(theme.muted)
-                    .child(shown),
+                    .children(prefix.map(|prefix| format!("{prefix}: ")))
+                    .child(
+                        div()
+                            .font_family(style::mono_family(&self.shared_settings))
+                            .child(shown),
+                    ),
             )
             .child(button)
     }
@@ -6244,13 +6171,8 @@ impl PilusView {
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_between()
+                .justify_end()
                 .px_3()
-                .child(style::section_label(
-                    theme,
-                    "REMOTE MACHINES",
-                    self.section_font(),
-                ))
                 .child(
                     style::small_button(
                         "pilus-machines-add",
@@ -6679,93 +6601,80 @@ impl PilusView {
                 .child(text)
         };
 
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(style::section_label(theme, "ABOUT PILUS", self.section_font()).px_3())
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .mx_3()
-                    .px_3()
-                    .py_3()
-                    .radius_md()
-                    .bg(theme.panel)
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(
+        div().flex().flex_col().gap_3().child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .px_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(label("Update channel"))
+                        .child(
+                            style::segmented(theme)
+                                .child(self.update_channel_segment(UpdateChannel::Stable, cx))
+                                .child(self.update_channel_segment(UpdateChannel::Preview, cx)),
+                        ),
+                )
+                .when(preview, |card| {
+                    card.child(style::enter(
+                        "pilus-update-feed-override",
                         div()
                             .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .child(label("Update channel"))
-                            .child(
-                                style::segmented(theme)
-                                    .child(self.update_channel_segment(UpdateChannel::Stable, cx))
-                                    .child(self.update_channel_segment(UpdateChannel::Preview, cx)),
-                            ),
-                    )
-                    .when(preview, |card| {
-                        card.child(style::enter(
-                            "pilus-update-feed-override",
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(label("Feed URL override"))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(field)
-                                        .child(feed_action),
-                                ),
-                        ))
-                    })
-                    .child(checkbox)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
+                            .flex_col()
+                            .gap_1()
+                            .child(label("Feed URL override"))
                             .child(
                                 div()
                                     .flex()
                                     .flex_row()
                                     .items_center()
                                     .gap_2()
-                                    .text_size(px(self.section_font()))
-                                    .child(div().text_color(theme.muted).child("Version"))
-                                    .child(
-                                        div()
-                                            .text_color(theme.fg)
-                                            .child(crate::update::current_version().to_string()),
-                                    ),
-                            )
-                            .child(
-                                style::small_button(
-                                    "pilus-update-check-now",
-                                    "Check for Updates",
-                                    style::ButtonKind::Secondary,
-                                    theme,
-                                    self.section_font(),
-                                )
-                                .flex_shrink_0()
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.check_for_updates(cx);
-                                    },
-                                )),
+                                    .child(field)
+                                    .child(feed_action),
                             ),
-                    ),
-            )
+                    ))
+                })
+                .child(checkbox)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_size(px(self.section_font()))
+                                .child(div().text_color(theme.muted).child("Version"))
+                                .child(
+                                    div()
+                                        .text_color(theme.fg)
+                                        .child(crate::update::current_version().to_string()),
+                                ),
+                        )
+                        .child(
+                            style::small_button(
+                                "pilus-update-check-now",
+                                "Check for Updates",
+                                style::ButtonKind::Secondary,
+                                theme,
+                                self.section_font(),
+                            )
+                            .flex_shrink_0()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.check_for_updates(cx);
+                            })),
+                        ),
+                ),
+        )
     }
 
     /// The ABOUT LUVUS section: the installed daemon version, a release check,
@@ -6780,7 +6689,7 @@ impl PilusView {
         let mut check_daemon = style::small_button(
             "pilus-check-daemon",
             "Check for Updates",
-            style::ButtonKind::Ghost,
+            style::ButtonKind::Secondary,
             theme,
             self.section_font(),
         )
@@ -6813,7 +6722,7 @@ impl PilusView {
             } else {
                 "Restart Luvus"
             },
-            style::ButtonKind::Ghost,
+            style::ButtonKind::Secondary,
             theme,
             self.section_font(),
         )
@@ -6849,68 +6758,57 @@ impl PilusView {
         let version = installed.unwrap_or_else(|| "not found".to_string());
         let update_available = self.daemon_latest.clone();
 
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(style::section_label(theme, "ABOUT LUVUS", self.section_font()).px_3())
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .mx_3()
-                    .px_3()
-                    .py_3()
-                    .radius_md()
-                    .bg(theme.panel)
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(self.section_font()))
-                                    .text_color(theme.muted)
-                                    .child("Version"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_size(px(self.section_font()))
-                                    .child(div().text_color(theme.fg).child(version))
-                                    .children(update_available.as_ref().map(|latest| {
-                                        div()
-                                            .text_color(theme.accent)
-                                            .child(format!("{latest} available"))
-                                    })),
-                            ),
-                    )
-                    .children((!daemon_status.is_empty()).then(|| {
-                        div()
-                            .text_size(px(self.footer_font()))
-                            .text_color(theme.muted)
-                            .child(daemon_status)
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .child(restart_daemon)
-                            .child(check_daemon)
-                            .when(update_available.is_some(), |row| row.child(update_daemon)),
-                    ),
-            )
+        div().flex().flex_col().gap_3().child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .px_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(self.section_font()))
+                                .text_color(theme.muted)
+                                .child("Version"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_size(px(self.section_font()))
+                                .child(div().text_color(theme.fg).child(version))
+                                .children(update_available.as_ref().map(|latest| {
+                                    div()
+                                        .text_color(theme.accent)
+                                        .child(format!("{latest} available"))
+                                })),
+                        ),
+                )
+                .children((!daemon_status.is_empty()).then(|| {
+                    div()
+                        .text_size(px(self.footer_font()))
+                        .text_color(theme.muted)
+                        .child(daemon_status)
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .child(restart_daemon)
+                        .child(check_daemon)
+                        .when(update_available.is_some(), |row| row.child(update_daemon)),
+                ),
+        )
     }
 
     /// The IROH IDENTITY section: who this machine is on the iroh network.
@@ -6955,30 +6853,15 @@ impl PilusView {
             &status.ticket,
             "pilus-copy-ticket",
         );
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(div().px_3().child(style::section_label(
-                theme,
-                "IROH IDENTITY",
-                self.section_font(),
-            )))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .mx_3()
-                    .px_3()
-                    .py_3()
-                    .radius_md()
-                    .bg(theme.panel)
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(endpoint)
-                    .child(ticket),
-            )
+        div().flex().flex_col().gap_3().child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .px_3()
+                .child(endpoint)
+                .child(ticket),
+        )
     }
 
     /// The IROH RELAY section: where the host connector dials out, and the project
@@ -6991,16 +6874,7 @@ impl PilusView {
         let url_value = relay.url.join(", ");
         let secret_set = relay.secret.is_some();
 
-        let mut section =
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(div().px_3().child(style::section_label(
-                    theme,
-                    "IROH RELAY",
-                    self.section_font(),
-                )));
+        let mut section = div().flex().flex_col().gap_3();
         let url_row = self.relay_field_row(
             RelayField::Url,
             "Relay URLs",
@@ -7019,13 +6893,7 @@ impl PilusView {
             .flex()
             .flex_col()
             .gap_3()
-            .mx_3()
             .px_3()
-            .py_3()
-            .radius_md()
-            .bg(theme.panel)
-            .border_1()
-            .border_color(theme.border)
             .child(url_row)
             .child(secret_row)
             .child(

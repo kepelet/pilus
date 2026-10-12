@@ -233,6 +233,31 @@ pub(super) fn section_card(theme: Theme) -> Div {
         .border_color(theme.border)
 }
 
+/// A section card with its title on a folder tab: the tab rises from the
+/// card's top-left edge in the card's own fill. Its bottom border lies on the
+/// card's top border, so the card's outline runs unbroken beneath the tab.
+pub(super) fn section_card_tab(theme: Theme, title: &'static str, size: f32) -> Div {
+    let height = size + 14.0;
+    section_card(theme).relative().mt(px(height)).child(
+        div()
+            .absolute()
+            .top(px(-height))
+            .left(px(12.0))
+            .h(px(height))
+            .flex()
+            .items_center()
+            .px_3()
+            .rounded_t_md()
+            .bg(theme.panel_dim)
+            .border_1()
+            .border_color(theme.border)
+            .text_size(px(size))
+            .font_weight(FontWeight::BOLD)
+            .text_color(theme.muted)
+            .child(title),
+    )
+}
+
 /// A small outlined tag for a value that qualifies a row: a dependency, a
 /// path glob, a mode. It sits in a list row or a property cell and never
 /// takes a click of its own.

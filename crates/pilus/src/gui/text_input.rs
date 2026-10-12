@@ -1319,16 +1319,20 @@ impl Render for TextInput {
                                 let x = piece
                                     .layout
                                     .x_for_index(head.saturating_sub(piece.byte_start));
-                                window.paint_quad(fill(
-                                    Bounds {
-                                        origin: point(
-                                            bounds.origin.x + x,
-                                            bounds.origin.y + px(line_height.as_f32() * row as f32),
-                                        ),
-                                        size: size(px(CARET_WIDTH), line_height),
-                                    },
-                                    accent,
-                                ));
+                                window.paint_quad(
+                                    fill(
+                                        Bounds {
+                                            origin: point(
+                                                bounds.origin.x + x,
+                                                bounds.origin.y
+                                                    + px(line_height.as_f32() * row as f32),
+                                            ),
+                                            size: size(px(CARET_WIDTH), line_height),
+                                        },
+                                        accent,
+                                    )
+                                    .corner_radii(px(2.0)),
+                                );
                             }
                         }
 

@@ -186,21 +186,6 @@ pub fn retry_luvus() {
     });
 }
 
-/// Show or hide the service log.
-pub fn toggle_log() {
-    let open = {
-        let mut shared = lock();
-        shared.view.log_open = !shared.view.log_open;
-        if !shared.view.log_open {
-            shared.view.log.clear();
-        }
-        shared.view.log_open
-    };
-    if open {
-        thread::spawn(refresh_log);
-    }
-}
-
 fn refresh_log() {
     let lines = agent_service::log_tail(LOG_LINES);
     let mut shared = lock();

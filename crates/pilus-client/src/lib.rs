@@ -48,8 +48,8 @@ pub use connection::{ClientEvent, Connection, EndpointIdentity};
 pub use connector::agent_binary;
 pub use control::{
     Agent, AgentFeed, AgentSession, Appearance, AutomationSummary, BarSegment, BarWidget,
-    ControlClient, FeedScope, FeedUpdate, PaneFrame, Tab, TaskAction, TaskSummary, ThemeInfo,
-    WorktreeInfo, worktree_blockers,
+    ControlClient, ControlTransport, FeedScope, FeedUpdate, PaneFrame, Tab, TaskAction,
+    TaskSummary, ThemeInfo, WorktreeInfo, worktree_blockers,
 };
 pub use diff::{
     DiffFile, DiffHunk, DiffLayer, DiffLine, DiffLineKind, DiffNote, DiffSnapshot, FileDiff,

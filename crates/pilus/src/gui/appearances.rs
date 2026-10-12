@@ -15,7 +15,7 @@ use gpui::{
     Window, WindowBounds, WindowOptions, anchored, canvas, deferred, div, point, prelude::*, px,
     size, svg,
 };
-use pilus_client::{Appearance, ControlClient, ThemeInfo};
+use pilus_client::{Appearance, ControlClient, ControlTransport, ThemeInfo};
 
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::theme::Theme;
@@ -54,7 +54,8 @@ impl FontField {
 
 /// The Appearances window root view.
 pub struct AppearancesView {
-    api_socket: PathBuf,
+    /// The daemon whose themes are listed and selected: the active endpoint's.
+    transport: ControlTransport,
     config_root: PathBuf,
     shared_settings: Rc<RefCell<Settings>>,
     settings: Settings,
@@ -76,9 +77,9 @@ pub struct AppearancesView {
 }
 
 impl AppearancesView {
-    /// Build the view against the daemon's control socket.
+    /// Build the view against a daemon's control surface.
     pub fn new(
-        api_socket: PathBuf,
+        transport: ControlTransport,
         config_root: PathBuf,
         shared_settings: Rc<RefCell<Settings>>,
         window: &mut Window,
@@ -104,7 +105,7 @@ impl AppearancesView {
         }
 
         let view = Self {
-            api_socket,
+            transport,
             config_root,
             shared_settings,
             settings,
@@ -161,13 +162,11 @@ impl AppearancesView {
         while let Ok(id) = self.select_rx.try_recv() {
             self.refreshing = true;
             self.last_poll = Instant::now();
-            let api = self.api_socket.clone();
+            let transport = self.transport.clone();
             let tx = self.tx.clone();
             std::thread::spawn(move || {
-                let result = ControlClient::connect(&api).and_then(|mut client| {
-                    client.select_theme(&id)?;
-                    client.appearance()
-                });
+                let mut client = ControlClient::from_transport(transport);
+                let result = client.select_theme(&id).and_then(|()| client.appearance());
                 tx.send(result).ok();
             });
         }
@@ -175,11 +174,10 @@ impl AppearancesView {
         if !self.refreshing && self.last_poll.elapsed() >= Duration::from_secs(1) {
             self.refreshing = true;
             self.last_poll = Instant::now();
-            let api = self.api_socket.clone();
+            let transport = self.transport.clone();
             let tx = self.tx.clone();
             std::thread::spawn(move || {
-                let result =
-                    ControlClient::connect(&api).and_then(|mut client| client.appearance());
+                let result = ControlClient::from_transport(transport).appearance();
                 tx.send(result).ok();
             });
         }
@@ -736,12 +734,33 @@ impl AppearancesView {
             this.settings.local_terminal_top_spacing = !this.settings.local_terminal_top_spacing;
             this.publish(cx);
         }));
+        let pane_ui = style::checkbox(
+            "pilus-pane-ui",
+            self.settings.pane_ui,
+            "Use pilus pane UI",
+            self.theme,
+            size,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.settings.pane_ui = !this.settings.pane_ui;
+            this.publish(cx);
+        }));
         div()
             .flex()
             .flex_col()
             .gap_2()
             .px_3()
             .py_1()
+            .child(pane_ui)
+            .child(
+                div()
+                    .text_size(px(self.fonts().label))
+                    .text_color(self.theme.muted)
+                    .child(
+                        "Draw split panes with rounded frames instead of \
+                         the daemon's square borders",
+                    ),
+            )
             .child(remote)
             .child(local)
             .child(
@@ -984,9 +1003,9 @@ impl Render for AppearancesView {
     }
 }
 
-/// Open the Appearances window on the daemon's control socket.
+/// Open the Appearances window on a daemon's control surface.
 pub fn open(
-    api_socket: PathBuf,
+    transport: ControlTransport,
     shared_settings: Rc<RefCell<Settings>>,
     config_root: PathBuf,
     cx: &mut App,
@@ -1007,7 +1026,7 @@ pub fn open(
         },
         move |window, cx| {
             cx.new(move |cx| {
-                AppearancesView::new(api_socket, config_root, shared_settings, window, cx)
+                AppearancesView::new(transport, config_root, shared_settings, window, cx)
             })
         },
     );

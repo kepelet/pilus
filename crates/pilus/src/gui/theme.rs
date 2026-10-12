@@ -63,6 +63,10 @@ pub struct Theme {
     pub border: Rgba,
     /// The edge of whatever holds focus: a focused field, panel, or card.
     pub border_focus: Rgba,
+    /// A color the daemon paints blank cells with, to draw as `bg` instead.
+    /// Set only on the terminal grid's copy of the theme, when pane frames
+    /// replace the daemon's own surface; `None` draws cells as sent.
+    pub remap_bg: Option<Rgba>,
     /// Accent for the connection indicator and links.
     pub accent: Rgba,
     /// Branch names in the sidebar.
@@ -97,6 +101,7 @@ impl Default for Theme {
             composer_footer: rgb(0x181818),
             border: soften(rgb(0x26262e)),
             border_focus: rgb(0x8c8c96),
+            remap_bg: None,
             accent: rgb(0x7aa2f7),
             branch: rgb(0xbb9af7),
             muted: rgb(0x8e8e9e),
@@ -126,6 +131,7 @@ impl Theme {
             composer_footer: p.surface0,
             border: soften(p.border),
             border_focus: p.border_focus,
+            remap_bg: None,
             accent: p.accent,
             branch: p.green,
             muted: p.subtext0,
@@ -163,6 +169,21 @@ impl Theme {
             g: self.window_bg.g * shade,
             b: self.window_bg.b * shade,
             a: glass + (1.0 - glass) * CHROME_DENSITY,
+        }
+    }
+
+    /// The color a terminal cell paints to read as the sidebar and top bar:
+    /// [`Self::chrome_glass`] spread over the cell's own `glass` coat, so the
+    /// two layers land on the chrome's opacity.
+    pub fn chrome_cell(self, glass: f32) -> Rgba {
+        let chrome = self.chrome_glass(glass);
+        Rgba {
+            a: if glass > 0.0 {
+                (chrome.a / glass).min(1.0)
+            } else {
+                chrome.a
+            },
+            ..chrome
         }
     }
 
@@ -206,6 +227,7 @@ impl Theme {
             // The projection carries one border; its brighter role stands in
             // for the focus edge, as it does for `border` itself.
             border_focus: c(chrome.border, base.border_focus),
+            remap_bg: None,
             accent: c(chrome.accent, base.accent),
             branch: base.branch,
             muted: c(chrome.subtext0, base.muted),

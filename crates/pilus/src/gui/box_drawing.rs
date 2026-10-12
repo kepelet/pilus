@@ -47,6 +47,39 @@ pub(super) fn box_char(symbol: &str) -> Option<char> {
     (chars.next().is_none() && matches!(c, '\u{2500}'..='\u{257f}')).then_some(c)
 }
 
+/// Which sides of its cell a solid box-drawing glyph reaches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Arms {
+    pub up: bool,
+    pub right: bool,
+    pub down: bool,
+    pub left: bool,
+}
+
+/// The sides `c` connects to, or `None` for a glyph that is not built from
+/// arms (dashes, diagonals) and so cannot continue a line. Weight is ignored:
+/// a heavy or double stroke reaches the same sides as a light one.
+pub(super) fn arms(c: char) -> Option<Arms> {
+    let index = (c as u32).checked_sub(0x2500).filter(|i| *i < 0x80)?;
+    let packed = match c {
+        // Arcs are not in `ARMS`; they connect like the square corners.
+        '\u{256d}' => 0x14,
+        '\u{256e}' => 0x05,
+        '\u{256f}' => 0x41,
+        '\u{2570}' => 0x50,
+        _ => ARMS[index as usize],
+    };
+    (packed != 0).then(|| {
+        let reaches = |shift: u8| (packed >> shift) & 0b11 != 0;
+        Arms {
+            up: reaches(6),
+            right: reaches(4),
+            down: reaches(2),
+            left: reaches(0),
+        }
+    })
+}
+
 /// The light stroke width for a terminal font size; heavy is twice this and a
 /// double line is two light strokes a light width apart. Whole pixels keep the
 /// edges crisp, and the width grows with the font as the glyph strokes would.
@@ -445,6 +478,18 @@ mod tests {
         assert_eq!(rects('┄').len(), 3);
         assert_eq!(rects('┊').len(), 4);
         assert_eq!(rects('╌').len(), 2);
+    }
+
+    #[test]
+    fn arms_name_the_sides_a_glyph_reaches() {
+        let arms = |c| arms(c).map(|a| (a.up, a.right, a.down, a.left));
+        assert_eq!(arms('\u{2502}'), Some((true, false, true, false)));
+        assert_eq!(arms('\u{251c}'), Some((true, true, true, false)));
+        assert_eq!(arms('\u{2550}'), Some((false, true, false, true)));
+        assert_eq!(arms('\u{256d}'), Some((false, true, true, false)));
+        assert_eq!(arms('\u{256f}'), Some((true, false, false, true)));
+        assert_eq!(arms('\u{2504}'), None);
+        assert_eq!(arms('x'), None);
     }
 
     #[test]

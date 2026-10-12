@@ -100,6 +100,9 @@ pub struct Settings {
     /// The same choice for the local daemon. Off by default: the Luvus
     /// installed alongside pilus still draws its title row.
     pub local_terminal_top_spacing: bool,
+    /// Draw split panes with pilus's own rounded frames in place of
+    /// the daemon's square box-drawing borders. Off keeps the daemon's.
+    pub pane_ui: bool,
     /// Whether the right sidebar (Changes and History tabs) is open.
     pub right_sidebar_visible: bool,
     /// The right sidebar's width in logical pixels; 0 takes the default.
@@ -148,6 +151,7 @@ impl Default for Settings {
             sidebar_agent_paths: false,
             terminal_top_spacing: true,
             local_terminal_top_spacing: false,
+            pane_ui: true,
             right_sidebar_visible: false,
             right_sidebar_width: 0.0,
             right_sidebar_tab: String::new(),
@@ -280,6 +284,7 @@ mod tests {
             serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
         assert!(back.terminal_top_spacing);
         assert!(!back.local_terminal_top_spacing);
+        assert!(back.pane_ui);
     }
 
     #[test]
@@ -414,6 +419,7 @@ mod tests {
             sidebar_agent_paths: true,
             terminal_top_spacing: false,
             local_terminal_top_spacing: true,
+            pane_ui: false,
             right_sidebar_visible: true,
             right_sidebar_width: 480.0,
             right_sidebar_tab: "git".to_string(),

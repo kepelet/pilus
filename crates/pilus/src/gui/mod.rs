@@ -29,6 +29,7 @@ mod mission;
 mod orchestration;
 mod page_split;
 mod palette;
+mod pane_frames;
 mod perf;
 mod picker;
 mod ports_tab;
@@ -89,11 +90,11 @@ use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use pilus_client::{
     Agent, AgentConfig, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent,
-    ConnectTarget, Connection, ControlClient, HOME_ENV, MachineInfo, SessionInfo, SshTarget,
-    Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary, common_git_dirs_remote,
-    config_dir, connect_machine, expand_local, expand_remote, generate_session_name, is_behind,
-    list_machines, list_session_infos, luvus_binary, pilus_config_dir, refresh_machines,
-    split_client_socket,
+    ConnectTarget, Connection, ControlClient, ControlTransport, HOME_ENV, MachineInfo, SessionInfo,
+    SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary,
+    common_git_dirs_remote, config_dir, connect_machine, expand_local, expand_remote,
+    generate_session_name, is_behind, list_machines, list_session_infos, luvus_binary,
+    pilus_config_dir, refresh_machines, split_client_socket,
 };
 use pilus_protocol::{
     CellData, ClientMessage, FrameData, ShellDockRect, ShellSidebars, ShellWorkspace,
@@ -414,12 +415,12 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             let root = pilus_root.clone();
             move |_: &OpenAppearances, cx: &mut App| {
                 // The frontmost window may have left the session this process
-                // launched in, and appearance belongs to the session's daemon.
-                let api = frontmost_window(cx)
+                // launched in, and appearance belongs to the daemon the window shows.
+                let transport = frontmost_window(cx)
                     .and_then(|handle| handle.downcast::<PilusView>())
-                    .and_then(|handle| handle.read(cx).ok().map(PilusView::api_socket))
-                    .unwrap_or_else(|| api.clone());
-                appearances::open(api, settings.clone(), root.clone(), cx)
+                    .and_then(|handle| handle.read(cx).ok().map(PilusView::control_transport))
+                    .unwrap_or_else(|| ControlTransport::Socket(api.clone()));
+                appearances::open(transport, settings.clone(), root.clone(), cx)
             }
         });
         cx.on_action(|_: &QuitApp, cx: &mut App| {
@@ -1354,12 +1355,14 @@ struct PilusView {
     appearance: Appearance,
     /// Last theme poll; the registry only changes on user action.
     last_theme_poll: Instant,
+    /// The endpoint `appearance` was last polled for.
+    theme_endpoint: EndpointId,
     /// A theme refresh is running off-thread; no overlapping spawns.
     theme_refreshing: bool,
     /// Fresh appearance snapshots from the background refresh.
-    theme_rx: Receiver<pilus_client::Result<Appearance>>,
+    theme_rx: Receiver<(EndpointId, pilus_client::Result<Appearance>)>,
     /// Sender half for the background theme refresh.
-    theme_tx: Sender<pilus_client::Result<Appearance>>,
+    theme_tx: Sender<(EndpointId, pilus_client::Result<Appearance>)>,
     /// Optimistic nav pick: the row a click chose, before the daemon confirms.
     nav_sel: Option<NavKind>,
     /// When the optimistic pick was made, so stale picks age out.
@@ -1858,6 +1861,7 @@ impl PilusView {
             pairing_second: 0,
             appearance: Appearance::default(),
             last_theme_poll: Instant::now() - Duration::from_secs(11),
+            theme_endpoint: EndpointId::Local,
             theme_refreshing: false,
             theme_rx,
             theme_tx,
@@ -2297,20 +2301,35 @@ impl PilusView {
         self.resolve_remote_homes();
         // The theme registry changes only when the user selects one, and the
         // selection can also come from another window or the CLI, so a slow
-        // poll keeps every pilus window on the same appearance.
-        if !self.theme_refreshing && self.last_theme_poll.elapsed() >= Duration::from_secs(2) {
+        // poll keeps every pilus window on the same appearance. It asks the
+        // daemon the window is showing: on a remote machine that is the
+        // machine's, not the local one's. A machine is polled less often, and
+        // moving to another endpoint polls it at once.
+        if self.theme_endpoint != self.active {
+            self.theme_endpoint = self.active.clone();
+            self.last_theme_poll = Instant::now() - THEME_POLL_REMOTE;
+        }
+        let theme_poll = match self.active {
+            EndpointId::Local => THEME_POLL_LOCAL,
+            EndpointId::Machine(_) => THEME_POLL_REMOTE,
+        };
+        if !self.theme_refreshing && self.last_theme_poll.elapsed() >= theme_poll {
             self.theme_refreshing = true;
             self.last_theme_poll = Instant::now();
-            let api = api_socket_for(&self.session_root, self.session_name.as_deref());
+            let endpoint = self.active.clone();
+            let transport = self.control_transport();
             let tx = self.theme_tx.clone();
             std::thread::spawn(move || {
-                let result =
-                    ControlClient::connect(&api).and_then(|mut client| client.appearance());
-                tx.send(result).ok();
+                let result = ControlClient::from_transport(transport).appearance();
+                tx.send((endpoint, result)).ok();
             });
         }
-        while let Ok(result) = self.theme_rx.try_recv() {
+        while let Ok((endpoint, result)) = self.theme_rx.try_recv() {
             self.theme_refreshing = false;
+            // A reply for an endpoint the window has since left is stale.
+            if endpoint != self.active {
+                continue;
+            }
             if let Ok(appearance) = result
                 && appearance != self.appearance
             {
@@ -7616,6 +7635,22 @@ impl PilusView {
         api_socket_for(&self.session_root, self.session_name.as_deref())
     }
 
+    /// How to reach the daemon the window is showing: the session's socket
+    /// locally, SSH to the machine otherwise. A machine with no SSH route
+    /// falls back to the local daemon rather than to nothing.
+    fn control_transport(&self) -> ControlTransport {
+        if let EndpointId::Machine(id) = &self.active
+            && let Some(target) = self
+                .machines
+                .iter()
+                .find(|machine| &machine.id == id)
+                .and_then(MachineInfo::ssh_target)
+        {
+            return ControlTransport::Ssh(target);
+        }
+        ControlTransport::Socket(self.api_socket())
+    }
+
     /// Attach to another session under the same state root.
     ///
     /// A failed attach keeps the old connection and reports why in the
@@ -12054,9 +12089,18 @@ impl Render for PilusView {
         // under the grid, the card, and the chrome, whatever the running app
         // paints. Voting the dominant cell color made the padding track the
         // app instead, so a green TUI left a green frame around an ink grid.
-        let terminal_bg = theme.window_bg;
+        // With pane frames the grid takes the chrome's own fill, and the cells
+        // the daemon paints in its base surface follow it, so the panes, the
+        // gaps between them, and the card read as the sidebar and top bar do.
+        let pane_ui = self.settings.pane_ui;
+        let terminal_bg = if pane_ui {
+            theme.chrome_cell(glass)
+        } else {
+            theme.window_bg
+        };
         let grid_theme = Theme {
             bg: terminal_bg,
+            remap_bg: pane_ui.then_some(theme.bg),
             ..theme
         };
         // One glass layer exactly: the grid has no padding and its edge
@@ -12111,6 +12155,7 @@ impl Render for PilusView {
                     glass,
                     layout.slack_x,
                     layout.slack_y,
+                    pane_ui,
                 )
             }),
             None => {
@@ -12367,6 +12412,11 @@ impl Render for PilusView {
     }
 }
 
+/// How often the window asks the local daemon which theme is selected.
+const THEME_POLL_LOCAL: Duration = Duration::from_secs(2);
+/// The same for a remote machine, whose every request crosses SSH.
+const THEME_POLL_REMOTE: Duration = Duration::from_secs(5);
+
 /// The tick loop's cadence for everything that has no arrival signal:
 /// tweens, toasts, reconnect backoff, and the other polled state.
 const TICK: Duration = Duration::from_millis(16);
@@ -12406,14 +12456,24 @@ fn render_grid(
     glass: f32,
     slack_x: f32,
     slack_y: f32,
+    pane_ui: bool,
 ) -> Div {
     let end_row = skip_rows
         .saturating_add(max_rows)
         .min(frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS));
-    let mut column = div().flex().flex_col().size_full();
+    let panes = if pane_ui {
+        pane_frames::PaneFrames::find(
+            frame,
+            frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS),
+        )
+    } else {
+        pane_frames::PaneFrames::default()
+    };
+    let mut column = div().relative().flex().flex_col().size_full();
     for row in skip_rows..end_row.max(skip_rows) {
         column = column.child(render_row(
             frame,
+            &panes,
             row,
             theme,
             font_size,
@@ -12445,13 +12505,73 @@ fn render_grid(
             glass,
         ));
     }
+    for pane in panes.panes() {
+        let focused = frame
+            .cursor
+            .is_some_and(|(cursor_column, cursor_row)| pane.holds(cursor_column, cursor_row));
+        column = column.child(pane_border(
+            pane,
+            focused,
+            theme,
+            line_height,
+            cell_width,
+            skip_cols,
+            skip_rows,
+        ));
+    }
     column
+}
+
+/// Thickness of a pane's frame in logical pixels.
+const PANE_BORDER_PX: f32 = 2.0;
+
+/// One pane's frame drawn natively over the grid, on the center lines of the
+/// daemon's border cells so it sits where the glyphs did. The corner radius
+/// follows the setting, and the pane holding the caret takes the focus edge.
+/// A top edge hidden behind the native tab strip is drawn at the grid's top.
+fn pane_border(
+    pane: &pane_frames::PaneFrame,
+    focused: bool,
+    theme: Theme,
+    line_height: Pixels,
+    cell_width: f32,
+    skip_cols: u16,
+    skip_rows: u16,
+) -> Div {
+    let height = f32::from(line_height);
+    let column_center = |column: u16| (f32::from(column) - f32::from(skip_cols) + 0.5) * cell_width;
+    let row_center = |row: u16| ((f32::from(row) - f32::from(skip_rows) + 0.5) * height).max(0.0);
+    // The stroke straddles the center line, so the box grows by half of it
+    // on every side.
+    let half = PANE_BORDER_PX / 2.0;
+    let (left, right) = (
+        column_center(pane.left).round() - half,
+        column_center(pane.right).round() + half,
+    );
+    let (top, bottom) = (
+        row_center(pane.top).round() - half,
+        row_center(pane.bottom).round() + half,
+    );
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .w(px(right - left))
+        .h(px(bottom - top))
+        .radius_md()
+        .border(px(PANE_BORDER_PX))
+        .border_color(if focused {
+            theme.border_focus
+        } else {
+            theme.border
+        })
 }
 
 /// Paint one grid row, skipping the dock columns our sidebar covers.
 #[allow(clippy::too_many_arguments)]
 fn render_row(
     frame: &FrameData,
+    panes: &pane_frames::PaneFrames,
     row: u16,
     theme: Theme,
     font_size: f32,
@@ -12539,6 +12659,11 @@ fn render_row(
             let column = f32::from(start_column.saturating_sub(skip_cols));
             let left = (column * cell_width).round();
             let right = ((column + 1.0) * cell_width).round();
+            // A pane's square daemon border is redrawn natively over the
+            // grid (`pane_border`), so its glyphs are not painted here.
+            if panes.is_border(start_column, row) {
+                continue;
+            }
             let color = fg;
             if let Some(strokes) =
                 box_drawing::strokes(c, left, right, f32::from(line_height), light_stroke)
@@ -13038,6 +13163,9 @@ fn style_of(
 ) -> (gpui::Rgba, gpui::Rgba, u16) {
     let mut fg = theme::resolve(cell.fg, theme.fg, &theme.ansi);
     let mut bg = theme::resolve(cell.bg, theme.bg, &theme.ansi);
+    if theme.remap_bg == Some(bg) {
+        bg = theme.bg;
+    }
     let mut mods = cell.mods;
     if cursor {
         // A caret block is the cell's declared foreground painted as the
@@ -14184,6 +14312,28 @@ mod tests {
         assert_eq!(
             style_of(&cell(M_REVERSED), theme, false, false),
             (theme.bg, theme.fg, 0)
+        );
+    }
+
+    #[test]
+    fn the_daemons_base_surface_draws_as_the_chrome_only_when_remapped() {
+        let theme = Theme::default();
+        let mut base = cell(0);
+        base.bg = (2 << 24) | 0x0011_1116; // `Theme::default().bg`, as the daemon sends it
+        let chrome = theme.window_bg;
+        let remapped = Theme {
+            bg: chrome,
+            remap_bg: Some(theme.bg),
+            ..theme
+        };
+        assert_eq!(style_of(&base, remapped, false, false).1, chrome);
+        assert_eq!(style_of(&base, theme, false, false).1, theme.bg);
+        let mut other = cell(0);
+        other.bg = (2 << 24) | 0x00ff_0000;
+        assert_eq!(
+            style_of(&other, remapped, false, false).1,
+            gpui::rgb(0xff0000),
+            "an app's own background is left alone"
         );
     }
 

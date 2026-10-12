@@ -2133,13 +2133,8 @@ impl Render for UiPlaygroundView {
                 self.section(
                     "SECTION CARD",
                     div().mx_neg_3().child(
-                        style::section_card(theme)
+                        style::section_card_tab(theme, "NOTIFICATIONS", self.fonts().label)
                             .gap_2()
-                            .child(div().px_3().child(style::section_label(
-                                theme,
-                                "NOTIFICATIONS",
-                                self.fonts().label,
-                            )))
                             .child(
                                 div()
                                     .px_3()

@@ -121,6 +121,10 @@ pub(super) trait RadiusExt: Styled + Sized {
         self.rounded(Radius::Full.pixels())
     }
 
+    fn radius_t_md(self) -> Self {
+        self.rounded_t(Radius::Md.pixels())
+    }
+
     fn radius_t_lg(self) -> Self {
         self.rounded_t(Radius::Lg.pixels())
     }
@@ -236,18 +240,21 @@ pub(super) fn section_card(theme: Theme) -> Div {
 /// A section card with its title on a folder tab: the tab rises from the
 /// card's top-left edge in the card's own fill. Its bottom border lies on the
 /// card's top border, so the card's outline runs unbroken beneath the tab.
+/// The tab's top corners and the card's follow the corner-radius setting, and
+/// the tab starts past the card's own top-left curve so the two never overlap.
 pub(super) fn section_card_tab(theme: Theme, title: &'static str, size: f32) -> Div {
     let height = size + 14.0;
+    let inset = Radius::Md.pixels().max(px(12.0));
     section_card(theme).relative().mt(px(height)).child(
         div()
             .absolute()
             .top(px(-height))
-            .left(px(12.0))
+            .left(inset)
             .h(px(height))
             .flex()
             .items_center()
             .px_3()
-            .rounded_t_md()
+            .radius_t_md()
             .bg(theme.panel_dim)
             .border_1()
             .border_color(theme.border)

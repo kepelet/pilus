@@ -5537,7 +5537,7 @@ impl PilusView {
             .size_full()
             .min_h(px(0.0))
             .child(
-                div().flex().flex_row().flex_shrink_0().px_4().pt_3().child(
+                div().flex().flex_row().flex_shrink_0().px_4().py_3().child(
                     style::small_button(
                         "pilus-settings-back",
                         "‹ Back",

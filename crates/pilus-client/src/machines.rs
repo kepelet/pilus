@@ -432,59 +432,6 @@ fn parse_machines(bytes: &[u8]) -> Vec<MachineInfo> {
     machines
 }
 
-/// Copy this build's connector onto `machine`, atomically and without starting
-/// it.
-///
-/// The agent is copied verbatim, so a remote platform that does not match this
-/// build is refused before any bytes move. The remote path mirrors the verified
-/// `luvus` binary's directory, so the two ship together. The binary lands under
-/// a temporary sibling and is renamed into place, so a half-copied agent is
-/// never executable. Install deliberately does not launch an unmanaged
-/// background process; the message tells the user what to run on the machine
-/// so the enrollment credentials it prints stay visible to them.
-pub fn install_agent(machine: &MachineInfo, agent: &Path) -> Result<String> {
-    let target = machine.ssh_target().ok_or_else(|| {
-        Error::Machine(format!(
-            "machine `{}` has no verified remote binary; run `luvus machine enable {}`",
-            machine.id, machine.id
-        ))
-    })?;
-    let remote = run_ssh(&target, "uname -sm")?;
-    let remote = remote.trim();
-    let local = local_uname();
-    if remote != local {
-        return Err(Error::Machine(format!(
-            "`{}` runs `{remote}`, this build is `{local}`; install a matching pilus-agent there",
-            machine.id
-        )));
-    }
-    let remote_dir = target
-        .binary
-        .rsplit_once('/')
-        .map(|(dir, _)| dir)
-        .unwrap_or(".");
-    let remote_path = format!("{remote_dir}/pilus-agent");
-    let remote_temp = format!("{remote_path}.tmp-{}", std::process::id());
-    copy_agent(agent, &machine.destination, &remote_temp)?;
-    run_ssh(&target, &install_command(&remote_temp, &remote_path))?;
-    Ok(format!(
-        "Installed pilus-agent on `{}` at `{remote_path}`. \
-         Run `{remote_path} serve --iroh --control` on that machine to start remote access.",
-        machine.id
-    ))
-}
-
-/// The remote command that marks a staged binary executable and renames it
-/// into place in one step.
-fn install_command(remote_temp: &str, remote_path: &str) -> String {
-    format!(
-        "chmod 755 {} && mv -f {} {}",
-        shell_quote(remote_temp),
-        shell_quote(remote_temp),
-        shell_quote(remote_path)
-    )
-}
-
 /// Run one shell command on the machine and return its stdout.
 fn run_ssh(target: &SshTarget, remote_command: &str) -> Result<String> {
     let output = target.shell(remote_command).output()?;
@@ -497,42 +444,6 @@ fn run_ssh(target: &SshTarget, remote_command: &str) -> Result<String> {
         }));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-/// Copy a local file to `destination:path` with the same batch SSH options.
-fn copy_agent(local: &Path, destination: &str, remote_path: &str) -> Result<()> {
-    let output = std::process::Command::new("scp")
-        .arg("-q")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(local)
-        .arg(format!("{destination}:{remote_path}"))
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(Error::Machine(if stderr.is_empty() {
-            format!("could not copy the agent to {destination}")
-        } else {
-            stderr
-        }));
-    }
-    Ok(())
-}
-
-/// The local `uname -s -m` equivalent, matching OpenSSH's remote output.
-fn local_uname() -> String {
-    let system = match std::env::consts::OS {
-        "macos" => "Darwin",
-        "linux" => "Linux",
-        other => other,
-    };
-    let machine = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        other => other,
-    };
-    format!("{system} {machine}")
 }
 
 /// Single-quote a path for the remote POSIX shell.
@@ -600,26 +511,5 @@ mod tests {
             "'/opt/my agent/pilus-agent'"
         );
         assert_eq!(shell_quote("/a'b"), "'/a'\\''b'");
-    }
-
-    #[test]
-    fn install_command_quotes_spaces_and_quotes() {
-        let command = install_command(
-            "/opt/my agent/pilus-agent.tmp-42",
-            "/opt/my agent's bin/pilus-agent",
-        );
-        assert_eq!(
-            command,
-            "chmod 755 '/opt/my agent/pilus-agent.tmp-42' \
-             && mv -f '/opt/my agent/pilus-agent.tmp-42' '/opt/my agent'\\''s bin/pilus-agent'"
-        );
-    }
-
-    #[test]
-    fn local_uname_looks_like_uname() {
-        let value = local_uname();
-        let (system, machine) = value.split_once(' ').expect("two fields");
-        assert!(!system.is_empty());
-        assert!(!machine.is_empty());
     }
 }

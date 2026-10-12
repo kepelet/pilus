@@ -38,8 +38,6 @@ pub enum Command {
     OpenSettings,
     OpenHome,
     OpenUiPlayground,
-    /// Open the native Pi Session panel for the active workspace.
-    OpenSession,
     Quit,
     FocusTab(u16),
     SwitchSession(String),

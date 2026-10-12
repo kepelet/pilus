@@ -45,18 +45,6 @@ pub enum Launch {
         /// Stable machine profile id.
         id: String,
     },
-    /// Open the main window with the native Pi Session panel on a cwd or file.
-    SessionUi {
-        /// A session `.jsonl` path, a session id (full or partial), or a cwd
-        /// whose latest session is shown.
-        spec: String,
-    },
-    /// Fold a Pi session and print its transcript, without opening a window.
-    ProbeSession {
-        /// A session `.jsonl` path, a session id (full or partial), or a cwd
-        /// whose latest session is shown.
-        spec: String,
-    },
     /// Play every notification cue once, so the audio path can be heard
     /// without waiting for an agent to block.
     TestSound,
@@ -82,8 +70,6 @@ pub fn run() -> Result<()> {
         Launch::Feed { target } => run_feed(target),
         Launch::CheckUpdates { channel, feed_url } => run_check_updates(channel, feed_url),
         Launch::ProbeMachine { id } => run_probe_machine(id),
-        Launch::SessionUi { spec } => run_session_ui(spec),
-        Launch::ProbeSession { spec } => run_probe_session(spec),
         Launch::TestSound => run_test_sound(),
         #[cfg(feature = "visual-test")]
         Launch::UiShots { main } => run_ui_shots(main),
@@ -99,8 +85,6 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
     let mut uhp = false;
     let mut feed = false;
     let mut check_updates = false;
-    let mut session_ui: Option<String> = None;
-    let mut probe_session: Option<String> = None;
     #[cfg(feature = "visual-test")]
     let (mut ui_shots, mut ui_shots_main) = (false, false);
     let mut machine_id = None;
@@ -141,12 +125,6 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
                 );
             }
             "--check-updates" => check_updates = true,
-            "--session-ui" => {
-                session_ui = Some(optional_value(&mut args).unwrap_or_else(|| ".".to_string()))
-            }
-            "--probe-session" => {
-                probe_session = Some(optional_value(&mut args).unwrap_or_else(|| ".".to_string()))
-            }
             "--test-sound" => return Ok(Launch::TestSound),
             #[cfg(feature = "visual-test")]
             "--ui-shots" => ui_shots = true,
@@ -183,12 +161,6 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
     if check_updates {
         return Ok(Launch::CheckUpdates { channel, feed_url });
     }
-    if let Some(spec) = session_ui {
-        return Ok(Launch::SessionUi { spec });
-    }
-    if let Some(spec) = probe_session {
-        return Ok(Launch::ProbeSession { spec });
-    }
     #[cfg(feature = "visual-test")]
     if ui_shots {
         return Ok(Launch::UiShots {
@@ -224,14 +196,6 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
     }
 }
 
-/// Consume the next argument when it is a value, not another flag.
-fn optional_value<I: Iterator<Item = String>>(args: &mut std::iter::Peekable<I>) -> Option<String> {
-    if args.peek().is_some_and(|arg| !arg.starts_with('-')) {
-        return args.next();
-    }
-    None
-}
-
 fn print_help() {
     println!(
         "pilus — native desktop client for a Luvus daemon\n\n\
@@ -245,8 +209,6 @@ fn print_help() {
          \x20   --probe-uhp      Stream one pane via UHP and print the screen\n\
          \x20   --probe-feed     Run the event-driven feed briefly and print it\n\
          \x20   --probe-machine ID  Attach to a saved machine over SSH and print it\n\
-         \x20   --session-ui [CWD|FILE|ID]  Open the main window on a Pi session\n\
-         \x20   --probe-session [CWD|FILE|ID]  Print a Pi session's transcript\n\
          \x20   --check-updates  Check the OTA release source and print it\n\
          \x20   --channel NAME   Channel for --check-updates (stable or preview)\n\
          \x20   --feed-url URL   Static release manifest for --check-updates\n\
@@ -335,99 +297,6 @@ fn run_probe_machine(id: String) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Open the native Pi Session window for a session file or cwd.
-#[cfg(feature = "gui")]
-fn run_session_ui(spec: String) -> Result<()> {
-    crate::gui::run_session(spec)
-}
-
-/// The session window is part of the gui feature.
-#[cfg(not(feature = "gui"))]
-fn run_session_ui(_spec: String) -> Result<()> {
-    bail!("--session-ui needs the gui feature")
-}
-
-/// Fold a Pi session and print its transcript.
-///
-/// The headless proof of the session reader: resolve the newest session for a
-/// cwd (or take an explicit file), tail it once, and print one line per item
-/// so the parse can be checked without a window.
-fn run_probe_session(spec: String) -> Result<()> {
-    let path = pilus_session::resolve(&spec)
-        .ok_or_else(|| anyhow::anyhow!("no pi session found for `{spec}`"))?;
-    let mut tail = pilus_session::Tail::open(&path)?;
-    tail.poll()?;
-    let transcript = tail.transcript();
-    let header = &transcript.header;
-    println!("session {} (version {})", header.id, header.version);
-    println!("cwd: {}", header.cwd);
-    if let Some(name) = &header.name {
-        println!("name: {name}");
-    }
-    if let Some(model) = &transcript.model {
-        println!("model: {model}");
-    }
-    println!(
-        "{} item(s), {} tokens, ${:.4}",
-        transcript.items.len(),
-        transcript.usage.total,
-        transcript.usage.cost
-    );
-    for item in &transcript.items {
-        let summary = match &item.kind {
-            pilus_session::ItemKind::User { text, images } => {
-                format!("you      {}{}", one_line(text), image_note(*images))
-            }
-            pilus_session::ItemKind::Assistant { text, .. } => {
-                format!("assistant {}", one_line(text))
-            }
-            pilus_session::ItemKind::Thinking { text } => {
-                format!("thinking  {}", one_line(text))
-            }
-            pilus_session::ItemKind::ToolCall { name, .. } => format!("tool      {name}"),
-            pilus_session::ItemKind::ToolResult {
-                name,
-                text,
-                is_error,
-                ..
-            } => format!(
-                "{} {name}  {}",
-                if *is_error { "error   " } else { "result  " },
-                one_line(text)
-            ),
-            pilus_session::ItemKind::Bash {
-                command, exit_code, ..
-            } => format!("bash      $ {command} (exit {})", exit_code.unwrap_or(-1)),
-            pilus_session::ItemKind::Note { title, text } => {
-                format!("note      {title}: {}", one_line(text))
-            }
-        };
-        println!("{summary}");
-    }
-    Ok(())
-}
-
-/// A single line of `text`, truncated for a terminal row.
-fn one_line(text: &str) -> String {
-    let first = text.lines().next().unwrap_or("").trim();
-    let mut chars = first.chars();
-    let head: String = chars.by_ref().take(120).collect();
-    if chars.next().is_some() {
-        format!("{head}…")
-    } else {
-        head.to_string()
-    }
-}
-
-/// ` (N images)` when a message carries images.
-fn image_note(images: usize) -> String {
-    if images == 0 {
-        String::new()
-    } else {
-        format!(" ({images} image(s))")
-    }
 }
 
 /// Stream one pane through UHP and print the parsed screen.
@@ -799,35 +668,6 @@ mod tests {
                 assert!(feed_url.is_none());
             }
             _ => panic!("expected CheckUpdates"),
-        }
-    }
-
-    #[test]
-    fn session_ui_spec_is_optional() {
-        match parse_args(&["--session-ui", "/tmp/app"]).expect("parse") {
-            Launch::SessionUi { spec } => assert_eq!(spec, "/tmp/app"),
-            _ => panic!("expected SessionUi"),
-        }
-        // A following flag is not eaten as the spec; the cwd is the default.
-        match parse_args(&["--session-ui"]).expect("parse") {
-            Launch::SessionUi { spec } => assert_eq!(spec, "."),
-            _ => panic!("expected SessionUi"),
-        }
-        match parse_args(&["--session-ui", "--probe-session"]).expect("parse") {
-            Launch::SessionUi { spec } => assert_eq!(spec, "."),
-            _ => panic!("expected SessionUi to win"),
-        }
-    }
-
-    #[test]
-    fn probe_session_spec_is_optional() {
-        match parse_args(&["--probe-session", "/tmp/app"]).expect("parse") {
-            Launch::ProbeSession { spec } => assert_eq!(spec, "/tmp/app"),
-            _ => panic!("expected ProbeSession"),
-        }
-        match parse_args(&["--probe-session"]).expect("parse") {
-            Launch::ProbeSession { spec } => assert_eq!(spec, "."),
-            _ => panic!("expected ProbeSession"),
         }
     }
 }

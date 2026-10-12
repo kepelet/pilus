@@ -88,9 +88,6 @@ pub struct Settings {
     /// Corner radius of controls, cards, and overlays, in logical pixels.
     /// Every rounded element scales from it, and zero squares them all.
     pub corner_radius: f32,
-    /// Replace a focused pi pane's terminal with the native conversation
-    /// view. On by default.
-    pub pi_gui_auto: bool,
     /// Whether WORKSPACES rows draw their path line. Off by default; the
     /// sidebar's Show Path row turns it on and persists the choice.
     pub sidebar_workspace_paths: bool,
@@ -140,7 +137,6 @@ impl Default for Settings {
             opacity: OPACITY,
             blur: BLUR,
             corner_radius: CORNER_RADIUS,
-            pi_gui_auto: true,
             sidebar_workspace_paths: false,
             sidebar_agent_paths: false,
             terminal_top_spacing: true,
@@ -324,7 +320,6 @@ mod tests {
             opacity: 0.7,
             blur: 0.5,
             corner_radius: 0.0,
-            pi_gui_auto: true,
             sidebar_workspace_paths: true,
             sidebar_agent_paths: true,
             terminal_top_spacing: false,

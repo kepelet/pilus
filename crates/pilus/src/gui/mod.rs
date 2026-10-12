@@ -29,13 +29,11 @@ mod mission;
 mod orchestration;
 mod page_split;
 mod palette;
-mod pi_extension;
 mod picker;
 mod ports_tab;
 mod right_sidebar;
 mod scheme;
 mod selection;
-mod session;
 mod session_ops;
 #[cfg(feature = "visual-test")]
 pub(crate) mod shots;
@@ -83,17 +81,18 @@ use gpui::{
 use gpui_platform::application;
 use gpui_updater_core::{Release, UpdateStatus, Version};
 use home::{HomeField, HomeFocus, HomePanel};
+use machines::MachineOp;
 use mission::MissionPanel;
 use page_split::{PageSplit, SplitAxis, page_extent};
 use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use pilus_client::{
     Agent, AgentConfig, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent,
-    ConnectTarget, Connection, ControlClient, HOME_ENV, MachineInfo, PaneFrame, SessionInfo,
-    SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary,
-    common_git_dirs_remote, config_dir, connect_machine, expand_local, expand_remote,
-    generate_session_name, install_agent, list_machines, list_session_infos, luvus_binary,
-    pilus_config_dir, refresh_machines, split_client_socket,
+    ConnectTarget, Connection, ControlClient, HOME_ENV, MachineInfo, SessionInfo, SshTarget,
+    Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary, common_git_dirs_remote,
+    config_dir, connect_machine, expand_local, expand_remote, generate_session_name, is_behind,
+    list_machines, list_session_infos, luvus_binary, pilus_config_dir, refresh_machines,
+    split_client_socket,
 };
 use pilus_protocol::{
     CellData, ClientMessage, FrameData, ShellDockRect, ShellSidebars, ShellWorkspace,
@@ -102,7 +101,6 @@ use pilus_protocol::{
 use ports_tab::PortsPanel;
 use right_sidebar::{RightSidebar, SidebarTab};
 use selection::{Cell, Selection};
-use session::SessionPanel;
 use session_ops::SessionVerb;
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
 use style::{FillExt, RadiusExt};
@@ -116,20 +114,12 @@ use updater::Updater;
 const LINE_HEIGHT_RATIO: f32 = 1.3;
 /// Height of our native tab strip; the grid starts below it.
 const TAB_STRIP_HEIGHT: f32 = 36.0;
-/// Metrics shared by composer picker chips and dropdowns (Home + session).
+/// Metrics shared by composer picker chips and dropdowns.
 const PICKER_CHIP_H: f32 = 24.0;
-/// Dropdown rows, gaps, and width: Home and session menus read as one.
+/// Dropdown rows and width.
 const PICKER_MENU_W: f32 = 260.0;
 const PICKER_MENU_MAX_H: f32 = 240.0;
 const PICKER_ROW_H: f32 = 30.0;
-/// A menu's own padding (`p_1`) and the gap between its rows (`gap_1`). The
-/// menus know their exact height from these, so an anchored overlay can
-/// offset by it and open without shifting the composer.
-const PICKER_PAD: f32 = 4.0;
-const PICKER_GAP: f32 = 4.0;
-/// A picker's type-to-filter field, drawn once a list outgrows the rows
-/// that fit.
-const PICKER_FIELD_H: f32 = 28.0;
 /// Grid offset from the window top: tab strip plus its top spacing.
 const HEADER_HEIGHT: f32 = 40.0;
 /// Daemon rows skipped at the top of the grid when it draws a title: its own
@@ -291,8 +281,8 @@ const M_REVERSED: u16 = 1 << 6;
 gpui::actions!([
     /// Open the native Appearances window.
     OpenAppearances,
-    /// Open the native remote-machine manager window.
-    OpenMachineManager,
+    /// Open the native Add Machine window.
+    OpenAddMachine,
     /// Quit the application.
     QuitApp,
     /// Copy the current grid selection.
@@ -382,19 +372,6 @@ pub(crate) struct MachineSignal {
 
 /// Open the desktop window and attach to `target`.
 pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
-    run_inner(target, None)
-}
-
-/// Launch the main window with the Pi Session panel already open for `spec`.
-///
-/// The CLI entry for `--session-ui`; the session is read inside the main
-/// window, never a separate one.
-pub fn run_session(spec: String) -> anyhow::Result<()> {
-    run_inner(ConnectTarget::local(), Some(spec))
-}
-
-/// Open the desktop window, optionally opening the Pi Session panel at launch.
-fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::Result<()> {
     // The window opens before the daemon is attached, so a stopped or
     // protocol-incompatible daemon cannot stop `pilus` from launching. The
     // view's local reconnect loop owns the first attach and every retry, and
@@ -449,7 +426,7 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
             let signal = machine_signal.clone();
             let theme = shared_theme.clone();
             let settings = settings.clone();
-            move |_: &OpenMachineManager, cx: &mut App| {
+            move |_: &OpenAddMachine, cx: &mut App| {
                 machines::open(
                     root.clone(),
                     signal.clone(),
@@ -503,7 +480,6 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
                     settings.clone(),
                     signal.clone(),
                     theme.clone(),
-                    None,
                     cx,
                 )
             }
@@ -601,18 +577,8 @@ fn run_inner(target: ConnectTarget, initial_session: Option<String>) -> anyhow::
             move |window, cx| {
                 let signal = machine_signal.clone();
                 let theme = shared_theme.clone();
-                let initial_session = initial_session.clone();
                 cx.new(move |cx| {
-                    PilusView::new(
-                        target,
-                        None,
-                        settings.clone(),
-                        signal,
-                        theme,
-                        initial_session,
-                        window,
-                        cx,
-                    )
+                    PilusView::new(target, None, settings.clone(), signal, theme, window, cx)
                 })
             },
         );
@@ -766,7 +732,6 @@ fn open_main_window(
     settings: Rc<RefCell<Settings>>,
     machine_signal: Rc<RefCell<MachineSignal>>,
     shared_theme: Rc<RefCell<Theme>>,
-    initial_session: Option<String>,
     cx: &mut App,
 ) {
     let bounds = WindowBounds::centered(size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
@@ -785,18 +750,7 @@ fn open_main_window(
         move |window, cx| {
             let signal = machine_signal.clone();
             let theme = shared_theme.clone();
-            cx.new(move |cx| {
-                PilusView::new(
-                    target,
-                    None,
-                    settings,
-                    signal,
-                    theme,
-                    initial_session,
-                    window,
-                    cx,
-                )
-            })
+            cx.new(move |cx| PilusView::new(target, None, settings, signal, theme, window, cx))
         },
     );
     if let Err(error) = opened {
@@ -906,8 +860,6 @@ enum InputLayer {
     Mission,
     /// The native Automations page.
     Automations,
-    /// The native Pi Session page.
-    Session,
     /// The live terminal grid.
     Terminal,
 }
@@ -924,7 +876,6 @@ fn top_layer(
     home: bool,
     settings: bool,
     page: Option<InputLayer>,
-    session: bool,
 ) -> InputLayer {
     if picker {
         InputLayer::Picker
@@ -936,8 +887,6 @@ fn top_layer(
         InputLayer::Settings
     } else if let Some(page) = page {
         page
-    } else if session {
-        InputLayer::Session
     } else {
         InputLayer::Terminal
     }
@@ -1016,18 +965,6 @@ struct SectionHeader {
     label: &'static str,
     collapsed: bool,
     toggle: SectionAction,
-}
-
-/// The focused pi pane the session panel currently stands in for, when
-/// `pi_gui_auto` replaced its terminal with the native conversation.
-/// `session` is the daemon's latest report; `None` means pi has not
-/// reported yet and the panel waits on the extension socket instead of
-/// flashing the terminal first.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PiView {
-    endpoint: EndpointId,
-    pane: String,
-    session: Option<String>,
 }
 
 /// A requested endpoint handoff waiting for its prepared frame.
@@ -1218,12 +1155,6 @@ struct MenuPrompt {
     action: PromptAction,
 }
 
-/// How long a pilus-initiated pi pin waits for `agent.list` to confirm
-/// before falling back to the snapshot. Shorter than the optimistic picks'
-/// four seconds: a wrong panel covers more than a wrong row highlight,
-/// and a confirming snapshot lands well inside this window.
-const PI_OPTIMISTIC_WINDOW: Duration = Duration::from_secs(2);
-
 /// How long a cached tab strip may stand in for a workspace click before the
 /// daemon's list is taken as it is. Spans a remote click's SSH round trips.
 const TABS_PICK_WINDOW: Duration = Duration::from_secs(4);
@@ -1242,21 +1173,6 @@ impl TabsPick {
         self.at.elapsed() < TABS_PICK_WINDOW && tabs.iter().map(|tab| &tab.id).eq(self.from.iter())
     }
 }
-/// Panels kept alive after their pi pane leaves the screen, newest first.
-/// Each holds a reader and a socket, so the list stays short.
-const PI_PARKED_MAX: usize = 3;
-/// How long a parked panel keeps following its session before it is shut
-/// down; a return after that reads the session afresh.
-const PI_PARK_TTL: Duration = Duration::from_secs(300);
-/// How often the on-screen pi pane's place in its tab is re-read: a split,
-/// a resize, or a zoom moves it without any event the window hears.
-const PI_FRAME_POLL_LOCAL: Duration = Duration::from_millis(500);
-/// The same over SSH, where every read is a proxied round trip.
-const PI_FRAME_POLL_REMOTE: Duration = Duration::from_secs(2);
-/// How long a click beside a split pi panel counts as moving focus off it,
-/// ahead of the `agent.list` that confirms the daemon followed the click.
-const PI_BLUR_WINDOW: Duration = Duration::from_secs(4);
-
 /// First automatic reconnect delay.
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
 /// Ceiling for the exponential backoff.
@@ -1410,15 +1326,21 @@ struct PilusView {
     /// Sender half for the cheap catalog reload.
     machine_list_tx: Sender<Vec<MachineInfo>>,
     /// Status lines from background machine mutations (enable/disable/remove).
-    machine_op_rx: Receiver<String>,
+    machine_op_rx: Receiver<machines::OpOutcome>,
     /// Sender half for background machine mutation outcomes.
-    machine_op_tx: Sender<String>,
+    machine_op_tx: Sender<machines::OpOutcome>,
     /// The machine id whose CLI mutation is running, if any.
     machine_busy: Option<String>,
     /// Remote access as the background service last reported it, read each tick.
     remote: connector::RemoteAccess,
     /// A machine remove awaiting its second click, if any.
     machine_pending_remove: Option<String>,
+    /// The next steps the last machine operation left on its row.
+    machine_follow: machines::FollowUps,
+    /// The `luvus` version installed on this Mac, to flag outdated machines.
+    luvus_local_version: Option<String>,
+    luvus_version_rx: Receiver<Option<String>>,
+    luvus_version_tx: Sender<Option<String>>,
     /// Whether the next pairing code lets its device start work (tasks,
     /// agents, workspaces). Off until the user asks, every time the page opens.
     pairing_operate: bool,
@@ -1581,57 +1503,6 @@ struct PilusView {
     home_resolve_pending: bool,
     /// The Home composer's state.
     home: HomePanel,
-    /// The native Pi Session panel, read live from a session file.
-    session: SessionPanel,
-    /// The pi pane the session panel is pinned to, if auto-switch put one
-    /// up. `None` means the card shows the terminal again.
-    pi_view: Option<PiView>,
-    /// A pi pane whose panel the user closed or browsed away from, keyed by
-    /// endpoint, pane, and the session that was showing: the terminal stays
-    /// up until the pane reports a session (for a waiting panel) or loses
-    /// focus, so a closed panel is not reopened every tick.
-    pi_released: Option<(EndpointId, String, Option<String>)>,
-    /// A pi pin awaiting `agent.list` confirmation, set when pilus itself
-    /// moved focus to a pane the snapshot already knew was pi — a sidebar
-    /// row or a tab holding one. The snapshot's own record stands in so the
-    /// panel opens with the click instead of a reconcile behind it.
-    pi_optimistic: Option<(PiView, Agent, Instant)>,
-    /// Panels whose pane left the screen, still following their sessions,
-    /// with when they were parked: returning to the pane swaps its panel
-    /// back in as it stands instead of reloading the conversation.
-    pi_parked: Vec<(PiView, SessionPanel, Instant)>,
-    /// The pi pane on screen (focused, or sharing the active tab through a
-    /// split), whose frame the window keeps reading.
-    pi_candidate: Option<(EndpointId, String)>,
-    /// Where `pi_candidate` sits in its tab, as last read.
-    pi_frame: Option<(EndpointId, String, PaneFrame)>,
-    pi_frame_rx: Receiver<(EndpointId, String, Option<PaneFrame>)>,
-    pi_frame_tx: Sender<(EndpointId, String, Option<PaneFrame>)>,
-    /// A frame read is in flight; one at a time.
-    pi_frame_pending: bool,
-    /// When the last frame read went out.
-    pi_frame_at: Option<Instant>,
-    /// Whether the pi view's pane holds the daemon's focus. In a split with
-    /// another pane focused, the panel shows but the keyboard stays with
-    /// the terminal.
-    pi_focused: bool,
-    /// A click on the grid beside a split panel, moving focus to the other
-    /// pane before `agent.list` says so.
-    pi_blurred_at: Option<Instant>,
-    /// Agents pilus launched moments ago, before `agent.list` has listed
-    /// them; `focus_agent` checks here so a launched pi pins immediately.
-    /// Pruned on age — the snapshot takes over within a few reconciles.
-    recent_launches: Vec<(EndpointId, Agent, Instant)>,
-    /// The last focused agent per endpoint and workspace. Switching to a
-    /// workspace restores its remembered pane, so the memory predicts
-    /// which agent holds focus a reconcile before `agent.list` says so.
-    workspace_focus: HashMap<(EndpointId, String), Agent>,
-    /// The same memory per tab: a tab restores the pane it last focused,
-    /// so `(endpoint, workspace, tab)` predicts a `focus_tab` outcome.
-    tab_focus: HashMap<(EndpointId, String, u16), Agent>,
-    /// Machine ids whose pi extension install already ran this window, so
-    /// the SSH write happens once per machine per launch.
-    pi_ext_machines: HashSet<String>,
     /// The composer's prompt, an IME-capable field over `home`'s buffer.
     home_prompt: Entity<TextInput>,
     /// The Tasks page's own state; the tasks come from `tasks` (the feed).
@@ -1666,8 +1537,6 @@ struct PilusView {
     /// The terminal sharing the card with the open Mission Control, Tasks,
     /// or Automations page. Cleared whenever none of them is open.
     page_split: Option<PageSplit>,
-    /// The Pi Session composer's field.
-    session_prompt: Entity<TextInput>,
     /// Agent availability and models for the Home composer.
     agent_configs: Vec<AgentConfig>,
     /// Agent configs by machine key (`local` or a machine id), so switching
@@ -1708,7 +1577,6 @@ impl PilusView {
         shared_settings: Rc<RefCell<Settings>>,
         machine_signal: Rc<RefCell<MachineSignal>>,
         shared_theme: Rc<RefCell<Theme>>,
-        initial_session: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1747,10 +1615,10 @@ impl PilusView {
         let (machine_tx, machine_rx) = std::sync::mpsc::channel();
         let (machine_list_tx, machine_list_rx) = std::sync::mpsc::channel();
         let (machine_op_tx, machine_op_rx) = std::sync::mpsc::channel();
+        let (luvus_version_tx, luvus_version_rx) = std::sync::mpsc::channel();
         let (tasks_op_tx, tasks_op_rx) = std::sync::mpsc::channel();
         let (home_resolve_tx, home_resolve_rx) = std::sync::mpsc::channel();
         let (agent_config_tx, agent_config_rx) = std::sync::mpsc::channel();
-        let (pi_frame_tx, pi_frame_rx) = std::sync::mpsc::channel();
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let (machine_connect_tx, machine_connect_rx) = std::sync::mpsc::channel();
         let (picker_tx, picker_rx) = std::sync::mpsc::channel();
@@ -1772,7 +1640,6 @@ impl PilusView {
         let initial_theme = *shared_theme.borrow();
         let initial_fonts = style::Fonts::resolve(&shared_settings);
         let home = HomePanel::default();
-        let session = SessionPanel::default();
         let home_prompt = cx.new(|cx| {
             TextInput::from_shared(
                 home.prompt().shared(),
@@ -1818,29 +1685,6 @@ impl PilusView {
             initial_theme,
             cx,
         );
-        let session_prompt = cx.new(|cx| {
-            TextInput::new(
-                String::new(),
-                "Message pi…",
-                style::chrome_font(&shared_settings),
-                px(initial_fonts.body),
-                true,
-                initial_theme,
-                cx,
-            )
-            .submit_on_enter()
-        });
-        let session_filter = cx.new(|cx| {
-            TextInput::new(
-                String::new(),
-                "Filter models",
-                style::chrome_font(&shared_settings),
-                px(initial_fonts.label),
-                false,
-                initial_theme,
-                cx,
-            )
-        });
         let picker = WorkspacePicker::default();
         let picker_path = cx.new(|cx| {
             TextInput::from_shared(
@@ -1996,6 +1840,10 @@ impl PilusView {
             machine_busy: None,
             remote: connector::snapshot(),
             machine_pending_remove: None,
+            machine_follow: machines::FollowUps::default(),
+            luvus_local_version: None,
+            luvus_version_rx,
+            luvus_version_tx,
             pairing_operate: false,
             appearance: Appearance::default(),
             last_theme_poll: Instant::now() - Duration::from_secs(11),
@@ -2074,23 +1922,6 @@ impl PilusView {
             home_resolve_pending: false,
             remote_home: HashMap::new(),
             home,
-            session,
-            pi_view: None,
-            pi_released: None,
-            pi_optimistic: None,
-            pi_parked: Vec::new(),
-            pi_candidate: None,
-            pi_frame: None,
-            pi_frame_rx,
-            pi_frame_tx,
-            pi_frame_pending: false,
-            pi_frame_at: None,
-            pi_focused: false,
-            pi_blurred_at: None,
-            recent_launches: Vec::new(),
-            workspace_focus: HashMap::new(),
-            tab_focus: HashMap::new(),
-            pi_ext_machines: HashSet::new(),
             home_prompt,
             tasks_panel: TasksPanel::default(),
             tasks_inputs,
@@ -2109,7 +1940,6 @@ impl PilusView {
             mission_answer,
             automations_page: AutomationsPanel::default(),
             page_split: None,
-            session_prompt,
             agent_configs: Vec::new(),
             agent_config_cache: HashMap::new(),
             agent_config_pending: HashSet::new(),
@@ -2124,10 +1954,6 @@ impl PilusView {
             settings_open: false,
             settings_status: String::new(),
         };
-        // The session panel filters its model picker through this field; it
-        // owns the entity the way the view owns the composer prompt, so a
-        // query never lands in the draft the user is about to send.
-        view.session.set_picker_field(session_filter);
         // Seed the remembered frame from the one the window actually opened
         // with; moves and resizes update it from here on.
         view.remember_window_bounds(window, cx);
@@ -2146,11 +1972,6 @@ impl PilusView {
         view.reload_machines();
         // Bridge every enabled machine up front so their workspaces are ready.
         view.auto_connect_machines();
-        // Drop the pi session-report extension into this machine's agent
-        // dir; remote machines get it when they become the active endpoint.
-        std::thread::spawn(|| {
-            let _ = pi_extension::install_local();
-        });
 
         cx.spawn(async move |this, cx| {
             loop {
@@ -2165,10 +1986,7 @@ impl PilusView {
                     let was_animating = view.sidebar_anim.is_some() || view.right.moving();
                     let settled = view.tick_sidebar_anim() & view.right.tick();
                     let released = view.release_sidebar_freeze();
-                    // The transcript glide behind the jump buttons.
-                    let gliding = view.session.tick_scroll();
-                    if view.poll(cx) || gliding || changed || !settled || was_animating || released
-                    {
+                    if view.poll(cx) || changed || !settled || was_animating || released {
                         cx.notify();
                     }
                 });
@@ -2181,13 +1999,6 @@ impl PilusView {
             }
         })
         .detach();
-
-        // `--session-ui` opens the panel immediately; a bare `pilus` waits
-        // for the palette's Open Pi Session.
-        if let Some(spec) = initial_session {
-            let api_socket = view.api_socket();
-            view.session.open_local(api_socket, spec, None, cx);
-        }
 
         view
     }
@@ -2221,10 +2032,6 @@ impl PilusView {
     /// Drain pending connection events. Returns whether a repaint is needed.
     fn poll(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
-        // The session panel owns a background reader, so this only ever
-        // clones an already-folded transcript.
-        let session_prompt = self.session_prompt.clone();
-        changed |= self.session.poll(&session_prompt, cx);
         // Track updater transitions here so a failure from an automatic check
         // can open the Update window once.
         let update_status = self.updater.read(cx).status().clone();
@@ -2289,9 +2096,6 @@ impl PilusView {
             self.reconcile_nav();
         }
         changed |= self.raise_attention(cx);
-        changed |= self.poll_pi_frame(tabs_changed);
-        changed |= self.sync_pi_view(cx);
-        self.poll_parked_sessions(cx);
         // Drop the optimistic endpoint pick once the handoff commits (the
         // committed highlight needs no pick) or every stage of the switch has
         // ended without one (the highlight must revert to the real surface).
@@ -2415,15 +2219,21 @@ impl PilusView {
             }
             changed |= self.apply_machine_catalog(machines);
         }
-        while let Ok(message) = self.machine_op_rx.try_recv() {
+        while let Ok(outcome) = self.machine_op_rx.try_recv() {
             self.machine_busy = None;
-            // Tell every open main window and the manager to reload.
+            self.machine_follow.apply(&outcome);
+            // Tell every open main window and the Add Machine window to reload.
             self.machine_signal.borrow_mut().revision += 1;
+            let message = outcome.message();
             if self.settings_open {
                 self.settings_status = message;
             } else {
                 self.toast(ToastKind::Info, message);
             }
+            changed = true;
+        }
+        while let Ok(version) = self.luvus_version_rx.try_recv() {
+            self.luvus_local_version = version;
             changed = true;
         }
         if self.tasks_panel.is_open() {
@@ -2563,27 +2373,14 @@ impl PilusView {
                 }
                 PickerEvent::HomeLaunched { machine, result } => {
                     match result {
-                        Ok((message, launched)) => {
+                        Ok((message, pane)) => {
                             // The agent is up and focused; only now leave the
                             // composer, so no empty terminal flashes first.
                             self.home_launching = false;
                             self.home_issue_clear();
                             self.home.close();
                             self.toast(ToastKind::Success, message);
-                            // `agent.list` will not list the pane for a
-                            // reconcile or two; the launch's own record
-                            // lets `focus_agent` pin a pi right away.
-                            let target = match &machine {
-                                None => EndpointId::Local,
-                                Some(id) => EndpointId::Machine(id.clone()),
-                            };
-                            if let Some(agent) = launched {
-                                self.recent_launches
-                                    .push((target, agent.clone(), Instant::now()));
-                                self.activate_opened_endpoint(machine, Some(agent.pane), cx);
-                            } else {
-                                self.activate_opened_endpoint(machine, None, cx);
-                            }
+                            self.activate_opened_endpoint(machine, pane, cx);
                         }
                         // Keep the composer up so the launch can be retried.
                         Err(error) => {
@@ -3098,7 +2895,7 @@ impl PilusView {
                     // A protocol mismatch never heals by retrying; point at the
                     // upgrade flow instead of leaving the user with a bare error.
                     let hint = if error.contains("protocol mismatch") {
-                        " — open Remote Machines and choose Upgrade, then Restart"
+                        " — open Settings and choose Update on that machine, then Restart"
                     } else {
                         ""
                     };
@@ -3870,16 +3667,6 @@ impl PilusView {
             InputLayer::Github => self.github_key(event, cx),
             InputLayer::Mission => self.mission_key(event, cx),
             InputLayer::Automations => self.automations_key(event, cx),
-            InputLayer::Session => {
-                let input = self.session_prompt.clone();
-                if self.session.key(&event.keystroke, &input, cx) {
-                    // A consumed key must not also reach the composer's
-                    // input method, which would turn Ctrl+T into a
-                    // transpose or Shift+Tab into a backtab.
-                    cx.stop_propagation();
-                    cx.notify();
-                }
-            }
             InputLayer::Terminal => self.terminal_key(event, cx),
         }
     }
@@ -3900,7 +3687,6 @@ impl PilusView {
                 .then_some(InputLayer::Diff)
                 .or(self.github_focused().then_some(InputLayer::Github))
                 .or_else(|| self.page_layer().filter(|_| !self.terminal_beside_page())),
-            self.session_owns_keys(),
         )
     }
 
@@ -3932,25 +3718,6 @@ impl PilusView {
     fn terminal_beside_page(&self) -> bool {
         self.page_split()
             .is_some_and(|split| split.terminal_focused)
-    }
-
-    /// Whether the session panel takes the keyboard: always when it owns
-    /// the card, and in a split only while its pane holds focus — keys for
-    /// the pane beside it belong to the terminal.
-    fn session_owns_keys(&self) -> bool {
-        self.session.is_open() && (self.pi_split().is_none() || self.pi_focused)
-    }
-
-    /// The pi panel's place in the card when its pane shares the tab with a
-    /// split: the panel covers only that pane and the terminal shows the
-    /// rest. `None` while the panel owns the whole card.
-    fn pi_split(&self) -> Option<PaneFrame> {
-        if !self.session.is_open() {
-            return None;
-        }
-        let view = self.pi_view.as_ref()?;
-        let (endpoint, pane, frame) = self.pi_frame.as_ref()?;
-        (*endpoint == view.endpoint && *pane == view.pane && !frame.is_full()).then_some(*frame)
     }
 
     /// Forward a keystroke to the daemon's terminal.
@@ -4130,18 +3897,6 @@ impl PilusView {
                 None,
             ),
         ];
-        // The native Pi Session panel reads whichever agent the active
-        // workspace is running, on any endpoint. Auto mode keeps pi panes
-        // covered itself, so the command only exists while the setting
-        // is off.
-        if !self.settings.pi_gui_auto && self.surface.workspaces().iter().any(|w| w.active) {
-            entries.push(entry(
-                Command::OpenSession,
-                "Open Pi Session",
-                "Workspace",
-                None,
-            ));
-        }
         for tab in &self.tabs {
             entries.push(entry(
                 Command::FocusTab(tab.index),
@@ -4216,7 +3971,6 @@ impl PilusView {
             Command::OpenUiPlayground => {
                 ui_playground::open(self.theme, self.shared_settings.clone(), cx);
             }
-            Command::OpenSession => self.open_session(cx),
             Command::FocusTab(index) => self.focus_tab(index, cx),
             Command::SwitchSession(name) => self.switch_session(&name),
             Command::NewSession => self.start_new_session(),
@@ -4246,39 +4000,9 @@ impl PilusView {
     ///
     /// The AGENTS row highlights immediately from the optimistic pick; the
     /// feed's next `agent.list` confirms it once the daemon has focused it.
-    /// A pi row gets the same optimism for its panel: the snapshot already
-    /// says the pane is pi, so the pin need not wait on the daemon's move.
     fn focus_agent(&mut self, pane: &str) {
         self.agent_sel = Some((self.active.clone(), pane.to_string()));
         self.agent_sel_at = Instant::now();
-        let picked = self
-            .agents
-            .iter()
-            .find(|agent| agent.pane == pane && agent.agent == "pi")
-            .or_else(|| {
-                // A pane pilus just launched outruns `agent.list`: its own
-                // record stands in until the snapshot knows the pane.
-                self.recent_launches
-                    .iter()
-                    .find_map(|(endpoint, agent, _)| {
-                        (*endpoint == self.active && agent.pane == pane && agent.agent == "pi")
-                            .then_some(agent)
-                    })
-            });
-        self.pi_optimistic = picked.map(|agent| {
-            (
-                PiView {
-                    endpoint: self.active.clone(),
-                    pane: agent.pane.clone(),
-                    session: agent.session.clone(),
-                },
-                agent.clone(),
-                Instant::now(),
-            )
-        });
-        if self.pi_optimistic.is_some() {
-            self.pi_released = None;
-        }
         if let Some(feed) = self.agent_feed.as_ref() {
             feed.focus_pane(pane);
         }
@@ -4297,33 +4021,6 @@ impl PilusView {
 
     /// Focus a workspace by id, switching the daemon's active workspace.
     fn focus_workspace(&mut self, workspace_id: &str) {
-        // The workspace will restore the pane it last focused — the
-        // memory names it, so a pi there pins ahead of the snapshot like
-        // any other pilus-initiated move.
-        let remembered = self
-            .workspace_focus
-            .get(&(self.active.clone(), workspace_id.to_string()))
-            .filter(|agent| agent.agent == "pi")
-            .and_then(|remembered| {
-                self.agents
-                    .iter()
-                    .find(|agent| agent.pane == remembered.pane && agent.agent == "pi")
-                    .cloned()
-            });
-        self.pi_optimistic = remembered.map(|agent| {
-            (
-                PiView {
-                    endpoint: self.active.clone(),
-                    pane: agent.pane.clone(),
-                    session: agent.session.clone(),
-                },
-                agent,
-                Instant::now(),
-            )
-        });
-        if self.pi_optimistic.is_some() {
-            self.pi_released = None;
-        }
         self.show_cached_tabs(workspace_id);
         self.send_active(ClientMessage::ShellWorkspaceFocus {
             workspace_id: workspace_id.to_string(),
@@ -4670,20 +4367,6 @@ impl PilusView {
         if self.settings_open {
             return style::enter("pilus-page-settings", self.settings_page(cx)).into_any_element();
         }
-        if let Some(frame) = self.pi_split() {
-            return self.split_session(cx, grid, layout, frame);
-        }
-        if self.session.is_open() {
-            return style::enter(
-                "pilus-page-session",
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_hidden()
-                    .child(self.session_render(cx)),
-            )
-            .into_any_element();
-        }
         div()
             .flex_1()
             .overflow_hidden()
@@ -4755,86 +4438,6 @@ impl PilusView {
         .into_any_element()
     }
 
-    /// The terminal with the pi panel laid over its own pane only, so the
-    /// panes it was split with stay live beside it.
-    ///
-    /// A press on the panel focuses its pane (the daemon would have, had
-    /// the press reached the grid); the panel's own controls still get it.
-    fn split_session(
-        &mut self,
-        cx: &mut Context<Self>,
-        grid: Div,
-        layout: &CardLayout,
-        frame: PaneFrame,
-    ) -> AnyElement {
-        let theme = self.theme;
-        let place = pane_place(frame, layout);
-        let mut panel = div()
-            .id("pilus-split-session")
-            .absolute()
-            .left(px(place.left))
-            .top(px(place.top))
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .occlude()
-            .bg(self.chrome_fill())
-            .border_1()
-            .radius_md()
-            // Focus is the one edge accent earns here: it says which side
-            // of the split the keyboard is on.
-            .border_color(if self.pi_focused {
-                theme.border_focus
-            } else {
-                theme.border
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.pi_blurred_at = None;
-                    if !this.pi_focused
-                        && let Some(view) = this.pi_view.clone()
-                    {
-                        this.pi_focused = true;
-                        this.focus_agent(&view.pane);
-                        cx.notify();
-                    }
-                }),
-            );
-        panel = match place.width {
-            Some(width) => panel.w(px(width)),
-            None => panel.right(px(0.0)),
-        };
-        panel = match place.height {
-            Some(height) => panel.h(px(height)),
-            None => panel.bottom(px(0.0)),
-        };
-        div()
-            .relative()
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_hidden()
-            .child(div().size_full().child(grid))
-            .child(style::enter(
-                "pilus-split-session-enter",
-                panel.child(self.session_render(cx)),
-            ))
-            .into_any_element()
-    }
-
-    /// Paint the Pi Session panel for the active workspace.
-    fn session_render(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = self.theme;
-        let settings = self.shared_settings.clone();
-        let input = self.session_prompt.clone();
-        // While a picker is open, up and down walk its rows rather than
-        // moving the draft's caret; every other editing key still belongs
-        // to the prompt.
-        let picker_open = self.session.picker_open();
-        input.update(cx, |input, _| input.surrender_vertical_keys(picker_open));
-        self.session.render(theme, &settings, &input, cx)
-    }
-
     /// The label for the picker's current endpoint.
     fn picker_source_label(&self) -> String {
         match self.picker.source() {
@@ -4848,468 +4451,18 @@ impl PilusView {
         }
     }
 
-    /// The pi pane the session panel should stand in for right now.
-    ///
-    /// Auto mode only: the focused agent, when it is pi. The daemon's
-    /// report is carried along as a seed but no longer gates the pin — a
-    /// pane waiting on it still gets the waiting panel instead of a beat
-    /// of terminal pi's extension will replace anyway.
-    /// Pure so tests can drive it with fabricated agents.
-    ///
-    /// With no pi focused, a pi sharing the visible tab (`visible`: the
-    /// active workspace id and tab index) through a split still counts —
-    /// its panel covers just its own pane beside the focused one. The
-    /// caller only shows it once the pane's frame confirms the split.
-    fn pi_view_for(
-        agents: &[Agent],
-        auto: bool,
-        endpoint: &EndpointId,
-        visible: Option<(&str, u16)>,
-    ) -> Option<(PiView, Agent)> {
-        if !auto {
-            return None;
-        }
-        let agent = match agents.iter().find(|agent| agent.focused) {
-            Some(agent) if agent.agent == "pi" => agent,
-            _ => {
-                let (workspace, tab) = visible?;
-                agents.iter().find(|agent| {
-                    agent.agent == "pi" && agent.workspace_id == workspace && agent.tab == tab
-                })?
-            }
-        };
-        Some((
-            PiView {
-                endpoint: endpoint.clone(),
-                pane: agent.pane.clone(),
-                session: agent.session.clone(),
-            },
-            agent.clone(),
-        ))
-    }
-
-    /// Follow the focused pi pane: pin its conversation over the terminal,
-    /// or close the panel when nothing pi-shaped holds focus.
-    ///
-    /// A focused pi pins even before its extension reports — the panel
-    /// waits on the socket rather than show a beat of terminal the report
-    /// then replaces. A pilus-initiated focus (an agent row or a tab
-    /// holding a pi) pins earlier still, on the snapshot's own record,
-    /// since the daemon's move is only reported a reconcile later. While
-    /// the socket is live its session id outranks the daemon's:
-    /// `pane.report_session` produces no event, so `agent.list` can lag a
-    /// `/new` by a reconcile tick, and reopening on that stale value would
-    /// blank the session the socket already followed.
-    ///
-    /// Also installs the session-report extension on a machine the first
-    /// time it becomes the active endpoint — the daemon's `session` field
-    /// only appears once the extension is running.
-    fn sync_pi_view(&mut self, cx: &mut Context<Self>) -> bool {
-        if let EndpointId::Machine(id) = &self.active
-            && self.pi_ext_machines.insert(id.clone())
-            && let Some(target) = self.machine_target_by_key(id)
-        {
-            std::thread::spawn(move || {
-                let _ = pi_extension::install_remote(&target);
-            });
-        }
-        // The strip may be the next workspace's while the surface still shows
-        // this one; pairing them would record or erase the wrong memory.
-        let strip_agrees = self.tabs_pick.is_none();
-        remember_focus(
-            &self.agents,
-            self.surface.workspaces(),
-            if strip_agrees { &self.tabs } else { &[] },
-            &self.active,
-            &mut self.workspace_focus,
-            &mut self.tab_focus,
-        );
-        // A launch the snapshot has adopted (or never will) leaves the list.
-        self.recent_launches.retain(|(_, agent, at)| {
-            at.elapsed() < Duration::from_secs(8)
-                && !self.agents.iter().any(|known| known.pane == agent.pane)
-        });
-        let visible_workspace = self
-            .surface
-            .workspaces()
-            .iter()
-            .find(|workspace| workspace.active)
-            .map(|workspace| workspace.id.clone());
-        let visible_tab = self
-            .tabs
-            .iter()
-            .find(|tab| tab.active && strip_agrees)
-            .map(|tab| tab.index);
-        let visible = visible_workspace.as_deref().zip(visible_tab);
-        let mut desired = Self::pi_view_for(
-            &self.agents,
-            self.settings.pi_gui_auto,
-            &self.active,
-            visible,
-        );
-        let mut focused = desired.as_ref().is_some_and(|(_, agent)| agent.focused);
-        // A pilus-initiated focus pins ahead of the snapshot: the daemon
-        // has not reported the move yet, so `pi_view_for` still names the
-        // pane we came from — or nothing. A snapshot showing the picked
-        // pane focused takes over (it produces the same `PiView`, so the
-        // panel never reopens); the window bounds a pick the daemon
-        // never confirms.
-        if self.settings.pi_gui_auto
-            && let Some((view, agent)) =
-                optimistic_pick(&self.agents, &self.active, &mut self.pi_optimistic)
-        {
-            desired = Some((view, agent));
-            focused = true;
-        }
-        // The frame reader follows the pi on screen whether or not its panel
-        // shows yet: an unfocused one waits on it below.
-        self.pi_candidate = desired
-            .as_ref()
-            .map(|(view, _)| (view.endpoint.clone(), view.pane.clone()));
-        // A click beside the panel moved focus off it; the snapshot catches
-        // up within a reconcile or two.
-        if let Some(at) = self.pi_blurred_at {
-            if !focused || at.elapsed() >= PI_BLUR_WINDOW {
-                self.pi_blurred_at = None;
-            } else {
-                focused = false;
-            }
-        }
-        // An unfocused pi shows only beside a split it is known to share;
-        // until its frame says so, the focused pane's terminal owns the card.
-        if !focused && let Some((view, _)) = &desired {
-            let split = self
-                .pi_frame
-                .as_ref()
-                .is_some_and(|(endpoint, pane, frame)| {
-                    *endpoint == view.endpoint && *pane == view.pane && !frame.is_full()
-                });
-            if !split {
-                desired = None;
-            }
-        }
-        let focus_changed = self.pi_focused != focused;
-        self.pi_focused = focused;
-        // A panel the user closed or browsed away from stays released until
-        // the pane reports a session (a waiting panel that finally got one)
-        // or loses focus; reopening it every tick would be the terminal
-        // flash, or the history browse, all over again.
-        if let Some((endpoint, pane, released_session)) = self.pi_released.clone() {
-            match &desired {
-                Some((view, _)) if view.endpoint == endpoint && view.pane == pane => {
-                    if released_session.is_none() && view.session.is_some() {
-                        self.pi_released = None;
-                    } else {
-                        return false;
-                    }
-                }
-                _ => self.pi_released = None,
-            }
-        }
-        let view = desired.as_ref().map(|(view, _)| view.clone());
-        if view == self.pi_view {
-            if focus_changed {
-                return true;
-            }
-            // A panel that got closed by hand is a release, not a state
-            // change: remember it so the next tick does not reopen.
-            if let Some(view) = &self.pi_view
-                && !self.session.is_open()
-            {
-                let session = view.session.clone();
-                self.pi_released = Some((view.endpoint.clone(), view.pane.clone(), session));
-            }
-            return false;
-        }
-        match desired {
-            Some((view, agent)) => {
-                let mut same_pane = self
-                    .pi_view
-                    .as_ref()
-                    .is_some_and(|old| old.endpoint == view.endpoint && old.pane == view.pane);
-                // Coming back to a pane whose panel was parked swaps it in
-                // as it stands — no reload, no skeleton, same scroll.
-                if !same_pane {
-                    self.park_session();
-                    same_pane = self.unpark_session(&view);
-                }
-                // The extension socket learns the pane's session before
-                // the daemon's report catches up; while it is live its
-                // word stands.
-                let live = (same_pane && self.session.rpc_live())
-                    .then(|| self.session.live_session())
-                    .flatten();
-                let want = live.or_else(|| view.session.clone());
-                let already = same_pane && want == self.session.live_session();
-                if !already {
-                    match &self.active {
-                        EndpointId::Local => self.session.open_local_session(
-                            self.api_socket(),
-                            expand_local(&agent.cwd),
-                            want.clone(),
-                            view.pane.clone(),
-                            cx,
-                        ),
-                        EndpointId::Machine(id) => {
-                            let Some(target) = self.machine_target_by_key(id) else {
-                                // The pane is real but the machine has no
-                                // SSH profile: nothing can read its
-                                // session, so the terminal stays up.
-                                let was_open = self.pi_view.take().is_some();
-                                if was_open {
-                                    self.session.close();
-                                }
-                                return was_open;
-                            };
-                            self.session.open_remote_session(
-                                target,
-                                self.expand_cwd(id, &agent.cwd),
-                                want.clone(),
-                                view.pane.clone(),
-                                cx,
-                            );
-                        }
-                    }
-                }
-                // Only a known session pins: a waiting panel stays
-                // escapable so a pi that never reports is not a locked
-                // card.
-                self.session.set_pinned(want.is_some());
-                self.pi_view = Some(PiView {
-                    session: want,
-                    ..view
-                });
-            }
-            None => {
-                self.park_session();
-                self.session.set_pinned(false);
-            }
-        }
-        true
-    }
-
-    /// Set the auto-pinned panel aside when its pane leaves the screen: it
-    /// keeps following the session, and the card gets an empty stand-in.
-    /// A panel the user already closed has nothing worth keeping.
-    fn park_session(&mut self) {
-        let Some(view) = self.pi_view.take() else {
-            self.session.close();
-            return;
-        };
-        if !self.session.is_open() {
-            self.session.close();
-            return;
-        }
-        self.session.suspend();
-        let stand_in = self.session.sibling();
-        let panel = std::mem::replace(&mut self.session, stand_in);
-        self.pi_parked.retain(|(parked, _, _)| {
-            !(parked.endpoint == view.endpoint && parked.pane == view.pane)
-        });
-        self.pi_parked.insert(0, (view, panel, Instant::now()));
-        while self.pi_parked.len() > PI_PARKED_MAX {
-            if let Some((_, mut evicted, _)) = self.pi_parked.pop() {
-                evicted.close();
-            }
-        }
-    }
-
-    /// Swap the parked panel for `view`'s pane back in. Returns whether one
-    /// was waiting.
-    fn unpark_session(&mut self, view: &PiView) -> bool {
-        let Some(index) = self.pi_parked.iter().position(|(parked, _, _)| {
-            parked.endpoint == view.endpoint && parked.pane == view.pane
-        }) else {
-            return false;
-        };
-        let (_, mut panel, _) = self.pi_parked.remove(index);
-        panel.resume();
-        let mut stand_in = std::mem::replace(&mut self.session, panel);
-        stand_in.close();
-        true
-    }
-
-    /// Keep parked panels current and retire the ones left too long.
-    fn poll_parked_sessions(&mut self, cx: &mut Context<Self>) {
-        let input = self.session_prompt.clone();
-        self.pi_parked.retain_mut(|(_, panel, parked_at)| {
-            if parked_at.elapsed() >= PI_PARK_TTL {
-                panel.close();
-                return false;
-            }
-            panel.poll(&input, cx);
-            true
-        });
-    }
-
-    /// Read where the on-screen pi pane sits in its tab, off the GUI
-    /// thread, and fold the answers in. Returns whether the panel's frame
-    /// changed.
-    fn poll_pi_frame(&mut self, refresh: bool) -> bool {
-        let mut changed = false;
-        while let Ok((endpoint, pane, frame)) = self.pi_frame_rx.try_recv() {
-            self.pi_frame_pending = false;
-            if self.pi_candidate.as_ref() != Some(&(endpoint.clone(), pane.clone())) {
-                continue;
-            }
-            let next = frame.map(|frame| (endpoint, pane, frame));
-            if next != self.pi_frame {
-                self.pi_frame = next;
-                changed = true;
-            }
-        }
-        let Some((endpoint, pane)) = self.pi_candidate.clone() else {
-            if self.pi_frame.take().is_some() {
-                changed = true;
-            }
-            return changed;
-        };
-        if self.pi_frame_pending {
-            return changed;
-        }
-        let known = self
-            .pi_frame
-            .as_ref()
-            .is_some_and(|(known_endpoint, known_pane, _)| {
-                *known_endpoint == endpoint && *known_pane == pane
-            });
-        let interval = match endpoint {
-            EndpointId::Local => PI_FRAME_POLL_LOCAL,
-            EndpointId::Machine(_) => PI_FRAME_POLL_REMOTE,
-        };
-        let due = !known || refresh || self.pi_frame_at.is_none_or(|at| at.elapsed() >= interval);
-        if !due {
-            return changed;
-        }
-        let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
-            return changed;
-        };
-        self.pi_frame_pending = true;
-        self.pi_frame_at = Some(Instant::now());
-        let tx = self.pi_frame_tx.clone();
-        std::thread::spawn(move || {
-            let frame = client.pane_layout(&pane).ok();
-            let _ = tx.send((endpoint, pane, frame));
-        });
-        changed
-    }
-
-    /// Remember that the auto-pinned panel was dismissed, so the next sync
-    /// does not reopen it while the same pane stays focused. A manual panel
-    /// (`--session-ui`, no pane) records nothing.
-    fn record_pi_release(&mut self) {
-        if let Some(view) = &self.pi_view {
-            let session = self.session.live_session().or_else(|| view.session.clone());
-            self.pi_released = Some((view.endpoint.clone(), view.pane.clone(), session));
-        }
-    }
-
-    /// Close the Pi Session panel from its header button.
-    fn release_pi_session(&mut self, cx: &mut Context<Self>) {
-        self.record_pi_release();
-        self.session.close();
-        self.session.set_pinned(false);
-        cx.notify();
-    }
-
-    /// Detach the panel from its live pane before browsing the history.
-    /// The chosen session is read-only, so the auto-pin must not retarget it
-    /// back to the pane's current session next tick.
-    fn release_pi_for_history(&mut self) {
-        self.record_pi_release();
-        self.session.set_pinned(false);
-    }
-
-    /// Open the Pi Session panel for the active workspace's agent.
-    ///
-    /// Manual open, used when `pi_gui_auto` is off. Only the pane's own
-    /// reported session id resolves — without the extension's report there
-    /// is no reliable link from a pane to a file, so we ask the user to get
-    /// one rather than paint the wrong conversation.
-    fn open_session(&mut self, cx: &mut Context<Self>) {
-        let Some(active) = self
-            .surface
-            .workspaces()
-            .iter()
-            .find(|workspace| workspace.active)
-            .cloned()
-        else {
-            self.toast(
-                ToastKind::Error,
-                "no active workspace to read a session from",
-            );
-            cx.notify();
-            return;
-        };
-        let Some(agent) = self
-            .agents
-            .iter()
-            .find(|agent| agent.agent == "pi" && agent.focused)
-            .or_else(|| {
-                self.agents
-                    .iter()
-                    .find(|agent| agent.agent == "pi" && agent.workspace_id == active.id)
-            })
-            .or_else(|| {
-                self.agents
-                    .iter()
-                    .find(|agent| agent.agent == "pi" && agent.cwd == active.cwd)
-            })
-            .cloned()
-        else {
-            self.toast(
-                ToastKind::Error,
-                "no pi agent in this workspace to read a session from",
-            );
-            cx.notify();
-            return;
-        };
-        let Some(session_id) = agent.session.clone() else {
-            self.toast(
-                ToastKind::Error,
-                "pi hasn't reported its session yet — restart pi or run /reload in it",
-            );
-            cx.notify();
-            return;
-        };
-        self.home.close();
-        self.settings_open = false;
-        match self.active.clone() {
-            EndpointId::Local => {
-                self.session.open_local_session(
-                    self.api_socket(),
-                    expand_local(&agent.cwd),
-                    Some(session_id),
-                    agent.pane.clone(),
-                    cx,
-                );
-            }
-            EndpointId::Machine(id) => {
-                let Some(target) = self.machine_target_by_key(&id) else {
-                    self.toast(ToastKind::Error, format!("no SSH target for `{id}`"));
-                    cx.notify();
-                    return;
-                };
-                let cwd = self.expand_cwd(&id, &agent.cwd);
-                self.session.open_remote_session(
-                    target,
-                    cwd,
-                    Some(session_id),
-                    agent.pane.clone(),
-                    cx,
-                );
-            }
-        }
-        cx.notify();
-    }
-
     /// Show the Settings page.
     fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.home.close();
         self.settings_open = true;
         self.settings_status.clear();
         self.probe_machines();
-        self.ensure_agent_configs_for("local");
+        let version_tx = self.luvus_version_tx.clone();
+        std::thread::spawn(move || {
+            version_tx
+                .send(crate::luvus_update::installed_version().map(|version| version.to_string()))
+                .ok();
+        });
         cx.notify();
     }
 
@@ -5862,14 +5015,6 @@ impl PilusView {
             }
             InputLayer::Mission => None,
             InputLayer::Automations => None,
-            // An open session picker takes the keyboard, so a query reaches
-            // its filter field instead of the prompt the user is typing.
-            InputLayer::Session => Some(
-                self.session
-                    .picker_filter_field()
-                    .unwrap_or_else(|| self.session_prompt.clone())
-                    .focus_handle(cx),
-            ),
             InputLayer::Terminal => None,
         };
         match target {
@@ -6336,10 +5481,7 @@ impl PilusView {
             .child(self.remote_access_section_block(cx))
             .child(self.relay_section_block(cx))
             .child(self.machines_section_block(cx))
-            .child(self.agent_config_section_block(cx))
             .child(self.notifications_section_block(cx))
-            .child(self.pi_gui_section_block(cx))
-            .child(self.terminal_section_block(cx))
             .child(self.updates_section_block(cx));
         div()
             .flex()
@@ -6383,138 +5525,6 @@ impl PilusView {
                     .text_color(theme.muted)
                     .child(self.settings_status.clone())
             })
-    }
-
-    /// The AGENT CONFIG section of the page: the coding agents installed on
-    /// this machine, their config source, and the model catalog each exposes.
-    fn agent_config_section_block(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let loading = self.agent_config_pending.contains("local");
-        let configs = self.agent_config_cache.get("local");
-        let mut section = div().flex().flex_col().gap_2().child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .px_3()
-                .child(style::section_label(
-                    theme,
-                    "AGENT CONFIG",
-                    self.section_font(),
-                ))
-                .child(
-                    style::small_button(
-                        "pilus-agents-refresh",
-                        "Refresh",
-                        style::ButtonKind::Secondary,
-                        theme,
-                        self.section_font(),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.agent_config_cache.remove("local");
-                        this.agent_config_pending.remove("local");
-                        this.ensure_agent_configs_for("local");
-                        cx.notify();
-                    })),
-                ),
-        );
-        match configs {
-            Some(configs) if !configs.is_empty() => {
-                for config in configs {
-                    section = section.child(self.agent_config_row(config));
-                }
-            }
-            Some(_) | None if loading => {
-                section = section.child(agent_config_empty(
-                    theme,
-                    "Detecting agents…",
-                    self.footer_font(),
-                ));
-            }
-            Some(_) | None => {
-                section = section.child(agent_config_empty(
-                    theme,
-                    "No coding agents found. Install one, then Refresh.",
-                    self.footer_font(),
-                ));
-            }
-        }
-        section
-    }
-
-    /// One installed agent row: name, config source, default, and model count.
-    fn agent_config_row(&self, config: &AgentConfig) -> Div {
-        let theme = self.theme;
-        let default = config
-            .default_model
-            .clone()
-            .unwrap_or_else(|| "—".to_string());
-        let catalog = if config.models.is_empty() {
-            "no catalog".to_string()
-        } else if config.discovered {
-            format!("{} models · live", config.models.len())
-        } else {
-            format!("{} models", config.models.len())
-        };
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .mx_3()
-            .px_2()
-            .py_2()
-            .radius_md()
-            .bg(theme.panel)
-            .border_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(self.chrome_font()))
-                                    .text_color(theme.fg)
-                                    .child(config.label.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(self.section_font()))
-                                    .text_color(theme.muted)
-                                    .child(config.kind.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .text_size(px(self.section_font()))
-                            .text_color(theme.muted)
-                            .child(config.source.clone())
-                            .child(format!("· default: {default}")),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(self.section_font()))
-                    .text_color(theme.muted)
-                    .child(catalog),
-            )
     }
 
     /// The REMOTE MACHINES section of the page: every saved machine profile
@@ -7142,14 +6152,14 @@ impl PilusView {
                 ))
                 .child(
                     style::small_button(
-                        "pilus-machines-manage",
-                        "Manage Machines",
+                        "pilus-machines-add",
+                        "Add Machine",
                         style::ButtonKind::Primary,
                         theme,
                         self.footer_font(),
                     )
                     .on_click(cx.listener(|_, _, window, cx| {
-                        window.dispatch_action(OpenMachineManager.boxed_clone(), cx);
+                        window.dispatch_action(OpenAddMachine.boxed_clone(), cx);
                     })),
                 ),
         );
@@ -7176,12 +6186,53 @@ impl PilusView {
         let theme = self.theme;
         let id = machine.id.clone();
         let busy = self.machine_busy.as_deref() == Some(machine.id.as_str());
-        let confirming = self.machine_pending_remove.as_deref() == Some(machine.id.as_str());
+        let follow = &self.machine_follow;
+        let is = |pending: &Option<String>| pending.as_deref() == Some(machine.id.as_str());
+        let confirming = is(&self.machine_pending_remove);
         let (status, status_color) = machine_status_text(machine, theme);
+        let behind = match (
+            machine.version.as_deref(),
+            self.luvus_local_version.as_deref(),
+        ) {
+            (Some(remote), Some(local)) => is_behind(remote, local),
+            _ => false,
+        };
         let toggle_id = id.clone();
         let toggle_label = if machine.enabled { "Disable" } else { "Enable" };
-        let install_id = id.clone();
+        let update_id = id.clone();
+        let restart_id = id.clone();
+        let stop_id = id.clone();
         let remove_id = id.clone();
+        let restart_button = (machine.enabled && is(&follow.restart_due)).then(|| {
+            self.machine_action(
+                format!("pilus-machine-page-restart-{id}"),
+                if is(&follow.confirming_restart) {
+                    "Confirm restart"
+                } else {
+                    "Restart"
+                },
+                theme.alert,
+                cx.listener(move |this, _, _, cx| {
+                    this.restart_machine_page(restart_id.clone());
+                    cx.notify();
+                }),
+            )
+        });
+        let stop_button = is(&follow.stop_due).then(|| {
+            self.machine_action(
+                format!("pilus-machine-page-stop-{id}"),
+                if is(&follow.confirming_stop) {
+                    "Confirm stop"
+                } else {
+                    "Stop & upgrade"
+                },
+                theme.alert,
+                cx.listener(move |this, _, _, cx| {
+                    this.stop_machine_page(stop_id.clone());
+                    cx.notify();
+                }),
+            )
+        });
         div()
             .flex()
             .flex_row()
@@ -7232,51 +6283,69 @@ impl PilusView {
                             .text_size(px(self.section_font()))
                             .text_color(theme.muted)
                             .child(machine.destination.clone())
+                            .children(
+                                machine
+                                    .version
+                                    .clone()
+                                    .map(|version| div().child(format!("v{version}"))),
+                            )
+                            .children(behind.then(|| {
+                                div().text_color(theme.alert).child(format!(
+                                    "behind v{}",
+                                    self.luvus_local_version.clone().unwrap_or_default()
+                                ))
+                            }))
                             .child(div().text_color(status_color).child(status)),
                     ),
             )
-            .child(
-                style::small_button(
-                    format!("pilus-machine-page-toggle-{id}"),
-                    if busy { "…" } else { toggle_label },
-                    style::ButtonKind::Ghost,
-                    theme,
-                    self.section_font(),
-                )
-                .text_color(if busy { theme.muted } else { theme.fg })
-                .on_click(cx.listener(move |this, _, _, cx| {
+            .child(self.machine_action(
+                format!("pilus-machine-page-toggle-{id}"),
+                if busy { "…" } else { toggle_label },
+                if busy { theme.muted } else { theme.fg },
+                cx.listener(move |this, _, _, cx| {
                     this.toggle_machine_page(toggle_id.clone());
                     cx.notify();
-                })),
-            )
-            .child(
-                style::small_button(
-                    format!("pilus-machine-page-agent-{id}"),
-                    "Install agent",
-                    style::ButtonKind::Ghost,
-                    theme,
-                    self.section_font(),
-                )
-                .text_color(theme.muted)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.install_machine_page(install_id.clone());
+                }),
+            ))
+            .children(stop_button)
+            .children(restart_button)
+            .child(self.machine_action(
+                format!("pilus-machine-page-update-{id}"),
+                if behind { "Upgrade" } else { "Update" },
+                if behind { theme.fg } else { theme.muted },
+                cx.listener(move |this, _, _, cx| {
+                    this.update_machine_page(update_id.clone());
                     cx.notify();
-                })),
-            )
-            .child(
-                style::small_button(
-                    format!("pilus-machine-page-remove-{id}"),
-                    if confirming { "Confirm" } else { "Remove" },
-                    style::ButtonKind::Ghost,
-                    theme,
-                    self.section_font(),
-                )
-                .text_color(if confirming { theme.alert } else { theme.muted })
-                .on_click(cx.listener(move |this, _, _, cx| {
+                }),
+            ))
+            .child(self.machine_action(
+                format!("pilus-machine-page-remove-{id}"),
+                if confirming { "Confirm" } else { "Remove" },
+                if confirming { theme.alert } else { theme.muted },
+                cx.listener(move |this, _, _, cx| {
                     this.remove_machine_page(remove_id.clone());
                     cx.notify();
-                })),
-            )
+                }),
+            ))
+    }
+
+    /// One ghost button of a machine row.
+    fn machine_action(
+        &self,
+        id: String,
+        label: &'static str,
+        color: gpui::Rgba,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Stateful<Div> {
+        style::small_button(
+            id,
+            label,
+            style::ButtonKind::Ghost,
+            self.theme,
+            self.section_font(),
+        )
+        .text_color(color)
+        .on_click(on_click)
     }
 
     /// Enable a disabled machine, or disable an enabled one, off-thread.
@@ -7284,28 +6353,76 @@ impl PilusView {
         if self.machine_busy.is_some() {
             return;
         }
-        let Some(machine) = self
+        let Some(enabled) = self
             .machines
             .iter()
             .find(|machine| machine.id == id)
-            .cloned()
+            .map(|machine| machine.enabled)
         else {
             return;
         };
-        self.machine_pending_remove = None;
-        if machine.enabled {
-            self.run_machine_page_op(
-                &id,
-                vec!["disable".to_string(), id.clone()],
-                format!("Disabled `{id}`."),
-            );
+        self.clear_machine_confirms();
+        let op = if enabled {
+            MachineOp::Disable { id: id.clone() }
         } else {
-            self.run_machine_page_op(
-                &id,
-                vec!["enable".to_string(), id.clone()],
-                format!("Enabled `{id}`."),
-            );
+            MachineOp::Enable { id: id.clone() }
+        };
+        self.run_machine_page_op(&id, op);
+    }
+
+    /// Re-provision a machine's Luvus from this Mac's, off-thread. The remote
+    /// daemon keeps running the old binary until it is restarted.
+    fn update_machine_page(&mut self, id: String) {
+        if self.machine_busy.is_some() {
+            return;
         }
+        self.clear_machine_confirms();
+        self.run_machine_page_op(&id.clone(), MachineOp::Update { id });
+    }
+
+    /// Restart a machine's daemon after a second confirming click, since it
+    /// stops every pane in that session.
+    fn restart_machine_page(&mut self, id: String) {
+        if self.machine_busy.is_some() {
+            return;
+        }
+        if self.machine_follow.confirming_restart.as_deref() != Some(id.as_str()) {
+            self.clear_machine_confirms();
+            self.settings_status = format!(
+                "Restart `{id}`? This stops every pane in its session. \
+                 Click Confirm restart to continue."
+            );
+            self.machine_follow.confirming_restart = Some(id);
+            return;
+        }
+        self.machine_follow.confirming_restart = None;
+        self.run_machine_page_op(&id.clone(), MachineOp::Restart { id });
+    }
+
+    /// Stop a machine's old daemon and install the new Luvus, after a second
+    /// confirming click, since the daemon's panes end.
+    fn stop_machine_page(&mut self, id: String) {
+        if self.machine_busy.is_some() {
+            return;
+        }
+        if self.machine_follow.confirming_stop.as_deref() != Some(id.as_str()) {
+            self.clear_machine_confirms();
+            self.settings_status = format!(
+                "Stop `{id}`'s daemon? Its panes end (the session is saved). \
+                 Click Confirm stop to continue."
+            );
+            self.machine_follow.confirming_stop = Some(id);
+            return;
+        }
+        self.machine_follow.confirming_stop = None;
+        self.run_machine_page_op(&id.clone(), MachineOp::StopAndUpdate { id });
+    }
+
+    /// Drop every machine action waiting on a second click.
+    fn clear_machine_confirms(&mut self) {
+        self.machine_pending_remove = None;
+        self.machine_follow.confirming_restart = None;
+        self.machine_follow.confirming_stop = None;
     }
 
     /// Remove a machine after a second confirming click.
@@ -7314,72 +6431,27 @@ impl PilusView {
             return;
         }
         if self.machine_pending_remove.as_deref() != Some(id.as_str()) {
+            self.clear_machine_confirms();
             self.machine_pending_remove = Some(id.clone());
             self.settings_status = format!("Remove `{id}`? Click Confirm to delete the profile.");
             return;
         }
         self.machine_pending_remove = None;
-        self.run_machine_page_op(
-            &id,
-            vec!["remove".to_string(), id.clone()],
-            format!("Removed `{id}`."),
-        );
+        self.run_machine_page_op(&id.clone(), MachineOp::Remove { id });
     }
 
-    /// Run one `luvus machine …` mutation off-thread, then report back.
+    /// Run one machine operation off-thread, then report back.
     ///
     /// The outcome and a fresh catalog travel through the existing channels,
-    /// so the window reloads the section and tells other windows, exactly
-    /// like the manager window's own mutations do.
-    fn run_machine_page_op(&mut self, id: &str, args: Vec<String>, success: String) {
+    /// so the window reloads the section and tells other windows.
+    fn run_machine_page_op(&mut self, id: &str, op: MachineOp) {
         self.machine_busy = Some(id.to_string());
         self.settings_status = "Running…".to_string();
         let root = self.session_root.clone();
         let op_tx = self.machine_op_tx.clone();
         let machine_tx = self.machine_tx.clone();
         std::thread::spawn(move || {
-            let message = match run_machine_cli(&root, args) {
-                Ok(()) => success,
-                Err(error) if error.contains("does not match local") => {
-                    format!("{error}\nOpen Remote Machines and choose Update, then Stop & upgrade.")
-                }
-                Err(error) => error,
-            };
-            op_tx.send(message).ok();
-            machine_tx.send(list_machines(&root)).ok();
-        });
-    }
-
-    /// Install the connector on `machine` over SSH, off-thread.
-    fn install_machine_page(&mut self, id: String) {
-        if self.machine_busy.is_some() {
-            return;
-        }
-        let Some(machine) = self
-            .machines
-            .iter()
-            .find(|machine| machine.id == id)
-            .cloned()
-        else {
-            return;
-        };
-        self.machine_pending_remove = None;
-        let Some(agent) = agent_binary() else {
-            self.settings_status =
-                "pilus-agent not found; set PILUS_AGENT_BIN or install it beside pilus".to_string();
-            return;
-        };
-        self.machine_busy = Some(id);
-        self.settings_status = "Installing agent…".to_string();
-        let op_tx = self.machine_op_tx.clone();
-        let machine_tx = self.machine_tx.clone();
-        let root = self.session_root.clone();
-        std::thread::spawn(move || {
-            let message = match install_agent(&machine, &agent) {
-                Ok(message) => message,
-                Err(error) => error.to_string(),
-            };
-            op_tx.send(message).ok();
+            op_tx.send(machines::run_op(&root, op)).ok();
             machine_tx.send(list_machines(&root)).ok();
         });
     }
@@ -7421,107 +6493,6 @@ impl PilusView {
     /// Toggle native notifications and persist the choice at once.
     fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
         self.settings.notifications = !self.settings.notifications;
-        self.settings.save(&self.pilus_root);
-        *self.shared_settings.borrow_mut() = self.settings.clone();
-        cx.notify();
-    }
-
-    /// The PI SESSIONS section of the page: whether a focused pi pane is
-    /// painted as the native conversation instead of its terminal.
-    fn pi_gui_section_block(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let on = self.settings.pi_gui_auto;
-        let toggle = style::toggle("pilus-pi-gui-toggle", on, theme)
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_pi_gui(cx)));
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .child(style::section_label(
-                        theme,
-                        "PI SESSIONS",
-                        self.section_font(),
-                    ))
-                    .child(toggle),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .text_size(px(self.footer_font()))
-                    .text_color(theme.muted)
-                    .child("Show pi panes as a native conversation instead of the terminal"),
-            )
-    }
-
-    /// Toggle the native pi view and persist the choice at once.
-    fn toggle_pi_gui(&mut self, cx: &mut Context<Self>) {
-        self.settings.pi_gui_auto = !self.settings.pi_gui_auto;
-        self.settings.save(&self.pilus_root);
-        *self.shared_settings.borrow_mut() = self.settings.clone();
-        cx.notify();
-    }
-
-    /// The TERMINAL section of the page: whether the grid shows the daemon
-    /// row under its tab strip, which only a titled Luvus fills. Remote
-    /// machines and the local daemon are set apart, since they can run
-    /// different Luvus versions.
-    fn terminal_section_block(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let remote = style::checkbox(
-            "pilus-terminal-top-spacing",
-            self.settings.terminal_top_spacing,
-            "Add top spacing to remote terminals",
-            theme,
-            self.footer_font(),
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.settings.terminal_top_spacing = !this.settings.terminal_top_spacing;
-            this.save_settings(cx);
-        }));
-        let local = style::checkbox(
-            "pilus-local-terminal-top-spacing",
-            self.settings.local_terminal_top_spacing,
-            "Add top spacing to the local terminal",
-            theme,
-            self.footer_font(),
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.settings.local_terminal_top_spacing = !this.settings.local_terminal_top_spacing;
-            this.save_settings(cx);
-        }));
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .px_3()
-                    .child(style::section_label(theme, "TERMINAL", self.section_font())),
-            )
-            .child(div().px_3().child(remote))
-            .child(div().px_3().child(local))
-            .child(
-                div()
-                    .px_3()
-                    .text_size(px(self.footer_font()))
-                    .text_color(theme.muted)
-                    .child(
-                        "For newer Luvus without show_title. Turn off for older Luvus \
-                         or when show_title is enabled",
-                    ),
-            )
-    }
-
-    /// Persist a settings change at once. A top-spacing change resizes the
-    /// daemon on the next render, since the skipped rows ride along.
-    fn save_settings(&mut self, cx: &mut Context<Self>) {
         self.settings.save(&self.pilus_root);
         *self.shared_settings.borrow_mut() = self.settings.clone();
         cx.notify();
@@ -8547,25 +7518,9 @@ impl PilusView {
     /// Drop what was learned about the session the window is leaving.
     ///
     /// Pane and workspace ids restart in every daemon, so a cache keyed by
-    /// one would answer for the wrong session: a parked Pi panel would reopen
-    /// another session's conversation on a pane of the same number, and a
-    /// remembered linked-worktree path would offer to delete it.
+    /// one would answer for the wrong session: a remembered linked-worktree
+    /// path would offer to delete it.
     fn forget_session_scoped_state(&mut self) {
-        self.pi_view = None;
-        self.session.close();
-        self.session.set_pinned(false);
-        for (_, mut panel, _) in self.pi_parked.drain(..) {
-            panel.close();
-        }
-        self.pi_released = None;
-        self.pi_optimistic = None;
-        self.pi_candidate = None;
-        self.pi_frame = None;
-        self.pi_focused = false;
-        self.pi_blurred_at = None;
-        self.recent_launches.clear();
-        self.workspace_focus.clear();
-        self.tab_focus.clear();
         self.worktree_linked.clear();
         self.worktree_probing.clear();
     }
@@ -10423,11 +9378,6 @@ impl PilusView {
             SIDEBAR_ROW_EDGE,
         ));
         content = content.child(self.new_workspace_row(cx));
-        // Auto mode replaces focused pi panes itself, so the manual toggle
-        // row only exists while the setting is off.
-        if !self.settings.pi_gui_auto {
-            content = content.child(self.session_row(cx));
-        }
         for kind in NavKind::ALL {
             content = content.child(self.nav_row(kind, cx));
         }
@@ -10502,42 +9452,6 @@ impl PilusView {
         self.leave_settings_page();
         self.tab_sel = Some(index);
         self.tab_sel_at = Instant::now();
-        // The tab restores the pane it last focused — the memory names it,
-        // so a pi there pins ahead of the snapshot like an agent row does.
-        // The live `agents` list re-validates it, so a pi that exited
-        // since cannot pin.
-        let workspace = self
-            .surface
-            .workspaces()
-            .iter()
-            .find(|workspace| workspace.active)
-            .map(|workspace| workspace.id.clone());
-        self.pi_optimistic = workspace
-            .and_then(|workspace| {
-                self.tab_focus
-                    .get(&(self.active.clone(), workspace, index))
-                    .filter(|agent| agent.agent == "pi")
-                    .and_then(|remembered| {
-                        self.agents
-                            .iter()
-                            .find(|agent| agent.pane == remembered.pane && agent.agent == "pi")
-                            .cloned()
-                    })
-            })
-            .map(|agent| {
-                (
-                    PiView {
-                        endpoint: self.active.clone(),
-                        pane: agent.pane.clone(),
-                        session: agent.session.clone(),
-                    },
-                    agent,
-                    Instant::now(),
-                )
-            });
-        if self.pi_optimistic.is_some() {
-            self.pi_released = None;
-        }
         if let Some(feed) = self.agent_feed.as_ref() {
             feed.focus_tab(index);
         }
@@ -12116,42 +11030,6 @@ impl PilusView {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_home(cx)))
     }
 
-    /// A "Pi Session" row: toggles the native session panel for the active
-    /// workspace.
-    fn session_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let selected = self.session.is_open();
-        div()
-            .id("pilus-pi-session")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(SIDEBAR_GLYPH_GAP))
-            .h(px(SIDEBAR_ROW_HEIGHT))
-            .pl(px(SIDEBAR_ROW_PAD))
-            .pr(px(SIDEBAR_ROW_PAD))
-            .radius_md()
-            .cursor_pointer()
-            .text_size(px(self.chrome_font()))
-            .text_color(theme.panel_fg)
-            .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
-            .child(style::hover_target(&self.sidebar_hover))
-            .child(icon(
-                include_bytes!("../../assets/icons/agents/pi.svg"),
-                SIDEBAR_GLYPH,
-                theme.muted,
-            ))
-            .child(div().flex_1().child("Pi Session"))
-            .on_click(cx.listener(|this, _, _, cx| {
-                if this.session.is_open() {
-                    this.session.close();
-                    cx.notify();
-                } else {
-                    this.open_session(cx);
-                }
-            }))
-    }
-
     /// Toggle the Home composer, shared by the Cmd+Shift+N chord and the
     /// sidebar's New Workspace row.
     fn toggle_home(&mut self, cx: &mut Context<Self>) {
@@ -12858,45 +11736,6 @@ impl PilusView {
     }
 }
 
-/// Where a split pane's panel sits inside the card, in card pixels. An
-/// edge on the card's own edge runs to it (`None` size), so the panel meets
-/// the card flush instead of stopping at the last whole cell.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct PanePlace {
-    left: f32,
-    top: f32,
-    width: Option<f32>,
-    height: Option<f32>,
-}
-
-/// A pane's cell span on the visible grid: `[col0, col1)` by `[row0, row1)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PaneCells {
-    col0: u16,
-    col1: u16,
-    row0: u16,
-    row1: u16,
-}
-
-/// Round a pane's fractional frame to the whole cells of a `cols` by
-/// `rows` grid.
-fn pane_cells(frame: PaneFrame, cols: u16, rows: u16) -> PaneCells {
-    let span = |start: f32, size: f32, cells: u16| {
-        let count = f32::from(cells);
-        let first = (start * count).round().clamp(0.0, count);
-        let last = ((start + size) * count).round().clamp(first, count);
-        (first as u16, last as u16)
-    };
-    let (col0, col1) = span(frame.x, frame.width, cols);
-    let (row0, row1) = span(frame.y, frame.height, rows);
-    PaneCells {
-        col0,
-        col1,
-        row0,
-        row1,
-    }
-}
-
 /// Daemon rows above the pane: the tab strip alone when the terminal takes
 /// top spacing, the tab strip and its title row otherwise.
 fn skipped_rows(top_spacing: bool) -> u16 {
@@ -12904,53 +11743,6 @@ fn skipped_rows(top_spacing: bool) -> u16 {
         SKIPPED_DAEMON_ROWS_UNTITLED
     } else {
         SKIPPED_DAEMON_ROWS
-    }
-}
-
-/// A copy of `frame` with the split pi pane's cells blanked.
-///
-/// The panel over the pane is glass under translucency, so whatever the
-/// cells beneath it hold — pi's own TUI — would read through it. Blank
-/// cells keep the grid's glass there and nothing else.
-fn mask_pane(frame: &FrameData, cells: PaneCells, skip_cols: u16, skip_rows: u16) -> FrameData {
-    let mut masked = frame.clone();
-    let width = usize::from(frame.width);
-    let col0 = usize::from(skip_cols.saturating_add(cells.col0)).min(width);
-    let col1 = usize::from(skip_cols.saturating_add(cells.col1)).min(width);
-    for row in cells.row0..cells.row1 {
-        let row = usize::from(skip_rows.saturating_add(row));
-        if row >= usize::from(frame.height) {
-            break;
-        }
-        let start = row * width;
-        if let Some(span) = masked.cells.get_mut(start + col0..start + col1) {
-            span.fill(CellData::default());
-        }
-    }
-    masked
-}
-
-/// Map a pane's fractional frame onto the card's whole-cell grid.
-fn pane_place(frame: PaneFrame, layout: &CardLayout) -> PanePlace {
-    let cells = pane_cells(frame, layout.cols, layout.rows);
-    let (col0, col1) = (f32::from(cells.col0), f32::from(cells.col1));
-    let (row0, row1) = (f32::from(cells.row0), f32::from(cells.row1));
-    let (to_right, to_bottom) = (cells.col1 >= layout.cols, cells.row1 >= layout.rows);
-    let left = if col0 <= 0.0 {
-        0.0
-    } else {
-        col0 * layout.cell_w
-    };
-    let top = if row0 <= 0.0 {
-        0.0
-    } else {
-        row0 * layout.cell_h
-    };
-    PanePlace {
-        left,
-        top,
-        width: (!to_right).then_some(col1 * layout.cell_w - left),
-        height: (!to_bottom).then_some(row1 * layout.cell_h - top),
     }
 }
 
@@ -13034,9 +11826,7 @@ impl Render for PilusView {
         // A native page that owns the whole card has no cells to carry the
         // glass, so it takes the chrome's denser coat: under translucency
         // its text would otherwise sit straight on the desktop.
-        let page_owns_card = self.home.is_open()
-            || self.settings_open
-            || (self.session.is_open() && self.pi_split().is_none());
+        let page_owns_card = self.home.is_open() || self.settings_open;
         let terminal_fill = if sealed {
             terminal_bg.opacity(0.0)
         } else {
@@ -13052,20 +11842,7 @@ impl Render for PilusView {
         } else {
             terminal_fill
         };
-        // Beside a split pi panel, the pane under it paints blank.
-        let masked = self
-            .pi_split()
-            .filter(|_| self.page_split().is_none())
-            .zip(self.shown_frame())
-            .map(|(pane, frame)| {
-                mask_pane(
-                    frame,
-                    pane_cells(pane, layout.cols, layout.rows),
-                    self.skipped_cols(),
-                    self.skipped_rows(),
-                )
-            });
-        let grid = match masked.as_ref().or(self.shown_frame()) {
+        let grid = match self.shown_frame() {
             Some(frame) => render_grid(
                 frame,
                 grid_theme,
@@ -13119,13 +11896,6 @@ impl Render for PilusView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    // A press beside a split pi panel focuses the pane under
-                    // it in the daemon; hand the keyboard back to the
-                    // terminal now rather than a reconcile later.
-                    if this.pi_focused && this.pi_split().is_some() {
-                        this.pi_focused = false;
-                        this.pi_blurred_at = Some(Instant::now());
-                    }
                     // A press on the terminal beside a split page takes the
                     // keyboard from the page.
                     if let Some(split) = this.page_split.as_mut() {
@@ -14305,63 +13075,6 @@ fn picker_option_row(
         .on_click(on_choose)
 }
 
-/// A picker's type-to-filter field: the query input beside the count of
-/// what it keeps. The field is interactive content, so it takes
-/// `theme.border` rather than the floating panel's hairline.
-fn picker_filter_field(
-    theme: Theme,
-    font_size: f32,
-    count: String,
-    input: Entity<TextInput>,
-) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .h(px(PICKER_FIELD_H))
-        .px_2()
-        .radius_md()
-        .border_1()
-        .border_color(theme.border)
-        .child(input)
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(px(font_size))
-                .text_color(theme.muted)
-                .child(count),
-        )
-}
-
-/// The exact pixel height of `rows` menu rows, so a menu that opens upward
-/// can offset by its full height.
-fn picker_rows_h(rows: usize) -> f32 {
-    // `p_1` top and bottom, `PICKER_ROW_H` rows, `gap_1` between them.
-    PICKER_PAD * 2.0 + rows as f32 * PICKER_ROW_H + rows.saturating_sub(1) as f32 * PICKER_GAP
-}
-
-/// The exact pixel height of a picker's virtualized option list.
-///
-/// Its rows pack without the gap a stacked menu puts between them — a
-/// virtualized list has no stacking to gap — which buys back the space a
-/// menu spends on the rows above.
-fn picker_body_h(rows: usize) -> f32 {
-    rows as f32 * PICKER_ROW_H
-}
-
-/// The exact pixel height of a composer picker menu: its padding, the
-/// filter field when the list is long enough to need one, and `rows`
-/// option rows.
-fn picker_menu_h(rows: usize, filtered: bool) -> f32 {
-    let field = if filtered {
-        PICKER_FIELD_H + PICKER_GAP
-    } else {
-        0.0
-    };
-    PICKER_PAD * 2.0 + field + picker_body_h(rows)
-}
-
 /// The leading glyph of one sidebar context-menu row.
 fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
     match item {
@@ -14663,30 +13376,6 @@ fn machine_status_text(machine: &MachineInfo, theme: Theme) -> (String, gpui::Rg
     }
 }
 
-/// Run one `luvus machine …` mutation, returning the error to show.
-fn run_machine_cli(root: &Path, args: Vec<String>) -> Result<(), String> {
-    let Some(binary) = luvus_binary() else {
-        return Err("luvus binary not found on PATH".to_string());
-    };
-    match std::process::Command::new(binary)
-        .arg("machine")
-        .args(&args)
-        .env(HOME_ENV, root)
-        .output()
-    {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(if stderr.is_empty() {
-                "The command failed.".to_string()
-            } else {
-                stderr
-            })
-        }
-        Err(error) => Err(error.to_string()),
-    }
-}
-
 /// Recover a `~`-shortened path by aligning `path` with a shorthand cwd.
 ///
 /// The daemon reports workspace cwds as `~`-shorthand but pane cwds absolute,
@@ -14778,20 +13467,6 @@ fn status_color(status: &str, theme: Theme) -> gpui::Rgba {
     }
 }
 
-/// A muted placeholder row for the AGENT CONFIG section.
-fn agent_config_empty(theme: Theme, message: &str, text_size: f32) -> Div {
-    div()
-        .mx_3()
-        .px_3()
-        .py_3()
-        .radius_md()
-        .border_1()
-        .border_color(theme.border)
-        .text_size(px(text_size))
-        .text_color(theme.muted)
-        .child(message.to_string())
-}
-
 /// Title-case the daemon's lowercase status (`working` -> `Working`).
 fn status_label(status: &str) -> String {
     let mut chars = status.chars();
@@ -14799,62 +13474,6 @@ fn status_label(status: &str) -> String {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
-}
-
-/// Record the snapshot's focused agent under its workspace and tab so a
-/// pilus-initiated `focus_workspace`/`focus_tab` can predict the pane the
-/// daemon restores, a reconcile before `agent.list` reports it. A group
-/// whose focused pane is a plain shell flags no agent, so its memory
-/// clears — the daemon restores that shell, not a stale pick.
-fn remember_focus(
-    agents: &[Agent],
-    workspaces: &[ShellWorkspace],
-    tabs: &[Tab],
-    active: &EndpointId,
-    workspace_focus: &mut HashMap<(EndpointId, String), Agent>,
-    tab_focus: &mut HashMap<(EndpointId, String, u16), Agent>,
-) {
-    if let Some(agent) = agents.iter().find(|agent| agent.focused) {
-        workspace_focus.insert((active.clone(), agent.workspace_id.clone()), agent.clone());
-        tab_focus.insert(
-            (active.clone(), agent.workspace_id.clone(), agent.tab),
-            agent.clone(),
-        );
-        return;
-    }
-    let Some(workspace) = workspaces
-        .iter()
-        .find(|workspace| workspace.active)
-        .map(|workspace| workspace.id.clone())
-    else {
-        return;
-    };
-    workspace_focus.remove(&(active.clone(), workspace.clone()));
-    if let Some(tab) = tabs.iter().find(|tab| tab.active) {
-        tab_focus.remove(&(active.clone(), workspace, tab.index));
-    }
-}
-
-/// The pending pilus-initiated pi pick, while it still stands: dropped
-/// once the snapshot shows its pane focused, once the active endpoint
-/// moves away (its pane id could collide there), or once its window
-/// lapses — the daemon may never confirm a guess that was wrong.
-fn optimistic_pick(
-    agents: &[Agent],
-    active: &EndpointId,
-    optimistic: &mut Option<(PiView, Agent, Instant)>,
-) -> Option<(PiView, Agent)> {
-    let (view, agent, at) = optimistic.as_ref()?;
-    let confirmed = view.endpoint == *active
-        && agents
-            .iter()
-            .find(|agent| agent.focused)
-            .is_some_and(|agent| agent.pane == view.pane);
-    if confirmed || view.endpoint != *active || at.elapsed() >= PI_OPTIMISTIC_WINDOW {
-        *optimistic = None;
-        return None;
-    }
-    Some((view.clone(), agent.clone()))
 }
 
 /// Whether a daemon's reported sidebars match the window's layout, ignoring
@@ -14893,7 +13512,7 @@ fn launch_home_agent(
     agent: &str,
     args: &[String],
     prompt: &str,
-) -> Result<(String, Option<Agent>), String> {
+) -> Result<(String, Option<String>), String> {
     client
         .open_workspace(location)
         .map_err(|error| error.to_string())?;
@@ -14914,16 +13533,7 @@ fn launch_home_agent(
     client
         .prompt_agent(target, prompt)
         .map_err(|error| error.to_string())?;
-    // The pane is known before `agent.list` lists the agent: a record made
-    // now lets the pin follow the launch instead of waiting a reconcile.
-    let launched = pane.map(|pane| Agent {
-        pane,
-        agent: agent.to_string(),
-        name: name.to_string(),
-        cwd: location.to_string(),
-        ..Agent::default()
-    });
-    Ok((format!("started {agent} as {name}"), launched))
+    Ok((format!("started {agent} as {name}"), pane))
 }
 
 #[cfg(test)]
@@ -14960,271 +13570,10 @@ mod tests {
         }
     }
 
-    fn agent(agent: &str, focused: bool, session: Option<&str>) -> Agent {
-        Agent {
-            pane: "7".to_string(),
-            agent: agent.to_string(),
-            focused,
-            session: session.map(str::to_string),
-            ..Agent::default()
-        }
-    }
-
-    #[test]
-    fn pi_view_needs_auto_mode_and_a_focused_pi() {
-        let endpoint = EndpointId::Local;
-        let focused = vec![agent("pi", true, Some("s1"))];
-        // Auto off always declines, even with a live report in front.
-        assert_eq!(
-            PilusView::pi_view_for(&focused, false, &endpoint, None),
-            None
-        );
-        // A non-pi pane stays terminal.
-        let non_pi = vec![agent("claude", true, Some("s1"))];
-        assert_eq!(PilusView::pi_view_for(&non_pi, true, &endpoint, None), None);
-        // An unfocused pi is nobody's foreground.
-        let background = vec![agent("pi", false, Some("s1"))];
-        assert_eq!(
-            PilusView::pi_view_for(&background, true, &endpoint, None),
-            None
-        );
-    }
-
-    #[test]
-    fn a_split_pane_maps_onto_whole_cells_and_meets_the_card_edges() {
-        let layout = CardLayout {
-            card_x: 0.0,
-            card_right: 0.0,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            cols: 80,
-            rows: 24,
-            cell_w: 8.0,
-            cell_h: 16.0,
-            slack_x: 0.0,
-            slack_y: 0.0,
-            page_w: 0.0,
-            page_h: 0.0,
-            content_w: 640.0,
-        };
-        let right_half = PaneFrame {
-            x: 0.5,
-            y: 0.0,
-            width: 0.5,
-            height: 1.0,
-        };
-        let place = pane_place(right_half, &layout);
-        assert_eq!(place.left, 40.0 * 8.0);
-        assert_eq!(place.top, 0.0);
-        // Its right and bottom edges are the card's.
-        assert_eq!((place.width, place.height), (None, None));
-        let top_left = PaneFrame {
-            x: 0.0,
-            y: 0.0,
-            width: 0.5,
-            height: 0.5,
-        };
-        let place = pane_place(top_left, &layout);
-        assert_eq!((place.left, place.top), (0.0, 0.0));
-        assert_eq!(place.width, Some(40.0 * 8.0));
-        assert_eq!(place.height, Some(12.0 * 16.0));
-    }
-
     #[test]
     fn top_spacing_keeps_the_row_under_the_daemon_tab_strip() {
         assert_eq!(skipped_rows(true), 1);
         assert_eq!(skipped_rows(false), SKIPPED_DAEMON_ROWS);
-    }
-
-    #[test]
-    fn a_split_pi_pane_is_blanked_under_its_panel() {
-        let mut frame = FrameData::blank(6, SKIPPED_DAEMON_ROWS + 2, 0x00ff_ffff, 0);
-        for cell in &mut frame.cells {
-            cell.symbol = "x".to_string();
-        }
-        // Right half of a 4-column visible grid behind a 2-column dock.
-        let cells = pane_cells(
-            PaneFrame {
-                x: 0.5,
-                y: 0.0,
-                width: 0.5,
-                height: 1.0,
-            },
-            4,
-            2,
-        );
-        let masked = mask_pane(&frame, cells, 2, SKIPPED_DAEMON_ROWS);
-        let row = usize::from(SKIPPED_DAEMON_ROWS) * 6;
-        let symbols: Vec<&str> = masked.cells[row..row + 6].iter().map(symbol).collect();
-        assert_eq!(symbols, ["x", "x", "x", "x", " ", " "]);
-    }
-
-    #[test]
-    fn pi_view_falls_back_to_a_pi_sharing_the_visible_tab() {
-        let endpoint = EndpointId::Local;
-        let mut split = agent("pi", false, Some("s1"));
-        split.workspace_id = "w1".to_string();
-        split.tab = 2;
-        let agents = vec![split];
-        // Beside the focused shell in the visible tab, the pi is a split.
-        let Some((view, agent)) = PilusView::pi_view_for(&agents, true, &endpoint, Some(("w1", 2)))
-        else {
-            panic!("a pi in the visible tab is on screen");
-        };
-        assert_eq!(view.pane, "7");
-        assert!(!agent.focused);
-        // Another tab or workspace hides it.
-        assert_eq!(
-            PilusView::pi_view_for(&agents, true, &endpoint, Some(("w1", 1))),
-            None
-        );
-        assert_eq!(
-            PilusView::pi_view_for(&agents, true, &endpoint, Some(("w2", 2))),
-            None
-        );
-    }
-
-    #[test]
-    fn pi_view_reports_the_focused_pane() {
-        let endpoint = EndpointId::Local;
-        let agents = vec![agent("pi", true, Some("s1"))];
-        let Some((view, _)) = PilusView::pi_view_for(&agents, true, &endpoint, None) else {
-            panic!("a focused, reporting pi must be chosen");
-        };
-        assert_eq!(view.pane, "7");
-        assert_eq!(view.session.as_deref(), Some("s1"));
-        assert_eq!(view.endpoint, endpoint);
-    }
-
-    #[test]
-    fn pi_view_pins_a_pi_that_has_not_reported() {
-        // A focused pi without a report still pins: the waiting panel is
-        // what keeps the terminal from flashing before the report lands.
-        let endpoint = EndpointId::Local;
-        let agents = vec![agent("pi", true, None)];
-        let Some((view, _)) = PilusView::pi_view_for(&agents, true, &endpoint, None) else {
-            panic!("a focused pi pins even without a session");
-        };
-        assert_eq!(view.pane, "7");
-        assert_eq!(view.session, None);
-    }
-
-    fn workspace(id: &str, active: bool) -> ShellWorkspace {
-        ShellWorkspace {
-            dot: String::new(),
-            dot_color: 0,
-            id: id.to_string(),
-            index: 0,
-            name: String::new(),
-            cwd: String::new(),
-            branch: None,
-            active,
-            selected: false,
-            nested: false,
-        }
-    }
-
-    #[test]
-    fn focus_memory_records_workspace_and_tab() {
-        let endpoint = EndpointId::Local;
-        let mut workspaces = HashMap::new();
-        let mut tabs = HashMap::new();
-        let mut pi = agent("pi", true, Some("s1"));
-        pi.workspace_id = "w1".to_string();
-        pi.tab = 2;
-        remember_focus(
-            &[pi.clone()],
-            &[],
-            &[],
-            &endpoint,
-            &mut workspaces,
-            &mut tabs,
-        );
-        assert_eq!(
-            workspaces.get(&(endpoint.clone(), "w1".to_string())),
-            Some(&pi)
-        );
-        assert_eq!(tabs.get(&(endpoint, "w1".to_string(), 2)), Some(&pi));
-    }
-
-    #[test]
-    fn focus_memory_clears_a_group_focused_on_a_shell() {
-        let endpoint = EndpointId::Local;
-        let mut workspaces = HashMap::new();
-        let mut tabs = HashMap::new();
-        let mut pi = agent("pi", false, None);
-        pi.workspace_id = "w1".to_string();
-        pi.tab = 2;
-        workspaces.insert((endpoint.clone(), "w1".to_string()), pi.clone());
-        tabs.insert((endpoint.clone(), "w1".to_string(), 2), pi.clone());
-        // An unfocused agent means the active group's focused pane is a
-        // shell; both memories drop their entries for it.
-        remember_focus(
-            &[pi],
-            &[workspace("w1", true)],
-            &[Tab {
-                index: 2,
-                active: true,
-                ..Tab::default()
-            }],
-            &endpoint,
-            &mut workspaces,
-            &mut tabs,
-        );
-        assert!(workspaces.is_empty());
-        assert!(tabs.is_empty());
-    }
-
-    #[test]
-    fn optimistic_pick_stands_until_the_snapshot_confirms() {
-        let endpoint = EndpointId::Local;
-        let mut pi = agent("pi", false, Some("s1"));
-        pi.workspace_id = "w1".to_string();
-        let view = PiView {
-            endpoint: endpoint.clone(),
-            pane: pi.pane.clone(),
-            session: pi.session.clone(),
-        };
-        let mut optimistic = Some((view.clone(), pi.clone(), Instant::now()));
-        // The daemon still shows another pane focused: the pick stands.
-        let mut other = agent("claude", true, None);
-        other.pane = "9".to_string();
-        let pending = vec![pi.clone(), other.clone()];
-        assert_eq!(
-            optimistic_pick(&pending, &endpoint, &mut optimistic).map(|(v, _)| v.pane),
-            Some("7".to_string())
-        );
-        // The next snapshot focuses the pick: the pin resolves and drops.
-        let confirmed = vec![agent("pi", true, Some("s1")), other];
-        assert_eq!(
-            optimistic_pick(&confirmed, &endpoint, &mut optimistic),
-            None
-        );
-        assert!(optimistic.is_none());
-    }
-
-    #[test]
-    fn optimistic_pick_drops_on_endpoint_drift_and_age() {
-        let local = EndpointId::Local;
-        let machine = EndpointId::Machine("m1".to_string());
-        let pi = agent("pi", false, None);
-        let view = PiView {
-            endpoint: local.clone(),
-            pane: pi.pane.clone(),
-            session: None,
-        };
-        // A pick made for one endpoint cannot survive a switch to another.
-        let mut optimistic = Some((view.clone(), pi.clone(), Instant::now()));
-        assert_eq!(optimistic_pick(&[], &machine, &mut optimistic), None);
-        assert!(optimistic.is_none());
-        // A pick the daemon never confirms expires with its window.
-        let mut optimistic = Some((
-            view,
-            pi,
-            Instant::now() - PI_OPTIMISTIC_WINDOW - Duration::from_secs(1),
-        ));
-        assert_eq!(optimistic_pick(&[], &local, &mut optimistic), None);
-        assert!(optimistic.is_none());
     }
 
     #[test]
@@ -15510,50 +13859,33 @@ mod tests {
     #[test]
     fn overlays_own_the_keyboard_over_content() {
         // Each content page owns the keyboard on its own...
+        assert_eq!(top_layer(false, false, true, false, None), InputLayer::Home);
         assert_eq!(
-            top_layer(false, false, true, false, None, false),
-            InputLayer::Home
-        );
-        assert_eq!(
-            top_layer(false, false, false, true, None, false),
+            top_layer(false, false, false, true, None),
             InputLayer::Settings
-        );
-        assert_eq!(
-            top_layer(false, false, false, false, None, true),
-            InputLayer::Session
         );
         // ...but an overlay opened above one takes over.
         assert_eq!(
-            top_layer(false, true, true, false, None, false),
+            top_layer(false, true, true, false, None),
             InputLayer::Palette
         );
         assert_eq!(
-            top_layer(false, true, false, true, None, false),
+            top_layer(false, true, false, true, None),
             InputLayer::Palette
         );
         // The folder picker is the topmost overlay.
+        assert_eq!(top_layer(true, true, true, true, None), InputLayer::Picker);
         assert_eq!(
-            top_layer(true, true, true, true, None, true),
-            InputLayer::Picker
-        );
-        assert_eq!(
-            top_layer(false, false, false, false, Some(InputLayer::Mission), true),
+            top_layer(false, false, false, false, Some(InputLayer::Mission)),
             InputLayer::Mission
         );
         assert_eq!(
-            top_layer(
-                false,
-                false,
-                false,
-                false,
-                Some(InputLayer::Automations),
-                true
-            ),
+            top_layer(false, false, false, false, Some(InputLayer::Automations)),
             InputLayer::Automations
         );
         // With nothing open, the grid has it.
         assert_eq!(
-            top_layer(false, false, false, false, None, false),
+            top_layer(false, false, false, false, None),
             InputLayer::Terminal
         );
     }

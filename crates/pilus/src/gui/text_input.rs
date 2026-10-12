@@ -551,10 +551,6 @@ pub(super) struct TextInput {
     /// Whether a bare Enter should be left to the window (to send) instead of
     /// inserting a newline. Shift+Enter always inserts one.
     enter_submits: bool,
-    /// Whether up and down belong to an overlay instead of the caret. A
-    /// picker opened over the composer walks its own rows with them, while
-    /// the caret keeps every other editing key.
-    surrender_vertical: bool,
     /// Whether the caret is in its visible blink phase.
     caret_on: bool,
     /// Whether the field held focus at the last paint. The blink task idles
@@ -620,7 +616,6 @@ impl TextInput {
             theme,
             dragging: false,
             enter_submits: false,
-            surrender_vertical: false,
             caret_on: true,
             focused: false,
             blink_started: false,
@@ -632,12 +627,6 @@ impl TextInput {
     pub(super) fn submit_on_enter(mut self) -> Self {
         self.enter_submits = true;
         self
-    }
-
-    /// Give up and down to whatever overlay is open above the field, so it
-    /// can walk its own rows. The caret keeps horizontal movement.
-    pub(super) fn surrender_vertical_keys(&mut self, surrender: bool) {
-        self.surrender_vertical = surrender;
     }
 
     /// Update the theme and type size to the window's current settings.
@@ -772,7 +761,7 @@ impl TextInput {
             "up" => {
                 // Single-line fields leave vertical movement to the window,
                 // which uses it to walk list rows.
-                if !self.multiline || self.surrender_vertical {
+                if !self.multiline {
                     return false;
                 }
                 self.buffer.borrow_mut().move_vertical(false, extend);
@@ -780,7 +769,7 @@ impl TextInput {
                 true
             }
             "down" => {
-                if !self.multiline || self.surrender_vertical {
+                if !self.multiline {
                     return false;
                 }
                 self.buffer.borrow_mut().move_vertical(true, extend);

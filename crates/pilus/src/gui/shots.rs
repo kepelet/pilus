@@ -11,7 +11,6 @@
 //! macOS requires before it will hand out a Metal device.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +18,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, HeadlessAppContext, Render, Window, point, px, size};
 
-use super::machines::MachineManagerView;
-use super::session::{HistoryEntry, PickerKind};
+use super::machines::AddMachineView;
 use super::theme::Theme;
 use super::update_window::UpdateWindow;
 use super::updater::Updater;
@@ -30,23 +28,8 @@ use crate::settings::Settings;
 /// Where the captured frames are written.
 const OUT: &str = "/tmp/pilus-shots";
 
-/// A deterministic session for the transcript shot, covering every item kind
-/// the native window draws.
-const SAMPLE_SESSION: &str = r#"{"type":"session","version":3,"id":"shot-0001","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/Users/dev/projects/api"}
-{"type":"session_info","id":"n0","parentId":null,"timestamp":"2024-12-03T14:00:00.500Z","name":"Refactor auth module"}
-{"type":"model_change","id":"m0","parentId":"n0","timestamp":"2024-12-03T14:00:01.000Z","provider":"anthropic","modelId":"claude-sonnet-4-5"}
-{"type":"thinking_level_change","id":"t0","parentId":"m0","timestamp":"2024-12-03T14:00:01.500Z","thinkingLevel":"high"}
-{"type":"message","id":"u1","parentId":"m0","timestamp":"2024-12-03T14:00:02.000Z","message":{"role":"user","content":"Add a token refresh to the auth module and cover it with a test.","timestamp":1733234402000}}
-{"type":"message","id":"a1","parentId":"u1","timestamp":"2024-12-03T14:00:04.000Z","message":{"role":"assistant","api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":1200,"output":210,"cacheRead":800,"cacheWrite":0,"totalTokens":2210,"cost":{"input":0.0036,"output":0.0031,"cacheRead":0.0002,"cacheWrite":0,"total":0.0069}},"stopReason":"toolUse","timestamp":1733234404000,"content":[{"type":"thinking","thinking":"Read the auth module first, then add refresh."},{"type":"text","text":"I'll read the auth module before changing it."},{"type":"toolCall","id":"c1","name":"read","arguments":{"path":"src/auth.rs","offset":0,"limit":120}},{"type":"toolCall","id":"c3","name":"bash","arguments":{"command":"cargo test auth","timeout":30}}]}}
-{"type":"message","id":"r1","parentId":"a1","timestamp":"2024-12-03T14:00:05.000Z","message":{"role":"toolResult","toolCallId":"c1","toolName":"read","content":[{"type":"text","text":"pub struct Session {\n    token: String,\n    expires_at: i64,\n}\n\npub fn refresh(session: &mut Session) -> Result<(), Error> {\n    // TODO: implement\n    Ok(())\n}"}],"isError":false,"timestamp":1733234405000}}
-{"type":"message","id":"r3","parentId":"r1","timestamp":"2024-12-03T14:00:05.500Z","message":{"role":"toolResult","toolCallId":"c3","toolName":"bash","content":[{"type":"text","text":"running 4 tests\ntest auth::refresh ... ok\ntest result: ok. 4 passed"}],"isError":false,"timestamp":1733234405500}}
-{"type":"message","id":"b1","parentId":"r1","timestamp":"2024-12-03T14:00:06.000Z","message":{"role":"bashExecution","command":"cargo test auth","output":"running 4 tests\ntest auth::refresh ... ok\ntest result: ok. 4 passed","exitCode":0,"cancelled":false,"truncated":false,"timestamp":1733234406000}}
-{"type":"message","id":"a2","parentId":"b1","timestamp":"2024-12-03T14:00:08.000Z","message":{"role":"assistant","api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":2400,"output":180,"cacheRead":0,"cacheWrite":0,"totalTokens":2580,"cost":{"input":0.0072,"output":0.0027,"cacheRead":0,"cacheWrite":0,"total":0.0099}},"stopReason":"toolUse","timestamp":1733234408000,"content":[{"type":"text","text":"**Plan**\n\n1. Implement `refresh`.\n2. Cover it with a test.\n\n```rust\npub fn refresh(s: &mut Session) -> Result<(), Error> {\n    s.token = request_refresh(&s.token)?;\n    Ok(())\n}\n```\n\nSee [the docs](https://example.com) for details, or the **bold** note below.\n\n> Refreshing must be idempotent."},{"type":"toolCall","id":"c2","name":"edit","arguments":{"path":"src/auth.rs","edits":[{"oldText":"// TODO: implement","newText":"self.token = request_refresh(&self.token)?;"}]}}]}}
-{"type":"compaction","id":"k1","parentId":"a2","timestamp":"2024-12-03T14:01:00.000Z","summary":"Implemented token refresh and its regression test.","firstKeptEntryId":"a2","tokensBefore":42000}
-"#;
-
-/// Width of the session captures; `PILUS_SHOT_WIDTH` narrows them to exercise
-/// the compact composer.
+/// Width of the standalone main-window captures; `PILUS_SHOT_WIDTH` narrows
+/// them to exercise compact layouts.
 fn shot_width() -> f32 {
     std::env::var("PILUS_SHOT_WIDTH")
         .ok()
@@ -166,14 +149,14 @@ pub fn run() -> Result<()> {
     )?;
     shoot(
         &mut cx,
-        "machines",
-        820.0,
-        600.0,
-        Duration::from_millis(1500),
+        "add-machine",
+        560.0,
+        300.0,
+        Duration::from_millis(400),
         |window, cx| {
             let root = pilus_client::config_dir();
             cx.new(|cx| {
-                MachineManagerView::new(
+                AddMachineView::new(
                     root,
                     Rc::new(RefCell::new(MachineSignal::default())),
                     Rc::new(RefCell::new(Theme::default())),
@@ -214,311 +197,6 @@ pub fn run() -> Result<()> {
             cx.new(|cx| UpdateWindow::new(updater, Theme::default(), settings(), window, cx))
         },
     )?;
-    // The native Pi Session panel, inside the main window. Written to a temp
-    // file so the shot is deterministic and independent of the machine's own
-    // pi sessions; no daemon is needed because the spec is an explicit file.
-    let sample = std::env::temp_dir().join("pilus-shot-session.jsonl");
-    std::fs::write(&sample, SAMPLE_SESSION).context("write sample session")?;
-    let spec = sample.to_string_lossy().into_owned();
-    shoot(
-        &mut cx,
-        "session",
-        1240.0,
-        780.0,
-        Duration::from_millis(400),
-        move |window, cx| {
-            let spec = spec.clone();
-            cx.new(move |cx| {
-                PilusView::new(
-                    pilus_client::ConnectTarget::local(),
-                    None,
-                    settings(),
-                    Rc::new(RefCell::new(MachineSignal::default())),
-                    Rc::new(RefCell::new(Theme::default())),
-                    Some(spec),
-                    window,
-                    cx,
-                )
-            })
-        },
-    )?;
-    // The same panel with a few cards expanded, to review the body layout and
-    // the Markdown rendering.
-    {
-        let cell: Rc<RefCell<Option<gpui::Entity<PilusView>>>> = Rc::new(RefCell::new(None));
-        let slot = cell.clone();
-        let spec = sample.to_string_lossy().into_owned();
-        let window = cx
-            .open_window(size(px(shot_width()), px(780.0)), move |window, cx| {
-                let view = cx.new(move |cx| {
-                    PilusView::new(
-                        pilus_client::ConnectTarget::local(),
-                        None,
-                        settings(),
-                        Rc::new(RefCell::new(MachineSignal::default())),
-                        Rc::new(RefCell::new(Theme::default())),
-                        Some(spec),
-                        window,
-                        cx,
-                    )
-                });
-                *slot.borrow_mut() = Some(view.clone());
-                view
-            })
-            .context("open session-expanded")?;
-        std::thread::sleep(Duration::from_millis(400));
-        cx.run_until_parked();
-        if let Some(view) = cell.borrow().clone() {
-            cx.update(|app| {
-                view.update(app, |view, cx| {
-                    // A reported state paints the context chip and the
-                    // picker's live model, exactly as an RPC-up panel shows.
-                    view.session.pi_state = Some(pilus_session::PiState {
-                        context: Some(pilus_session::ContextUsage {
-                            tokens: Some(655_360),
-                            context_window: 1_048_576,
-                            percent: Some(62.5),
-                        }),
-                        model: Some(pilus_session::PiModel {
-                            provider: "opencode-go".to_string(),
-                            id: "muse-spark-1.3-contributor".to_string(),
-                            name: "Muse Spark 1.3 Contributor".to_string(),
-                            ..pilus_session::PiModel::default()
-                        }),
-                        thinking: Some("high".to_string()),
-                        ..pilus_session::PiState::default()
-                    });
-                    view.session.toggle(4);
-                    view.session.toggle_work(6);
-                    view.session.toggle_group(6);
-                    view.session.toggle(6);
-                    cx.notify();
-                });
-            });
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        cx.run_until_parked();
-        let image = cx
-            .capture_screenshot(window.into())
-            .context("capture session-expanded")?;
-        std::fs::create_dir_all(OUT).context("create shots dir")?;
-        image
-            .save(format!("{OUT}/session-expanded.png"))
-            .context("save session-expanded")?;
-        println!("shot: {OUT}/session-expanded.png");
-    }
-    // The model picker over a catalog far longer than the rows that fit:
-    // the filter field, the provider hint, and the virtualized list
-    // scrolled to the live model, which sits deep in the catalog.
-    {
-        let cell: Rc<RefCell<Option<gpui::Entity<PilusView>>>> = Rc::new(RefCell::new(None));
-        let slot = cell.clone();
-        let spec = sample.to_string_lossy().into_owned();
-        let window = cx
-            .open_window(size(px(shot_width()), px(780.0)), move |window, cx| {
-                let view = cx.new(move |cx| {
-                    PilusView::new(
-                        pilus_client::ConnectTarget::local(),
-                        None,
-                        settings(),
-                        Rc::new(RefCell::new(MachineSignal::default())),
-                        Rc::new(RefCell::new(Theme::default())),
-                        Some(spec),
-                        window,
-                        cx,
-                    )
-                });
-                *slot.borrow_mut() = Some(view.clone());
-                view
-            })
-            .context("open session-picker")?;
-        std::thread::sleep(Duration::from_millis(400));
-        cx.run_until_parked();
-        if let Some(view) = cell.borrow().clone() {
-            cx.update(|app| {
-                view.update(app, |view, cx| {
-                    view.session.pi_state = Some(pilus_session::PiState {
-                        model: Some(pilus_session::PiModel {
-                            provider: "opencode-go".to_string(),
-                            id: "model-57".to_string(),
-                            name: "Model 57".to_string(),
-                            ..pilus_session::PiModel::default()
-                        }),
-                        thinking: Some("high".to_string()),
-                        ..pilus_session::PiState::default()
-                    });
-                    view.session.set_catalog(
-                        (0..60)
-                            .map(|ix| pilus_client::AgentModel {
-                                provider: if ix % 3 == 0 {
-                                    "opencode-go".to_string()
-                                } else {
-                                    "openrouter".to_string()
-                                },
-                                id: format!("model-{ix}"),
-                                name: format!("Model {ix}"),
-                                ..pilus_client::AgentModel::default()
-                            })
-                            .collect(),
-                    );
-                    view.session.open_picker_shot(PickerKind::Model);
-                    cx.notify();
-                });
-            });
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        cx.run_until_parked();
-        let image = cx
-            .capture_screenshot(window.into())
-            .context("capture session-picker")?;
-        std::fs::create_dir_all(OUT).context("create shots dir")?;
-        image
-            .save(format!("{OUT}/session-picker.png"))
-            .context("save session-picker")?;
-        println!("shot: {OUT}/session-picker.png");
-        // The thinking picker, whose seven levels all fit, so it draws no
-        // filter field.
-        if let Some(view) = cell.borrow().clone() {
-            cx.update(|app| {
-                view.update(app, |view, cx| {
-                    view.session.open_picker_shot(PickerKind::Thinking);
-                    cx.notify();
-                });
-            });
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        cx.run_until_parked();
-        let image = cx
-            .capture_screenshot(window.into())
-            .context("capture session-picker-thinking")?;
-        image
-            .save(format!("{OUT}/session-picker-thinking.png"))
-            .context("save session-picker-thinking")?;
-        println!("shot: {OUT}/session-picker-thinking.png");
-        // The picker before the catalog lands: skeleton rows hold the space
-        // the options will take, so the menu never flashes empty.
-        if let Some(view) = cell.borrow().clone() {
-            cx.update(|app| {
-                view.update(app, |view, cx| {
-                    view.session.set_catalog_loading(true);
-                    view.session.open_picker_shot(PickerKind::Thinking);
-                    cx.notify();
-                });
-            });
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        cx.run_until_parked();
-        let image = cx
-            .capture_screenshot(window.into())
-            .context("capture session-picker-loading")?;
-        std::fs::create_dir_all(OUT).context("create shots dir")?;
-        image
-            .save(format!("{OUT}/session-picker-loading.png"))
-            .context("save session-picker-loading")?;
-        println!("shot: {OUT}/session-picker-loading.png");
-    }
-    // The session history menu under the header's clock button, with the
-    // live session marked and older ones titled by their openers.
-    {
-        let cell: Rc<RefCell<Option<gpui::Entity<PilusView>>>> = Rc::new(RefCell::new(None));
-        let slot = cell.clone();
-        let spec = sample.to_string_lossy().into_owned();
-        let window = cx
-            .open_window(size(px(shot_width()), px(780.0)), move |window, cx| {
-                let view = cx.new(move |cx| {
-                    PilusView::new(
-                        pilus_client::ConnectTarget::local(),
-                        None,
-                        settings(),
-                        Rc::new(RefCell::new(MachineSignal::default())),
-                        Rc::new(RefCell::new(Theme::default())),
-                        Some(spec),
-                        window,
-                        cx,
-                    )
-                });
-                *slot.borrow_mut() = Some(view.clone());
-                view
-            })
-            .context("open session-history")?;
-        std::thread::sleep(Duration::from_millis(400));
-        cx.run_until_parked();
-        if let Some(view) = cell.borrow().clone() {
-            cx.update(|app| {
-                view.update(app, |view, cx| {
-                    let entry = |id: &str, title: &str| HistoryEntry {
-                        path: PathBuf::from(format!("/tmp/{id}.jsonl")),
-                        id: id.to_string(),
-                        title: title.to_string(),
-                    };
-                    view.session.open_history_shot(vec![
-                        entry("shot-0001", "Refactor the auth module"),
-                        entry("shot-0000", "Add a retry to the uploader"),
-                        entry("shot-0002", ""),
-                    ]);
-                    cx.notify();
-                });
-            });
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        cx.run_until_parked();
-        let image = cx
-            .capture_screenshot(window.into())
-            .context("capture session-history")?;
-        std::fs::create_dir_all(OUT).context("create shots dir")?;
-        image
-            .save(format!("{OUT}/session-history.png"))
-            .context("save session-history")?;
-        println!("shot: {OUT}/session-history.png");
-    }
-    // The waiting panel a focused pi gets before its extension reports:
-    // the auto pin's stand-in while the socket is discovered.
-    {
-        let cell: Rc<RefCell<Option<gpui::Entity<PilusView>>>> = Rc::new(RefCell::new(None));
-        let slot = cell.clone();
-        let window = cx
-            .open_window(size(px(shot_width()), px(780.0)), move |window, cx| {
-                let view = cx.new(move |cx| {
-                    PilusView::new(
-                        pilus_client::ConnectTarget::local(),
-                        None,
-                        settings(),
-                        Rc::new(RefCell::new(MachineSignal::default())),
-                        Rc::new(RefCell::new(Theme::default())),
-                        None,
-                        window,
-                        cx,
-                    )
-                });
-                *slot.borrow_mut() = Some(view.clone());
-                view
-            })
-            .context("open session-waiting")?;
-        if let Some(view) = cell.borrow().clone() {
-            cx.update(|app| {
-                view.update(app, |view, cx| {
-                    view.session.open_local_session(
-                        PathBuf::from("/tmp/pilus-shot-api.sock"),
-                        "~/work/repo".to_string(),
-                        None,
-                        "shot-pane".to_string(),
-                        cx,
-                    );
-                    cx.notify();
-                });
-            });
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        cx.run_until_parked();
-        let image = cx
-            .capture_screenshot(window.into())
-            .context("capture session-waiting")?;
-        std::fs::create_dir_all(OUT).context("create shots dir")?;
-        image
-            .save(format!("{OUT}/session-waiting.png"))
-            .context("save session-waiting")?;
-        println!("shot: {OUT}/session-waiting.png");
-    }
     // The Tasks page, seeded with one task per interesting status: the list,
     // a selected task's detail pane, and the new-task composer. It needs no
     // daemon, so it rides the standalone captures.
@@ -534,7 +212,6 @@ pub fn run() -> Result<()> {
                         settings(),
                         Rc::new(RefCell::new(MachineSignal::default())),
                         Rc::new(RefCell::new(Theme::default())),
-                        None,
                         window,
                         cx,
                     )
@@ -909,7 +586,6 @@ pub fn run_main() -> Result<()> {
                     settings(),
                     Rc::new(RefCell::new(MachineSignal::default())),
                     Rc::new(RefCell::new(Theme::default())),
-                    None,
                     window,
                     cx,
                 )
@@ -1368,7 +1044,7 @@ pub fn run_main() -> Result<()> {
         view.update(app, |view, _| view.home.close_dropdown());
     });
 
-    // The Settings page: machines, agent config, updates. Remote access is
+    // The Settings page: machines, notifications, updates. Remote access is
     // shown running with a live pairing code and two paired devices, the state
     // with the most to draw.
     super::connector::preview(remote_access_fixture(true));

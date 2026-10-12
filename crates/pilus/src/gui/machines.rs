@@ -1,7 +1,8 @@
-//! The native Remote Machines window.
+//! The native Add Machine window, and the `luvus machine` operations the
+//! Settings page runs on saved machines.
 //!
-//! It is a thin, owner-local manager over the `luvus machine` CLI: the daemon
-//! exposes no machine method, so listing, adding, enabling, disabling, and
+//! Both are thin, owner-local wrappers over the `luvus machine` CLI: the daemon
+//! exposes no machine method, so adding, enabling, disabling, upgrading, and
 //! removing profiles all shell out with `LUVUS_HOME` pinned to this client's
 //! state root. Every mutation bumps a shared revision so open main windows
 //! reload the catalog immediately.
@@ -10,29 +11,28 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, Div, Entity, FocusHandle, Focusable, Font, KeyDownEvent, MouseButton,
-    Pixels, Render, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    App, Bounds, Context, Div, Entity, FocusHandle, Focusable, Font, KeyDownEvent, Pixels, Render,
+    Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use pilus_client::{
-    HOME_ENV, MachineInfo, find_installed_binary, is_behind, list_machines, luvus_binary,
-    refresh_machines, restart_remote, stop_remote,
+    HOME_ENV, find_installed_binary, list_machines, luvus_binary, restart_remote, stop_remote,
 };
 
 use crate::settings::Settings;
 
-use super::style::{self, ButtonKind, RadiusExt};
+use super::style::{self, ButtonKind};
 use super::text_input::TextInput;
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, MachineSignal};
 
-/// Width and height of the machines window.
-const WINDOW_SIZE: (f32, f32) = (820.0, 600.0);
-/// The smallest the window can be dragged to: below this its rows and
-/// controls start to clip.
-const WINDOW_MIN_SIZE: (f32, f32) = (640.0, 420.0);
+/// Width and height of the add-machine window.
+const WINDOW_SIZE: (f32, f32) = (560.0, 300.0);
+/// The smallest the window can be dragged to: below this its fields start to
+/// clip.
+const WINDOW_MIN_SIZE: (f32, f32) = (440.0, 280.0);
 
 /// One editable field in the add form.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,13 +80,8 @@ struct Form {
 }
 
 impl Form {
-    fn new(
-        font: &Font,
-        font_size: Pixels,
-        theme: Theme,
-        cx: &mut Context<MachineManagerView>,
-    ) -> Self {
-        let input = |cx: &mut Context<MachineManagerView>, placeholder: &'static str| {
+    fn new(font: &Font, font_size: Pixels, theme: Theme, cx: &mut Context<AddMachineView>) -> Self {
+        let input = |cx: &mut Context<AddMachineView>, placeholder: &'static str| {
             cx.new(|cx| {
                 TextInput::new(
                     String::new(),
@@ -138,8 +133,8 @@ impl Form {
     }
 }
 
-/// One CLI mutation requested by the window.
-enum MachineOp {
+/// One CLI mutation on a machine profile.
+pub(super) enum MachineOp {
     Add {
         id: String,
         host: String,
@@ -149,7 +144,6 @@ enum MachineOp {
     },
     Enable {
         id: String,
-        install: bool,
     },
     Disable {
         id: String,
@@ -175,7 +169,7 @@ enum MachineOp {
 }
 
 /// The outcome of one background CLI run.
-enum OpOutcome {
+pub(super) enum OpOutcome {
     Ok(String),
     /// A new remote binary is in place but the old daemon is still running.
     Installed {
@@ -191,44 +185,84 @@ enum OpOutcome {
     Err(String),
 }
 
-/// The Remote Machines window root view.
-pub struct MachineManagerView {
+impl OpOutcome {
+    /// The line to show for this outcome.
+    pub(super) fn message(&self) -> String {
+        let text = match self {
+            Self::Ok(message)
+            | Self::Installed { message, .. }
+            | Self::NeedsStop { message, .. }
+            | Self::Err(message) => message,
+        };
+        if !text.is_empty() {
+            return text.clone();
+        }
+        match self {
+            Self::Err(_) => "The command failed.".to_string(),
+            _ => "Done.".to_string(),
+        }
+    }
+
+    /// Whether the command failed outright. A stop-needed or restart-due
+    /// outcome is a next step, not a failure.
+    pub(super) fn failed(&self) -> bool {
+        matches!(self, Self::Err(_))
+    }
+}
+
+/// What a finished operation leaves for the user to do next on a machine row.
+#[derive(Default)]
+pub(super) struct FollowUps {
+    /// A machine whose daemon still runs the pre-upgrade binary.
+    pub(super) restart_due: Option<String>,
+    /// A machine whose old daemon must be stopped before it can be upgraded.
+    pub(super) stop_due: Option<String>,
+    /// A stop-and-upgrade awaiting its second click.
+    pub(super) confirming_stop: Option<String>,
+    /// A restart awaiting its second click; it stops that session's panes.
+    pub(super) confirming_restart: Option<String>,
+}
+
+impl FollowUps {
+    /// Fold a finished operation into the pending next steps.
+    pub(super) fn apply(&mut self, outcome: &OpOutcome) {
+        match outcome {
+            OpOutcome::NeedsStop { id, .. } => {
+                self.stop_due = Some(id.clone());
+                self.confirming_stop = None;
+            }
+            OpOutcome::Installed { id, .. } => {
+                self.stop_due = None;
+                self.confirming_stop = None;
+                self.restart_due = Some(id.clone());
+            }
+            OpOutcome::Ok(_) => *self = Self::default(),
+            OpOutcome::Err(_) => {}
+        }
+    }
+}
+
+/// The Add Machine window root view.
+pub struct AddMachineView {
     root: PathBuf,
     signal: Rc<RefCell<MachineSignal>>,
     /// The app's live chrome palette, so this window matches the scheme.
     shared_theme: Rc<RefCell<Theme>>,
     /// Shared client settings, so the Interface font reaches this window.
     shared_settings: Rc<RefCell<Settings>>,
-    machines: Vec<MachineInfo>,
     theme: Theme,
     form: Form,
-    /// The machine id (or `add`) whose command is running.
-    busy: Option<String>,
-    /// A remove awaiting its second click.
-    pending_remove: Option<String>,
-    /// A machine whose daemon still runs the pre-upgrade binary.
-    pending_restart: Option<String>,
-    /// A machine whose old daemon must be stopped before it can be upgraded.
-    pending_stop: Option<String>,
-    /// A stop-and-upgrade awaiting its second click.
-    confirming_stop: Option<String>,
-    /// A restart awaiting its second click; it stops that session's panes.
-    confirming_restart: Option<String>,
-    /// The `luvus` version installed on this Mac, to flag outdated machines.
-    local_version: Option<String>,
-    version_rx: Receiver<Option<String>>,
-    version_tx: Sender<Option<String>>,
+    /// An add is running; the form ignores a second submit until it settles.
+    adding: bool,
     status: String,
-    refreshing: bool,
-    last_probe: Instant,
+    /// The last add failed, so the status line reads as an error.
+    status_failed: bool,
     op_rx: Receiver<OpOutcome>,
     op_tx: Sender<OpOutcome>,
-    list_rx: Receiver<Vec<MachineInfo>>,
-    list_tx: Sender<Vec<MachineInfo>>,
     focus_handle: FocusHandle,
 }
 
-impl MachineManagerView {
+impl AddMachineView {
     pub(super) fn new(
         root: PathBuf,
         signal: Rc<RefCell<MachineSignal>>,
@@ -238,46 +272,31 @@ impl MachineManagerView {
         cx: &mut Context<Self>,
     ) -> Self {
         let (op_tx, op_rx) = std::sync::mpsc::channel();
-        let (list_tx, list_rx) = std::sync::mpsc::channel();
-        let (version_tx, version_rx) = std::sync::mpsc::channel();
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let theme = *shared_theme.borrow();
         let fonts = style::Fonts::resolve(&shared_settings);
         let font = style::chrome_font(&shared_settings);
 
-        let mut view = Self {
+        let view = Self {
             root,
             signal,
             theme,
             shared_theme,
             shared_settings,
-            machines: Vec::new(),
             form: Form::new(&font, px(fonts.body), theme, cx),
-            busy: None,
-            pending_remove: None,
-            pending_restart: None,
-            pending_stop: None,
-            confirming_stop: None,
-            confirming_restart: None,
-            local_version: None,
-            version_rx,
-            version_tx,
-            status: "Loading machines…".to_string(),
-            refreshing: false,
-            last_probe: Instant::now(),
+            adding: false,
+            status: String::new(),
+            status_failed: false,
             op_rx,
             op_tx,
-            list_rx,
-            list_tx,
             focus_handle,
         };
-        view.probe();
 
         cx.spawn(async move |this, cx| {
             loop {
                 let updated = this.update(cx, |view, cx| {
-                    if view.poll() {
+                    if view.poll(cx) {
                         cx.notify();
                     }
                 });
@@ -294,106 +313,55 @@ impl MachineManagerView {
         view
     }
 
-    /// Drain finished background work. Returns whether a repaint is needed.
-    fn poll(&mut self) -> bool {
+    /// Drain a finished add. Returns whether a repaint is needed.
+    ///
+    /// The form is cleared only once the machine was added: a failed add keeps
+    /// what the user typed so they can fix one field and retry.
+    fn poll(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         let theme = *self.shared_theme.borrow();
         if theme != self.theme {
             self.theme = theme;
             changed = true;
         }
-        while let Ok(machines) = self.list_rx.try_recv() {
-            self.machines = machines;
-            self.refreshing = false;
-            // Clear the initial placeholder once the first catalog lands.
-            if self.status == "Loading machines…" {
-                self.status.clear();
-            }
-            changed = true;
-        }
-        while let Ok(version) = self.version_rx.try_recv() {
-            self.local_version = version;
-            changed = true;
-        }
         while let Ok(outcome) = self.op_rx.try_recv() {
-            self.busy = None;
-            match outcome {
-                OpOutcome::NeedsStop { id, message } => {
-                    self.pending_stop = Some(id);
-                    self.confirming_stop = None;
-                    self.status = message;
-                }
-                OpOutcome::Installed { id, message } => {
-                    self.pending_stop = None;
-                    self.confirming_stop = None;
-                    self.pending_restart = Some(id);
-                    self.status = message;
-                    self.signal.borrow_mut().revision += 1;
-                    self.reload();
-                }
-                OpOutcome::Ok(message) => {
-                    self.pending_stop = None;
-                    self.confirming_stop = None;
-                    self.pending_restart = None;
-                    self.confirming_restart = None;
-                    self.status = if message.is_empty() {
-                        "Done.".to_string()
-                    } else {
-                        message
-                    };
-                    // Tell every open main window to reload the catalog.
-                    self.signal.borrow_mut().revision += 1;
-                    self.reload();
-                }
-                OpOutcome::Err(message) => {
-                    self.status = if message.is_empty() {
-                        "The command failed.".to_string()
-                    } else {
-                        message
-                    };
-                }
+            self.adding = false;
+            self.status = outcome.message();
+            self.status_failed = outcome.failed();
+            if !outcome.failed() {
+                self.form.clear(cx);
+                // Tell every open main window to reload the catalog.
+                self.signal.borrow_mut().revision += 1;
             }
             changed = true;
-        }
-        // Reachability drifts; probe on a slow tick without blocking the window.
-        if !self.refreshing && self.last_probe.elapsed() >= Duration::from_secs(10) {
-            self.probe();
         }
         changed
     }
 
-    /// Re-read the catalog cheaply, without probing.
-    fn reload(&mut self) {
-        let root = self.root.clone();
-        let tx = self.list_tx.clone();
-        self.refreshing = true;
-        std::thread::spawn(move || {
-            tx.send(list_machines(&root)).ok();
-        });
-    }
-
-    /// Re-read the catalog with a parallel reachability probe.
-    fn probe(&mut self) {
-        let root = self.root.clone();
-        let tx = self.list_tx.clone();
-        self.refreshing = true;
-        self.last_probe = Instant::now();
-        let version_tx = self.version_tx.clone();
-        std::thread::spawn(move || {
-            version_tx
-                .send(crate::luvus_update::installed_version().map(|v| v.to_string()))
-                .ok();
-            tx.send(refresh_machines(&root)).ok();
-        });
-    }
-
-    /// Run one CLI mutation on a background thread.
-    fn start_op(&mut self, op: MachineOp, label: &str) {
-        if self.busy.is_some() {
+    /// Submit the add form.
+    fn submit(&mut self, cx: &mut Context<Self>) {
+        if self.adding {
             return;
         }
-        self.busy = Some(label.to_string());
-        self.status = format!("Running {label}…");
+        let id = self.form.id.read(cx).value().trim().to_string();
+        let host = self.form.host.read(cx).value().trim().to_string();
+        if id.is_empty() || host.is_empty() {
+            self.status = "A profile id and an SSH host are required.".to_string();
+            self.status_failed = true;
+            return;
+        }
+        let label = self.form.label.read(cx).value().trim().to_string();
+        let session = self.form.session.read(cx).value().trim().to_string();
+        let op = MachineOp::Add {
+            id,
+            host,
+            label,
+            session,
+            install: self.form.install,
+        };
+        self.adding = true;
+        self.status = "Adding…".to_string();
+        self.status_failed = false;
         let root = self.root.clone();
         let tx = self.op_tx.clone();
         std::thread::spawn(move || {
@@ -401,56 +369,24 @@ impl MachineManagerView {
         });
     }
 
-    /// Submit the add form.
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.form.id.read(cx).value().trim().to_string();
-        let host = self.form.host.read(cx).value().trim().to_string();
-        if id.is_empty() || host.is_empty() {
-            self.status = "A profile id and an SSH host are required.".to_string();
-            return;
-        }
-        let label = self.form.label.read(cx).value().trim().to_string();
-        let session = self.form.session.read(cx).value().trim().to_string();
-        let install = self.form.install;
-        self.start_op(
-            MachineOp::Add {
-                id,
-                host,
-                label,
-                session,
-                install,
-            },
-            "add",
-        );
-        self.form.clear(cx);
-        let handle = self.focus_handle.clone();
-        window.focus(&handle, cx);
-    }
-
-    /// Escape clears focus, then a pending removal, then closes the window.
-    /// Tab walks the form; every other editing key belongs to the focused
-    /// field, which consumes what it handles before it reaches here.
+    /// Escape leaves the focused field, then closes the window. Tab walks the
+    /// form; every other editing key belongs to the focused field, which
+    /// consumes what it handles before it reaches here.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         if key == "escape" {
             if self.form.focused(window, cx).is_some() {
                 let handle = self.focus_handle.clone();
                 window.focus(&handle, cx);
-            } else if self.pending_remove.is_some() {
-                self.pending_remove = None;
             } else {
                 window.remove_window();
             }
             cx.notify();
             return;
         }
-        if self.pending_remove.is_some() && key != "shift" {
-            self.pending_remove = None;
-            cx.notify();
-        }
         let Some(field) = self.form.focused(window, cx) else {
             if key == "enter" {
-                self.submit(window, cx);
+                self.submit(cx);
             }
             cx.notify();
             return;
@@ -464,7 +400,7 @@ impl MachineManagerView {
                 };
                 self.form.focus(next, window, cx);
             }
-            "enter" => self.submit(window, cx),
+            "enter" => self.submit(cx),
             _ => {}
         }
         cx.notify();
@@ -504,19 +440,11 @@ impl MachineManagerView {
             entity,
         )
         .flex_1()
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                this.pending_remove = None;
-                cx.notify();
-            }),
-        )
     }
 
     /// The add-machine form.
     fn add_form(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let installing = self.busy.as_deref() == Some("add");
         let checkbox = style::checkbox(
             "pilus-machine-install",
             self.form.install,
@@ -526,12 +454,11 @@ impl MachineManagerView {
         )
         .on_click(cx.listener(|this, _, _, cx| {
             this.form.install = !this.form.install;
-            this.pending_remove = None;
             cx.notify();
         }));
         let mut add = style::button(
             "pilus-machine-add",
-            if installing {
+            if self.adding {
                 "Adding…"
             } else {
                 "Add machine"
@@ -540,11 +467,11 @@ impl MachineManagerView {
             theme,
             self.fonts().secondary,
         );
-        if installing {
+        if self.adding {
             add = add.bg(theme.panel_dim).text_color(theme.muted);
         }
-        let add = add.on_click(cx.listener(|this, _, window, cx| {
-            this.submit(window, cx);
+        let add = add.on_click(cx.listener(|this, _, _, cx| {
+            this.submit(cx);
             cx.notify();
         }));
         div()
@@ -553,11 +480,6 @@ impl MachineManagerView {
             .gap_2()
             .px_3()
             .pt_3()
-            .child(style::section_label(
-                theme,
-                "ADD A MACHINE",
-                self.fonts().label,
-            ))
             .child(
                 div()
                     .flex()
@@ -585,311 +507,11 @@ impl MachineManagerView {
                     .child(add),
             )
     }
-
-    /// One saved machine row with its connection controls.
-    fn machine_row(&self, machine: &MachineInfo, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let id = machine.id.clone();
-        let busy = self.busy.as_deref() == Some(machine.id.as_str());
-        let confirming = self.pending_remove.as_deref() == Some(machine.id.as_str());
-        let (status, status_color) = machine_status(machine, theme);
-        let installing = self.form.install;
-
-        let toggle = if machine.enabled {
-            (false, "Disable")
-        } else {
-            (true, "Enable")
-        };
-        let toggle_id = id.clone();
-        let mut toggle_button = style::small_button(
-            format!("pilus-machine-toggle-{id}"),
-            toggle.1,
-            ButtonKind::Ghost,
-            theme,
-            self.fonts().label,
-        );
-        if busy {
-            toggle_button = toggle_button.text_color(theme.muted);
-        }
-        let toggle_button = toggle_button.on_click(cx.listener(move |this, _, _, cx| {
-            if this.busy.is_some() {
-                return;
-            }
-            this.pending_remove = None;
-            let op = if toggle.0 {
-                MachineOp::Enable {
-                    id: toggle_id.clone(),
-                    install: installing,
-                }
-            } else {
-                MachineOp::Disable {
-                    id: toggle_id.clone(),
-                }
-            };
-            this.start_op(op, &toggle_id);
-            cx.notify();
-        }));
-
-        let behind = match (machine.version.as_deref(), self.local_version.as_deref()) {
-            (Some(remote), Some(local)) => is_behind(remote, local),
-            _ => false,
-        };
-        let restart_due = self.pending_restart.as_deref() == Some(machine.id.as_str());
-        let restart_confirming = self.confirming_restart.as_deref() == Some(machine.id.as_str());
-        let update_id = id.clone();
-        let mut update_button = style::small_button(
-            format!("pilus-machine-update-{id}"),
-            if behind { "Upgrade" } else { "Update" },
-            if behind {
-                ButtonKind::Secondary
-            } else {
-                ButtonKind::Ghost
-            },
-            theme,
-            self.fonts().label,
-        );
-        if busy {
-            update_button = update_button.text_color(theme.muted);
-        }
-        let update_button = update_button.on_click(cx.listener(move |this, _, _, cx| {
-            if this.busy.is_some() {
-                return;
-            }
-            this.pending_remove = None;
-            this.start_op(
-                MachineOp::Update {
-                    id: update_id.clone(),
-                },
-                &update_id,
-            );
-            cx.notify();
-        }));
-
-        let restart_id = id.clone();
-        let restart_button = style::small_button(
-            format!("pilus-machine-restart-{id}"),
-            if restart_confirming {
-                "Confirm restart"
-            } else {
-                "Restart"
-            },
-            ButtonKind::Ghost,
-            theme,
-            self.fonts().label,
-        )
-        .text_color(theme.alert)
-        .on_click(cx.listener(move |this, _, _, cx| {
-            if this.busy.is_some() {
-                return;
-            }
-            if this.confirming_restart.as_deref() == Some(restart_id.as_str()) {
-                this.confirming_restart = None;
-                this.start_op(
-                    MachineOp::Restart {
-                        id: restart_id.clone(),
-                    },
-                    &restart_id,
-                );
-            } else {
-                this.confirming_restart = Some(restart_id.clone());
-                this.status = format!(
-                    "Restart `{restart_id}`? This stops every pane in its session. \
-                     Click Confirm restart to continue."
-                );
-            }
-            cx.notify();
-        }));
-
-        let stop_due = self.pending_stop.as_deref() == Some(machine.id.as_str());
-        let stop_confirming = self.confirming_stop.as_deref() == Some(machine.id.as_str());
-        let stop_id = id.clone();
-        let stop_button = style::small_button(
-            format!("pilus-machine-stop-{id}"),
-            if stop_confirming {
-                "Confirm stop"
-            } else {
-                "Stop & upgrade"
-            },
-            ButtonKind::Ghost,
-            theme,
-            self.fonts().label,
-        )
-        .text_color(theme.alert)
-        .on_click(cx.listener(move |this, _, _, cx| {
-            if this.busy.is_some() {
-                return;
-            }
-            if this.confirming_stop.as_deref() == Some(stop_id.as_str()) {
-                this.confirming_stop = None;
-                this.start_op(
-                    MachineOp::StopAndUpdate {
-                        id: stop_id.clone(),
-                    },
-                    &stop_id,
-                );
-            } else {
-                this.confirming_stop = Some(stop_id.clone());
-                this.status = format!(
-                    "Stop `{stop_id}`'s daemon? Its panes end (the session is saved). \
-                     Click Confirm stop to continue."
-                );
-            }
-            cx.notify();
-        }));
-
-        let remove_id = id.clone();
-        let remove_button = style::small_button(
-            format!("pilus-machine-remove-{id}"),
-            if confirming { "Confirm" } else { "Remove" },
-            ButtonKind::Ghost,
-            theme,
-            self.fonts().label,
-        )
-        .text_color(if confirming { theme.alert } else { theme.muted })
-        .on_click(cx.listener(move |this, _, _, cx| {
-            if this.busy.is_some() {
-                return;
-            }
-            if this.pending_remove.as_deref() == Some(remove_id.as_str()) {
-                this.pending_remove = None;
-                this.start_op(
-                    MachineOp::Remove {
-                        id: remove_id.clone(),
-                    },
-                    &remove_id,
-                );
-            } else {
-                this.pending_remove = Some(remove_id.clone());
-                this.status = format!("Remove `{remove_id}`? Click Confirm to delete the profile.");
-            }
-            cx.notify();
-        }));
-
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .px_2()
-            .py_2()
-            .radius_md()
-            .bg(theme.panel)
-            .border_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(self.fonts().body))
-                                    .text_color(theme.fg)
-                                    .child(machine.display().to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(self.fonts().label))
-                                    .text_color(theme.muted)
-                                    .child(machine.id.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .text_size(px(self.fonts().label))
-                            .text_color(theme.muted)
-                            .child(machine.destination.clone())
-                            .children(
-                                machine
-                                    .version
-                                    .clone()
-                                    .map(|version| div().child(format!("v{version}"))),
-                            )
-                            .children(behind.then(|| {
-                                div().text_color(theme.alert).child(format!(
-                                    "behind v{}",
-                                    self.local_version.clone().unwrap_or_default()
-                                ))
-                            }))
-                            .child(div().text_color(status_color).child(status)),
-                    ),
-            )
-            .child(toggle_button)
-            .children(stop_due.then_some(stop_button))
-            .children((machine.enabled && restart_due).then_some(restart_button))
-            .child(update_button)
-            .child(remove_button)
-    }
-
-    /// The saved-machine list.
-    fn machine_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let mut list = div()
-            .id("pilus-machine-list")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .gap_1()
-            .px_3()
-            .pt_3()
-            .pb_2()
-            .overflow_y_scroll();
-        list = list.child(style::section_label(theme, "SAVED MACHINES", self.fonts().label).pb_1());
-        if self.machines.is_empty() {
-            return list.child(
-                div()
-                    .text_size(px(self.fonts().secondary))
-                    .text_color(theme.muted)
-                    .child("No machines yet. Add one above."),
-            );
-        }
-        for machine in &self.machines {
-            if machine.id == "local" {
-                continue;
-            }
-            list = list.child(self.machine_row(machine, cx));
-        }
-        list
-    }
 }
 
-impl Render for MachineManagerView {
+impl Render for AddMachineView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let refresh = style::small_button(
-            "pilus-machine-refresh",
-            if self.refreshing {
-                "Refreshing…"
-            } else {
-                "Refresh"
-            },
-            ButtonKind::Secondary,
-            theme,
-            self.fonts().label,
-        )
-        .text_color(if self.refreshing {
-            theme.muted
-        } else {
-            theme.fg
-        })
-        .on_click(cx.listener(|this, _, _, cx| {
-            if !this.refreshing {
-                this.probe();
-            }
-            cx.notify();
-        }));
-
         let root = div()
             .id("pilus-machines-window")
             .relative()
@@ -904,19 +526,13 @@ impl Render for MachineManagerView {
             }))
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
             .on_action(cx.listener(|_, _: &CloseTab, window, _| window.remove_window()))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .pt_3()
-                    .child(style::title(theme, "Remote Machines", self.fonts().title))
-                    .child(refresh),
-            )
+            .child(div().px_3().pt_3().child(style::title(
+                theme,
+                "Add Machine",
+                self.fonts().title,
+            )))
             .child(self.add_form(window, cx))
-            .child(self.machine_list(cx))
+            .child(div().flex_1())
             .child(
                 div()
                     .px_3()
@@ -924,28 +540,19 @@ impl Render for MachineManagerView {
                     .border_t_1()
                     .border_color(theme.border)
                     .text_size(px(self.fonts().label))
-                    .text_color(theme.muted)
+                    .text_color(if self.status_failed {
+                        theme.alert
+                    } else {
+                        theme.muted
+                    })
                     .child(self.status.clone()),
             );
         super::apply_chrome_font(root, &self.shared_settings)
     }
 }
 
-/// The status label and color for a saved machine.
-fn machine_status(machine: &MachineInfo, theme: Theme) -> (String, gpui::Rgba) {
-    if !machine.enabled {
-        return ("disabled".to_string(), theme.muted);
-    }
-    match (machine.online, machine.latency_ms) {
-        (Some(true), Some(ms)) => (format!("online · {ms} ms"), theme.ok),
-        (Some(true), None) => ("online".to_string(), theme.ok),
-        (Some(false), _) => ("offline".to_string(), theme.alert),
-        (None, _) => ("probing…".to_string(), theme.muted),
-    }
-}
-
 /// Run one `luvus machine …` mutation and capture its result.
-fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
+pub(super) fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
     if let MachineOp::Restart { id } = &op {
         return restart_machine(root, id);
     }
@@ -971,7 +578,7 @@ fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
     // A short confirmation instead of the CLI's JSON stdout.
     let success = match &op {
         MachineOp::Add { id, .. } => format!("Added `{id}`."),
-        MachineOp::Enable { id, .. } => format!("Enabled `{id}`."),
+        MachineOp::Enable { id } => format!("Enabled `{id}`."),
         MachineOp::Disable { id } => format!("Disabled `{id}`."),
         MachineOp::Remove { id } => format!("Removed `{id}`."),
         MachineOp::Update { id } => format!(
@@ -1013,13 +620,10 @@ fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
                 args.push("--install".to_string());
             }
         }
-        MachineOp::Enable { id, install } => {
+        MachineOp::Enable { id } => {
             mismatch_id = Some(id.clone());
             args.push("enable".to_string());
             args.push(id);
-            if install {
-                args.push("--install".to_string());
-            }
         }
         MachineOp::Disable { id } => {
             args.push("disable".to_string());
@@ -1208,7 +812,7 @@ fn restart_machine(root: &Path, id: &str) -> OpOutcome {
     }
 }
 
-/// Open the Remote Machines window.
+/// Open the Add Machine window.
 pub fn open(
     root: PathBuf,
     signal: Rc<RefCell<MachineSignal>>,
@@ -1222,7 +826,7 @@ pub fn open(
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Remote Machines".into()),
+                title: Some("Add Machine".into()),
                 appears_transparent: false,
                 ..Default::default()
             }),
@@ -1230,12 +834,12 @@ pub fn open(
         },
         move |window, cx| {
             cx.new(move |cx| {
-                MachineManagerView::new(root, signal, shared_theme, shared_settings, window, cx)
+                AddMachineView::new(root, signal, shared_theme, shared_settings, window, cx)
             })
         },
     );
     if let Err(error) = opened {
-        eprintln!("pilus: could not open the machines window: {error}");
+        eprintln!("pilus: could not open the add machine window: {error}");
     }
 }
 

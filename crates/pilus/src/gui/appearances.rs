@@ -709,6 +709,52 @@ impl AppearancesView {
             .child(larger)
     }
 
+    /// The top-spacing toggles: whether the grid shows the daemon row under
+    /// its tab strip, which only a titled Luvus fills. Remote machines and the
+    /// local daemon are set apart, since they can run different Luvus versions.
+    fn terminal_rows(&self, cx: &mut Context<Self>) -> Div {
+        let size = self.fonts().secondary;
+        let remote = style::checkbox(
+            "pilus-terminal-top-spacing",
+            self.settings.terminal_top_spacing,
+            "Add top spacing to remote terminals",
+            self.theme,
+            size,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.settings.terminal_top_spacing = !this.settings.terminal_top_spacing;
+            this.publish(cx);
+        }));
+        let local = style::checkbox(
+            "pilus-local-terminal-top-spacing",
+            self.settings.local_terminal_top_spacing,
+            "Add top spacing to the local terminal",
+            self.theme,
+            size,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.settings.local_terminal_top_spacing = !this.settings.local_terminal_top_spacing;
+            this.publish(cx);
+        }));
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .child(remote)
+            .child(local)
+            .child(
+                div()
+                    .text_size(px(self.fonts().label))
+                    .text_color(self.theme.muted)
+                    .child(
+                        "For newer Luvus without show_title. Turn off for older Luvus \
+                         or when show_title is enabled",
+                    ),
+            )
+    }
+
     /// A section title, matching the weight of the list headings below.
     fn section_heading(&self, label: &str) -> Div {
         style::section_label(self.theme, label.to_string(), self.fonts().label)
@@ -911,6 +957,10 @@ impl Render for AppearancesView {
         list = list
             .child(self.section_heading("WINDOW"))
             .child(self.corner_radius_row(cx));
+
+        list = list
+            .child(self.section_heading("TERMINAL"))
+            .child(self.terminal_rows(cx));
 
         let root = div()
             .id("pilus-appearances")

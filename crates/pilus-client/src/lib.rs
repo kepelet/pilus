@@ -72,7 +72,7 @@ pub use github::{
     PullDetail, PullDraft, RepoInfo, StateFilter, unix_seconds,
 };
 pub use machines::{
-    MachineInfo, connect_machine, find_installed_binary, install_agent, is_behind, list_machines,
+    MachineInfo, connect_machine, find_installed_binary, is_behind, list_machines,
     refresh_machines, restart_remote, stop_remote,
 };
 pub use mission::{

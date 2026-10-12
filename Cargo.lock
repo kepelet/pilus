@@ -5582,7 +5582,6 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "pilus-client",
  "pilus-protocol",
- "pilus-session",
  "qrcode",
  "raw-window-handle",
  "resvg",
@@ -5645,15 +5644,6 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "unicode-width",
-]
-
-[[package]]
-name = "pilus-session"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.21",
 ]
 
 [[package]]

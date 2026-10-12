@@ -74,9 +74,9 @@ pub enum PickerEvent {
     HomeLaunched {
         /// The machine profile id that owns the workspace, or `None` for local.
         machine: Option<String>,
-        /// A success line plus a record for the launched pane (for the pi
-        /// pin), or the error that stopped the launch.
-        result: Result<(String, Option<pilus_client::Agent>), String>,
+        /// A success line plus the launched pane, or the error that stopped
+        /// the launch.
+        result: Result<(String, Option<String>), String>,
     },
 }
 

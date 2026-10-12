@@ -1,9 +1,8 @@
 //! A native page (Mission Control, Tasks, Automations) sharing the card with
 //! the terminal.
 //!
-//! Pi's split is the daemon's: the panel overlays one pane's frame. These
-//! pages have no pane behind them, so the split is the window's own. The page
-//! takes the leading half of the card and the terminal the rest; the daemon
+//! These pages have no pane behind them, so the split is the window's own. The
+//! page takes the leading half of the card and the terminal the rest; the daemon
 //! sees only a smaller viewport, so it reflows once when the split opens or
 //! closes and never while it stays.
 

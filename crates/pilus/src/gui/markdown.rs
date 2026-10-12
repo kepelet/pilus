@@ -1,13 +1,13 @@
-//! Markdown rendering for the Pi Session transcript and for documents.
+//! Markdown rendering for documents and GitHub bodies.
 //!
-//! Pi mostly replies in Markdown (CommonMark plus GFM). This module parses a
-//! reply with `markdown` (the markdown-rs crate) and paints its mdast as GPUI
-//! elements: paragraphs and inline runs (bold, italic, code, links), headings,
-//! fenced code blocks, lists, block quotes, tables, and rules.
+//! This module parses CommonMark plus GFM with `markdown` (the markdown-rs
+//! crate) and paints its mdast as GPUI elements: paragraphs and inline runs
+//! (bold, italic, code, links), headings, fenced code blocks, lists, block
+//! quotes, tables, and rules.
 //!
-//! A file is drawn the same way, a block at a time: [`Document`] keeps the
-//! parsed blocks with the source lines each covers, so the viewer can virtualize
-//! the list and set a review note under the block its lines fall in.
+//! A file is drawn a block at a time: [`Document`] keeps the parsed blocks
+//! with the source lines each covers, so the viewer can virtualize the list
+//! and set a review note under the block its lines fall in.
 //!
 //! Inline styling rides one [`Text`] per paragraph, so wrapping stays natural;
 //! each run carries its own font and color. A paragraph with inline code lays

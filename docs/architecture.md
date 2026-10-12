@@ -17,191 +17,8 @@ window's dependency chain. `pilus-mobile` sits on the phone side of that same
 door: it enrolls over iroh, speaks the hub methods below, and exposes a C FFI
 the iOS app (`ios/`) links against.
 
-`pilus-session` is the one crate outside that chain that has nothing to do with
-the daemon: it reads pi's session JSONL — parse, discover by working directory,
-and tail — so the window can paint a Pi conversation natively. It depends only
-on `serde_json`.
-
 Nothing in `pilus-protocol` or `pilus-client` knows about GPUI, so the connection
-layer is testable headlessly (see `crates/pilus-client/tests/handshake.rs`);
-`pilus-session` is likewise testable without a window
-(`crates/pilus-session/tests/`).
-
-## The native Pi Session panel
-
-Pi renders its conversation in a terminal, but it also persists it as JSONL
-under `~/.pi/agent/sessions/--<cwd>--/`. `pilus` paints that conversation as a
-native panel inside the main window instead: `pilus-session` folds each line
-into an ordered `Transcript` (a `message` entry's content blocks become prose,
-thinking, and tool calls; tool results, shell runs, compactions, and model
-changes become their own items), and `gui/session.rs` draws it, following
-appended bytes on a background reader.
-
-The reader is tolerant by design: unknown entry types and message roles are
-counted and dropped rather than failing the file, so a newer pi still renders.
-User turns sit on the right, assistant turns on the left, and thinking, tool
-calls, and shell runs are borderless muted rows with a chevron that opens their
-body (collapsed by default; no line counts). Thinking labels as `Thinking` and
-renders at a smaller Markdown size. A model change is one plain muted line
-(`Model changed to …`); thinking-level changes, compactions, and other
-structural notes render as the same muted collapsible rows.
-
-A tool result is paired with its call by `call_id` (in `pilus-session`). Each
-stretch of thinking and tool calls between assistant replies collapses into one
-`Working for 10m 3s` row (or `Working…` while it is the last thing in the
-transcript, or when the entry timestamps give no span); a stretch that is only
-thinking skips the wrapper and shows the `Thinking` row directly. Opening a
-work row lists the thinking and the calls, and a run of consecutive calls
-groups further under a prose summary (`Read 3 files, ran 1 search, ran 1
-command`). Calls themselves label as verb phrases (`Read src/auth.rs`,
-`Edited src/auth.rs`, `Ran cargo test`, `Searched foo`), with arguments and
-result in the muted monospace family when opened.
-Assistant prose is rendered as Markdown (`markdown-rs` via `gui/markdown.rs`):
-headings, bold/italic/inline code, links, fenced code blocks, lists, block
-quotes, tables, and rules.
-
-The header is one borderless row: the session's first prompt on the left,
-cut to 80 characters and ellipsized to the window width, then a clock button
-that opens the session history and an × button that closes the panel. The
-close is a release: the auto-pin leaves the same pane alone until it reports
-a session or loses focus, so closing a pinned conversation is not undone on
-the next reconcile. The history menu lists the endpoint's earlier sessions
-for the same cwd, newest first, each titled by its first prompt (read from
-the file, or from one SSH sample per row on a machine); choosing one opens
-that file read-only, detached from the live pane. A remote pane shows
-a skeleton bar only until its reader reports — a fold, an error, or a
-confirmed empty session — so a fresh remote pane drops the skeleton instead
-of holding it forever; a local pane reads at once and never shows one. Only
-the tail window
-(the last 50 items) renders on first paint, so a huge session opens fast;
-the rest fills in behind the scenes a chunk per frame — pinned to the bottom
-while you follow the tail, or holding position when you park at the top, so
-scrolling up lazy-loads history with no button in the way. Mid-viewport stays
-frozen so reading never shifts. Expansion keys are absolute transcript
-indices, so growing the window never misaligns them.
-The composer is one
-rounded panel holding the input and, below it, the meta row: a model picker
-showing the catalog display name (`Muse Spark 1.3 Contributor`, falling back
-to the `provider/id` slug), a thinking-level picker showing just the level
-(`High`, via the shared `effort_label`), a context-occupancy donut with the
-token counts beside it, the token breakdown (`in • out • cache-hit % (cost)`),
-and, on the right side only, the circular arrow send button (Home's arrow
-style). The context readout comes from the extension socket and is hidden
-while pi reports no positive occupancy — a fresh session's zero, or the
-uncounted state after a compaction — so an empty gauge never paints. Both
-pickers read the extension socket's live report first, the
-transcript fold second, and pi's configured default from the endpoint's
-catalog last, so a fresh remote pane names the model and level pi will run
-even before its extension socket connects.
-The model picker offers every model in pi's catalog for the endpoint (loaded
-once in the background from the agent's models-store, locally or over SSH),
-plus any session model the catalog does not know; choosing one sends `/model`
-to the live agent. pi's catalog runs to hundreds of models, so the list is
-virtualized and bounded to the shared menu height: it scrolls, and once it
-outgrows the rows that fit it grows a type-to-filter field (the composer
-prompt keeps the keyboard otherwise, so a query never lands in the draft).
-The query matches a display name or a `provider/id` slug, which is also the
-dim hint beside each row — names repeat across providers. Opening scrolls
-the live model into view, and up/down plus Enter walk and take the rows, so
-the picker is usable without a mouse. Picker chips and dropdowns are the
-shared composer
-components Home uses (`picker_face`, `picker_menu`, `picker_row`): the same
-chip face, leading glyphs, and floated option list, opening upward in the
-session composer. Picker lists dismiss on an outside press or Escape. A successful send clears the draft silently; only
-failures report a status. While pi is still working — the transcript ends
-mid-work with no reply yet — a spinner `Working` line sits above the
-composer. Sending is optimistic: the prompt appears as a bubble and the
-indicator shows at once, and both persist until pi's first responding content
-(an assistant message or anything it produced) lands — not just the echoed
-user message. A prompt sent while pi is already working reads `Steering…`
-instead, until that same first response. `Steering…` is optimistic too: it is
-shown from the moment you send, so nothing waits on the file. A send while one
-is in flight queues instead of vanishing, and the round button becomes a stop
-square that interrupts the run through `agent.keys` (an injected Escape, what
-pi's own `app.interrupt` does). The send status line is gone, so sending never
-shifts the layout; only failures report.
-
-Floating above the composer's right side are two jump buttons: the prompts
-button opens a menu of every user prompt (one truncated row each) that
-scrolls to the chosen message, and shows whenever a prompt exists. The
-arrow-down button jumps to the tail and appears only while the tail is
-unpinned. The tail pin is sticky
-state, not a raw offset comparison (scroll offsets run negative downward): it
-sets at the bottom and clears the moment the viewport moves without growth,
-so background fill can never hijack a programmatic jump.
-
-The composer field soft-wraps: each logical line is shaped into display
-pieces that fit the field's width, breaking at spaces and mid-word for
-overlong words, and caret/selection/IME map through those pieces
-(`gui/text_input.rs`). A draft taller than the panel's half-height cap
-scrolls inside the field.
-
-### Sending a prompt
-
-A sticky composer sits below the transcript as a flex sibling, so it can never
-cover the last message (a draft is capped at half the panel and scrolls inside
-its field). Enter (the field declines it; `submit_on_enter`) sends its text
-over the pilus pi extension's RPC socket when one is connected — prompts,
-steer/follow-up delivery, abort, `/model`, `/thinking`, and `/new` all ride
-the same newline-JSON channel — and through the endpoint's control surface
-as `agent.prompt` when it is not, typing into pi's editor the way the
-terminal would. A prompt is sent on a background thread and the field
-clears only once it is accepted. The panel is still a view of the file pi
-writes — the prompt's effect appears when pi appends the next turn.
-
-The extension's sidecar names its pane, so the panel finds the socket by
-pane rather than waiting on the daemon's `agent.session` report — which
-carries no event and can lag a reconcile tick. A socket `hello` naming a
-new session (`/new`, `/resume`, `/fork`) retargets the reader in place:
-the same mechanism fills the auto-pinned panel shown while a focused pi
-has not reported yet, where a terminal would otherwise flash first.
-
-Remote sessions additionally keep a local copy. Pi's session file is
-append-only JSONL, so the reader mirrors every chunk it fetches into
-`~/.pilus/session-cache/<endpoint>/<session-id>.jsonl` at its source
-offset — writes that stay correct even when two tails shadow the same
-source. A tiny `<id>.path` file records where the session lived, so a
-re-open resolves nothing over SSH at all: the mirrored bytes fold and
-paint before the first network call, and the live tail resumes from the
-mirrored length. A stale path hint deletes itself on the first read
-error and falls back to the real resolve; a shrunk source rewinds and
-truncates its mirror. Local sessions skip the mirror — their reads are
-already local.
-
-A focus pilus itself initiates pins earlier still: an agent row names the
-pane outright, the view keeps a memory of the pane each workspace and tab
-last focused so a workspace or tab row predicts its own restore, and a
-Home launch hands its own pane record forward so a fresh pi pins before
-`agent.list` has ever listed it. The picked pi's panel opens with the
-click — waiting state if no report yet — instead of a reconcile behind
-it, and the snapshot's focused flag confirms or expires the pick within a
-short window. Focus moves made inside the terminal (a mouse click on a
-pane, a keybinding) reach the panel through the feed's reconcile alone;
-only moves pilus makes can be pre-empted.
-
-### One path, local and remote
-
-The panel is opened by the command palette's **Open Pi Session** or the
-sidebar's **Pi Session** row for the active workspace, and it works across
-every connected endpoint:
-
-- **Locate.** The endpoint's own daemon is asked `agent.sessions` (UHP), which
-  scans each supported agent's store and returns the exact `cwd` and session id
-  a live agent is in. This is the same call local and remote — a machine
-  reaches it through `luvus uhp proxy` over SSH — so the panel does not guess
-  by newest-file.
-- **Read.** UHP exposes agent session *ids*, not session file contents
-  (`agent.read` returns the rendered screen). So the bytes come through
-  `pilus-session`'s `Source` trait: a local `FileSource`, or an SSH `tail` for a
-  machine, using the same `SshTarget` options the render bridge and folder
-  picker use. Every host shell command is quoted for the machine's login shell
-  and run through `/bin/sh -c`, so a host whose default shell is fish (which
-  rejects `${VAR:-default}`) still lists and reads sessions. The headless
-  `--probe-session [CWD|FILE]` folds the same file.
-
-All lookups and reads run on one background thread per open panel, so the GUI
-thread only ever clones an already-folded `Transcript`. If Luvus later exposes
-a `agent.session.read` UHP method, only `Source` needs to change.
+layer is testable headlessly (see `crates/pilus-client/tests/handshake.rs`).
 
 ## Why the client is a thin painter
 
@@ -226,11 +43,7 @@ debug build). Sockets live there:
 
 `pilus` attaches to the **render** socket (`luvus-client.sock`). `$LUVUS_SESSION`
 selects a session, matching the daemon's own environment convention; `--session`
-and `--socket` override it. `--session-ui` is separate: it opens the native Pi
-Session panel on a session file, a session id (full or partial, mirroring pi's
-own `--session <path|id>`), or a cwd whose newest session is read. A spec that
-resolves to nothing paints the reader's "no session found" error instead of an
-empty placeholder. When the derived path is too long for `sun_path`,
+and `--socket` override it. When the derived path is too long for `sun_path`,
 both the daemon and `pilus` relocate it to a hashed, owner-scoped alias under the
 temporary directory (`discovery::alias_for`).
 
@@ -650,7 +463,7 @@ Each enabled machine becomes one endpoint:
   Because `uhp proxy` forwards a single request, a remote feed reconciles on a
   short timer instead of holding an `events.subscribe` stream. An active feed
   also runs an agents-only lane every ~1.2s — one request where a full pass
-  is five — so the pi panel's pin does not wait on the snapshot tick.
+  is five.
 
 There is no daemon-side machine method: the window owns every SSH process, and
 two clients attached to the same local session load the same profiles without
@@ -1025,14 +838,10 @@ needs the contrast), with Copy rows for the code and the link; the card hides
 itself when the code expires. Endpoint id and ticket stay below as copy rows, followed by a **SERVICE LOG**
 disclosure that tails the last lines of `agent.log` (polled only while it is open)
 with a Copy button.
-Each machine row in that page gains an **Install agent** action that stages this
-build's `pilus-agent` under a temporary sibling beside the verified remote
-`luvus` binary and renames it into place over SSH; a remote platform that does
-not match this build is refused before any bytes move. The action intentionally
-does not launch an unmanaged background process: the UI reports the exact
-`serve --iroh --control` command to run on that machine, so the endpoint, ticket,
-and enrollment code the agent prints remain visible to the user. The separate
-Remote Machines window keeps add/enable/disable/remove.
+Each machine row in that page carries enable/disable/remove and the Luvus upgrade actions (Update, then Restart,
+or Stop & upgrade for a daemon too old to handshake); the **Add Machine** button
+opens a window that holds only the add form, which keeps what was typed when the
+add fails.
 
 The connector must be found before any of this works: `scripts/bundle-macos.sh`
 builds and copies `pilus-agent` into `Contents/MacOS/` beside `pilus`, and
@@ -1084,6 +893,6 @@ Selection lives in `gui/selection.rs`: it normalizes a reversed drag, answers
 - Daemon upgrades: **Settings → UPDATES → Luvus daemon** checks
   `luvus.dev/latest.json` and installs the verified platform archive itself
   (refusing a package-manager install), then restarts through
-  `luvus server restart`. The Remote Machines window's **Update** button
+  `luvus server restart`. The **Update** button on a machine's Settings row
   re-provisions a host with `luvus machine enable <id> --install`, and its rows
   show the remote daemon version from the last probe.

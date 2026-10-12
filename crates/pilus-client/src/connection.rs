@@ -20,6 +20,7 @@ use pilus_protocol::{
 };
 
 use crate::ConnectTarget;
+use crate::arrival::Arrival;
 use crate::error::{Error, Result};
 use crate::transport::Stream;
 
@@ -397,12 +398,17 @@ fn spawn_coalescer(raw: Receiver<ClientEvent>, inbound: Sender<ClientEvent>, gat
                         Err(_) => break,
                     }
                 }
-                let _gate = gate.lock().unwrap_or_else(|e| e.into_inner());
-                for event in burst {
-                    if inbound.send(event).is_err() {
-                        return;
+                {
+                    let _gate = gate.lock().unwrap_or_else(|e| e.into_inner());
+                    for event in burst {
+                        if inbound.send(event).is_err() {
+                            return;
+                        }
                     }
                 }
+                // Signal after the gate drops so the window never wakes into
+                // a drain that waits on the lock we still hold.
+                Arrival::global().signal();
             }
         })
         .ok();

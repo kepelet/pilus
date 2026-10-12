@@ -142,22 +142,31 @@ impl Surface {
         self.shell_sidebars.as_ref()
     }
 
+    /// Replace the grid with a full frame the daemon sent.
+    fn install_frame(&mut self, frame: FrameData) -> SurfaceChange {
+        self.needs_full_frame = false;
+        self.resync_requested = false;
+        self.frame = Some(frame);
+        self.frame_dock = self.shell_dock;
+        SurfaceChange::Resized
+    }
+
+    /// [`Surface::apply`] for a message the caller is done with: a full frame
+    /// moves into the surface instead of copying every cell's string.
+    pub fn apply_owned(&mut self, message: ServerMessage) -> SurfaceChange {
+        match message {
+            ServerMessage::Frame(frame) | ServerMessage::PreparedFrame { frame, .. } => {
+                self.install_frame(frame)
+            }
+            other => self.apply(&other),
+        }
+    }
+
     /// Fold one server message into the surface.
     pub fn apply(&mut self, message: &ServerMessage) -> SurfaceChange {
         match message {
-            ServerMessage::Frame(frame) => {
-                self.needs_full_frame = false;
-                self.resync_requested = false;
-                self.frame = Some(frame.clone());
-                self.frame_dock = self.shell_dock;
-                SurfaceChange::Resized
-            }
-            ServerMessage::PreparedFrame { frame, .. } => {
-                self.needs_full_frame = false;
-                self.resync_requested = false;
-                self.frame = Some(frame.clone());
-                self.frame_dock = self.shell_dock;
-                SurfaceChange::Resized
+            ServerMessage::Frame(frame) | ServerMessage::PreparedFrame { frame, .. } => {
+                self.install_frame(frame.clone())
             }
             ServerMessage::FrameDiff(diff) => {
                 let applied = match self.frame.as_mut() {
@@ -230,6 +239,22 @@ mod tests {
             cursor: None,
             cursor_visible: false,
         }
+    }
+
+    #[test]
+    fn an_owned_frame_installs_like_a_borrowed_one() {
+        let mut borrowed = Surface::new();
+        let mut owned = Surface::new();
+        let message = ServerMessage::Frame(full(2, 1));
+        assert_eq!(borrowed.apply(&message), SurfaceChange::Resized);
+        assert_eq!(owned.apply_owned(message), SurfaceChange::Resized);
+        assert_eq!(owned.frame(), borrowed.frame());
+        // Everything that is not a frame still takes the borrowed path.
+        assert_eq!(
+            owned.apply_owned(ServerMessage::Clipboard("hi".into())),
+            SurfaceChange::None
+        );
+        assert_eq!(owned.take_clipboard().as_deref(), Some("hi"));
     }
 
     #[test]

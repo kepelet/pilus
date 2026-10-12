@@ -29,6 +29,7 @@ mod mission;
 mod orchestration;
 mod page_split;
 mod palette;
+mod perf;
 mod picker;
 mod ports_tab;
 mod right_sidebar;
@@ -1996,9 +1997,7 @@ impl PilusView {
                 if updated.is_err() {
                     break;
                 }
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
+                tick_or_arrival(cx.background_executor().timer(TICK)).await;
             }
         })
         .detach();
@@ -2510,7 +2509,14 @@ impl PilusView {
                     if let pilus_protocol::ServerMessage::MachineCatalogChanged { .. } = &message {
                         catalog = true;
                     }
-                    if self.surface.apply(&message) != SurfaceChange::None {
+                    if matches!(
+                        message,
+                        pilus_protocol::ServerMessage::Frame(_)
+                            | pilus_protocol::ServerMessage::FrameDiff(_)
+                    ) {
+                        perf::frame();
+                    }
+                    if self.surface.apply_owned(message) != SurfaceChange::None {
                         changed = true;
                     }
                     // A rejected diff leaves the grid stale; the daemon answers
@@ -2760,7 +2766,7 @@ impl PilusView {
                         {
                             prepared = Some(id.clone());
                         }
-                        if endpoint.surface.apply(&message) != SurfaceChange::None {
+                        if endpoint.surface.apply_owned(message) != SurfaceChange::None {
                             changed = true;
                         }
                     }
@@ -11811,6 +11817,7 @@ fn tab_exists(tabs: &[Tab], index: u16) -> bool {
 
 impl Render for PilusView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        perf::render();
         self.window_active = window.is_window_active();
         // Remember the open dock so the collapse tween still has a width to
         // fold from once the daemon drops it in response to our hide message.
@@ -11899,22 +11906,24 @@ impl Render for PilusView {
             terminal_fill
         };
         let grid = match self.shown_frame() {
-            Some(frame) => render_grid(
-                frame,
-                grid_theme,
-                self.settings.terminal_font_size,
-                self.settings.terminal_font.as_str(),
-                line_height,
-                selection,
-                cell_width,
-                self.skipped_cols(),
-                self.skipped_rows(),
-                layout.cols,
-                layout.rows,
-                glass,
-                layout.slack_x,
-                layout.slack_y,
-            ),
+            Some(frame) => perf::grid_build(|| {
+                render_grid(
+                    frame,
+                    grid_theme,
+                    self.settings.terminal_font_size,
+                    self.settings.terminal_font.as_str(),
+                    line_height,
+                    selection,
+                    cell_width,
+                    self.skipped_cols(),
+                    self.skipped_rows(),
+                    layout.cols,
+                    layout.rows,
+                    glass,
+                    layout.slack_x,
+                    layout.slack_y,
+                )
+            }),
             None => {
                 let mut empty = div()
                     .flex()
@@ -12167,6 +12176,26 @@ impl Render for PilusView {
             .child(self.menu_prompt_overlay(cx))
             .child(self.toast_stack(cx))
     }
+}
+
+/// The tick loop's cadence for everything that has no arrival signal:
+/// tweens, toasts, reconnect backoff, and the other polled state.
+const TICK: Duration = Duration::from_millis(16);
+
+/// Resolve on the first of the tick timer or a daemon burst landing, so a
+/// frame is drained when it arrives rather than up to a tick later, and the
+/// grid's cadence follows the daemon's instead of beating against the timer.
+async fn tick_or_arrival(timer: impl Future<Output = ()>) {
+    let mut timer = std::pin::pin!(timer);
+    let mut arrival = std::pin::pin!(pilus_client::Arrival::global().wait());
+    std::future::poll_fn(|cx| {
+        if arrival.as_mut().poll(cx).is_ready() || timer.as_mut().poll(cx).is_ready() {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
 }
 
 /// Paint the visible window of the grid, clamped to the layout: the daemon

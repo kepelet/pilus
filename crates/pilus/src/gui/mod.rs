@@ -157,7 +157,7 @@ const SIDEBAR_HOVER_WEIGHT: f32 = 0.6;
 const SIDEBAR_GLYPH: f32 = 14.0;
 /// Gap between a row's leading glyph and its label.
 const SIDEBAR_GLYPH_GAP: f32 = 8.0;
-/// Height of a single-line sidebar row (nav, new workspace, section header).
+/// Height of a single-line sidebar row (nav, open workspace, section header).
 const SIDEBAR_ROW_HEIGHT: f32 = 28.0;
 /// Height of a one-line band that carries no control: a section header, an
 /// endpoint group label, or an empty-state placeholder.
@@ -9439,7 +9439,7 @@ impl PilusView {
             style::RADIUS_MD,
             SIDEBAR_ROW_EDGE,
         ));
-        content = content.child(self.new_workspace_row(cx));
+        content = content.child(self.open_workspace_row(cx));
         for kind in NavKind::ALL {
             content = content.child(self.nav_row(kind, cx));
         }
@@ -11061,15 +11061,14 @@ impl PilusView {
         }
     }
 
-    /// A "New Workspace" action above the nav rows.
+    /// An "Open Workspace" action above the nav rows.
     ///
-    /// The Home composer is where a new workspace and its first agent are
-    /// chosen, so this row toggles the same composer as the Cmd+Shift+N chord.
-    fn new_workspace_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// It opens the same folder picker as the Cmd+Shift+O chord. The picker is
+    /// a modal overlay, so the row never takes the selection pill.
+    fn open_workspace_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let selected = self.home.is_open();
         div()
-            .id("pilus-new-workspace")
+            .id("pilus-open-workspace")
             .flex()
             .flex_row()
             .items_center()
@@ -11081,19 +11080,17 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
-            .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
             .child(style::hover_target(&self.sidebar_hover))
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
                 SIDEBAR_GLYPH,
                 theme.muted,
             ))
-            .child(div().flex_1().child("New Workspace"))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_home(cx)))
+            .child(div().flex_1().child("Open Workspace"))
+            .on_click(cx.listener(|this, _, _, cx| this.open_picker(cx)))
     }
 
-    /// Toggle the Home composer, shared by the Cmd+Shift+N chord and the
-    /// sidebar's New Workspace row.
+    /// Toggle the Home composer, bound to the Cmd+Shift+N chord.
     fn toggle_home(&mut self, cx: &mut Context<Self>) {
         if self.home.is_open() {
             self.home.close();

@@ -1344,6 +1344,8 @@ struct PilusView {
     /// Whether the next pairing code lets its device start work (tasks,
     /// agents, workspaces). Off until the user asks, every time the page opens.
     pairing_operate: bool,
+    /// The last whole second the pairing countdown was drawn at.
+    pairing_second: u64,
     /// Registered appearance themes and the selected id, from `theme.list`.
     appearance: Appearance,
     /// Last theme poll; the registry only changes on user action.
@@ -1845,6 +1847,7 @@ impl PilusView {
             luvus_version_rx,
             luvus_version_tx,
             pairing_operate: false,
+            pairing_second: 0,
             appearance: Appearance::default(),
             last_theme_poll: Instant::now() - Duration::from_secs(11),
             theme_refreshing: false,
@@ -2064,6 +2067,14 @@ impl PilusView {
         if remote != self.remote {
             self.remote = remote;
             changed = true;
+        }
+        // The pairing card counts down in whole seconds.
+        if self.settings_open && self.remote.code.is_some() {
+            let second = tasks::unix_now();
+            if second != self.pairing_second {
+                self.pairing_second = second;
+                changed = true;
+            }
         }
         changed |= self.poll_active(cx);
         changed |= self
@@ -2551,12 +2562,9 @@ impl PilusView {
 
     /// Show a daemon push as a toast titled with the session it came from.
     ///
-    /// The Notifications setting gates only this path: a daemon can chatter,
-    /// but the outcome of something the user just did always surfaces.
+    /// Only daemon pushes come through here; the outcome of something the user
+    /// just did surfaces on its own path.
     fn notify_daemon(&mut self, text: String) {
-        if !self.settings.notifications {
-            return;
-        }
         let title = Some(self.active_session()).filter(|session| !session.is_empty());
         self.toasts.push(ToastKind::Info, title, text);
         self.dock.alert();
@@ -2566,15 +2574,14 @@ impl PilusView {
     ///
     /// Behind another app a toast cannot be seen, so the notification goes to
     /// the OS (with a Dock bounce); in front it would only duplicate what the
-    /// sidebar's blocked dot already shows, so it is a toast. The
-    /// Notifications setting gates both, and a cleared banner is withdrawn
-    /// either way so Notification Center never lists a stale ask.
+    /// sidebar's blocked dot already shows, so it is a toast. A
+    /// cleared banner is withdrawn either way so Notification Center never
+    /// lists a stale ask.
     fn raise_attention(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         for event in self.attention.drain() {
             match event {
                 attention::Event::Cleared(tag) => cx.dismiss_system_notification(&tag),
-                attention::Event::Blocked(_) if !self.settings.notifications => {}
                 attention::Event::Blocked(blocked) => {
                     let body = format!("{} is waiting on you", blocked.agent);
                     let in_front = dock::app_active().unwrap_or(self.window_active);
@@ -5474,15 +5481,34 @@ impl PilusView {
             return div();
         }
         let theme = self.theme;
+        // The relay only matters to the connector, so it appears with it.
+        let relay = self.remote.on().then(|| {
+            style::section_card(theme).child(style::enter(
+                "pilus-settings-relay",
+                self.relay_section_block(cx),
+            ))
+        });
+        let identity = self
+            .remote
+            .status
+            .as_ref()
+            .filter(|_| self.remote.on())
+            .map(|status| {
+                style::section_card(theme).child(style::enter(
+                    "pilus-settings-iroh-identity",
+                    self.iroh_identity_section_block(status, cx),
+                ))
+            });
         let body = div()
             .flex()
             .flex_col()
             .gap_6()
-            .child(self.remote_access_section_block(cx))
-            .child(self.relay_section_block(cx))
-            .child(self.machines_section_block(cx))
-            .child(self.notifications_section_block(cx))
-            .child(self.updates_section_block(cx));
+            .child(style::section_card(theme).child(self.remote_access_section_block(cx)))
+            .children(identity)
+            .children(relay)
+            .child(style::section_card(theme).child(self.machines_section_block(cx)))
+            .child(style::section_card(theme).child(self.about_pilus_section_block(cx)))
+            .child(style::section_card(theme).child(self.about_luvus_section_block(cx)));
         div()
             .flex()
             .flex_col()
@@ -5749,6 +5775,11 @@ impl PilusView {
                                 )
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
+                                        // A fresh pairing starts at the safe level;
+                                        // a re-mint keeps the choice on screen.
+                                        if this.remote.code.is_none() {
+                                            this.pairing_operate = false;
+                                        }
                                         connector::mint_code(if this.pairing_operate {
                                             pilus_client::agent_service::DeviceLevel::Operate
                                         } else {
@@ -5815,22 +5846,8 @@ impl PilusView {
                     cx,
                 ));
         }
-        if !status.strict {
-            block = block.child(
-                style::checkbox(
-                    "pilus-pairing-operate",
-                    self.pairing_operate,
-                    "Allow the next device to start work (tasks, agents, workspaces)",
-                    theme,
-                    small,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.pairing_operate = !this.pairing_operate;
-                    cx.notify();
-                })),
-            );
-        }
         if let Some(code) = &remote.code {
+            let remaining = code.expires_at.saturating_sub(tasks::unix_now());
             block = block.child(style::enter(
                 "pilus-pairing-card",
                 div()
@@ -5876,20 +5893,58 @@ impl PilusView {
                                     )),
                             ),
                     )
+                    // The level is part of the code, so changing it mints a new one.
                     .child(
-                        div().flex().flex_row().justify_end().child(
-                            style::small_button(
-                                "pilus-pairing-done",
-                                "Done",
-                                style::ButtonKind::Ghost,
-                                theme,
-                                small,
+                        style::checkbox(
+                            "pilus-pairing-operate",
+                            self.pairing_operate,
+                            "Allow this device to start work (tasks, agents, workspaces)",
+                            theme,
+                            small,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.remote.minting {
+                                return;
+                            }
+                            this.pairing_operate = !this.pairing_operate;
+                            connector::mint_code(if this.pairing_operate {
+                                pilus_client::agent_service::DeviceLevel::Operate
+                            } else {
+                                pilus_client::agent_service::DeviceLevel::Control
+                            });
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(small))
+                                    .text_color(theme.muted)
+                                    .child(format!(
+                                        "Expires in {}:{:02}",
+                                        remaining / 60,
+                                        remaining % 60
+                                    )),
                             )
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                connector::dismiss_code();
-                                cx.notify();
-                            })),
-                        ),
+                            .child(
+                                style::small_button(
+                                    "pilus-pairing-done",
+                                    "Done",
+                                    style::ButtonKind::Primary,
+                                    theme,
+                                    small,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pairing_operate = false;
+                                    connector::dismiss_code();
+                                    cx.notify();
+                                })),
+                            ),
                     ),
             ));
         }
@@ -5900,7 +5955,7 @@ impl PilusView {
             .px_3()
             .py_2()
             .radius_md()
-            .bg(theme.panel_dim)
+            .bg(theme.panel)
             .border_1()
             .border_color(theme.border);
         devices = devices.child(style::section_label(theme, "PAIRED DEVICES", small));
@@ -5922,33 +5977,40 @@ impl PilusView {
                 device.label.clone()
             };
             let id = device.endpoint_id.clone();
-            let lower_to = match device.level {
-                pilus_client::agent_service::DeviceLevel::Operate => {
-                    Some(pilus_client::agent_service::DeviceLevel::Control)
+            // Raising a level takes a new code, so only the levels below the
+            // device's own can be picked; the rest show the range.
+            let limit = (!status.strict).then(|| {
+                let mut levels = style::segmented(theme);
+                for (label, level) in [
+                    ("View", pilus_client::agent_service::DeviceLevel::View),
+                    ("Control", pilus_client::agent_service::DeviceLevel::Control),
+                    ("Operate", pilus_client::agent_service::DeviceLevel::Operate),
+                ] {
+                    let id = id.clone();
+                    let lowers = level < device.level;
+                    levels = levels.child(
+                        style::segment(
+                            SharedString::from(format!("pilus-limit-{index}-{label}")),
+                            label,
+                            level == device.level,
+                            lowers,
+                            theme,
+                            small,
+                        )
+                        .when(lowers, |segment| {
+                            segment.on_click(cx.listener(move |_, _, _, cx| {
+                                connector::lower(id.clone(), level);
+                                cx.notify();
+                            }))
+                        }),
+                    );
                 }
-                pilus_client::agent_service::DeviceLevel::Control => {
-                    Some(pilus_client::agent_service::DeviceLevel::View)
-                }
-                pilus_client::agent_service::DeviceLevel::View => None,
-            };
-            let limit = lower_to.filter(|_| !status.strict).map(|target| {
-                let id = id.clone();
-                style::small_button(
-                    SharedString::from(format!("pilus-limit-{index}")),
-                    format!("Limit to {}", target.label().to_lowercase()),
-                    style::ButtonKind::Ghost,
-                    theme,
-                    small,
-                )
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    connector::lower(id.clone(), target);
-                    cx.notify();
-                }))
+                levels
             });
             let revoke = (!status.strict).then(|| {
                 style::small_button(
                     SharedString::from(format!("pilus-revoke-{index}")),
-                    "Revoke",
+                    "Unpair",
                     style::ButtonKind::Ghost,
                     theme,
                     small,
@@ -5970,32 +6032,47 @@ impl PilusView {
                     .child(
                         div().flex_1().min_w(px(0.0)).truncate().child(name).child(
                             div()
-                                .text_color(
-                                    if device.level
-                                        == pilus_client::agent_service::DeviceLevel::Operate
-                                    {
-                                        theme.alert
-                                    } else {
-                                        theme.muted
-                                    },
+                                .flex()
+                                .flex_row()
+                                .gap_1()
+                                .text_color(theme.muted)
+                                .child(
+                                    div()
+                                        .text_color(
+                                            if device.level
+                                                == pilus_client::agent_service::DeviceLevel::Operate
+                                            {
+                                                theme.alert
+                                            } else {
+                                                theme.muted
+                                            },
+                                        )
+                                        .child(device.level.label()),
                                 )
-                                .child(device.level.label()),
+                                .when(device.enrolled_at > 0, |line| {
+                                    line.child(format!(
+                                        "· Paired {}",
+                                        mission::utc_label(device.enrolled_at)
+                                    ))
+                                }),
                         ),
                     )
                     .children(limit)
                     .children(revoke),
             );
         }
+        // Say why a segment is greyed out, or the control reads as broken.
+        if !status.strict && !status.devices.is_empty() {
+            devices = devices.child(
+                div()
+                    .pt_1()
+                    .text_size(px(small))
+                    .text_color(theme.muted)
+                    .child("A device's level can only be lowered. To raise it, unpair the device and pair it again with a new code."),
+            );
+        }
         block = block.child(devices);
-        block
-            .child(self.copy_row(
-                "endpoint",
-                status.endpoint_id.clone(),
-                "pilus-copy-endpoint",
-                cx,
-            ))
-            .child(self.copy_row("ticket", status.ticket.clone(), "pilus-copy-ticket", cx))
-            .child(self.service_log_block(cx))
+        block.child(self.service_log_block(cx))
     }
 
     /// The service's recent log, behind a disclosure: where to look when
@@ -6081,7 +6158,7 @@ impl PilusView {
         block
     }
 
-    /// A muted read-only value with a Copy button beside it.
+    /// A muted read-only `label: value` with a Copy button beside it.
     fn copy_row(
         &self,
         label: &'static str,
@@ -6089,12 +6166,36 @@ impl PilusView {
         id: &'static str,
         cx: &mut Context<Self>,
     ) -> Div {
+        let shown = format!("{label}: {value}");
+        self.copy_shown(label, shown, value, id, cx)
+    }
+
+    /// A muted read-only value with a Copy button beside it, for a row whose
+    /// heading already names it.
+    fn copy_value_row(
+        &self,
+        label: &'static str,
+        value: String,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        self.copy_shown(label, value.clone(), value, id, cx)
+    }
+
+    /// `shown` beside a Copy button that puts `value` on the clipboard.
+    fn copy_shown(
+        &self,
+        label: &'static str,
+        shown: String,
+        value: String,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let theme = self.theme;
         let size = self.section_font();
-        let copied = value.clone();
         let button = style::small_button(id, "Copy", style::ButtonKind::Ghost, theme, size)
             .on_click(cx.listener(move |this, _, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+                cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
                 this.settings_status = format!("Copied {label}.");
                 cx.notify();
             }));
@@ -6110,7 +6211,7 @@ impl PilusView {
                     .truncate()
                     .text_size(px(size))
                     .text_color(theme.muted)
-                    .child(format!("{label}: {value}")),
+                    .child(shown),
             )
             .child(button)
     }
@@ -6138,7 +6239,7 @@ impl PilusView {
 
     fn machines_section_block(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let mut section = div().flex().flex_col().gap_2().child(
+        let mut section = div().flex().flex_col().gap_3().child(
             div()
                 .flex()
                 .flex_row()
@@ -6198,7 +6299,11 @@ impl PilusView {
             _ => false,
         };
         let toggle_id = id.clone();
-        let toggle_label = if machine.enabled { "Disable" } else { "Enable" };
+        let toggle_label = if machine.enabled {
+            "Disable Machine"
+        } else {
+            "Enable Machine"
+        };
         let update_id = id.clone();
         let restart_id = id.clone();
         let stop_id = id.clone();
@@ -6282,12 +6387,12 @@ impl PilusView {
                             .gap_2()
                             .text_size(px(self.section_font()))
                             .text_color(theme.muted)
-                            .child(machine.destination.clone())
+                            .child(format!("{} via SSH", machine.destination))
                             .children(
                                 machine
                                     .version
                                     .clone()
-                                    .map(|version| div().child(format!("v{version}"))),
+                                    .map(|version| div().child(format!("Luvus {version}"))),
                             )
                             .children(behind.then(|| {
                                 div().text_color(theme.alert).child(format!(
@@ -6311,7 +6416,11 @@ impl PilusView {
             .children(restart_button)
             .child(self.machine_action(
                 format!("pilus-machine-page-update-{id}"),
-                if behind { "Upgrade" } else { "Update" },
+                if behind {
+                    "Upgrade Luvus"
+                } else {
+                    "Update Luvus"
+                },
                 if behind { theme.fg } else { theme.muted },
                 cx.listener(move |this, _, _, cx| {
                     this.update_machine_page(update_id.clone());
@@ -6320,7 +6429,11 @@ impl PilusView {
             ))
             .child(self.machine_action(
                 format!("pilus-machine-page-remove-{id}"),
-                if confirming { "Confirm" } else { "Remove" },
+                if confirming {
+                    "Confirm"
+                } else {
+                    "Remove Machine"
+                },
                 if confirming { theme.alert } else { theme.muted },
                 cx.listener(move |this, _, _, cx| {
                     this.remove_machine_page(remove_id.clone());
@@ -6456,51 +6569,10 @@ impl PilusView {
         });
     }
 
-    /// The NOTIFICATIONS section of the page: a single toggle for native
-    /// desktop notifications, persisted immediately.
-    fn notifications_section_block(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let on = self.settings.notifications;
-        let toggle = style::toggle("pilus-notifications-toggle", on, theme)
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_notifications(cx)));
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .child(style::section_label(
-                        theme,
-                        "NOTIFICATIONS",
-                        self.section_font(),
-                    ))
-                    .child(toggle),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .text_size(px(self.footer_font()))
-                    .text_color(theme.muted)
-                    .child("Notify me when an agent is waiting on me or the daemon pushes one"),
-            )
-    }
-
-    /// Toggle native notifications and persist the choice at once.
-    fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
-        self.settings.notifications = !self.settings.notifications;
-        self.settings.save(&self.pilus_root);
-        *self.shared_settings.borrow_mut() = self.settings.clone();
-        cx.notify();
-    }
-
-    /// The UPDATES section of the page: channel, feed override, auto-check,
-    /// and a manual check. Committing a change rebuilds the updater engine.
-    fn updates_section_block(&self, cx: &mut Context<Self>) -> Div {
+    /// The ABOUT PILUS section: the running version, the update channel, the
+    /// feed override (preview only), auto-check, and a manual check.
+    /// Committing a change rebuilds the updater engine.
+    fn about_pilus_section_block(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let request = UpdateRequest::from_settings(
             &self.settings.update_channel,
@@ -6599,13 +6671,115 @@ impl PilusView {
         )
         .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_check(cx)));
 
+        let preview = UpdateChannel::parse(&self.settings.update_channel) == UpdateChannel::Preview;
+        let label = |text: &'static str| {
+            div()
+                .text_size(px(self.section_font()))
+                .text_color(theme.muted)
+                .child(text)
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(style::section_label(theme, "ABOUT PILUS", self.section_font()).px_3())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .mx_3()
+                    .px_3()
+                    .py_3()
+                    .radius_md()
+                    .bg(theme.panel)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(label("Update channel"))
+                            .child(
+                                style::segmented(theme)
+                                    .child(self.update_channel_segment(UpdateChannel::Stable, cx))
+                                    .child(self.update_channel_segment(UpdateChannel::Preview, cx)),
+                            ),
+                    )
+                    .when(preview, |card| {
+                        card.child(style::enter(
+                            "pilus-update-feed-override",
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(label("Feed URL override"))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(field)
+                                        .child(feed_action),
+                                ),
+                        ))
+                    })
+                    .child(checkbox)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_size(px(self.section_font()))
+                                    .child(div().text_color(theme.muted).child("Version"))
+                                    .child(
+                                        div()
+                                            .text_color(theme.fg)
+                                            .child(crate::update::current_version().to_string()),
+                                    ),
+                            )
+                            .child(
+                                style::small_button(
+                                    "pilus-update-check-now",
+                                    "Check for Updates",
+                                    style::ButtonKind::Secondary,
+                                    theme,
+                                    self.section_font(),
+                                )
+                                .flex_shrink_0()
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.check_for_updates(cx);
+                                    },
+                                )),
+                            ),
+                    ),
+            )
+    }
+
+    /// The ABOUT LUVUS section: the installed daemon version, a release check,
+    /// and the restart that loads a newly installed binary. Update Luvus only
+    /// appears once a check has found a newer release.
+    fn about_luvus_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
         // `pilus` checks the public manifest and installs the daemon archive
         // itself; only the restart goes through the CLI, which knows the
         // selected session. A restart is two-click because it stops every pane.
         let daemon_busy = self.daemon_busy;
         let mut check_daemon = style::small_button(
             "pilus-check-daemon",
-            "Check Luvus",
+            "Check for Updates",
             style::ButtonKind::Ghost,
             theme,
             self.section_font(),
@@ -6620,7 +6794,7 @@ impl PilusView {
         let mut update_daemon = style::small_button(
             "pilus-update-daemon",
             "Update Luvus",
-            style::ButtonKind::Secondary,
+            style::ButtonKind::Primary,
             theme,
             self.section_font(),
         )
@@ -6667,20 +6841,19 @@ impl PilusView {
             }
         }));
         let daemon_status = self.daemon_status.clone();
-        let daemon_version = match (&self.daemon_installed, &self.daemon_latest) {
-            (Some(installed), Some(latest)) => {
-                Some(format!("installed {installed} · latest {latest}"))
-            }
-            (Some(installed), None) => Some(format!("installed {installed}")),
-            (None, Some(latest)) => Some(format!("latest {latest}")),
-            (None, None) => None,
-        };
+        let installed = self
+            .daemon_installed
+            .as_ref()
+            .map(ToString::to_string)
+            .or_else(|| self.luvus_local_version.clone());
+        let version = installed.unwrap_or_else(|| "not found".to_string());
+        let update_available = self.daemon_latest.clone();
 
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .child(style::section_label(theme, "UPDATES", self.section_font()).px_3())
+            .child(style::section_label(theme, "ABOUT LUVUS", self.section_font()).px_3())
             .child(
                 div()
                     .flex()
@@ -6703,28 +6876,7 @@ impl PilusView {
                                 div()
                                     .text_size(px(self.section_font()))
                                     .text_color(theme.muted)
-                                    .child("Channel"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(self.update_channel_pill(UpdateChannel::Stable, cx))
-                                    .child(self.update_channel_pill(UpdateChannel::Preview, cx)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(px(self.section_font()))
-                                    .text_color(theme.muted)
-                                    .child("Feed URL override"),
+                                    .child("Version"),
                             )
                             .child(
                                 div()
@@ -6732,40 +6884,15 @@ impl PilusView {
                                     .flex_row()
                                     .items_center()
                                     .gap_2()
-                                    .child(field)
-                                    .child(feed_action),
-                            ),
-                    )
-                    .child(checkbox)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
                                     .text_size(px(self.section_font()))
-                                    .text_color(theme.muted)
-                                    .child("Luvus daemon"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(check_daemon)
-                                    .child(update_daemon)
-                                    .child(restart_daemon),
+                                    .child(div().text_color(theme.fg).child(version))
+                                    .children(update_available.as_ref().map(|latest| {
+                                        div()
+                                            .text_color(theme.accent)
+                                            .child(format!("{latest} available"))
+                                    })),
                             ),
                     )
-                    .children(daemon_version.map(|version| {
-                        div()
-                            .text_size(px(self.footer_font()))
-                            .text_color(theme.muted)
-                            .child(version)
-                    }))
                     .children((!daemon_status.is_empty()).then(|| {
                         div()
                             .text_size(px(self.footer_font()))
@@ -6773,24 +6900,88 @@ impl PilusView {
                             .child(daemon_status)
                     }))
                     .child(
-                        div().flex().flex_row().items_center().justify_end().child(
-                            style::small_button(
-                                "pilus-update-check-now",
-                                "Check Now",
-                                style::ButtonKind::Secondary,
-                                theme,
-                                self.section_font(),
-                            )
-                            .flex_shrink_0()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.check_for_updates(cx);
-                            })),
-                        ),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(restart_daemon)
+                            .child(check_daemon)
+                            .when(update_available.is_some(), |row| row.child(update_daemon)),
                     ),
             )
     }
 
-    /// The RELAY section: where the host connector dials out, and the project
+    /// The IROH IDENTITY section: who this machine is on the iroh network.
+    ///
+    /// The endpoint ID is the connector's stable key, which every paired device
+    /// pins. The ticket wraps it with how to reach it, for a device that
+    /// already trusts this host; a new device pairs with a code instead.
+    fn iroh_identity_section_block(
+        &self,
+        status: &pilus_client::agent_service::ServiceStatus,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = self.theme;
+        let mut row = |title: &'static str, blurb: &'static str, value: &str, id: &'static str| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(self.section_font()))
+                        .text_color(theme.fg)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(self.footer_font()))
+                        .text_color(theme.muted)
+                        .child(blurb),
+                )
+                .child(self.copy_value_row(title, value.to_string(), id, cx))
+        };
+        let endpoint = row(
+            "Endpoint ID",
+            "This machine's permanent address on the iroh network. Paired devices pin it, so it stays the same across restarts.",
+            &status.endpoint_id,
+            "pilus-copy-endpoint",
+        );
+        let ticket = row(
+            "Ticket",
+            "The endpoint ID plus how to reach it right now (relay and direct addresses). It lets a device that already trusts this machine reconnect; to pair a new device, use Add device.",
+            &status.ticket,
+            "pilus-copy-ticket",
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().px_3().child(style::section_label(
+                theme,
+                "IROH IDENTITY",
+                self.section_font(),
+            )))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .mx_3()
+                    .px_3()
+                    .py_3()
+                    .radius_md()
+                    .bg(theme.panel)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(endpoint)
+                    .child(ticket),
+            )
+    }
+
+    /// The IROH RELAY section: where the host connector dials out, and the project
     /// secret that lets it use a managed relay. Both live in `settings.json`
     /// (the agent reads them there), and the agent only reads them at start.
     fn relay_section_block(&self, cx: &mut Context<Self>) -> Div {
@@ -6807,7 +6998,7 @@ impl PilusView {
                 .gap_3()
                 .child(div().px_3().child(style::section_label(
                     theme,
-                    "RELAY",
+                    "IROH RELAY",
                     self.section_font(),
                 )));
         let url_row = self.relay_field_row(
@@ -6859,13 +7050,12 @@ impl PilusView {
                 div().flex().flex_row().items_center().justify_end().child(
                     style::small_button(
                         "pilus-relay-clear",
-                        "Use Public Relays",
-                        style::ButtonKind::Ghost,
+                        "Reset to Public Relays",
+                        style::ButtonKind::Primary,
                         theme,
                         self.section_font(),
                     )
                     .flex_shrink_0()
-                    .text_color(theme.muted)
                     .on_click(cx.listener(|this, _, _, cx| this.clear_relay(cx))),
                 ),
             );
@@ -7023,43 +7213,24 @@ impl PilusView {
         cx.notify();
     }
 
-    /// One channel pill; the active one uses the accent color.
-    fn update_channel_pill(&self, value: UpdateChannel, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
+    /// One segment of the channel control.
+    fn update_channel_segment(
+        &self,
+        value: UpdateChannel,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let active = UpdateChannel::parse(&self.settings.update_channel) == value;
-        div().child(
-            div()
-                .id(format!("pilus-update-channel-{}", value.label()))
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(22.0))
-                .px_3()
-                .radius_md()
-                .border_1()
-                .border_color(if active { theme.accent } else { theme.border })
-                .text_color(if active { theme.window_bg } else { theme.fg })
-                .text_size(px(self.section_font()))
-                .font_weight(if active {
-                    FontWeight::BOLD
-                } else {
-                    FontWeight::NORMAL
-                })
-                .cursor_pointer()
-                .state_fill(
-                    if active {
-                        theme.accent
-                    } else {
-                        theme.panel_dim
-                    },
-                    theme.border,
-                    style::RADIUS_MD,
-                )
-                .child(value.label())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_update_channel(value, cx);
-                })),
+        style::segment(
+            format!("pilus-update-channel-{}", value.label()),
+            value.label(),
+            active,
+            true,
+            self.theme,
+            self.section_font(),
         )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.set_update_channel(value, cx);
+        }))
     }
 
     /// The Open Workspace picker overlay.
@@ -7704,6 +7875,12 @@ impl PilusView {
     /// Switch the update channel from the Settings page.
     fn set_update_channel(&mut self, channel: UpdateChannel, cx: &mut Context<Self>) {
         self.settings.update_channel = channel.label().to_string();
+        // The override field only exists on preview, so leaving it must not
+        // keep redirecting stable checks to a feed nobody can see.
+        if channel == UpdateChannel::Stable {
+            self.settings.update_feed_url = None;
+            self.update_url_editing = false;
+        }
         self.save_update_settings(cx);
     }
 

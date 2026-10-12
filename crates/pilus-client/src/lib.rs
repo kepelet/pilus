@@ -10,6 +10,7 @@
 pub mod agent_service;
 pub mod agents;
 pub mod ansi;
+mod arrival;
 mod autostart;
 mod commit;
 mod connection;
@@ -40,6 +41,7 @@ pub use agents::AgentModel;
 pub use agents::effort_label;
 /// Raw pi thinking levels for display labels (`High` to `high`).
 pub use agents::thinking_level;
+pub use arrival::Arrival;
 pub use autostart::{delete_session, ensure_server, ensure_server_for, stop_session};
 pub use commit::{CommitDetail, CommitFile, show_commit};
 pub use connection::{ClientEvent, Connection, EndpointIdentity};

@@ -158,6 +158,7 @@ pub fn run() -> Result<()> {
             cx.new(|cx| {
                 AddMachineView::new(
                     root,
+                    None,
                     Rc::new(RefCell::new(MachineSignal::default())),
                     Rc::new(RefCell::new(Theme::default())),
                     settings(),
@@ -753,6 +754,7 @@ pub fn run_main() -> Result<()> {
                     running: false,
                 },
             ];
+            view.settings.set_session_label("brave-falcon", "Work");
             view.session_menu_open = true;
             // Hold the slow disk poll off so the canned list stands.
             view.last_session_poll = std::time::Instant::now();
@@ -773,6 +775,15 @@ pub fn run_main() -> Result<()> {
     settle(&mut cx, 8);
     capture(&mut cx, window.into(), "main-session-menu-confirm")?;
     cx.update(|app| view.update(app, |view, _| view.close_session_menu()));
+    // The rename prompt a session row's pencil opens.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.open_session_rename("brave-falcon", cx);
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-session-rename")?;
+    cx.update(|app| view.update(app, |view, _| view.menu_prompt = None));
 
     // The WORKSPACES row context menu, with the keyboard cursor on Close,
     // and its Quick Actions submenu underneath.

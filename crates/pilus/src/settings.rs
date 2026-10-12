@@ -5,6 +5,7 @@
 //! and the terminal grid. Update preferences live here too so both the window
 //! and `pilus --check-updates` read the same channel and feed URL.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -106,6 +107,10 @@ pub struct Settings {
     /// The right sidebar's open tab, `diff` or `git`; anything else, such as
     /// a fresh install's empty value, opens the Diff.
     pub right_sidebar_tab: String,
+    /// Display names for Luvus sessions, keyed by the real session name. The
+    /// CLI and daemon cannot rename a session, so a label lives only here:
+    /// the session keeps its name on disk, in sockets, and in `--session`.
+    pub session_labels: BTreeMap<String, String>,
     /// Height of the Diff's file list above the patch, in logical pixels; 0
     /// takes the default.
     pub diff_list_height: f32,
@@ -139,6 +144,7 @@ impl Default for Settings {
             right_sidebar_visible: false,
             right_sidebar_width: 0.0,
             right_sidebar_tab: String::new(),
+            session_labels: BTreeMap::new(),
             diff_list_height: 0.0,
             git_list_height: 0.0,
             relay: pilus_client::RelaySettings::default(),
@@ -189,6 +195,24 @@ impl Settings {
     /// the file cannot turn the window invisible.
     pub fn glass_opacity(&self) -> f32 {
         self.opacity.clamp(0.1, 1.0)
+    }
+
+    /// What to call `session` in the UI: its label, else its real name.
+    pub fn session_label<'a>(&'a self, session: &'a str) -> &'a str {
+        self.session_labels
+            .get(session)
+            .map_or(session, String::as_str)
+    }
+
+    /// Label `session`, or restore its real name when `label` is blank.
+    pub fn set_session_label(&mut self, session: &str, label: &str) {
+        let label = label.trim();
+        if label.is_empty() || label == session {
+            self.session_labels.remove(session);
+        } else {
+            self.session_labels
+                .insert(session.to_string(), label.to_string());
+        }
     }
 
     /// The corner radius, clamped so a stray value cannot draw blobs.
@@ -244,6 +268,28 @@ mod tests {
         let back: Settings =
             serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
         assert_eq!(back.opacity, OPACITY);
+    }
+
+    #[test]
+    fn a_session_label_shadows_the_name_until_cleared() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.session_label("kind-voyager"), "kind-voyager");
+        settings.set_session_label("kind-voyager", "  Work  ");
+        assert_eq!(settings.session_label("kind-voyager"), "Work");
+        assert_eq!(settings.session_label("other"), "other");
+        // Blank, or the real name itself, drops the mapping.
+        settings.set_session_label("kind-voyager", "kind-voyager");
+        assert!(settings.session_labels.is_empty());
+        settings.set_session_label("kind-voyager", "Work");
+        settings.set_session_label("kind-voyager", " ");
+        assert!(settings.session_labels.is_empty());
+    }
+
+    #[test]
+    fn missing_session_labels_load_empty() {
+        let back: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert!(back.session_labels.is_empty());
     }
 
     #[test]
@@ -319,6 +365,7 @@ mod tests {
             right_sidebar_visible: true,
             right_sidebar_width: 480.0,
             right_sidebar_tab: "git".to_string(),
+            session_labels: BTreeMap::from([("kind-voyager".to_string(), "Work".to_string())]),
             diff_list_height: 200.0,
             git_list_height: 260.0,
             relay: pilus_client::RelaySettings {

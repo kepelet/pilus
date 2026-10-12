@@ -18,7 +18,7 @@ use gpui::{
     Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use pilus_client::{
-    HOME_ENV, find_installed_binary, list_machines, luvus_binary, restart_remote, stop_remote,
+    find_installed_binary, list_machines, luvus_binary, luvus_command, restart_remote, stop_remote,
 };
 
 use crate::settings::Settings;
@@ -245,6 +245,8 @@ impl FollowUps {
 /// The Add Machine window root view.
 pub struct AddMachineView {
     root: PathBuf,
+    /// The session whose profiles this window edits; `None` is the default.
+    session: Option<String>,
     signal: Rc<RefCell<MachineSignal>>,
     /// The app's live chrome palette, so this window matches the scheme.
     shared_theme: Rc<RefCell<Theme>>,
@@ -265,6 +267,7 @@ pub struct AddMachineView {
 impl AddMachineView {
     pub(super) fn new(
         root: PathBuf,
+        session: Option<String>,
         signal: Rc<RefCell<MachineSignal>>,
         shared_theme: Rc<RefCell<Theme>>,
         shared_settings: Rc<RefCell<Settings>>,
@@ -280,6 +283,7 @@ impl AddMachineView {
 
         let view = Self {
             root,
+            session,
             signal,
             theme,
             shared_theme,
@@ -363,9 +367,10 @@ impl AddMachineView {
         self.status = "Adding…".to_string();
         self.status_failed = false;
         let root = self.root.clone();
+        let session = self.session.clone();
         let tx = self.op_tx.clone();
         std::thread::spawn(move || {
-            tx.send(run_op(&root, op)).ok();
+            tx.send(run_op(&root, session.as_deref(), op)).ok();
         });
     }
 
@@ -552,12 +557,12 @@ impl Render for AddMachineView {
 }
 
 /// Run one `luvus machine …` mutation and capture its result.
-pub(super) fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
+pub(super) fn run_op(root: &Path, session: Option<&str>, op: MachineOp) -> OpOutcome {
     if let MachineOp::Restart { id } = &op {
-        return restart_machine(root, id);
+        return restart_machine(root, session, id);
     }
     let stop_note = match &op {
-        MachineOp::StopAndUpdate { id } => match stop_machine(root, id) {
+        MachineOp::StopAndUpdate { id } => match stop_machine(root, session, id) {
             Ok(note) => note,
             Err(outcome) => return outcome,
         },
@@ -573,7 +578,7 @@ pub(super) fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
         return OpOutcome::Err("luvus binary not found on PATH".to_string());
     };
     if let MachineOp::StopAndUpdate { id } = &op {
-        return reinstall_machine(&binary, root, id, &stop_note);
+        return reinstall_machine(&binary, root, session, id, &stop_note);
     }
     // A short confirmation instead of the CLI's JSON stdout.
     let success = match &op {
@@ -647,11 +652,7 @@ pub(super) fn run_op(root: &Path, op: MachineOp) -> OpOutcome {
             return OpOutcome::Ok(String::new());
         }
     }
-    match std::process::Command::new(binary)
-        .args(&args)
-        .env(HOME_ENV, root)
-        .output()
-    {
+    match luvus_command(&binary, root, session).args(&args).output() {
         Ok(output) if output.status.success() => match update_id {
             Some(id) => OpOutcome::Installed {
                 id,
@@ -709,8 +710,11 @@ fn refresh_local_install() -> String {
 ///
 /// An already-stopped or unreachable daemon is not an error here: the install
 /// that follows reports any real connectivity problem itself.
-fn stop_machine(root: &Path, id: &str) -> Result<String, OpOutcome> {
-    let Some(machine) = list_machines(root).into_iter().find(|m| m.id == id) else {
+fn stop_machine(root: &Path, session: Option<&str>, id: &str) -> Result<String, OpOutcome> {
+    let Some(machine) = list_machines(root, session)
+        .into_iter()
+        .find(|m| m.id == id)
+    else {
         return Err(OpOutcome::Err(format!(
             "machine `{id}` is not in the catalog"
         )));
@@ -724,11 +728,16 @@ fn stop_machine(root: &Path, id: &str) -> Result<String, OpOutcome> {
     })
 }
 
-/// Run one `luvus` command against `root`, returning its stderr on failure.
-fn run_luvus(binary: &Path, root: &Path, args: &[&str]) -> Result<(), String> {
-    let output = std::process::Command::new(binary)
+/// Run one `luvus` command against `session` under `root`, returning its
+/// stderr on failure.
+fn run_luvus(
+    binary: &Path,
+    root: &Path,
+    session: Option<&str>,
+    args: &[&str],
+) -> Result<(), String> {
+    let output = luvus_command(binary, root, session)
         .args(args)
-        .env(HOME_ENV, root)
         .output()
         .map_err(|error| error.to_string())?;
     if output.status.success() {
@@ -750,8 +759,17 @@ fn run_luvus(binary: &Path, root: &Path, args: &[&str]) -> Result<(), String> {
 /// leaves the remote untouched) and adding it again with `--install` has
 /// nothing pinned to reuse. If the add fails, the old profile is restored
 /// disabled, pointing at its previous binary, so the machine is not lost.
-fn reinstall_machine(binary: &Path, root: &Path, id: &str, stop_note: &str) -> OpOutcome {
-    let Some(machine) = list_machines(root).into_iter().find(|m| m.id == id) else {
+fn reinstall_machine(
+    binary: &Path,
+    root: &Path,
+    session: Option<&str>,
+    id: &str,
+    stop_note: &str,
+) -> OpOutcome {
+    let Some(machine) = list_machines(root, session)
+        .into_iter()
+        .find(|m| m.id == id)
+    else {
         return OpOutcome::Err(format!("machine `{id}` is not in the catalog"));
     };
     let mut add = vec!["machine", "add", id, "--host", machine.destination.as_str()];
@@ -761,12 +779,12 @@ fn reinstall_machine(binary: &Path, root: &Path, id: &str, stop_note: &str) -> O
     if let Some(session) = machine.preferred_session.as_deref() {
         add.extend(["--session", session]);
     }
-    if let Err(error) = run_luvus(binary, root, &["machine", "remove", id]) {
+    if let Err(error) = run_luvus(binary, root, session, &["machine", "remove", id]) {
         return OpOutcome::Err(format!("{stop_note}could not remove `{id}`: {error}"));
     }
     let mut install = add.clone();
     install.push("--install");
-    let Err(error) = run_luvus(binary, root, &install) else {
+    let Err(error) = run_luvus(binary, root, session, &install) else {
         return OpOutcome::Ok(format!("{stop_note}Reinstalled `{id}` on the new Luvus."));
     };
     // The install can land the binary and still fail its closing handshake.
@@ -777,8 +795,8 @@ fn reinstall_machine(binary: &Path, root: &Path, id: &str, stop_note: &str) -> O
     {
         let mut pinned = add.clone();
         pinned.extend(["--disabled", "--remote-binary", path.as_str()]);
-        if run_luvus(binary, root, &pinned).is_ok() {
-            return match run_luvus(binary, root, &["machine", "enable", id]) {
+        if run_luvus(binary, root, session, &pinned).is_ok() {
+            return match run_luvus(binary, root, session, &["machine", "enable", id]) {
                 Ok(()) => OpOutcome::Ok(format!(
                     "{stop_note}Reinstalled `{id}` on the new Luvus (install reported: {error})."
                 )),
@@ -794,7 +812,7 @@ fn reinstall_machine(binary: &Path, root: &Path, id: &str, stop_note: &str) -> O
     if !machine.remote_binary.is_empty() {
         restore.extend(["--remote-binary", machine.remote_binary.as_str()]);
     }
-    let restored = match run_luvus(binary, root, &restore) {
+    let restored = match run_luvus(binary, root, session, &restore) {
         Ok(()) => "The old profile was restored, disabled.".to_string(),
         Err(restore_error) => format!("Restoring the old profile also failed: {restore_error}"),
     };
@@ -802,8 +820,11 @@ fn reinstall_machine(binary: &Path, root: &Path, id: &str, stop_note: &str) -> O
 }
 
 /// Restart one machine's daemon through its freshly provisioned binary.
-fn restart_machine(root: &Path, id: &str) -> OpOutcome {
-    let Some(machine) = list_machines(root).into_iter().find(|m| m.id == id) else {
+fn restart_machine(root: &Path, session: Option<&str>, id: &str) -> OpOutcome {
+    let Some(machine) = list_machines(root, session)
+        .into_iter()
+        .find(|m| m.id == id)
+    else {
         return OpOutcome::Err(format!("machine `{id}` is not in the catalog"));
     };
     match restart_remote(&machine) {
@@ -815,6 +836,7 @@ fn restart_machine(root: &Path, id: &str) -> OpOutcome {
 /// Open the Add Machine window.
 pub fn open(
     root: PathBuf,
+    session: Option<String>,
     signal: Rc<RefCell<MachineSignal>>,
     shared_theme: Rc<RefCell<Theme>>,
     shared_settings: Rc<RefCell<Settings>>,
@@ -834,7 +856,15 @@ pub fn open(
         },
         move |window, cx| {
             cx.new(move |cx| {
-                AddMachineView::new(root, signal, shared_theme, shared_settings, window, cx)
+                AddMachineView::new(
+                    root,
+                    session,
+                    signal,
+                    shared_theme,
+                    shared_settings,
+                    window,
+                    cx,
+                )
             })
         },
     );

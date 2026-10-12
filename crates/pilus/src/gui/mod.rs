@@ -282,8 +282,6 @@ const M_REVERSED: u16 = 1 << 6;
 gpui::actions!([
     /// Open the native Appearances window.
     OpenAppearances,
-    /// Open the native Add Machine window.
-    OpenAddMachine,
     /// Quit the application.
     QuitApp,
     /// Copy the current grid selection.
@@ -420,21 +418,6 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                     .and_then(|handle| handle.read(cx).ok().map(PilusView::api_socket))
                     .unwrap_or_else(|| api.clone());
                 appearances::open(api, settings.clone(), root.clone(), cx)
-            }
-        });
-        cx.on_action({
-            let root = config_root.clone();
-            let signal = machine_signal.clone();
-            let theme = shared_theme.clone();
-            let settings = settings.clone();
-            move |_: &OpenAddMachine, cx: &mut App| {
-                machines::open(
-                    root.clone(),
-                    signal.clone(),
-                    theme.clone(),
-                    settings.clone(),
-                    cx,
-                );
             }
         });
         cx.on_action(|_: &QuitApp, cx: &mut App| {
@@ -1031,6 +1014,8 @@ enum PromptAction {
     },
     /// Give a live agent's pane an addressable alias (`agent.name`).
     RenameAgent { endpoint: EndpointId, pane: String },
+    /// Label a Luvus session, in pilus only. The session keeps its real name.
+    RenameSession { name: String },
     /// Name the focused terminal pane, resolved when the prompt is answered.
     RenamePane { endpoint: EndpointId },
     /// Move the focused terminal pane to a tab, resolved when answered.
@@ -1319,13 +1304,13 @@ struct PilusView {
     /// A machine refresh is running off-thread; no overlapping spawns.
     machine_refreshing: bool,
     /// Fresh machine profiles from the background refresh.
-    machine_rx: Receiver<Vec<MachineInfo>>,
+    machine_rx: Receiver<MachineCatalog>,
     /// Sender half for the background machine refresh.
-    machine_tx: Sender<Vec<MachineInfo>>,
+    machine_tx: Sender<MachineCatalog>,
     /// Cheap catalog reloads (no probe) from the background `list_machines`.
-    machine_list_rx: Receiver<Vec<MachineInfo>>,
+    machine_list_rx: Receiver<MachineCatalog>,
     /// Sender half for the cheap catalog reload.
-    machine_list_tx: Sender<Vec<MachineInfo>>,
+    machine_list_tx: Sender<MachineCatalog>,
     /// Status lines from background machine mutations (enable/disable/remove).
     machine_op_rx: Receiver<machines::OpOutcome>,
     /// Sender half for background machine mutation outcomes.
@@ -2165,6 +2150,14 @@ impl PilusView {
                 }
                 SessionOpResult::Done(name, verb) => {
                     self.session_working.remove(&name);
+                    // A deleted session's name can be generated again later,
+                    // and must not come back wearing the old label.
+                    if verb == SessionVerb::Delete
+                        && self.settings.session_labels.contains_key(&name)
+                    {
+                        self.settings.set_session_label(&name, "");
+                        self.save_settings();
+                    }
                     self.sessions = list_session_infos(&self.session_root);
                     self.toast(ToastKind::Success, format!("{} {name}", verb.done()));
                 }
@@ -2205,11 +2198,20 @@ impl PilusView {
             self.catalog_dirty = false;
             self.probe_machines();
         }
-        while let Ok(machines) = self.machine_rx.try_recv() {
+        while let Ok((session, machines)) = self.machine_rx.try_recv() {
             self.machine_refreshing = false;
+            // A probe that outlived a session switch describes the session the
+            // window left; read the current one's catalog instead.
+            if session != self.session_name {
+                self.catalog_dirty = true;
+                continue;
+            }
             changed |= self.apply_machine_catalog(machines);
         }
-        while let Ok(mut machines) = self.machine_list_rx.try_recv() {
+        while let Ok((session, mut machines)) = self.machine_list_rx.try_recv() {
+            if session != self.session_name {
+                continue;
+            }
             // `list_machines` omits the Local row and reachability; keep both
             // from the last probe so the section never flickers.
             if !machines.iter().any(|machine| machine.id == "local")
@@ -2582,7 +2584,9 @@ impl PilusView {
     /// Only daemon pushes come through here; the outcome of something the user
     /// just did surfaces on its own path.
     fn notify_daemon(&mut self, text: String) {
-        let title = Some(self.active_session()).filter(|session| !session.is_empty());
+        let title = Some(self.active_session())
+            .filter(|session| !session.is_empty())
+            .map(|session| self.settings.session_label(&session).to_string());
         self.toasts.push(ToastKind::Info, title, text);
         self.dock.alert();
     }
@@ -2637,9 +2641,11 @@ impl PilusView {
     /// uses, and the next probe tick fills in reachability.
     fn reload_machines(&mut self) {
         let root = self.session_root.clone();
+        let session = self.session_name.clone();
         let tx = self.machine_list_tx.clone();
         std::thread::spawn(move || {
-            tx.send(list_machines(&root)).ok();
+            let machines = list_machines(&root, session.as_deref());
+            tx.send((session, machines)).ok();
         });
     }
 
@@ -2695,9 +2701,11 @@ impl PilusView {
         self.machine_refreshing = true;
         self.last_machine_poll = Instant::now();
         let root = self.session_root.clone();
+        let session = self.session_name.clone();
         let tx = self.machine_tx.clone();
         std::thread::spawn(move || {
-            tx.send(refresh_machines(&root)).ok();
+            let machines = refresh_machines(&root, session.as_deref());
+            tx.send((session, machines)).ok();
         });
     }
     /// The active endpoint as a picker/control source.
@@ -3857,6 +3865,7 @@ impl PilusView {
                 Some("⌘⇧D"),
             ),
             entry(Command::NewSession, "New Session", "Session", None),
+            entry(Command::RenameSession, "Rename Session", "Session", None),
             entry(Command::NewWindow, "New Window", "Application", Some("⌘N")),
             entry(
                 Command::OpenAppearances,
@@ -3932,7 +3941,10 @@ impl PilusView {
         for session in &self.sessions {
             entries.push(entry(
                 Command::SwitchSession(session.name.clone()),
-                &format!("Switch to Session {}", session.name),
+                &format!(
+                    "Switch to Session {}",
+                    self.settings.session_label(&session.name)
+                ),
                 "Navigate",
                 None,
             ));
@@ -3998,6 +4010,10 @@ impl PilusView {
             Command::FocusTab(index) => self.focus_tab(index, cx),
             Command::SwitchSession(name) => self.switch_session(&name),
             Command::NewSession => self.start_new_session(),
+            Command::RenameSession => {
+                let name = self.current_session_name().to_string();
+                self.open_session_rename(&name, cx);
+            }
             Command::FocusWorkspace(id) => {
                 self.leave_settings_page();
                 self.focus_workspace(&id);
@@ -6198,8 +6214,18 @@ impl PilusView {
                         theme,
                         self.footer_font(),
                     )
-                    .on_click(cx.listener(|_, _, window, cx| {
-                        window.dispatch_action(OpenAddMachine.boxed_clone(), cx);
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        // Opened from here, not through a global action: that
+                        // handler runs inside this window's update, where the
+                        // view cannot be read back to learn its session.
+                        machines::open(
+                            this.session_root.clone(),
+                            this.session_name.clone(),
+                            this.machine_signal.clone(),
+                            this.shared_theme.clone(),
+                            this.shared_settings.clone(),
+                            cx,
+                        );
                     })),
                 ),
         );
@@ -6500,11 +6526,15 @@ impl PilusView {
         self.machine_busy = Some(id.to_string());
         self.settings_status = "Running…".to_string();
         let root = self.session_root.clone();
+        let session = self.session_name.clone();
         let op_tx = self.machine_op_tx.clone();
         let machine_tx = self.machine_tx.clone();
         std::thread::spawn(move || {
-            op_tx.send(machines::run_op(&root, op)).ok();
-            machine_tx.send(list_machines(&root)).ok();
+            op_tx
+                .send(machines::run_op(&root, session.as_deref(), op))
+                .ok();
+            let machines = list_machines(&root, session.as_deref());
+            machine_tx.send((session, machines)).ok();
         });
     }
 
@@ -7579,6 +7609,9 @@ impl PilusView {
     fn forget_session_scoped_state(&mut self) {
         self.worktree_linked.clear();
         self.worktree_probing.clear();
+        // Pane ids restart too, so attention would compare unrelated panes.
+        self.attention.forget_all();
+        self.home_pending_open = None;
     }
 
     /// Create a fresh session and attach to it once its socket appears.
@@ -9097,6 +9130,19 @@ impl PilusView {
                     .ok();
                 });
             }
+            PromptAction::RenameSession { name } => {
+                if trimmed.chars().count() > 40 {
+                    self.toast(
+                        ToastKind::Error,
+                        "session labels are capped at 40 characters",
+                    );
+                    cx.notify();
+                    return;
+                }
+                self.settings.set_session_label(&name, &trimmed);
+                self.save_settings();
+                cx.notify();
+            }
             PromptAction::RenameAgent { endpoint, pane } => {
                 let Some(mut client) = self.control_client_for_endpoint(&endpoint) else {
                     self.toast(
@@ -10048,9 +10094,11 @@ impl PilusView {
             .text_size(px(self.chrome_font()))
             .hover_fill(theme.panel.opacity(glass), style::RADIUS_SOFT)
             .child(
-                div()
-                    .text_color(theme.panel_fg)
-                    .child(self.current_session_name().to_string()),
+                div().text_color(theme.panel_fg).child(
+                    self.settings
+                        .session_label(self.current_session_name())
+                        .to_string(),
+                ),
             )
             .child(icon(
                 include_bytes!("../../assets/icons/chevron-down.svg"),
@@ -10065,6 +10113,61 @@ impl PilusView {
                 }
                 cx.notify();
             }))
+    }
+
+    /// The pencil on a session row. The label is pilus's own, so it works on
+    /// running and stopped sessions alike.
+    fn session_rename_button(&self, name: &str, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = self.theme;
+        let target = name.to_string();
+        div()
+            .id(format!("pilus-menu-session-rename-{name}"))
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .w(px(22.0))
+            .h(px(22.0))
+            .radius_md()
+            .cursor_pointer()
+            .hover_fill(theme.panel_dim, style::RADIUS_MD)
+            .child(icon(
+                include_bytes!("../../assets/icons/pencil.svg"),
+                13.0,
+                theme.muted,
+            ))
+            .tooltip(row_tooltip(
+                format!("Rename session (pilus only) · {name}"),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_session_rename(&target, cx);
+                cx.stop_propagation();
+            }))
+    }
+
+    /// Ask for a display label for `name`, closing the session menu first so
+    /// the prompt is the only thing taking input.
+    fn open_session_rename(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.close_session_menu();
+        let current = self.settings.session_label(name).to_string();
+        self.open_menu_prompt(
+            PromptAction::RenameSession {
+                name: name.to_string(),
+            },
+            "Rename session",
+            "Shown in pilus only; the session keeps its name. Leave empty to restore it.",
+            &current,
+            cx,
+        );
+    }
+
+    /// Persist the settings and share them with every window.
+    fn save_settings(&mut self) {
+        self.settings.save(&self.pilus_root);
+        *self.shared_settings.borrow_mut() = self.settings.clone();
     }
 
     /// The trailing end of a session row: its status, or the stop/delete
@@ -10239,8 +10342,9 @@ impl PilusView {
                         } else {
                             theme.muted
                         })
-                        .child(session.name.clone()),
-                );
+                        .child(self.settings.session_label(&session.name).to_string()),
+                )
+                .child(self.session_rename_button(&session.name, cx));
             row = row.child(
                 div()
                     .flex_shrink_0()
@@ -13405,6 +13509,10 @@ fn row_tooltip(
         .into()
     }
 }
+
+/// A machine catalog tagged with the session it was read for, so a result
+/// that lands after a session switch is not applied to the new session.
+type MachineCatalog = (Option<String>, Vec<MachineInfo>);
 
 /// Outcome of a background session start, stop, or delete.
 enum SessionOpResult {

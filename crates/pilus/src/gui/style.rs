@@ -218,6 +218,21 @@ pub(super) fn section_label(theme: Theme, text: impl IntoElement, size: f32) -> 
         .child(text)
 }
 
+/// A page section's frame: a `panel_dim` fill inside a `theme.border` edge, so
+/// each group on a long page reads as its own block. Cards a section draws
+/// inside it use `panel`, which sits a step above this fill.
+pub(super) fn section_card(theme: Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .mx_3()
+        .py_3()
+        .radius_md()
+        .bg(theme.panel_dim)
+        .border_1()
+        .border_color(theme.border)
+}
+
 /// A small outlined tag for a value that qualifies a row: a dependency, a
 /// path glob, a mode. It sits in a list row or a property cell and never
 /// takes a click of its own.
@@ -325,6 +340,68 @@ pub(super) fn icon_button(
                 .flex_shrink_0()
                 .text_color(fg),
         )
+}
+
+/// The frame of a segmented control: a short row of mutually exclusive
+/// choices read as one object. Fill it with [`segment`]s.
+pub(super) fn segmented(theme: Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .items_center()
+        .gap_1()
+        .p(px(2.0))
+        .radius_md()
+        .bg(theme.panel_dim)
+        .border_1()
+        .border_color(theme.border)
+}
+
+/// One choice of a [`segmented`] control. The chosen one takes the accent; the
+/// rest wash on hover. A segment that cannot be picked (a level that can only
+/// be reached with a new pairing code, say) stays visible but muted, takes no
+/// pointer and no hover, so the control still shows the whole range.
+pub(super) fn segment(
+    id: impl Into<ElementId>,
+    label: impl IntoElement,
+    active: bool,
+    enabled: bool,
+    theme: Theme,
+    text_size: f32,
+) -> Stateful<Div> {
+    let clear = gpui::transparent_black();
+    let (rest, hover): (Hsla, Hsla) = if active {
+        (theme.accent.into(), theme.accent.into())
+    } else if enabled {
+        (clear, theme.panel.into())
+    } else {
+        (clear, clear)
+    };
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(CONTROL_HEIGHT_SMALL - 6.0))
+        .px_2()
+        .radius_sm()
+        .text_size(px(text_size))
+        .font_weight(if active {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        })
+        .text_color(if active {
+            theme.window_bg
+        } else if enabled {
+            theme.fg
+        } else {
+            tint(theme.muted, 0.55)
+        })
+        .when(enabled && !active, |segment| segment.cursor_pointer())
+        .state_fill(rest, hover, RADIUS_SM)
+        .child(label)
 }
 
 /// One tab of a strip: the selected tab is raised by its panel fill alone,

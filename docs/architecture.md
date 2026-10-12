@@ -632,7 +632,8 @@ implementation; Settings says so instead of showing a switch.
 `<state root>/agent/agent.sock` (`0600` in a `0700` directory) answers one JSON
 request per connection: `status` (endpoint id, current ticket, gateway health,
 enrolled devices, never a code), `new_code` (a code plus the
-`pilus://pair/<ticket>?code=…&name=…` link a QR encodes), `set_level`, `revoke`,
+`pilus://pair/<ticket>?code=…` link a QR encodes; it carries no `name`, so the
+device labels itself), `set_level`, `revoke`,
 and `retry`, which cuts the supervisor's backoff short and starts the Luvus server
 now (the window's *Start Luvus*; a person asking overrides the once-a-minute
 limit). It is the only way the window reads the service, and it is why the window needs no stdout.
@@ -675,9 +676,9 @@ Operate is remote code execution by design (a task's agent and gate command, an
 agent, a shell in a new workspace), and on an SSH machine it is exactly as
 powerful as sitting at that machine. So it is opt-in per device, and a level can
 only be **raised by a live enrollment code at that level**, which exists only on
-the host: *Add device* with "Allow the next device to start work" ticked. The
-admin socket can only **lower** a level (Settings: *Limit to control*, *Limit to
-view only*), and a lowered or revoked device is refused on the very next request
+the host: *Add device* with "Allow this device to start work" ticked. The
+admin socket can only **lower** a level (Settings: the View / Control / Operate
+control on a paired device), and a lowered or revoked device is refused on the very next request
 of a connection that is already open, because the level is looked up per stream.
 Re-enrolling an already-enrolled device with a live code at another level
 re-levels it; presenting no code or a dead one changes nothing, so a plain
@@ -831,11 +832,12 @@ Quitting pilus does **not** stop it. While it runs the section shows its health
 (`Running`; a **Restart** button runs `service restart` so a new build is picked up
 without switching Remote access off and on; `Waiting for Luvus`, with what to do and a **Start Luvus** button; or
 `Luvus not found`, where retrying cannot help), an **Add device** button
-with its *Allow the next device to start work* choice (off every time), and the
-paired devices, each showing its level, with **Limit to…** and **Revoke**. Add device mints a code and shows it as a
+and the paired devices, each showing its level and when it paired (UTC), as a segmented View / Control / Operate control (only lower levels can be picked; raising takes a new code) with **Unpair**. Add device mints a code and shows it as a
 QR (`style::qr_code`, always dark on light whatever the theme, because a scanner
-needs the contrast), with Copy rows for the code and the link; the card hides
-itself when the code expires. Endpoint id and ticket stay below as copy rows, followed by a **SERVICE LOG**
+needs the contrast), with Copy rows for the code and the link, the *Allow this device to start work*
+choice (off every time; toggling it mints a new code, since the level is part of
+the code), an expiry countdown, and a **Done** button; the card hides itself when
+the code expires. Below it, a **SERVICE LOG**
 disclosure that tails the last lines of `agent.log` (polled only while it is open)
 with a Copy button.
 Each machine row in that page carries enable/disable/remove and the Luvus upgrade actions (Update, then Restart,
@@ -890,9 +892,9 @@ Selection lives in `gui/selection.rs`: it normalizes a reversed drag, answers
   opens only.
 - Double-click to select a word, and triple-click to select a line.
 - Named-pipe transport on Windows.
-- Daemon upgrades: **Settings → UPDATES → Luvus daemon** checks
+- Daemon upgrades: **Settings → ABOUT LUVUS** checks
   `luvus.dev/latest.json` and installs the verified platform archive itself
   (refusing a package-manager install), then restarts through
-  `luvus server restart`. The **Update** button on a machine's Settings row
+  `luvus server restart`. The **Update Luvus** button on a machine's Settings row
   re-provisions a host with `luvus machine enable <id> --install`, and its rows
   show the remote daemon version from the last probe.

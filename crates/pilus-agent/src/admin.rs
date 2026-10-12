@@ -163,7 +163,9 @@ impl Admin {
             "level": level.as_str(),
             "code": code,
             "expires_at": expires_at,
-            "link": pairing_link(&self.ticket(), Some(&code), &self.label),
+            // No `name`: it would become the device's own label, and the
+            // device is the one that knows what to call itself.
+            "link": pairing_link(&self.ticket(), Some(&code), ""),
         })
     }
 
@@ -172,7 +174,8 @@ impl Admin {
     }
 }
 
-/// The deep link a device scans or pastes: `pilus://pair/<ticket>?code=…&name=…`.
+/// The deep link a device scans or pastes: `pilus://pair/<ticket>?code=…`, with
+/// an optional `&name=…` the minted links leave out.
 ///
 /// The ticket is the path, not the host, because it is long base32 a URL
 /// parser would otherwise lowercase or reject as a hostname.

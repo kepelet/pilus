@@ -192,6 +192,10 @@ async fn service_enrolls_serves_the_hub_and_survives_a_gateway_restart() {
         link.starts_with("pilus://pair/endpoint") && link.contains("code="),
         "{link}"
     );
+    assert!(
+        !link.contains("name="),
+        "the link must leave the device's label to the device: {link}"
+    );
     let code = minted["code"].as_str().expect("code");
     let enrolled = one_line(
         &client,

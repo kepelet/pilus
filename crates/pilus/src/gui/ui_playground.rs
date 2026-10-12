@@ -626,14 +626,16 @@ impl UiPlaygroundView {
             .items_center()
             .gap_4()
             .child(style::qr_code(
-                "pilus://pair/endpointaaaabbbbccccddddeeeeffff?code=AB12-CD34-EF56-7890&name=Studio%20Mac",
+                "pilus://pair/endpointaaaabbbbccccddddeeeeffff?code=AB12-CD34-EF56-7890",
                 176.0,
             ))
             .child(
                 div()
                     .text_size(px(self.fonts().secondary))
                     .text_color(self.theme.muted)
-                    .child("Always dark on light, whatever the theme: a scanner needs the contrast."),
+                    .child(
+                        "Always dark on light, whatever the theme: a scanner needs the contrast.",
+                    ),
             )
     }
 
@@ -2091,6 +2093,59 @@ impl Render for UiPlaygroundView {
                                     .text_size(px(self.settings.borrow().terminal_font_size))
                                     .text_color(theme.fg)
                                     .child("monospace 0123456789"),
+                            ),
+                    ),
+                ),
+            )
+            .child(
+                self.section(
+                    "SEGMENTED CONTROL",
+                    self.tray(
+                        style::segmented(theme)
+                            .child(style::segment(
+                                "pg-seg-view",
+                                "View",
+                                false,
+                                true,
+                                theme,
+                                self.fonts().secondary,
+                            ))
+                            .child(style::segment(
+                                "pg-seg-control",
+                                "Control",
+                                true,
+                                true,
+                                theme,
+                                self.fonts().secondary,
+                            ))
+                            .child(style::segment(
+                                "pg-seg-operate",
+                                "Operate",
+                                false,
+                                false,
+                                theme,
+                                self.fonts().secondary,
+                            )),
+                    ),
+                ),
+            )
+            .child(
+                self.section(
+                    "SECTION CARD",
+                    div().mx_neg_3().child(
+                        style::section_card(theme)
+                            .gap_2()
+                            .child(div().px_3().child(style::section_label(
+                                theme,
+                                "NOTIFICATIONS",
+                                self.fonts().label,
+                            )))
+                            .child(
+                                div()
+                                    .px_3()
+                                    .text_size(px(self.fonts().secondary))
+                                    .text_color(theme.muted)
+                                    .child("A page section: panel-dim fill inside a theme border."),
                             ),
                     ),
                 ),

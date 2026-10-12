@@ -71,10 +71,6 @@ pub struct Settings {
     /// Run the host connector ("this node" remote access) while pilus is open.
     /// Off by default; the Remote Machines window toggles it.
     pub connector: bool,
-    /// Tell the user when an agent starts waiting on them (a native
-    /// notification while pilus is behind another app, a toast in front) and
-    /// when the daemon pushes a notice. On by default.
-    pub notifications: bool,
     /// Window opacity for glass surfaces (terminal, sidebar, tab strip);
     /// 1.0 is opaque. Files written before the control existed stay
     /// translucent via the default.
@@ -133,7 +129,6 @@ impl Default for Settings {
             update_feed_url: None,
             window: None,
             connector: false,
-            notifications: true,
             opacity: OPACITY,
             blur: BLUR,
             corner_radius: CORNER_RADIUS,
@@ -224,16 +219,14 @@ mod tests {
         assert_eq!(settings.update_channel, "stable");
         assert!(settings.update_feed_url.is_none());
         assert!(settings.window.is_none());
-        assert!(settings.notifications);
         assert_eq!(settings.opacity, OPACITY);
     }
 
     #[test]
-    fn missing_notifications_defaults_on() {
-        // Settings written before the toggle existed must still notify.
-        let back: Settings =
-            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
-        assert!(back.notifications);
+    fn a_retired_notifications_key_is_ignored() {
+        // The toggle is gone; files that still carry it must keep loading.
+        serde_json::from_str::<Settings>(r#"{"terminal_font":"Menlo","notifications":false}"#)
+            .expect("deserialize");
     }
 
     #[test]
@@ -316,7 +309,6 @@ mod tests {
                 display: Some("6d0f9a4c-30b2-4f25-9a2e-4a8f9c3b7d10".to_string()),
             }),
             connector: true,
-            notifications: false,
             opacity: 0.7,
             blur: 0.5,
             corner_radius: 0.0,

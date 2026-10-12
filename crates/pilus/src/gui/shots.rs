@@ -1044,7 +1044,7 @@ pub fn run_main() -> Result<()> {
         view.update(app, |view, _| view.home.close_dropdown());
     });
 
-    // The Settings page: machines, notifications, updates. Remote access is
+    // The Settings page: machines, about pilus, about luvus. Remote access is
     // shown running with a live pairing code and two paired devices, the state
     // with the most to draw.
     super::connector::preview(remote_access_fixture(true));
@@ -1601,10 +1601,10 @@ fn remote_access_fixture(with_code: bool) -> super::connector::RemoteAccess {
             linger: None,
         }),
         code: with_code.then(|| PairingCode {
-            level: DeviceLevel::Operate,
+            level: DeviceLevel::Control,
             code: "832F-21EF-0E12-382C".to_string(),
-            expires_at: u64::MAX,
-            link: format!("pilus://pair/{ticket}?code=832F-21EF-0E12-382C&name=Studio%20Mac"),
+            expires_at: super::tasks::unix_now() + 9 * 60 + 42,
+            link: format!("pilus://pair/{ticket}?code=832F-21EF-0E12-382C"),
         }),
         error: None,
         minting: false,

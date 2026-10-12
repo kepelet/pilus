@@ -126,7 +126,7 @@ final class AppStore {
         }
     }
 
-    /// A `pilus://pair/<ticket>?code=…&name=…` link, scanned or opened.
+    /// A `pilus://pair/<ticket>?code=…` link (optionally `&name=…`), scanned or opened.
     /// Returns false when the URL is not a pair link.
     @discardableResult
     func connect(pairLink: String) async -> Bool {

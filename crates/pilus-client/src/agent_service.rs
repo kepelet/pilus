@@ -182,7 +182,8 @@ pub struct PairingCode {
     pub code: String,
     /// When it stops working, as a Unix timestamp.
     pub expires_at: u64,
-    /// `pilus://pair/<ticket>?code=…&name=…`, what a QR encodes.
+    /// `pilus://pair/<ticket>?code=…`, what a QR encodes. It carries no `name`, so
+    /// the device picks its own label.
     pub link: String,
 }
 

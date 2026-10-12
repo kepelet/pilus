@@ -21,6 +21,9 @@ pub enum SurfaceChange {
 pub struct Surface {
     frame: Option<FrameData>,
     needs_full_frame: bool,
+    /// A recovery request is already out for the current outage, so a burst
+    /// of rejected diffs asks the daemon once rather than once per diff.
+    resync_requested: bool,
     notify: Option<String>,
     sounds: Vec<SoundSignal>,
     clipboard: Option<String>,
@@ -57,9 +60,17 @@ impl Surface {
         self.needs_full_frame
     }
 
-    /// Clear the resync flag after a full frame has been requested.
-    pub fn clear_resync(&mut self) {
-        self.needs_full_frame = false;
+    /// Whether the caller should ask the daemon for a full frame now.
+    ///
+    /// True once per outage: after a rejected diff, until a full frame lands.
+    /// Later rejected diffs in the same outage stay quiet because a request is
+    /// already in flight.
+    pub fn take_resync(&mut self) -> bool {
+        if self.needs_full_frame && !self.resync_requested {
+            self.resync_requested = true;
+            return true;
+        }
+        false
     }
 
     /// Take the most recent notification text.
@@ -136,12 +147,14 @@ impl Surface {
         match message {
             ServerMessage::Frame(frame) => {
                 self.needs_full_frame = false;
+                self.resync_requested = false;
                 self.frame = Some(frame.clone());
                 self.frame_dock = self.shell_dock;
                 SurfaceChange::Resized
             }
             ServerMessage::PreparedFrame { frame, .. } => {
                 self.needs_full_frame = false;
+                self.resync_requested = false;
                 self.frame = Some(frame.clone());
                 self.frame_dock = self.shell_dock;
                 SurfaceChange::Resized
@@ -349,5 +362,33 @@ mod tests {
         });
         assert_eq!(surface.apply(&diff), SurfaceChange::None);
         assert!(surface.needs_full_frame());
+    }
+
+    #[test]
+    fn a_rejected_diff_asks_for_one_full_frame_until_it_lands() {
+        let mut surface = Surface::new();
+        surface.apply(&ServerMessage::Frame(full(2, 1)));
+        assert!(!surface.take_resync());
+
+        // A diff sized for a different grid is rejected and leaves the frame.
+        let stale = ServerMessage::FrameDiff(FrameDiff {
+            width: 4,
+            height: 1,
+            runs: Vec::new(),
+            cursor: None,
+            cursor_visible: false,
+        });
+        assert_eq!(surface.apply(&stale), SurfaceChange::None);
+        assert!(surface.take_resync(), "first rejection asks for recovery");
+
+        // More diffs arrive before the daemon answers: no second request.
+        surface.apply(&stale);
+        assert!(!surface.take_resync());
+
+        // The full frame ends the outage, and a later rejection asks again.
+        surface.apply(&ServerMessage::Frame(full(2, 1)));
+        assert!(!surface.needs_full_frame());
+        surface.apply(&stale);
+        assert!(surface.take_resync());
     }
 }

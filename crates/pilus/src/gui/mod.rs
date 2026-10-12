@@ -2513,6 +2513,17 @@ impl PilusView {
                     if self.surface.apply(&message) != SurfaceChange::None {
                         changed = true;
                     }
+                    // A rejected diff leaves the grid stale; the daemon answers
+                    // a resize with a full frame, which is the only recovery
+                    // the protocol offers.
+                    if self.surface.take_resync() {
+                        self.send_active(ClientMessage::Resize {
+                            cols: self.cols,
+                            rows: self.rows,
+                            cell_width_px: self.sent_cell.0,
+                            cell_height_px: self.sent_cell.1,
+                        });
+                    }
                     if let Some(text) = self.surface.take_notify() {
                         self.notify_daemon(text);
                         changed = true;

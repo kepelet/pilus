@@ -111,6 +111,13 @@ pub struct Settings {
     /// CLI and daemon cannot rename a session, so a label lives only here:
     /// the session keeps its name on disk, in sockets, and in `--session`.
     pub session_labels: BTreeMap<String, String>,
+    /// The named session the window was attached to when it last closed;
+    /// `None` is the default session. The next plain launch reopens it.
+    pub last_session: Option<String>,
+    /// The machine id that owned the surface in `last_session`; `None` is the
+    /// local daemon. Machine profiles belong to a session, so a session switch
+    /// clears it.
+    pub last_endpoint: Option<String>,
     /// Height of the Diff's file list above the patch, in logical pixels; 0
     /// takes the default.
     pub diff_list_height: f32,
@@ -145,6 +152,8 @@ impl Default for Settings {
             right_sidebar_width: 0.0,
             right_sidebar_tab: String::new(),
             session_labels: BTreeMap::new(),
+            last_session: None,
+            last_endpoint: None,
             diff_list_height: 0.0,
             git_list_height: 0.0,
             relay: pilus_client::RelaySettings::default(),
@@ -213,6 +222,17 @@ impl Settings {
             self.session_labels
                 .insert(session.to_string(), label.to_string());
         }
+    }
+
+    /// The session a plain launch should reopen: the one left last, provided
+    /// it is still running. A session that was stopped or deleted since falls
+    /// back to the default rather than starting a daemon nobody asked for.
+    pub fn restorable_session(&self, sessions: &[pilus_client::SessionInfo]) -> Option<String> {
+        let last = self.last_session.as_deref()?;
+        sessions
+            .iter()
+            .any(|session| session.name == last && session.running)
+            .then(|| last.to_string())
     }
 
     /// The corner radius, clamped so a stray value cannot draw blobs.
@@ -293,6 +313,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_last_state_opens_the_default_session_on_local() {
+        let back: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert!(back.last_session.is_none());
+        assert!(back.last_endpoint.is_none());
+    }
+
+    #[test]
+    fn only_a_running_session_is_restored() {
+        let session = |name: &str, running| pilus_client::SessionInfo {
+            name: name.to_string(),
+            running,
+        };
+        let sessions = [
+            session("default", true),
+            session("kind-voyager", true),
+            session("stopped", false),
+        ];
+        let mut settings = Settings::default();
+        assert_eq!(settings.restorable_session(&sessions), None);
+        settings.last_session = Some("kind-voyager".to_string());
+        assert_eq!(
+            settings.restorable_session(&sessions).as_deref(),
+            Some("kind-voyager")
+        );
+        settings.last_session = Some("stopped".to_string());
+        assert_eq!(settings.restorable_session(&sessions), None);
+        settings.last_session = Some("deleted".to_string());
+        assert_eq!(settings.restorable_session(&sessions), None);
+    }
+
+    #[test]
     fn missing_blur_keeps_full_blur() {
         // Files written before the control existed have no blur key.
         let back: Settings =
@@ -366,6 +418,8 @@ mod tests {
             right_sidebar_width: 480.0,
             right_sidebar_tab: "git".to_string(),
             session_labels: BTreeMap::from([("kind-voyager".to_string(), "Work".to_string())]),
+            last_session: Some("kind-voyager".to_string()),
+            last_endpoint: Some("build-box".to_string()),
             diff_list_height: 200.0,
             git_list_height: 260.0,
             relay: pilus_client::RelaySettings {

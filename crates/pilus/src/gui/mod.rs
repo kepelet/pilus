@@ -377,12 +377,14 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     // the empty grid area names the failure. The real viewport is not known
     // until a window exists; the first resize after the window opens corrects
     // the provisional dimensions.
-    let appearances_socket = api_socket_for_target(&target);
     let config_root = config_dir();
     let pilus_root = pilus_config_dir();
     migrate_legacy_stores(&config_root, &pilus_root);
-    let new_window_target = target.clone();
     let settings = Rc::new(RefCell::new(Settings::load(&pilus_root)));
+    let target = reopen_last_session(target, &settings.borrow(), &config_root);
+    let restore_endpoint = settings.borrow().last_endpoint.clone();
+    let appearances_socket = api_socket_for_target(&target);
+    let new_window_target = target.clone();
     style::sync_corner_radius(&settings.borrow());
     let machine_signal = Rc::new(RefCell::new(MachineSignal::default()));
     let shared_theme = Rc::new(RefCell::new(Theme::default()));
@@ -561,9 +563,13 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             move |window, cx| {
                 let signal = machine_signal.clone();
                 let theme = shared_theme.clone();
-                cx.new(move |cx| {
+                let view = cx.new(move |cx| {
                     PilusView::new(target, None, settings.clone(), signal, theme, window, cx)
-                })
+                });
+                // Only this first window reopens on the machine it left; a
+                // later one starts on the local daemon, like it always did.
+                view.update(cx, |view, _| view.restore_endpoint = restore_endpoint);
+                view
             },
         );
         if let Err(error) = opened {
@@ -574,6 +580,18 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+/// Swap a plain launch's target for the session the window was last attached
+/// to. An explicit `--session`, `--socket`, or `$LUVUS_SESSION` is the user
+/// asking for something specific, so only the untouched default is replaced.
+fn reopen_last_session(target: ConnectTarget, settings: &Settings, root: &Path) -> ConnectTarget {
+    if target != ConnectTarget::local() {
+        return target;
+    }
+    settings
+        .restorable_session(&list_session_infos(root))
+        .map_or(target, ConnectTarget::session)
 }
 
 /// The window the user is looking at. The platform's notion of the active
@@ -1555,6 +1573,9 @@ struct PilusView {
     settings_open: bool,
     /// The Settings page's one-line status, above the page footer.
     settings_status: String,
+    /// The machine the last run ended on, until the local daemon is attached
+    /// and its profile is in the catalog so the window can move there.
+    restore_endpoint: Option<String>,
 }
 
 impl PilusView {
@@ -1579,6 +1600,7 @@ impl PilusView {
         .detach();
         // A quit flushes the frame without waiting for the debounce.
         cx.on_app_quit(|view, _cx| {
+            view.remember_location();
             view.settings.save(&view.pilus_root);
             view.ports_stop_all();
             async {}
@@ -1942,6 +1964,7 @@ impl PilusView {
             home_pending_open: None,
             settings_open: false,
             settings_status: String::new(),
+            restore_endpoint: None,
         };
         // Seed the remembered frame from the one the window actually opened
         // with; moves and resizes update it from here on.
@@ -2181,6 +2204,7 @@ impl PilusView {
                 changed = true;
             }
         }
+        changed |= self.restore_last_endpoint(cx);
         let needs_probe = self.machines.iter().any(|machine| {
             machine.id != "local"
                 && machine.enabled
@@ -3175,6 +3199,7 @@ impl PilusView {
         if let Some(pane) = pending.pane {
             self.focus_agent(&pane);
         }
+        self.remember_location();
     }
 
     /// Select an endpoint, connecting it first when necessary.
@@ -3646,6 +3671,67 @@ impl PilusView {
         }
         self.window_dirty = false;
         self.settings.save(&self.pilus_root);
+    }
+
+    /// Record which session and endpoint own the window, so the next launch
+    /// reopens there. Writes only on a change.
+    fn remember_location(&mut self) {
+        let endpoint = match &self.active {
+            EndpointId::Local => None,
+            EndpointId::Machine(id) => Some(id.clone()),
+        };
+        // Until the restore has run, `Local` is where the window happens to
+        // be, not where the user left it; quitting early must not forget.
+        let endpoint = if self.restore_endpoint.is_some() {
+            self.settings.last_endpoint.clone()
+        } else {
+            endpoint
+        };
+        if self.settings.last_session == self.session_name
+            && self.settings.last_endpoint == endpoint
+        {
+            return;
+        }
+        self.settings.last_session = self.session_name.clone();
+        self.settings.last_endpoint = endpoint;
+        self.save_settings();
+    }
+
+    /// Move to the machine the last run ended on, once the local daemon is
+    /// attached and the catalog can name it.
+    ///
+    /// Anything the user did in the meantime wins: a click on any endpoint
+    /// cancels the restore, as does a machine that is gone or disabled.
+    fn restore_last_endpoint(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.restore_endpoint.clone() else {
+            return false;
+        };
+        if self.endpoint_sel.is_some()
+            || self.wanted.is_some()
+            || self.pending_switch.is_some()
+            || self.active != EndpointId::Local
+        {
+            self.restore_endpoint = None;
+            return false;
+        }
+        if self.connection.is_none() {
+            return false;
+        }
+        let Some(machine) = self.machines.iter().find(|machine| machine.id == id) else {
+            // The Local row only arrives with the first full probe, so a
+            // catalog without it may simply not have listed the machine yet.
+            if self.machines.iter().any(|machine| machine.id == "local") {
+                self.restore_endpoint = None;
+            }
+            return false;
+        };
+        let enabled = machine.enabled;
+        self.restore_endpoint = None;
+        if !enabled {
+            return false;
+        }
+        self.activate_endpoint(EndpointId::Machine(id), None, None, cx);
+        true
     }
 
     /// Pull shared settings the Appearances window or Settings page changed.
@@ -7591,6 +7677,8 @@ impl PilusView {
                 // auto-connects it once it lands.
                 self.reload_machines();
                 self.status = format!("connecting to {name}…");
+                self.restore_endpoint = None;
+                self.remember_location();
             }
             Err(error) => {
                 self.toast(

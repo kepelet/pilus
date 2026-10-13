@@ -31,7 +31,7 @@ const BORDER_PX: f32 = 1.0;
 /// The space between two cards, and between a card and the edge of the
 /// surface, in logical pixels. Cells are wider than they are tall, so a gap
 /// that fell out of the cell grid would differ by axis.
-const GAP_PX: f32 = 8.0;
+pub(super) const GAP_PX: f32 = 8.0;
 /// Whether a card is outlined. Off, the stroke's ring stays as surface around
 /// the card, so the geometry and the shadow's overlap are unchanged.
 const SHOW_BORDER: bool = false;

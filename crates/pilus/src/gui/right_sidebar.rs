@@ -32,6 +32,9 @@ pub(super) const MIN_WIDTH: f32 = 300.0;
 const MAX_WINDOW_SHARE: f32 = 0.6;
 /// Width a first open gets.
 pub(super) const DEFAULT_WIDTH: f32 = 480.0;
+/// Pixels the column is drawn wider than its stored width, growing to its
+/// left. The stored width and the drag math stay as the user set them.
+const WIDTH_BONUS: f32 = 2.0;
 /// The draggable strip on the column's leading edge.
 const HANDLE_WIDTH: f32 = 6.0;
 
@@ -265,8 +268,9 @@ impl RightSidebar {
 
     /// The column's width at its current stretch.
     pub(super) fn shown_width(&self) -> f32 {
-        let full = self.full.max(self.width);
-        self.width + (full - self.width) * self.spread().min(1.0)
+        let own = self.width + WIDTH_BONUS;
+        let full = self.full.max(own);
+        own + (full - own) * self.spread().min(1.0)
     }
 
     /// Pixels the column takes from the card right now.
@@ -952,7 +956,7 @@ mod tests {
     fn expanding_fills_the_window_and_hiding_lets_go() {
         let mut side = RightSidebar::new(true, 400.0, SidebarTab::Diff);
         side.set_full(1000.0);
-        assert_eq!(side.px(), 400.0);
+        assert_eq!(side.px(), 400.0 + WIDTH_BONUS);
         side.toggle_expanded();
         assert!(side.expanded() && side.moving());
         // Settled, the column is as wide as the window leaves it.
@@ -961,7 +965,7 @@ mod tests {
         assert_eq!(side.px(), 1000.0);
         // A window narrower than the column never shrinks it.
         side.set_full(200.0);
-        assert_eq!(side.shown_width(), 400.0);
+        assert_eq!(side.shown_width(), 400.0 + WIDTH_BONUS);
         side.set_full(1000.0);
         side.toggle();
         assert!(

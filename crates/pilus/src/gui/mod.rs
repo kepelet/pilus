@@ -10002,11 +10002,7 @@ impl PilusView {
             .flex()
             .flex_col()
             .justify_center()
-            .bg(if self.is_split() {
-                theme.pane_surface(glass).opacity(glass)
-            } else {
-                self.chrome_fill()
-            })
+            .bg(self.tab_strip_fill())
             .border_color(theme.border)
             .child(tab_strip)
     }
@@ -12011,12 +12007,32 @@ impl PilusView {
         }
     }
 
+    /// The tab strip's background. Opaque, it is whatever the terminal sits
+    /// on: a split's cards, or the sidebar's own fill when one pane has no
+    /// cards. Translucent, it is the pane surface, so one pane and many look
+    /// alike.
+    fn tab_strip_fill(&self) -> gpui::Rgba {
+        let glass = self.glass_opacity();
+        if !self.settings.pane_ui {
+            self.chrome_fill()
+        } else if glass >= 1.0 {
+            if self.is_split() {
+                self.theme.bg
+            } else {
+                self.chrome_fill()
+            }
+        } else {
+            self.theme.pane_surface(glass).opacity(glass)
+        }
+    }
+
     /// The fill of the selected and hovered tab. In a split the strip sits on
     /// the tinted surface, so a tab is raised in the card's own fill, which
     /// reads as the tab opening into the terminal card below it; otherwise
-    /// it is the panel fill.
+    /// (including an opaque strip, which already is the card) it is the panel
+    /// fill.
     fn tab_raise(&self) -> gpui::Rgba {
-        if self.is_split() {
+        if self.is_split() && self.glass_opacity() < 1.0 {
             self.theme.bg
         } else {
             self.theme.panel

@@ -46,8 +46,6 @@ const DIM: f32 = 0.4;
 /// them; [`paint_shadow_outside`] keeps it off the card.
 const SHADOW_ALPHA: f32 = 0.1;
 const SHADOW_BLUR_PX: f32 = 6.0;
-/// The blur on the top and left sides, which sit closer to the card.
-const SHADOW_LEAD_BLUR_PX: f32 = 3.0;
 
 /// Where a pane's frame sits and what it looks like right now. Geometry is
 /// in pixels relative to the grid's top-left.
@@ -208,9 +206,9 @@ pub(super) fn surface(
         .bg(fill)
 }
 
-/// The focused card's shadow along its straight edges only. GPUI's drop shadow
-/// also fills the element it belongs to, which would dim the card's text and
-/// show through a translucent window, and a content mask can only be a
+/// The focused card's shadow along its straight edges only. GPUI's drop
+/// shadow also fills the element it belongs to, which would dim the card's text
+/// and show through a translucent window, and a content mask can only be a
 /// rectangle, so the shadow is painted once per side of the card instead.
 ///
 /// Each side's shadow rectangle is shortened along the edge by the corner
@@ -219,8 +217,8 @@ pub(super) fn surface(
 ///
 /// The scene drops a shadow whose own rectangle (without its blur) misses the
 /// mask, so each side reaches [`BORDER_PX`] into the card, under the frame's
-/// stroke. That also rules out a vertical offset: it would pull the top side
-/// off the card again.
+/// stroke. That also rules out an offset: it would pull a side off the card
+/// again.
 fn paint_shadow_outside(
     window: &mut Window,
     bounds: Bounds<Pixels>,
@@ -235,48 +233,41 @@ fn paint_shadow_outside(
         .max(corners.bottom_right);
     let (left, top) = (bounds.origin.x, bounds.origin.y);
     let (right, bottom) = (bounds.right(), bounds.bottom());
-    // The top and left sides are tighter than the bottom and right ones, so
-    // the card reads as lit from the upper left.
-    for (side, blur) in [
-        (Side::Top, SHADOW_LEAD_BLUR_PX),
-        (Side::Bottom, SHADOW_BLUR_PX),
-        (Side::Left, SHADOW_LEAD_BLUR_PX),
-        (Side::Right, SHADOW_BLUR_PX),
+    let reach = px(SHADOW_BLUR_PX * 3.0);
+    let shrink = (radius + px(SHADOW_BLUR_PX * 2.0))
+        .min(bounds.size.width / 2.0 - px(1.0))
+        .min(bounds.size.height / 2.0 - px(1.0))
+        .max(px(0.0));
+    let shadow = [BoxShadow {
+        color: black().opacity(SHADOW_ALPHA * strength),
+        offset: point(px(0.0), px(0.0)),
+        blur_radius: px(SHADOW_BLUR_PX),
+        spread_radius: px(0.0),
+        inset: false,
+    }];
+    for (rect, from, to) in [
+        // Top, bottom, left, right.
+        (
+            Bounds::from_corners(point(left + shrink, top), point(right - shrink, bottom)),
+            point(left - reach, top - reach),
+            point(right + reach, top + stroke),
+        ),
+        (
+            Bounds::from_corners(point(left + shrink, top), point(right - shrink, bottom)),
+            point(left - reach, bottom - stroke),
+            point(right + reach, bottom + reach),
+        ),
+        (
+            Bounds::from_corners(point(left, top + shrink), point(right, bottom - shrink)),
+            point(left - reach, top - reach),
+            point(left + stroke, bottom + reach),
+        ),
+        (
+            Bounds::from_corners(point(left, top + shrink), point(right, bottom - shrink)),
+            point(right - stroke, top - reach),
+            point(right + reach, bottom + reach),
+        ),
     ] {
-        let reach = px(blur * 3.0);
-        let shrink = (radius + px(blur * 2.0))
-            .min(bounds.size.width / 2.0 - px(1.0))
-            .min(bounds.size.height / 2.0 - px(1.0))
-            .max(px(0.0));
-        let (rect, from, to) = match side {
-            Side::Top => (
-                Bounds::from_corners(point(left + shrink, top), point(right - shrink, bottom)),
-                point(left - reach, top - reach),
-                point(right + reach, top + stroke),
-            ),
-            Side::Bottom => (
-                Bounds::from_corners(point(left + shrink, top), point(right - shrink, bottom)),
-                point(left - reach, bottom - stroke),
-                point(right + reach, bottom + reach),
-            ),
-            Side::Left => (
-                Bounds::from_corners(point(left, top + shrink), point(right, bottom - shrink)),
-                point(left - reach, top - reach),
-                point(left + stroke, bottom + reach),
-            ),
-            Side::Right => (
-                Bounds::from_corners(point(left, top + shrink), point(right, bottom - shrink)),
-                point(right - stroke, top - reach),
-                point(right + reach, bottom + reach),
-            ),
-        };
-        let shadow = [BoxShadow {
-            color: black().opacity(SHADOW_ALPHA * strength),
-            offset: point(px(0.0), px(0.0)),
-            blur_radius: px(blur),
-            spread_radius: px(0.0),
-            inset: false,
-        }];
         let mask = ContentMask {
             bounds: Bounds::from_corners(from, to),
         };
@@ -284,14 +275,6 @@ fn paint_shadow_outside(
             window.paint_drop_shadows(rect, Corners::default(), &shadow);
         });
     }
-}
-
-#[derive(Clone, Copy)]
-enum Side {
-    Top,
-    Bottom,
-    Left,
-    Right,
 }
 
 /// A look's transition, kept across frames under the pane's element id.

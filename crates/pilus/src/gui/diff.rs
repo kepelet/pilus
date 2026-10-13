@@ -179,6 +179,10 @@ pub(super) struct DiffPanel {
     divider: Option<(f32, f32)>,
     /// Fingerprints of versions marked viewed in this window.
     viewed: HashSet<String>,
+    /// Files folded down to their header, as History folds a commit's files.
+    collapsed: HashSet<FileKey>,
+    /// Set by a fold toggle, so only that click turns the chevron.
+    toggled: bool,
     confirm_delete: Option<String>,
     status: String,
     list: ListState,
@@ -221,6 +225,8 @@ impl DiffPanel {
             list_h: DEFAULT_LIST_HEIGHT,
             divider: None,
             viewed: HashSet::new(),
+            collapsed: HashSet::new(),
+            toggled: false,
             confirm_delete: None,
             status: String::new(),
             list: ListState::new(0, ListAlignment::Top, px(600.0)),
@@ -706,6 +712,7 @@ impl PilusView {
         }
         let panel = &mut self.diff_panel;
         panel.selected = Some(key);
+        panel.toggled = false;
         panel.loaded = None;
         panel.loading = None;
         panel.md = None;
@@ -742,6 +749,22 @@ impl PilusView {
     /// Open a file the user chose, as a step the column's Back returns from.
     fn diff_pick(&mut self, key: FileKey, cx: &mut Context<Self>) {
         self.right_navigate(cx, |this, cx| this.diff_select(key, cx));
+    }
+
+    /// Fold the open file down to its header, or open it again.
+    fn diff_toggle_collapsed(&mut self, cx: &mut Context<Self>) {
+        let panel = &mut self.diff_panel;
+        let Some(key) = panel.selected.clone() else {
+            return;
+        };
+        if !panel.collapsed.remove(&key) {
+            panel.collapsed.insert(key);
+            // A form inside the folded patch would be left open out of sight.
+            panel.composer = None;
+            panel.anchor = None;
+        }
+        panel.toggled = true;
+        cx.notify();
     }
 
     /// Flip between the rendered document and the patch for a markdown file.
@@ -2078,6 +2101,9 @@ impl PilusView {
             return column.child(self.diff_message("Nothing matches this filter"));
         };
         let head = self.diff_file_head(file, cx);
+        if panel.collapsed.contains(&(file.layer, file.path.clone())) {
+            return column.child(head);
+        }
         if panel.previewing() {
             return column.child(head).child(self.diff_preview(cx));
         }
@@ -2272,6 +2298,28 @@ impl PilusView {
                 )
         });
         let showing_document = panel.previewing();
+        let open = !panel.collapsed.contains(&(file.layer, file.path.clone()));
+        // The chevron and name fold the file; the controls beside them keep
+        // their own clicks.
+        let fold = div()
+            .id("pilus-diff-file-fold")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .cursor_pointer()
+            .child(style::chevron(
+                "pilus-diff-file-chevron",
+                open,
+                panel.toggled,
+                fonts.secondary,
+                theme.muted,
+            ))
+            .child(title)
+            .on_click(cx.listener(|this, _, _, cx| this.diff_toggle_collapsed(cx)));
         div()
             .flex()
             .flex_row()
@@ -2282,7 +2330,7 @@ impl PilusView {
             .px_3()
             .border_b_1()
             .border_color(theme.border)
-            .child(title)
+            .child(fold)
             .child(counts)
             .children(rendering)
             .child(

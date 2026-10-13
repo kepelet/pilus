@@ -106,6 +106,9 @@ pub struct Settings {
     /// Draw split panes with pilus's own rounded frames in place of
     /// the daemon's square box-drawing borders. Off keeps the daemon's.
     pub pane_ui: bool,
+    /// Draw the focused pane's corner toolbar (split, fullscreen, close).
+    /// Only shows with `pane_ui`, which owns the frames it sits on.
+    pub pane_toolbar: bool,
     /// Whether the right sidebar (Changes and History tabs) is open.
     pub right_sidebar_visible: bool,
     /// The right sidebar's width in logical pixels; 0 takes the default.
@@ -155,6 +158,7 @@ impl Default for Settings {
             terminal_top_spacing: true,
             local_terminal_top_spacing: false,
             pane_ui: true,
+            pane_toolbar: true,
             right_sidebar_visible: false,
             right_sidebar_width: 0.0,
             right_sidebar_tab: String::new(),
@@ -293,6 +297,7 @@ mod tests {
         assert!(back.terminal_top_spacing);
         assert!(!back.local_terminal_top_spacing);
         assert!(back.pane_ui);
+        assert!(back.pane_toolbar);
     }
 
     #[test]
@@ -432,6 +437,7 @@ mod tests {
             terminal_top_spacing: false,
             local_terminal_top_spacing: true,
             pane_ui: false,
+            pane_toolbar: false,
             right_sidebar_visible: true,
             right_sidebar_width: 480.0,
             right_sidebar_tab: "git".to_string(),

@@ -4001,6 +4001,16 @@ impl PilusView {
                 Some("⌘B"),
             ),
             entry(
+                Command::TogglePaneToolbar,
+                if self.settings.pane_toolbar {
+                    "Hide Pane Toolbar"
+                } else {
+                    "Show Pane Toolbar"
+                },
+                "View",
+                None,
+            ),
+            entry(
                 Command::IncreaseFontSize,
                 "Increase Font Size",
                 "View",
@@ -4110,6 +4120,7 @@ impl PilusView {
             Command::ToggleRightSidebar => {
                 window.dispatch_action(ToggleRightSidebar.boxed_clone(), cx)
             }
+            Command::TogglePaneToolbar => self.toggle_pane_toolbar(cx),
             Command::IncreaseFontSize => window.dispatch_action(IncreaseFontSize.boxed_clone(), cx),
             Command::DecreaseFontSize => window.dispatch_action(DecreaseFontSize.boxed_clone(), cx),
             Command::ResetFontSize => window.dispatch_action(ResetFontSize.boxed_clone(), cx),
@@ -9080,6 +9091,14 @@ impl PilusView {
         );
     }
 
+    /// Show or hide the focused pane's corner toolbar, persisting the choice.
+    fn toggle_pane_toolbar(&mut self, cx: &mut Context<Self>) {
+        self.settings.pane_toolbar = !self.settings.pane_toolbar;
+        self.settings.save(&self.pilus_root);
+        *self.shared_settings.borrow_mut() = self.settings.clone();
+        cx.notify();
+    }
+
     /// Flip whether the WORKSPACES rows draw their path line, persisting the
     /// choice and pushing it to the daemon's own dock.
     fn menu_toggle_workspace_paths(&mut self, cx: &mut Context<Self>) {
@@ -12315,7 +12334,7 @@ impl Render for PilusView {
         } else {
             terminal_fill
         };
-        let pane_toolbar = pane_ui.then(|| self.pane_toolbar(cx));
+        let pane_toolbar = (pane_ui && self.settings.pane_toolbar).then(|| self.pane_toolbar(cx));
         let grid = match self.shown_frame() {
             Some(frame) => perf::grid_build(|| {
                 render_grid(

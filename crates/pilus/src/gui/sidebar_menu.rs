@@ -45,8 +45,9 @@ pub enum MenuTarget {
         name: String,
     },
     /// The terminal grid. `selection` is whether text is highlighted, which
-    /// is what Copy needs, so the row only appears when it can work.
-    Terminal { selection: bool },
+    /// is what Copy needs, so the row only appears when it can work. `agent`
+    /// is whether the focused pane runs an agent, which Fork needs.
+    Terminal { selection: bool, agent: bool },
     /// A row of the Files tab's tree, or its blank area (`root`), which acts
     /// on the tree's own folder.
     File {
@@ -101,8 +102,6 @@ pub enum Item {
     Delete,
     /// Send the clipboard to the focused pane.
     Paste,
-    /// Highlight the whole visible grid.
-    SelectAll,
     /// Split the focused pane side by side.
     SplitRight,
     /// Split the focused pane stacked.
@@ -166,7 +165,6 @@ impl Item {
             Self::Delete => "Delete",
             Self::CopySelection => "Copy",
             Self::Paste => "Paste",
-            Self::SelectAll => "Select All",
             Self::SplitRight => "Split Right",
             Self::SplitDown => "Split Down",
             Self::ForkPane => "Fork to New Pane",
@@ -243,7 +241,7 @@ impl SidebarMenu {
                 workspace_rows(branch.as_deref().is_some(), linked)
             }
             MenuTarget::Agent { .. } => agent_rows(),
-            MenuTarget::Terminal { selection } => terminal_rows(*selection),
+            MenuTarget::Terminal { selection, agent } => terminal_rows(*selection, *agent),
             MenuTarget::File { root, .. } => file_rows(*root),
         }
     }
@@ -317,20 +315,24 @@ fn agent_rows() -> Vec<Item> {
 }
 
 /// The terminal's rows: the clipboard first, then the pane actions, the
-/// pane's name and tab, and the tab actions, each group below a divider. Copy needs a highlight, so it is left out without one
+/// pane's name and tab, and the tab actions, each group below a divider. Copy
+/// needs a highlight and Fork needs an agent, so each is left out without one
 /// rather than shown dead.
-fn terminal_rows(selection: bool) -> Vec<Item> {
+fn terminal_rows(selection: bool, agent: bool) -> Vec<Item> {
     let mut items = Vec::new();
     if selection {
         items.push(Item::CopySelection);
     }
     items.extend([
         Item::Paste,
-        Item::SelectAll,
         Item::Divider,
         Item::SplitRight,
         Item::SplitDown,
-        Item::ForkPane,
+    ]);
+    if agent {
+        items.push(Item::ForkPane);
+    }
+    items.extend([
         Item::Divider,
         Item::Rename,
         Item::MoveToTab,
@@ -431,24 +433,30 @@ mod tests {
 
     #[test]
     fn terminal_rows_offer_copy_only_over_a_selection() {
-        let with = terminal_rows(true);
+        let with = terminal_rows(true, false);
         assert_eq!(with[0], Item::CopySelection);
-        let without = terminal_rows(false);
+        let without = terminal_rows(false, false);
         assert!(!without.contains(&Item::CopySelection));
         assert_eq!(without[0], Item::Paste);
         // Closing the tab sits alone at the end, away from the safe rows.
         assert_eq!(without.last(), Some(&Item::CloseTab));
         assert_eq!(without[without.len() - 2], Item::Divider);
         assert!(Item::CloseTab.destructive());
-        for item in [Item::ForkPane, Item::Rename, Item::MoveToTab] {
+        for item in [Item::Rename, Item::MoveToTab] {
             assert!(without.contains(&item));
         }
     }
 
     #[test]
+    fn fork_is_offered_only_for_an_agent() {
+        assert!(!terminal_rows(false, false).contains(&Item::ForkPane));
+        assert!(terminal_rows(false, true).contains(&Item::ForkPane));
+    }
+
+    #[test]
     fn the_terminal_target_builds_its_own_rows() {
-        let menu = SidebarMenu::new(MenuTarget::Terminal { selection: false }, 0.0, 0.0);
-        assert_eq!(menu.rows(true), terminal_rows(false));
+        let menu = SidebarMenu::new(MenuTarget::Terminal { selection: false, agent: true }, 0.0, 0.0);
+        assert_eq!(menu.rows(true), terminal_rows(false, true));
     }
 
     #[test]
@@ -473,7 +481,7 @@ mod tests {
 
     #[test]
     fn panel_height_counts_a_divider_as_a_hairline() {
-        let rows = terminal_rows(false);
+        let rows = terminal_rows(false, true);
         let dividers = rows.iter().filter(|item| !item.selectable()).count() as f32;
         let selectable = rows.len() as f32 - dividers;
         assert_eq!(

@@ -704,7 +704,19 @@ impl PilusView {
                 list = list.child(self.automations_row(row, now, cx));
             }
         }
-        div().flex().flex_col().child(header).child(list)
+        // The table is framed like a card, inset from the page edge so the
+        // border reads as a frame rather than a second page rule.
+        div().flex().flex_col().p_4().child(
+            div()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .child(header)
+                .child(list),
+        )
     }
 
     fn automations_row(

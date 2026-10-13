@@ -16,6 +16,7 @@ mod diff;
 mod diff_model;
 mod dock;
 mod files_tab;
+mod fonts;
 mod git_tab;
 mod github_tab;
 mod glass;
@@ -392,6 +393,7 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     let shared_theme = Rc::new(RefCell::new(Theme::default()));
 
     application().run(move |cx: &mut App| {
+        fonts::install(cx.text_system());
         app_icon::install();
         // Name the process for notification and taskbar identity. Read the
         // running bundle so a packaged app reports its `Info.plist` value;
@@ -415,13 +417,23 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             let settings = settings.clone();
             let root = pilus_root.clone();
             move |_: &OpenAppearances, cx: &mut App| {
-                // The frontmost window may have left the session this process
-                // launched in, and appearance belongs to the daemon the window shows.
-                let transport = frontmost_window(cx)
-                    .and_then(|handle| handle.downcast::<PilusView>())
-                    .and_then(|handle| handle.read(cx).ok().map(PilusView::control_transport))
-                    .unwrap_or_else(|| ControlTransport::Socket(api.clone()));
-                appearances::open(transport, settings.clone(), root.clone(), cx)
+                // The menu and key dispatch run inside the frontmost window's
+                // own update, where reading that window fails and would drop
+                // us onto the local daemon even on a remote machine. Defer
+                // until it has been released.
+                let api = api.clone();
+                let settings = settings.clone();
+                let root = root.clone();
+                cx.defer(move |cx| {
+                    // The frontmost window may have left the session this
+                    // process launched in, and appearance belongs to the
+                    // daemon the window shows.
+                    let transport = frontmost_window(cx)
+                        .and_then(|handle| handle.downcast::<PilusView>())
+                        .and_then(|handle| handle.read(cx).ok().map(PilusView::control_transport))
+                        .unwrap_or_else(|| ControlTransport::Socket(api));
+                    appearances::open(transport, settings, root, cx)
+                });
             }
         });
         cx.on_action(|_: &QuitApp, cx: &mut App| {
@@ -12007,32 +12019,26 @@ impl PilusView {
         }
     }
 
-    /// The tab strip's background. Opaque, it is whatever the terminal sits
-    /// on: a split's cards, or the sidebar's own fill when one pane has no
-    /// cards. Translucent, it is the pane surface, so one pane and many look
-    /// alike.
+    /// The tab strip's background. A split always takes the pane surface, the
+    /// tinted ground its cards sit on, opaque or not. One pane has no cards:
+    /// opaque, its strip is the sidebar's own fill; translucent, it takes the
+    /// pane surface so one pane and many look alike.
     fn tab_strip_fill(&self) -> gpui::Rgba {
         let glass = self.glass_opacity();
-        if !self.settings.pane_ui {
-            self.chrome_fill()
-        } else if glass >= 1.0 {
-            if self.is_split() {
-                self.theme.bg
-            } else {
-                self.chrome_fill()
-            }
+        let surface = self.theme.pane_surface(glass).opacity(glass);
+        if self.is_split() || (self.settings.pane_ui && glass < 1.0) {
+            surface
         } else {
-            self.theme.pane_surface(glass).opacity(glass)
+            self.chrome_fill()
         }
     }
 
     /// The fill of the selected and hovered tab. In a split the strip sits on
     /// the tinted surface, so a tab is raised in the card's own fill, which
     /// reads as the tab opening into the terminal card below it; otherwise
-    /// (including an opaque strip, which already is the card) it is the panel
-    /// fill.
+    /// it is the panel fill.
     fn tab_raise(&self) -> gpui::Rgba {
-        if self.is_split() && self.glass_opacity() < 1.0 {
+        if self.is_split() {
             self.theme.bg
         } else {
             self.theme.panel

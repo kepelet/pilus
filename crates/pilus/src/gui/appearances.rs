@@ -1,8 +1,11 @@
-//! The native Appearances window: pick a Luvus theme and the fonts.
+//! The native Appearances window: pick a Luvus theme, the fonts, and how
+//! translucent and rounded the window is.
 //!
 //! It is a thin view over the daemon's theme registry (`theme.list` /
-//! `theme.use`, both on a background thread) plus the client-owned font
-//! settings, which are shared live with the main window and persisted.
+//! `theme.use`, both on a background thread) plus the client-owned font and
+//! window settings, which are shared live with the main window and persisted.
+//! Transparency and corners are offered as presets; their sliders appear only
+//! under "Custom".
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -33,6 +36,68 @@ const FONT_SIZE_RANGE: (f32, f32) = (9.0, 32.0);
 
 /// The label for the platform default chrome font, which is stored as `None`.
 const SYSTEM_FONT_LABEL: &str = "System";
+
+/// Window opacity and blur of the "Solid" preset: nothing shows through.
+const SOLID: (f32, f32) = (1.0, 0.0);
+/// Window opacity and blur of the "Translucent" preset: full frost under a
+/// light 15% coat of the scheme's own color.
+const TRANSLUCENT: (f32, f32) = (0.15, 1.0);
+/// Corner radius of the "Square" preset, in pixels.
+const SQUARE_RADIUS: f32 = 0.0;
+/// Corner radius of the "Rounded" preset, in pixels.
+const ROUNDED_RADIUS: f32 = 8.0;
+
+/// How close a stored value must sit to a preset to count as it, so a slider
+/// that landed a float's width away still reads as the preset.
+const PRESET_EPSILON: f32 = 0.005;
+
+/// A named setting of the window's translucency.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Transparency {
+    Solid,
+    Translucent,
+    Custom,
+}
+
+impl Transparency {
+    /// The preset the stored opacity and blur amount to, else `Custom`.
+    fn of(settings: &Settings) -> Self {
+        let near = |a: f32, b: f32| (a - b).abs() < PRESET_EPSILON;
+        let (opacity, blur) = (settings.glass_opacity(), settings.blur.clamp(0.0, 1.0));
+        if near(opacity, SOLID.0) && near(blur, SOLID.1) {
+            Self::Solid
+        } else if near(opacity, TRANSLUCENT.0) && near(blur, TRANSLUCENT.1) {
+            Self::Translucent
+        } else {
+            Self::Custom
+        }
+    }
+}
+
+/// A named setting of the corner radius.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Corners {
+    Square,
+    Rounded,
+    Custom,
+}
+
+impl Corners {
+    /// The preset the stored radius amounts to, else `Custom`.
+    fn of(settings: &Settings) -> Self {
+        let radius = settings.radius();
+        if (radius - SQUARE_RADIUS).abs() < PRESET_EPSILON {
+            Self::Square
+        } else if (radius - ROUNDED_RADIUS).abs() < PRESET_EPSILON {
+            Self::Rounded
+        } else {
+            Self::Custom
+        }
+    }
+}
+
+/// What picking a segment of a preset row does.
+type ModeHandler = Box<dyn Fn(&mut AppearancesView, &mut Context<AppearancesView>)>;
 
 /// Which font a control edits.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -70,6 +135,12 @@ pub struct AppearancesView {
     select_rx: Receiver<String>,
     select_tx: Sender<String>,
     open_picker: Option<FontField>,
+    /// Whether "Custom" was picked for transparency. Values that happen to
+    /// equal a preset must not collapse the sliders out from under the user
+    /// mid-drag, so the pick is held here, not inferred from the values.
+    custom_transparency: bool,
+    /// The same for the corner radius.
+    custom_corners: bool,
     /// Each trigger's last painted bounds, in window coordinates, so the
     /// dropdown lines up with the control rather than with the click.
     trigger_bounds: [Rc<Cell<Bounds<gpui::Pixels>>>; 2],
@@ -120,6 +191,8 @@ impl AppearancesView {
             select_rx,
             select_tx,
             open_picker: None,
+            custom_transparency: false,
+            custom_corners: false,
             trigger_bounds: [
                 Rc::new(Cell::new(Bounds::default())),
                 Rc::new(Cell::new(Bounds::default())),
@@ -223,11 +296,14 @@ impl AppearancesView {
         if self.theme.is_light() {
             return;
         }
-        // The top zone stops at 97.5%; snapping it restores fully opaque.
+        // The end zones stop at 2.5% and 97.5%; snapping them reaches fully
+        // clear and fully opaque.
         self.settings.opacity = if value >= 0.975 {
             1.0
+        } else if value <= 0.025 {
+            0.0
         } else {
-            value.clamp(0.1, 1.0)
+            value
         };
         self.stage(cx);
     }
@@ -238,7 +314,7 @@ impl AppearancesView {
         if self.theme.is_light() {
             return;
         }
-        self.settings.opacity = (self.settings.glass_opacity() + delta).clamp(0.1, 1.0);
+        self.settings.opacity = (self.settings.glass_opacity() + delta).clamp(0.0, 1.0);
         self.publish(cx);
     }
 
@@ -271,6 +347,47 @@ impl AppearancesView {
     fn adjust_corner_radius(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.settings.corner_radius =
             (self.settings.radius() + delta).clamp(0.0, CORNER_RADIUS_MAX);
+        self.publish(cx);
+    }
+
+    fn transparency_mode(&self) -> Transparency {
+        if self.custom_transparency {
+            Transparency::Custom
+        } else {
+            Transparency::of(&self.settings)
+        }
+    }
+
+    fn corner_mode(&self) -> Corners {
+        if self.custom_corners {
+            Corners::Custom
+        } else {
+            Corners::of(&self.settings)
+        }
+    }
+
+    /// Apply a translucency preset. `Custom` only opens the sliders, keeping
+    /// the values it starts from.
+    fn pick_transparency(&mut self, mode: Transparency, cx: &mut Context<Self>) {
+        self.custom_transparency = mode == Transparency::Custom;
+        let (opacity, blur) = match mode {
+            Transparency::Solid => SOLID,
+            Transparency::Translucent => TRANSLUCENT,
+            Transparency::Custom => return cx.notify(),
+        };
+        self.settings.opacity = opacity;
+        self.settings.blur = blur;
+        self.publish(cx);
+    }
+
+    /// Apply a corner preset; `Custom` only opens the slider.
+    fn pick_corners(&mut self, mode: Corners, cx: &mut Context<Self>) {
+        self.custom_corners = mode == Corners::Custom;
+        self.settings.corner_radius = match mode {
+            Corners::Square => SQUARE_RADIUS,
+            Corners::Rounded => ROUNDED_RADIUS,
+            Corners::Custom => return cx.notify(),
+        };
         self.publish(cx);
     }
 
@@ -533,6 +650,125 @@ impl AppearancesView {
         }
     }
 
+    /// A labelled row of mutually exclusive presets. `key` namespaces the
+    /// segment ids.
+    fn preset_row(
+        &self,
+        label: &str,
+        key: &str,
+        choices: Vec<(&'static str, bool, ModeHandler)>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut segments = style::segmented(self.theme);
+        for (name, active, handler) in choices {
+            segments = segments.child(
+                style::segment(
+                    format!("pilus-{key}-{}", name.to_lowercase()),
+                    name,
+                    active,
+                    true,
+                    self.theme,
+                    self.fonts().secondary,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| handler(this, cx))),
+            );
+        }
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .text_size(px(self.fonts().secondary))
+            .text_color(self.theme.fg)
+            .child(
+                div()
+                    .w(px(84.0))
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .text_color(self.theme.muted)
+                    .child(label.to_string()),
+            )
+            .child(segments)
+    }
+
+    /// The translucency presets, with the opacity and blur sliders beneath
+    /// them only under "Custom".
+    fn transparency_rows(&self, cx: &mut Context<Self>) -> Div {
+        let mode = self.transparency_mode();
+        let choice =
+            |name: &'static str, target: Transparency| -> (&'static str, bool, ModeHandler) {
+                (
+                    name,
+                    mode == target,
+                    Box::new(move |this, cx| this.pick_transparency(target, cx)),
+                )
+            };
+        let presets = self.preset_row(
+            "Material",
+            "transparency",
+            vec![
+                choice("Solid", Transparency::Solid),
+                choice("Translucent", Transparency::Translucent),
+                choice("Custom", Transparency::Custom),
+            ],
+            cx,
+        );
+        let mut rows = div().flex().flex_col().child(presets).child(
+            div()
+                .px_3()
+                .pb_1()
+                .text_size(px(self.fonts().label))
+                .text_color(self.theme.muted)
+                .child("Translucency only applies to dark themes; light themes stay solid"),
+        );
+        if mode == Transparency::Custom {
+            // Wrapped so the fade does not fight the opacity row's own dimming
+            // under a light scheme.
+            rows = rows.child(style::enter(
+                "pilus-transparency-custom",
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(self.opacity_row(cx))
+                    .child(self.blur_row(cx)),
+            ));
+        }
+        rows
+    }
+
+    /// The corner presets, with the radius slider beneath them only under
+    /// "Custom".
+    fn corner_rows(&self, cx: &mut Context<Self>) -> Div {
+        let mode = self.corner_mode();
+        let choice = |name: &'static str, target: Corners| -> (&'static str, bool, ModeHandler) {
+            (
+                name,
+                mode == target,
+                Box::new(move |this, cx| this.pick_corners(target, cx)),
+            )
+        };
+        let presets = self.preset_row(
+            "Corners",
+            "corners",
+            vec![
+                choice("Square", Corners::Square),
+                choice("Rounded", Corners::Rounded),
+                choice("Custom", Corners::Custom),
+            ],
+            cx,
+        );
+        let mut rows = div().flex().flex_col().child(presets);
+        if mode == Corners::Custom {
+            rows = rows.child(style::enter(
+                "pilus-corners-custom",
+                div().flex().flex_col().child(self.corner_radius_row(cx)),
+            ));
+        }
+        rows
+    }
+
     /// The window-opacity row: a slider with steppers and a live percentage.
     ///
     /// A light scheme is always opaque (the frost behind it is dark), so the
@@ -680,7 +916,7 @@ impl AppearancesView {
                     .flex_shrink_0()
                     .whitespace_nowrap()
                     .text_color(self.theme.muted)
-                    .child("Corners".to_string()),
+                    .child("Radius".to_string()),
             )
             .child(
                 div().flex_1().child(
@@ -970,12 +1206,11 @@ impl Render for AppearancesView {
 
         list = list
             .child(self.section_heading("TRANSPARENCY"))
-            .child(self.opacity_row(cx))
-            .child(self.blur_row(cx));
+            .child(self.transparency_rows(cx));
 
         list = list
             .child(self.section_heading("WINDOW"))
-            .child(self.corner_radius_row(cx));
+            .child(self.corner_rows(cx));
 
         list = list
             .child(self.section_heading("TERMINAL"))
@@ -1052,6 +1287,48 @@ mod tests {
     fn a_real_system_family_does_not_shadow_the_reset_entry() {
         let families = vec!["System".to_string(), "Menlo".to_string()];
         assert_eq!(font_options(FontField::Ui, &families), ["System", "Menlo"]);
+    }
+
+    fn settings(opacity: f32, blur: f32, radius: f32) -> Settings {
+        Settings {
+            opacity,
+            blur,
+            corner_radius: radius,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn transparency_presets_are_recognised_from_the_stored_values() {
+        assert_eq!(
+            Transparency::of(&settings(1.0, 0.0, 0.0)),
+            Transparency::Solid
+        );
+        assert_eq!(
+            Transparency::of(&settings(0.15, 1.0, 0.0)),
+            Transparency::Translucent
+        );
+        // Anything between, including a half-applied preset, is custom.
+        assert_eq!(
+            Transparency::of(&settings(1.0, 1.0, 0.0)),
+            Transparency::Custom
+        );
+        assert_eq!(
+            Transparency::of(&settings(0.85, 1.0, 0.0)),
+            Transparency::Custom
+        );
+    }
+
+    #[test]
+    fn corner_presets_are_recognised_from_the_stored_radius() {
+        assert_eq!(Corners::of(&settings(1.0, 0.0, 0.0)), Corners::Square);
+        assert_eq!(Corners::of(&settings(1.0, 0.0, 8.0)), Corners::Rounded);
+        assert_eq!(Corners::of(&settings(1.0, 0.0, 6.0)), Corners::Custom);
+    }
+
+    #[test]
+    fn the_bundled_terminal_face_is_offered_as_monospace() {
+        assert!(is_monospace_name(crate::settings::FONT_FAMILY));
     }
 
     #[test]

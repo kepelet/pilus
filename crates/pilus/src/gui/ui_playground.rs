@@ -2095,7 +2095,7 @@ impl Render for UiPlaygroundView {
                             )
                             .child(
                                 div()
-                                    .font_family("Menlo")
+                                    .font_family(style::mono_family(&self.settings))
                                     .text_size(px(self.settings.borrow().terminal_font_size))
                                     .text_color(theme.fg)
                                     .child("monospace 0123456789"),

@@ -74,7 +74,10 @@ fn context() -> Result<HeadlessAppContext> {
     );
     // Shots capture a frame or two after a panel opens; with motion on they
     // would catch fades half-way and spinners mid-turn.
-    cx.update(|app| app.set_reduce_motion(true));
+    cx.update(|app| {
+        super::fonts::install(app.text_system());
+        app.set_reduce_motion(true);
+    });
     Ok(cx)
 }
 

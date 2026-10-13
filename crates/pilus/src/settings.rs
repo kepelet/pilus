@@ -10,8 +10,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Default monospace family for the terminal grid.
-pub const FONT_FAMILY: &str = "Menlo";
+/// Default monospace family for the terminal grid: bundled with the app, in
+/// its terminal cut (no ligatures, so cells stay one column wide).
+pub const FONT_FAMILY: &str = "Ioskeley Mono Term";
+/// Default chrome family, bundled with the app.
+pub const CHROME_FONT_FAMILY: &str = "Geist";
 /// Default terminal cell text size in logical pixels.
 pub const FONT_SIZE: f32 = 13.0;
 /// Default chrome text size in logical pixels.
@@ -135,7 +138,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            ui_font: None,
+            ui_font: Some(CHROME_FONT_FAMILY.to_string()),
             ui_font_size: CHROME_FONT,
             terminal_font: FONT_FAMILY.to_string(),
             terminal_font_size: FONT_SIZE,
@@ -204,10 +207,15 @@ impl Settings {
         }
     }
 
-    /// Glass-surface opacity, clamped to a usable range so a stray value in
-    /// the file cannot turn the window invisible.
+    /// Glass-surface opacity, clamped to 0..=1 so a stray value in the file
+    /// stays meaningful. Zero is a real setting, not a hazard: the glass coat
+    /// and blur keep the grid text readable with every surface clear.
     pub fn glass_opacity(&self) -> f32 {
-        self.opacity.clamp(0.1, 1.0)
+        if self.opacity.is_finite() {
+            self.opacity.clamp(0.0, 1.0)
+        } else {
+            OPACITY
+        }
     }
 
     /// What to call `session` in the UI: its label, else its real name.
@@ -263,7 +271,7 @@ mod tests {
         assert_eq!(settings.terminal_font, FONT_FAMILY);
         assert_eq!(settings.terminal_font_size, FONT_SIZE);
         assert_eq!(settings.ui_font_size, CHROME_FONT);
-        assert!(settings.ui_font.is_none());
+        assert_eq!(settings.ui_font.as_deref(), Some(CHROME_FONT_FAMILY));
         assert_eq!(settings.update_channel, "stable");
         assert!(settings.update_feed_url.is_none());
         assert!(settings.window.is_none());
@@ -380,9 +388,13 @@ mod tests {
         let mut settings = Settings::default();
         assert_eq!(settings.glass_opacity(), OPACITY);
         settings.opacity = 0.0;
-        assert_eq!(settings.glass_opacity(), 0.1);
+        assert_eq!(settings.glass_opacity(), 0.0);
+        settings.opacity = -1.0;
+        assert_eq!(settings.glass_opacity(), 0.0);
         settings.opacity = 2.0;
         assert_eq!(settings.glass_opacity(), 1.0);
+        settings.opacity = f32::NAN;
+        assert_eq!(settings.glass_opacity(), OPACITY);
     }
 
     #[test]

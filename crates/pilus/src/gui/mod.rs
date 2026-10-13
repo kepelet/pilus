@@ -12553,6 +12553,7 @@ fn render_grid(
                 focused,
                 surface,
                 border,
+                theme.border,
                 line_height,
                 cell_width,
                 (slack_x, slack_y),

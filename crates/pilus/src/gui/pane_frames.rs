@@ -106,6 +106,17 @@ impl PaneFrames {
         &self.panes
     }
 
+    /// The box the panes tile, border cells included; `None` when not split.
+    pub(super) fn bounds(&self) -> Option<PaneFrame> {
+        let first = self.panes.first()?;
+        Some(self.panes.iter().fold(*first, |all, pane| PaneFrame {
+            left: all.left.min(pane.left),
+            top: all.top.min(pane.top),
+            right: all.right.max(pane.right),
+            bottom: all.bottom.max(pane.bottom),
+        }))
+    }
+
     /// Whether the cell is part of a pane's border box.
     pub(super) fn is_border(&self, column: u16, row: u16) -> bool {
         self.panes.iter().any(|pane| pane.on_border(column, row))
@@ -313,6 +324,14 @@ mod tests {
         // A popup ate the second pane's right edge, so the boxes no longer
         // tile; the daemon's own glyphs stay rather than half a layout.
         assert!(panes(&["┌───┐┌────", "│   ││    ", "│   ││    ", "└───┘└────"]).is_empty());
+    }
+
+    #[test]
+    fn bounds_span_every_pane() {
+        let frame = frame(&["┌───┐┌───┐", "│   ││   │", "│   ││   │", "└───┘└───┘"]);
+        let found = PaneFrames::find(&frame, frame.height);
+        assert_eq!(found.bounds(), Some(pane(0, 0, 9, 3)));
+        assert_eq!(PaneFrames::default().bounds(), None);
     }
 
     #[test]

@@ -120,6 +120,17 @@ pub fn run() -> Result<()> {
         Duration::ZERO,
         |_, cx| cx.new(|_| GlyphGridView),
     )?;
+    for (name, id) in [
+        ("panes-dawn", "rose-pine-dawn"),
+        ("panes-noir", "noir"),
+        ("panes-dracula", "dracula"),
+        ("panes-paper", "paper"),
+    ] {
+        let theme = super::scheme::builtin(id).map_or_else(Theme::default, Theme::from_palette);
+        shoot(&mut cx, name, 560.0, 420.0, Duration::ZERO, move |_, cx| {
+            cx.new(|_| PaneGridView { theme })
+        })?;
+    }
     shoot(
         &mut cx,
         "playground",
@@ -1291,23 +1302,7 @@ impl Render for GlyphGridView {
             cursor_visible: false,
         };
         let cell_height = (font_size * super::LINE_HEIGHT_RATIO).round().max(1.0);
-        let cell_width: f32 = window
-            .text_system()
-            .shape_line(
-                "M".into(),
-                px(font_size),
-                &[gpui::TextRun {
-                    len: 1,
-                    font: gpui::font(settings.terminal_font.as_str()),
-                    color: gpui::Hsla::default(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
-                None,
-            )
-            .width
-            .into();
+        let cell_width = grid_cell_width(window, &settings);
         gpui::div()
             .size_full()
             .bg(theme.window_bg)
@@ -1324,6 +1319,113 @@ impl Render for GlyphGridView {
                 skip_rows,
                 width,
                 height - skip_rows - super::SKIPPED_DAEMON_BOTTOM_ROWS,
+                1.0,
+                0.0,
+                0.0,
+                true,
+            ))
+    }
+}
+
+/// The width of one terminal cell in the configured terminal font.
+fn grid_cell_width(window: &Window, settings: &Settings) -> f32 {
+    window
+        .text_system()
+        .shape_line(
+            "M".into(),
+            px(settings.terminal_font_size),
+            &[gpui::TextRun {
+                len: 1,
+                font: gpui::font(settings.terminal_font.as_str()),
+                color: gpui::Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        )
+        .width
+        .into()
+}
+
+/// A three-pane split painted through [`super::render_grid`] from a synthetic
+/// frame, with the caret in the left pane, so the pane surface, frames, and
+/// the active pane's inner shadow can be reviewed in any scheme without a
+/// daemon.
+struct PaneGridView {
+    theme: Theme,
+}
+
+impl Render for PaneGridView {
+    fn render(
+        &mut self,
+        window: &mut Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{ParentElement as _, Styled as _};
+        use pilus_protocol::FrameData;
+        let theme = self.theme;
+        let settings = Settings::default();
+        let skip_rows = super::SKIPPED_DAEMON_ROWS;
+        let body: u16 = 16;
+        let (width, height) = (60u16, skip_rows + body + super::SKIPPED_DAEMON_BOTTOM_ROWS);
+        let mut frame = FrameData::blank(width, height, 0, 0);
+        let mut put = |column: u16, row: u16, text: &str| {
+            for (offset, c) in text.chars().enumerate() {
+                frame.cells[usize::from(row) * usize::from(width) + usize::from(column) + offset]
+                    .symbol = c.to_string();
+            }
+        };
+        let top = skip_rows;
+        let bottom = skip_rows + body - 1;
+        let middle = skip_rows + body / 2;
+        let boxed = |put: &mut dyn FnMut(u16, u16, &str), l: u16, t: u16, r: u16, b: u16| {
+            let line = |c: char, n: u16| c.to_string().repeat(usize::from(n));
+            put(l, t, &format!("┌{}┐", line('─', r - l - 1)));
+            put(l, b, &format!("└{}┘", line('─', r - l - 1)));
+            for row in t + 1..b {
+                put(l, row, "│");
+                put(r, row, "│");
+            }
+        };
+        boxed(&mut put, 0, top, 29, bottom);
+        boxed(&mut put, 30, top, 59, middle - 1);
+        boxed(&mut put, 30, middle, 59, bottom);
+        put(2, top + 1, "~/pilus $ cargo test");
+        put(2, top + 2, "   Compiling pilus v0.1.0");
+        put(2, top + 3, "test result: ok. 214 passed");
+        put(2, top + 4, "~/pilus $");
+        put(32, top + 1, "~/pilus $ git status");
+        put(32, middle + 1, "~/pilus $ tail -f log");
+        frame.cursor = Some((12, top + 4));
+        frame.cursor_visible = true;
+        let font_size = settings.terminal_font_size;
+        let cell_height = (font_size * super::LINE_HEIGHT_RATIO).round().max(1.0);
+        let cell_width = grid_cell_width(window, &settings);
+        // The window's own glass is opaque here: cards in the chrome fill on
+        // the tinted surface.
+        let card = theme.chrome_cell(1.0);
+        let grid_theme = Theme {
+            bg: card,
+            remap_bg: Some(theme.bg),
+            ..theme
+        };
+        gpui::div()
+            .size_full()
+            .bg(theme.window_bg)
+            .p_4()
+            .child(super::render_grid(
+                &frame,
+                grid_theme,
+                font_size,
+                settings.terminal_font.as_str(),
+                px(cell_height),
+                None,
+                cell_width,
+                0,
+                skip_rows,
+                width,
+                body,
                 1.0,
                 0.0,
                 0.0,

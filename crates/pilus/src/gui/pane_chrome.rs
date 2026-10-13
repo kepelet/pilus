@@ -5,20 +5,22 @@
 //! center lines of the cells it replaces, in the surface color, so a pane
 //! reads as its card alone. A pane that does not hold the caret is dimmed by a
 //! veil of that surface over its card and text, which lifts under the pointer.
+//! The pane that does hold the caret also casts a soft shadow around its card.
 //!
 //! The grid is rebuilt every frame, so the transition lives in GPUI element
 //! state keyed by the pane's index. A pane seen for the first time fades in; a
-//! pane whose focus or hover changes eases between the dimmed and clear look.
+//! pane whose focus or hover changes eases between the dimmed and clear look,
+//! and its shadow with the focus.
 //! State carries colors, not geometry, so resizing a split never replays the
 //! fade.
 
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, BorderStyle, Bounds, Corners, DispatchPhase, Div, Edges, Element, ElementId,
-    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Length,
-    MouseMoveEvent, Pixels, Rgba, Size, Style, Styled as _, Window, div, px, quad,
-    transparent_black,
+    App, BorderStyle, Bounds, BoxShadow, ContentMask, Corners, DispatchPhase, Div, Edges, Element,
+    ElementId, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
+    Length, MouseMoveEvent, Pixels, Rgba, Size, Style, Styled as _, Window, black, div, point, px,
+    quad, transparent_black,
 };
 
 use super::pane_frames::PaneFrame;
@@ -30,12 +32,22 @@ const BORDER_PX: f32 = 1.0;
 /// surface, in logical pixels. Cells are wider than they are tall, so a gap
 /// that fell out of the cell grid would differ by axis.
 const GAP_PX: f32 = 8.0;
+/// Whether a card is outlined. Off, the stroke's ring stays as surface around
+/// the card, so the geometry and the shadow's overlap are unchanged.
+const SHOW_BORDER: bool = false;
 /// How long a pane's frame takes to fade in when it first appears.
 const ENTER: Duration = Duration::from_millis(260);
 /// How long the frame takes to move between resting and focused.
 const FOCUS_EASE: Duration = Duration::from_millis(160);
 /// How much of the surface a dimmed pane is veiled with.
 const DIM: f32 = 0.4;
+/// The focused card's shadow: how dark and how soft; kept faint. It is painted with the
+/// frame, above the rows, because the row fills cover anything drawn under
+/// them; [`paint_shadow_outside`] keeps it off the card.
+const SHADOW_ALPHA: f32 = 0.1;
+const SHADOW_BLUR_PX: f32 = 6.0;
+/// The blur on the top and left sides, which sit closer to the card.
+const SHADOW_LEAD_BLUR_PX: f32 = 3.0;
 
 /// Where a pane's frame sits and what it looks like right now. Geometry is
 /// in pixels relative to the grid's top-left.
@@ -56,6 +68,8 @@ struct Look {
     border: Rgba,
     /// How much the pane is dimmed, 0 to 1.
     dim: f32,
+    /// How much of the focused card's shadow shows, 0 to 1.
+    shadow: f32,
 }
 
 impl Look {
@@ -63,6 +77,7 @@ impl Look {
         Look {
             border: mix(self.border, other.border, step),
             dim: self.dim + (other.dim - self.dim) * step,
+            shadow: self.shadow + (other.shadow - self.shadow) * step,
         }
     }
 }
@@ -117,9 +132,15 @@ pub(super) fn pane_chrome(
     let top = top - BORDER_PX;
     let right = right + BORDER_PX;
     let bottom = bottom + BORDER_PX;
+    let stroke = if focused { focus_border } else { border };
     let rest = Look {
-        border: if focused { focus_border } else { border },
+        border: if SHOW_BORDER {
+            stroke
+        } else {
+            Rgba { a: 0.0, ..stroke }
+        },
         dim: if focused { 0.0 } else { 1.0 },
+        shadow: if focused { 1.0 } else { 0.0 },
     };
     PaneChrome {
         index,
@@ -185,6 +206,92 @@ pub(super) fn surface(
         .w(px((right - left).max(0.0)))
         .h(px((bottom - top).max(0.0)))
         .bg(fill)
+}
+
+/// The focused card's shadow along its straight edges only. GPUI's drop shadow
+/// also fills the element it belongs to, which would dim the card's text and
+/// show through a translucent window, and a content mask can only be a
+/// rectangle, so the shadow is painted once per side of the card instead.
+///
+/// Each side's shadow rectangle is shortened along the edge by the corner
+/// radius plus the blur's reach, so it fades out by itself before the corner
+/// rather than ending at a mask's hard cut.
+///
+/// The scene drops a shadow whose own rectangle (without its blur) misses the
+/// mask, so each side reaches [`BORDER_PX`] into the card, under the frame's
+/// stroke. That also rules out a vertical offset: it would pull the top side
+/// off the card again.
+fn paint_shadow_outside(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    corners: Corners<Pixels>,
+    strength: f32,
+) {
+    let stroke = px(BORDER_PX);
+    let radius = corners
+        .top_left
+        .max(corners.top_right)
+        .max(corners.bottom_left)
+        .max(corners.bottom_right);
+    let (left, top) = (bounds.origin.x, bounds.origin.y);
+    let (right, bottom) = (bounds.right(), bounds.bottom());
+    // The top and left sides are tighter than the bottom and right ones, so
+    // the card reads as lit from the upper left.
+    for (side, blur) in [
+        (Side::Top, SHADOW_LEAD_BLUR_PX),
+        (Side::Bottom, SHADOW_BLUR_PX),
+        (Side::Left, SHADOW_LEAD_BLUR_PX),
+        (Side::Right, SHADOW_BLUR_PX),
+    ] {
+        let reach = px(blur * 3.0);
+        let shrink = (radius + px(blur * 2.0))
+            .min(bounds.size.width / 2.0 - px(1.0))
+            .min(bounds.size.height / 2.0 - px(1.0))
+            .max(px(0.0));
+        let (rect, from, to) = match side {
+            Side::Top => (
+                Bounds::from_corners(point(left + shrink, top), point(right - shrink, bottom)),
+                point(left - reach, top - reach),
+                point(right + reach, top + stroke),
+            ),
+            Side::Bottom => (
+                Bounds::from_corners(point(left + shrink, top), point(right - shrink, bottom)),
+                point(left - reach, bottom - stroke),
+                point(right + reach, bottom + reach),
+            ),
+            Side::Left => (
+                Bounds::from_corners(point(left, top + shrink), point(right, bottom - shrink)),
+                point(left - reach, top - reach),
+                point(left + stroke, bottom + reach),
+            ),
+            Side::Right => (
+                Bounds::from_corners(point(left, top + shrink), point(right, bottom - shrink)),
+                point(right - stroke, top - reach),
+                point(right + reach, bottom + reach),
+            ),
+        };
+        let shadow = [BoxShadow {
+            color: black().opacity(SHADOW_ALPHA * strength),
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(blur),
+            spread_radius: px(0.0),
+            inset: false,
+        }];
+        let mask = ContentMask {
+            bounds: Bounds::from_corners(from, to),
+        };
+        window.with_content_mask(Some(mask), |window| {
+            window.paint_drop_shadows(rect, Corners::default(), &shadow);
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Side {
+    Top,
+    Bottom,
+    Left,
+    Right,
 }
 
 /// A look's transition, kept across frames under the pane's element id.
@@ -284,6 +391,7 @@ impl Element for PaneChrome {
                             ..target.border
                         },
                         dim: target.dim,
+                        shadow: 0.0,
                     },
                     to: target,
                     started: now,
@@ -306,6 +414,9 @@ impl Element for PaneChrome {
 
         let radius = RADIUS_MD.pixels();
         let corners = Corners::all(radius).clamp_radii_for_quad_size(bounds.size);
+        if look.shadow > 0.0 {
+            paint_shadow_outside(window, bounds, corners, look.shadow);
+        }
         if look.dim > 0.0 {
             let veil = Rgba {
                 a: self.surface.a * DIM * look.dim,

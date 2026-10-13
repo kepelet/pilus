@@ -25,7 +25,7 @@ use super::pane_frames::PaneFrame;
 use super::style::{RADIUS_MD, RadiusExt as _, ease_out_cubic, mix};
 
 /// Thickness of a pane's frame in logical pixels.
-const BORDER_PX: f32 = 2.0;
+const BORDER_PX: f32 = 1.0;
 /// The space between two cards, and between a card and the edge of the
 /// surface, in logical pixels. Cells are wider than they are tall, so a gap
 /// that fell out of the cell grid would differ by axis.
@@ -76,7 +76,8 @@ impl Look {
 /// setting. `surface` is the color the surface layer paints, which the dimming
 /// veil shares; `border` is the stroke's color, clear when the window is
 /// translucent, since a stroke over the surface there would double its alpha
-/// into a visible ring. The stroke sits just outside the card. A top edge
+/// into a visible ring. The focused pane strokes `focus_border` instead, the
+/// hairline the sidebar parts with. The stroke sits just outside the card. A top edge
 /// hidden behind the native tab strip is drawn flush with the grid's top, so
 /// the strip reads as opening into the card.
 #[allow(clippy::too_many_arguments)]
@@ -87,6 +88,7 @@ pub(super) fn pane_chrome(
     focused: bool,
     surface: Rgba,
     border: Rgba,
+    focus_border: Rgba,
     line_height: Pixels,
     cell_width: f32,
     slack: (f32, f32),
@@ -116,7 +118,7 @@ pub(super) fn pane_chrome(
     let right = right + BORDER_PX;
     let bottom = bottom + BORDER_PX;
     let rest = Look {
-        border,
+        border: if focused { focus_border } else { border },
         dim: if focused { 0.0 } else { 1.0 },
     };
     PaneChrome {
@@ -353,6 +355,7 @@ mod tests {
             true,
             clear,
             clear,
+            clear,
             px(17.0),
             8.4,
             (0.0, 0.0),
@@ -404,6 +407,7 @@ mod tests {
             &tiled,
             &tiled,
             true,
+            clear,
             clear,
             clear,
             px(17.0),

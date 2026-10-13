@@ -9889,7 +9889,6 @@ impl PilusView {
         fullscreen: bool,
     ) -> Div {
         let theme = self.theme;
-        let glass = self.glass_opacity();
         // Beside the sidebar when it is open; full width when it is hidden.
         // The left inset only clears the floating traffic lights, which
         // fullscreen hides, so the strip runs to the edge there.
@@ -9909,11 +9908,10 @@ impl PilusView {
         // The raised fill is one pill that slides to the selected tab, so a
         // switch reads as motion from the old tab to the new one.
         let selection = style::GlideSlot::default();
-        let raise = self.tab_raise();
         tabs = tabs.child(style::glide(
             "pilus-tab-glide",
             &selection,
-            raise.opacity(glass),
+            self.tab_raise(1.0),
             style::RADIUS_SOFT,
             0.0,
         ));
@@ -9946,7 +9944,7 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.muted)
-            .hover_fill(raise.opacity(glass), style::RADIUS_SOFT)
+            .hover_fill(self.tab_raise(SIDEBAR_HOVER_WEIGHT), style::RADIUS_SOFT)
             .hover(move |style| style.text_color(theme.panel_fg))
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
@@ -10026,10 +10024,7 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
-        let glass = self.glass_opacity();
         let active = self.tab_active(tab);
-        let raise = self.tab_raise();
-        let split = self.is_split();
         let index = tab.index;
         let close_index = tab.index;
         let fg = if active { theme.panel_fg } else { theme.muted };
@@ -10096,13 +10091,7 @@ impl PilusView {
             // The selected tab's raised fill is the strip's glide pill;
             // hovering any other tab only hints at it.
             .hover_fill(
-                if active {
-                    raise.opacity(0.0)
-                } else if split {
-                    raise.opacity(glass)
-                } else {
-                    raise.opacity(glass * 0.5)
-                },
+                self.tab_raise(if active { 0.0 } else { SIDEBAR_HOVER_WEIGHT }),
                 style::RADIUS_SOFT,
             )
             .text_color(fg)
@@ -12033,15 +12022,17 @@ impl PilusView {
         }
     }
 
-    /// The fill of the selected and hovered tab. In a split the strip sits on
-    /// the tinted surface, so a tab is raised in the card's own fill, which
-    /// reads as the tab opening into the terminal card below it; otherwise
-    /// it is the panel fill.
-    fn tab_raise(&self) -> gpui::Rgba {
+    /// The fill of the selected (`weight` 1) and hovered tab. In a split the
+    /// strip sits on the tinted surface, so a tab is raised in the card's own
+    /// fill, which reads as the tab opening into the terminal card below it
+    /// and takes no weight. Otherwise it is the sidebar's raised pill, so a
+    /// tab and a sidebar row look alike at any window opacity.
+    fn tab_raise(&self, weight: f32) -> gpui::Rgba {
+        let glass = self.glass_opacity();
         if self.is_split() {
-            self.theme.bg
+            self.theme.bg.opacity(glass * weight.min(1.0).ceil())
         } else {
-            self.theme.panel
+            self.theme.sidebar_raise(glass, weight)
         }
     }
 

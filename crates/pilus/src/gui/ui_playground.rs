@@ -1983,7 +1983,13 @@ impl Render for UiPlaygroundView {
                             .items_center()
                             .gap_2()
                             .child(self.tab(0, "Overview", cx))
-                            .child(self.tab(1, "Changes", cx)),
+                            .child(self.tab(1, "Changes", cx))
+                            .child(style::tab_disabled(
+                                "pg-tab-disabled",
+                                "History",
+                                self.theme,
+                                self.fonts().body,
+                            )),
                     ),
                 ),
             )

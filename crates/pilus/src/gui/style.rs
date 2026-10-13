@@ -1380,7 +1380,7 @@ impl FillState {
     }
 }
 
-fn ease_out_cubic(step: f32) -> f32 {
+pub(super) fn ease_out_cubic(step: f32) -> f32 {
     1.0 - (1.0 - step).powi(3)
 }
 
@@ -1395,7 +1395,7 @@ pub(super) fn tint(color: Rgba, alpha: f32) -> Rgba {
 
 /// Blend two colors. A transparent end borrows the other end's hue, so a
 /// fill fading in from nothing never passes through a grey or black tint.
-fn mix(from: Rgba, to: Rgba, step: f32) -> Rgba {
+pub(super) fn mix(from: Rgba, to: Rgba, step: f32) -> Rgba {
     let from = if from.a == 0.0 {
         Rgba { a: 0.0, ..to }
     } else {

@@ -29,6 +29,7 @@ mod mission;
 mod orchestration;
 mod page_split;
 mod palette;
+mod pane_chrome;
 mod pane_frames;
 mod perf;
 mod picker;
@@ -12089,9 +12090,9 @@ impl Render for PilusView {
         // under the grid, the card, and the chrome, whatever the running app
         // paints. Voting the dominant cell color made the padding track the
         // app instead, so a green TUI left a green frame around an ink grid.
-        // With pane frames the grid takes the chrome's own fill, and the cells
-        // the daemon paints in its base surface follow it, so the panes, the
-        // gaps between them, and the card read as the sidebar and top bar do.
+        // With pane frames the grid takes the chrome's own fill for the cards
+        // inside each pane's border, and `render_grid` lays a tinted surface
+        // under them, so the gutters and margin read as pilus's container.
         let pane_ui = self.settings.pane_ui;
         let terminal_bg = if pane_ui {
             theme.chrome_cell(glass)
@@ -12470,6 +12471,43 @@ fn render_grid(
         pane_frames::PaneFrames::default()
     };
     let mut column = div().relative().flex().flex_col().size_full();
+    let surface = theme.pane_surface(glass).opacity(glass);
+    let chromes: Vec<pane_chrome::PaneChrome> = panes
+        .panes()
+        .iter()
+        .enumerate()
+        .map(|(index, pane)| {
+            let focused = frame
+                .cursor
+                .is_some_and(|(cursor_column, cursor_row)| pane.holds(cursor_column, cursor_row));
+            pane_chrome::pane_chrome(
+                index,
+                pane,
+                focused,
+                surface,
+                line_height,
+                cell_width,
+                skip_cols,
+                skip_rows,
+            )
+        })
+        .collect();
+    // The surface and the cards sit under the rows. Cells the daemon paints
+    // in its base color skip their fill inside the tiled box (`render_row`),
+    // so the cards show through; the gutters keep the surface.
+    if let Some(tiled) = panes.bounds() {
+        column = column.child(pane_chrome::surface(
+            &tiled,
+            surface,
+            line_height,
+            cell_width,
+            skip_cols,
+            skip_rows,
+        ));
+        for chrome in &chromes {
+            column = column.child(chrome.card(theme.bg.opacity(glass)));
+        }
+    }
     for row in skip_rows..end_row.max(skip_rows) {
         column = column.child(render_row(
             frame,
@@ -12505,66 +12543,26 @@ fn render_grid(
             glass,
         ));
     }
-    for pane in panes.panes() {
-        let focused = frame
-            .cursor
-            .is_some_and(|(cursor_column, cursor_row)| pane.holds(cursor_column, cursor_row));
-        column = column.child(pane_border(
-            pane,
-            focused,
-            theme,
-            line_height,
-            cell_width,
-            skip_cols,
-            skip_rows,
-        ));
+    for chrome in chromes {
+        column = column.child(chrome);
     }
     column
 }
 
-/// Thickness of a pane's frame in logical pixels.
-const PANE_BORDER_PX: f32 = 2.0;
-
-/// One pane's frame drawn natively over the grid, on the center lines of the
-/// daemon's border cells so it sits where the glyphs did. The corner radius
-/// follows the setting, and the pane holding the caret takes the focus edge.
-/// A top edge hidden behind the native tab strip is drawn at the grid's top.
-fn pane_border(
-    pane: &pane_frames::PaneFrame,
-    focused: bool,
-    theme: Theme,
-    line_height: Pixels,
-    cell_width: f32,
-    skip_cols: u16,
-    skip_rows: u16,
-) -> Div {
-    let height = f32::from(line_height);
-    let column_center = |column: u16| (f32::from(column) - f32::from(skip_cols) + 0.5) * cell_width;
-    let row_center = |row: u16| ((f32::from(row) - f32::from(skip_rows) + 0.5) * height).max(0.0);
-    // The stroke straddles the center line, so the box grows by half of it
-    // on every side.
-    let half = PANE_BORDER_PX / 2.0;
-    let (left, right) = (
-        column_center(pane.left).round() - half,
-        column_center(pane.right).round() + half,
-    );
-    let (top, bottom) = (
-        row_center(pane.top).round() - half,
-        row_center(pane.bottom).round() + half,
-    );
-    div()
-        .absolute()
-        .left(px(left))
-        .top(px(top))
-        .w(px(right - left))
-        .h(px(bottom - top))
-        .radius_md()
-        .border(px(PANE_BORDER_PX))
-        .border_color(if focused {
-            theme.border_focus
-        } else {
-            theme.border
-        })
+/// The parts of the `cells` columns from `start` that fall outside
+/// `left..=right`.
+fn outside_columns(start: u16, cells: u16, left: u16, right: u16) -> Vec<(u16, u16)> {
+    let end = start.saturating_add(cells);
+    let mut parts = Vec::new();
+    if start < left {
+        parts.push((start, end.min(left) - start));
+    }
+    let after = right.saturating_add(1);
+    if end > after {
+        let from = start.max(after);
+        parts.push((from, end - from));
+    }
+    parts
 }
 
 /// Paint one grid row, skipping the dock columns our sidebar covers.
@@ -12620,9 +12618,20 @@ fn render_row(
     // Fill first, in color-only runs: a uniformly-filled row is then one rect
     // instead of one per fallback glyph, so the device-snapped edges cannot
     // leave backdrop-colored hairlines between them.
-    for (start_column, run_cells, bg) in
-        collect_background_runs(frame.width, &rendered, theme, row, selection)
-    {
+    let tiled = panes
+        .bounds()
+        .filter(|tiled| (tiled.top..=tiled.bottom).contains(&row));
+    let fills = collect_background_runs(frame.width, &rendered, theme, row, selection)
+        .into_iter()
+        .flat_map(|(start, cells, bg)| match tiled {
+            // The cards under the grid are the base inside the tiled box.
+            Some(tiled) if bg == theme.bg => outside_columns(start, cells, tiled.left, tiled.right)
+                .into_iter()
+                .map(|(start, cells)| (start, cells, bg))
+                .collect::<Vec<_>>(),
+            _ => vec![(start, cells, bg)],
+        });
+    for (start_column, run_cells, bg) in fills {
         element = element.child(
             div()
                 .absolute()

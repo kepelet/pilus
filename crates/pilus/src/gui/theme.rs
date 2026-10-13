@@ -12,6 +12,8 @@
 
 use gpui::{Rgba, rgb};
 
+use super::style::mix;
+
 /// The modules of a QR code. A scanner needs dark on light whatever the
 /// theme, so these are the one pair of colors that deliberately ignore it.
 pub fn qr_dark() -> Rgba {
@@ -28,6 +30,14 @@ const CHROME_SHADE: f32 = 0.35;
 /// How much of the remaining transparency translucent chrome fills in, so it
 /// reads denser than the grid at every opacity.
 const CHROME_DENSITY: f32 = 0.45;
+/// How much of the accent a light scheme's surface takes on, so the container
+/// around the terminal cards reads in the theme's own hue (rose pine dawn is
+/// blush) while the cards keep the chrome's ground.
+const SURFACE_TINT_LIGHT: f32 = 0.12;
+/// The same for a dark scheme, where far less accent already shows: a vivid
+/// accent such as noir's lime turns a near-black ground olive at the light
+/// scheme's amount.
+const SURFACE_TINT_DARK: f32 = 0.05;
 /// The opacity every border and hairline is drawn at. The schemes' border
 /// roles are tuned as solid fills, which read heavier than a 1px line wants.
 const BORDER_ALPHA: f32 = 0.55;
@@ -185,6 +195,22 @@ impl Theme {
             },
             ..chrome
         }
+    }
+
+    /// The color of the surface pilus lays under the terminal cards, as a cell
+    /// paints it: `window_bg` tinted toward the accent, shaded and thickened
+    /// like [`Self::chrome_cell`].
+    pub fn pane_surface(self, glass: f32) -> Rgba {
+        let tint = if self.is_light() {
+            SURFACE_TINT_LIGHT
+        } else {
+            SURFACE_TINT_DARK
+        };
+        Theme {
+            window_bg: mix(self.window_bg, self.accent, tint),
+            ..self
+        }
+        .chrome_cell(glass)
     }
 
     /// The raised fill under a selected or hovered sidebar row, at window
@@ -420,6 +446,19 @@ mod tests {
         assert!(luminance(chrome) < luminance(theme.window_bg));
         // Opaque, chrome and terminal are one seamless base.
         assert_eq!(theme.chrome_glass(1.0), theme.window_bg);
+    }
+
+    #[test]
+    fn pane_surface_leans_toward_the_accent_and_the_card_does_not() {
+        let dawn = Theme::from_palette(
+            super::super::scheme::builtin("rose-pine-dawn").unwrap_or_else(default_palette),
+        );
+        let surface = dawn.pane_surface(1.0);
+        // Dawn's ground is near-white; its rose accent pulls green and blue
+        // down while red holds, so the surface reads blush.
+        assert!(surface.g < dawn.window_bg.g && surface.b < dawn.window_bg.b);
+        assert!(surface.r - surface.b > dawn.window_bg.r - dawn.window_bg.b);
+        assert_eq!(dawn.chrome_cell(1.0), dawn.window_bg);
     }
 
     #[test]

@@ -738,7 +738,10 @@ pub fn run_main() -> Result<()> {
         view.update(app, |view, cx| {
             view.palette.close();
             view.open_context_menu(
-                super::sidebar_menu::MenuTarget::Terminal { selection: true },
+                super::sidebar_menu::MenuTarget::Terminal {
+                    selection: true,
+                    agent: true,
+                },
                 point(px(520.0), px(260.0)),
                 cx,
             );
@@ -1437,7 +1440,7 @@ impl Render for PaneGridView {
                 9.0,
                 true,
                 Some(
-                    super::style::pane_toolbar(theme)
+                    super::style::pane_toolbar()
                         .child(super::style::icon_button(
                             "shot-pane-split-right",
                             include_bytes!("../../assets/icons/columns-2.svg"),

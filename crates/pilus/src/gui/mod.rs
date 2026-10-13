@@ -3800,7 +3800,7 @@ impl PilusView {
         // An open context menu owns up/down/enter/escape until one runs or it
         // closes; an open prompt owns Enter (submit) and Escape (cancel).
         if self.context_menu.is_some() {
-            self.context_menu_key(event, window, cx);
+            self.context_menu_key(event, cx);
             return;
         }
         if self.menu_prompt.is_some() {
@@ -4556,13 +4556,16 @@ impl PilusView {
             .into_any_element()
     }
 
-    /// A native page as a rounded card on the pane surface, the way each pane
-    /// of a split terminal sits in its gutters: the same gap on every side, no
-    /// outline, no shadow. With pane frames off the terminal has no cards, so
-    /// the page runs flush on the chrome's fill instead.
+    /// A native page as a rounded card in gutters of the chrome's own fill, the
+    /// way each pane of a split terminal sits in its gutters: the same gap on
+    /// every side, no outline, no shadow. With pane frames off the terminal has
+    /// no cards, so the page runs flush on the chrome's fill instead.
     ///
-    /// The surface is the page's own layer rather than the card's, so a split
-    /// page carries it on its half and the terminal half keeps the grid's.
+    /// The gutter is the sidebar's fill, not the tinted pane surface: a page
+    /// has no terminal cards for that surface to frame, and the tint would
+    /// read as a different shade from the sidebar beside it. It is the page's
+    /// own layer rather than the card's, so a split page carries it on its
+    /// half and the terminal half keeps the grid's.
     fn inset_page(&self, page: Div) -> Div {
         let glass = self.glass_opacity();
         if !self.settings.pane_ui {
@@ -4571,7 +4574,7 @@ impl PilusView {
         div()
             .size_full()
             .p(px(pane_chrome::GAP_PX))
-            .bg(self.theme.pane_surface(glass).opacity(glass))
+            .bg(self.chrome_fill())
             .child(
                 div()
                     .size_full()
@@ -8698,7 +8701,7 @@ impl PilusView {
     }
 
     /// Drive the open context menu from the keyboard.
-    fn context_menu_key(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+    fn context_menu_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let rows = self.menu_rows();
         let quick_open = self
@@ -8757,7 +8760,7 @@ impl PilusView {
                     .filter(|index| rows.get(*index).is_some_and(|item| item.selectable()))
                     .or_else(|| rows.iter().position(|item| item.selectable()));
                 if let Some(index) = row {
-                    self.run_context_item(rows[index], window, cx);
+                    self.run_context_item(rows[index], cx);
                 }
             }
             _ => {}
@@ -8767,7 +8770,7 @@ impl PilusView {
     /// Run one hit context-menu row. The menu is cloned so the Quick Actions
     /// parent row can swap the submenu open in place; everything else closes
     /// it and runs the action.
-    fn run_context_item(&mut self, item: SidebarItem, window: &Window, cx: &mut Context<Self>) {
+    fn run_context_item(&mut self, item: SidebarItem, cx: &mut Context<Self>) {
         let Some(menu) = self.context_menu.as_ref() else {
             return;
         };
@@ -8878,7 +8881,7 @@ impl PilusView {
             }
             (SidebarMenuTarget::Terminal { .. }, item) => {
                 self.close_context_menu();
-                self.run_terminal_item(item, window, cx);
+                self.run_terminal_item(item, cx);
             }
             (SidebarMenuTarget::File { path, .. }, SidebarItem::CopyPath) => {
                 self.close_context_menu();
@@ -8897,11 +8900,10 @@ impl PilusView {
 
     /// Run one row of the terminal's menu. Every row is something the client
     /// already does from a chord, so the menu is only a second way in.
-    fn run_terminal_item(&mut self, item: SidebarItem, window: &Window, cx: &mut Context<Self>) {
+    fn run_terminal_item(&mut self, item: SidebarItem, cx: &mut Context<Self>) {
         match item {
             SidebarItem::CopySelection => self.copy_selection(cx),
             SidebarItem::Paste => self.paste_clipboard(cx),
-            SidebarItem::SelectAll => self.select_all(window, cx),
             SidebarItem::SplitRight => self.split("right", cx),
             SidebarItem::SplitDown => self.split("down", cx),
             SidebarItem::ForkPane => self.fork_focused_pane(cx),
@@ -8995,8 +8997,9 @@ impl PilusView {
         let selection = self
             .selection
             .is_some_and(|selection| !selection.is_collapsed());
+        let agent = self.agents.iter().any(|agent| agent.focused);
         self.open_context_menu(
-            SidebarMenuTarget::Terminal { selection },
+            SidebarMenuTarget::Terminal { selection, agent },
             event.position,
             cx,
         );
@@ -10753,8 +10756,8 @@ impl PilusView {
                     .text_color(color)
                     .child(icon(sidebar_menu_icon(item), 15.0, color))
                     .child(div().flex_1().min_w_0().truncate().child(label))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.run_context_item(item, window, cx);
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.run_context_item(item, cx);
                     })),
             );
         }
@@ -12100,11 +12103,14 @@ impl PilusView {
     /// The tab strip's background. A split always takes the pane surface, the
     /// tinted ground its cards sit on, opaque or not. One pane has no cards:
     /// opaque, its strip is the sidebar's own fill; translucent, it takes the
-    /// pane surface so one pane and many look alike.
+    /// pane surface so one pane and many look alike. A native page alone in the
+    /// card sits in the chrome's fill, so the strip keeps to it.
     fn tab_strip_fill(&self) -> gpui::Rgba {
         let glass = self.glass_opacity();
         let surface = self.theme.pane_surface(glass).opacity(glass);
-        if self.is_split() || (self.settings.pane_ui && glass < 1.0) {
+        if self.split_page_open() && self.page_split().is_none() {
+            self.chrome_fill()
+        } else if self.is_split() || (self.settings.pane_ui && glass < 1.0) {
             surface
         } else {
             self.chrome_fill()
@@ -13813,7 +13819,6 @@ fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
         SidebarItem::Delete => include_bytes!("../../assets/icons/trash-2.svg"),
         SidebarItem::CopySelection => include_bytes!("../../assets/icons/copy.svg"),
         SidebarItem::Paste => include_bytes!("../../assets/icons/clipboard.svg"),
-        SidebarItem::SelectAll => include_bytes!("../../assets/icons/square-dashed.svg"),
         SidebarItem::SplitRight => include_bytes!("../../assets/icons/columns-2.svg"),
         SidebarItem::SplitDown => include_bytes!("../../assets/icons/rows-2.svg"),
         SidebarItem::ForkPane => include_bytes!("../../assets/icons/git-fork.svg"),

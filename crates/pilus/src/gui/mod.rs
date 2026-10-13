@@ -9955,7 +9955,11 @@ impl PilusView {
             .flex()
             .flex_col()
             .justify_center()
-            .bg(self.chrome_fill())
+            .bg(if self.is_split() {
+                theme.pane_surface(glass).opacity(glass)
+            } else {
+                self.chrome_fill()
+            })
             .border_color(theme.border)
             .child(tab_strip)
     }
@@ -11944,6 +11948,20 @@ impl PilusView {
         }
     }
 
+    /// Whether the shown frame is a split with pane frames drawn, which is
+    /// when the terminal sits on the tinted surface the tab strip matches.
+    fn is_split(&self) -> bool {
+        self.settings.pane_ui
+            && self.shown_frame().is_some_and(|frame| {
+                !pane_frames::PaneFrames::find(
+                    frame,
+                    frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS),
+                )
+                .panes()
+                .is_empty()
+            })
+    }
+
     /// The fill behind the sidebar, the tab strip, and a native page: a
     /// shade denser than the terminal under translucency, so the chrome
     /// frames the grid and a page's text never sits on the bare desktop.
@@ -12471,7 +12489,8 @@ fn render_grid(
         pane_frames::PaneFrames::default()
     };
     let mut column = div().relative().flex().flex_col().size_full();
-    let surface = theme.pane_surface(glass).opacity(glass);
+    let surface_base = theme.pane_surface(glass);
+    let surface = surface_base.opacity(glass);
     let chromes: Vec<pane_chrome::PaneChrome> = panes
         .panes()
         .iter()
@@ -12523,6 +12542,7 @@ fn render_grid(
             max_cols,
             glass,
             slack_x,
+            surface_base,
         ));
     }
     // Full-bleed pools the sub-cell remainder below the last row; extend
@@ -12541,6 +12561,8 @@ fn render_grid(
             slack_x,
             slack_y,
             glass,
+            panes.bounds(),
+            surface_base,
         ));
     }
     for chrome in chromes {
@@ -12581,6 +12603,7 @@ fn render_row(
     max_cols: u16,
     glass: f32,
     slack_x: f32,
+    surface: gpui::Rgba,
 ) -> Div {
     let width = usize::from(frame.width);
     let skip = usize::from(skip_cols).min(width);
@@ -12785,6 +12808,14 @@ fn render_row(
             }
             None => theme::resolve(0, theme.bg, &theme.ansi),
         };
+        // Inside a split the base is the card, which stops at the cell grid;
+        // the remainder beyond it belongs to the surface, or a strip of card
+        // color shows along the right edge.
+        let edge_bg = if tiled.is_some() && edge_bg == theme.bg {
+            surface
+        } else {
+            edge_bg
+        };
         element = element.child(
             div()
                 .absolute()
@@ -12815,8 +12846,13 @@ fn bottom_fill(
     slack_x: f32,
     slack_y: f32,
     glass: f32,
+    tiled: Option<pane_frames::PaneFrame>,
+    surface: gpui::Rgba,
 ) -> Div {
     let spans = bottom_fill_spans(frame, row, theme, selection, skip_cols, max_cols);
+    // The same remainder rule as `render_row`: under a split, the base color
+    // below the last row is the surface, not the card.
+    let tiled = tiled.filter(|tiled| (tiled.top..=tiled.bottom).contains(&row));
     let strip_width = f32::from(max_cols) * cell_width + slack_x;
     let mut strip = div()
         .relative()
@@ -12841,7 +12877,15 @@ fn bottom_fill(
                 .top(px(0.0))
                 .right(px(right))
                 .h_full()
-                .bg(bg.opacity(glass)),
+                .bg(match tiled {
+                    Some(tiled)
+                        if *bg == theme.bg && skip_cols.saturating_add(*offset) >= tiled.left =>
+                    {
+                        surface
+                    }
+                    _ => *bg,
+                }
+                .opacity(glass)),
         );
     }
     strip

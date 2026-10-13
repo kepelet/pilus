@@ -26,6 +26,10 @@ use super::style::{RADIUS_MD, RadiusExt as _, ease_out_cubic, mix};
 
 /// Thickness of a pane's frame in logical pixels.
 const BORDER_PX: f32 = 2.0;
+/// The space between two cards, and between a card and the edge of the
+/// surface, in logical pixels. Cells are wider than they are tall, so a gap
+/// that fell out of the cell grid would differ by axis.
+const GAP_PX: f32 = 8.0;
 /// How long a pane's frame takes to fade in when it first appears.
 const ENTER: Duration = Duration::from_millis(260);
 /// How long the frame takes to move between resting and focused.
@@ -63,35 +67,54 @@ impl Look {
     }
 }
 
-/// One pane's frame, on the center lines of the daemon's border cells so it
-/// sits where the glyphs did. The corner radius follows the setting. `surface`
-/// is the color the surface layer paints, which the dimming veil shares;
-/// `border` is the stroke's color, clear when the window is translucent, since
-/// a stroke over the surface there would double its alpha into a visible ring.
-/// A top edge hidden behind the native tab strip is drawn at the
-/// grid's top.
+/// One pane's frame. Each card is its box of cells pulled in from the cell
+/// boundaries: half the gap on an edge it shares with a neighbor, so two cards
+/// are a whole gap apart whichever way they are split, and a whole gap on an
+/// edge that meets the surface's border. The grid's sub-cell remainder
+/// (`slack`) is surface too, so the outermost right and bottom cards grow
+/// over it, keeping those margins a gap whatever the window's size. The corner radius follows the
+/// setting. `surface` is the color the surface layer paints, which the dimming
+/// veil shares; `border` is the stroke's color, clear when the window is
+/// translucent, since a stroke over the surface there would double its alpha
+/// into a visible ring. The stroke sits just outside the card. A top edge
+/// hidden behind the native tab strip is drawn flush with the grid's top, so
+/// the strip reads as opening into the card.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pane_chrome(
     index: usize,
     pane: &PaneFrame,
+    tiled: &PaneFrame,
     focused: bool,
     surface: Rgba,
     border: Rgba,
     line_height: Pixels,
     cell_width: f32,
+    slack: (f32, f32),
     skip_cols: u16,
     skip_rows: u16,
 ) -> PaneChrome {
     let height = f32::from(line_height);
-    let column_center = |column: u16| (f32::from(column) - f32::from(skip_cols) + 0.5) * cell_width;
-    let row_center = |row: u16| ((f32::from(row) - f32::from(skip_rows) + 0.5) * height).max(0.0);
-    // The stroke straddles the center line, so the box grows by half of it
-    // on every side.
-    let half = BORDER_PX / 2.0;
-    let left = column_center(pane.left).round() - half;
-    let right = column_center(pane.right).round() + half;
-    let top = row_center(pane.top).round() - half;
-    let bottom = row_center(pane.bottom).round() + half;
+    let column_edge =
+        |column: u16| ((f32::from(column) - f32::from(skip_cols)) * cell_width).round();
+    let row_edge = |row: u16| ((f32::from(row) - f32::from(skip_rows)) * height).round();
+    let inset = |shared: bool| if shared { GAP_PX / 2.0 } else { GAP_PX };
+    let left = column_edge(pane.left) + inset(pane.left != tiled.left);
+    let outer_right = pane.right == tiled.right;
+    let outer_bottom = pane.bottom == tiled.bottom;
+    let right =
+        column_edge(pane.right + 1) + if outer_right { slack.0 } else { 0.0 } - inset(!outer_right);
+    let top = if pane.top < skip_rows {
+        0.0
+    } else {
+        row_edge(pane.top) + inset(pane.top != tiled.top)
+    };
+    let bottom =
+        row_edge(pane.bottom + 1) + if outer_bottom { slack.1 } else { 0.0 } - inset(!outer_bottom);
+    // The stroke grows the box outward, leaving the card as the inner area.
+    let left = left - BORDER_PX;
+    let top = top - BORDER_PX;
+    let right = right + BORDER_PX;
+    let bottom = bottom + BORDER_PX;
     let rest = Look {
         border,
         dim: if focused { 0.0 } else { 1.0 },
@@ -100,8 +123,8 @@ pub(super) fn pane_chrome(
         index,
         left,
         top,
-        width: right - left,
-        height: bottom - top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
         rest,
         hover: Look { dim: 0.0, ..rest },
         surface,
@@ -309,5 +332,95 @@ impl Element for PaneChrome {
                 window.refresh();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chrome(pane: PaneFrame, tiled: PaneFrame) -> PaneChrome {
+        let clear = Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+        pane_chrome(
+            0,
+            &pane,
+            &tiled,
+            true,
+            clear,
+            clear,
+            px(17.0),
+            8.4,
+            (0.0, 0.0),
+            0,
+            1,
+        )
+    }
+
+    fn frame(left: u16, top: u16, right: u16, bottom: u16) -> PaneFrame {
+        PaneFrame {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn side_by_side_and_stacked_panes_share_one_gap() {
+        let tiled = frame(0, 1, 39, 20);
+        let visible = |c: &PaneChrome| {
+            (
+                c.left + BORDER_PX,
+                c.top + BORDER_PX,
+                c.left + c.width - BORDER_PX,
+                c.top + c.height - BORDER_PX,
+            )
+        };
+        let left = visible(&chrome(frame(0, 1, 19, 20), tiled));
+        let right = visible(&chrome(frame(20, 1, 39, 20), tiled));
+        let upper = visible(&chrome(frame(0, 1, 39, 9), tiled));
+        let lower = visible(&chrome(frame(0, 10, 39, 20), tiled));
+        assert_eq!(right.0 - left.2, GAP_PX);
+        assert_eq!(lower.1 - upper.3, GAP_PX);
+    }
+
+    #[test]
+    fn the_remainder_below_the_grid_does_not_widen_the_margin() {
+        let tiled = frame(0, 1, 39, 20);
+        let bare = chrome(tiled, tiled);
+        let clear = Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+        let slack = pane_chrome(
+            0,
+            &tiled,
+            &tiled,
+            true,
+            clear,
+            clear,
+            px(17.0),
+            8.4,
+            (5.0, 9.0),
+            0,
+            1,
+        );
+        assert_eq!(slack.width - bare.width, 5.0);
+        assert_eq!(slack.height - bare.height, 9.0);
+    }
+
+    #[test]
+    fn the_surface_margin_matches_the_gap() {
+        let tiled = frame(0, 2, 39, 20);
+        let card = chrome(tiled, tiled);
+        assert_eq!(card.left + BORDER_PX, GAP_PX);
+        assert_eq!(card.top + BORDER_PX, (17.0f32 * 1.0).round() + GAP_PX);
     }
 }

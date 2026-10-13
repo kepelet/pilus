@@ -1334,14 +1334,7 @@ impl PilusView {
             .border_color(theme.border)
             .child(header);
         for (index, (key, row)) in rows.iter().enumerate() {
-            list = list.child(self.mission_row(
-                index + 1,
-                key,
-                row,
-                columns,
-                index + 1 < rows.len(),
-                cx,
-            ));
+            list = list.child(self.mission_row(index + 1, key, row, columns, cx));
         }
         column.child(list)
     }
@@ -1411,7 +1404,6 @@ impl PilusView {
         key: &str,
         row: &MissionRow,
         columns: MissionColumns,
-        rule_below: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
@@ -1586,12 +1578,10 @@ impl PilusView {
                     .px_1()
                     .child(self.mission_row_actions(key, row, cx)),
             );
-        let row_el = if rule_below {
-            row_el.border_b_1().border_color(theme.border)
-        } else {
-            row_el
-        };
-        row_el.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+        row_el
+            .border_b_1()
+            .border_color(theme.border)
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
             let pick = key_owned.clone();
             if event.click_count() >= 2 {
                 this.mission.selection = Some(pick);

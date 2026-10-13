@@ -8564,9 +8564,9 @@ impl PilusView {
     }
 
     /// Ask the daemon whether the row's checkout is a linked worktree, once
-    /// per workspace. Until an answer lands the row is absent; a successful
-    /// probe inserts it a beat later. A failed probe is not cached, so the
-    /// next right-click retries.
+    /// per workspace, and only for a repo. Until an answer lands the row is
+    /// absent; a successful probe inserts it a beat later. A failed probe is
+    /// not cached, so the next right-click retries.
     fn probe_worktree(
         &mut self,
         endpoint_key: &str,
@@ -8584,6 +8584,9 @@ impl PilusView {
             return;
         };
         let expanded = match target {
+            // A plain folder has no worktrees to list, and the daemon answers
+            // `worktree.list` there with an error.
+            SidebarMenuTarget::Workspace { branch: None, .. } => return,
             SidebarMenuTarget::Workspace { cwd, .. } => self.expand_cwd(endpoint_key, cwd),
             SidebarMenuTarget::Agent { .. }
             | SidebarMenuTarget::Terminal { .. }

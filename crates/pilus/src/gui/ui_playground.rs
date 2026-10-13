@@ -351,7 +351,7 @@ impl UiPlaygroundView {
     fn pane_toolbar(&self) -> impl IntoElement {
         let theme = self.theme;
         let size = style::scaled(&self.settings, 24.0);
-        style::pane_toolbar(theme)
+        style::pane_toolbar()
             .child(style::icon_button(
                 "pg-pane-split-right",
                 include_bytes!("../../assets/icons/columns-2.svg"),

@@ -156,6 +156,16 @@ pub(super) fn pane_chrome(
     }
 }
 
+/// `bar` pinned to the grid's top-right corner, for a tab with one pane and
+/// so no frame to measure from.
+pub(super) fn lone_toolbar(bar: Div) -> Div {
+    div()
+        .absolute()
+        .top(px(TOOLBAR_INSET_PX))
+        .right(px(TOOLBAR_INSET_PX))
+        .child(style::enter("pilus-pane-toolbar-lone", bar))
+}
+
 impl PaneChrome {
     /// Whether this pane holds the caret.
     pub(super) fn focused(&self) -> bool {

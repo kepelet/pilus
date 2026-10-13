@@ -10608,7 +10608,7 @@ impl PilusView {
 
     /// The focused pane's corner buttons: split either way, take the pane
     /// to a tab of its own (the daemon has no zoom, so a tab is its
-    /// fullscreen), and close the tab. `render_grid` pins it to the pane.
+    /// fullscreen), and close the pane. `render_grid` pins it to the pane.
     fn pane_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let size = style::scaled(&self.shared_settings, 24.0);
@@ -10621,7 +10621,7 @@ impl PilusView {
                     theme,
                 ))
             };
-        style::pane_toolbar(theme)
+        style::pane_toolbar()
             .child(
                 button(
                     "pilus-pane-split-right",
@@ -10659,14 +10659,19 @@ impl PilusView {
             )
             .child(
                 button(
-                    "pilus-pane-close-tab",
+                    "pilus-pane-close",
                     include_bytes!("../../assets/icons/x.svg"),
                     style::ButtonKind::Danger,
-                    "Close tab",
+                    "Close pane",
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.close_active_tab();
-                    cx.notify();
+                    let endpoint = this.active.clone();
+                    this.pane_op(
+                        &endpoint,
+                        "pane closed".to_string(),
+                        |client, pane| client.close_pane(pane),
+                        cx,
+                    );
                 })),
             )
     }
@@ -12734,12 +12739,17 @@ fn render_grid(
             surface_base,
         ));
     }
-    // Above the frames, so the focused pane's buttons take the pointer.
+    // Above the frames, so the focused pane's buttons take the pointer. An
+    // unsplit tab has no frames: its one pane is the whole grid.
     let toolbar = toolbar.and_then(|bar| {
-        chromes
-            .iter()
-            .find(|chrome| chrome.focused())
-            .map(|chrome| chrome.toolbar(bar))
+        if chromes.is_empty() {
+            Some(pane_chrome::lone_toolbar(bar))
+        } else {
+            chromes
+                .iter()
+                .find(|chrome| chrome.focused())
+                .map(|chrome| chrome.toolbar(bar))
+        }
     });
     for chrome in chromes {
         column = column.child(chrome);

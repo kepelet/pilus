@@ -375,17 +375,16 @@ pub(super) fn icon_button(
 }
 
 /// The strip of icon buttons that floats over the focused pane's top-right
-/// corner. It occludes the grid under it, so a press on a button never also
+/// corner. It has no fill, so the terminal shows through between the glyphs;
+/// it still occludes the grid under it, so a press on a button never also
 /// starts a selection or reaches the daemon. Fill it with [`icon_button`]s.
-pub(super) fn pane_toolbar(theme: Theme) -> Div {
+pub(super) fn pane_toolbar() -> Div {
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
         .p_1()
-        .radius_md()
-        .bg(theme.panel)
         .occlude()
 }
 

@@ -4488,6 +4488,11 @@ impl PilusView {
                 Some(SplitAxis::Right) => layout.page_w,
                 _ => layout.content_w,
             };
+            let page_w = if self.settings.pane_ui {
+                page_w - 2.0 * pane_chrome::GAP_PX
+            } else {
+                page_w
+            };
             let page = div()
                 .flex_1()
                 .min_h(px(0.0))
@@ -4528,6 +4533,34 @@ impl PilusView {
             .into_any_element()
     }
 
+    /// A native page as a rounded card on the pane surface, the way each pane
+    /// of a split terminal sits in its gutters: the same gap on every side, no
+    /// outline, no shadow. With pane frames off the terminal has no cards, so
+    /// the page runs flush on the chrome's fill instead.
+    ///
+    /// The surface is the page's own layer rather than the card's, so a split
+    /// page carries it on its half and the terminal half keeps the grid's.
+    fn inset_page(&self, page: Div) -> Div {
+        let glass = self.glass_opacity();
+        if !self.settings.pane_ui {
+            return div().size_full().bg(self.chrome_fill()).child(page);
+        }
+        div()
+            .size_full()
+            .p(px(pane_chrome::GAP_PX))
+            .bg(self.theme.pane_surface(glass).opacity(glass))
+            .child(
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .radius_md()
+                    .bg(self.theme.bg.opacity(glass))
+                    .child(page),
+            )
+    }
+
     /// A native page in the card: alone, or leading the terminal when split.
     ///
     /// The page keeps its fade under its own id; the terminal half takes
@@ -4543,7 +4576,7 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(split) = self.page_split() else {
-            return style::enter(id, page).into_any_element();
+            return style::enter(id, self.inset_page(page)).into_any_element();
         };
         let page_extent = match split.axis {
             SplitAxis::Right => layout.page_w,
@@ -4555,8 +4588,8 @@ impl PilusView {
             .flex_shrink_0()
             .overflow_hidden()
             // The card is clear beside a page, so each half carries its own
-            // coat: the page the chrome's, the terminal the grid's.
-            .bg(self.chrome_fill())
+            // coat: the page's inset card sits on the pane surface, the
+            // terminal on the grid's.
             .border_color(self.theme.border)
             .on_mouse_down(
                 MouseButton::Left,
@@ -4583,7 +4616,7 @@ impl PilusView {
         let row = div()
             .flex()
             .size_full()
-            .child(style::enter(id, lead.child(page)));
+            .child(style::enter(id, lead.child(self.inset_page(page))));
         match split.axis {
             SplitAxis::Right => row.flex_row(),
             SplitAxis::Down => row.flex_col(),
@@ -12192,9 +12225,9 @@ impl Render for PilusView {
         // Tasks, Mission Control, and Automations own the card only while
         // unsplit; split, `page_card` coats each half itself.
         let page_alone = self.split_page_open() && self.page_split().is_none();
-        let card_bg = if page_owns_card || page_alone {
+        let card_bg = if page_owns_card {
             self.chrome_fill()
-        } else if self.page_split().is_some() {
+        } else if page_alone || self.page_split().is_some() {
             terminal_bg.opacity(0.0)
         } else {
             terminal_fill

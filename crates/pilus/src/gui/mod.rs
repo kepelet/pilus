@@ -12571,6 +12571,7 @@ fn render_grid(
             surface,
             line_height,
             cell_width,
+            slack_x,
             skip_cols,
             skip_rows,
         ));

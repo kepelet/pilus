@@ -13287,6 +13287,33 @@ fn collect_background_runs(
     runs
 }
 
+/// How far (as an RGB distance, 0..=sqrt(3)) from the daemon's base surface a
+/// background still counts as a blend toward it.
+const BASE_BLEND_REACH: f32 = 0.12;
+
+/// Draw `bg` against `to` instead of `base`, carrying near-base colors along.
+///
+/// The daemon's exact base surface becomes `to` outright. An app that fades
+/// toward the terminal background (pi's logo halo, dimmed overlays) paints
+/// colors a step off the base, which an equality test would leave on the old
+/// surface: a visible box of the wrong tone around the fade. Shifting those by
+/// the same offset, tapering to nothing at [`BASE_BLEND_REACH`], keeps the
+/// fade seamless while leaving an app's own distinct backgrounds untouched.
+fn remap_near(bg: gpui::Rgba, base: gpui::Rgba, to: gpui::Rgba) -> gpui::Rgba {
+    let distance =
+        ((bg.r - base.r).powi(2) + (bg.g - base.g).powi(2) + (bg.b - base.b).powi(2)).sqrt();
+    let weight = (1.0 - distance / BASE_BLEND_REACH).clamp(0.0, 1.0);
+    if weight >= 1.0 {
+        return to;
+    }
+    gpui::Rgba {
+        r: bg.r + (to.r - base.r) * weight,
+        g: bg.g + (to.g - base.g) * weight,
+        b: bg.b + (to.b - base.b) * weight,
+        a: bg.a + (to.a - bg.a) * weight,
+    }
+}
+
 fn style_of(
     cell: &CellData,
     theme: Theme,
@@ -13295,8 +13322,8 @@ fn style_of(
 ) -> (gpui::Rgba, gpui::Rgba, u16) {
     let mut fg = theme::resolve(cell.fg, theme.fg, &theme.ansi);
     let mut bg = theme::resolve(cell.bg, theme.bg, &theme.ansi);
-    if theme.remap_bg == Some(bg) {
-        bg = theme.bg;
+    if let Some(base) = theme.remap_bg {
+        bg = remap_near(bg, base, theme.bg);
     }
     let mut mods = cell.mods;
     if cursor {
@@ -14466,6 +14493,44 @@ mod tests {
             style_of(&other, remapped, false, false).1,
             gpui::rgb(0xff0000),
             "an app's own background is left alone"
+        );
+    }
+
+    #[test]
+    fn a_fade_toward_the_base_surface_stays_seamless_when_remapped() {
+        // A light theme: the daemon's base is `mantle`, drawn as the lighter
+        // `crust`. pi fades its logo halo toward that base, so a halo cell is
+        // a step off it and must move with it rather than keep the old tone.
+        let theme =
+            Theme::from_palette(scheme::builtin("rose-pine-dawn").expect("vendored scheme"));
+        let remapped = Theme {
+            bg: theme.window_bg,
+            remap_bg: Some(theme.bg),
+            ..theme
+        };
+        let packed = |c: gpui::Rgba| {
+            (2 << 24)
+                | (((c.r * 255.0).round() as u32) << 16)
+                | (((c.g * 255.0).round() as u32) << 8)
+                | (c.b * 255.0).round() as u32
+        };
+        let mut halo = cell(0);
+        halo.bg = packed(gpui::rgb(0x00f8_f1e8));
+        let drawn = style_of(&halo, remapped, false, false).1;
+        let raw = gpui::rgb(0x00f8_f1e8);
+        let surface = theme.window_bg;
+        // The cell keeps its offset from the base, so it lands near the new
+        // surface, not on the old tone.
+        assert!(
+            (drawn.b - surface.b).abs() < (raw.b - surface.b).abs(),
+            "halo drawn {drawn:?} should track the surface {surface:?}"
+        );
+        // A color well away from the base is an app's own and stays put.
+        let mut far = cell(0);
+        far.bg = packed(gpui::rgb(0x00d7_827e));
+        assert_eq!(
+            style_of(&far, remapped, false, false).1,
+            gpui::rgb(0x00d7_827e)
         );
     }
 

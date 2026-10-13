@@ -1086,13 +1086,13 @@ impl Element for Meter {
 }
 
 /// The row [`stat_tile`]s sit in. Tiles are square and flush: the strip owns
-/// the top, bottom, and left edges and each tile its right one, so every
-/// seam is a single hairline.
+/// the bottom and left edges and each tile its right one, so every seam is a
+/// single hairline. It takes no top edge: the page header above already ends
+/// in one.
 pub(super) fn stat_strip(theme: Theme) -> Div {
     div()
         .flex()
         .flex_row()
-        .border_t_1()
         .border_b_1()
         .border_l_1()
         .border_color(theme.border)

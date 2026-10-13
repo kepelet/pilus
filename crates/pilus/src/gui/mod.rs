@@ -12704,6 +12704,33 @@ fn render_row(
         );
     }
 
+    // Rounded by the corner setting, so zero corners keep a square block.
+    if let Some(index) = rendered.iter().position(|(_, _, cursor)| *cursor) {
+        let (column, cell, _) = rendered[index];
+        let end_column = rendered
+            .get(index + 1)
+            .map_or(frame.width, |(next, _, _)| *next);
+        let bg = style_of(
+            cell,
+            theme,
+            true,
+            selection.is_some_and(|s| s.contains(column, row)),
+        )
+        .1;
+        let left = f32::from(column.saturating_sub(skip_cols)) * cell_width;
+        let width = f32::from(end_column.saturating_sub(column).max(1)) * cell_width;
+        element = element.child(
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(0.0))
+                .w(px(width))
+                .h(line_height)
+                .rounded(style::RADIUS_SM.pixels())
+                .bg(bg.opacity(glass)),
+        );
+    }
+
     let mut blocks = BlockBands::default();
     let mut box_rects = BoxRects::default();
     let mut box_curves: Vec<(box_drawing::Curve, gpui::Rgba)> = Vec::new();
@@ -13202,11 +13229,13 @@ fn collect_background_runs(
     row: u16,
     selection: Option<Selection>,
 ) -> Vec<(u16, u16, gpui::Rgba)> {
-    let bg_at = |column: u16, cell: &CellData, cursor: bool| {
+    // The cursor is not a run: it paints on top as its own rounded block
+    // (`cursor_block`), so the cell under its corners keeps the row's fill.
+    let bg_at = |column: u16, cell: &CellData| {
         style_of(
             cell,
             theme,
-            cursor,
+            false,
             selection.is_some_and(|s| s.contains(column, row)),
         )
         .1
@@ -13214,12 +13243,12 @@ fn collect_background_runs(
     let mut runs = Vec::new();
     let mut index = 0usize;
     while index < rendered.len() {
-        let (start_column, cell, cursor) = rendered[index];
-        let bg = bg_at(start_column, cell, cursor);
+        let (start_column, cell, _) = rendered[index];
+        let bg = bg_at(start_column, cell);
         let mut next = index + 1;
         while next < rendered.len() {
-            let (column, cell, cursor) = rendered[next];
-            if bg_at(column, cell, cursor) != bg {
+            let (column, cell, _) = rendered[next];
+            if bg_at(column, cell) != bg {
                 break;
             }
             next += 1;

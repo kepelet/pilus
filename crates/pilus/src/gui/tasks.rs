@@ -17,7 +17,7 @@ use gpui::{
 };
 use pilus_client::{NewTask, Task, TaskAction, TaskStatus};
 
-use super::orchestration::{Board, Lane, agent_name, waiting_on};
+use super::orchestration::{Canvas, agent_name, waiting_on};
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::task_compose::{ComposeState, Fetched, Scope, TaskPicker, TasksMsg};
 use super::text_input::TextInput;
@@ -63,6 +63,15 @@ pub(super) enum TaskLayout {
     #[default]
     List,
     Board,
+}
+
+/// What the Tasks page's side pane holds: the composer takes the pane the
+/// detail view would use.
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+enum SidePane {
+    Compose,
+    Detail(Task),
 }
 
 /// The composer's fields, in Tab order.
@@ -153,18 +162,20 @@ pub(super) struct TasksPanel {
     layout: TaskLayout,
     pub(super) view: TaskView,
     pub(super) selected: Option<String>,
+    /// What the side pane last showed, kept while it slides shut.
+    shown: Option<SidePane>,
+    /// The side pane's spring, so it slides rather than pops.
+    slide: style::PaneSlide,
     composing: bool,
     pub(super) compose_focus: ComposeField,
     pub(super) compose: ComposeState,
     collapsed: HashSet<TaskStatus>,
-    /// Board cards folded down to their title.
+    /// Canvas cards folded down to their title.
     pub(super) folded: HashSet<String>,
     /// When each card last folded or unfolded, so its height eases.
     pub(super) fold_turned: HashMap<String, Instant>,
-    /// Board lanes folded down to a strip.
-    pub(super) folded_lanes: HashSet<Lane>,
-    /// When each lane last folded or unfolded, so its width eases.
-    pub(super) lane_turned: HashMap<Lane, Instant>,
+    /// Where the Orchestration canvas's cards sit and what it has drawn.
+    pub(super) canvas: Canvas,
     /// The group whose chevron was just toggled, so only it animates.
     toggled: Option<TaskStatus>,
     pub(super) confirm_delete: Option<String>,
@@ -199,8 +210,7 @@ impl TasksPanel {
             collapsed: std::mem::take(&mut self.collapsed),
             folded: std::mem::take(&mut self.folded),
             fold_turned: std::mem::take(&mut self.fold_turned),
-            folded_lanes: std::mem::take(&mut self.folded_lanes),
-            lane_turned: std::mem::take(&mut self.lane_turned),
+            canvas: std::mem::take(&mut self.canvas),
             scope: std::mem::take(&mut self.scope),
             remote: std::mem::take(&mut self.remote),
             ..Self::default()
@@ -489,12 +499,24 @@ impl PilusView {
         self.tasks_panel.confirm_delete = None;
         // A task starts in the workspace it was queued in, wherever the
         // window is looking now.
-        let workspace_id = self
-            .scope_tasks()
-            .iter()
-            .find(|task| task.id == id)
-            .and_then(|task| task.workspace_id.clone())
+        // On the canvas, a queued card may have been pointed at another
+        // workspace or agent.
+        let pick = self
+            .tasks_panel
+            .canvas
+            .pick(&self.scope_machine().key(), &id)
+            .cloned()
+            .unwrap_or_default();
+        let workspace_id = pick
+            .workspace
+            .or_else(|| {
+                self.scope_tasks()
+                    .iter()
+                    .find(|task| task.id == id)
+                    .and_then(|task| task.workspace_id.clone())
+            })
             .or_else(|| self.active_workspace_id());
+        let agent = pick.agent;
         if op == TaskOp::Start && workspace_id.is_none() {
             self.toast(ToastKind::Info, "Open a workspace to start a task");
             cx.notify();
@@ -507,7 +529,7 @@ impl PilusView {
             let result = client.map(|mut client| match op {
                 TaskOp::Start => client.start_task(
                     &id,
-                    None,
+                    agent.as_deref(),
                     "worktree",
                     workspace_id.as_deref().unwrap_or_default(),
                 ),
@@ -583,6 +605,10 @@ impl PilusView {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let tasks = self.scope_tasks();
+        let board = self.tasks_panel.layout == TaskLayout::Board;
+        if board {
+            self.prepare_canvas(&tasks, cx);
+        }
         let groups = grouped(&tasks, self.tasks_panel.view);
         let selected = self
             .tasks_panel
@@ -595,11 +621,11 @@ impl PilusView {
             self.tasks_skeleton().into_any_element()
         } else if tasks.is_empty() {
             self.tasks_empty(cx).into_any_element()
+        } else if board {
+            // The canvas shows every task: the list's filters do not apply.
+            self.task_canvas(&tasks, cx).into_any_element()
         } else if groups.is_empty() {
             self.tasks_message("Nothing in this view")
-                .into_any_element()
-        } else if self.tasks_panel.layout == TaskLayout::Board {
-            self.task_board(&Board::build(&tasks, self.tasks_panel.view), cx)
                 .into_any_element()
         } else {
             self.tasks_list(&groups, cx).into_any_element()
@@ -611,11 +637,26 @@ impl PilusView {
             .flex_1()
             .min_h(px(0.0))
             .child(div().flex().flex_col().flex_1().min_w(px(0.0)).child(list));
-        // The composer takes the side pane the detail view would use.
-        if self.tasks_panel.composing {
-            body = body.child(self.task_compose_pane(cx));
-        } else if let Some(task) = selected {
-            body = body.child(self.task_detail(&task, cx));
+        let side = if self.tasks_panel.composing {
+            Some(SidePane::Compose)
+        } else {
+            selected.map(SidePane::Detail)
+        };
+        let open = side.is_some();
+        if side.is_some() {
+            self.tasks_panel.shown = side;
+        }
+        let slide = self.tasks_panel.slide.sync(open, cx);
+        if slide.shown()
+            && let Some(shown) = self.tasks_panel.shown.clone()
+        {
+            let scaled = |width: f32| style::scaled(&self.shared_settings, width);
+            body = body.child(match shown {
+                SidePane::Compose => slide.wrap(scaled(COMPOSE_WIDTH), self.task_compose_pane(cx)),
+                SidePane::Detail(task) => {
+                    slide.wrap(scaled(DETAIL_WIDTH), self.task_detail(&task, cx))
+                }
+            });
         }
 
         let footer = (!self.tasks_panel.status.is_empty()).then(|| {
@@ -1205,8 +1246,7 @@ impl PilusView {
             div()
                 .flex()
                 .flex_col()
-                .w(px(style::scaled(&self.shared_settings, DETAIL_WIDTH)))
-                .flex_shrink_0()
+                .w_full()
                 .min_h(px(0.0))
                 .border_l_1()
                 .border_color(theme.border)
@@ -1348,8 +1388,7 @@ impl PilusView {
             div()
                 .flex()
                 .flex_col()
-                .w(px(style::scaled(&self.shared_settings, COMPOSE_WIDTH)))
-                .flex_shrink_0()
+                .w_full()
                 .min_h(px(0.0))
                 .border_l_1()
                 .border_color(theme.border)

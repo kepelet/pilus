@@ -1101,8 +1101,9 @@ impl Element for Meter {
 
 /// The row [`stat_tile`]s sit in. Tiles are square and flush: the strip owns
 /// the bottom and left edges and each tile its right one, so every seam is a
-/// single hairline. It takes no top edge: the page header above already ends
-/// in one.
+/// single hairline. The last tile drops its rule (`.border_r_0()`) so the strip
+/// does not close on a line against the page edge. It takes no top edge: the
+/// page header above already ends in one.
 pub(super) fn stat_strip(theme: Theme) -> Div {
     div()
         .flex()
@@ -1110,6 +1111,29 @@ pub(super) fn stat_strip(theme: Theme) -> Div {
         .border_b_1()
         .border_l_1()
         .border_color(theme.border)
+}
+
+/// One cell of a page table: a fixed `width`, or the flexible column when it
+/// is `None`. Every cell but the `last` closes with a column rule, so a
+/// table's header and rows share one grid. The cell stretches to its row,
+/// whose height the caller sets, and centres its content.
+pub(super) fn table_cell(
+    settings: &Rc<RefCell<Settings>>,
+    theme: Theme,
+    width: Option<f32>,
+    last: bool,
+) -> Div {
+    let cell = div().flex().items_center().px_2().min_w(px(0.0));
+    let cell = match width {
+        Some(width) => cell.w(px(scaled(settings, width))),
+        None => cell.flex_1(),
+    };
+    let cell = cell.flex_shrink_0();
+    if last {
+        cell
+    } else {
+        cell.border_r_1().border_color(theme.border)
+    }
 }
 
 /// One headline figure on a dashboard: a section label, the value in its
@@ -1569,6 +1593,92 @@ pub(super) fn ease_spring(step: f32) -> f32 {
 const SPRING_DAMPING: f32 = 8.0;
 /// [`ease_spring`]'s angular frequency over the unit duration.
 const SPRING_FREQUENCY: f32 = 9.0;
+
+/// How long a page's side pane takes to slide open or shut: long enough for
+/// the spring to overshoot and settle, as the sidebar's does.
+const SLIDE: Duration = Duration::from_millis(420);
+
+/// A page's side pane sliding open or shut on [`ease_spring`]. The page calls
+/// [`PaneSlide::sync`] once per render with whether the pane should be open and
+/// draws what it returns, so a reversal mid-slide glides from where it is.
+#[derive(Debug, Default)]
+pub(super) struct PaneSlide {
+    open: bool,
+    from: f32,
+    started: Option<Instant>,
+}
+
+/// One frame of a [`PaneSlide`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Slide {
+    /// How open the pane is: 0 shut, 1 open, a touch past 1 on the overshoot.
+    pub(super) factor: f32,
+    /// Whether it is still moving, so the page asks for another frame.
+    pub(super) moving: bool,
+}
+
+impl PaneSlide {
+    fn at(&self, cx: &App) -> Slide {
+        let target = if self.open { 1.0 } else { 0.0 };
+        let step = self
+            .started
+            .map(|started| started.elapsed().as_secs_f32() / SLIDE.as_secs_f32());
+        match step {
+            Some(step) if step < 1.0 && !cx.reduce_motion() => Slide {
+                factor: (self.from + (target - self.from) * ease_spring(step)).max(0.0),
+                moving: true,
+            },
+            _ => Slide {
+                factor: target,
+                moving: false,
+            },
+        }
+    }
+
+    /// Aim the pane at `open` and sample this frame.
+    pub(super) fn sync(&mut self, open: bool, cx: &App) -> Slide {
+        if open != self.open {
+            self.from = self.at(cx).factor;
+            self.started = Some(Instant::now());
+            self.open = open;
+        }
+        self.at(cx)
+    }
+}
+
+impl Slide {
+    /// Whether the pane takes any room this frame: open, or still closing.
+    pub(super) fn shown(self) -> bool {
+        self.factor > 0.0 || self.moving
+    }
+
+    /// The room the pane takes of a `width` it opens to.
+    pub(super) fn room(self, width: f32) -> f32 {
+        width * self.factor
+    }
+
+    /// `pane` in a clip that opens to `width`. The pane keeps its own width
+    /// while the clip grows, so it is revealed rather than squeezed, and
+    /// stretches only for the overshoot.
+    pub(super) fn wrap(self, width: f32, pane: impl IntoElement) -> Div {
+        div()
+            .flex()
+            .flex_row()
+            .flex_shrink_0()
+            .overflow_hidden()
+            .w(px(self.room(width)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_shrink_0()
+                    .h_full()
+                    .w(px(width * self.factor.max(1.0)))
+                    .child(pane),
+            )
+            .children(self.moving.then(next_frame))
+    }
+}
 
 /// Where a glide's target sits this frame.
 ///
@@ -2378,6 +2488,34 @@ pub(super) struct Connector {
 /// How far an arrowhead reaches back from its tip, at stroke width 1.5.
 const ARROW_LENGTH: f32 = 7.0;
 
+impl Connector {
+    /// The curve's end at its arrowhead's base, and its two control points.
+    /// Controls reach out sideways, so every curve leaves and enters its card
+    /// level; a link inside one lane bows out instead of cutting across the
+    /// cards between. The arrowhead takes the last stretch, so the curve stops
+    /// at its base and the stroke never pokes through the tip.
+    fn controls(&self, stroke: f32) -> ((f32, f32), (f32, f32), (f32, f32)) {
+        let (fx, fy) = self.from;
+        let (tx, ty) = self.to;
+        let head = ARROW_LENGTH * (stroke / 1.5).max(1.0);
+        let base = (tx + self.to_side.sign() * head, ty);
+        let reach = ((tx - fx).abs() / 2.0).max(36.0);
+        let ctrl_a = (fx + self.from_side.sign() * reach, fy);
+        let ctrl_b = (base.0 + self.to_side.sign() * reach, base.1);
+        (base, ctrl_a, ctrl_b)
+    }
+
+    /// Where the line passes its own middle: the spot for a handle on it.
+    pub(super) fn midpoint(&self, stroke: f32) -> (f32, f32) {
+        let (base, a, b) = self.controls(stroke);
+        // A cubic Bezier at t = 1/2 weighs its four points 1:3:3:1.
+        (
+            (self.from.0 + 3.0 * a.0 + 3.0 * b.0 + base.0) / 8.0,
+            (self.from.1 + 3.0 * a.1 + 3.0 * b.1 + base.1) / 8.0,
+        )
+    }
+}
+
 /// Draw `connectors` over the whole parent box. Place it before the cards so
 /// the lines run beneath them.
 pub(super) fn connectors(connectors: Vec<Connector>, stroke: f32) -> gpui::Canvas<()> {
@@ -2386,18 +2524,8 @@ pub(super) fn connectors(connectors: Vec<Connector>, stroke: f32) -> gpui::Canva
         move |bounds, (), window, _cx| {
             let at = |(x, y): (f32, f32)| point(bounds.origin.x + px(x), bounds.origin.y + px(y));
             for line in &connectors {
-                let (fx, fy) = line.from;
-                let (tx, ty) = line.to;
-                // The arrowhead takes the last stretch, so the curve stops at
-                // its base and the stroke never pokes through the tip.
                 let head = ARROW_LENGTH * (stroke / 1.5).max(1.0);
-                let base = (tx + line.to_side.sign() * head, ty);
-                // Controls reach out sideways, so every curve leaves and
-                // enters its card level; a link inside one lane bows out
-                // instead of cutting across the cards between.
-                let reach = ((tx - fx).abs() / 2.0).max(36.0);
-                let ctrl_a = (fx + line.from_side.sign() * reach, fy);
-                let ctrl_b = (base.0 + line.to_side.sign() * reach, base.1);
+                let (base, ctrl_a, ctrl_b) = line.controls(stroke);
                 let mut curve = PathBuilder::stroke(px(stroke));
                 if line.dashed {
                     curve = curve.dash_array(&[px(4.0), px(4.0)]);
@@ -2420,6 +2548,46 @@ pub(super) fn connectors(connectors: Vec<Connector>, stroke: f32) -> gpui::Canva
                 if let Ok(path) = arrow.build() {
                     window.paint_path(path, line.color);
                 }
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
+/// A field of dots `step` pixels apart over the whole parent box, the ground
+/// a canvas sits on. Only the part of the field in view is painted, so a
+/// canvas as large as its scroll extent costs no more than the window.
+pub(super) fn dot_grid(color: Hsla, step: f32) -> gpui::Canvas<()> {
+    canvas(
+        |_bounds, _window, _cx| (),
+        move |bounds, (), window, _cx| {
+            let view = window.content_mask().bounds.intersect(&bounds);
+            if view.size.width <= px(0.0) || view.size.height <= px(0.0) {
+                return;
+            }
+            let dot = 2.0;
+            let first = |from: Pixels, origin: Pixels| {
+                let offset = (from - origin).as_f32();
+                origin.as_f32() + (offset / step).floor().max(0.0) * step
+            };
+            let (left, top) = (view.left(), view.top());
+            let mut y = first(top, bounds.top());
+            while y < view.bottom().as_f32() {
+                let mut x = first(left, bounds.left());
+                while x < view.right().as_f32() {
+                    window.paint_quad(
+                        gpui::fill(
+                            Bounds::new(point(px(x), px(y)), gpui::size(px(dot), px(dot))),
+                            color,
+                        )
+                        .corner_radii(Corners::all(px(dot / 2.0))),
+                    );
+                    x += step;
+                }
+                y += step;
             }
         },
     )

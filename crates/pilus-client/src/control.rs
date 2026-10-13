@@ -972,6 +972,13 @@ impl ControlClient {
             .map(drop)
     }
 
+    /// Replace the ids a task waits on (`task.update`). A daemon that does
+    /// not edit dependencies after the fact refuses it.
+    pub fn set_task_deps(&mut self, id: &str, deps: &[String]) -> Result<()> {
+        self.request("task.update", json!({ "id": id, "deps": deps }))
+            .map(drop)
+    }
+
     /// Attach a note to a task.
     pub fn note_task(&mut self, id: &str, note: &str) -> Result<()> {
         self.request("task.update", json!({ "id": id, "note": note }))

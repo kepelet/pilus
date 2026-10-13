@@ -695,9 +695,10 @@ impl UiPlaygroundView {
                 theme.alert,
                 "awaiting response",
             ))
-            .child(style::stat_tile(
-                theme, fonts, "SPEND", "$25.16", theme.ok, "$1.20/hr",
-            ))
+            .child(
+                style::stat_tile(theme, fonts, "SPEND", "$25.16", theme.ok, "$1.20/hr")
+                    .border_r_0(),
+            )
     }
 
     fn context_gauge_demo(&self) -> Div {

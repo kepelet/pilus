@@ -12517,25 +12517,29 @@ fn render_grid(
     } else {
         surface
     };
+    let tiled = panes.bounds();
     let chromes: Vec<pane_chrome::PaneChrome> = panes
         .panes()
         .iter()
         .enumerate()
-        .map(|(index, pane)| {
+        .filter_map(|(index, pane)| {
+            let tiled = tiled.as_ref()?;
             let focused = frame
                 .cursor
                 .is_some_and(|(cursor_column, cursor_row)| pane.holds(cursor_column, cursor_row));
-            pane_chrome::pane_chrome(
+            Some(pane_chrome::pane_chrome(
                 index,
                 pane,
+                tiled,
                 focused,
                 surface,
                 border,
                 line_height,
                 cell_width,
+                (slack_x, slack_y),
                 skip_cols,
                 skip_rows,
-            )
+            ))
         })
         .collect();
     // The surface and the cards sit under the rows. Cells the daemon paints

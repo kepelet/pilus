@@ -1427,8 +1427,10 @@ impl Render for PaneGridView {
                 width,
                 body,
                 1.0,
-                0.0,
-                0.0,
+                // A window is rarely a whole number of cells, and the
+                // remainder is surface the cards must grow over.
+                5.0,
+                9.0,
                 true,
             ))
     }

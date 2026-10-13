@@ -97,14 +97,7 @@ fn session_verb(binary: &Path, root: &Path, verb: &str, name: &str) -> Result<()
 /// `socket`. Split out so tests can drive the failure paths with a binary
 /// that never starts anything.
 fn start_and_wait(binary: &Path, root: &Path, session: Option<&str>, socket: &Path) -> Result<()> {
-    let mut command = std::process::Command::new(binary);
-    if let Some(name) = session {
-        command.arg("--session").arg(name);
-    }
-    let output = command
-        .arg("server")
-        .arg("start")
-        .env(HOME_ENV, root)
+    let output = start_command(binary, root, session)
         .output()
         .map_err(|error| Error::ServerStart(error.to_string()))?;
     if !output.status.success() {
@@ -128,6 +121,25 @@ fn start_and_wait(binary: &Path, root: &Path, session: Option<&str>, socket: &Pa
     }
     tracing::info!(path = %socket.display(), "started Luvus server");
     Ok(())
+}
+
+/// The `server start` invocation for `session` under `root`.
+///
+/// Panes inherit the daemon's environment, and a GUI launch carries no
+/// `COLORTERM`. Apps then assume a 256-color terminal and snap every blend to
+/// the xterm cube, whose coarse light steps cast yellow and pink halos over a
+/// light theme. This client paints truecolor, so say so unless the caller
+/// already chose.
+fn start_command(binary: &Path, root: &Path, session: Option<&str>) -> std::process::Command {
+    let mut command = std::process::Command::new(binary);
+    if let Some(name) = session {
+        command.arg("--session").arg(name);
+    }
+    command.arg("server").arg("start").env(HOME_ENV, root);
+    if std::env::var_os("COLORTERM").is_none() {
+        command.env("COLORTERM", "truecolor");
+    }
+    command
 }
 
 /// Whether something answers at `path`.
@@ -220,5 +232,18 @@ mod tests {
         )
         .expect_err("spawning nothing always fails");
         assert!(matches!(error, Error::ServerStart(_)), "{error:?}");
+    }
+
+    #[test]
+    fn started_daemon_advertises_truecolor_unless_the_caller_chose() {
+        let command = start_command(Path::new("luvus"), Path::new("/tmp"), Some("work"));
+        let colorterm = command
+            .get_envs()
+            .find(|(key, _)| *key == "COLORTERM")
+            .and_then(|(_, value)| value);
+        match std::env::var_os("COLORTERM") {
+            None => assert_eq!(colorterm, Some(std::ffi::OsStr::new("truecolor"))),
+            Some(_) => assert_eq!(colorterm, None),
+        }
     }
 }

@@ -9833,7 +9833,13 @@ impl PilusView {
             }))
     }
 
-    fn top_chrome(&self, cx: &mut Context<Self>, cell_width: f32, fullscreen: bool) -> Div {
+    fn top_chrome(
+        &self,
+        cx: &mut Context<Self>,
+        cell_width: f32,
+        right: f32,
+        fullscreen: bool,
+    ) -> Div {
         let theme = self.theme;
         let glass = self.glass_opacity();
         // Beside the sidebar when it is open; full width when it is hidden.
@@ -9951,7 +9957,7 @@ impl PilusView {
         div()
             .absolute()
             .left(px(left))
-            .right(px(self.right.px()))
+            .right(px(right))
             .top(px(0.0))
             .h(px(HEADER_HEIGHT))
             // Clip only while the column is stretching over the strip, so
@@ -11940,9 +11946,21 @@ impl PilusView {
         // extends its edge colors over it.
         let slack_x = (inner_w - f32::from(cols) * cell_w).max(0.0);
         let slack_y = (inner_h - f32::from(rows) * cell_h).max(0.0);
+        // The left sidebar is whole cells wide, so the card's left edge is
+        // cell-aligned. The right column is free-width, which would leave up
+        // to a cell of remainder between the grid and it, a margin the left
+        // never has. The column takes that remainder instead, so the grid
+        // meets both edges. Only at rest: mid-tween the column would stair-step
+        // a cell at a time.
+        let absorbed = if !self.right.tweening() && slack_x < cell_w {
+            slack_x
+        } else {
+            0.0
+        };
+        let (slack_x, content_w) = (slack_x - absorbed, content_w - absorbed);
         CardLayout {
             card_x,
-            card_right: right_px,
+            card_right: right_px + absorbed,
             origin_x: card_x + page_w,
             origin_y: HEADER_HEIGHT + page_h,
             cols,
@@ -12439,9 +12457,10 @@ impl Render for PilusView {
             // Chrome layers live at the root so they paint above the content
             // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
-            .child(self.top_chrome(cx, cell_width, fullscreen))
+            .child(self.top_chrome(cx, cell_width, layout.card_right, fullscreen))
             .children(
-                (self.right.openness() > 0.0).then(|| self.right_sidebar_view(fullscreen, cx)),
+                (self.right.openness() > 0.0)
+                    .then(|| self.right_sidebar_view(layout.card_right, fullscreen, cx)),
             )
             .child(self.session_menu(cx, cell_width, fullscreen))
             .child(self.palette_overlay(cx))

@@ -302,6 +302,12 @@ impl RightSidebar {
         });
     }
 
+    /// Whether an open, close, or stretch tween is in flight. A drag is not
+    /// one: it follows the pointer, so the card may snap to cells beneath it.
+    pub(super) fn tweening(&self) -> bool {
+        self.tween.is_some() || self.spread_tween.is_some()
+    }
+
     /// Whether the daemon should hold its viewport: the column is moving.
     pub(super) fn moving(&self) -> bool {
         self.tween.is_some() || self.spread_tween.is_some() || self.drag.is_some()
@@ -658,14 +664,17 @@ impl PilusView {
 
     /// The column: a tab strip over the open tab and its footer, with a drag
     /// handle on its leading edge.
+    ///
+    /// `width` is what the card leaves it: the column's own width plus the
+    /// grid's sub-cell remainder (see `PilusView::card_layout`).
     pub(super) fn right_sidebar_view(
         &mut self,
+        width: f32,
         fullscreen: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let width = self.right.px();
         let focused = self.right.focused;
         let split = self.is_split();
         let expanded = self.right.expanded();

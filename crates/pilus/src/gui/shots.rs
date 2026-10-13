@@ -1326,6 +1326,7 @@ impl Render for GlyphGridView {
                 0.0,
                 0.0,
                 true,
+                None,
             ))
     }
 }
@@ -1435,6 +1436,37 @@ impl Render for PaneGridView {
                 5.0,
                 9.0,
                 true,
+                Some(
+                    super::style::pane_toolbar(theme)
+                        .child(super::style::icon_button(
+                            "shot-pane-split-right",
+                            include_bytes!("../../assets/icons/columns-2.svg"),
+                            super::style::ButtonKind::Ghost,
+                            theme,
+                            24.0,
+                        ))
+                        .child(super::style::icon_button(
+                            "shot-pane-split-down",
+                            include_bytes!("../../assets/icons/rows-2.svg"),
+                            super::style::ButtonKind::Ghost,
+                            theme,
+                            24.0,
+                        ))
+                        .child(super::style::icon_button(
+                            "shot-pane-fullscreen",
+                            include_bytes!("../../assets/icons/maximize.svg"),
+                            super::style::ButtonKind::Ghost,
+                            theme,
+                            24.0,
+                        ))
+                        .child(super::style::icon_button(
+                            "shot-pane-close",
+                            include_bytes!("../../assets/icons/x.svg"),
+                            super::style::ButtonKind::Danger,
+                            theme,
+                            24.0,
+                        )),
+                ),
             ))
     }
 }

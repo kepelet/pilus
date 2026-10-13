@@ -374,6 +374,21 @@ pub(super) fn icon_button(
         )
 }
 
+/// The strip of icon buttons that floats over the focused pane's top-right
+/// corner. It occludes the grid under it, so a press on a button never also
+/// starts a selection or reaches the daemon. Fill it with [`icon_button`]s.
+pub(super) fn pane_toolbar(theme: Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .p_1()
+        .radius_md()
+        .bg(theme.panel)
+        .occlude()
+}
+
 /// The frame of a segmented control: a short row of mutually exclusive
 /// choices read as one object. Fill it with [`segment`]s.
 pub(super) fn segmented(theme: Theme) -> Div {

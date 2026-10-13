@@ -10606,6 +10606,71 @@ impl PilusView {
         .into_any_element()
     }
 
+    /// The focused pane's corner buttons: split either way, take the pane
+    /// to a tab of its own (the daemon has no zoom, so a tab is its
+    /// fullscreen), and close the tab. `render_grid` pins it to the pane.
+    fn pane_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let size = style::scaled(&self.shared_settings, 24.0);
+        let button =
+            |id: &'static str, glyph: &'static [u8], kind: style::ButtonKind, tip: &str| {
+                style::icon_button(id, glyph, kind, theme, size).tooltip(row_tooltip(
+                    tip.to_string(),
+                    theme.panel_fg,
+                    Vec::new(),
+                    theme,
+                ))
+            };
+        style::pane_toolbar(theme)
+            .child(
+                button(
+                    "pilus-pane-split-right",
+                    include_bytes!("../../assets/icons/columns-2.svg"),
+                    style::ButtonKind::Ghost,
+                    "Split right",
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.split("right", cx))),
+            )
+            .child(
+                button(
+                    "pilus-pane-split-down",
+                    include_bytes!("../../assets/icons/rows-2.svg"),
+                    style::ButtonKind::Ghost,
+                    "Split down",
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.split("down", cx))),
+            )
+            .child(
+                button(
+                    "pilus-pane-fullscreen",
+                    include_bytes!("../../assets/icons/maximize.svg"),
+                    style::ButtonKind::Ghost,
+                    "Fullscreen (move to a new tab)",
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let endpoint = this.active.clone();
+                    this.pane_op(
+                        &endpoint,
+                        "moved to a new tab".to_string(),
+                        |client, pane| client.move_pane(pane, None),
+                        cx,
+                    );
+                })),
+            )
+            .child(
+                button(
+                    "pilus-pane-close-tab",
+                    include_bytes!("../../assets/icons/x.svg"),
+                    style::ButtonKind::Danger,
+                    "Close tab",
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.close_active_tab();
+                    cx.notify();
+                })),
+            )
+    }
+
     /// The right-click context menu for a WORKSPACES or AGENTS row.
     ///
     /// A full-window catcher occludes the grid and sidebar while the menu is
@@ -10679,7 +10744,7 @@ impl PilusView {
         if left + width + 8.0 > viewport_width {
             left = (viewport_width - width - 8.0).max(8.0);
         }
-        let height = 8.0 + rows.len() as f32 * 30.0;
+        let height = sidebar_menu::panel_height(&rows);
         let mut top = menu.row + 6.0;
         if top + height > viewport_height {
             top = (menu.row - height - 6.0).max(8.0);
@@ -12245,6 +12310,7 @@ impl Render for PilusView {
         } else {
             terminal_fill
         };
+        let pane_toolbar = pane_ui.then(|| self.pane_toolbar(cx));
         let grid = match self.shown_frame() {
             Some(frame) => perf::grid_build(|| {
                 render_grid(
@@ -12263,6 +12329,7 @@ impl Render for PilusView {
                     layout.slack_x,
                     layout.slack_y,
                     pane_ui,
+                    pane_toolbar,
                 )
             }),
             None => {
@@ -12565,6 +12632,7 @@ fn render_grid(
     slack_x: f32,
     slack_y: f32,
     pane_ui: bool,
+    toolbar: Option<Div>,
 ) -> Div {
     let end_row = skip_rows
         .saturating_add(max_rows)
@@ -12666,10 +12734,17 @@ fn render_grid(
             surface_base,
         ));
     }
+    // Above the frames, so the focused pane's buttons take the pointer.
+    let toolbar = toolbar.and_then(|bar| {
+        chromes
+            .iter()
+            .find(|chrome| chrome.focused())
+            .map(|chrome| chrome.toolbar(bar))
+    });
     for chrome in chromes {
         column = column.child(chrome);
     }
-    column
+    column.children(toolbar)
 }
 
 /// The parts of the `cells` columns from `start` that fall outside

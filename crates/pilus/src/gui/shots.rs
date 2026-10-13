@@ -289,16 +289,12 @@ pub fn run() -> Result<()> {
         cx.update(|app| view.update(app, |view, cx| view.tasks_panel_select("t6", cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "orchestration-detail")?;
-        // Two cards folded to their title (the waiting one keeps its badge)
-        // and the Review lane folded to a strip.
+        // Two cards folded to their title (the waiting one keeps its badge).
         cx.update(|app| {
             view.update(app, |view, cx| {
                 for id in ["t4", "t5"] {
                     view.tasks_panel.folded.insert(id.to_string());
                 }
-                view.tasks_panel
-                    .folded_lanes
-                    .insert(super::orchestration::Lane::Review);
                 view.tasks_panel.selected = None;
                 cx.notify();
             })

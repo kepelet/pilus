@@ -151,6 +151,8 @@ pub(super) struct MissionPanel {
     selection: Option<String>,
     /// Whether the side pane shows the selection (the daemon's `o`).
     detail_open: bool,
+    /// The side pane's spring, so it slides rather than pops.
+    slide: style::PaneSlide,
     answering: bool,
     /// Whether the machine picker's list is open.
     machine_menu: bool,
@@ -179,6 +181,7 @@ impl Default for MissionPanel {
             error: None,
             selection: None,
             detail_open: true,
+            slide: style::PaneSlide::default(),
             answering: false,
             machine_menu: false,
             confirm_close: None,
@@ -207,6 +210,9 @@ impl MissionPanel {
         self.answering = false;
         self.confirm_close = None;
         self.selection = None;
+        // A reopened page starts with its pane settled, not sliding from the
+        // state it was left in.
+        self.slide = style::PaneSlide::default();
         self.status.clear();
     }
 
@@ -321,23 +327,6 @@ fn short_model(model: &str) -> String {
         }
     }
     model.to_string()
-}
-
-/// Spend summed per model, largest first: the cost-by-model chart.
-fn cost_by_model(rows: &[&MissionRow]) -> Vec<(String, f64)> {
-    let mut totals: Vec<(String, f64)> = Vec::new();
-    for usage in rows.iter().filter_map(|row| row.usage.as_ref()) {
-        let Some(cost) = usage.cost_usd else {
-            continue;
-        };
-        let model = short_model(&usage.model);
-        match totals.iter_mut().find(|(name, _)| *name == model) {
-            Some(entry) => entry.1 += cost,
-            None => totals.push((model, cost)),
-        }
-    }
-    totals.sort_by(|a, b| b.1.total_cmp(&a.1));
-    totals
 }
 
 /// The line a blocked agent is waiting on: the last line of its output that
@@ -861,16 +850,19 @@ impl PilusView {
         let loaded = self.mission.snapshot.is_some();
         // The side pane takes its width from the roster, so a narrow page drops
         // columns instead of clipping them behind it.
-        let side_w = if self.mission.detail_open && loaded {
-            style::scaled(&self.shared_settings, DETAIL_WIDTH)
-        } else {
-            0.0
-        };
-        let roster_w = (page_w - side_w).max(0.0);
+        let open = self.mission.detail_open && loaded;
+        let side_w = style::scaled(&self.shared_settings, DETAIL_WIDTH);
+        let slide = self.mission.slide.sync(open, cx);
         // Beside a side pane the roster must still hold its essential columns;
-        // when it can't, the pane takes the page and Hide returns the roster.
-        let stacked = side_w > 0.0 && roster_w < self.mission_essential_width();
-        let roster_w = if stacked { 0.0 } else { roster_w };
+        // when it can't, the pane takes the page and Close returns the roster.
+        // That is judged at the pane's full width, so the roster does not flip
+        // between the two while the pane slides.
+        let stacked = open && page_w - side_w < self.mission_essential_width();
+        let roster_w = if stacked {
+            0.0
+        } else {
+            (page_w - slide.room(side_w)).max(0.0)
+        };
 
         let mut main = div()
             .id("pilus-mission-scroll")
@@ -893,8 +885,10 @@ impl PilusView {
         if !stacked {
             body = body.child(main);
         }
-        if self.mission.detail_open && loaded {
-            body = body.child(self.mission_side(&refs, stacked, cx));
+        if stacked {
+            body = body.child(self.mission_side(true, cx));
+        } else if slide.shown() {
+            body = body.child(slide.wrap(side_w, self.mission_side(false, cx)));
         }
 
         let hints = "↑↓ navigate · r refresh · ⏎ go · a answer · y approve · \
@@ -1248,14 +1242,17 @@ impl PilusView {
                     "no blocked agents"
                 },
             ))
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "SPEND",
-                fmt_cost(cost),
-                if over_budget { theme.alert } else { theme.ok },
-                spend_detail,
-            ))
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "SPEND",
+                    fmt_cost(cost),
+                    if over_budget { theme.alert } else { theme.ok },
+                    spend_detail,
+                )
+                .border_r_0(),
+            )
     }
 
     /// The agent table: one row per live agent, then resumable sessions. The
@@ -1318,15 +1315,15 @@ impl PilusView {
             header = header.child(label("COST", Some(COST_WIDTH), true, false));
         }
         header = header.child(label("ACTIONS", Some(ACTIONS_WIDTH), false, true));
+        if rows.is_empty() {
+            return self.mission_empty();
+        }
         let column = div().flex().flex_col().child(
             style::section_label(theme, "AGENT SESSIONS", fonts.label)
                 .px_4()
                 .pt_4()
                 .pb_2(),
         );
-        if rows.is_empty() {
-            return column.child(self.mission_empty());
-        }
         let mut list = div()
             .flex()
             .flex_col()
@@ -1385,17 +1382,7 @@ impl PilusView {
     /// `None`. Every cell but the last closes with a column rule, so the
     /// header and the rows share one grid.
     fn mission_cell(&self, width: Option<f32>, last: bool) -> Div {
-        let cell = div().flex().items_center().h_full().px_2().min_w(px(0.0));
-        let cell = match width {
-            Some(width) => cell.w(px(style::scaled(&self.shared_settings, width))),
-            None => cell.flex_1(),
-        };
-        let cell = cell.flex_shrink_0();
-        if last {
-            cell
-        } else {
-            cell.border_r_1().border_color(self.theme.border)
-        }
+        style::table_cell(&self.shared_settings, self.theme, width, last)
     }
 
     fn mission_row(
@@ -1582,27 +1569,21 @@ impl PilusView {
             .border_b_1()
             .border_color(theme.border)
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-            let pick = key_owned.clone();
-            if event.click_count() >= 2 {
-                this.mission.selection = Some(pick);
-                this.mission_go(cx);
-                return;
-            }
-            this.mission.detail_open = true;
-            this.mission_select(Some(pick), cx);
-        }))
+                let pick = key_owned.clone();
+                if event.click_count() >= 2 {
+                    this.mission.selection = Some(pick);
+                    this.mission_go(cx);
+                    return;
+                }
+                this.mission.detail_open = true;
+                this.mission_select(Some(pick), cx);
+            }))
     }
 
-    /// The side pane: the selected agent, then the fleet's status counts and
-    /// spend by model.
+    /// The side pane: the selected agent's usage and actions.
     /// `stacked` stretches the pane over the whole page, for a page too narrow
     /// to hold it beside the roster.
-    fn mission_side(
-        &self,
-        rows: &[&MissionRow],
-        stacked: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn mission_side(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let (content, actions): (AnyElement, Option<Div>) = match self.mission_selected_row() {
@@ -1633,7 +1614,7 @@ impl PilusView {
             .child(
                 style::small_button(
                     "pilus-mission-side-close",
-                    "Hide",
+                    "Close",
                     ButtonKind::Ghost,
                     theme,
                     fonts.secondary,
@@ -1643,22 +1624,12 @@ impl PilusView {
                     cx.notify();
                 })),
             );
-        let sections = div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .p_4()
-            .child(content)
-            .child(self.mission_status_counts(rows))
-            .child(self.mission_cost_chart(rows));
+        let sections = div().flex().flex_col().gap_5().p_4().child(content);
         let frame = div().flex().flex_col().min_h(px(0.0));
         let frame = if stacked {
             frame.flex_1().min_w(px(0.0))
         } else {
-            frame
-                .w(px(style::scaled(&self.shared_settings, DETAIL_WIDTH)))
-                .flex_shrink_0()
-                .border_l_1()
+            frame.w_full().border_l_1()
         };
         style::enter(
             "pilus-mission-side",
@@ -1944,100 +1915,6 @@ impl PilusView {
         )
     }
 
-    /// Live agents per state: the daemon's AGENT STATUS matrix.
-    fn mission_status_counts(&self, rows: &[&MissionRow]) -> Div {
-        let theme = self.theme;
-        let fonts = style::Fonts::resolve(&self.shared_settings);
-        let mut grid = div().flex().flex_row().flex_wrap().gap_2();
-        for state in ["working", "blocked", "done", "idle"] {
-            let count = rows
-                .iter()
-                .filter(|row| !row.resumable() && row.state == state)
-                .count();
-            let color = status_color(state, theme);
-            grid = grid.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .h(px(style::scaled(&self.shared_settings, 24.0)))
-                    .radius_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .text_size(px(fonts.secondary))
-                    .child(div().w(px(7.0)).h(px(7.0)).radius_full().bg(color))
-                    .child(
-                        div()
-                            .text_color(theme.panel_fg)
-                            .child(super::status_label(state)),
-                    )
-                    .child(div().text_color(theme.muted).child(format!("{count:02}"))),
-            );
-        }
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(style::section_label(theme, "AGENT STATUS", fonts.label))
-            .child(grid)
-    }
-
-    fn mission_cost_chart(&self, rows: &[&MissionRow]) -> Div {
-        let theme = self.theme;
-        let fonts = style::Fonts::resolve(&self.shared_settings);
-        let totals = cost_by_model(rows);
-        let mut column = div().flex().flex_col().gap_2().child(style::section_label(
-            theme,
-            "COST BY MODEL",
-            fonts.label,
-        ));
-        let Some(max) = totals.first().map(|(_, cost)| cost.max(1e-9)) else {
-            return column.child(
-                div()
-                    .text_size(px(fonts.secondary))
-                    .text_color(theme.muted)
-                    .child("Cost data unavailable"),
-            );
-        };
-        for (model, cost) in totals {
-            column = column.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .text_size(px(fonts.secondary))
-                    .child(
-                        div()
-                            .w(px(style::scaled(&self.shared_settings, 52.0)))
-                            .flex_shrink_0()
-                            .truncate()
-                            .text_color(theme.branch)
-                            .child(model.clone()),
-                    )
-                    .child(div().flex_1().child(style::meter(
-                        format!("pilus-mission-cost-{model}"),
-                        Some((cost / max) as f32),
-                        theme.accent,
-                        theme,
-                        style::scaled(&self.shared_settings, 8.0),
-                    )))
-                    .child(
-                        div()
-                            .w(px(style::scaled(&self.shared_settings, 52.0)))
-                            .flex()
-                            .justify_end()
-                            .flex_shrink_0()
-                            .text_color(theme.ok)
-                            .child(fmt_cost(cost)),
-                    ),
-            );
-        }
-        column
-    }
-
     fn mission_empty(&self) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
@@ -2047,9 +1924,6 @@ impl PilusView {
             .items_center()
             .gap_3()
             .py_8()
-            .radius_md()
-            .border_1()
-            .border_color(theme.border)
             .child(icon(
                 include_bytes!("../../assets/icons/gauge.svg"),
                 fonts.headline,
@@ -2167,8 +2041,8 @@ mod tests {
     use pilus_client::{MissionRow, MissionUsage};
 
     use super::{
-        Signal, blocked_line, civil_from_days, cost_by_model, fmt_cost, fmt_tokens, resume_ordinal,
-        row_keys, short_model, step_key, until_label, utc_label,
+        Signal, blocked_line, civil_from_days, fmt_cost, fmt_tokens, resume_ordinal, row_keys,
+        short_model, step_key, until_label, utc_label,
     };
 
     fn row(pane: Option<&str>, agent: &str, state: &str) -> MissionRow {
@@ -2221,30 +2095,6 @@ mod tests {
         assert_eq!(Signal::of(&[&working, &blocked]), Signal::Attention);
         assert_eq!(Signal::of(&[&working]), Signal::Active);
         assert_eq!(Signal::of(&[&resumable]), Signal::Standby);
-    }
-
-    #[test]
-    fn spend_groups_by_model_largest_first() {
-        let mut opus = row(Some("1"), "claude", "idle");
-        opus.usage = Some(MissionUsage {
-            model: "claude-opus-4".into(),
-            cost_usd: Some(2.0),
-            ..MissionUsage::default()
-        });
-        let mut opus_too = opus.clone();
-        opus_too.usage.as_mut().expect("usage").cost_usd = Some(3.0);
-        let mut gpt = row(Some("2"), "codex", "idle");
-        gpt.usage = Some(MissionUsage {
-            model: "gpt-5-codex".into(),
-            cost_usd: Some(4.0),
-            ..MissionUsage::default()
-        });
-        let unknown = row(Some("3"), "pi", "idle");
-        let totals = cost_by_model(&[&gpt, &opus, &opus_too, &unknown]);
-        assert_eq!(
-            totals,
-            [("opus".to_string(), 5.0), ("gpt-5".to_string(), 4.0)]
-        );
     }
 
     #[test]

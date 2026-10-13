@@ -33,9 +33,10 @@ const REFRESH: Duration = Duration::from_secs(3);
 const DETAIL_WIDTH: f32 = 380.0;
 const ROW_HEIGHT: f32 = 34.0;
 const STATE_WIDTH: f32 = 104.0;
+const AGENT_WIDTH: f32 = 96.0;
 const NEXT_WIDTH: f32 = 72.0;
 /// Run now and Pause/Enable, plus the cell padding.
-const ACTIONS_WIDTH: f32 = 128.0;
+const ACTIONS_WIDTH: f32 = 136.0;
 
 /// The tint for an automation state.
 pub(super) fn automation_color(state: &str, theme: Theme) -> Rgba {
@@ -126,6 +127,10 @@ pub(super) struct AutomationsPanel {
     error: Option<String>,
     /// The selected definition, by id; the side pane shows it.
     selected: Option<String>,
+    /// The definition the side pane last showed, kept while it slides shut.
+    shown: Option<String>,
+    /// The side pane's spring, so it slides rather than pops.
+    slide: style::PaneSlide,
     detail: Option<(String, Option<Result<AutomationDetail, String>>)>,
     /// Whether the machine picker's list is open.
     machine_menu: bool,
@@ -147,6 +152,8 @@ impl Default for AutomationsPanel {
             fetched_at: None,
             error: None,
             selected: None,
+            shown: None,
+            slide: style::PaneSlide::default(),
             detail: None,
             machine_menu: false,
             status: String::new(),
@@ -165,6 +172,8 @@ impl AutomationsPanel {
         self.open = false;
         self.selected = None;
         self.detail = None;
+        self.shown = None;
+        self.slide = style::PaneSlide::default();
         self.machine_menu = false;
         self.status.clear();
     }
@@ -470,7 +479,6 @@ impl PilusView {
                 if panel.selected.take().is_none() {
                     panel.close();
                 }
-                panel.detail = None;
                 cx.notify();
             }
             _ => {}
@@ -510,9 +518,18 @@ impl PilusView {
         };
 
         let mut body = div().flex().flex_row().flex_1().min_h(px(0.0)).child(main);
-        if loaded && let Some(id) = panel.selected.clone() {
-            body = body.child(self.automations_side(&id, cx));
+        let open = loaded && self.automations_page.selected.is_some();
+        if open {
+            self.automations_page.shown = self.automations_page.selected.clone();
         }
+        let slide = self.automations_page.slide.sync(open, cx);
+        if slide.shown()
+            && let Some(id) = self.automations_page.shown.clone()
+        {
+            let width = style::scaled(&self.shared_settings, DETAIL_WIDTH);
+            body = body.child(slide.wrap(width, self.automations_side(&id, cx)));
+        }
+        let panel = &self.automations_page;
 
         let hints = "↑↓ navigate · n run now · p pause/enable · r refresh · esc back";
         let footer_text = if panel.status.is_empty() {
@@ -648,75 +665,67 @@ impl PilusView {
                 if attention > 0 { theme.alert } else { theme.ok },
                 format!("{} review · {} failed", health.review, health.failed),
             ))
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "NEXT RUN",
-                next,
-                theme.panel_fg,
-                next_detail,
-            ))
+            .child(
+                style::stat_tile(theme, fonts, "NEXT RUN", next, theme.panel_fg, next_detail)
+                    .border_r_0(),
+            )
     }
 
-    /// The definitions, most urgent first.
+    /// The definitions, most urgent first, as the same full-width table the
+    /// Mission Control roster draws.
     fn automations_list(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let scaled = |width: f32| px(style::scaled(&self.shared_settings, width));
-        let label = |text: &'static str| {
-            div()
+        let cell = |width: Option<f32>, last: bool| {
+            style::table_cell(&self.shared_settings, theme, width, last)
+        };
+        let label = |text: &'static str, width: Option<f32>, right: bool, last: bool| {
+            let cell = cell(width, last)
+                .overflow_hidden()
                 .text_size(px(fonts.label))
                 .font_weight(FontWeight::BOLD)
-                .text_color(theme.muted)
-                .child(text)
+                .text_color(theme.muted);
+            if right {
+                cell.justify_end().child(text)
+            } else {
+                cell.child(text)
+            }
         };
         let header = div()
             .flex()
             .flex_row()
-            .items_center()
-            .gap_3()
-            .h(scaled(26.0))
-            .px_4()
+            .items_stretch()
+            .h(px(style::scaled(&self.shared_settings, 26.0)))
             .bg(theme.panel_dim)
             .border_b_1()
             .border_color(theme.border)
-            .child(
-                div()
-                    .w(scaled(STATE_WIDTH))
-                    .flex_shrink_0()
-                    .child(label("STATE")),
-            )
-            .child(div().flex_1().min_w(px(0.0)).child(label("NAME")))
-            .child(div().flex_shrink_0().child(label("AGENT")))
-            .child(
-                div()
-                    .w(scaled(NEXT_WIDTH))
-                    .flex()
-                    .justify_end()
-                    .flex_shrink_0()
-                    .child(label("NEXT")),
-            )
-            .child(div().w(scaled(ACTIONS_WIDTH)).flex_shrink_0());
+            .child(label("STATE", Some(STATE_WIDTH), false, false))
+            .child(label("NAME", None, false, false))
+            .child(label("AGENT", Some(AGENT_WIDTH), false, false))
+            .child(label("NEXT", Some(NEXT_WIDTH), true, false))
+            .child(label("ACTIONS", Some(ACTIONS_WIDTH), false, true));
         let now = unix_now();
-        let mut list = div().flex().flex_col().p_1();
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(header);
         if let Some(rows) = &self.automations_page.rows {
             for row in ordered(rows) {
                 list = list.child(self.automations_row(row, now, cx));
             }
         }
-        // The table is framed like a card, inset from the page edge so the
-        // border reads as a frame rather than a second page rule.
-        div().flex().flex_col().p_4().child(
-            div()
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.border)
-                .child(header)
-                .child(list),
-        )
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                style::section_label(theme, "AUTOMATIONS", fonts.label)
+                    .px_4()
+                    .pt_4()
+                    .pb_2(),
+            )
+            .child(list)
     }
 
     fn automations_row(
@@ -727,7 +736,9 @@ impl PilusView {
     ) -> impl IntoElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let scaled = |width: f32| px(style::scaled(&self.shared_settings, width));
+        let cell = |width: Option<f32>, last: bool| {
+            style::table_cell(&self.shared_settings, theme, width, last)
+        };
         let selected = self.automations_page.selected.as_deref() == Some(row.id.as_str());
         let (rest, hover) = row_fills(selected, theme);
         let color = automation_color(&row.state, theme);
@@ -738,7 +749,6 @@ impl PilusView {
         let name = div()
             .flex()
             .flex_col()
-            .flex_1()
             .min_w(px(0.0))
             .child(
                 div()
@@ -748,7 +758,7 @@ impl PilusView {
                     .font_weight(if selected {
                         FontWeight::BOLD
                     } else {
-                        FontWeight::NORMAL
+                        FontWeight::MEDIUM
                     })
                     .child(row.name.clone()),
             )
@@ -766,10 +776,7 @@ impl PilusView {
             .flex()
             .flex_row()
             .items_center()
-            .justify_end()
             .gap_1()
-            .w(scaled(ACTIONS_WIDTH))
-            .flex_shrink_0()
             .child(
                 style::small_button(
                     format!("pilus-automations-run-{}", row.id),
@@ -801,46 +808,42 @@ impl PilusView {
             .id(format!("pilus-automations-row-{}", row.id))
             .flex()
             .flex_row()
-            .items_center()
-            .gap_3()
-            .min_h(scaled(ROW_HEIGHT))
-            .px_3()
-            .py_1()
-            .radius_md()
+            .items_stretch()
+            .min_h(px(style::scaled(&self.shared_settings, ROW_HEIGHT)))
             .cursor_pointer()
-            .state_fill(rest, hover, style::RADIUS_MD)
+            .state_fill(rest, hover, style::Radius::None)
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
+                cell(Some(STATE_WIDTH), false)
                     .gap_2()
-                    .w(scaled(STATE_WIDTH))
-                    .flex_shrink_0()
                     .text_size(px(fonts.secondary))
                     .text_color(color)
-                    .child(div().w(px(8.0)).h(px(8.0)).radius_full().bg(color))
+                    .child(
+                        div()
+                            .w(px(8.0))
+                            .h(px(8.0))
+                            .flex_shrink_0()
+                            .radius_full()
+                            .bg(color),
+                    )
                     .child(automation_label(&row.state)),
             )
-            .child(name)
+            .child(cell(None, false).py_1().child(name))
             .child(
-                div()
-                    .flex_shrink_0()
+                cell(Some(AGENT_WIDTH), false)
                     .text_size(px(fonts.secondary))
                     .text_color(theme.muted)
-                    .child(row.agent_id.clone()),
+                    .child(div().min_w(px(0.0)).truncate().child(row.agent_id.clone())),
             )
             .child(
-                div()
-                    .w(scaled(NEXT_WIDTH))
-                    .flex()
+                cell(Some(NEXT_WIDTH), false)
                     .justify_end()
-                    .flex_shrink_0()
                     .text_size(px(fonts.secondary))
                     .text_color(theme.muted)
                     .child(next),
             )
-            .child(actions)
+            .child(cell(Some(ACTIONS_WIDTH), true).px_1().child(actions))
+            .border_b_1()
+            .border_color(theme.border)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 let next = (this.automations_page.selected.as_deref() != Some(id.as_str()))
                     .then(|| id.clone());
@@ -866,7 +869,7 @@ impl PilusView {
             .child(
                 style::small_button(
                     "pilus-automations-side-close",
-                    "Hide",
+                    "Close",
                     ButtonKind::Ghost,
                     theme,
                     fonts.secondary,
@@ -878,8 +881,7 @@ impl PilusView {
             div()
                 .flex()
                 .flex_col()
-                .w(px(style::scaled(&self.shared_settings, DETAIL_WIDTH)))
-                .flex_shrink_0()
+                .w_full()
                 .min_h(px(0.0))
                 .border_l_1()
                 .border_color(theme.border)

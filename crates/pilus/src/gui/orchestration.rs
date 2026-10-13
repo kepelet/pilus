@@ -1,205 +1,137 @@
-//! The native Orchestration page: the task queue as a board with its
-//! dependency lines, a bird's-eye view of what is waiting on what.
+//! The native Orchestration page: the task queue as a free canvas, cards the
+//! user places and arrows that say what waits on what.
 //!
 //! It is a second layout of the Tasks page, not a second copy of it: the
 //! tasks, the machine and workspace scope, the selection, the composer, and
 //! the detail pane are all `TasksPanel`'s, so switching between the list and
-//! the board keeps the user's place. This module holds the board's pure
-//! placement rules (lanes, card slots, links, arrow-key moves), which stay
-//! unit-testable without GPUI, and the rendering that paints them.
+//! the canvas keeps the user's place. This module holds the canvas's pure
+//! placement rules (default positions, links, arrow-key moves), which stay
+//! unit-testable without GPUI, the layout file that remembers where the user
+//! put things, and the rendering and drag handling that paint and edit it.
+//!
+//! The daemon owns the tasks and their dependencies; the canvas owns only
+//! where cards sit, the arrows the daemon would not record, and the
+//! workspace and agent a queued card will start with. Those live in
+//! `orchestration.json` beside the settings, per machine.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, Context, Div, FontWeight, Hsla, SharedString, Stateful, div, prelude::*, px,
+    Anchor, AnyElement, Context, Div, DragMoveEvent, FontWeight, Hsla, MouseButton, Pixels, Point,
+    Render, SharedString, Stateful, Window, anchored, deferred, div, prelude::*, px,
 };
 use pilus_client::{Agent, Task, TaskStatus};
+use serde::{Deserialize, Serialize};
 
-use super::style::{self, Connector, RadiusExt, Side};
-use super::tasks::{TaskLayout, TaskView, age_label, status_glyph, unix_now};
-use super::{PilusView, agent_icon, icon};
+use super::style::{self, Connector, FillExt, Radius, RadiusExt, Side};
+use super::task_compose::TasksMsg;
+use super::tasks::{TaskLayout, age_label, status_glyph, unix_now};
+use super::toast::ToastKind;
+use super::{PICKER_MENU_MAX_H, PilusView, agent_icon, icon, picker_menu, picker_row};
 
-/// A column of the board. Several statuses share one, so the board reads as
-/// a handful of stages rather than the daemon's full state machine; each card
-/// still carries its exact status glyph.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) enum Lane {
-    Queued,
-    Working,
-    Review,
-    Done,
-    Failed,
+/// A card's box on the canvas.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Rect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
 }
 
-impl Lane {
-    /// Every lane, left to right.
-    const ALL: [Lane; 5] = [
-        Lane::Queued,
-        Lane::Working,
-        Lane::Review,
-        Lane::Done,
-        Lane::Failed,
-    ];
-
-    pub(super) fn of(status: TaskStatus) -> Self {
-        match status {
-            TaskStatus::Queued => Self::Queued,
-            TaskStatus::Claimed | TaskStatus::Running => Self::Working,
-            TaskStatus::Review | TaskStatus::Blocked => Self::Review,
-            TaskStatus::Done | TaskStatus::Merging | TaskStatus::Merged => Self::Done,
-            TaskStatus::Failed => Self::Failed,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Queued => "QUEUED",
-            Self::Working => "WORKING",
-            Self::Review => "REVIEW",
-            Self::Done => "DONE",
-            Self::Failed => "FAILED",
-        }
-    }
-
-    /// The status whose glyph heads the lane.
-    fn glyph(self) -> TaskStatus {
-        match self {
-            Self::Queued => TaskStatus::Queued,
-            Self::Working => TaskStatus::Running,
-            Self::Review => TaskStatus::Review,
-            Self::Done => TaskStatus::Done,
-            Self::Failed => TaskStatus::Failed,
-        }
-    }
-
-    /// Whether the board draws this lane under `view` while it holds
-    /// `count` cards. The working stages stay up when empty so the board
-    /// keeps its shape; Failed appears only when something failed.
-    fn shown(self, view: TaskView, count: usize) -> bool {
-        match self {
-            Self::Failed => count > 0 && view != TaskView::Active,
-            Self::Done => view != TaskView::Active,
-            Self::Queued | Self::Working | Self::Review => view != TaskView::Closed,
-        }
+impl Rect {
+    fn center(self) -> (f32, f32) {
+        (self.x + self.w / 2.0, self.y + self.h / 2.0)
     }
 }
 
 /// A dependency drawn between two cards: `from` must merge before `to` can
-/// run. Slots are `(lane index, row)` on the board.
+/// run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Link {
-    pub(super) from: (usize, usize),
-    pub(super) to: (usize, usize),
-    pub(super) from_id: String,
-    pub(super) to_id: String,
+    pub(super) from: String,
+    pub(super) to: String,
     /// The dependency already merged: the line is history, not a hold.
     pub(super) settled: bool,
+    /// Drawn on the canvas but not recorded by the daemon, so it is a plan
+    /// rather than a hold.
+    pub(super) planned: bool,
 }
 
-/// The board's cards, placed in lanes.
-#[derive(Debug)]
-pub(super) struct Board<'a> {
-    pub(super) lanes: Vec<(Lane, Vec<&'a Task>)>,
-}
-
-impl<'a> Board<'a> {
-    /// Place the tasks `view` admits. Within a lane, a task sits below the
-    /// tasks it depends on, so chains read top to bottom and their lines
-    /// stay short.
-    pub(super) fn build(tasks: &'a [Task], view: TaskView) -> Self {
-        let depth = depths(tasks);
-        let lanes = Lane::ALL
-            .into_iter()
-            .filter_map(|lane| {
-                let mut cards: Vec<&Task> = tasks
-                    .iter()
-                    .filter(|task| Lane::of(task.status()) == lane && view.admits(task))
-                    .collect();
-                cards.sort_by_key(|task| {
-                    (
-                        depth.get(task.id.as_str()).copied().unwrap_or(0),
-                        id_number(&task.id),
-                        task.id.clone(),
-                    )
-                });
-                lane.shown(view, cards.len()).then_some((lane, cards))
-            })
-            .collect();
-        Self { lanes }
-    }
-
-    pub(super) fn slot(&self, id: &str) -> Option<(usize, usize)> {
-        self.lanes
-            .iter()
-            .enumerate()
-            .find_map(|(lane, (_, cards))| {
-                cards
-                    .iter()
-                    .position(|task| task.id == id)
-                    .map(|row| (lane, row))
-            })
-    }
-
-    /// Every dependency whose both ends are on the board.
-    pub(super) fn links(&self) -> Vec<Link> {
-        let mut links = Vec::new();
-        for (lane, (_, cards)) in self.lanes.iter().enumerate() {
-            for (row, task) in cards.iter().enumerate() {
-                for dep in &task.deps {
-                    let Some(from) = self.slot(dep) else {
-                        continue;
-                    };
-                    let settled = self.lanes[from.0].1[from.1].status() == TaskStatus::Merged;
-                    links.push(Link {
-                        from,
-                        to: (lane, row),
-                        from_id: dep.clone(),
-                        to_id: task.id.clone(),
-                        settled,
-                    });
-                }
-            }
-        }
-        links
-    }
-
-    /// The card an arrow key moves to from `current`: `dy` within the lane,
-    /// `dx` across lanes (skipping empty ones) at the nearest row. With
-    /// nothing selected, any key picks the first card.
-    pub(super) fn step(&self, current: Option<&str>, dx: isize, dy: isize) -> Option<String> {
-        let first = || {
-            self.lanes
-                .iter()
-                .find_map(|(_, cards)| cards.first())
-                .map(|task| task.id.clone())
-        };
-        let Some((lane, row)) = current.and_then(|id| self.slot(id)) else {
-            return first();
-        };
-        if dx == 0 {
-            let cards = &self.lanes[lane].1;
-            let next = (row as isize + dy).clamp(0, cards.len() as isize - 1) as usize;
-            return Some(cards[next].id.clone());
-        }
-        let mut at = lane as isize;
-        loop {
-            at += dx.signum();
-            let Some((_, cards)) = usize::try_from(at).ok().and_then(|at| self.lanes.get(at))
-            else {
-                return Some(self.lanes[lane].1[row].id.clone());
+/// Every dependency whose both ends are among `tasks`, then the user's own
+/// arrows the daemon does not already hold.
+pub(super) fn links(tasks: &[&Task], planned: &[(String, String)]) -> Vec<Link> {
+    let by_id: HashMap<&str, &Task> = tasks.iter().map(|task| (task.id.as_str(), *task)).collect();
+    let mut seen = HashSet::new();
+    let mut links = Vec::new();
+    for task in tasks {
+        for dep in &task.deps {
+            let Some(from) = by_id.get(dep.as_str()) else {
+                continue;
             };
-            if let Some(task) = cards.get(row.min(cards.len().saturating_sub(1))) {
-                return Some(task.id.clone());
+            if seen.insert((dep.as_str(), task.id.as_str())) {
+                links.push(Link {
+                    from: dep.clone(),
+                    to: task.id.clone(),
+                    settled: from.status() == TaskStatus::Merged,
+                    planned: false,
+                });
             }
         }
     }
+    for (from, to) in planned {
+        if by_id.contains_key(from.as_str())
+            && by_id.contains_key(to.as_str())
+            && seen.insert((from.as_str(), to.as_str()))
+        {
+            links.push(Link {
+                from: from.clone(),
+                to: to.clone(),
+                settled: false,
+                planned: true,
+            });
+        }
+    }
+    links
+}
+
+/// Whether `goal` can be reached from `start` by following `edges` (each a
+/// `(from, to)` arrow).
+fn reaches(edges: &[(&str, &str)], start: &str, goal: &str) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(at) = stack.pop() {
+        if at == goal {
+            return true;
+        }
+        if !seen.insert(at) {
+            continue;
+        }
+        stack.extend(
+            edges
+                .iter()
+                .filter(|(from, _)| *from == at)
+                .map(|(_, to)| *to),
+        );
+    }
+    false
+}
+
+/// Whether an arrow `from → to` would close a loop among `links`: `to`
+/// already leads back to `from`, or the arrow points at its own card.
+fn closes_loop(links: &[Link], from: &str, to: &str) -> bool {
+    let edges: Vec<(&str, &str)> = links
+        .iter()
+        .map(|link| (link.from.as_str(), link.to.as_str()))
+        .collect();
+    from == to || reaches(&edges, to, from)
 }
 
 /// Each task's longest dependency chain among `tasks`. A cycle, which the
 /// daemon should refuse but a hand-edited queue could hold, ends the chain
 /// instead of recursing forever.
-fn depths(tasks: &[Task]) -> HashMap<&str, usize> {
+fn depths<'a>(tasks: &[&'a Task]) -> HashMap<&'a str, usize> {
     fn visit<'a>(
         id: &'a str,
         by_id: &HashMap<&'a str, &'a Task>,
@@ -226,7 +158,7 @@ fn depths(tasks: &[Task]) -> HashMap<&str, usize> {
         depth.insert(id, deepest);
         deepest
     }
-    let by_id: HashMap<&str, &Task> = tasks.iter().map(|task| (task.id.as_str(), task)).collect();
+    let by_id: HashMap<&str, &Task> = tasks.iter().map(|task| (task.id.as_str(), *task)).collect();
     let mut depth = HashMap::new();
     let mut visiting = HashSet::new();
     for task in tasks {
@@ -256,23 +188,19 @@ pub(super) fn waiting_on<'a>(task: &'a Task, known: &[Task]) -> Vec<&'a str> {
         .collect()
 }
 
-/// The board's measurements, in pixels at the user's Interface size.
+/// The canvas's measurements, in pixels at the user's Interface size.
 #[derive(Clone, Copy, Debug)]
 struct Geometry {
     card_w: f32,
     card_h: f32,
     /// A folded card: its status line and title.
     folded_h: f32,
-    row_gap: f32,
-    /// Room between lanes for the lines to bend through.
-    lane_gap: f32,
-    lane_pad: f32,
-    header_h: f32,
-    /// Room between a lane's header and its first card.
-    header_gap: f32,
-    /// A folded lane: a strip holding its glyph, count, and name.
-    strip_w: f32,
+    /// Room between default columns for the lines to bend through.
+    gap_x: f32,
+    gap_y: f32,
     pad: f32,
+    /// The dots' spacing, which a dragged card snaps to.
+    grid: f32,
 }
 
 impl Geometry {
@@ -281,183 +209,294 @@ impl Geometry {
             card_w: scale(248.0),
             card_h: scale(124.0),
             folded_h: scale(58.0),
-            row_gap: scale(12.0),
-            lane_gap: scale(48.0),
-            lane_pad: scale(8.0),
-            header_h: scale(36.0),
-            header_gap: scale(10.0),
-            strip_w: scale(40.0),
-            pad: 16.0,
+            gap_x: scale(72.0),
+            gap_y: scale(24.0),
+            pad: 32.0,
+            grid: 24.0,
         }
-    }
-
-    fn lane_w(&self) -> f32 {
-        self.card_w + 2.0 * self.lane_pad
-    }
-
-    fn cards_top(&self) -> f32 {
-        self.pad + self.header_h + self.header_gap
     }
 }
 
-/// Each card's top edge in a lane: the cards stack from `top`, `gap` apart.
-fn stack(top: f32, gap: f32, heights: &[f32]) -> Vec<f32> {
-    heights
-        .iter()
-        .scan(top, |next, height| {
-            let at = *next;
-            *next += height + gap;
-            Some(at)
+/// Where cards with no saved spot go: a column per dependency depth, each
+/// column ordered by id, so a chain reads left to right and its lines stay
+/// short. Positions are in canvas pixels.
+fn auto_positions(tasks: &[&Task], geometry: &Geometry) -> HashMap<String, (f32, f32)> {
+    let depth = depths(tasks);
+    let mut order: Vec<&Task> = tasks.to_vec();
+    order.sort_by_key(|task| {
+        (
+            depth.get(task.id.as_str()).copied().unwrap_or(0),
+            id_number(&task.id),
+            task.id.clone(),
+        )
+    });
+    let mut rows: HashMap<usize, usize> = HashMap::new();
+    order
+        .into_iter()
+        .map(|task| {
+            let column = depth.get(task.id.as_str()).copied().unwrap_or(0);
+            let row = rows.entry(column).or_insert(0);
+            let at = (
+                geometry.pad + column as f32 * (geometry.card_w + geometry.gap_x),
+                geometry.pad + *row as f32 * (geometry.card_h + geometry.gap_y),
+            );
+            *row += 1;
+            (task.id.clone(), at)
         })
         .collect()
 }
 
-/// Every card's box on the board: lanes side by side at their own widths,
-/// cards stacked at their own heights, so a folded lane or card pulls the
-/// rest in.
-struct Layout {
-    geometry: Geometry,
-    /// Per lane: left edge, width, and how far it has folded, from 0 (open)
-    /// to 1 (a strip).
-    columns: Vec<(f32, f32, f32)>,
-    /// Per lane, each card's `(top, height)`.
-    lanes: Vec<Vec<(f32, f32)>>,
+/// Every card's box: its saved or default position at `height(task)`.
+fn rects(
+    tasks: &[&Task],
+    positions: &HashMap<String, (f32, f32)>,
+    geometry: &Geometry,
+    mut height: impl FnMut(&Task) -> f32,
+) -> Vec<(String, Rect)> {
+    tasks
+        .iter()
+        .map(|task| {
+            let (x, y) = positions
+                .get(&task.id)
+                .copied()
+                .unwrap_or((geometry.pad, geometry.pad));
+            (
+                task.id.clone(),
+                Rect {
+                    x,
+                    y,
+                    w: geometry.card_w,
+                    h: height(task),
+                },
+            )
+        })
+        .collect()
 }
 
-impl Layout {
-    fn new(
-        geometry: Geometry,
-        board: &Board<'_>,
-        lane_fold: impl Fn(Lane) -> f32,
-        height: impl Fn(&Task) -> f32,
-    ) -> Self {
-        let folds: Vec<f32> = board
-            .lanes
-            .iter()
-            .map(|(lane, _)| lane_fold(*lane))
-            .collect();
-        let widths: Vec<f32> = folds
-            .iter()
-            .map(|fold| geometry.lane_w() + (geometry.strip_w - geometry.lane_w()) * fold)
-            .collect();
-        // Neighbouring folded strips stack flush; the gap exists only for the
-        // lines between open lanes, so it closes as both sides fold.
-        let mut next = geometry.pad;
-        let lefts: Vec<f32> = widths
-            .iter()
-            .enumerate()
-            .map(|(i, width)| {
-                let flush = if i == 0 { 0.0 } else { folds[i - 1] * folds[i] };
-                next += if i == 0 {
-                    0.0
-                } else {
-                    geometry.lane_gap * (1.0 - flush)
-                };
-                let at = next;
-                next += width;
-                at
-            })
-            .collect();
-        let columns = lefts
-            .into_iter()
-            .zip(widths)
-            .zip(folds)
-            .map(|((left, width), fold)| (left, width, fold))
-            .collect();
-        let lanes = board
-            .lanes
-            .iter()
-            .map(|(_, cards)| {
-                let heights: Vec<f32> = cards.iter().map(|task| height(task)).collect();
-                let tops = stack(geometry.cards_top(), geometry.row_gap, &heights);
-                tops.into_iter().zip(heights).collect()
-            })
-            .collect();
-        Self {
-            geometry,
-            columns,
-            lanes,
-        }
-    }
-
-    /// A lane's `(left, width, fold)`.
-    fn column(&self, lane: usize) -> (f32, f32, f32) {
-        self.columns[lane]
-    }
-
-    /// A card's `(x, y, height)`.
-    fn card(&self, (lane, row): (usize, usize)) -> (f32, f32, f32) {
-        let (top, height) = self.lanes[lane][row];
-        let (left, ..) = self.columns[lane];
-        (left + self.geometry.lane_pad, top, height)
-    }
-
-    /// The board's extent: every lane, as tall as the tallest open stack.
-    fn size(&self) -> (f32, f32) {
-        let g = &self.geometry;
-        let width = self
-            .columns
-            .last()
-            .map_or(g.pad, |(left, width, _)| left + width)
-            + g.pad;
-        let bottom = self
-            .lanes
-            .iter()
-            .zip(&self.columns)
-            .filter(|(_, (.., fold))| *fold < 1.0)
-            .filter_map(|(cards, _)| cards.last())
-            .map(|(top, height)| top + height)
-            .fold(g.cards_top() + g.card_h, f32::max);
-        (width, bottom + g.lane_pad + g.pad)
-    }
-
-    /// Whether `link` has nothing to join: both ends sit in one folded lane.
-    fn hides(&self, link: &Link) -> bool {
-        link.from.0 == link.to.0 && self.columns[link.from.0].2 >= 1.0
-    }
-
-    /// Where `link`'s line leaves and enters. A link to a lane on the right
-    /// runs right edge to left edge, one to the left mirrors that, and one
-    /// within a lane bows out of both right edges. A card in a folding lane
-    /// hands its end to the strip, sliding there as the lane narrows.
-    fn connector(&self, link: &Link, color: Hsla) -> Connector {
-        let (from_side, to_side) = match link.from.0.cmp(&link.to.0) {
-            std::cmp::Ordering::Less => (Side::Right, Side::Left),
-            std::cmp::Ordering::Greater => (Side::Left, Side::Right),
-            std::cmp::Ordering::Equal => (Side::Right, Side::Right),
-        };
-        let g = &self.geometry;
-        let port = |slot: (usize, usize), side: Side| {
-            let (x, y, height) = self.card(slot);
-            let (left, width, fold) = self.column(slot.0);
-            let (card_x, strip_x) = match side {
-                Side::Left => (x, left),
-                Side::Right => (x + g.card_w, left + width),
-            };
-            let card_y = y + height / 2.0;
-            let strip_y = g.cards_top() + g.folded_h / 2.0;
+/// The canvas's extent: every card, and a margin past the farthest.
+fn extent(rects: &[(String, Rect)], geometry: &Geometry) -> (f32, f32) {
+    rects.iter().fold(
+        (
+            geometry.card_w + 2.0 * geometry.pad,
+            geometry.card_h + 2.0 * geometry.pad,
+        ),
+        |(width, height), (_, rect)| {
             (
-                card_x + (strip_x - card_x) * fold,
-                card_y + (strip_y - card_y) * fold,
+                width.max(rect.x + rect.w + geometry.pad),
+                height.max(rect.y + rect.h + geometry.pad),
             )
-        };
-        Connector {
-            from: port(link.from, from_side),
-            from_side,
-            to: port(link.to, to_side),
-            to_side,
-            color,
-            dashed: link.settled,
+        },
+    )
+}
+
+/// The card an arrow key moves to from `current`: the nearest one that lies
+/// in that direction, counting a sideways offset double so the pick stays
+/// roughly in line. With nothing selected, any key picks the top-left card.
+fn step(cards: &[(String, Rect)], current: Option<&str>, dx: f32, dy: f32) -> Option<String> {
+    let Some(from) = current
+        .and_then(|id| cards.iter().find(|(card, _)| card == id))
+        .map(|(_, rect)| rect.center())
+    else {
+        return cards
+            .iter()
+            .min_by(|(_, a), (_, b)| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)))
+            .map(|(id, _)| id.clone());
+    };
+    cards
+        .iter()
+        .filter(|(id, _)| Some(id.as_str()) != current)
+        .filter_map(|(id, rect)| {
+            let (x, y) = rect.center();
+            let (along, across) = if dx != 0.0 {
+                ((x - from.0) * dx, (y - from.1).abs())
+            } else {
+                ((y - from.1) * dy, (x - from.0).abs())
+            };
+            (along > 1.0).then_some((id, along + 2.0 * across))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(id, _)| id.clone())
+        .or_else(|| current.map(str::to_string))
+}
+
+/// The line between two cards: out of the side that faces the other card,
+/// into the side that faces this one. Cards that overlap in x bow out of
+/// both right edges.
+fn connector(from: Rect, to: Rect, color: Hsla, dashed: bool) -> Connector {
+    let (from_side, to_side) = if to.x >= from.x + from.w {
+        (Side::Right, Side::Left)
+    } else if to.x + to.w <= from.x {
+        (Side::Left, Side::Right)
+    } else {
+        (Side::Right, Side::Right)
+    };
+    let port = |rect: Rect, side: Side| match side {
+        Side::Left => (rect.x, rect.y + rect.h / 2.0),
+        Side::Right => (rect.x + rect.w, rect.y + rect.h / 2.0),
+    };
+    Connector {
+        from: port(from, from_side),
+        from_side,
+        to: port(to, to_side),
+        to_side,
+        color,
+        dashed,
+    }
+}
+
+/// What a queued card will start with, when the user chose.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Pick {
+    /// The workspace to start in, by id.
+    #[serde(default)]
+    pub(super) workspace: Option<String>,
+    /// The agent kind to start with.
+    #[serde(default)]
+    pub(super) agent: Option<String>,
+}
+
+/// One machine's canvas: its task ids are the daemon's, so they key it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct MachineCanvas {
+    /// Each pinned card's top-left corner.
+    #[serde(default)]
+    positions: BTreeMap<String, (f32, f32)>,
+    /// Arrows drawn here, `(from, to)`: `to` waits on `from`.
+    #[serde(default)]
+    links: Vec<(String, String)>,
+    #[serde(default)]
+    picks: BTreeMap<String, Pick>,
+}
+
+/// Everything the canvas remembers, by machine.
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct CanvasFile {
+    #[serde(default)]
+    machines: BTreeMap<String, MachineCanvas>,
+}
+
+const FILE: &str = "orchestration.json";
+
+impl CanvasFile {
+    /// Read `<root>/orchestration.json`, falling back to an empty canvas.
+    fn load(root: &Path) -> Self {
+        std::fs::read_to_string(root.join(FILE))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist, best-effort like the settings: a canvas that cannot be saved
+    /// still works for the session.
+    fn save(&self, root: &Path) {
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::create_dir_all(root);
+            let _ = std::fs::write(root.join(FILE), text);
         }
+    }
+}
+
+/// Which of a card's two pickers is open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PickKind {
+    Workspace,
+    Agent,
+}
+
+/// A card being dragged: the pointer where it last moved.
+#[derive(Debug)]
+struct Grab {
+    id: String,
+    last: Option<Point<Pixels>>,
+}
+
+/// An arrow being drawn: from `from`'s port to the pointer.
+#[derive(Debug)]
+struct Wire {
+    from: String,
+    /// Out of the card's right port (it is waited on) or into its left one.
+    outgoing: bool,
+    to: (f32, f32),
+}
+
+/// The canvas's state: what it remembers, and the gesture in flight.
+#[derive(Debug, Default)]
+pub(super) struct Canvas {
+    file: Option<CanvasFile>,
+    drag: Option<Grab>,
+    wire: Option<Wire>,
+    /// Something changed that the file does not hold yet.
+    dirty: bool,
+    /// Where each card sat at the last render, for drags to start from.
+    shown: HashMap<String, (f32, f32)>,
+    /// The picker open on a card.
+    menu: Option<(String, PickKind)>,
+}
+
+impl Canvas {
+    fn ensure_loaded(&mut self, root: &Path) {
+        if self.file.is_none() {
+            self.file = Some(CanvasFile::load(root));
+        }
+    }
+
+    fn machine(&mut self, key: &str) -> &mut MachineCanvas {
+        self.file
+            .get_or_insert_with(CanvasFile::default)
+            .machines
+            .entry(key.to_string())
+            .or_default()
+    }
+
+    fn peek(&self, key: &str) -> Option<&MachineCanvas> {
+        self.file.as_ref()?.machines.get(key)
+    }
+
+    /// What `id` will start with, on the machine `key`.
+    pub(super) fn pick(&self, key: &str, id: &str) -> Option<&Pick> {
+        self.peek(key)?.picks.get(id)
+    }
+
+    fn save_if_dirty(&mut self, root: &Path) {
+        if self.dirty
+            && let Some(file) = &self.file
+        {
+            file.save(root);
+            self.dirty = false;
+        }
+    }
+}
+
+/// A card being moved, as GPUI's drag carries it.
+#[derive(Clone)]
+struct CardDrag {
+    id: String,
+}
+
+/// An arrow being drawn from a port.
+#[derive(Clone)]
+struct LinkDrag {
+    id: String,
+    outgoing: bool,
+}
+
+/// What GPUI draws at the pointer for a drag. The card itself moves, so
+/// there is nothing more to show.
+struct DragGhost;
+
+impl Render for DragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
     }
 }
 
 impl PilusView {
-    /// Open the board from the sidebar.
+    /// Open the canvas from the sidebar.
     pub(super) fn open_orchestration(&mut self, cx: &mut Context<Self>) {
         self.leave_settings_page();
         self.picker.close();
         self.tasks_panel.open_as(TaskLayout::Board);
+        self.tasks_panel.canvas.ensure_loaded(&self.pilus_root);
         cx.notify();
     }
 
@@ -483,13 +522,76 @@ impl PilusView {
             .filter(|name| !name.is_empty())
     }
 
-    /// Arrow keys and hjkl move the selection across the board.
+    fn canvas_geometry(&self) -> Geometry {
+        Geometry::new(|design| style::scaled(&self.shared_settings, design))
+    }
+
+    /// Sync the canvas with the queue before it paints: drop what refers to
+    /// tasks the machine no longer lists or the daemon now records itself,
+    /// work out where each card sits, and write the file once a gesture
+    /// has ended.
+    pub(super) fn prepare_canvas(&mut self, tasks: &[Task], cx: &Context<Self>) {
+        let machine = self.scope_machine();
+        let key = machine.key();
+        let everything = self.machine_tasks(&machine);
+        let geometry = self.canvas_geometry();
+        let refs: Vec<&Task> = tasks.iter().collect();
+        let auto = auto_positions(&refs, &geometry);
+        let dragging = cx.has_active_drag();
+        let canvas = &mut self.tasks_panel.canvas;
+        canvas.ensure_loaded(&self.pilus_root);
+        if !dragging {
+            canvas.drag = None;
+            canvas.wire = None;
+        }
+        // An empty machine may just not have answered yet, so it prunes nothing.
+        if !everything.is_empty() {
+            let known: HashSet<&str> = everything.iter().map(|task| task.id.as_str()).collect();
+            let queued: HashSet<&str> = everything
+                .iter()
+                .filter(|task| task.status() == TaskStatus::Queued)
+                .map(|task| task.id.as_str())
+                .collect();
+            let held: HashSet<(&str, &str)> = everything
+                .iter()
+                .flat_map(|task| task.deps.iter().map(|dep| (dep.as_str(), task.id.as_str())))
+                .collect();
+            let state = canvas.machine(&key);
+            let before = (state.positions.len(), state.links.len(), state.picks.len());
+            state.positions.retain(|id, _| known.contains(id.as_str()));
+            state.picks.retain(|id, _| queued.contains(id.as_str()));
+            state.links.retain(|(from, to)| {
+                known.contains(from.as_str())
+                    && known.contains(to.as_str())
+                    && !held.contains(&(from.as_str(), to.as_str()))
+            });
+            let after = (state.positions.len(), state.links.len(), state.picks.len());
+            canvas.dirty |= before != after;
+        }
+        let pinned = canvas.peek(&key).map(|state| state.positions.clone());
+        let pinned = pinned.unwrap_or_default();
+        canvas.shown = refs
+            .iter()
+            .filter_map(|task| {
+                let at = pinned
+                    .get(&task.id)
+                    .or_else(|| auto.get(&task.id))
+                    .copied()?;
+                Some((task.id.clone(), at))
+            })
+            .collect();
+        if !dragging {
+            canvas.save_if_dirty(&self.pilus_root);
+        }
+    }
+
+    /// Arrow keys and hjkl move the selection across the canvas.
     pub(super) fn board_key(&mut self, key: &str, tasks: &[Task]) -> bool {
         let (dx, dy) = match key {
-            "left" | "h" => (-1, 0),
-            "right" | "l" => (1, 0),
-            "up" | "k" => (0, -1),
-            "down" | "j" => (0, 1),
+            "left" | "h" => (-1.0, 0.0),
+            "right" | "l" => (1.0, 0.0),
+            "up" | "k" => (0.0, -1.0),
+            "down" | "j" => (0.0, 1.0),
             "space" => {
                 if let Some(id) = self.tasks_panel.selected.clone() {
                     self.toggle_fold(id);
@@ -498,14 +600,16 @@ impl PilusView {
             }
             _ => return false,
         };
-        let mut board = Board::build(tasks, self.tasks_panel.view);
-        // A folded lane shows no cards, so arrows pass over it.
-        for (lane, cards) in &mut board.lanes {
-            if self.tasks_panel.folded_lanes.contains(lane) {
-                cards.clear();
+        let geometry = self.canvas_geometry();
+        let refs: Vec<&Task> = tasks.iter().collect();
+        let cards = rects(&refs, &self.tasks_panel.canvas.shown, &geometry, |task| {
+            if self.tasks_panel.folded.contains(&task.id) {
+                geometry.folded_h
+            } else {
+                geometry.card_h
             }
-        }
-        let next = board.step(self.tasks_panel.selected.as_deref(), dx, dy);
+        });
+        let next = step(&cards, self.tasks_panel.selected.as_deref(), dx, dy);
         self.tasks_panel.confirm_delete = None;
         self.tasks_panel.selected = next;
         true
@@ -518,30 +622,6 @@ impl PilusView {
             panel.folded.insert(id.clone());
         }
         panel.fold_turned.insert(id, Instant::now());
-    }
-
-    /// Fold `lane` down to a strip, or open it back up.
-    fn toggle_lane(&mut self, lane: Lane) {
-        let panel = &mut self.tasks_panel;
-        if !panel.folded_lanes.remove(&lane) {
-            panel.folded_lanes.insert(lane);
-        }
-        panel.lane_turned.insert(lane, Instant::now());
-    }
-
-    /// How far `lane` has folded this frame, and whether it is still moving.
-    fn lane_fold(&self, lane: Lane, cx: &Context<Self>) -> (f32, bool) {
-        let folded = self.tasks_panel.folded_lanes.contains(&lane);
-        let (from, to) = if folded { (0.0, 1.0) } else { (1.0, 0.0) };
-        match self
-            .tasks_panel
-            .lane_turned
-            .get(&lane)
-            .and_then(|turned| style::eased(*turned, style::FOLD, cx))
-        {
-            Some(step) => (from + (to - from) * step, true),
-            None => (to, false),
-        }
     }
 
     /// A card's height this frame, easing toward folded or open, and
@@ -573,95 +653,348 @@ impl PilusView {
             .count()
     }
 
-    /// The board, drawn where the Tasks page draws its list.
-    pub(super) fn task_board(&self, board: &Board<'_>, cx: &mut Context<Self>) -> Stateful<Div> {
-        let theme = self.theme;
-        let geometry = Geometry::new(|design| style::scaled(&self.shared_settings, design));
-        let moving = std::cell::Cell::new(false);
-        let layout = Layout::new(
-            geometry,
-            board,
-            |lane| {
-                let (fold, tweening) = self.lane_fold(lane, cx);
-                moving.set(moving.get() || tweening);
-                fold
-            },
-            |task| {
-                let (height, tweening) = self.card_height(&task.id, &geometry, cx);
-                moving.set(moving.get() || tweening);
-                height
-            },
-        );
-        let (width, height) = layout.size();
-        // Dependencies can live outside the scoped workspace or the view, so
-        // waiting is judged against the whole machine.
-        let known = self.machine_tasks(&self.scope_machine());
-        let selected = self.tasks_panel.selected.as_deref();
-
-        let mut canvas = div().relative().w(px(width)).h(px(height)).min_h_full();
-        for (index, (lane, cards)) in board.lanes.iter().enumerate() {
-            canvas = canvas.child(self.board_lane(index, *lane, cards.len(), &layout, cx));
+    /// A card is being dragged: carry it by how far the pointer moved since
+    /// the last event, and pick it. The first event only anchors the pointer,
+    /// so the card does not jump by the distance GPUI waited before starting.
+    fn canvas_move(&mut self, id: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let key = self.scope_machine().key();
+        let grid = self.canvas_geometry().grid;
+        let panel = &mut self.tasks_panel;
+        if panel.canvas.drag.as_ref().is_none_or(|grab| grab.id != id) {
+            panel.canvas.drag = Some(Grab {
+                id: id.to_string(),
+                last: None,
+            });
+            panel.selected = Some(id.to_string());
+            panel.confirm_delete = None;
+            panel.close_composer();
         }
+        let canvas = &mut panel.canvas;
+        let Some(grab) = canvas.drag.as_mut() else {
+            return;
+        };
+        let Some(last) = grab.last.replace(position) else {
+            cx.notify();
+            return;
+        };
+        let moved = position - last;
+        let Some(&(x, y)) = canvas.shown.get(id) else {
+            return;
+        };
+        // Held back from the edge, so a card is never lost off the canvas.
+        let at = (
+            (x + moved.x.as_f32()).max(grid),
+            (y + moved.y.as_f32()).max(grid),
+        );
+        canvas.machine(&key).positions.insert(id.to_string(), at);
+        canvas.shown.insert(id.to_string(), at);
+        canvas.dirty = true;
+        cx.notify();
+    }
 
-        let links: Vec<Link> = board
-            .links()
-            .into_iter()
-            .filter(|link| !layout.hides(link))
-            .collect();
-        let muted = Hsla::from(theme.muted);
-        let lines = links
+    /// An arrow is being drawn: follow the pointer, in canvas coordinates.
+    fn canvas_wire(&mut self, drag: &LinkDrag, to: (f32, f32), cx: &mut Context<Self>) {
+        self.tasks_panel.canvas.wire = Some(Wire {
+            from: drag.id.clone(),
+            outgoing: drag.outgoing,
+            to,
+        });
+        cx.notify();
+    }
+
+    /// The pointer came up: the gesture is over, so keep what it changed.
+    fn canvas_release(&mut self, cx: &mut Context<Self>) {
+        let canvas = &mut self.tasks_panel.canvas;
+        canvas.drag = None;
+        canvas.wire = None;
+        canvas.save_if_dirty(&self.pilus_root);
+        cx.notify();
+    }
+
+    /// Ask the daemon to record `deps` for `id`. Older daemons refuse, which
+    /// leaves the canvas's own arrow standing.
+    fn send_deps(&mut self, id: String, deps: Vec<String>, cx: &mut Context<Self>) {
+        let tx = self.tasks_op_tx.clone();
+        let client = self.control_client_for_endpoint(&self.scope_machine());
+        std::thread::spawn(move || {
+            let message = match client.map(|mut client| client.set_task_deps(&id, &deps)) {
+                Some(Ok(())) if deps.is_empty() => Ok(format!("{id} waits on nothing")),
+                Some(Ok(())) => Ok(format!("{id} waits on {}", deps.join(", "))),
+                Some(Err(error)) => Err(format!(
+                    "The daemon did not take the change to {id}, so it stays on this canvas: {error}"
+                )),
+                None => Err("Could not reach the daemon; the arrow stays on this canvas".into()),
+            };
+            tx.send(TasksMsg::Status(message)).ok();
+        });
+        cx.notify();
+    }
+
+    /// An arrow was dropped on `target`: draw it, and tell the daemon.
+    fn draw_link(&mut self, drag: &LinkDrag, target: &str, cx: &mut Context<Self>) {
+        let (from, to) = if drag.outgoing {
+            (drag.id.clone(), target.to_string())
+        } else {
+            (target.to_string(), drag.id.clone())
+        };
+        let machine = self.scope_machine();
+        let key = machine.key();
+        let everything = self.machine_tasks(&machine);
+        let refs: Vec<&Task> = everything.iter().collect();
+        let planned = self
+            .tasks_panel
+            .canvas
+            .peek(&key)
+            .map(|state| state.links.clone())
+            .unwrap_or_default();
+        let current = links(&refs, &planned);
+        if from == to {
+            return;
+        }
+        if current
             .iter()
-            .map(|link| {
+            .any(|link| link.from == from && link.to == to)
+        {
+            self.toast(ToastKind::Info, format!("{to} already waits on {from}"));
+            cx.notify();
+            return;
+        }
+        if closes_loop(&current, &from, &to) {
+            self.toast(ToastKind::Info, format!("{from} already waits on {to}"));
+            cx.notify();
+            return;
+        }
+        let canvas = &mut self.tasks_panel.canvas;
+        canvas.machine(&key).links.push((from.clone(), to.clone()));
+        canvas.dirty = true;
+        canvas.save_if_dirty(&self.pilus_root);
+        let mut deps: Vec<String> = everything
+            .iter()
+            .find(|task| task.id == to)
+            .map(|task| task.deps.clone())
+            .unwrap_or_default();
+        deps.push(from);
+        self.send_deps(to, deps, cx);
+    }
+
+    /// Take an arrow off the canvas, and off the task if the daemon holds it.
+    fn remove_link(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
+        let machine = self.scope_machine();
+        let key = machine.key();
+        let canvas = &mut self.tasks_panel.canvas;
+        let state = canvas.machine(&key);
+        state.links.retain(|(a, b)| !(a == from && b == to));
+        canvas.dirty = true;
+        canvas.save_if_dirty(&self.pilus_root);
+        let held = self
+            .machine_tasks(&machine)
+            .into_iter()
+            .find(|task| task.id == to)
+            .filter(|task| task.deps.iter().any(|dep| dep == from));
+        if let Some(task) = held {
+            let deps = task.deps.into_iter().filter(|dep| dep != from).collect();
+            self.send_deps(to.to_string(), deps, cx);
+        }
+        cx.notify();
+    }
+
+    /// Open `kind`'s list on a card, or close it if it is the open one.
+    fn toggle_pick_menu(&mut self, id: &str, kind: PickKind, cx: &mut Context<Self>) {
+        let canvas = &mut self.tasks_panel.canvas;
+        if canvas
+            .menu
+            .as_ref()
+            .is_some_and(|(open, k)| open == id && *k == kind)
+        {
+            canvas.menu = None;
+        } else {
+            canvas.menu = Some((id.to_string(), kind));
+            if kind == PickKind::Agent {
+                let key = self.scope_machine().key();
+                self.ensure_agent_configs_for(&key);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Choose what `id` starts with. `None` goes back to the default.
+    fn choose_pick(
+        &mut self,
+        id: &str,
+        kind: PickKind,
+        value: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = self.scope_machine().key();
+        let canvas = &mut self.tasks_panel.canvas;
+        canvas.menu = None;
+        let pick = canvas
+            .machine(&key)
+            .picks
+            .entry(id.to_string())
+            .or_default();
+        match kind {
+            PickKind::Workspace => pick.workspace = value,
+            PickKind::Agent => pick.agent = value,
+        }
+        if *pick == Pick::default() {
+            canvas.machine(&key).picks.remove(id);
+        }
+        canvas.dirty = true;
+        canvas.save_if_dirty(&self.pilus_root);
+        cx.notify();
+    }
+
+    /// The canvas, drawn where the Tasks page draws its list.
+    pub(super) fn task_canvas(&self, tasks: &[Task], cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = self.theme;
+        let geometry = self.canvas_geometry();
+        let machine = self.scope_machine();
+        let key = machine.key();
+        let refs: Vec<&Task> = tasks.iter().collect();
+        let mut moving = false;
+        let cards = rects(&refs, &self.tasks_panel.canvas.shown, &geometry, |task| {
+            let (height, tweening) = self.card_height(&task.id, &geometry, cx);
+            moving |= tweening;
+            height
+        });
+        let (width, height) = extent(&cards, &geometry);
+        let rect_of: HashMap<&str, Rect> = cards
+            .iter()
+            .map(|(id, rect)| (id.as_str(), *rect))
+            .collect();
+        // Dependencies can live outside the scoped workspace, so waiting is
+        // judged against the whole machine.
+        let known = self.machine_tasks(&machine);
+        let selected = self.tasks_panel.selected.as_deref();
+        let canvas_state = &self.tasks_panel.canvas;
+        let planned = canvas_state
+            .peek(&key)
+            .map(|state| state.links.clone())
+            .unwrap_or_default();
+
+        let mut surface = div()
+            .id("pilus-canvas")
+            .relative()
+            .w(px(width))
+            .h(px(height))
+            .min_w_full()
+            .min_h_full()
+            .child(style::dot_grid(
+                Hsla::from(theme.border).opacity(0.7),
+                geometry.grid,
+            ));
+
+        let all_links = links(&refs, &planned);
+        let muted = Hsla::from(theme.muted);
+        let branch = Hsla::from(theme.branch);
+        let line = |link: &Link, color: Hsla| {
+            let (from, to) = (
+                rect_of.get(link.from.as_str())?,
+                rect_of.get(link.to.as_str())?,
+            );
+            Some(connector(*from, *to, color, link.settled))
+        };
+        let lines = all_links
+            .iter()
+            .filter_map(|link| {
                 let strength = if link.settled { 0.35 } else { 0.75 };
-                layout.connector(link, muted.opacity(strength))
+                line(
+                    link,
+                    if link.planned { branch } else { muted }.opacity(strength),
+                )
             })
             .collect();
-        canvas = canvas.child(style::connectors(lines, 1.5));
+        surface = surface.child(style::connectors(lines, 1.5));
+
         // The selected card's links light up over the rest, fading in under
-        // the selection's id so each pick replays it.
+        // the selection's id so each pick replays it, each with a handle to
+        // cut it.
         if let Some(id) = selected {
-            let lit: Vec<Connector> = links
+            let touching: Vec<&Link> = all_links
                 .iter()
-                .filter(|link| link.from_id == id || link.to_id == id)
-                .map(|link| layout.connector(link, theme.accent.into()))
+                .filter(|link| link.from == id || link.to == id)
+                .collect();
+            let lit: Vec<Connector> = touching
+                .iter()
+                .filter_map(|link| line(link, theme.accent.into()))
                 .collect();
             if !lit.is_empty() {
-                canvas = canvas.child(style::enter(
-                    SharedString::from(format!("pilus-board-lit-{id}")),
-                    style::connectors(lit, 2.0),
+                let handles: Vec<AnyElement> = touching
+                    .iter()
+                    .filter_map(|link| {
+                        let at = line(link, muted)?.midpoint(2.0);
+                        Some(self.link_handle(link, at, cx))
+                    })
+                    .collect();
+                surface = surface.child(style::enter(
+                    SharedString::from(format!("pilus-canvas-lit-{id}")),
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .child(style::connectors(lit, 2.0))
+                        .children(handles),
                 ));
             }
         }
 
-        // Cards ride in a clip the lane's size, above the lines: a folding
-        // lane narrows over its cards rather than squeezing them.
-        for (lane, (_, cards)) in board.lanes.iter().enumerate() {
-            let (left, lane_w, fold) = layout.column(lane);
-            if fold >= 1.0 {
+        // The arrow being drawn follows the pointer.
+        if let Some(wire) = &canvas_state.wire
+            && let Some(card) = rect_of.get(wire.from.as_str())
+        {
+            let tip = Rect {
+                x: wire.to.0,
+                y: wire.to.1,
+                w: 0.0,
+                h: 0.0,
+            };
+            let line = if wire.outgoing {
+                connector(*card, tip, theme.accent.into(), true)
+            } else {
+                connector(tip, *card, theme.accent.into(), true)
+            };
+            surface = surface.child(style::connectors(vec![line], 1.5));
+        }
+
+        // Cards sit above the lines. The picked and dragged one goes last,
+        // so it overlaps the rest rather than hiding behind them.
+        let mut order: Vec<&Task> = refs.clone();
+        order.sort_by_key(|task| Some(task.id.as_str()) == selected);
+        for task in order {
+            let Some(rect) = rect_of.get(task.id.as_str()) else {
                 continue;
-            }
-            let mut clip = div()
-                .absolute()
-                .left(px(left))
-                .top_0()
-                .w(px(lane_w))
-                .h_full()
-                .overflow_hidden();
-            for (row, task) in cards.iter().enumerate() {
-                let (x, y, height) = layout.card((lane, row));
-                let waiting = waiting_on(task, &known);
-                clip = clip.child(
-                    self.board_card(task, &waiting, &geometry, height, cx)
-                        .absolute()
-                        .left(px(x - left))
-                        .top(px(y)),
-                );
-            }
-            canvas = canvas.child(clip);
+            };
+            let waiting = waiting_on(task, &known);
+            surface = surface.child(self.canvas_card(task, *rect, &waiting, &key, cx));
         }
-        if moving.get() {
-            canvas = canvas.child(style::next_frame());
+        if moving {
+            surface = surface.child(style::next_frame());
         }
+
+        let surface = surface
+            .on_drag_move::<CardDrag>(cx.listener(
+                |this, event: &DragMoveEvent<CardDrag>, _, cx| {
+                    let id = event.drag(cx).id.clone();
+                    this.canvas_move(&id, event.event.position, cx);
+                },
+            ))
+            .on_drag_move::<LinkDrag>(cx.listener(
+                |this, event: &DragMoveEvent<LinkDrag>, _, cx| {
+                    let drag = event.drag(cx).clone();
+                    let at = event.event.position - event.bounds.origin;
+                    this.canvas_wire(&drag, (at.x.as_f32(), at.y.as_f32()), cx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.canvas_release(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.canvas_release(cx)),
+            );
 
         div()
             .id("pilus-board-scroll")
@@ -669,155 +1002,374 @@ impl PilusView {
             .min_h(px(0.0))
             .min_w(px(0.0))
             .overflow_scroll()
-            .child(canvas)
+            .child(surface)
     }
 
-    /// One lane's backdrop and header. Lanes are chrome, so they take the
-    /// terminal card's hairline rather than the content border. Open, the
-    /// header band folds it; folded, the whole strip opens it.
-    fn board_lane(
+    /// The round handle on a lit arrow that cuts it.
+    fn link_handle(&self, link: &Link, at: (f32, f32), cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let size = 18.0;
+        let (from, to) = (link.from.clone(), link.to.clone());
+        div()
+            .id(SharedString::from(format!(
+                "pilus-canvas-cut-{}-{}",
+                link.from, link.to
+            )))
+            .absolute()
+            .left(px(at.0 - size / 2.0))
+            .top(px(at.1 - size / 2.0))
+            .w(px(size))
+            .h(px(size))
+            .flex()
+            .items_center()
+            .justify_center()
+            .radius_full()
+            .bg(theme.bg)
+            .border_1()
+            .border_color(theme.border_focus)
+            .cursor_pointer()
+            .child(icon(
+                include_bytes!("../../assets/icons/x.svg"),
+                size * 0.6,
+                theme.muted,
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.remove_link(&from, &to, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// One port on a card's edge: drag from it to another card to draw an
+    /// arrow. The right one makes this card the one waited on; the left one
+    /// makes it the one waiting.
+    fn canvas_port(&self, id: &str, outgoing: bool, rect: Rect) -> Div {
+        let theme = self.theme;
+        let hit = 22.0;
+        let dot = 10.0;
+        let drawing = self
+            .tasks_panel
+            .canvas
+            .wire
+            .as_ref()
+            .is_some_and(|wire| wire.from == id && wire.outgoing == outgoing);
+        let edge = if outgoing { rect.w } else { 0.0 };
+        let drag = LinkDrag {
+            id: id.to_string(),
+            outgoing,
+        };
+        // The hover fill makes its element relative, so the port sits in a
+        // wrapper that does the placing.
+        div()
+            .absolute()
+            .left(px(edge - hit / 2.0))
+            .top(px(rect.h / 2.0 - hit / 2.0))
+            .w(px(hit))
+            .h(px(hit))
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "pilus-canvas-port-{}-{id}",
+                        if outgoing { "out" } else { "in" }
+                    )))
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_crosshair()
+                    .hover_fill(Hsla::from(theme.accent).opacity(0.25), Radius::Full)
+                    .child(
+                        div()
+                            .w(px(dot))
+                            .h(px(dot))
+                            .radius_full()
+                            .border_1()
+                            .border_color(if drawing {
+                                theme.accent
+                            } else {
+                                theme.border_focus
+                            })
+                            .bg(if drawing { theme.accent } else { theme.panel }),
+                    )
+                    .on_drag(drag, |_, _, _, cx| cx.new(|_| DragGhost)),
+            )
+    }
+
+    /// One task card on the canvas: the card itself, its two ports, and the
+    /// list of whichever picker is open on it.
+    fn canvas_card(
         &self,
-        index: usize,
-        lane: Lane,
-        count: usize,
-        layout: &Layout,
+        task: &Task,
+        rect: Rect,
+        waiting: &[&str],
+        key: &str,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> Div {
+        let id = task.id.clone();
+        let mut wrapper = div()
+            .absolute()
+            .left(px(rect.x))
+            .top(px(rect.y))
+            .w(px(rect.w))
+            .h(px(rect.h))
+            .child(self.board_card(task, waiting, rect, key, cx))
+            .child(self.canvas_port(&id, false, rect))
+            .child(self.canvas_port(&id, true, rect));
+        if let Some((open, kind)) = &self.tasks_panel.canvas.menu
+            && *open == id
+        {
+            wrapper = wrapper.child(self.pick_menu(task, *kind, rect, key, cx));
+        }
+        wrapper
+    }
+
+    /// The list under a card's workspace or agent chip.
+    fn pick_menu(
+        &self,
+        task: &Task,
+        kind: PickKind,
+        rect: Rect,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let geometry = &layout.geometry;
-        let (left, width, _) = layout.column(index);
-        let folded = self.tasks_panel.folded_lanes.contains(&lane);
-        let turning = self
+        let picked = self
             .tasks_panel
-            .lane_turned
-            .get(&lane)
-            .is_some_and(|turned| turned.elapsed() < style::FOLD * 2);
-        let chevron = style::chevron(
-            format!("pilus-board-lane-chevron-{}", lane.label()),
-            !folded,
-            turning,
-            fonts.secondary,
-            theme.muted,
-        );
-        let count_label = div()
-            .text_size(px(fonts.label))
-            .text_color(theme.muted)
-            .child(count.to_string());
-        // Each state's content fades in under its own id, so the swap between
-        // the header row and the strip never blinks.
-        let content: AnyElement = if folded {
-            let mut letters = div().flex().flex_col().items_center();
-            for letter in lane.label().chars() {
-                letters =
-                    letters.child(style::section_label(theme, letter.to_string(), fonts.label));
+            .canvas
+            .pick(key, &task.id)
+            .cloned()
+            .unwrap_or_default();
+        // Each row: its label, the value it sets, and whether it is the
+        // current one.
+        let rows: Vec<(String, Option<String>, bool)> = match kind {
+            PickKind::Workspace => {
+                let current = picked.workspace.clone().or(task.workspace_id.clone());
+                self.endpoint_workspaces(&self.scope_machine())
+                    .iter()
+                    .map(|workspace| {
+                        (
+                            workspace.name.clone(),
+                            Some(workspace.id.clone()),
+                            current.as_deref() == Some(workspace.id.as_str()),
+                        )
+                    })
+                    .collect()
             }
-            style::enter(
-                SharedString::from(format!("pilus-board-strip-{}", lane.label())),
+            PickKind::Agent => {
+                let mut rows = vec![("Any agent".to_string(), None, picked.agent.is_none())];
+                rows.extend(
+                    self.agent_config_cache
+                        .get(key)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|config| {
+                            (
+                                config.label.clone(),
+                                Some(config.kind.clone()),
+                                picked.agent.as_deref() == Some(config.kind.as_str()),
+                            )
+                        }),
+                );
+                rows
+            }
+        };
+        let mut list = picker_menu(format!("pilus-canvas-menu-{}", task.id), theme)
+            .max_h(px(PICKER_MENU_MAX_H))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.tasks_panel.canvas.menu = None;
+                cx.notify();
+            }));
+        if rows.is_empty() {
+            list = list.child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .w(px(geometry.strip_w))
-                    .h_full()
-                    .pt(px((geometry.header_h - fonts.secondary) / 2.0))
-                    .pb(px(geometry.header_h / 2.0))
-                    .child(letters)
-                    .child(div().flex_1())
-                    .child(count_label),
+                    .px_3()
+                    .py_3()
+                    .text_size(px(fonts.secondary))
+                    .text_color(theme.muted)
+                    .child(match kind {
+                        PickKind::Workspace => "No workspaces",
+                        PickKind::Agent => "Looking for agents…",
+                    }),
+            );
+        }
+        for (index, (label, value, active)) in rows.into_iter().enumerate() {
+            let id = task.id.clone();
+            list = list.child(picker_row(
+                format!("pilus-canvas-option-{}-{index}", task.id),
+                label,
+                active,
+                theme,
+                fonts.body,
+                cx.listener(move |this, _, _, cx| {
+                    this.choose_pick(&id, kind, value.clone(), cx);
+                }),
+            ));
+        }
+        div()
+            .absolute()
+            .left(px(8.0))
+            .top(px(rect.h - 2.0))
+            .child(
+                deferred(
+                    anchored()
+                        .anchor(Anchor::TopLeft)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(style::enter(
+                            SharedString::from(format!("pilus-canvas-menu-enter-{}", task.id)),
+                            list,
+                        )),
+                )
+                .with_priority(2),
             )
             .into_any_element()
+    }
+
+    /// The agent and workspace a card shows: what a queued card will start
+    /// with, or who runs it and where.
+    fn card_footer(&self, task: &Task, waiting: &[&str], key: &str, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        // Only a card that has not started can still be pointed elsewhere.
+        let pickable = task.status() == TaskStatus::Queued;
+        let picked = self
+            .tasks_panel
+            .canvas
+            .pick(key, &task.id)
+            .cloned()
+            .unwrap_or_default();
+
+        let (agent_mark, agent_label, agent_color) = if pickable {
+            let config = picked.agent.as_deref().map(|kind| {
+                self.agent_config_cache
+                    .get(key)
+                    .and_then(|configs| configs.iter().find(|config| config.kind == kind))
+                    .map_or_else(|| kind.to_string(), |config| config.label.clone())
+            });
+            match config {
+                Some(label) => (
+                    agent_icon(picked.agent.as_deref().unwrap_or_default()),
+                    label,
+                    theme.panel_fg,
+                ),
+                None => (agent_icon(""), "Any agent".to_string(), theme.muted),
+            }
         } else {
-            let mut open = div().flex().flex_col().w(px(geometry.lane_w())).child(
+            match self.task_agent(task) {
+                Some(agent) => (agent_icon(&agent.agent), agent_name(agent), theme.panel_fg),
+                None if task.assignee.is_some() => (
+                    agent_icon(""),
+                    format!("pane {}", task.assignee.unwrap_or_default()),
+                    theme.panel_fg,
+                ),
+                None => (agent_icon(""), "Unassigned".to_string(), theme.muted),
+            }
+        };
+        let mut agent = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .flex_1()
+            .min_w(px(0.0))
+            .child(icon(agent_mark, fonts.secondary, agent_color))
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(fonts.secondary))
+                    .text_color(agent_color)
+                    .child(agent_label),
+            );
+        let mut footer = div().flex().flex_row().items_center().gap_2();
+        let workspace = match picked.workspace.as_deref() {
+            Some(chosen) if pickable => self
+                .endpoint_workspaces(&self.scope_machine())
+                .iter()
+                .find(|workspace| workspace.id == chosen)
+                .map(|workspace| workspace.name.clone()),
+            _ => None,
+        }
+        .or_else(|| self.task_workspace_name(task));
+        let chevron = |color| {
+            icon(
+                include_bytes!("../../assets/icons/chevron-down.svg"),
+                fonts.label,
+                color,
+            )
+        };
+        if pickable {
+            let id = task.id.clone();
+            agent = agent.child(chevron(theme.muted));
+            footer = footer.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "pilus-canvas-agent-{}",
+                        task.id
+                    )))
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .cursor_pointer()
+                    .child(agent)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_pick_menu(&id, PickKind::Agent, cx);
+                    })),
+            );
+        } else {
+            footer = footer.child(agent);
+        }
+        if let Some(workspace) = workspace {
+            let chip = style::chip(
+                theme,
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
-                    .h(px(geometry.header_h))
-                    .px(px(geometry.lane_pad + 4.0))
-                    .child(chevron)
-                    .child(status_glyph(lane.glyph(), fonts.secondary, theme))
-                    .child(style::section_label(theme, lane.label(), fonts.label))
-                    .child(count_label),
+                    .gap_1()
+                    .child(workspace)
+                    .children(pickable.then(|| chevron(theme.muted))),
+                fonts.label,
             );
-            if count == 0 {
-                open = open.child(
+            if pickable {
+                let id = task.id.clone();
+                footer = footer.child(
                     div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .mt(px(geometry.header_gap))
-                        .h(px(geometry.card_h / 2.0))
-                        .text_size(px(fonts.secondary))
-                        .text_color(theme.muted)
-                        .child("No tasks"),
+                        .id(SharedString::from(format!(
+                            "pilus-canvas-workspace-{}",
+                            task.id
+                        )))
+                        .cursor_pointer()
+                        .child(chip)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_pick_menu(&id, PickKind::Workspace, cx);
+                        })),
                 );
+            } else {
+                footer = footer.child(chip);
             }
-            style::enter(
-                SharedString::from(format!("pilus-board-lane-open-{}", lane.label())),
-                open,
-            )
-            .into_any_element()
-        };
-        let backdrop = div()
-            .id(SharedString::from(format!(
-                "pilus-board-lane-{}",
-                lane.label()
-            )))
-            .absolute()
-            .left(px(left))
-            .top(px(geometry.pad))
-            .bottom(px(geometry.pad))
-            .w(px(width))
-            .overflow_hidden()
-            .radius_md()
-            .bg(Hsla::from(theme.panel_dim).opacity(0.45))
-            .border_1()
-            .border_color(theme.border)
-            .child(content);
-        if folded {
-            return backdrop
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_lane(lane);
-                    cx.notify();
-                }));
         }
-        // Open, only the header band folds the lane; the cards below it take
-        // their own clicks.
-        backdrop.child(
-            div()
-                .id(SharedString::from(format!(
-                    "pilus-board-lane-head-{}",
-                    lane.label()
-                )))
-                .absolute()
-                .top_0()
-                .left_0()
-                .w_full()
-                .h(px(geometry.header_h))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_lane(lane);
-                    cx.notify();
-                })),
-        )
+        if !waiting.is_empty() {
+            footer = footer.child(blocked_badge(waiting, theme, fonts.label));
+        }
+        footer
     }
 
     /// One task card: status and id, title, description, then who runs it,
-    /// where, and what it is waiting on.
+    /// where, and what it is waiting on. Dragging it moves it.
     fn board_card(
         &self,
         task: &Task,
         waiting: &[&str],
-        geometry: &Geometry,
-        height: f32,
+        rect: Rect,
+        key: &str,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
+        let geometry = self.canvas_geometry();
         let selected = self.tasks_panel.selected.as_deref() == Some(task.id.as_str());
         let folded = self.tasks_panel.folded.contains(&task.id);
         // The chevron turns only right after a toggle; a card scrolling into
@@ -926,44 +1478,15 @@ impl PilusView {
                     .unwrap_or_else(|| "No description".to_string()),
             );
 
-        let agent = self.task_agent(task);
-        let (agent_mark, agent_label, agent_color) = match agent {
-            Some(agent) => (agent_icon(&agent.agent), agent_name(agent), theme.panel_fg),
-            None if task.assignee.is_some() => (
-                agent_icon(""),
-                format!("pane {}", task.assignee.unwrap_or_default()),
-                theme.panel_fg,
-            ),
-            None => (agent_icon(""), "Unassigned".to_string(), theme.muted),
-        };
-        let mut footer = div().flex().flex_row().items_center().gap_2().child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .flex_1()
-                .min_w(px(0.0))
-                .child(icon(agent_mark, fonts.secondary, agent_color))
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(px(fonts.secondary))
-                        .text_color(agent_color)
-                        .child(agent_label),
-                ),
-        );
-        if let Some(workspace) = self.task_workspace_name(task) {
-            footer = footer.child(style::chip(theme, workspace, fonts.label));
-        }
-        if !waiting.is_empty() {
-            footer = footer.child(blocked_badge(waiting, theme, fonts.label));
-        }
+        let footer = self.card_footer(task, waiting, key, cx);
 
         let id = task.id.clone();
+        let me = task.id.clone();
+        let target = task.id.clone();
+        let accent = theme.accent;
         style::board_card(format!("pilus-board-card-{}", task.id), selected, theme)
-            .w(px(geometry.card_w))
-            .h(px(height))
+            .w_full()
+            .h(px(rect.h))
             // The content keeps its open height and the card clips it, so
             // folding draws a curtain over the lower lines instead of
             // squeezing them.
@@ -982,6 +1505,20 @@ impl PilusView {
                     .child(description)
                     .child(footer),
             )
+            // An arrow dragged over a card lights its frame.
+            .drag_over::<LinkDrag>(move |style, drag, _, _| {
+                if drag.id == me {
+                    style
+                } else {
+                    style.border_color(accent)
+                }
+            })
+            .on_drop(cx.listener(move |this, drag: &LinkDrag, _, cx| {
+                this.draw_link(drag, &target, cx);
+            }))
+            .on_drag(CardDrag { id: id.clone() }, |_, _, _, cx| {
+                cx.new(|_| DragGhost)
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 let next =
                     (this.tasks_panel.selected.as_deref() != Some(id.as_str())).then(|| id.clone());
@@ -1030,9 +1567,14 @@ fn blocked_badge(waiting: &[&str], theme: super::theme::Theme, size: f32) -> Div
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use pilus_client::{Task, TaskStatus};
 
-    use super::{Board, Geometry, Lane, Layout, TaskView, depths, stack, waiting_on};
+    use super::{
+        CanvasFile, Geometry, Link, MachineCanvas, Pick, Rect, auto_positions, closes_loop,
+        connector, depths, extent, links, rects, step, waiting_on,
+    };
 
     fn task(id: &str, status: TaskStatus, deps: &[&str]) -> Task {
         Task {
@@ -1043,42 +1585,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn statuses_fold_into_stages() {
-        assert_eq!(Lane::of(TaskStatus::Claimed), Lane::Working);
-        assert_eq!(Lane::of(TaskStatus::Blocked), Lane::Review);
-        assert_eq!(Lane::of(TaskStatus::Merging), Lane::Done);
+    fn refs(tasks: &[Task]) -> Vec<&Task> {
+        tasks.iter().collect()
+    }
+
+    fn card(id: &str, x: f32, y: f32) -> (String, Rect) {
+        (
+            id.to_string(),
+            Rect {
+                x,
+                y,
+                w: 100.0,
+                h: 60.0,
+            },
+        )
     }
 
     #[test]
-    fn empty_stages_stay_but_failed_only_when_used() {
-        let tasks = [task("t1", TaskStatus::Queued, &[])];
-        let board = Board::build(&tasks, TaskView::All);
-        let lanes: Vec<_> = board.lanes.iter().map(|(lane, _)| *lane).collect();
-        assert_eq!(
-            lanes,
-            [Lane::Queued, Lane::Working, Lane::Review, Lane::Done]
-        );
-        let active = Board::build(&tasks, TaskView::Active);
-        assert_eq!(active.lanes.len(), 3);
-    }
-
-    #[test]
-    fn a_task_sits_below_what_it_waits_on() {
+    fn a_chain_reads_left_to_right_one_column_per_depth() {
         let tasks = [
             task("t9", TaskStatus::Queued, &["t2"]),
             task("t2", TaskStatus::Queued, &["t1"]),
             task("t10", TaskStatus::Queued, &[]),
             task("t1", TaskStatus::Running, &[]),
         ];
-        let board = Board::build(&tasks, TaskView::All);
-        let queued: Vec<_> = board.lanes[0]
-            .1
-            .iter()
-            .map(|task| task.id.as_str())
-            .collect();
-        assert_eq!(queued, ["t10", "t2", "t9"]);
-        assert_eq!(depths(&tasks)["t9"], 2);
+        let g = Geometry::new(|design| design);
+        let at = auto_positions(&refs(&tasks), &g);
+        let column = |id: &str| (at[id].0 - g.pad) / (g.card_w + g.gap_x);
+        assert_eq!(column("t1"), 0.0);
+        assert_eq!(column("t10"), 0.0);
+        assert_eq!(column("t2"), 1.0);
+        assert_eq!(column("t9"), 2.0);
+        // Within a column, ids sort numerically: t1 above t10.
+        assert!(at["t1"].1 < at["t10"].1);
+        assert_eq!(depths(&refs(&tasks))["t9"], 2);
     }
 
     #[test]
@@ -1088,17 +1628,51 @@ mod tests {
             task("t2", TaskStatus::Running, &["t1"]),
             task("t3", TaskStatus::Queued, &["t2", "t7"]),
         ];
-        let board = Board::build(&tasks, TaskView::All);
-        let links = board.links();
-        assert_eq!(links.len(), 2, "t7 is not on the board");
-        let settled = links.iter().find(|link| link.from_id == "t1").expect("t1");
-        assert!(settled.settled);
-        assert_eq!(settled.to, (1, 0));
+        let all = links(&refs(&tasks), &[]);
+        assert_eq!(all.len(), 2, "t7 is not on the canvas");
+        let settled = all.iter().find(|link| link.from == "t1").expect("t1");
+        assert!(settled.settled && !settled.planned);
+        assert!(!all.iter().any(|link| link.from == "t2" && link.settled));
+    }
+
+    #[test]
+    fn a_drawn_arrow_the_daemon_holds_is_not_drawn_twice() {
+        let tasks = [
+            task("t1", TaskStatus::Running, &[]),
+            task("t2", TaskStatus::Queued, &["t1"]),
+            task("t3", TaskStatus::Queued, &[]),
+        ];
+        let planned = [
+            ("t1".to_string(), "t2".to_string()),
+            ("t2".to_string(), "t3".to_string()),
+            ("t2".to_string(), "t9".to_string()),
+        ];
+        let all = links(&refs(&tasks), &planned);
+        assert_eq!(all.len(), 2);
         assert!(
-            !links
-                .iter()
-                .any(|link| link.from_id == "t2" && link.settled)
+            all.iter()
+                .any(|link| link.from == "t2" && link.to == "t3" && link.planned)
         );
+        assert!(
+            all.iter()
+                .any(|link| link.from == "t1" && link.to == "t2" && !link.planned)
+        );
+    }
+
+    #[test]
+    fn an_arrow_that_would_close_a_loop_is_refused() {
+        let link = |from: &str, to: &str| Link {
+            from: from.to_string(),
+            to: to.to_string(),
+            settled: false,
+            planned: false,
+        };
+        let chain = [link("t1", "t2"), link("t2", "t3")];
+        assert!(closes_loop(&chain, "t3", "t1"));
+        assert!(closes_loop(&chain, "t2", "t1"));
+        assert!(closes_loop(&chain, "t2", "t2"));
+        assert!(!closes_loop(&chain, "t1", "t3"));
+        assert!(!closes_loop(&chain, "t4", "t1"));
     }
 
     #[test]
@@ -1112,73 +1686,93 @@ mod tests {
     }
 
     #[test]
-    fn arrows_walk_lanes_and_skip_empty_ones() {
-        let tasks = [
-            task("t1", TaskStatus::Queued, &[]),
-            task("t2", TaskStatus::Queued, &[]),
-            task("t3", TaskStatus::Review, &[]),
+    fn arrows_pick_the_nearest_card_that_way() {
+        let cards = [
+            card("a", 0.0, 0.0),
+            card("b", 200.0, 0.0),
+            card("c", 200.0, 200.0),
+            card("d", 400.0, 10.0),
         ];
-        let board = Board::build(&tasks, TaskView::All);
-        assert_eq!(board.step(None, 0, 1).as_deref(), Some("t1"));
-        assert_eq!(board.step(Some("t1"), 0, 1).as_deref(), Some("t2"));
-        assert_eq!(board.step(Some("t2"), 0, 1).as_deref(), Some("t2"));
-        // Working is empty, so right from Queued lands in Review.
-        assert_eq!(board.step(Some("t2"), 1, 0).as_deref(), Some("t3"));
-        assert_eq!(board.step(Some("t3"), 1, 0).as_deref(), Some("t3"));
-        assert_eq!(board.step(Some("t3"), -1, 0).as_deref(), Some("t1"));
+        assert_eq!(step(&cards, None, 1.0, 0.0).as_deref(), Some("a"));
+        assert_eq!(step(&cards, Some("a"), 1.0, 0.0).as_deref(), Some("b"));
+        assert_eq!(step(&cards, Some("b"), 1.0, 0.0).as_deref(), Some("d"));
+        assert_eq!(step(&cards, Some("b"), 0.0, 1.0).as_deref(), Some("c"));
+        // Nothing lies up or left of a: the selection stays.
+        assert_eq!(step(&cards, Some("a"), -1.0, 0.0).as_deref(), Some("a"));
+        assert_eq!(step(&cards, Some("a"), 0.0, -1.0).as_deref(), Some("a"));
+        assert_eq!(step(&cards, Some("c"), 0.0, -1.0).as_deref(), Some("b"));
+        assert!(step(&[], None, 1.0, 0.0).is_none());
     }
 
     #[test]
-    fn folded_cards_pull_the_stack_up() {
-        assert_eq!(stack(10.0, 4.0, &[20.0, 8.0, 20.0]), [10.0, 34.0, 46.0]);
-        assert!(stack(0.0, 4.0, &[]).is_empty());
+    fn a_line_leaves_the_side_facing_the_other_card() {
+        let left = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 60.0,
+        };
+        let right = Rect {
+            x: 300.0,
+            y: 100.0,
+            w: 100.0,
+            h: 60.0,
+        };
+        let line = connector(left, right, gpui::Hsla::default(), false);
+        assert_eq!(line.from, (100.0, 30.0));
+        assert_eq!(line.to, (300.0, 130.0));
+        let back = connector(right, left, gpui::Hsla::default(), false);
+        assert_eq!(back.from, (300.0, 130.0));
+        assert_eq!(back.to, (100.0, 30.0));
+        // Stacked cards bow out of both right edges.
+        let below = Rect { y: 200.0, ..left };
+        let bow = connector(left, below, gpui::Hsla::default(), false);
+        assert_eq!((bow.from.0, bow.to.0), (100.0, 100.0));
     }
 
     #[test]
-    fn a_link_meets_each_card_at_its_own_middle() {
-        let tasks = [
-            task("t1", TaskStatus::Queued, &[]),
-            task("t2", TaskStatus::Queued, &["t1"]),
-        ];
-        let board = Board::build(&tasks, TaskView::All);
-        let geometry = Geometry::new(|design| design);
-        let layout = Layout::new(
-            geometry,
-            &board,
-            |_| 0.0,
-            |task| {
-                if task.id == "t1" { 40.0 } else { 100.0 }
-            },
+    fn folded_cards_take_less_of_the_canvas() {
+        let tasks = [task("t1", TaskStatus::Queued, &[])];
+        let g = Geometry::new(|design| design);
+        let positions = HashMap::from([("t1".to_string(), (500.0, 400.0))]);
+        let open = extent(&rects(&refs(&tasks), &positions, &g, |_| g.card_h), &g);
+        let folded = extent(&rects(&refs(&tasks), &positions, &g, |_| g.folded_h), &g);
+        assert_eq!(open.0, 500.0 + g.card_w + g.pad);
+        assert!(folded.1 < open.1);
+        // An empty canvas still has room for a card.
+        assert_eq!(
+            extent(&[], &g),
+            (g.card_w + 2.0 * g.pad, g.card_h + 2.0 * g.pad)
         );
-        let (_, top, _) = layout.card((0, 1));
-        assert_eq!(top, geometry.cards_top() + 40.0 + geometry.row_gap);
-        let line = layout.connector(&board.links()[0], gpui::Hsla::default());
-        assert_eq!(line.from.1, geometry.cards_top() + 20.0);
-        assert_eq!(line.to.1, top + 50.0);
     }
 
     #[test]
-    fn a_folded_lane_narrows_and_takes_its_cards_lines() {
-        let tasks = [
-            task("t1", TaskStatus::Running, &[]),
-            task("t2", TaskStatus::Queued, &["t1"]),
-            task("t3", TaskStatus::Queued, &["t2"]),
-        ];
-        let board = Board::build(&tasks, TaskView::All);
-        let geometry = Geometry::new(|design| design);
-        let fold = |lane| if lane == Lane::Queued { 1.0 } else { 0.0 };
-        let layout = Layout::new(geometry, &board, fold, |_| geometry.card_h);
-        let (_, width, _) = layout.column(0);
-        assert_eq!(width, geometry.strip_w);
-        let (working, ..) = layout.column(1);
-        assert_eq!(working, geometry.pad + geometry.strip_w + geometry.lane_gap);
-        let links = board.links();
-        let into_strip = links.iter().find(|link| link.from_id == "t1").expect("t1");
-        let line = layout.connector(into_strip, gpui::Hsla::default());
-        assert_eq!(line.to.0, geometry.pad + geometry.strip_w);
-        let inside = links.iter().find(|link| link.from_id == "t2").expect("t2");
-        assert!(layout.hides(inside));
-        assert!(!layout.hides(into_strip));
+    fn the_layout_file_round_trips_and_forgives_missing_fields() {
+        let mut file = CanvasFile::default();
+        let machine = MachineCanvas {
+            positions: [("t1".to_string(), (10.0, 20.0))].into(),
+            links: vec![("t1".to_string(), "t2".to_string())],
+            picks: [(
+                "t2".to_string(),
+                Pick {
+                    workspace: Some("w1".to_string()),
+                    agent: None,
+                },
+            )]
+            .into(),
+        };
+        file.machines.insert("local".to_string(), machine);
+        let text = serde_json::to_string(&file).expect("serialize");
+        let back: CanvasFile = serde_json::from_str(&text).expect("parse");
+        let local = &back.machines["local"];
+        assert_eq!(local.positions["t1"], (10.0, 20.0));
+        assert_eq!(local.links, [("t1".to_string(), "t2".to_string())]);
+        assert_eq!(local.picks["t2"].workspace.as_deref(), Some("w1"));
+        // A file from before a field existed still loads.
+        let old: CanvasFile =
+            serde_json::from_str(r#"{"machines":{"m":{"positions":{}}}}"#).expect("old file");
+        assert!(old.machines["m"].links.is_empty());
+        assert!(serde_json::from_str::<CanvasFile>("{}").is_ok());
     }
 
     #[test]
@@ -1187,7 +1781,7 @@ mod tests {
             task("t1", TaskStatus::Queued, &["t2"]),
             task("t2", TaskStatus::Queued, &["t1"]),
         ];
-        let depth = depths(&tasks);
+        let depth = depths(&refs(&tasks));
         assert!(depth["t1"] <= 2 && depth["t2"] <= 2);
     }
 }

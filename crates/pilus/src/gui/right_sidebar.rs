@@ -100,6 +100,11 @@ impl SidebarTab {
     fn takes_keys(self) -> bool {
         self == Self::Diff
     }
+
+    /// Whether the tab reads a git repo, so a plain folder has nothing for it.
+    fn needs_repo(self) -> bool {
+        matches!(self, Self::Diff | Self::Git | Self::Github)
+    }
 }
 
 /// Where the column was, enough to put it back.
@@ -547,9 +552,29 @@ impl PilusView {
         }
     }
 
+    /// Whether the active workspace is a git repo, which is what Changes,
+    /// History, and GitHub read. The daemon reports a branch only for a repo.
+    fn active_is_repo(&self) -> bool {
+        self.surface
+            .workspaces()
+            .iter()
+            .find(|workspace| workspace.active)
+            .is_some_and(|workspace| workspace.branch.is_some())
+    }
+
+    /// The tab on screen. A git tab in a folder that is not a repo has
+    /// nothing to read, so the column shows Files instead; the choice itself
+    /// is kept, and returns with the next repo.
+    fn shown_tab(&self) -> SidebarTab {
+        if self.right.tab.needs_repo() && !self.active_is_repo() {
+            return SidebarTab::Files;
+        }
+        self.right.tab
+    }
+
     /// Whether the Diff is on screen, so it should poll the daemon.
     pub(super) fn diff_visible(&self) -> bool {
-        self.right.visible && self.right.tab == SidebarTab::Diff
+        self.right.visible && self.shown_tab() == SidebarTab::Diff
     }
 
     /// Whether Diff holds the keyboard.
@@ -559,17 +584,17 @@ impl PilusView {
 
     /// Whether the Git tab is on screen, so it should poll the daemon.
     pub(super) fn git_visible(&self) -> bool {
-        self.right.visible && self.right.tab == SidebarTab::Git
+        self.right.visible && self.shown_tab() == SidebarTab::Git
     }
 
     /// Whether the Files tab is on screen, so it should poll the daemon.
     pub(super) fn files_visible(&self) -> bool {
-        self.right.visible && self.right.tab == SidebarTab::Files
+        self.right.visible && self.shown_tab() == SidebarTab::Files
     }
 
     /// Whether the GitHub tab is on screen, so it should poll `gh`.
     pub(super) fn github_visible(&self) -> bool {
-        self.right.visible && self.right.tab == SidebarTab::Github
+        self.right.visible && self.shown_tab() == SidebarTab::Github
     }
 
     /// Whether a GitHub text field holds the keyboard. The tab has no
@@ -681,6 +706,8 @@ impl PilusView {
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let split = self.is_split();
         let expanded = self.right.expanded();
+        let shown = self.shown_tab();
+        let is_repo = self.active_is_repo();
         // Stretched under the floating traffic lights when the left sidebar
         // is away, the strip starts past them.
         let lights = if fullscreen {
@@ -732,10 +759,19 @@ impl PilusView {
                     .overflow_x_scroll()
                     .overflow_y_hidden()
                     .children(SidebarTab::STRIP.map(|tab| {
+                        if tab.needs_repo() && !is_repo {
+                            return style::tab_disabled(
+                                format!("pilus-right-tab-{}", tab.wire()),
+                                tab.label(),
+                                theme,
+                                fonts.body,
+                            )
+                            .flex_shrink_0();
+                        }
                         style::tab(
                             format!("pilus-right-tab-{}", tab.wire()),
                             tab.label(),
-                            self.right.tab == tab,
+                            shown == tab,
                             theme,
                             fonts.body,
                         )
@@ -811,14 +847,14 @@ impl PilusView {
             .flex_1()
             .min_h(px(0.0))
             .overflow_hidden()
-            .child(match self.right.tab {
+            .child(match shown {
                 SidebarTab::Diff => self.diff_page(self.right.shown_width(), cx),
                 SidebarTab::Git => self.git_page(cx),
                 SidebarTab::Files => self.files_page(cx),
                 SidebarTab::Github => self.github_page(cx),
                 SidebarTab::Ports => self.ports_page(cx),
             });
-        let footer = match self.right.tab {
+        let footer = match shown {
             SidebarTab::Diff => self.diff_footer(cx),
             SidebarTab::Git | SidebarTab::Files | SidebarTab::Github | SidebarTab::Ports => None,
         };
@@ -865,7 +901,7 @@ impl PilusView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    if !this.right.focused && this.right.tab.takes_keys() {
+                    if !this.right.focused && this.shown_tab().takes_keys() {
                         this.right.focused = true;
                         cx.notify();
                     }

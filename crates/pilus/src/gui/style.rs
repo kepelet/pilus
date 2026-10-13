@@ -471,6 +471,28 @@ pub(super) fn tab(
         .child(label)
 }
 
+/// A tab that cannot be opened: dimmed, and deaf to the pointer.
+pub(super) fn tab_disabled(
+    id: impl Into<ElementId>,
+    label: impl IntoElement,
+    theme: Theme,
+    text_size: f32,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .h(px(super::TAB_HEIGHT))
+        .px_3()
+        .radius_md()
+        .text_color(theme.muted)
+        .text_size(px(text_size))
+        .opacity(0.35)
+        .child(label)
+}
+
 /// How far each level of a tree steps in.
 pub(super) const TREE_INDENT: f32 = 14.0;
 const TREE_DISCLOSURE: f32 = 12.0;

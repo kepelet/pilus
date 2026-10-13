@@ -152,11 +152,19 @@ impl PaneChrome {
 /// The surface under every card: the whole box the panes tile, cell-aligned,
 /// so the gutters between cards and the margin around them show it. A top
 /// row hidden behind the native tab strip starts at the grid's top.
+///
+/// The right edge runs a pixel past the cell grid when the remainder (`slack_x`)
+/// is too thin for the row filler to paint (`render_row` skips it at 0.5px or
+/// less): the cell edge is rounded, so without this a strip of card color
+/// shows along the sidebar. A wider remainder is the filler's, and covering it
+/// here too would double the tint under translucency. The card clips the
+/// overshoot.
 pub(super) fn surface(
     tiled: &PaneFrame,
     fill: Rgba,
     line_height: Pixels,
     cell_width: f32,
+    slack_x: f32,
     skip_cols: u16,
     skip_rows: u16,
 ) -> Div {
@@ -164,7 +172,8 @@ pub(super) fn surface(
     let left = ((f32::from(tiled.left) - f32::from(skip_cols)) * cell_width)
         .round()
         .max(0.0);
-    let right = ((f32::from(tiled.right) + 1.0 - f32::from(skip_cols)) * cell_width).round();
+    let right = ((f32::from(tiled.right) + 1.0 - f32::from(skip_cols)) * cell_width).round()
+        + if slack_x > 0.5 { 0.0 } else { slack_x + 1.0 };
     let top = ((f32::from(tiled.top) - f32::from(skip_rows)) * height)
         .round()
         .max(0.0);

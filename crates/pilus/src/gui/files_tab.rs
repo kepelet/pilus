@@ -1174,7 +1174,7 @@ impl PilusView {
             .child(div().flex_1().min_h(px(0.0)).child(body))
     }
 
-    /// One row: the root's name and the refresh control.
+    /// Two rows: the machine with the tab's controls, then the root.
     fn files_header(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
@@ -1236,7 +1236,10 @@ impl PilusView {
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(theme.panel_fg)
                     .child(self.endpoint_label(&self.active)),
-            );
+            )
+            .child(new)
+            .child(upload)
+            .child(refresh);
         let directory = div()
             .flex()
             .flex_row()
@@ -1255,10 +1258,7 @@ impl PilusView {
                     .text_size(px(fonts.secondary))
                     .text_color(theme.muted)
                     .child(root),
-            )
-            .child(new)
-            .child(upload)
-            .child(refresh);
+            );
         div()
             .flex()
             .flex_col()

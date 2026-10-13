@@ -4558,8 +4558,9 @@ impl PilusView {
 
     /// A native page as a rounded card in gutters of the chrome's own fill, the
     /// way each pane of a split terminal sits in its gutters: the same gap on
-    /// every side, no outline, no shadow. With pane frames off the terminal has
-    /// no cards, so the page runs flush on the chrome's fill instead.
+    /// every side, a hairline border, no shadow. With pane frames off the
+    /// terminal has no cards, so the page runs flush on the chrome's fill
+    /// instead.
     ///
     /// The gutter is the sidebar's fill, not the tinted pane surface: a page
     /// has no terminal cards for that surface to frame, and the tint would
@@ -4582,6 +4583,8 @@ impl PilusView {
                     .flex_col()
                     .overflow_hidden()
                     .radius_md()
+                    .border_1()
+                    .border_color(self.theme.border)
                     .bg(self.theme.bg.opacity(glass))
                     .child(page),
             )

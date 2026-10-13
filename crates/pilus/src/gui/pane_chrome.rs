@@ -19,12 +19,12 @@ use std::time::{Duration, Instant};
 use gpui::{
     App, BorderStyle, Bounds, BoxShadow, ContentMask, Corners, DispatchPhase, Div, Edges, Element,
     ElementId, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    Length, MouseMoveEvent, Pixels, Rgba, Size, Style, Styled as _, Window, black, div, point, px,
-    quad, transparent_black,
+    Length, MouseMoveEvent, ParentElement as _, Pixels, Rgba, Size, Style, Styled as _, Window,
+    black, div, point, px, quad, transparent_black,
 };
 
 use super::pane_frames::PaneFrame;
-use super::style::{RADIUS_MD, RadiusExt as _, ease_out_cubic, mix};
+use super::style::{self, RADIUS_MD, RadiusExt as _, ease_out_cubic, mix};
 
 /// Thickness of a pane's frame in logical pixels.
 const BORDER_PX: f32 = 1.0;
@@ -46,11 +46,14 @@ const DIM: f32 = 0.4;
 /// them; [`paint_shadow_outside`] keeps it off the card.
 const SHADOW_ALPHA: f32 = 0.1;
 const SHADOW_BLUR_PX: f32 = 6.0;
+/// How far the focused pane's toolbar sits in from its card's top-right corner.
+const TOOLBAR_INSET_PX: f32 = 6.0;
 
 /// Where a pane's frame sits and what it looks like right now. Geometry is
 /// in pixels relative to the grid's top-left.
 pub(super) struct PaneChrome {
     index: usize,
+    focused: bool,
     left: f32,
     top: f32,
     width: f32,
@@ -142,6 +145,7 @@ pub(super) fn pane_chrome(
     };
     PaneChrome {
         index,
+        focused,
         left,
         top,
         width: (right - left).max(0.0),
@@ -153,6 +157,26 @@ pub(super) fn pane_chrome(
 }
 
 impl PaneChrome {
+    /// Whether this pane holds the caret.
+    pub(super) fn focused(&self) -> bool {
+        self.focused
+    }
+
+    /// `bar` pinned inside the card's top-right corner. The fade is keyed by
+    /// the pane, so moving focus to another pane replays it there.
+    pub(super) fn toolbar(&self, bar: Div) -> Div {
+        div()
+            .absolute()
+            .left(px(self.left))
+            .top(px(self.top + BORDER_PX + TOOLBAR_INSET_PX))
+            .w(px(self.width))
+            .pr(px(BORDER_PX + TOOLBAR_INSET_PX))
+            .flex()
+            .flex_row()
+            .justify_end()
+            .child(style::enter(("pilus-pane-toolbar", self.index as u64), bar))
+    }
+
     /// The pane's card: the rounded fill inside its frame, painted under the
     /// grid's text. A card has no animation of its own; the frame fades in
     /// around it.

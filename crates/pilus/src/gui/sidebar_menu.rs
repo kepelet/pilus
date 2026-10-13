@@ -178,6 +178,31 @@ impl Item {
     }
 }
 
+/// A selectable row's height in pixels.
+pub const ROW_HEIGHT: f32 = 26.0;
+/// A divider's height: its hairline plus the margin above and below.
+pub const DIVIDER_HEIGHT: f32 = 9.0;
+/// The panel's padding and border around its rows, top and bottom together.
+pub const PANEL_CHROME: f32 = 10.0;
+
+/// The panel's height for `rows`, which the renderer needs before layout to
+/// decide whether the menu opens below or above the pointer. Dividers are
+/// shorter than rows, so counting every entry as a row overshoots and parks an
+/// upward menu far above the pointer.
+pub fn panel_height(rows: &[Item]) -> f32 {
+    PANEL_CHROME
+        + rows
+            .iter()
+            .map(|item| {
+                if item.selectable() {
+                    ROW_HEIGHT
+                } else {
+                    DIVIDER_HEIGHT
+                }
+            })
+            .sum::<f32>()
+}
+
 /// The open context menu: target, anchor point in window pixels, and the
 /// keyboard cursor. Mouse users get no persistent selection, like every
 /// other native list here; `selected` is only painted when the keyboard is
@@ -444,6 +469,18 @@ mod tests {
         assert_eq!(entry.last(), Some(&Item::Delete));
         assert_eq!(entry[entry.len() - 2], Item::Divider);
         assert!(Item::Delete.destructive());
+    }
+
+    #[test]
+    fn panel_height_counts_a_divider_as_a_hairline() {
+        let rows = terminal_rows(false);
+        let dividers = rows.iter().filter(|item| !item.selectable()).count() as f32;
+        let selectable = rows.len() as f32 - dividers;
+        assert_eq!(
+            panel_height(&rows),
+            PANEL_CHROME + selectable * ROW_HEIGHT + dividers * DIVIDER_HEIGHT
+        );
+        assert!(panel_height(&rows) < 8.0 + rows.len() as f32 * 30.0);
     }
 
     #[test]

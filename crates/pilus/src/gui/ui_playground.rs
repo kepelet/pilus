@@ -347,6 +347,41 @@ impl UiPlaygroundView {
             ))
     }
 
+    /// The strip the focused pane wears over its top-right corner.
+    fn pane_toolbar(&self) -> impl IntoElement {
+        let theme = self.theme;
+        let size = style::scaled(&self.settings, 24.0);
+        style::pane_toolbar(theme)
+            .child(style::icon_button(
+                "pg-pane-split-right",
+                include_bytes!("../../assets/icons/columns-2.svg"),
+                ButtonKind::Ghost,
+                theme,
+                size,
+            ))
+            .child(style::icon_button(
+                "pg-pane-split-down",
+                include_bytes!("../../assets/icons/rows-2.svg"),
+                ButtonKind::Ghost,
+                theme,
+                size,
+            ))
+            .child(style::icon_button(
+                "pg-pane-fullscreen",
+                include_bytes!("../../assets/icons/maximize.svg"),
+                ButtonKind::Ghost,
+                theme,
+                size,
+            ))
+            .child(style::icon_button(
+                "pg-pane-close",
+                include_bytes!("../../assets/icons/x.svg"),
+                ButtonKind::Danger,
+                theme,
+                size,
+            ))
+    }
+
     fn circle_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         div()
@@ -1916,6 +1951,7 @@ impl Render for UiPlaygroundView {
                             .child(self.button("pg-danger", "Danger", ButtonKind::Danger, cx))
                             .child(self.circle_button(cx))
                             .child(self.icon_buttons())
+                            .child(self.pane_toolbar())
                             .child(
                                 div()
                                     .text_size(px(self.fonts().label))

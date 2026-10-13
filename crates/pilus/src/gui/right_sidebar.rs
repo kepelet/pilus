@@ -667,6 +667,7 @@ impl PilusView {
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let width = self.right.px();
         let focused = self.right.focused;
+        let split = self.is_split();
         let expanded = self.right.expanded();
         // Stretched under the floating traffic lights when the left sidebar
         // is away, the strip starts past them.
@@ -839,9 +840,17 @@ impl PilusView {
             .bg(self.chrome_fill())
             .border_l_1()
             // Focus is the one edge accent earns here: it says which side
-            // of the window the keyboard is on.
+            // of the window the keyboard is on. A split's tinted surface runs
+            // up to the column, so at rest it parts from it by fill alone,
+            // as the left sidebar does; the edge keeps its pixel so the
+            // content box does not shift.
             .border_color(if focused {
                 theme.border_focus
+            } else if split {
+                gpui::Rgba {
+                    a: 0.0,
+                    ..theme.border
+                }
             } else {
                 theme.border
             })

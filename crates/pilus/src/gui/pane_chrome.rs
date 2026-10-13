@@ -65,8 +65,10 @@ impl Look {
 
 /// One pane's frame, on the center lines of the daemon's border cells so it
 /// sits where the glyphs did. The corner radius follows the setting. `surface`
-/// is the color the surface layer paints, which the border and the dimming
-/// veil share. A top edge hidden behind the native tab strip is drawn at the
+/// is the color the surface layer paints, which the dimming veil shares;
+/// `border` is the stroke's color, clear when the window is translucent, since
+/// a stroke over the surface there would double its alpha into a visible ring.
+/// A top edge hidden behind the native tab strip is drawn at the
 /// grid's top.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pane_chrome(
@@ -74,6 +76,7 @@ pub(super) fn pane_chrome(
     pane: &PaneFrame,
     focused: bool,
     surface: Rgba,
+    border: Rgba,
     line_height: Pixels,
     cell_width: f32,
     skip_cols: u16,
@@ -90,7 +93,7 @@ pub(super) fn pane_chrome(
     let top = row_center(pane.top).round() - half;
     let bottom = row_center(pane.bottom).round() + half;
     let rest = Look {
-        border: surface,
+        border,
         dim: if focused { 0.0 } else { 1.0 },
     };
     PaneChrome {
@@ -284,10 +287,16 @@ impl Element for PaneChrome {
             ));
         }
         if look.border.a > 0.0 {
+            // The fill is the border's own color at zero alpha: the quad
+            // blends border into fill across the anti-aliased inner edge,
+            // and a black fill would leave a dark fringe on the corners.
             window.paint_quad(quad(
                 bounds,
                 corners,
-                transparent_black(),
+                Rgba {
+                    a: 0.0,
+                    ..look.border
+                },
                 Edges::all(px(BORDER_PX)),
                 look.border,
                 BorderStyle::Solid,

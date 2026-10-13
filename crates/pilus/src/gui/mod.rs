@@ -9659,15 +9659,19 @@ impl PilusView {
         // overlay rather than a border: a border would take a pixel from the
         // panel's content box and leave the rows' right inset one short of
         // their left.
-        panel.child(
-            div()
-                .absolute()
-                .top(px(0.0))
-                .bottom(px(0.0))
-                .right(px(0.0))
-                .w(px(1.0))
-                .bg(self.theme.border),
-        )
+        // A split's tinted surface runs up to the sidebar, so it parts from
+        // it by fill alone.
+        panel.when(!self.is_split(), |panel| {
+            panel.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .bottom(px(0.0))
+                    .right(px(0.0))
+                    .w(px(1.0))
+                    .bg(self.theme.border),
+            )
+        })
     }
 
     /// Focus a workspace tab.
@@ -9851,10 +9855,11 @@ impl PilusView {
         // The raised fill is one pill that slides to the selected tab, so a
         // switch reads as motion from the old tab to the new one.
         let selection = style::GlideSlot::default();
+        let raise = self.tab_raise();
         tabs = tabs.child(style::glide(
             "pilus-tab-glide",
             &selection,
-            theme.panel.opacity(glass),
+            raise.opacity(glass),
             style::RADIUS_SOFT,
             0.0,
         ));
@@ -9887,7 +9892,7 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.muted)
-            .hover_fill(theme.panel.opacity(glass), style::RADIUS_SOFT)
+            .hover_fill(raise.opacity(glass), style::RADIUS_SOFT)
             .hover(move |style| style.text_color(theme.panel_fg))
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
@@ -9973,6 +9978,8 @@ impl PilusView {
         let theme = self.theme;
         let glass = self.glass_opacity();
         let active = self.tab_active(tab);
+        let raise = self.tab_raise();
+        let split = self.is_split();
         let index = tab.index;
         let close_index = tab.index;
         let fg = if active { theme.panel_fg } else { theme.muted };
@@ -10040,9 +10047,11 @@ impl PilusView {
             // hovering any other tab only hints at it.
             .hover_fill(
                 if active {
-                    theme.panel.opacity(0.0)
+                    raise.opacity(0.0)
+                } else if split {
+                    raise.opacity(glass)
                 } else {
-                    theme.panel.opacity(glass * 0.5)
+                    raise.opacity(glass * 0.5)
                 },
                 style::RADIUS_SOFT,
             )
@@ -11948,6 +11957,18 @@ impl PilusView {
         }
     }
 
+    /// The fill of the selected and hovered tab. In a split the strip sits on
+    /// the tinted surface, so a tab is raised in the card's own fill, which
+    /// reads as the tab opening into the terminal card below it; otherwise
+    /// it is the panel fill.
+    fn tab_raise(&self) -> gpui::Rgba {
+        if self.is_split() {
+            self.theme.bg
+        } else {
+            self.theme.panel
+        }
+    }
+
     /// Whether the shown frame is a split with pane frames drawn, which is
     /// when the terminal sits on the tinted surface the tab strip matches.
     fn is_split(&self) -> bool {
@@ -12491,6 +12512,11 @@ fn render_grid(
     let mut column = div().relative().flex().flex_col().size_full();
     let surface_base = theme.pane_surface(glass);
     let surface = surface_base.opacity(glass);
+    let border = if glass < 1.0 {
+        gpui::Rgba { a: 0.0, ..surface }
+    } else {
+        surface
+    };
     let chromes: Vec<pane_chrome::PaneChrome> = panes
         .panes()
         .iter()
@@ -12504,6 +12530,7 @@ fn render_grid(
                 pane,
                 focused,
                 surface,
+                border,
                 line_height,
                 cell_width,
                 skip_cols,

@@ -202,6 +202,8 @@ impl Updater {
 
     /// Relaunch into the staged update.
     pub fn restart(&self, cx: &mut Context<Self>) {
+        // The new copy owns the menu bar item, so no helper is left for it.
+        super::background::skip_hand_off();
         cx.restart();
     }
 }

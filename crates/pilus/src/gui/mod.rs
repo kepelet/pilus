@@ -453,6 +453,9 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
                 let settings = settings.clone();
                 let root = root.clone();
                 cx.defer(move |cx| {
+                    if frontmost_luvus_missing(cx) {
+                        return;
+                    }
                     // The frontmost window may have left the session this
                     // process launched in, and appearance belongs to the
                     // daemon the window shows.
@@ -539,17 +542,38 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
         cx.on_action({
             let settings = settings.clone();
             let root = pilus_root.clone();
-            move |_: &IncreaseFontSize, cx: &mut App| bump_font(&settings, &root, 1.0, cx)
+            move |_: &IncreaseFontSize, cx: &mut App| {
+                let (settings, root) = (settings.clone(), root.clone());
+                cx.defer(move |cx| {
+                    if !frontmost_luvus_missing(cx) {
+                        bump_font(&settings, &root, 1.0, cx);
+                    }
+                });
+            }
         });
         cx.on_action({
             let settings = settings.clone();
             let root = pilus_root.clone();
-            move |_: &DecreaseFontSize, cx: &mut App| bump_font(&settings, &root, -1.0, cx)
+            move |_: &DecreaseFontSize, cx: &mut App| {
+                let (settings, root) = (settings.clone(), root.clone());
+                cx.defer(move |cx| {
+                    if !frontmost_luvus_missing(cx) {
+                        bump_font(&settings, &root, -1.0, cx);
+                    }
+                });
+            }
         });
         cx.on_action({
             let settings = settings.clone();
             let root = pilus_root.clone();
-            move |_: &ResetFontSize, cx: &mut App| bump_font(&settings, &root, 0.0, cx)
+            move |_: &ResetFontSize, cx: &mut App| {
+                let (settings, root) = (settings.clone(), root.clone());
+                cx.defer(move |cx| {
+                    if !frontmost_luvus_missing(cx) {
+                        bump_font(&settings, &root, 0.0, cx);
+                    }
+                });
+            }
         });
         cx.bind_keys(app_key_bindings());
         cx.set_menus([
@@ -760,6 +784,16 @@ fn frontmost_window(cx: &mut App) -> Option<gpui::AnyWindowHandle> {
                 .unwrap_or(false)
         })
     })
+}
+
+/// Whether the frontmost window is waiting on a Luvus install, so the
+/// app-level shortcuts that belong to a working window can stand down too.
+/// Call it deferred: a window mid-dispatch is leased and cannot be read.
+fn frontmost_luvus_missing(cx: &mut App) -> bool {
+    frontmost_window(cx)
+        .and_then(|handle| handle.downcast::<PilusView>())
+        .and_then(|handle| handle.read(cx).ok().map(PilusView::luvus_missing))
+        .unwrap_or(false)
 }
 
 /// Every application-level keybinding, in one place so a duplicate chord is a
@@ -1171,6 +1205,9 @@ enum MachineConnect {
     /// The owner-local daemon could not be reached or restarted.
     LocalFailed {
         error: String,
+        /// No `luvus` binary exists to start, as opposed to a daemon that
+        /// failed to come up.
+        luvus_missing: bool,
     },
 }
 
@@ -1327,6 +1364,16 @@ enum DaemonOutcome {
     Installed { version: Version, path: PathBuf },
     /// A restart or a failure finished; carries a message for the status line.
     Message(Result<String, String>),
+}
+
+/// Progress of installing Luvus from the prompt shown when it is missing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum LuvusInstall {
+    #[default]
+    Idle,
+    Installing,
+    /// The reason the last attempt failed, shown under the buttons.
+    Failed(String),
 }
 
 /// The little modal a context-menu action opens: rename, alias, or branch.
@@ -1646,6 +1693,13 @@ struct PilusView {
     reconnects: HashMap<String, Reconnect>,
     /// Automatic reconnect state for the owner-local daemon.
     local_reconnect: Option<Reconnect>,
+    /// The last local attach failed because no `luvus` binary exists. The
+    /// reconnect loop keeps probing, so installing it clears this by itself.
+    local_luvus_missing: bool,
+    /// The in-window Luvus install, driven from the missing-Luvus prompt.
+    luvus_install: LuvusInstall,
+    luvus_install_rx: Receiver<Result<PathBuf, String>>,
+    luvus_install_tx: Sender<Result<PathBuf, String>>,
     /// Whether the active connection is still alive; a dropped machine
     /// endpoint is replaced in place when its reconnect succeeds.
     active_live: bool,
@@ -1823,6 +1877,7 @@ impl PilusView {
         let (menu_tx, menu_rx) = std::sync::mpsc::channel();
         let (theme_tx, theme_rx) = std::sync::mpsc::channel();
         let (daemon_tx, daemon_rx) = std::sync::mpsc::channel();
+        let (luvus_install_tx, luvus_install_rx) = std::sync::mpsc::channel();
         let settings = shared_settings.borrow().clone();
         // The path toggles seed the sidebar flags; the daemon's own
         // `workspace_paths` is deliberately not adopted, since the client
@@ -2107,6 +2162,10 @@ impl PilusView {
             auto_connected: HashSet::new(),
             reconnects: HashMap::new(),
             local_reconnect: None,
+            local_luvus_missing: false,
+            luvus_install: LuvusInstall::Idle,
+            luvus_install_rx,
+            luvus_install_tx,
             active_live,
             // Force the first probe, which also seeds the Local row; the cheap
             // reload only supplies the saved profiles.
@@ -2233,6 +2292,129 @@ impl PilusView {
         if let Some(connection) = self.connection.as_ref() {
             let _ = connection.send(message);
         }
+    }
+
+    /// Whether the window has no daemon to show because Luvus is not
+    /// installed. Everything that talks to the daemon, from the tab strip to
+    /// the shortcuts, stands down until the install appears.
+    fn luvus_missing(&self) -> bool {
+        self.local_luvus_missing && !self.active_live && self.active == EndpointId::Local
+    }
+
+    /// Probe for the daemon now instead of waiting out the backoff.
+    fn recheck_luvus(&mut self, cx: &mut Context<Self>) {
+        self.local_reconnect = None;
+        self.spawn_local_connect();
+        cx.notify();
+    }
+
+    /// Download and install Luvus off the GUI thread. The poll loop picks up
+    /// the result and attaches to the daemon it starts.
+    fn install_luvus(&mut self, cx: &mut Context<Self>) {
+        if self.luvus_install == LuvusInstall::Installing {
+            return;
+        }
+        self.luvus_install = LuvusInstall::Installing;
+        let tx = self.luvus_install_tx.clone();
+        std::thread::spawn(move || {
+            let engine = crate::luvus_update::first_install_engine();
+            let result = match crate::luvus_update::check(&engine) {
+                Ok(Some(release)) => crate::luvus_update::install(&engine, &release, |_, _| {})
+                    .map_err(|error| error.to_string()),
+                Ok(None) => Err("no Luvus release is published for this platform".to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            tx.send(result).ok();
+        });
+        cx.notify();
+    }
+
+    /// The call to action that fills the card while Luvus is not installed.
+    fn install_luvus_prompt(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let installing = self.luvus_install == LuvusInstall::Installing;
+        let checking = self.connecting.contains(&EndpointId::Local);
+        let install_label = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .when(installing, |label| {
+                label.child(style::spinner(
+                    "pilus-install-luvus-spinner",
+                    fonts.secondary,
+                    theme.window_bg,
+                ))
+            })
+            .child(if installing {
+                "Installing…"
+            } else {
+                "Install Luvus"
+            });
+        let mut prompt = style::empty_state(
+            theme,
+            fonts,
+            icon(
+                include_bytes!("../../assets/icons/server.svg"),
+                fonts.headline,
+                theme.muted,
+            ),
+            "Luvus is not installed",
+            "pilus is a client for the Luvus daemon. Install Luvus to start workspaces and agents.",
+        )
+        .size_full()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(
+                    style::button_enabled(
+                        "pilus-install-luvus",
+                        install_label,
+                        style::ButtonKind::Primary,
+                        theme,
+                        fonts.secondary,
+                        !installing,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.install_luvus(cx))),
+                )
+                .child(
+                    style::button(
+                        "pilus-recheck-luvus",
+                        if checking {
+                            "Checking…"
+                        } else {
+                            "Check again"
+                        },
+                        style::ButtonKind::Secondary,
+                        theme,
+                        fonts.secondary,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.recheck_luvus(cx))),
+                )
+                .child(
+                    style::button(
+                        "pilus-install-luvus-manually",
+                        "Install manually",
+                        style::ButtonKind::Ghost,
+                        theme,
+                        fonts.secondary,
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.open_url(LUVUS_INSTALL_URL))),
+                ),
+        );
+        if let LuvusInstall::Failed(error) = &self.luvus_install {
+            prompt = prompt.child(
+                div()
+                    .max_w(px(fonts.secondary * 30.0))
+                    .text_size(px(fonts.secondary))
+                    .text_color(theme.alert)
+                    .child(format!("Install failed: {error}")),
+            );
+        }
+        prompt
     }
 
     /// Tell the active bridge how much surface we want, when one exists.
@@ -2537,6 +2719,18 @@ impl PilusView {
                 self.apply_appearance();
                 changed = true;
             }
+        }
+        while let Ok(result) = self.luvus_install_rx.try_recv() {
+            match result {
+                Ok(_) => {
+                    self.luvus_install = LuvusInstall::Idle;
+                    // The binary is in place; attach now rather than waiting
+                    // out the reconnect backoff.
+                    self.recheck_luvus(cx);
+                }
+                Err(error) => self.luvus_install = LuvusInstall::Failed(error),
+            }
+            changed = true;
         }
         while let Ok(outcome) = self.daemon_rx.try_recv() {
             self.daemon_busy = false;
@@ -3148,6 +3342,7 @@ impl PilusView {
                         continue;
                     }
                     self.local_reconnect = None;
+                    self.local_luvus_missing = false;
                     if self.active == EndpointId::Local {
                         self.replace_active_local(connection);
                     } else {
@@ -3181,7 +3376,10 @@ impl PilusView {
                     };
                     changed = true;
                 }
-                MachineConnect::LocalFailed { error } => {
+                MachineConnect::LocalFailed {
+                    error,
+                    luvus_missing,
+                } => {
                     if !self.connecting.remove(&EndpointId::Local) {
                         continue;
                     }
@@ -3197,6 +3395,7 @@ impl PilusView {
                         self.active_live = false;
                         self.status = format!("local server unavailable: {error}");
                     }
+                    self.local_luvus_missing = luvus_missing;
                     changed = true;
                 }
             }
@@ -3553,6 +3752,8 @@ impl PilusView {
             let result = match pilus_client::connect(&target, cols, rows) {
                 Ok(connection) => MachineConnect::LocalConnected { connection },
                 Err(error) => MachineConnect::LocalFailed {
+                    luvus_missing: matches!(error, pilus_client::Error::NotFound { .. })
+                        && luvus_binary().is_none(),
                     error: error.to_string(),
                 },
             };
@@ -3984,6 +4185,10 @@ impl PilusView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // With no daemon there is nothing to type into or navigate.
+        if self.luvus_missing() {
+            return;
+        }
         // An open context menu owns up/down/enter/escape until one runs or it
         // closes; an open prompt owns Enter (submit) and Escape (cancel).
         if self.context_menu.is_some() {
@@ -4667,6 +4872,10 @@ impl PilusView {
         layout: &CardLayout,
         terminal_fill: gpui::Rgba,
     ) -> AnyElement {
+        if self.luvus_missing() {
+            return style::enter("pilus-page-install-luvus", self.install_luvus_prompt(cx))
+                .into_any_element();
+        }
         if self.home.is_open() {
             return style::enter(
                 "pilus-page-home",
@@ -10287,6 +10496,12 @@ impl PilusView {
     ) -> Div {
         let theme = self.theme;
 
+        // Nothing in the strip works without a daemon, so it leaves no bar
+        // behind: the window's own base shows through where it would sit.
+        if self.luvus_missing() {
+            return div();
+        }
+
         // Beside the sidebar when it is open; full width when it is hidden.
         // The left inset only clears the floating traffic lights, which
         // fullscreen hides, so the strip runs to the edge there.
@@ -10679,6 +10894,9 @@ impl PilusView {
     fn sidebar_cells(&self) -> u16 {
         // Full width regardless of visibility: `sidebar_factor` folds the
         // collapse tween in at each surface, so all of them glide together.
+        if self.luvus_missing() {
+            return 0;
+        }
         self.sidebar_dock().map_or(0, |dock| dock.width)
     }
 
@@ -12874,8 +13092,13 @@ impl Render for PilusView {
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, _| {
                 this.scroll(event, window);
             }));
+        let luvus_missing = self.luvus_missing();
         let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
-        let sidebar = self.sidebar(cx, cell_width, f32::from(window.viewport_size().height));
+        let sidebar = if luvus_missing {
+            div()
+        } else {
+            self.sidebar(cx, cell_width, f32::from(window.viewport_size().height))
+        };
 
         // A bare spacer: the sidebar, tab strip, and card each paint their
         // own background, so the root stays transparent and no chrome layer
@@ -12914,84 +13137,92 @@ impl Render for PilusView {
                     this.git_divider_end(cx);
                 }),
             )
-            .on_action(cx.listener(|this, _: &CopySelection, _window, cx| {
-                this.copy_selection(cx);
-            }))
-            .on_action(cx.listener(|this, _: &PasteClipboard, _window, cx| {
-                this.paste_clipboard(cx);
-            }))
-            .on_action(cx.listener(|this, _: &SelectAllGrid, window, cx| {
-                this.select_all(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &NewTab, _window, _cx| this.new_tab()))
-            .on_action(cx.listener(|this, _: &OpenLocalTerminal, _window, cx| {
-                this.open_local_terminal(cx);
-            }))
-            .on_action(cx.listener(|this, _: &SplitVertical, _window, cx| this.split("right", cx)))
-            .on_action(cx.listener(|this, _: &SplitHorizontal, _window, cx| this.split("down", cx)))
-            .on_action(cx.listener(|this, _: &CloseTab, _window, cx| {
-                this.close_active_tab();
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
-                this.toggle_sidebar(cx);
-            }))
-            .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
-                this.toggle_right_sidebar(cx);
-            }))
-            .on_action(cx.listener(|this, _: &RightSidebarBack, _window, cx| {
-                if this.right.visible {
-                    this.right_back(cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &RightSidebarForward, _window, cx| {
-                if this.right.visible {
-                    this.right_forward(cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
-                // The chord toggles, so pressing it again dismisses.
-                if this.palette.is_open() {
-                    this.palette.close();
-                } else {
-                    this.palette.open();
-                }
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &OpenWorkspacePicker, _window, cx| {
-                this.leave_settings_page();
-                this.open_picker(cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenSettings, _window, cx| {
-                this.open_settings(cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenHome, _window, cx| {
-                this.toggle_home(cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenSessionMenu, _window, cx| {
-                this.session_menu_open = true;
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &OpenAbout, _window, cx| {
-                about::open(this.theme, this.shared_settings.clone(), cx);
-            }))
-            .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| {
-                this.check_for_updates(cx);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &FocusTab1, _window, cx| this.focus_tab(1, cx)))
-            .on_action(cx.listener(|this, _: &FocusTab2, _window, cx| this.focus_tab(2, cx)))
-            .on_action(cx.listener(|this, _: &FocusTab3, _window, cx| this.focus_tab(3, cx)))
-            .on_action(cx.listener(|this, _: &FocusTab4, _window, cx| this.focus_tab(4, cx)))
-            .on_action(cx.listener(|this, _: &FocusTab5, _window, cx| this.focus_tab(5, cx)))
-            .on_action(cx.listener(|this, _: &FocusTab6, _window, cx| this.focus_tab(6, cx)))
-            .on_action(cx.listener(|this, _: &FocusTab7, _window, cx| this.focus_tab(7, cx)))
-            .on_action(cx.listener(|this, _: &FocusTab8, _window, cx| this.focus_tab(8, cx)))
-            .on_action(cx.listener(|this, _: &FocusTab9, _window, cx| {
-                if let Some(tab) = this.tabs.last() {
-                    this.focus_tab(tab.index, cx);
-                }
-            }));
+            // Every pilus shortcut lands on one of these, so leaving them
+            // unregistered makes the whole set a no-op while Luvus is missing.
+            .when(!luvus_missing, |root| {
+                root.on_action(cx.listener(|this, _: &CopySelection, _window, cx| {
+                    this.copy_selection(cx);
+                }))
+                .on_action(cx.listener(|this, _: &PasteClipboard, _window, cx| {
+                    this.paste_clipboard(cx);
+                }))
+                .on_action(cx.listener(|this, _: &SelectAllGrid, window, cx| {
+                    this.select_all(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &NewTab, _window, _cx| this.new_tab()))
+                .on_action(cx.listener(|this, _: &OpenLocalTerminal, _window, cx| {
+                    this.open_local_terminal(cx);
+                }))
+                .on_action(
+                    cx.listener(|this, _: &SplitVertical, _window, cx| this.split("right", cx)),
+                )
+                .on_action(
+                    cx.listener(|this, _: &SplitHorizontal, _window, cx| this.split("down", cx)),
+                )
+                .on_action(cx.listener(|this, _: &CloseTab, _window, cx| {
+                    this.close_active_tab();
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
+                    this.toggle_sidebar(cx);
+                }))
+                .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
+                    this.toggle_right_sidebar(cx);
+                }))
+                .on_action(cx.listener(|this, _: &RightSidebarBack, _window, cx| {
+                    if this.right.visible {
+                        this.right_back(cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &RightSidebarForward, _window, cx| {
+                    if this.right.visible {
+                        this.right_forward(cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
+                    // The chord toggles, so pressing it again dismisses.
+                    if this.palette.is_open() {
+                        this.palette.close();
+                    } else {
+                        this.palette.open();
+                    }
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|this, _: &OpenWorkspacePicker, _window, cx| {
+                    this.leave_settings_page();
+                    this.open_picker(cx);
+                }))
+                .on_action(cx.listener(|this, _: &OpenSettings, _window, cx| {
+                    this.open_settings(cx);
+                }))
+                .on_action(cx.listener(|this, _: &OpenHome, _window, cx| {
+                    this.toggle_home(cx);
+                }))
+                .on_action(cx.listener(|this, _: &OpenSessionMenu, _window, cx| {
+                    this.session_menu_open = true;
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|this, _: &OpenAbout, _window, cx| {
+                    about::open(this.theme, this.shared_settings.clone(), cx);
+                }))
+                .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| {
+                    this.check_for_updates(cx);
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|this, _: &FocusTab1, _window, cx| this.focus_tab(1, cx)))
+                .on_action(cx.listener(|this, _: &FocusTab2, _window, cx| this.focus_tab(2, cx)))
+                .on_action(cx.listener(|this, _: &FocusTab3, _window, cx| this.focus_tab(3, cx)))
+                .on_action(cx.listener(|this, _: &FocusTab4, _window, cx| this.focus_tab(4, cx)))
+                .on_action(cx.listener(|this, _: &FocusTab5, _window, cx| this.focus_tab(5, cx)))
+                .on_action(cx.listener(|this, _: &FocusTab6, _window, cx| this.focus_tab(6, cx)))
+                .on_action(cx.listener(|this, _: &FocusTab7, _window, cx| this.focus_tab(7, cx)))
+                .on_action(cx.listener(|this, _: &FocusTab8, _window, cx| this.focus_tab(8, cx)))
+                .on_action(cx.listener(|this, _: &FocusTab9, _window, cx| {
+                    if let Some(tab) = this.tabs.last() {
+                        this.focus_tab(tab.index, cx);
+                    }
+                }))
+            });
 
         // The chrome inherits the chosen UI family and size; the grid overrides
         // both.
@@ -13024,17 +13255,22 @@ impl Render for PilusView {
             .child(sidebar)
             .child(self.top_chrome(cx, cell_width, layout.card_right, fullscreen))
             .children(
-                (self.right.openness() > 0.0)
+                (!luvus_missing && self.right.openness() > 0.0)
                     .then(|| self.right_sidebar_view(layout.card_right, fullscreen, cx)),
             )
-            .child(self.session_menu(cx, cell_width, fullscreen))
-            .child(self.palette_overlay(cx))
-            .child(self.picker_overlay(window, cx))
+            .when(!luvus_missing, |root| {
+                root.child(self.session_menu(cx, cell_width, fullscreen))
+                    .child(self.palette_overlay(cx))
+                    .child(self.picker_overlay(window, cx))
+            })
             .child(self.context_menu_overlay(cx, window))
             .child(self.menu_prompt_overlay(cx))
             .child(self.toast_stack(cx))
     }
 }
+
+/// Where to get Luvus, for the prompt shown when no `luvus` binary exists.
+const LUVUS_INSTALL_URL: &str = "https://luvus.dev";
 
 /// How often the window asks the local daemon which theme is selected.
 const THEME_POLL_LOCAL: Duration = Duration::from_secs(2);

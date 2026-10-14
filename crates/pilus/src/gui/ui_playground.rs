@@ -735,6 +735,52 @@ impl UiPlaygroundView {
             )
     }
 
+    fn empty_state_demo(&self) -> Div {
+        let theme = self.theme;
+        let fonts = self.fonts();
+        style::empty_state(
+            theme,
+            fonts,
+            icon(
+                include_bytes!("../../assets/icons/server.svg"),
+                fonts.headline,
+                theme.muted,
+            ),
+            "Luvus is not installed",
+            "pilus is a client for the Luvus daemon. Install Luvus to start workspaces and agents.",
+        )
+        .w_full()
+        .py_4()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(style::button(
+                    "playground-empty-install",
+                    "Install Luvus",
+                    ButtonKind::Primary,
+                    theme,
+                    fonts.secondary,
+                ))
+                .child(style::button_enabled(
+                    "playground-empty-installing",
+                    "Installing…",
+                    ButtonKind::Primary,
+                    theme,
+                    fonts.secondary,
+                    false,
+                ))
+                .child(style::button(
+                    "playground-empty-recheck",
+                    "Check again",
+                    ButtonKind::Secondary,
+                    theme,
+                    fonts.secondary,
+                )),
+        )
+    }
+
     fn context_gauge_demo(&self) -> Div {
         let theme = self.theme;
         let size = style::scaled(&self.settings, style::GAUGE_SIZE);
@@ -2083,6 +2129,7 @@ impl Render for UiPlaygroundView {
             .child(self.section("CONTEXT GAUGE", self.tray(self.context_gauge_demo())))
             .child(self.section("METER", self.tray(self.meter_demo())))
             .child(self.section("STAT TILE", self.tray(self.stat_tile_demo())))
+            .child(self.section("EMPTY STATE", self.tray(self.empty_state_demo())))
             .child(self.section("QR CODE", self.tray(self.qr_demo())))
             .child(
                 self.section(

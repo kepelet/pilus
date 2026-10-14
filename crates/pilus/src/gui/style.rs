@@ -18,7 +18,7 @@ use gpui::{
     Transformation, Window, canvas, div, font, percentage, point, prelude::*, px, svg,
 };
 
-use crate::settings::{CHROME_FONT, CORNER_RADIUS, Settings};
+use crate::settings::{CHROME_FONT, CORNER_RADIUS, DEFAULT_CORNER_RADIUS, Settings};
 
 use super::theme::Theme;
 use super::toast::ToastKind;
@@ -66,7 +66,7 @@ pub(super) enum Radius {
 /// it without threading the settings through every builder. The windows
 /// share one thread and one setting, and [`sync_corner_radius`] writes it
 /// before they build their trees.
-static CORNER_RADIUS_PX: AtomicU32 = AtomicU32::new(CORNER_RADIUS.to_bits());
+static CORNER_RADIUS_PX: AtomicU32 = AtomicU32::new(DEFAULT_CORNER_RADIUS.to_bits());
 
 /// Publish the user's corner radius for [`Radius`] to resolve against.
 pub(super) fn sync_corner_radius(settings: &Settings) {
@@ -293,6 +293,9 @@ pub(super) fn title(theme: Theme, text: impl IntoElement, size: f32) -> Div {
         .child(text)
 }
 
+/// How far a disabled control dims.
+const DISABLED_OPACITY: f32 = 0.55;
+
 /// The catalogue's button treatments.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ButtonKind {
@@ -314,7 +317,30 @@ pub(super) fn button(
     theme: Theme,
     text_size: f32,
 ) -> Stateful<Div> {
-    button_at(id, label, kind, theme, text_size, CONTROL_HEIGHT, px(12.0))
+    button_at(id, label, kind, theme, text_size, CONTROL_HEIGHT, px(12.0), true)
+}
+
+/// A regular-height button that can be switched off. A disabled one keeps its
+/// place but dims, takes no pointer, and ignores hover, so an action already
+/// under way cannot be started twice. Callers still guard their handler.
+pub(super) fn button_enabled(
+    id: impl Into<ElementId>,
+    label: impl IntoElement,
+    kind: ButtonKind,
+    theme: Theme,
+    text_size: f32,
+    enabled: bool,
+) -> Stateful<Div> {
+    button_at(
+        id,
+        label,
+        kind,
+        theme,
+        text_size,
+        CONTROL_HEIGHT,
+        px(12.0),
+        enabled,
+    )
 }
 
 /// A compact-height chrome button for dense rows and section headers.
@@ -333,6 +359,7 @@ pub(super) fn small_button(
         text_size,
         CONTROL_HEIGHT_SMALL,
         px(8.0),
+        true,
     )
 }
 
@@ -1177,6 +1204,35 @@ pub(super) fn stat_tile(
         )
 }
 
+/// A centered empty state: a glyph, a title, and a muted line of detail.
+/// Callers append the call to action, so one frame serves a surface with
+/// nothing to show and one that cannot show anything yet.
+pub(super) fn empty_state(
+    theme: Theme,
+    fonts: Fonts,
+    glyph: impl IntoElement,
+    title: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .px_6()
+        .text_center()
+        .child(glyph)
+        .child(self::title(theme, title.into(), fonts.title))
+        .child(
+            div()
+                .max_w(px(fonts.secondary * 30.0))
+                .text_size(px(fonts.secondary))
+                .text_color(theme.muted)
+                .child(detail.into()),
+        )
+}
+
 /// A stroked circular arc: `sweep` radians clockwise from `start` (0 is the
 /// 3 o'clock position), or the full ring when the sweep closes the circle.
 fn ring_arc(
@@ -1206,6 +1262,7 @@ fn ring_arc(
 }
 
 /// One button at an explicit height and horizontal padding.
+#[allow(clippy::too_many_arguments)]
 fn button_at(
     id: impl Into<ElementId>,
     label: impl IntoElement,
@@ -1214,6 +1271,7 @@ fn button_at(
     text_size: f32,
     height: f32,
     padding: Pixels,
+    enabled: bool,
 ) -> Stateful<Div> {
     let (bg, fg, border) = button_colors(kind, theme);
     let primary = kind == ButtonKind::Primary;
@@ -1249,9 +1307,10 @@ fn button_at(
         } else {
             FontWeight::NORMAL
         })
-        .cursor_pointer()
-        .state_fill(bg, hover_bg, RADIUS_MD)
-        .when(!primary, |button| {
+        .when(enabled, |button| button.cursor_pointer())
+        .when(!enabled, |button| button.opacity(DISABLED_OPACITY))
+        .state_fill(bg, if enabled { hover_bg } else { bg }, RADIUS_MD)
+        .when(!primary && enabled, |button| {
             button.hover(move |style| style.text_color(hover_fg))
         })
         .child(label)

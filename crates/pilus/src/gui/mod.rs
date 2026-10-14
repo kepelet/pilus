@@ -1053,6 +1053,9 @@ enum PromptAction {
     /// Move the focused terminal pane to a tab, resolved when answered.
     MovePane { endpoint: EndpointId },
     /// Create a linked worktree of the right-clicked workspace's repo.
+    /// Name a tab in the strip. Holds the tab's id rather than its position,
+    /// so a reorder while the prompt is open cannot rename the wrong tab.
+    RenameTab { tab_id: String },
     NewWorktree { endpoint: EndpointId, index: u16 },
     /// Create an empty file, or a folder, inside `dir` in the Files tab.
     CreateEntry {
@@ -9397,6 +9400,24 @@ impl PilusView {
                                 worktree_probe: None,
                                 worktree_cleared: None,
                                 worktree_escalated: None,
+            PromptAction::RenameTab { tab_id } => {
+                if trimmed.chars().count() > TAB_NAME_MAX {
+                    self.toast(
+                        ToastKind::Error,
+                        format!("tab names are capped at {TAB_NAME_MAX} characters"),
+                    );
+                    cx.notify();
+                    return;
+                }
+                // An empty name clears it, which hands the label back to the cwd.
+                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                    tab.name = trimmed.clone();
+                    if let Some(feed) = self.agent_feed.as_ref() {
+                        feed.rename_tab(tab.index, trimmed);
+                    }
+                }
+                cx.notify();
+            }
                             })
                             .ok();
                             None
@@ -9950,6 +9971,57 @@ impl PilusView {
         fullscreen: bool,
     ) -> Div {
         let theme = self.theme;
+    /// Open the rename prompt for the tab at `index`.
+    fn open_tab_rename(&mut self, index: u16, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.index == index) else {
+            return;
+        };
+        let (tab_id, name) = (tab.id.clone(), tab.name.clone());
+        self.open_menu_prompt(
+            PromptAction::RenameTab { tab_id },
+            "Rename tab",
+            "Name (empty shows the directory)",
+            &name,
+            cx,
+        );
+    }
+
+    /// Move the tab at `from` to position `to`, as a drag-and-drop asks.
+    ///
+    /// The strip reorders at once and holds off the daemon's list until it
+    /// reports the new order, so the dropped tab does not hop back for a
+    /// refresh. Anything keyed by tab position (the selection, an agent's
+    /// tab) follows the move.
+    fn reorder_tab(&mut self, from: u16, to: u16, cx: &mut Context<Self>) {
+        if from == to || !tab_exists(&self.tabs, from) || !tab_exists(&self.tabs, to) {
+            return;
+        }
+        self.tabs_pick = Some(TabsPick {
+            from: self.tabs.iter().map(|tab| tab.id.clone()).collect(),
+            at: Instant::now(),
+        });
+        for tab in &mut self.tabs {
+            tab.index = moved_position(tab.index, from, to);
+        }
+        self.tabs.sort_by_key(|tab| tab.index);
+        if let Some(selected) = self.tab_sel.as_mut() {
+            *selected = moved_position(*selected, from, to);
+        }
+        if let Some(workspace_id) = self.active_workspace_id() {
+            for agent in self
+                .agents
+                .iter_mut()
+                .filter(|agent| agent.workspace_id == workspace_id)
+            {
+                agent.tab = moved_position(agent.tab, from, to);
+            }
+        }
+        if let Some(feed) = self.agent_feed.as_ref() {
+            feed.move_tab(from, to);
+        }
+        cx.notify();
+    }
+
         // Beside the sidebar when it is open; full width when it is hidden.
         // The left inset only clears the floating traffic lights, which
         // fullscreen hides, so the strip runs to the edge there.
@@ -10089,24 +10161,33 @@ impl PilusView {
         let index = tab.index;
         let close_index = tab.index;
         let fg = if active { theme.panel_fg } else { theme.muted };
-        // Until `session.snapshot` enriches the tab, show the workspace's
+        // The cwd is the label until the tab is named. Until
+        // `session.snapshot` enriches the tab, it is the workspace's
         // breadcrumb cwd.
         let cwd = if tab.cwd.is_empty() {
             self.crumb_path()
         } else {
             self.shorten_cwd(&self.active.key(), &tab.cwd)
         };
-        let label = tab_label(&cwd, index);
+        let label = tab_label(&tab.name, &cwd, index);
+        let drag = TabDrag {
+            index,
+            label: label.clone(),
+            theme,
+            font_size: self.footer_font(),
+        };
         let process = if tab.process.is_empty() {
             "No terminal process"
         } else {
             tab.process.as_str()
         };
         let agent = self.tab_agent(index);
-        let mut tip_lines = vec![
-            (format!("Directory: {cwd}"), theme.muted),
-            (format!("Process: {process}"), theme.muted),
-        ];
+        let mut tip_lines = Vec::new();
+        if !tab.name.trim().is_empty() {
+            tip_lines.push((format!("Name: {}", tab.name.trim()), theme.muted));
+        }
+        tip_lines.push((format!("Directory: {cwd}"), theme.muted));
+        tip_lines.push((format!("Process: {process}"), theme.muted));
         if let Some(agent) = agent {
             tip_lines.push((
                 format!("Agent: {} · {}", agent.agent, status_label(&agent.status)),
@@ -10154,10 +10235,28 @@ impl PilusView {
             .hover_fill(
                 self.tab_raise(if active { 0.0 } else { SIDEBAR_HOVER_WEIGHT }),
                 style::RADIUS_SOFT,
+        tip_lines.push((
+            "Double-click to rename · drag to reorder".to_string(),
+            theme.muted,
+        ));
             )
             .text_color(fg)
+        let drop_fill = self.tab_raise(0.6);
             .hover(move |style| style.text_color(theme.panel_fg))
-            .tooltip(tip);
+            .tooltip(tip)
+            .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+            // The tab under a drag shows the pill it would take, unless it is
+            // the one being dragged.
+            .drag_over::<TabDrag>(move |style, drag, _, _| {
+                if drag.index == index {
+                    style
+                } else {
+                    style.bg(drop_fill)
+                }
+            })
+            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                this.reorder_tab(drag.index, index, cx);
+            }));
         let mut content = div()
             .flex_1()
             .flex()
@@ -10234,9 +10333,15 @@ impl PilusView {
         } else {
             tab
         };
-        tab.child(content)
-            .child(close)
-            .on_click(cx.listener(move |this, _, _, cx| this.focus_tab(index, cx)))
+        tab.child(content).child(close).on_click(cx.listener(
+            move |this, event: &ClickEvent, _, cx| {
+                if event.click_count() >= 2 {
+                    this.open_tab_rename(index, cx);
+                } else {
+                    this.focus_tab(index, cx);
+                }
+            },
+        ))
     }
 
     /// Daemon columns hidden beneath our sidebar: the dock the daemon blanks
@@ -14224,11 +14329,61 @@ fn abbreviate_path(path: &str) -> String {
         .join("/")
 }
 
-/// A tab's label: its abbreviated workspace cwd plus the `⌘N` shortcut. The
-/// cwd is capped before the shortcut is appended, so `⌘N` is never truncated
-/// away.
-fn tab_label(cwd: &str, index: u16) -> String {
-    format!("{} ⌘{index}", truncate_label(&abbreviate_path(cwd), 24))
+/// A tab's label: its name, or its abbreviated cwd while it has none, plus the
+/// `⌘N` shortcut. The text is capped before the shortcut is appended, so `⌘N`
+/// is never truncated away.
+fn tab_label(name: &str, cwd: &str, index: u16) -> String {
+    let name = name.trim();
+    let text = if name.is_empty() {
+        abbreviate_path(cwd)
+    } else {
+        name.to_string()
+    };
+    format!("{} ⌘{index}", truncate_label(&text, 24))
+}
+
+/// The longest name a tab takes, so one title cannot crowd the strip.
+const TAB_NAME_MAX: usize = 40;
+
+/// Where the tab at position `at` sits once the tab at `from` has moved to
+/// `to`: the moved tab lands on `to` and those between shift one step toward
+/// the gap it left.
+fn moved_position(at: u16, from: u16, to: u16) -> u16 {
+    if at == from {
+        to
+    } else if from < to && at > from && at <= to {
+        at - 1
+    } else if from > to && at >= to && at < from {
+        at + 1
+    } else {
+        at
+    }
+}
+
+/// A tab being dragged along the strip, carrying the position it started at.
+#[derive(Clone)]
+struct TabDrag {
+    index: u16,
+    label: String,
+    theme: Theme,
+    font_size: f32,
+}
+
+/// What GPUI draws at the pointer for a tab drag: the tab's own pill, so the
+/// drag reads as lifting it.
+impl Render for TabDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .h(px(TAB_HEIGHT))
+            .px_3()
+            .radius_soft()
+            .bg(self.theme.panel)
+            .text_color(self.theme.panel_fg)
+            .text_size(px(self.font_size))
+            .child(self.label.clone())
+    }
 }
 
 /// A color for an agent status dot.
@@ -14599,10 +14754,10 @@ mod tests {
     }
 
     #[test]
-    fn tab_label_keeps_cwd_and_shortcut() {
-        assert_eq!(tab_label("~/work/pilus", 3), "~/w/pilus ⌘3");
-        assert_eq!(tab_label("~", 1), "~ ⌘1");
-        let long = tab_label("~/work/a-directory-name-that-will-not-fit", 7);
+    fn tab_label_falls_back_to_cwd_and_keeps_shortcut() {
+        assert_eq!(tab_label("", "~/work/pilus", 3), "~/w/pilus ⌘3");
+        assert_eq!(tab_label("  ", "~", 1), "~ ⌘1");
+        let long = tab_label("", "~/work/a-directory-name-that-will-not-fit", 7);
         assert!(long.ends_with("… ⌘7"));
     }
 
@@ -14653,6 +14808,23 @@ mod tests {
             top_layer(false, false, false, false, Some(InputLayer::Mission)),
             InputLayer::Mission
         );
+    #[test]
+    fn tab_label_prefers_the_name_over_the_cwd() {
+        assert_eq!(tab_label("api", "~/work/pilus", 2), "api ⌘2");
+        let long = tab_label(&"n".repeat(40), "~/work/pilus", 9);
+        assert!(long.ends_with("… ⌘9"));
+    }
+
+    #[test]
+    fn moved_position_shifts_the_tabs_between() {
+        // 2 -> 4: tabs 3 and 4 slide left into the gap.
+        let after: Vec<u16> = (1..=5).map(|at| moved_position(at, 2, 4)).collect();
+        assert_eq!(after, [1, 4, 2, 3, 5]);
+        // 4 -> 2: tabs 2 and 3 slide right.
+        let after: Vec<u16> = (1..=5).map(|at| moved_position(at, 4, 2)).collect();
+        assert_eq!(after, [1, 3, 4, 2, 5]);
+    }
+
         assert_eq!(
             top_layer(false, false, false, false, Some(InputLayer::Automations)),
             InputLayer::Automations

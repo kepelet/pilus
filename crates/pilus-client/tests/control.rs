@@ -21,7 +21,7 @@ fn reads_and_commands_over_one_connection_per_request() {
 
     let listener = UnixListener::bind(&socket).expect("bind");
     let server = thread::spawn(move || {
-        for _ in 0..14 {
+        for _ in 0..16 {
             let (stream, _) = listener.accept().expect("accept");
             let mut reader = BufReader::new(stream.try_clone().expect("clone"));
             let mut writer = stream;
@@ -88,6 +88,16 @@ fn reads_and_commands_over_one_connection_per_request() {
                 }),
                 "tab.focus" => {
                     assert_eq!(request["params"]["tab"], "1");
+                    serde_json::json!({ "type": "ok" })
+                }
+                "tab.rename" => {
+                    assert_eq!(request["params"]["tab"], "2");
+                    assert_eq!(request["params"]["name"], "docs");
+                    serde_json::json!({ "type": "ok" })
+                }
+                "tab.move" => {
+                    assert_eq!(request["params"]["tab"], "1");
+                    assert_eq!(request["params"]["to"], "2");
                     serde_json::json!({ "type": "ok" })
                 }
                 "pane.focus" => {
@@ -174,6 +184,8 @@ fn reads_and_commands_over_one_connection_per_request() {
     assert_eq!(tabs[1].cwd, "/repo/docs");
     assert_eq!(tabs[1].process, "devin");
     client.focus_tab(1).expect("focus tab");
+    client.rename_tab(2, "docs").expect("rename tab");
+    client.move_tab(1, 2).expect("move tab");
 
     client.focus_pane("4").expect("focus pane");
 

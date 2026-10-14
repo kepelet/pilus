@@ -130,6 +130,9 @@ pub struct Settings {
     /// Height of the Diff's file list above the patch, in logical pixels; 0
     /// takes the default.
     pub diff_list_height: f32,
+    /// Width of the Diff's file list beside the patch when the page is wide,
+    /// in logical pixels; 0 takes the default.
+    pub diff_list_width: f32,
     /// Height of the Git tab's commit list above the open commit, in logical
     /// pixels; 0 takes the default.
     pub git_list_height: f32,
@@ -166,6 +169,7 @@ impl Default for Settings {
             last_session: None,
             last_endpoint: None,
             diff_list_height: 0.0,
+            diff_list_width: 0.0,
             git_list_height: 0.0,
             relay: pilus_client::RelaySettings::default(),
         }
@@ -445,6 +449,7 @@ mod tests {
             last_session: Some("kind-voyager".to_string()),
             last_endpoint: Some("build-box".to_string()),
             diff_list_height: 200.0,
+            diff_list_width: 320.0,
             git_list_height: 260.0,
             relay: pilus_client::RelaySettings {
                 secret: Some("project-secret".to_string()),

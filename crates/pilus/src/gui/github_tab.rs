@@ -1896,7 +1896,7 @@ impl PilusView {
         panel.fixture = true;
         panel.spot = Some(spot);
         panel.state = Some(match scene {
-            Scene::SignedOut => GhState::SignedOut,
+            Scene::SignedOut => GhState::SignedOut(String::new()),
             _ => GhState::Ready(RepoInfo {
                 name: "kepelet/pilus".to_string(),
                 url: "https://github.com/kepelet/pilus".to_string(),

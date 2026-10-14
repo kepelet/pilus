@@ -87,7 +87,7 @@ pub use pilus_protocol as protocol;
 pub use ports::{ListeningPort, PortForward, free_local_port, kill_process, list_ports};
 pub use read::{MAX_TEXT_BYTES, TextFile, Version, read_text};
 pub use relay::RelaySettings;
-pub use stage::{StageAction, set_staged};
+pub use stage::{Discard, StageAction, discard, set_staged};
 pub use surface::{Surface, SurfaceChange};
 pub use tasks::{NewTask, Task, TaskStatus, split_list};
 pub use transport::SshTarget;

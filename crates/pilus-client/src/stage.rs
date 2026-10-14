@@ -41,6 +41,27 @@ impl StageAction {
     }
 }
 
+/// What discarding a file throws away.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Discard {
+    /// A tracked file's edits (or its deletion): the working tree goes back to
+    /// what the index holds, so anything staged survives.
+    Edits,
+    /// A file Git does not track: it is deleted. Nothing can bring it back.
+    Untracked,
+}
+
+impl Discard {
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            // `checkout --` rather than `restore`, which older Git lacks.
+            Self::Edits => &["--literal-pathspecs", "checkout", "-q", "--"],
+            // `-d` because an untracked directory is listed as one entry.
+            Self::Untracked => &["--literal-pathspecs", "clean", "-f", "-d", "-q", "--"],
+        }
+    }
+}
+
 /// Stage or unstage `paths` (relative to the repository at `repo`) on this
 /// machine, or on `target`'s host. Failures carry Git's own message.
 pub fn set_staged(
@@ -49,6 +70,34 @@ pub fn set_staged(
     paths: &[String],
     action: StageAction,
 ) -> Result<(), String> {
+    let fallback = format!("couldn't {} the file", action.verb());
+    run_git(target, repo, action.args(), paths, &fallback)
+}
+
+/// Throw away the working-tree state of `paths`; see [`Discard`]. The caller
+/// confirms first, because neither kind can be undone.
+pub fn discard(
+    target: Option<&SshTarget>,
+    repo: &str,
+    paths: &[String],
+    kind: Discard,
+) -> Result<(), String> {
+    run_git(
+        target,
+        repo,
+        kind.args(),
+        paths,
+        "couldn't discard the changes",
+    )
+}
+
+fn run_git(
+    target: Option<&SshTarget>,
+    repo: &str,
+    args: &[&str],
+    paths: &[String],
+    fallback: &str,
+) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -56,10 +105,10 @@ pub fn set_staged(
         None => {
             let mut command = Command::new("git");
             command.arg("-C").arg(repo);
-            command.args(action.args()).args(paths);
+            command.args(args).args(paths);
             command
         }
-        Some(target) => target.shell(&remote_command(repo, paths, action)),
+        Some(target) => target.shell(&remote_command(repo, paths, args)),
     };
     let output = command
         .stdin(Stdio::null())
@@ -70,16 +119,16 @@ pub fn set_staged(
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     Err(if stderr.is_empty() {
-        format!("couldn't {} the file", action.verb())
+        fallback.to_string()
     } else {
         stderr
     })
 }
 
 /// The line the remote shell runs, every argument quoted.
-fn remote_command(repo: &str, paths: &[String], action: StageAction) -> String {
+fn remote_command(repo: &str, paths: &[String], args: &[&str]) -> String {
     let mut words = vec!["git".to_string(), "-C".to_string(), sh_quote(repo)];
-    words.extend(action.args().iter().map(|arg| sh_quote(arg)));
+    words.extend(args.iter().map(|arg| sh_quote(arg)));
     words.extend(paths.iter().map(|path| sh_quote(path)));
     words.join(" ")
 }
@@ -159,6 +208,53 @@ mod tests {
     }
 
     #[test]
+    fn discarding_edits_keeps_what_is_staged() {
+        let dir = repo("discard-edits");
+        let root = dir.to_str().expect("utf8");
+        std::fs::write(dir.join("a.txt"), "one\n").expect("write");
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.join("a.txt"), "two\n").expect("write");
+        git(&dir, &["add", "a.txt"]);
+        std::fs::write(dir.join("a.txt"), "three\n").expect("write");
+        discard(None, root, &paths(&["a.txt"]), Discard::Edits).expect("discard");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).expect("read"),
+            "two\n"
+        );
+        assert_eq!(git(&dir, &["status", "--porcelain"]), "M  a.txt\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discarding_a_deletion_brings_the_file_back() {
+        let dir = repo("discard-delete");
+        let root = dir.to_str().expect("utf8");
+        std::fs::write(dir.join("a.txt"), "one\n").expect("write");
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "first"]);
+        std::fs::remove_file(dir.join("a.txt")).expect("remove");
+        discard(None, root, &paths(&["a.txt"]), Discard::Edits).expect("discard");
+        assert_eq!(git(&dir, &["status", "--porcelain"]), "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discarding_untracked_deletes_only_the_named_paths() {
+        let dir = repo("discard-untracked");
+        let root = dir.to_str().expect("utf8");
+        std::fs::write(dir.join("a.rs"), "a\n").expect("write");
+        std::fs::write(dir.join("*.rs"), "star\n").expect("write");
+        std::fs::create_dir_all(dir.join("new")).expect("dir");
+        std::fs::write(dir.join("new/b.txt"), "b\n").expect("write");
+        discard(None, root, &paths(&["*.rs", "new/"]), Discard::Untracked).expect("discard");
+        assert!(dir.join("a.rs").exists(), "a pattern must not match a.rs");
+        assert!(!dir.join("*.rs").exists());
+        assert!(!dir.join("new").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn git_failures_surface_the_reason() {
         let error = set_staged(
             None,
@@ -172,7 +268,11 @@ mod tests {
 
     #[test]
     fn the_remote_line_quotes_every_word() {
-        let line = remote_command("/work/my repo", &paths(&["a b.rs"]), StageAction::Stage);
+        let line = remote_command(
+            "/work/my repo",
+            &paths(&["a b.rs"]),
+            StageAction::Stage.args(),
+        );
         assert_eq!(
             line,
             "git -C '/work/my repo' '--literal-pathspecs' 'add' '-A' '--' 'a b.rs'"

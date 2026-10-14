@@ -4,7 +4,9 @@
 # The updater's macOS installer expects a `.dmg` containing a single `pilus.app`
 # at its root; on download it mounts the image with `hdiutil`, copies the new
 # bundle over the running one with `ditto` (preserving its signature), and
-# relaunches via `open`. Asset names must stay
+# relaunches via `open`. The window Finder shows (background photo, arrow,
+# Applications link) is laid out by `dmg-settings.py`; extra root entries are
+# fine as long as none is a second `*.app`. Asset names must stay
 # `pilus-v<version>-macos-<arch>.dmg` — the client's GitHub source matches on
 # the `macos`, `<arch>`, and `.dmg` substrings.
 #
@@ -32,17 +34,29 @@ arch="arm64"
 
 ./scripts/bundle-macos.sh
 
-stage="target/release/dmg-stage"
 dmg="target/release/pilus-v${version}-macos-${arch}.dmg"
-rm -rf "$stage" "$dmg"
-mkdir -p "$stage"
-cp -R target/release/pilus.app "$stage/pilus.app"
+rm -f "$dmg"
 
-hdiutil create \
-    -volname "pilus" \
-    -srcfolder "$stage" \
-    -ov -format UDZO \
-    "$dmg" >/dev/null
+# `dmgbuild` writes the Finder layout (.DS_Store) directly, so packaging needs
+# no GUI session or AppleScript, unlike a Finder-driven DMG. The venv lives in
+# target/ and is reused across runs.
+venv="target/dmg-venv"
+if [ ! -x "$venv/bin/dmgbuild" ]; then
+    python3 -m venv "$venv"
+    "$venv/bin/pip" install --quiet "dmgbuild==1.6.7"
+fi
+
+# A multi-representation TIFF lets Finder pick the 2x background on Retina.
+background="target/release/dmg-background.tiff"
+tiffutil -cathidpicheck \
+    crates/pilus/assets/dmg/background.png \
+    crates/pilus/assets/dmg/background@2x.png \
+    -out "$background" 2>/dev/null
+
+"$venv/bin/dmgbuild" -s scripts/dmg-settings.py \
+    -D app=target/release/pilus.app \
+    -D background="$background" \
+    "pilus" "$dmg" >/dev/null
 
 if [ -n "${NOTARY_PROFILE:-}" ]; then
     # Gatekeeper trusts the update only when the bundle is notarized.

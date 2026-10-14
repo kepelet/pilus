@@ -23,7 +23,7 @@ use pilus_client::{Appearance, ControlClient, ControlTransport, ThemeInfo};
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, scheme};
-use crate::settings::{CORNER_RADIUS_MAX, Settings};
+use crate::settings::{CORNER_RADIUS_MAX, DEFAULT_CORNER_RADIUS, Settings};
 
 /// Width and height of the appearances window.
 const WINDOW_SIZE: (f32, f32) = (640.0, 600.0);
@@ -45,7 +45,7 @@ const TRANSLUCENT: (f32, f32) = (0.15, 1.0);
 /// Corner radius of the "Square" preset, in pixels.
 const SQUARE_RADIUS: f32 = 0.0;
 /// Corner radius of the "Rounded" preset, in pixels.
-const ROUNDED_RADIUS: f32 = 8.0;
+const ROUNDED_RADIUS: f32 = DEFAULT_CORNER_RADIUS;
 
 /// How close a stored value must sit to a preset to count as it, so a slider
 /// that landed a float's width away still reads as the preset.

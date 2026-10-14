@@ -19,14 +19,19 @@ pub const CHROME_FONT_FAMILY: &str = "Geist";
 pub const FONT_SIZE: f32 = 13.0;
 /// Default chrome text size in logical pixels.
 pub const CHROME_FONT: f32 = 13.0;
-/// Default window opacity for glass surfaces (terminal, sidebar, tab strip).
-pub const OPACITY: f32 = 0.85;
-/// Default blur strength over the desktop: full system blur.
-pub const BLUR: f32 = 1.0;
-/// Default corner radius in logical pixels: what `rounded_md` drew before the
-/// radius became a setting. Controls, cards, and overlays use it directly;
-/// the dense and large steps scale from it.
+/// Default window opacity for glass surfaces (terminal, sidebar, tab strip):
+/// fully opaque, the Appearances "Solid" material.
+pub const OPACITY: f32 = 1.0;
+/// Default blur strength over the desktop: none, which is what an opaque
+/// window wants.
+pub const BLUR: f32 = 0.0;
+/// The corner radius `rounded_md` drew before the radius became a setting.
+/// It stays the floor the tab strip never squares below.
 pub const CORNER_RADIUS: f32 = 6.0;
+/// Default corner radius in logical pixels: the Appearances "Rounded"
+/// material. Controls, cards, and overlays use it directly; the dense and
+/// large steps scale from it.
+pub const DEFAULT_CORNER_RADIUS: f32 = 8.0;
 /// The largest corner radius the Appearances slider offers.
 pub const CORNER_RADIUS_MAX: f32 = 16.0;
 
@@ -79,13 +84,13 @@ pub struct Settings {
     /// Off by default; the Remote Machines window toggles it.
     pub connector: bool,
     /// Window opacity for glass surfaces (terminal, sidebar, tab strip);
-    /// 1.0 is opaque. Files written before the control existed stay
-    /// translucent via the default.
+    /// 1.0 is opaque. Files written before the control existed take the
+    /// default.
     #[serde(default = "default_opacity")]
     pub opacity: f32,
     /// Blur strength over the desktop; 1.0 is the full system blur and 0.0
     /// drops the blur view so the desktop shows sharp. Files written before
-    /// the control existed keep full blur via the default.
+    /// the control existed take the default.
     #[serde(default = "default_blur")]
     pub blur: f32,
     /// Corner radius of controls, cards, and overlays, in logical pixels.
@@ -103,14 +108,15 @@ pub struct Settings {
     /// there; turn it off for an older Luvus or one with `show_title`
     /// enabled.
     pub terminal_top_spacing: bool,
-    /// The same choice for the local daemon. Off by default: the Luvus
-    /// installed alongside pilus still draws its title row.
+    /// The same choice for the local daemon. On by default, like remote
+    /// machines; turn it off for a Luvus that still draws its title row.
     pub local_terminal_top_spacing: bool,
     /// Draw split panes with pilus's own rounded frames in place of
     /// the daemon's square box-drawing borders. Off keeps the daemon's.
     pub pane_ui: bool,
     /// Draw the focused pane's corner toolbar (split, fullscreen, close).
-    /// Only shows with `pane_ui`, which owns the frames it sits on.
+    /// Off by default; only shows with `pane_ui`, which owns the frames it
+    /// sits on.
     pub pane_toolbar: bool,
     /// Whether the right sidebar (Changes and History tabs) is open.
     pub right_sidebar_visible: bool,
@@ -159,13 +165,13 @@ impl Default for Settings {
             connector: false,
             opacity: OPACITY,
             blur: BLUR,
-            corner_radius: CORNER_RADIUS,
+            corner_radius: DEFAULT_CORNER_RADIUS,
             sidebar_workspace_paths: false,
             sidebar_agent_paths: false,
             terminal_top_spacing: true,
-            local_terminal_top_spacing: false,
+            local_terminal_top_spacing: true,
             pane_ui: true,
-            pane_toolbar: true,
+            pane_toolbar: false,
             right_sidebar_visible: false,
             right_sidebar_width: 0.0,
             right_sidebar_tab: String::new(),
@@ -264,7 +270,7 @@ impl Settings {
         if self.corner_radius.is_finite() {
             self.corner_radius.clamp(0.0, CORNER_RADIUS_MAX)
         } else {
-            CORNER_RADIUS
+            DEFAULT_CORNER_RADIUS
         }
     }
 }
@@ -303,13 +309,13 @@ mod tests {
         let back: Settings =
             serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
         assert!(back.terminal_top_spacing);
-        assert!(!back.local_terminal_top_spacing);
+        assert!(back.local_terminal_top_spacing);
         assert!(back.pane_ui);
-        assert!(back.pane_toolbar);
+        assert!(!back.pane_toolbar);
     }
 
     #[test]
-    fn missing_opacity_stays_translucent() {
+    fn missing_opacity_takes_the_solid_default() {
         // Files written before the control existed have no opacity key.
         let back: Settings =
             serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
@@ -371,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_blur_keeps_full_blur() {
+    fn missing_blur_takes_the_solid_default() {
         // Files written before the control existed have no blur key.
         let back: Settings =
             serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
@@ -379,10 +385,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_corner_radius_keeps_the_old_look() {
+    fn missing_corner_radius_takes_the_rounded_default() {
         let back: Settings =
             serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
-        assert_eq!(back.radius(), CORNER_RADIUS);
+        assert_eq!(back.radius(), DEFAULT_CORNER_RADIUS);
     }
 
     #[test]
@@ -393,7 +399,7 @@ mod tests {
         settings.corner_radius = 99.0;
         assert_eq!(settings.radius(), CORNER_RADIUS_MAX);
         settings.corner_radius = f32::NAN;
-        assert_eq!(settings.radius(), CORNER_RADIUS);
+        assert_eq!(settings.radius(), DEFAULT_CORNER_RADIUS);
     }
 
     #[test]

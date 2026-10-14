@@ -12,7 +12,8 @@
 use std::collections::HashMap;
 
 use pilus_client::{
-    DiffFile, DiffLineKind, DiffNote, FileDiff, NoteKind, NoteRange, NoteSide, NoteState,
+    DiffFile, DiffLayer, DiffLineKind, DiffNote, FileDiff, NoteKind, NoteRange, NoteSide,
+    NoteState, StageAction,
 };
 
 use super::highlight::{self, Span};
@@ -463,24 +464,60 @@ impl FileFilter {
     }
 }
 
-/// The files `filter` admits, in list order: grouped by layer, conflicts
-/// first, each group keeping the daemon's order.
+/// Whether `file`'s path answers a search: every word of `query` appears in
+/// it, in any order and ignoring case. A renamed file answers to both its
+/// names, so a search for where it came from still finds it. An empty query
+/// admits everything.
+pub(super) fn matches_query(file: &DiffFile, query: &str) -> bool {
+    let path = file.path.to_lowercase();
+    let old = file.renamed().then(|| file.old_path.to_lowercase());
+    query.split_whitespace().all(|word| {
+        let word = word.to_lowercase();
+        path.contains(&word) || old.as_ref().is_some_and(|old| old.contains(&word))
+    })
+}
+
+/// The files `filter` and `query` admit, in list order: grouped by layer,
+/// conflicts first, each group keeping the daemon's order.
 pub(super) fn visible_files(
     files: &[DiffFile],
     filter: FileFilter,
+    query: &str,
     viewed: impl Fn(&DiffFile) -> bool,
 ) -> Vec<usize> {
     let mut order = Vec::new();
-    for layer in pilus_client::DiffLayer::ALL {
+    for layer in DiffLayer::ALL {
         order.extend(
             files
                 .iter()
                 .enumerate()
-                .filter(|(_, file)| file.layer == layer && filter.admits(file, viewed(file)))
+                .filter(|(_, file)| {
+                    file.layer == layer
+                        && filter.admits(file, viewed(file))
+                        && matches_query(file, query)
+                })
                 .map(|(index, _)| index),
         );
     }
     order
+}
+
+/// The layer `path` sits in once `action` has run, for a selection to follow
+/// the file it was on. Staging lands in the index; unstaging leaves the file
+/// edited or, when it was new, untracked.
+pub(super) fn layer_after(
+    files: &[DiffFile],
+    path: &str,
+    action: StageAction,
+) -> Option<DiffLayer> {
+    let candidates: &[DiffLayer] = match action {
+        StageAction::Stage => &[DiffLayer::Staged],
+        StageAction::Unstage => &[DiffLayer::Worktree, DiffLayer::Untracked],
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|layer| files.iter().any(|f| f.layer == *layer && f.path == path))
 }
 
 /// Notes still pointing at live code and awaiting a decision.
@@ -787,10 +824,87 @@ mod tests {
         let mut noted = file();
         noted.notes = 1;
         let files = vec![staged, noted, conflict];
-        let all = visible_files(&files, FileFilter::All, |_| false);
+        let all = visible_files(&files, FileFilter::All, "", |_| false);
         assert_eq!(all, vec![2, 0, 1]);
-        assert_eq!(visible_files(&files, FileFilter::Notes, |_| false), vec![1]);
-        assert!(visible_files(&files, FileFilter::Unviewed, |_| true).is_empty());
+        assert_eq!(
+            visible_files(&files, FileFilter::Notes, "", |_| false),
+            vec![1]
+        );
+        assert!(visible_files(&files, FileFilter::Unviewed, "", |_| true).is_empty());
         assert_eq!(FileFilter::Notes.next(), FileFilter::All);
+    }
+
+    #[test]
+    fn a_search_narrows_by_every_word_of_the_path() {
+        let named = |path: &str| {
+            let mut f = file();
+            f.path = path.into();
+            f.old_path = path.into();
+            f
+        };
+        let files = vec![
+            named("crates/pilus/src/gui/diff.rs"),
+            named("crates/pilus/src/gui/Style.rs"),
+            named("README.md"),
+        ];
+        let find = |query: &str| visible_files(&files, FileFilter::All, query, |_| false);
+        assert_eq!(find(""), vec![0, 1, 2]);
+        assert_eq!(find("   "), vec![0, 1, 2]);
+        assert_eq!(find("STYLE"), vec![1]);
+        assert_eq!(find("gui diff"), vec![0]);
+        assert_eq!(find("diff gui"), vec![0]);
+        assert!(find("missing").is_empty());
+    }
+
+    #[test]
+    fn a_search_also_matches_where_a_renamed_file_came_from() {
+        let mut moved = file();
+        moved.path = "new_name.rs".into();
+        moved.old_path = "old_name.rs".into();
+        assert!(matches_query(&moved, "old_name"));
+        assert!(matches_query(&moved, "new_name"));
+        assert!(!matches_query(&moved, "other"));
+    }
+
+    #[test]
+    fn a_selection_follows_a_file_to_its_new_layer() {
+        let at = |layer: DiffLayer, path: &str| {
+            let mut f = file();
+            f.layer = layer;
+            f.path = path.into();
+            f
+        };
+        let staged = vec![at(DiffLayer::Staged, "a.rs")];
+        assert_eq!(
+            layer_after(&staged, "a.rs", StageAction::Stage),
+            Some(DiffLayer::Staged)
+        );
+        let edited = vec![at(DiffLayer::Worktree, "a.rs")];
+        assert_eq!(
+            layer_after(&edited, "a.rs", StageAction::Unstage),
+            Some(DiffLayer::Worktree)
+        );
+        let new = vec![at(DiffLayer::Untracked, "a.rs")];
+        assert_eq!(
+            layer_after(&new, "a.rs", StageAction::Unstage),
+            Some(DiffLayer::Untracked)
+        );
+        // The file is gone from the list, as after a commit elsewhere.
+        assert_eq!(layer_after(&new, "b.rs", StageAction::Stage), None);
+    }
+
+    #[test]
+    fn a_search_composes_with_the_filter() {
+        let mut noted = file();
+        noted.path = "a.rs".into();
+        noted.notes = 1;
+        let mut plain = file();
+        plain.path = "b.rs".into();
+        let files = vec![noted, plain];
+        assert_eq!(
+            visible_files(&files, FileFilter::Notes, "rs", |_| false),
+            vec![0]
+        );
+        assert!(visible_files(&files, FileFilter::Notes, "b.rs", |_| false).is_empty());
     }
 }

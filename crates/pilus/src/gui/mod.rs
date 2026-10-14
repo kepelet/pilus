@@ -1796,6 +1796,16 @@ impl PilusView {
         })
         .detach();
 
+        // The file list filters on what the search field holds. The field also
+        // notifies on caret blinks, which must not repaint the page.
+        cx.observe(&diff_inputs.search, |this, input, cx| {
+            let query = input.read(cx).value();
+            if this.diff_panel.set_query(query) {
+                cx.notify();
+            }
+        })
+        .detach();
+
         let active_live = connection.is_some();
         let mut view = Self {
             target,
@@ -5213,10 +5223,14 @@ impl PilusView {
                 .tasks_inputs
                 .focus_handle(self.tasks_panel.compose_focus(), cx),
             InputLayer::Tasks => None,
-            // The note field holds focus while it is open; otherwise the
-            // window root reads the page's shortcuts.
+            // The note field holds focus while it is open, and the search
+            // field while it is being typed in; otherwise the window root
+            // reads the page's shortcuts.
             InputLayer::Diff if self.diff_panel.composing() => {
                 Some(self.diff_inputs.focus_handle(cx))
+            }
+            InputLayer::Diff if self.diff_panel.searching() => {
+                Some(self.diff_inputs.search_focus_handle(cx))
             }
             InputLayer::Diff => None,
             // The open comment or pull request field holds focus.

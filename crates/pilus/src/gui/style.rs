@@ -2303,23 +2303,48 @@ pub(super) fn field(
                 .text_color(theme.muted)
                 .child(label.to_string()),
         )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .min_h(px(height))
-                .px_2()
-                .radius_md()
-                .bg(theme.panel_dim)
-                .border_1()
-                .border_color(if focused {
-                    theme.border_focus
-                } else {
-                    theme.border
-                })
-                .cursor_pointer()
-                .child(body),
-        )
+        .child(field_box(focused, theme, height).child(body))
+}
+
+/// The boxed control a [`field`] and a [`search_field`] share.
+fn field_box(focused: bool, theme: Theme, height: f32) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .min_h(px(height))
+        .px_2()
+        .radius_md()
+        .bg(theme.panel_dim)
+        .border_1()
+        .border_color(if focused {
+            theme.border_focus
+        } else {
+            theme.border
+        })
+        .cursor_pointer()
+}
+
+/// A field with no label, for narrowing a list in place: a magnifier before
+/// the editable body. The caller owns focus and click behavior, as with
+/// [`field`].
+pub(super) fn search_field(
+    id: impl Into<ElementId>,
+    focused: bool,
+    theme: Theme,
+    height: f32,
+    icon_size: f32,
+    body: impl IntoElement,
+) -> Stateful<Div> {
+    div().id(id).child(
+        field_box(focused, theme, height)
+            .gap_2()
+            .child(super::icon(
+                include_bytes!("../../assets/icons/search.svg"),
+                icon_size,
+                theme.muted,
+            ))
+            .child(div().flex_1().min_w(px(0.0)).child(body)),
+    )
 }
 
 /// How long a folding card takes to reach its new height.

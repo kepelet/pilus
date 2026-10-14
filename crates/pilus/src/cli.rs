@@ -9,6 +9,9 @@ use pilus_client::ConnectTarget;
 pub enum Launch {
     /// Open the desktop window.
     Gui(ConnectTarget),
+    /// Run with only the menu bar item and no window, the copy a quit leaves
+    /// behind.
+    MenuBar(ConnectTarget),
     /// Connect once, then print the surface and exit. `workspaces` also claims
     /// the workspaces dock; `open_menu` drives the Settings chord.
     Probe {
@@ -60,7 +63,8 @@ pub enum Launch {
 pub fn run() -> Result<()> {
     let launch = parse(std::env::args().skip(1))?;
     match launch {
-        Launch::Gui(target) => run_gui(target),
+        Launch::Gui(target) => run_gui(target, false),
+        Launch::MenuBar(target) => run_gui(target, true),
         Launch::Probe {
             target,
             workspaces,
@@ -80,6 +84,7 @@ pub fn run() -> Result<()> {
 pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
     let mut target = ConnectTarget::local();
     let mut probe = false;
+    let mut menubar = false;
     let mut workspaces = false;
     let mut open_menu = false;
     let mut uhp = false;
@@ -106,6 +111,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
                     .ok_or_else(|| anyhow::anyhow!("--session needs a name"))?;
                 target = ConnectTarget::session(name);
             }
+            "--menubar" => menubar = true,
             "--probe" => probe = true,
             "--probe-workspaces" => {
                 probe = true;
@@ -191,6 +197,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
             workspaces,
             open_menu,
         })
+    } else if menubar {
+        Ok(Launch::MenuBar(target))
     } else {
         Ok(Launch::Gui(target))
     }
@@ -203,6 +211,7 @@ fn print_help() {
          OPTIONS:\n\
          \x20   --session NAME   Attach to a named Luvus session\n\
          \x20   --socket PATH    Attach to an explicit client-socket path\n\
+         \x20   --menubar        Run only the menu bar item (macOS); a quit leaves this behind\n\
          \x20   --probe          Connect once and print the first frame\n\
          \x20   --probe-workspaces  Probe while claiming the workspaces dock\n\
          \x20   --probe-menu     Probe, then open the daemon's Menu by click\n\
@@ -435,12 +444,12 @@ fn run_check_updates(channel: Option<String>, feed_url: Option<String>) -> Resul
 }
 
 #[cfg(feature = "gui")]
-fn run_gui(target: ConnectTarget) -> Result<()> {
-    crate::gui::run(target)
+fn run_gui(target: ConnectTarget, menubar_only: bool) -> Result<()> {
+    crate::gui::run(target, menubar_only)
 }
 
 #[cfg(not(feature = "gui"))]
-fn run_gui(_target: ConnectTarget) -> Result<()> {
+fn run_gui(_target: ConnectTarget, _menubar_only: bool) -> Result<()> {
     bail!("this build has no GUI; rebuild with --features gui")
 }
 

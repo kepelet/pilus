@@ -70,6 +70,9 @@ pub struct Settings {
     /// Override the release feed with a static manifest URL; empty uses the
     /// channel default (`releases.kepelet.com/pilus/<channel>.json`).
     pub update_feed_url: Option<String>,
+    /// Show the agent list in the macOS menu bar. On by default; a no-op on
+    /// other platforms.
+    pub menu_bar: bool,
     /// Frame of the main window, restored on the next launch.
     pub window: Option<WindowGeometry>,
     /// Run the host connector ("this node" remote access) while pilus is open.
@@ -151,6 +154,7 @@ impl Default for Settings {
             update_channel: "stable".to_string(),
             auto_check_updates: false,
             update_feed_url: None,
+            menu_bar: true,
             window: None,
             connector: false,
             opacity: OPACITY,
@@ -415,6 +419,16 @@ mod tests {
     }
 
     #[test]
+    fn menu_bar_is_on_unless_a_file_says_otherwise() {
+        assert!(Settings::default().menu_bar);
+        let old: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert!(old.menu_bar);
+        let off: Settings = serde_json::from_str(r#"{"menu_bar":false}"#).expect("deserialize");
+        assert!(!off.menu_bar);
+    }
+
+    #[test]
     fn round_trips_through_json() {
         let settings = Settings {
             ui_font: Some("Helvetica".to_string()),
@@ -432,6 +446,7 @@ mod tests {
                 maximized: true,
                 display: Some("6d0f9a4c-30b2-4f25-9a2e-4a8f9c3b7d10".to_string()),
             }),
+            menu_bar: false,
             connector: true,
             opacity: 0.7,
             blur: 0.5,

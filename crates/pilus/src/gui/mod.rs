@@ -6,10 +6,12 @@
 //! that one panel natively, and selects text over the grid itself.
 
 mod about;
+mod agent_watch;
 mod app_icon;
 mod appearances;
 mod attention;
 mod automations;
+mod background;
 mod box_drawing;
 mod connector;
 mod diff;
@@ -26,6 +28,7 @@ mod keys;
 mod machines;
 mod markdown;
 mod md_view;
+mod menubar;
 mod mission;
 mod orchestration;
 mod page_split;
@@ -86,6 +89,7 @@ use gpui_platform::application;
 use gpui_updater_core::{Release, UpdateStatus, Version};
 use home::{HomeField, HomeFocus, HomePanel};
 use machines::MachineOp;
+use menubar::MenuBar;
 use mission::MissionPanel;
 use page_split::{PageSplit, SplitAxis, page_extent};
 use palette::{Command, Entry, Palette};
@@ -373,7 +377,7 @@ pub(crate) struct MachineSignal {
 }
 
 /// Open the desktop window and attach to `target`.
-pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
+pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
     // The window opens before the daemon is attached, so a stopped or
     // protocol-incompatible daemon cannot stop `pilus` from launching. The
     // view's local reconnect loop owns the first attach and every retry, and
@@ -383,6 +387,10 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     let config_root = config_dir();
     let pilus_root = pilus_config_dir();
     migrate_legacy_stores(&config_root, &pilus_root);
+    // A helper a quit left behind hands its menu bar item to this process.
+    if !menubar_only {
+        background::retire_helper(&pilus_root);
+    }
     let settings = Rc::new(RefCell::new(Settings::load(&pilus_root)));
     let target = reopen_last_session(target, &settings.borrow(), &config_root);
     let restore_endpoint = settings.borrow().last_endpoint.clone();
@@ -392,7 +400,27 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     let machine_signal = Rc::new(RefCell::new(MachineSignal::default()));
     let shared_theme = Rc::new(RefCell::new(Theme::default()));
 
-    application().run(move |cx: &mut App| {
+    let app_shared = AppShared {
+        target: new_window_target.clone(),
+        settings: settings.clone(),
+        signal: machine_signal.clone(),
+        theme: shared_theme.clone(),
+        config_root: config_root.clone(),
+        pilus_root: pilus_root.clone(),
+        menubar_only,
+    };
+    let app = application();
+    // Clicking the Dock icon with every window closed brings one back.
+    app.on_reopen({
+        let app_shared = app_shared.clone();
+        move |cx| {
+            if !app_shared.has_window(cx) {
+                app_shared.open_window(None, cx);
+            }
+            cx.activate(true);
+        }
+    });
+    app.run(move |cx: &mut App| {
         fonts::install(cx.text_system());
         app_icon::install();
         // Name the process for notification and taskbar identity. Read the
@@ -439,6 +467,19 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
         cx.on_action(|_: &QuitApp, cx: &mut App| {
             cx.quit();
         });
+        // Quitting leaves the menu bar item standing, in a helper process,
+        // unless the user ended pilus from the item itself.
+        cx.on_app_quit({
+            let settings = settings.clone();
+            let app_shared = app_shared.clone();
+            move |_| {
+                if background::hand_off_wanted(settings.borrow().menu_bar) {
+                    background::spawn_helper(&app_shared.pilus_root, &app_shared.target);
+                }
+                async {}
+            }
+        })
+        .detach();
         cx.on_action(|_: &HideApp, cx: &mut App| cx.hide());
         cx.on_action(|_: &HideOtherApps, cx: &mut App| cx.hide_other_apps());
         // Key and menu dispatch run inside the target window's own update,
@@ -470,20 +511,22 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
             });
         });
         cx.on_action({
-            let target = new_window_target.clone();
-            let settings = settings.clone();
-            let signal = machine_signal.clone();
-            let theme = shared_theme.clone();
-            move |_: &NewWindow, cx: &mut App| {
-                open_main_window(
-                    target.clone(),
-                    settings.clone(),
-                    signal.clone(),
-                    theme.clone(),
-                    cx,
-                )
-            }
+            let app_shared = app_shared.clone();
+            move |_: &NewWindow, cx: &mut App| app_shared.open_window(None, cx)
         });
+        // The menu bar item outlives every window, so while none is open the
+        // app feeds and serves it itself.
+        cx.spawn({
+            let app_shared = app_shared.clone();
+            async move |cx| {
+                let mut watch = None;
+                loop {
+                    cx.update(|cx| app_shared.tick_menubar(&mut watch, cx));
+                    cx.background_executor().timer(MENU_BAR_TICK).await;
+                }
+            }
+        })
+        .detach();
         cx.on_action(|_: &CloseAllWindows, cx: &mut App| {
             cx.defer(|cx| {
                 for window in cx.windows() {
@@ -560,6 +603,12 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
                 MenuItem::action("Close Window", CloseWindow),
             ]),
         ]);
+        // The helper opens no window: it is only the menu bar item, until a
+        // click or a second launch asks for one.
+        if menubar_only {
+            background::set_accessory(true);
+            return;
+        }
         let (bounds, display_id) = remembered_frame(&settings.borrow(), cx);
         let opened = cx.open_window(
             WindowOptions {
@@ -594,6 +643,98 @@ pub fn run(target: ConnectTarget) -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+/// What opening a window needs, kept by the app so a window can open when none
+/// is left: from the menu bar, the Dock, or File > New Window.
+#[derive(Clone)]
+struct AppShared {
+    target: ConnectTarget,
+    settings: Rc<RefCell<Settings>>,
+    signal: Rc<RefCell<MachineSignal>>,
+    theme: Rc<RefCell<Theme>>,
+    config_root: PathBuf,
+    pilus_root: PathBuf,
+    /// Started as the menu-bar-only helper rather than the full app.
+    menubar_only: bool,
+}
+
+/// How often the app checks on the menu bar while no window does.
+const MENU_BAR_TICK: Duration = Duration::from_millis(250);
+
+impl AppShared {
+    /// Whether a main window is open. Other windows (Appearances, About) do
+    /// not feed the menu bar or count here.
+    fn has_window(&self, cx: &App) -> bool {
+        cx.windows()
+            .iter()
+            .any(|window| window.downcast::<PilusView>().is_some())
+    }
+
+    /// Open a main window, then focus `menu_pick` once its endpoint is up.
+    fn open_window(&self, menu_pick: Option<(String, String)>, cx: &mut App) {
+        // The helper has no Dock icon; a window makes it the full app.
+        background::set_accessory(false);
+        let target = reopen_last_session(
+            self.target.clone(),
+            &self.settings.borrow(),
+            &self.config_root,
+        );
+        open_main_window(
+            target,
+            self.settings.clone(),
+            self.signal.clone(),
+            self.theme.clone(),
+            menu_pick,
+            cx,
+        );
+    }
+
+    /// Run the menu bar while no window does: watch the daemons, draw their
+    /// agents, and turn a click into a window. With a window open the view
+    /// feeds the item and the watch is dropped.
+    fn tick_menubar(&self, watch: &mut Option<agent_watch::Watch>, cx: &mut App) {
+        if self.has_window(cx) {
+            *watch = None;
+            return;
+        }
+        let enabled = self.settings.borrow().menu_bar;
+        if !enabled {
+            *watch = None;
+            menubar::headless(false, &[]);
+            // The helper exists for the item alone, so without one it ends.
+            if self.menubar_only {
+                background::quit_fully(cx);
+            }
+            return;
+        }
+        let watch = watch.get_or_insert_with(|| {
+            let target = reopen_last_session(
+                self.target.clone(),
+                &self.settings.borrow(),
+                &self.config_root,
+            );
+            let (root, session) = match &target.socket {
+                Some(path) => split_client_socket(path).unwrap_or_else(|| (config_dir(), None)),
+                None => (config_dir(), target.session.clone()),
+            };
+            agent_watch::Watch::new(api_socket_for(&root, session.as_deref()), root, session)
+        });
+        let rows = watch.rows(*self.theme.borrow());
+        for pick in menubar::headless(true, &rows) {
+            match pick {
+                menubar::Pick::Quit => background::quit_fully(cx),
+                menubar::Pick::Show => {
+                    self.open_window(None, cx);
+                    cx.activate(true);
+                }
+                menubar::Pick::Agent { endpoint, pane } => {
+                    self.open_window(Some((endpoint, pane)), cx);
+                    cx.activate(true);
+                }
+            }
+        }
+    }
 }
 
 /// Swap a plain launch's target for the session the window was last attached
@@ -748,6 +889,7 @@ fn open_main_window(
     settings: Rc<RefCell<Settings>>,
     machine_signal: Rc<RefCell<MachineSignal>>,
     shared_theme: Rc<RefCell<Theme>>,
+    menu_pick: Option<(String, String)>,
     cx: &mut App,
 ) {
     let bounds = WindowBounds::centered(size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
@@ -766,7 +908,12 @@ fn open_main_window(
         move |window, cx| {
             let signal = machine_signal.clone();
             let theme = shared_theme.clone();
-            cx.new(move |cx| PilusView::new(target, None, settings, signal, theme, window, cx))
+            let view =
+                cx.new(move |cx| PilusView::new(target, None, settings, signal, theme, window, cx));
+            view.update(cx, |view, _| {
+                view.menu_pick = menu_pick.map(|(endpoint, pane)| (endpoint, pane, Instant::now()));
+            });
+            view
         },
     );
     if let Err(error) = opened {
@@ -1052,10 +1199,10 @@ enum PromptAction {
     RenamePane { endpoint: EndpointId },
     /// Move the focused terminal pane to a tab, resolved when answered.
     MovePane { endpoint: EndpointId },
-    /// Create a linked worktree of the right-clicked workspace's repo.
     /// Name a tab in the strip. Holds the tab's id rather than its position,
     /// so a reorder while the prompt is open cannot rename the wrong tab.
     RenameTab { tab_id: String },
+    /// Create a linked worktree of the right-clicked workspace's repo.
     NewWorktree { endpoint: EndpointId, index: u16 },
     /// Create an empty file, or a folder, inside `dir` in the Files tab.
     CreateEntry {
@@ -1272,6 +1419,14 @@ struct PilusView {
     /// Dock bounce and badge for pushes that arrive while pilus is behind
     /// another app.
     dock: Dock,
+    /// The menu bar's agent list; one window at a time owns the item.
+    menubar: MenuBar,
+    /// This window, so a menu bar click can bring it forward.
+    window_handle: gpui::AnyWindowHandle,
+    /// An agent chosen in the menu bar, waiting for its endpoint to connect:
+    /// a click with no window open starts a window, and the endpoint is not
+    /// there yet. Dropped once it lands or after [`MENU_PICK_PATIENCE`].
+    menu_pick: Option<(String, String, Instant)>,
     /// Spots agents that start waiting on the user, across every endpoint.
     attention: attention::Watch,
     /// Measured monospace advance width, resolved once from the font.
@@ -1848,6 +2003,9 @@ impl PilusView {
             window_active: false,
             toasts: Toasts::new(),
             dock: Dock::new(),
+            menubar: MenuBar::new(cx.entity_id().as_u64()),
+            window_handle: window.window_handle(),
+            menu_pick: None,
             attention: attention::Watch::default(),
             cell_width: None,
             sent_cell: (0, 0),
@@ -2134,6 +2292,7 @@ impl PilusView {
             .tick(Instant::now(), self.window_active, cx.reduce_motion());
         self.dock.sync();
         changed |= self.poll_endpoints();
+        self.sync_menubar(cx);
         changed |= self.poll_machine_connects();
         self.pump_reconnects();
         self.drive_pending_switch();
@@ -5752,6 +5911,10 @@ impl PilusView {
             )
             .children(identity)
             .children(relay)
+            .children(cfg!(target_os = "macos").then(|| {
+                style::section_card_tab(theme, "MENU BAR", self.section_font())
+                    .child(self.menu_bar_section_block(cx))
+            }))
             .child(
                 style::section_card_tab(theme, "REMOTE MACHINES", self.section_font())
                     .child(self.machines_section_block(cx)),
@@ -8020,6 +8183,107 @@ impl PilusView {
         self.save_update_settings(cx);
     }
 
+    /// The MENU BAR section: whether the agent list lives in the menu bar.
+    fn menu_bar_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let on = self.settings.menu_bar;
+        div().flex().flex_col().gap_2().child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .pb_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(self.footer_font()))
+                        .text_color(theme.muted)
+                        .child(
+                            "Lists your agents in the menu bar, with a dot for each one's status. Choosing one brings it into focus. Quitting pilus leaves the menu bar running; choose Quit pilus from it to exit fully.",
+                        ),
+                )
+                .child(
+                    style::toggle("pilus-menu-bar-toggle", on, theme).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.settings.menu_bar = !this.settings.menu_bar;
+                            this.save_settings();
+                            cx.notify();
+                        },
+                    )),
+                ),
+        )
+    }
+
+    /// Mirror the agents into the menu bar and act on its clicks.
+    fn sync_menubar(&mut self, cx: &mut Context<Self>) {
+        let theme = self.theme;
+        let rows: Vec<menubar::Row> = self
+            .connected_endpoints()
+            .into_iter()
+            .flat_map(|id| {
+                let key = id.key();
+                let group = self.endpoint_label(&id);
+                self.endpoint_agents(&id)
+                    .iter()
+                    .map(|agent| {
+                        let path = self.shorten_cwd(&key, &agent.cwd);
+                        agent_menu_row(&key, &group, agent, path, theme)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        self.menubar.sync(self.settings.menu_bar, &rows);
+        for pick in self.menubar.drain() {
+            match pick {
+                menubar::Pick::Quit => {
+                    background::quit_fully(cx);
+                    return;
+                }
+                menubar::Pick::Show => self.raise_window(cx),
+                menubar::Pick::Agent { endpoint, pane } => {
+                    self.raise_window(cx);
+                    self.menu_pick = Some((endpoint, pane, Instant::now()));
+                }
+            }
+        }
+        self.apply_menu_pick(cx);
+    }
+
+    /// Bring this window in front of whatever app was active.
+    fn raise_window(&self, cx: &mut Context<Self>) {
+        cx.activate(true);
+        let window = self.window_handle;
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, _| window.activate_window())
+                .ok();
+        });
+    }
+
+    /// Focus the agent a menu bar click chose, once its endpoint is ready: a
+    /// window that has just opened is still attaching to its daemon, and
+    /// focusing before then would only start the reconnect.
+    fn apply_menu_pick(&mut self, cx: &mut Context<Self>) {
+        let Some((endpoint, pane, picked)) = self.menu_pick.clone() else {
+            return;
+        };
+        let ready = self
+            .connected_endpoints()
+            .into_iter()
+            .find(|id| id.key() == endpoint)
+            .filter(|id| *id != self.active || self.active_live);
+        if let Some(endpoint) = ready {
+            self.menu_pick = None;
+            self.leave_settings_page();
+            self.activate_endpoint(endpoint, None, Some(pane), cx);
+        } else if picked.elapsed() > MENU_PICK_PATIENCE {
+            self.menu_pick = None;
+        }
+    }
+
     /// Toggle the launch-time auto-check from the Settings page.
     fn toggle_auto_check(&mut self, cx: &mut Context<Self>) {
         self.settings.auto_check_updates = !self.settings.auto_check_updates;
@@ -9314,6 +9578,24 @@ impl PilusView {
         };
         let trimmed = self.menu_prompt_field.value().trim().to_string();
         match prompt.action {
+            PromptAction::RenameTab { tab_id } => {
+                if trimmed.chars().count() > TAB_NAME_MAX {
+                    self.toast(
+                        ToastKind::Error,
+                        format!("tab names are capped at {TAB_NAME_MAX} characters"),
+                    );
+                    cx.notify();
+                    return;
+                }
+                // An empty name clears it, which hands the label back to the cwd.
+                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                    tab.name = trimmed.clone();
+                    if let Some(feed) = self.agent_feed.as_ref() {
+                        feed.rename_tab(tab.index, trimmed);
+                    }
+                }
+                cx.notify();
+            }
             PromptAction::RenameWorkspace {
                 endpoint,
                 workspace_id,
@@ -9400,24 +9682,6 @@ impl PilusView {
                                 worktree_probe: None,
                                 worktree_cleared: None,
                                 worktree_escalated: None,
-            PromptAction::RenameTab { tab_id } => {
-                if trimmed.chars().count() > TAB_NAME_MAX {
-                    self.toast(
-                        ToastKind::Error,
-                        format!("tab names are capped at {TAB_NAME_MAX} characters"),
-                    );
-                    cx.notify();
-                    return;
-                }
-                // An empty name clears it, which hands the label back to the cwd.
-                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                    tab.name = trimmed.clone();
-                    if let Some(feed) = self.agent_feed.as_ref() {
-                        feed.rename_tab(tab.index, trimmed);
-                    }
-                }
-                cx.notify();
-            }
                             })
                             .ok();
                             None
@@ -9963,14 +10227,6 @@ impl PilusView {
             }))
     }
 
-    fn top_chrome(
-        &self,
-        cx: &mut Context<Self>,
-        cell_width: f32,
-        right: f32,
-        fullscreen: bool,
-    ) -> Div {
-        let theme = self.theme;
     /// Open the rename prompt for the tab at `index`.
     fn open_tab_rename(&mut self, index: u16, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.iter().find(|tab| tab.index == index) else {
@@ -10021,6 +10277,15 @@ impl PilusView {
         }
         cx.notify();
     }
+
+    fn top_chrome(
+        &self,
+        cx: &mut Context<Self>,
+        cell_width: f32,
+        right: f32,
+        fullscreen: bool,
+    ) -> Div {
+        let theme = self.theme;
 
         // Beside the sidebar when it is open; full width when it is hidden.
         // The left inset only clears the floating traffic lights, which
@@ -10194,8 +10459,13 @@ impl PilusView {
                 status_color(&agent.status, theme),
             ));
         }
+        tip_lines.push((
+            "Double-click to rename · drag to reorder".to_string(),
+            theme.muted,
+        ));
         let tip = row_tooltip(format!("Tab {index}"), fg, tip_lines, theme);
         let group = format!("pilus-tab-{index}");
+        let drop_fill = self.tab_raise(0.6);
         let close = div()
             .id(format!("pilus-tab-close-{index}"))
             .flex()
@@ -10235,13 +10505,8 @@ impl PilusView {
             .hover_fill(
                 self.tab_raise(if active { 0.0 } else { SIDEBAR_HOVER_WEIGHT }),
                 style::RADIUS_SOFT,
-        tip_lines.push((
-            "Double-click to rename · drag to reorder".to_string(),
-            theme.muted,
-        ));
             )
             .text_color(fg)
-        let drop_fill = self.tab_raise(0.6);
             .hover(move |style| style.text_color(theme.panel_fg))
             .tooltip(tip)
             .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
@@ -14396,6 +14661,31 @@ fn status_color(status: &str, theme: Theme) -> gpui::Rgba {
     }
 }
 
+/// How long a menu bar pick waits for its endpoint before giving up.
+const MENU_PICK_PATIENCE: Duration = Duration::from_secs(20);
+
+/// An agent as the menu bar draws it: the label, its status as a colored dot,
+/// and the working directory for the tooltip. `path` is already
+/// shortened by the caller, which knows whose home it is relative to.
+fn agent_menu_row(
+    endpoint: &str,
+    group: &str,
+    agent: &Agent,
+    path: String,
+    theme: Theme,
+) -> menubar::Row {
+    let color = status_color(&agent.status, theme);
+    menubar::Row {
+        endpoint: endpoint.to_string(),
+        group: group.to_string(),
+        pane: agent.pane.clone(),
+        title: agent.label().to_string(),
+        status: agent.status.clone(),
+        path,
+        color: [color.r, color.g, color.b].map(|c| (c * 255.0).round() as u8),
+    }
+}
+
 /// Title-case the daemon's lowercase status (`working` -> `Working`).
 fn status_label(status: &str) -> String {
     let mut chars = status.chars();
@@ -14754,6 +15044,31 @@ mod tests {
     }
 
     #[test]
+    fn menu_rows_carry_the_path_for_hover_and_a_dot_for_status() {
+        let agent = Agent {
+            pane: "p1".to_string(),
+            agent: "claude".to_string(),
+            status: "blocked".to_string(),
+            cwd: "/work/api".to_string(),
+            ..Agent::default()
+        };
+        let row = agent_menu_row(
+            "local",
+            "Local",
+            &agent,
+            "~/work/api".to_string(),
+            Theme::default(),
+        );
+        let alert = Theme::default().alert;
+        assert_eq!(
+            row.color,
+            [alert.r, alert.g, alert.b].map(|c| (c * 255.0).round() as u8)
+        );
+        assert_eq!(row.path, "~/work/api");
+        assert_eq!((row.endpoint.as_str(), row.pane.as_str()), ("local", "p1"));
+    }
+
+    #[test]
     fn tab_label_falls_back_to_cwd_and_keeps_shortcut() {
         assert_eq!(tab_label("", "~/work/pilus", 3), "~/w/pilus ⌘3");
         assert_eq!(tab_label("  ", "~", 1), "~ ⌘1");
@@ -14808,6 +15123,17 @@ mod tests {
             top_layer(false, false, false, false, Some(InputLayer::Mission)),
             InputLayer::Mission
         );
+        assert_eq!(
+            top_layer(false, false, false, false, Some(InputLayer::Automations)),
+            InputLayer::Automations
+        );
+        // With nothing open, the grid has it.
+        assert_eq!(
+            top_layer(false, false, false, false, None),
+            InputLayer::Terminal
+        );
+    }
+
     #[test]
     fn tab_label_prefers_the_name_over_the_cwd() {
         assert_eq!(tab_label("api", "~/work/pilus", 2), "api ⌘2");
@@ -14823,17 +15149,6 @@ mod tests {
         // 4 -> 2: tabs 2 and 3 slide right.
         let after: Vec<u16> = (1..=5).map(|at| moved_position(at, 4, 2)).collect();
         assert_eq!(after, [1, 3, 4, 2, 5]);
-    }
-
-        assert_eq!(
-            top_layer(false, false, false, false, Some(InputLayer::Automations)),
-            InputLayer::Automations
-        );
-        // With nothing open, the grid has it.
-        assert_eq!(
-            top_layer(false, false, false, false, None),
-            InputLayer::Terminal
-        );
     }
 
     #[test]

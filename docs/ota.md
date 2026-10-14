@@ -75,7 +75,8 @@ self-hosted feed):
 
 1. Bump `version` in the workspace `Cargo.toml`.
 2. Tag and push `vX.Y.Z`. The workflow packages
-   `pilus-v<version>-macos-arm64.dmg` (one `pilus.app` at the image root), writes
+   `pilus-v<version>-macos-arm64.dmg` (one `pilus.app` at the image root, beside an `Applications` link and a
+   drag-to-install background), writes
    `SHA256SUMS`, and attaches everything to the GitHub release. Apple Silicon
    only.
 3. Upload the DMG and write `stable.json` (or `preview.json`) on

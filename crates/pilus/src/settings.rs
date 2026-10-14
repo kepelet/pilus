@@ -108,8 +108,8 @@ pub struct Settings {
     /// there; turn it off for an older Luvus or one with `show_title`
     /// enabled.
     pub terminal_top_spacing: bool,
-    /// The same choice for the local daemon. On by default, like remote
-    /// machines; turn it off for a Luvus that still draws its title row.
+    /// The same choice for the local daemon. Off by default, unlike remote
+    /// machines; turn it on for a Luvus that no longer draws a title row.
     pub local_terminal_top_spacing: bool,
     /// Draw split panes with pilus's own rounded frames in place of
     /// the daemon's square box-drawing borders. Off keeps the daemon's.
@@ -169,7 +169,7 @@ impl Default for Settings {
             sidebar_workspace_paths: false,
             sidebar_agent_paths: false,
             terminal_top_spacing: true,
-            local_terminal_top_spacing: true,
+            local_terminal_top_spacing: false,
             pane_ui: true,
             pane_toolbar: false,
             right_sidebar_visible: false,
@@ -304,12 +304,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_top_spacing_defaults_on() {
-        // Files written before the toggle existed follow newer Luvus.
+    fn missing_top_spacing_defaults() {
+        // Files written before the toggle existed follow newer Luvus for
+        // remote machines; the local terminal stays flush with the tab strip.
         let back: Settings =
             serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
         assert!(back.terminal_top_spacing);
-        assert!(back.local_terminal_top_spacing);
+        assert!(!back.local_terminal_top_spacing);
         assert!(back.pane_ui);
         assert!(!back.pane_toolbar);
     }

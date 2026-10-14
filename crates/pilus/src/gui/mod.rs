@@ -269,6 +269,12 @@ impl NavKind {
         }
     }
 
+    /// Whether the row opens its page. Tasks, Mission Control, and
+    /// Orchestration are held back until their write actions are ready.
+    fn enabled(self) -> bool {
+        matches!(self, NavKind::Automations)
+    }
+
     /// Vendored lucide glyph; tinted by the caller's text color.
     fn icon(self) -> &'static [u8] {
         match self {
@@ -12126,6 +12132,7 @@ impl PilusView {
             None => div(),
         };
         let label = div().flex_1();
+        let enabled = kind.enabled();
         div()
             .id(format!("pilus-nav-{}", kind.label()))
             .flex()
@@ -12138,20 +12145,23 @@ impl PilusView {
             // column rather than a number touching the panel edge.
             .pr(px(SIDEBAR_ROW_PAD))
             .radius_md()
-            .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
+            .when(enabled, |row| row.cursor_pointer())
+            .when(!enabled, |row| row.opacity(style::DISABLED_OPACITY))
             .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
-            .child(style::hover_target(&self.sidebar_hover))
+            .children(enabled.then(|| style::hover_target(&self.sidebar_hover)))
             .child(icon(kind.icon(), SIDEBAR_GLYPH, theme.muted))
             .child(label.child(kind.label().to_string()))
             .child(badge)
-            .on_click(cx.listener(move |this, _, _, cx| match kind {
-                NavKind::Tasks => this.open_tasks(cx),
-                NavKind::Mission => this.open_mission(cx),
-                NavKind::Automations => this.open_automations(cx),
-                NavKind::Orchestration => this.open_orchestration(cx),
-            }))
+            .when(enabled, |row| {
+                row.on_click(cx.listener(move |this, _, _, cx| match kind {
+                    NavKind::Tasks => this.open_tasks(cx),
+                    NavKind::Mission => this.open_mission(cx),
+                    NavKind::Automations => this.open_automations(cx),
+                    NavKind::Orchestration => this.open_orchestration(cx),
+                }))
+            })
     }
 
     /// Send `<bind> + key`: the daemon's prefix chord followed by `key`.

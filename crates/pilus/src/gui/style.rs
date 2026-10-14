@@ -294,7 +294,7 @@ pub(super) fn title(theme: Theme, text: impl IntoElement, size: f32) -> Div {
 }
 
 /// How far a disabled control dims.
-const DISABLED_OPACITY: f32 = 0.55;
+pub(super) const DISABLED_OPACITY: f32 = 0.55;
 
 /// The catalogue's button treatments.
 #[derive(Clone, Copy, PartialEq, Eq)]

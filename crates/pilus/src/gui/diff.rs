@@ -1,13 +1,16 @@
 //! The native Diff page: the daemon's read-only review of the active
-//! workspace's Git changes, with local review notes.
+//! workspace's Git changes, with local review notes and per-file staging.
 //!
 //! The daemon owns the scan, the bounded patch parser, and the notes
 //! (`diff.*` over UHP); this page polls its snapshot on a background thread,
 //! lays the selected file out through `diff_model`, and sends every note edit
 //! back off the GUI thread. Nothing here stages, discards, or commits: the
-//! page never writes to the checkout. The daemon answers for whichever
-//! workspace it has active, so the page follows the sidebar's selection
-//! rather than carrying a workspace of its own.
+//! page never edits the checkout. The one write it makes is the index: the
+//! daemon has no call for that, so staging and unstaging run Git itself
+//! (`pilus_client::set_staged`), off the GUI thread, then ask the daemon for a
+//! fresh scan. The daemon answers for whichever workspace it has active, so
+//! the page follows the sidebar's selection rather than carrying a workspace
+//! of its own.
 
 use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender};
@@ -20,7 +23,8 @@ use gpui::{
 };
 use pilus_client::{
     Agent, ControlClient, DiffFile, DiffLayer, DiffNote, DiffSnapshot, FileDiff, NoteKind,
-    NoteRange, NoteSelection, NoteSide, NoteState, TextFile, Version, read_text,
+    NoteRange, NoteSelection, NoteSide, NoteState, StageAction, TextFile, Version, read_text,
+    set_staged,
 };
 
 use super::diff_model::{
@@ -70,6 +74,8 @@ pub(super) enum DiffMsg {
     },
     /// A note operation finished; the text becomes a toast.
     Done(Result<String, String>),
+    /// Git finished moving a file into or out of the index.
+    Staged(Result<(), String>),
 }
 
 /// A changed markdown file's rendered form, for the version of it the
@@ -160,6 +166,14 @@ pub(super) struct DiffPanel {
     loaded: Option<Loaded>,
     loading: Option<(FileKey, String)>,
     filter: FileFilter,
+    /// What the search field holds, mirrored here so list logic needs no
+    /// view context.
+    query: String,
+    /// The search field holds the keyboard.
+    searching: bool,
+    /// A file just staged or unstaged, and which way: the open file moves
+    /// layer with it, so the next snapshot reopens it there.
+    follow: Option<(FileKey, StageAction)>,
     mode: LayoutMode,
     /// Show a markdown file rendered rather than as a patch.
     rendered: bool,
@@ -212,6 +226,9 @@ impl DiffPanel {
             loaded: None,
             loading: None,
             filter: FileFilter::default(),
+            query: String::new(),
+            searching: false,
+            follow: None,
             mode: LayoutMode::default(),
             rendered: true,
             md: None,
@@ -259,12 +276,26 @@ impl DiffPanel {
         self.composer.is_some()
     }
 
+    /// Whether the search field holds the keyboard.
+    pub(super) fn searching(&self) -> bool {
+        self.searching
+    }
+
+    /// Mirror the search field's text. Returns whether it changed.
+    pub(super) fn set_query(&mut self, query: String) -> bool {
+        let changed = self.query != query;
+        self.query = query;
+        changed
+    }
+
     /// Drop everything read from the daemon, keeping the user's view
     /// settings.
     fn reset(&mut self) {
         let (tx, rx) = std::sync::mpsc::channel();
         *self = Self {
             filter: self.filter,
+            // The field keeps its text across machines, so the mirror does.
+            query: std::mem::take(&mut self.query),
             mode: self.mode,
             rendered: self.rendered,
             viewed: std::mem::take(&mut self.viewed),
@@ -285,7 +316,9 @@ impl DiffPanel {
 
     /// Indices into [`Self::files`] the list shows, in list order.
     fn visible(&self) -> Vec<usize> {
-        model::visible_files(self.files(), self.filter, |file| self.is_viewed(file))
+        model::visible_files(self.files(), self.filter, &self.query, |file| {
+            self.is_viewed(file)
+        })
     }
 
     fn selected_file(&self) -> Option<&DiffFile> {
@@ -367,6 +400,7 @@ impl DiffPanel {
 /// The text fields the page edits.
 pub(super) struct DiffInputs {
     note: Entity<TextInput>,
+    pub(super) search: Entity<TextInput>,
 }
 
 impl DiffInputs {
@@ -376,6 +410,7 @@ impl DiffInputs {
         theme: Theme,
         cx: &mut Context<PilusView>,
     ) -> Self {
+        let search_font = font.clone();
         let note = cx.new(move |cx| {
             TextInput::new(
                 String::new(),
@@ -388,11 +423,26 @@ impl DiffInputs {
             )
             .submit_on_enter()
         });
-        Self { note }
+        let search = cx.new(move |cx| {
+            TextInput::new(
+                String::new(),
+                "Filter files…",
+                search_font,
+                px(size),
+                false,
+                theme,
+                cx,
+            )
+        });
+        Self { note, search }
     }
 
     pub(super) fn focus_handle(&self, cx: &gpui::App) -> gpui::FocusHandle {
         gpui::Focusable::focus_handle(&self.note, cx)
+    }
+
+    pub(super) fn search_focus_handle(&self, cx: &gpui::App) -> gpui::FocusHandle {
+        gpui::Focusable::focus_handle(&self.search, cx)
     }
 }
 
@@ -554,6 +604,20 @@ impl PilusView {
                 // Pick the daemon's new truth up now rather than next poll.
                 self.diff_panel.last_poll = None;
             }
+            DiffMsg::Staged(result) => {
+                let panel = &mut self.diff_panel;
+                panel.status.clear();
+                if let Err(error) = result {
+                    panel.follow = None;
+                    self.toast(ToastKind::Error, error);
+                }
+                // The index moved (or Git said why not); either way the
+                // list should show what is true now, so ask for a new scan
+                // rather than wait out the poll.
+                let panel = &mut self.diff_panel;
+                panel.needs_refresh = true;
+                panel.last_poll = None;
+            }
         }
     }
 
@@ -566,11 +630,21 @@ impl PilusView {
         if changed_notes {
             panel.refresh_file_notes();
         }
-        // Keep the open file while it exists; otherwise start at the first.
+        // Keep the open file while it exists; a file just staged or unstaged
+        // is reopened in its new layer; otherwise start at the first.
         let present = panel.selected_file().is_some();
         if !present {
-            let first = panel.visible().first().map(|&at| panel.files()[at].key());
-            panel.selected = first.map(|(layer, path)| (layer, path.to_string()));
+            let followed = panel.follow.take().and_then(|((_, path), action)| {
+                model::layer_after(panel.files(), &path, action).map(|layer| (layer, path))
+            });
+            let first = || {
+                panel
+                    .visible()
+                    .first()
+                    .map(|&at| panel.files()[at].key())
+                    .map(|(layer, path)| (layer, path.to_string()))
+            };
+            panel.selected = followed.or_else(first);
             panel.loaded = None;
             panel.md = None;
             panel.md_loading = None;
@@ -712,6 +786,7 @@ impl PilusView {
         }
         let panel = &mut self.diff_panel;
         panel.selected = Some(key);
+        panel.follow = None;
         panel.toggled = false;
         panel.loaded = None;
         panel.loading = None;
@@ -748,6 +823,7 @@ impl PilusView {
 
     /// Open a file the user chose, as a step the column's Back returns from.
     fn diff_pick(&mut self, key: FileKey, cx: &mut Context<Self>) {
+        self.diff_panel.searching = false;
         self.right_navigate(cx, |this, cx| this.diff_select(key, cx));
     }
 
@@ -1113,6 +1189,94 @@ impl PilusView {
         cx.notify();
     }
 
+    /// Move a file into the index, or back out of it, with Git. A conflicted
+    /// file is the user's to resolve first, so it takes neither.
+    fn diff_set_staged(&mut self, key: FileKey, action: StageAction, cx: &mut Context<Self>) {
+        let panel = &self.diff_panel;
+        let Some(snapshot) = panel.snapshot.as_ref() else {
+            return;
+        };
+        let Some(file) = snapshot
+            .files
+            .iter()
+            .find(|file| file.layer == key.0 && file.path == key.1)
+        else {
+            return;
+        };
+        let applies = match action {
+            StageAction::Stage => matches!(file.layer, DiffLayer::Worktree | DiffLayer::Untracked),
+            StageAction::Unstage => file.layer == DiffLayer::Staged,
+        };
+        if !applies {
+            return;
+        }
+        // A rename is two index entries; moving only the new name would
+        // leave the old one deleted on its own.
+        let mut paths = vec![file.path.clone()];
+        if file.renamed() {
+            paths.push(file.old_path.clone());
+        }
+        let repo = snapshot.repo.clone();
+        let target = match self.read_target(&self.active) {
+            Ok(target) => target,
+            Err(error) => {
+                self.toast(ToastKind::Error, error);
+                cx.notify();
+                return;
+            }
+        };
+        let panel = &mut self.diff_panel;
+        if panel.selected.as_ref() == Some(&key) {
+            panel.follow = Some((key.clone(), action));
+        }
+        panel.status = match action {
+            StageAction::Stage => format!("Staging {}…", key.1),
+            StageAction::Unstage => format!("Unstaging {}…", key.1),
+        };
+        let tx = panel.tx.clone();
+        std::thread::spawn(move || {
+            let result = set_staged(target.as_ref(), &repo, &paths, action);
+            tx.send(DiffMsg::Staged(result)).ok();
+        });
+        cx.notify();
+    }
+
+    /// Stage the open file, or unstage it when it is already in the index.
+    fn diff_toggle_staged(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.diff_panel.selected_key() else {
+            return;
+        };
+        let action = match key.0 {
+            DiffLayer::Staged => StageAction::Unstage,
+            _ => StageAction::Stage,
+        };
+        self.diff_set_staged(key, action, cx);
+    }
+
+    /// Give the search field the keyboard.
+    fn diff_begin_search(&mut self, cx: &mut Context<Self>) {
+        let panel = &mut self.diff_panel;
+        panel.searching = true;
+        panel.menu = None;
+        self.right.focused = true;
+        cx.notify();
+    }
+
+    /// Hand the keyboard back to the page, keeping what was typed.
+    fn diff_end_search(&mut self, cx: &mut Context<Self>) {
+        self.diff_panel.searching = false;
+        cx.notify();
+    }
+
+    /// Empty the search and hand the keyboard back.
+    fn diff_clear_search(&mut self, cx: &mut Context<Self>) {
+        self.diff_inputs
+            .search
+            .update(cx, |input, cx| input.clear(cx));
+        self.diff_panel.query.clear();
+        self.diff_end_search(cx);
+    }
+
     fn diff_refresh_now(&mut self, cx: &mut Context<Self>) {
         self.diff_panel.needs_refresh = true;
         self.diff_panel.last_poll = None;
@@ -1187,6 +1351,33 @@ impl PilusView {
         let key = event.keystroke.key.as_str();
         let mods = event.keystroke.modifiers;
 
+        // The search field has typed the character already; only the keys
+        // that leave it are the page's.
+        if self.diff_panel.searching {
+            match key {
+                "escape" => self.diff_clear_search(cx),
+                "enter" => {
+                    // Open the first match when the open file is not one.
+                    let panel = &self.diff_panel;
+                    let visible = panel.visible();
+                    let shown = panel.selected_file().is_some_and(|file| {
+                        visible
+                            .iter()
+                            .any(|&at| panel.files()[at].key() == file.key())
+                    });
+                    let first = visible
+                        .first()
+                        .filter(|_| !shown)
+                        .map(|&at| (panel.files()[at].layer, panel.files()[at].path.clone()));
+                    self.diff_end_search(cx);
+                    if let Some(key) = first {
+                        self.diff_pick(key, cx);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.diff_panel.menu.is_some() {
             if key == "escape" {
                 self.diff_panel.menu = None;
@@ -1282,6 +1473,8 @@ impl PilusView {
             }
             "]" | "[" => self.diff_jump_note(ch == "]", cx),
             "m" => self.diff_toggle_viewed(cx),
+            "S" => self.diff_toggle_staged(cx),
+            "/" => self.diff_begin_search(cx),
             "p" if self.diff_panel.selected_file().is_some_and(previewable) => {
                 self.diff_toggle_rendered(cx);
             }
@@ -1334,6 +1527,8 @@ impl PilusView {
             "K" => self.diff_step_file(-1, cx),
             "p" => self.diff_toggle_rendered(cx),
             "m" => self.diff_toggle_viewed(cx),
+            "S" => self.diff_toggle_staged(cx),
+            "/" => self.diff_begin_search(cx),
             "f" => {
                 self.diff_panel.filter = self.diff_panel.filter.next();
                 cx.notify();
@@ -1354,6 +1549,8 @@ impl PilusView {
         match ch {
             "j" | "down" | "J" => self.diff_step_file(1, cx),
             "k" | "up" | "K" => self.diff_step_file(-1, cx),
+            "S" => self.diff_toggle_staged(cx),
+            "/" => self.diff_begin_search(cx),
             "f" => {
                 self.diff_panel.filter = self.diff_panel.filter.next();
                 cx.notify();
@@ -1530,6 +1727,13 @@ impl PilusView {
                 px(fonts.body),
             );
         });
+        self.diff_inputs.search.update(cx, |input, _| {
+            input.set_style(
+                theme,
+                style::chrome_font(&self.shared_settings),
+                px(fonts.body),
+            );
+        });
         if self.diff_sync(split) | self.diff_sync_preview() {
             cx.notify();
         }
@@ -1567,6 +1771,13 @@ impl PilusView {
             .size_full()
             .min_h(px(0.0))
             .child(self.diff_header(cx))
+            .children(
+                self.diff_panel
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.files.is_empty())
+                    .then(|| self.diff_search_row(cx)),
+            )
             .child(body)
             .children(footer)
             .children(self.diff_send_panel(cx))
@@ -1647,6 +1858,56 @@ impl PilusView {
             .child(refresh)
             .child(layout)
             .child(filter)
+    }
+
+    /// The row under the header that narrows the file list by name.
+    fn diff_search_row(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let panel = &self.diff_panel;
+        let field = style::search_field(
+            "pilus-diff-search",
+            panel.searching,
+            theme,
+            style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL),
+            fonts.secondary,
+            self.diff_inputs.search.clone(),
+        )
+        .flex_1()
+        .min_w(px(0.0))
+        .text_size(px(fonts.body))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.diff_begin_search(cx)),
+        );
+        let clear = (!panel.query.is_empty()).then(|| {
+            style::icon_button(
+                "pilus-diff-search-clear",
+                include_bytes!("../../assets/icons/x.svg"),
+                ButtonKind::Ghost,
+                theme,
+                style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL),
+            )
+            .tooltip(super::row_tooltip(
+                "Clear search".to_string(),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.diff_clear_search(cx)))
+        });
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .flex_shrink_0()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(field)
+            .children(clear)
     }
 
     /// A 24px icon control, with a small chevron when it opens a dropdown.
@@ -1902,6 +2163,20 @@ impl PilusView {
                 );
             }
         }
+        if panel.snapshot.is_some() && visible.is_empty() && !panel.files().is_empty() {
+            column = column.child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(fonts.secondary))
+                    .text_color(theme.muted)
+                    .child(if panel.query.trim().is_empty() {
+                        "No files match this filter".to_string()
+                    } else {
+                        format!("No files match “{}”", panel.query.trim())
+                    }),
+            );
+        }
         for layer in DiffLayer::ALL {
             let rows: Vec<&DiffFile> = visible
                 .iter()
@@ -2002,6 +2277,40 @@ impl PilusView {
                 theme.muted,
             ));
         }
+        let stage = match file.layer {
+            DiffLayer::Staged => Some((
+                StageAction::Unstage,
+                include_bytes!("../../assets/icons/minus.svg").as_slice(),
+                "Unstage",
+            )),
+            DiffLayer::Worktree | DiffLayer::Untracked => Some((
+                StageAction::Stage,
+                include_bytes!("../../assets/icons/plus.svg").as_slice(),
+                "Stage",
+            )),
+            DiffLayer::Conflict => None,
+        };
+        let stage = stage.map(|(action, glyph, tip)| {
+            let key = key.clone();
+            style::icon_button(
+                format!("pilus-diff-stage-{}-{}", file.layer.wire(), file.path),
+                glyph,
+                ButtonKind::Ghost,
+                theme,
+                style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL),
+            )
+            .tooltip(super::row_tooltip(
+                tip.to_string(),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
+            // The row beneath opens the file; this only moves it.
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.diff_set_staged(key.clone(), action, cx);
+            }))
+        });
         div()
             .id(format!(
                 "pilus-diff-file-{}-{}",
@@ -2058,6 +2367,7 @@ impl PilusView {
                     ),
             )
             .child(meta)
+            .children(stage)
             .on_click(cx.listener(move |this, _, _, cx| this.diff_pick(key.clone(), cx)))
     }
 

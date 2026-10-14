@@ -143,6 +143,7 @@ pub struct UiPlaygroundView {
     focus_handle: FocusHandle,
     single: Entity<TextInput>,
     multi: Entity<TextInput>,
+    search: Entity<TextInput>,
     pickers: Vec<Picker>,
     open_picker: Option<usize>,
     /// The picker an outside press just dismissed, so the chip's own click can
@@ -191,6 +192,17 @@ impl UiPlaygroundView {
                 cx,
             )
         });
+        let search = cx.new(|cx| {
+            TextInput::new(
+                String::new(),
+                "Filter files…",
+                font.clone(),
+                px(fonts.body),
+                false,
+                theme,
+                cx,
+            )
+        });
         let input_handle = single.focus_handle(cx);
         window.focus(&input_handle, cx);
         Self {
@@ -199,6 +211,7 @@ impl UiPlaygroundView {
             focus_handle,
             single,
             multi,
+            search,
             pickers: vec![
                 Picker {
                     icon: include_bytes!("../../assets/icons/cpu.svg"),
@@ -400,6 +413,27 @@ impl UiPlaygroundView {
                 15.0,
                 theme.fg,
             ))
+    }
+
+    /// The label-less search field the Diff page filters its file list with.
+    fn search_box(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let fonts = self.fonts();
+        let entity = self.search.clone();
+        entity.update(cx, |input, _| {
+            input.set_style(theme, style::chrome_font(&self.settings), px(fonts.body));
+        });
+        let focused = entity.read(cx).is_focused(window);
+        style::search_field(
+            "pg-input-search",
+            focused,
+            theme,
+            style::scaled(&self.settings, style::CONTROL_HEIGHT),
+            fonts.body,
+            entity,
+        )
+        .w(px(240.0))
+        .text_size(px(fonts.body))
     }
 
     /// A labelled input box, editable while it owns the keyboard.
@@ -1973,7 +2007,8 @@ impl Render for UiPlaygroundView {
                             .items_start()
                             .gap_4()
                             .child(self.input_box(InputId::Single, "Single line", window, cx))
-                            .child(self.input_box(InputId::Multi, "Multi line", window, cx)),
+                            .child(self.input_box(InputId::Multi, "Multi line", window, cx))
+                            .child(self.search_box(window, cx)),
                     ),
                 ),
             )

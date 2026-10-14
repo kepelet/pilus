@@ -25,7 +25,7 @@ pub struct Row {
     pub title: String,
     /// `working`, `blocked`, `done`, or `idle`.
     pub status: String,
-    /// The working directory, shown on hover.
+    /// The working directory, shown on hover after the status.
     pub path: String,
     /// The status dot's color, resolved from the theme by the caller.
     pub color: [u8; 3],
@@ -307,8 +307,14 @@ mod imp {
                 };
                 let item = self.action_item(&row.title, Some(&pick));
                 item.setAttributedTitle(Some(&self.row_title(&row.title, row.color)));
-                if !row.path.is_empty() {
-                    item.setToolTip(Some(&NSString::from_str(&row.path)));
+                let tip = match (row.status.is_empty(), row.path.is_empty()) {
+                    (false, false) => format!("[{}] {}", row.status, row.path),
+                    (false, true) => format!("[{}]", row.status),
+                    (true, false) => row.path.clone(),
+                    (true, true) => String::new(),
+                };
+                if !tip.is_empty() {
+                    item.setToolTip(Some(&NSString::from_str(&tip)));
                 }
                 menu.addItem(&item);
             }

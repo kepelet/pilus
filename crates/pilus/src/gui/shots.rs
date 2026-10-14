@@ -750,6 +750,11 @@ pub fn run_main() -> Result<()> {
             view.toast(super::toast::ToastKind::Success, "Opened the workspace");
             view.toast(
                 super::toast::ToastKind::Error,
+                    name: match index {
+                        2 => "devin review".to_string(),
+                        4 => "api server".to_string(),
+                        _ => String::new(),
+                    },
                 "Couldn't open workspace: the folder no longer exists on this machine",
             );
             cx.notify();

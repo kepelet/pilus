@@ -1003,6 +1003,26 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Name the tab at `index` (1-based); an empty name clears it, so the
+    /// strip falls back to the tab's directory.
+    pub fn rename_tab(&mut self, index: u16, name: &str) -> Result<()> {
+        self.request(
+            "tab.rename",
+            json!({ "tab": index.to_string(), "name": name }),
+        )?;
+        Ok(())
+    }
+
+    /// Move the tab at `from` to the exact position `to` (both 1-based). The
+    /// daemon refuses a move onto the same position.
+    pub fn move_tab(&mut self, from: u16, to: u16) -> Result<()> {
+        self.request(
+            "tab.move",
+            json!({ "tab": from.to_string(), "to": to.to_string() }),
+        )?;
+        Ok(())
+    }
+
     /// Type literal text into a pane — a shell command ends in `"\n"` so the
     /// terminal runs it rather than leaving it on the line.
     pub fn send_input(&mut self, pane: &str, text: &str) -> Result<()> {
@@ -1146,6 +1166,8 @@ enum Command {
     FocusTab(u16),
     NewTab,
     CloseTab(u16),
+    RenameTab(u16, String),
+    MoveTab(u16, u16),
     Split(String),
     /// Re-read the snapshot without changing anything: a state change made
     /// on another connection (a workspace focus) needs its chrome read back.
@@ -1304,6 +1326,16 @@ impl AgentFeed {
         let _ = self.commands.send(Command::CloseTab(index));
     }
 
+    /// Ask the daemon to name the tab at `index`; empty clears the name.
+    pub fn rename_tab(&self, index: u16, name: String) {
+        let _ = self.commands.send(Command::RenameTab(index, name));
+    }
+
+    /// Ask the daemon to move the tab at `from` to position `to`.
+    pub fn move_tab(&self, from: u16, to: u16) {
+        let _ = self.commands.send(Command::MoveTab(from, to));
+    }
+
     /// Ask the daemon to split the focused pane (`right`/`down`/`auto`).
     pub fn split(&self, direction: &str) {
         let _ = self.commands.send(Command::Split(direction.to_string()));
@@ -1349,6 +1381,8 @@ fn serve(client: &mut ControlClient, command: Command) {
         Command::FocusTab(index) => client.focus_tab(index),
         Command::NewTab => client.new_tab(),
         Command::CloseTab(index) => client.close_tab(index),
+        Command::RenameTab(index, name) => client.rename_tab(index, &name),
+        Command::MoveTab(from, to) => client.move_tab(from, to),
         Command::Split(direction) => client.split_pane(&direction),
         Command::Refresh => return,
     };

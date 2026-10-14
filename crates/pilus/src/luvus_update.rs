@@ -101,10 +101,22 @@ pub fn installed_version() -> Option<Version> {
 /// `BestEffort` is enough: the download is checked against the published
 /// sidecar whenever one exists, and the archive is served over HTTPS.
 pub fn engine() -> LuvusEngine {
+    engine_with(Verification::BestEffort)
+}
+
+/// The engine for a first install, which fails closed on a checksum mismatch.
+///
+/// An update replaces a binary the user already runs; a first install has
+/// nothing else vouching for what lands in `~/.local/bin`.
+pub fn first_install_engine() -> LuvusEngine {
+    engine_with(Verification::Checksum)
+}
+
+fn engine_with(verification: Verification) -> LuvusEngine {
     UpdateEngine::new(
         Box::new(LuvusSource) as Box<dyn UpdateSource>,
         EngineConfig::new(installed_version().unwrap_or_else(|| Version::new(0, 0, 0)))
-            .verification(Verification::BestEffort),
+            .verification(verification),
     )
 }
 

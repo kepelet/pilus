@@ -1229,6 +1229,45 @@ pub fn run_main() -> Result<()> {
     settle(&mut cx, 4);
     capture(&mut cx, window.into(), "main-session-menu")?;
 
+    // No `luvus` binary: the strip, sidebars, and shortcuts stand down and the
+    // card asks for an install. The live link is only flagged, not dropped.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.session_menu_open = false;
+            view.active_live = false;
+            view.local_luvus_missing = true;
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 30);
+    capture(&mut cx, window.into(), "main-luvus-missing")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.luvus_install = super::LuvusInstall::Installing;
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-luvus-installing")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.luvus_install = super::LuvusInstall::Failed(
+                "https://luvus.dev/latest.json: connection refused".to_string(),
+            );
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-luvus-install-failed")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.active_live = true;
+            view.local_luvus_missing = false;
+            view.luvus_install = super::LuvusInstall::Idle;
+            cx.notify();
+        });
+    });
+
     // The same window under a light built-in scheme, so hard-coded chrome
     // colors (borders, scrims) show up.
     cx.update(|app| {

@@ -12,7 +12,9 @@
 //! the page follows the sidebar's selection rather than carrying a workspace
 //! of its own.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -22,13 +24,14 @@ use gpui::{
     anchored, deferred, div, list, point, prelude::*, px,
 };
 use pilus_client::{
-    Agent, ControlClient, DiffFile, DiffLayer, DiffNote, DiffSnapshot, FileDiff, NoteKind,
-    NoteRange, NoteSelection, NoteSide, NoteState, StageAction, TextFile, Version, read_text,
-    set_staged,
+    Agent, ControlClient, DiffFile, DiffLayer, DiffNote, DiffSnapshot, Discard, FileDiff, NoteKind,
+    NoteRange, NoteSelection, NoteSide, NoteState, StageAction, TextFile, Version, discard,
+    read_text, set_staged,
 };
 
 use super::diff_model::{
-    self as model, Cursor, Display, FileFilter, Flat, LayoutMode, Row, Src, SrcKind,
+    self as model, Cursor, Display, FileFilter, Flat, FolderKey, LayoutMode, ListView, Row, Src,
+    SrcKind, TreeRow,
 };
 use super::highlight::Token;
 use super::md_view::{self, Composing, MdDoc, Page};
@@ -37,6 +40,7 @@ use super::text_input::TextInput;
 use super::theme::Theme;
 use super::toast::ToastKind;
 use super::{EndpointId, PilusView, agent_icon, icon};
+use crate::settings::Settings;
 
 /// How often the open page asks the daemon for a fresh snapshot.
 const POLL: Duration = Duration::from_millis(1500);
@@ -76,6 +80,7 @@ pub(super) enum DiffMsg {
     Done(Result<String, String>),
     /// Git finished moving a file into or out of the index.
     Staged(Result<(), String>),
+    Discarded(Result<(), String>),
 }
 
 /// A changed markdown file's rendered form, for the version of it the
@@ -166,6 +171,12 @@ pub(super) struct DiffPanel {
     loaded: Option<Loaded>,
     loading: Option<(FileKey, String)>,
     filter: FileFilter,
+    /// Whether the list shows files flat or nested under their folders.
+    view: ListView,
+    /// Folders folded shut in the tree, by layer.
+    folded: HashSet<FolderKey>,
+    /// The folder whose chevron was just turned, so only it animates.
+    folder_toggled: Option<FolderKey>,
     /// What the search field holds, mirrored here so list logic needs no
     /// view context.
     query: String,
@@ -191,6 +202,13 @@ pub(super) struct DiffPanel {
     list_h: f32,
     /// A divider drag in progress: pointer y and list height at its start.
     divider: Option<(f32, f32)>,
+    /// Width of the file list beside the diff, in logical pixels; `None`
+    /// until dragged, which takes the default at the Interface size.
+    list_w: Option<f32>,
+    /// A side divider drag in progress: pointer x and list width at its start.
+    side_divider: Option<(f32, f32)>,
+    /// Width of the page as last drawn, which bounds the list's width.
+    page_w: f32,
     /// Fingerprints of versions marked viewed in this window.
     viewed: HashSet<String>,
     /// Files folded down to their header, as History folds a commit's files.
@@ -226,6 +244,9 @@ impl DiffPanel {
             loaded: None,
             loading: None,
             filter: FileFilter::default(),
+            view: ListView::default(),
+            folded: HashSet::new(),
+            folder_toggled: None,
             query: String::new(),
             searching: false,
             follow: None,
@@ -241,6 +262,9 @@ impl DiffPanel {
             menu_dismissed: None,
             list_h: DEFAULT_LIST_HEIGHT,
             divider: None,
+            list_w: None,
+            side_divider: None,
+            page_w: 0.0,
             viewed: HashSet::new(),
             collapsed: HashSet::new(),
             toggled: false,
@@ -272,6 +296,21 @@ impl DiffPanel {
         }
     }
 
+    /// Start the wide file list at a saved width; an unset 0 keeps the default.
+    pub(super) fn set_list_width(&mut self, width: f32) {
+        if width >= model::MIN_LIST_WIDTH {
+            self.list_w = Some(width);
+        }
+    }
+
+    /// The width the file list takes beside the diff.
+    fn list_width(&self, settings: &Rc<RefCell<Settings>>) -> f32 {
+        self.list_w.map_or_else(
+            || style::scaled(settings, LIST_WIDTH),
+            |wanted| model::clamp_list_width(wanted, self.page_w),
+        )
+    }
+
     pub(super) fn composing(&self) -> bool {
         self.composer.is_some()
     }
@@ -294,12 +333,15 @@ impl DiffPanel {
         let (tx, rx) = std::sync::mpsc::channel();
         *self = Self {
             filter: self.filter,
+            view: self.view,
+            folded: std::mem::take(&mut self.folded),
             // The field keeps its text across machines, so the mirror does.
             query: std::mem::take(&mut self.query),
             mode: self.mode,
             rendered: self.rendered,
             viewed: std::mem::take(&mut self.viewed),
             list_h: self.list_h,
+            list_w: self.list_w,
             tx,
             rx,
             ..Self::new()
@@ -319,6 +361,36 @@ impl DiffPanel {
         model::visible_files(self.files(), self.filter, &self.query, |file| {
             self.is_viewed(file)
         })
+    }
+
+    /// A layer's rows in the tree. A search opens every folder so no match
+    /// hides inside a shut one.
+    fn tree(&self, layer: DiffLayer, visible: &[usize]) -> Vec<TreeRow> {
+        model::tree_rows(
+            self.files(),
+            visible,
+            layer,
+            &self.folded,
+            !self.query.trim().is_empty(),
+        )
+    }
+
+    /// Indices into [`Self::files`] in the order the list draws them, which is
+    /// the order the step keys walk. A file inside a shut folder is not drawn,
+    /// so it is not listed.
+    fn listed(&self) -> Vec<usize> {
+        let visible = self.visible();
+        if self.view == ListView::Flat {
+            return visible;
+        }
+        DiffLayer::ALL
+            .into_iter()
+            .flat_map(|layer| self.tree(layer, &visible))
+            .filter_map(|row| match row {
+                TreeRow::File { index, .. } => Some(index),
+                TreeRow::Folder { .. } => None,
+            })
+            .collect()
     }
 
     fn selected_file(&self) -> Option<&DiffFile> {
@@ -604,6 +676,17 @@ impl PilusView {
                 // Pick the daemon's new truth up now rather than next poll.
                 self.diff_panel.last_poll = None;
             }
+            DiffMsg::Discarded(result) => {
+                let panel = &mut self.diff_panel;
+                panel.status.clear();
+                if let Err(error) = result {
+                    self.toast(ToastKind::Error, error);
+                }
+                // The file is gone from the list, or Git said why not.
+                let panel = &mut self.diff_panel;
+                panel.needs_refresh = true;
+                panel.last_poll = None;
+            }
             DiffMsg::Staged(result) => {
                 let panel = &mut self.diff_panel;
                 panel.status.clear();
@@ -639,7 +722,7 @@ impl PilusView {
             });
             let first = || {
                 panel
-                    .visible()
+                    .listed()
                     .first()
                     .map(|&at| panel.files()[at].key())
                     .map(|(layer, path)| (layer, path.to_string()))
@@ -803,7 +886,7 @@ impl PilusView {
     /// Select the file `delta` rows from the current one in list order.
     fn diff_step_file(&mut self, delta: isize, cx: &mut Context<Self>) {
         let panel = &self.diff_panel;
-        let visible = panel.visible();
+        let visible = panel.listed();
         if visible.is_empty() {
             return;
         }
@@ -819,6 +902,22 @@ impl PilusView {
         let file = &panel.files()[visible[next]];
         let key = (file.layer, file.path.clone());
         self.diff_pick(key, cx);
+    }
+
+    fn diff_toggle_view(&mut self, cx: &mut Context<Self>) {
+        let panel = &mut self.diff_panel;
+        panel.view = panel.view.next();
+        panel.menu = None;
+        cx.notify();
+    }
+
+    fn diff_toggle_folder(&mut self, key: FolderKey, cx: &mut Context<Self>) {
+        let panel = &mut self.diff_panel;
+        if !panel.folded.remove(&key) {
+            panel.folded.insert(key.clone());
+        }
+        panel.folder_toggled = Some(key);
+        cx.notify();
     }
 
     /// Open a file the user chose, as a step the column's Back returns from.
@@ -1241,6 +1340,62 @@ impl PilusView {
         cx.notify();
     }
 
+    /// Ask before throwing a file's working-tree changes away. Only a file
+    /// that is not in the index qualifies: a staged one has Unstage, and a
+    /// conflicted one is the user's to resolve.
+    fn diff_ask_discard(&mut self, key: FileKey, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.diff_panel.snapshot.as_ref() else {
+            return;
+        };
+        let Some(file) = snapshot
+            .files
+            .iter()
+            .find(|file| file.layer == key.0 && file.path == key.1)
+        else {
+            return;
+        };
+        let kind = match file.layer {
+            DiffLayer::Worktree => Discard::Edits,
+            DiffLayer::Untracked => Discard::Untracked,
+            DiffLayer::Staged | DiffLayer::Conflict => return,
+        };
+        let action = super::PromptAction::DiscardChanges {
+            endpoint: self.active.clone(),
+            repo: snapshot.repo.clone(),
+            paths: vec![file.path.clone()],
+            kind,
+            label: file.path.clone(),
+        };
+        self.open_menu_prompt(action, "Discard changes", "", "", cx);
+    }
+
+    /// Run the confirmed discard off the GUI thread.
+    pub(super) fn diff_discard(
+        &mut self,
+        endpoint: &EndpointId,
+        repo: String,
+        paths: Vec<String>,
+        kind: Discard,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match self.read_target(endpoint) {
+            Ok(target) => target,
+            Err(error) => {
+                self.toast(ToastKind::Error, error);
+                cx.notify();
+                return;
+            }
+        };
+        let panel = &mut self.diff_panel;
+        panel.status = "Discarding changes…".to_string();
+        let tx = panel.tx.clone();
+        std::thread::spawn(move || {
+            let result = discard(target.as_ref(), &repo, &paths, kind);
+            tx.send(DiffMsg::Discarded(result)).ok();
+        });
+        cx.notify();
+    }
+
     /// Stage the open file, or unstage it when it is already in the index.
     fn diff_toggle_staged(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.diff_panel.selected_key() else {
@@ -1359,7 +1514,7 @@ impl PilusView {
                 "enter" => {
                     // Open the first match when the open file is not one.
                     let panel = &self.diff_panel;
-                    let visible = panel.visible();
+                    let visible = panel.listed();
                     let shown = panel.selected_file().is_some_and(|file| {
                         visible
                             .iter()
@@ -1453,6 +1608,7 @@ impl PilusView {
         match ch {
             "J" => self.diff_step_file(1, cx),
             "K" => self.diff_step_file(-1, cx),
+            "t" => self.diff_toggle_view(cx),
             "s" => {
                 self.diff_panel.mode = self.diff_panel.mode.next();
                 self.diff_panel.reveal = true;
@@ -1526,6 +1682,7 @@ impl PilusView {
             "J" => self.diff_step_file(1, cx),
             "K" => self.diff_step_file(-1, cx),
             "p" => self.diff_toggle_rendered(cx),
+            "t" => self.diff_toggle_view(cx),
             "m" => self.diff_toggle_viewed(cx),
             "S" => self.diff_toggle_staged(cx),
             "/" => self.diff_begin_search(cx),
@@ -1549,6 +1706,7 @@ impl PilusView {
         match ch {
             "j" | "down" | "J" => self.diff_step_file(1, cx),
             "k" | "up" | "K" => self.diff_step_file(-1, cx),
+            "t" => self.diff_toggle_view(cx),
             "S" => self.diff_toggle_staged(cx),
             "/" => self.diff_begin_search(cx),
             "f" => {
@@ -1709,8 +1867,9 @@ impl PilusView {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let show_list = page_w >= LIST_MIN_PAGE;
+        self.diff_panel.page_w = page_w;
         let list_w = if show_list {
-            style::scaled(&self.shared_settings, LIST_WIDTH)
+            self.diff_panel.list_width(&self.shared_settings)
         } else {
             0.0
         };
@@ -1742,7 +1901,9 @@ impl PilusView {
         // with a handle between them to drag.
         let mut body = div().flex().min_h(px(0.0)).flex_1();
         body = if show_list {
-            body.flex_row().child(self.diff_file_list(Some(list_w), cx))
+            body.flex_row()
+                .child(self.diff_file_list(Some(list_w), cx))
+                .child(self.diff_side_divider(cx))
         } else {
             body.flex_col()
                 .child(self.diff_file_list(None, cx))
@@ -1813,6 +1974,26 @@ impl PilusView {
                 false,
             )
             .on_click(cx.listener(|this, _, _, cx| this.diff_refresh_now(cx)));
+        // The icon is the view a press switches to.
+        let (view_glyph, view_tip) = match panel.view {
+            ListView::Flat => (
+                include_bytes!("../../assets/icons/list-tree.svg").as_slice(),
+                "View as tree",
+            ),
+            ListView::Tree => (
+                include_bytes!("../../assets/icons/list.svg").as_slice(),
+                "View as list",
+            ),
+        };
+        let view = self
+            .diff_icon_button(
+                "pilus-diff-view",
+                view_glyph,
+                view_tip.to_string(),
+                false,
+                false,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.diff_toggle_view(cx)));
         let layout = self.diff_menu_button(
             DiffMenu::Layout,
             self.diff_icon_button(
@@ -1856,6 +2037,7 @@ impl PilusView {
                     .child(summary),
             )
             .child(refresh)
+            .child(view)
             .child(layout)
             .child(filter)
     }
@@ -2105,6 +2287,44 @@ impl PilusView {
             )
     }
 
+    /// The handle between the file list and the diff when they sit side by
+    /// side, with the hairline the list's edge used to draw.
+    fn diff_side_divider(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = self.theme;
+        div()
+            .id("pilus-diff-side-divider")
+            .flex()
+            .justify_center()
+            .w(px(DIVIDER_HEIGHT))
+            .h_full()
+            .flex_shrink_0()
+            .cursor_col_resize()
+            .hover_fill(theme.panel_dim, style::RADIUS_SM)
+            .child(div().w(px(1.0)).h_full().bg(theme.border))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    let shown = this.diff_panel.list_width(&this.shared_settings);
+                    this.diff_panel.side_divider = Some((f32::from(event.position.x), shown));
+                    cx.stop_propagation();
+                }),
+            )
+    }
+
+    /// Follow a side divider drag; called for every pointer move in the
+    /// window.
+    pub(super) fn diff_side_divider_move(&mut self, x: f32, cx: &mut Context<Self>) {
+        let panel = &mut self.diff_panel;
+        let Some((start_x, start_width)) = panel.side_divider else {
+            return;
+        };
+        let width = model::clamp_list_width(start_width + (x - start_x), panel.page_w);
+        if panel.list_w.is_none_or(|now| (width - now).abs() >= 0.5) {
+            panel.list_w = Some(width);
+            cx.notify();
+        }
+    }
+
     /// Follow a divider drag; called for every pointer move in the window.
     pub(super) fn diff_divider_move(&mut self, y: f32, window_h: f32, cx: &mut Context<Self>) {
         let panel = &mut self.diff_panel;
@@ -2120,8 +2340,16 @@ impl PilusView {
 
     /// End a divider drag and keep where it landed.
     pub(super) fn diff_divider_end(&mut self, cx: &mut Context<Self>) {
-        if self.diff_panel.divider.take().is_some() {
-            self.settings.diff_list_height = self.diff_panel.list_h;
+        let panel = &mut self.diff_panel;
+        let dragged_height = panel.divider.take().is_some();
+        let dragged_width = panel.side_divider.take().is_some();
+        if dragged_height || dragged_width {
+            if dragged_height {
+                self.settings.diff_list_height = self.diff_panel.list_h;
+            }
+            if dragged_width {
+                self.settings.diff_list_width = self.diff_panel.list_w.unwrap_or(0.0);
+            }
             self.settings.save(&self.pilus_root);
             cx.notify();
         }
@@ -2186,6 +2414,7 @@ impl PilusView {
             if rows.is_empty() {
                 continue;
             }
+            let count = rows.len();
             column = column.child(
                 div()
                     .flex()
@@ -2202,11 +2431,30 @@ impl PilusView {
                         div()
                             .text_size(px(fonts.label))
                             .text_color(theme.muted)
-                            .child(rows.len().to_string()),
+                            .child(count.to_string()),
                     ),
             );
-            for file in rows {
-                column = column.child(self.diff_file_row(file, cx));
+            match panel.view {
+                ListView::Flat => {
+                    for file in rows {
+                        column = column.child(self.diff_file_row(file, None, cx));
+                    }
+                }
+                ListView::Tree => {
+                    for row in panel.tree(layer, &visible) {
+                        column = column.child(match row {
+                            TreeRow::Folder {
+                                path,
+                                name,
+                                depth,
+                                open,
+                            } => self.diff_folder_row(layer, path, name, depth, open, cx),
+                            TreeRow::File { index, depth } => self
+                                .diff_file_row(&panel.files()[index], Some(depth), cx)
+                                .into_any_element(),
+                        });
+                    }
+                }
             }
         }
         let list = div()
@@ -2214,7 +2462,7 @@ impl PilusView {
             .flex_shrink_0()
             .overflow_y_scroll();
         let list = match width {
-            Some(width) => list.w(px(width)).h_full().border_r_1(),
+            Some(width) => list.w(px(width)).h_full(),
             // Above the diff: the height the divider was dragged to. The
             // divider draws the hairline below it.
             None => list.w_full().h(px(panel.list_h)),
@@ -2222,7 +2470,41 @@ impl PilusView {
         list.border_color(theme.border).child(column)
     }
 
-    fn diff_file_row(&self, file: &DiffFile, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A folder in the tree: a press folds it shut or opens it again.
+    fn diff_folder_row(
+        &self,
+        layer: DiffLayer,
+        path: String,
+        name: String,
+        depth: u16,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key: FolderKey = (layer, path);
+        style::tree_row(
+            format!("pilus-diff-folder-{}-{}", layer.wire(), key.1),
+            style::TreeEntry {
+                depth,
+                name: name.into(),
+                folder: Some(open),
+                animate: self.diff_panel.folder_toggled.as_ref() == Some(&key),
+                mark: None,
+            },
+            self.theme,
+            &self.shared_settings,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.diff_toggle_folder(key.clone(), cx)))
+        .into_any_element()
+    }
+
+    /// One file. In the tree it sits at `depth` under its folder and drops the
+    /// directory the folders above already say.
+    fn diff_file_row(
+        &self,
+        file: &DiffFile,
+        depth: Option<u16>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let panel = &self.diff_panel;
@@ -2239,6 +2521,7 @@ impl PilusView {
             theme.panel_dim.into()
         };
         let (dir, name) = split_path(&file.path);
+        let dir = if depth.is_some() { "" } else { dir };
         let (glyph, status_color) = status_glyph(theme, file.layer, &file.status);
         let viewed = panel.is_viewed(file);
         let mut meta = div()
@@ -2311,6 +2594,26 @@ impl PilusView {
                 this.diff_set_staged(key.clone(), action, cx);
             }))
         });
+        let discard = matches!(file.layer, DiffLayer::Worktree | DiffLayer::Untracked).then(|| {
+            let key = key.clone();
+            style::icon_button(
+                format!("pilus-diff-discard-{}-{}", file.layer.wire(), file.path),
+                include_bytes!("../../assets/icons/undo-2.svg").as_slice(),
+                ButtonKind::Ghost,
+                theme,
+                style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL),
+            )
+            .tooltip(super::row_tooltip(
+                "Discard changes".to_string(),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.diff_ask_discard(key.clone(), cx);
+            }))
+        });
         div()
             .id(format!(
                 "pilus-diff-file-{}-{}",
@@ -2322,6 +2625,11 @@ impl PilusView {
             .items_center()
             .gap_2()
             .h(px(style::scaled(&self.shared_settings, 32.0)))
+            // Margin, not padding, so the hover fill starts at the file and
+            // not at the folder's edge. The 8px is the row's own `px_2`.
+            .ml(px(
+                depth.map_or(0.0, |depth| style::tree_glyph_x(depth) - 8.0)
+            ))
             .px_2()
             .radius_md()
             .cursor_pointer()
@@ -2367,6 +2675,7 @@ impl PilusView {
                     ),
             )
             .child(meta)
+            .children(discard)
             .children(stage)
             .on_click(cx.listener(move |this, _, _, cx| this.diff_pick(key.clone(), cx)))
     }
@@ -3379,6 +3688,18 @@ impl PilusView {
 /// without a daemon.
 #[cfg(feature = "visual-test")]
 impl PilusView {
+    pub(super) fn diff_show_discard(&mut self, cx: &mut Context<Self>) {
+        let key = self
+            .diff_panel
+            .files()
+            .iter()
+            .find(|file| file.layer == DiffLayer::Worktree)
+            .map(|file| (file.layer, file.path.clone()));
+        if let Some(key) = key {
+            self.diff_ask_discard(key, cx);
+        }
+    }
+
     pub(super) fn diff_show_sample(&mut self, cx: &mut Context<Self>) {
         use pilus_client::{DiffHunk, DiffLine, DiffLineKind as Kind};
 
@@ -3667,6 +3988,16 @@ impl PilusView {
 
     pub(super) fn diff_close_menu(&mut self, cx: &mut Context<Self>) {
         self.diff_panel.menu = None;
+        cx.notify();
+    }
+
+    pub(super) fn diff_show_view(&mut self, view: ListView, cx: &mut Context<Self>) {
+        self.diff_panel.view = view;
+        cx.notify();
+    }
+
+    pub(super) fn diff_show_list_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.diff_panel.set_list_width(width);
         cx.notify();
     }
 

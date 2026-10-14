@@ -1294,7 +1294,7 @@ impl PilusView {
         };
         let row = row.clone();
         let menu_entry = (row.path.clone(), row.dir);
-        style::tree_row(
+        let tree = style::tree_row(
             SharedString::from(format!("pilus-files-row-{}", row.path)),
             entry,
             self.theme,
@@ -1337,8 +1337,15 @@ impl PilusView {
                 this.files_click_file(&row, target, cx);
             }
             cx.notify();
-        }))
-        .into_any_element()
+        }));
+        // The list lays an item out at its content width; the column gives
+        // the row's margin-based indent a width to stretch into.
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(tree)
+            .into_any_element()
     }
 
     /// What Git says about a row: a changed file's status letter, or a dot on

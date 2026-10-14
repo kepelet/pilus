@@ -331,6 +331,38 @@ pub fn run() -> Result<()> {
             window.simulate_mouse_move(point(px(300.0), px(600.0)), cx);
         })
         .ok();
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.diff_show_view(super::diff_model::ListView::Tree, cx)
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-tree")?;
+        // The confirm that guards discarding a file's changes.
+        cx.update(|app| view.update(app, |view, cx| view.diff_show_discard(cx)));
+        settle(&mut cx, 8);
+        capture(&mut cx, window.into(), "diff-discard-confirm")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.menu_prompt = None;
+                cx.notify();
+            })
+        });
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.diff_show_view(super::diff_model::ListView::Flat, cx)
+            })
+        });
+        settle(&mut cx, 12);
+        // Expanded, the list sits beside the patch behind a draggable edge.
+        cx.update(|app| view.update(app, |view, cx| view.toggle_right_expanded(cx)));
+        settle(&mut cx, 30);
+        capture(&mut cx, window.into(), "diff-wide")?;
+        cx.update(|app| view.update(app, |view, cx| view.diff_show_list_width(460.0, cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "diff-wide-resized")?;
+        cx.update(|app| view.update(app, |view, cx| view.toggle_right_expanded(cx)));
+        settle(&mut cx, 30);
         cx.update(|app| view.update(app, |view, cx| view.diff_show_menu(false, cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "diff-menu-layout")?;

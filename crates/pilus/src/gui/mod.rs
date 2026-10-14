@@ -1078,6 +1078,17 @@ enum PromptAction {
         /// What the confirm shows: the pid and the command line.
         label: String,
     },
+    /// Throw away a Diff-page file's working-tree changes, after the confirm
+    /// prompt.
+    DiscardChanges {
+        endpoint: EndpointId,
+        /// The repository root the daemon reported, which `paths` are under.
+        repo: String,
+        paths: Vec<String>,
+        kind: pilus_client::Discard,
+        /// What the confirm shows: the file's path.
+        label: String,
+    },
     /// Delete a linked worktree (and its files) after the confirm prompt.
     DeleteWorktree {
         endpoint: EndpointId,
@@ -1111,7 +1122,10 @@ impl PromptAction {
     fn is_confirm(&self) -> bool {
         matches!(
             self,
-            Self::DeleteWorktree { .. } | Self::DeleteEntry { .. } | Self::KillProcess { .. }
+            Self::DeleteWorktree { .. }
+                | Self::DeleteEntry { .. }
+                | Self::KillProcess { .. }
+                | Self::DiscardChanges { .. }
         )
     }
 }
@@ -1692,6 +1706,7 @@ impl PilusView {
         );
         let mut diff_panel = DiffPanel::new();
         diff_panel.set_list_height(settings.diff_list_height);
+        diff_panel.set_list_width(settings.diff_list_width);
         let github_inputs = GithubInputs::new(
             style::chrome_font(&shared_settings),
             initial_fonts.body,
@@ -9460,6 +9475,13 @@ impl PilusView {
                 name,
                 ..
             } => self.ports_kill(&endpoint, pid, port, name, cx),
+            PromptAction::DiscardChanges {
+                endpoint,
+                repo,
+                paths,
+                kind,
+                ..
+            } => self.diff_discard(&endpoint, repo, paths, kind, cx),
             PromptAction::DeleteWorktree {
                 endpoint,
                 path,
@@ -10864,6 +10886,13 @@ impl PilusView {
             PromptAction::KillProcess { .. } => {
                 Some("Stops the process. Anything it hasn't saved is lost.")
             }
+            PromptAction::DiscardChanges {
+                kind: pilus_client::Discard::Untracked,
+                ..
+            } => Some("Deletes the file, which Git has no copy of. This can't be undone."),
+            PromptAction::DiscardChanges { .. } => {
+                Some("Reverts the file to its staged state. Your edits are lost for good.")
+            }
             _ => None,
         };
         let confirm_escalated = prompt.action.escalated();
@@ -10879,7 +10908,8 @@ impl PilusView {
             PromptAction::DeleteWorktree { path, .. } | PromptAction::DeleteEntry { path, .. } => {
                 Some(path.clone())
             }
-            PromptAction::KillProcess { label, .. } => Some(label.clone()),
+            PromptAction::KillProcess { label, .. }
+            | PromptAction::DiscardChanges { label, .. } => Some(label.clone()),
             _ => None,
         };
         let input = self.menu_prompt_input.clone();
@@ -10952,6 +10982,7 @@ impl PilusView {
                         .text_color(theme.muted)
                         .child(match (&prompt.action, confirm_escalated) {
                             (PromptAction::KillProcess { .. }, _) => "⏎ Kill · Esc Cancel",
+                            (PromptAction::DiscardChanges { .. }, _) => "⏎ Discard · Esc Cancel",
                             (_, true) => "⏎ Delete anyway · Esc Cancel",
                             (_, false) => "⏎ Delete · Esc Cancel",
                         }),
@@ -12502,6 +12533,7 @@ impl Render for PilusView {
                 this.right_sidebar_drag_move(f32::from(event.position.x), window_w, cx);
                 let window_h = f32::from(window.viewport_size().height);
                 this.diff_divider_move(f32::from(event.position.y), window_h, cx);
+                this.diff_side_divider_move(f32::from(event.position.x), cx);
                 this.git_divider_move(f32::from(event.position.y), window_h, cx);
             }))
             .on_mouse_up(

@@ -1,6 +1,6 @@
 //! The Diff page's pure rules: turning a [`FileDiff`] into display rows,
 //! moving a cursor over them, anchoring notes, and filtering the
-//! file list.
+//! file list, flat or folded into a tree.
 //!
 //! Nothing here touches GPUI or the daemon, so the layout and navigation
 //! rules stay unit-testable. `diff.rs` owns the state and paints these rows.
@@ -9,7 +9,7 @@
 //! survive a switch between Split and Stack, which only changes how the same
 //! source rows are laid out as *display rows*.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use pilus_client::{
     DiffFile, DiffLayer, DiffLineKind, DiffNote, FileDiff, NoteKind, NoteRange, NoteSide,
@@ -415,6 +415,20 @@ pub(super) fn clamp_list_height(wanted: f32, window_h: f32) -> f32 {
     )
 }
 
+/// Narrowest the file list goes when it sits beside the diff.
+pub(super) const MIN_LIST_WIDTH: f32 = 180.0;
+/// Width the diff keeps beside a dragged list, so it stays readable.
+const MIN_CODE_WIDTH: f32 = 360.0;
+
+/// `wanted` kept between the minimum and what leaves the diff its room in a
+/// page `page_w` wide. The minimum wins on a page too narrow for both.
+pub(super) fn clamp_list_width(wanted: f32, page_w: f32) -> f32 {
+    wanted.clamp(
+        MIN_LIST_WIDTH,
+        (page_w - MIN_CODE_WIDTH).max(MIN_LIST_WIDTH),
+    )
+}
+
 /// Which files the list shows.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum FileFilter {
@@ -500,6 +514,131 @@ pub(super) fn visible_files(
         );
     }
     order
+}
+
+/// How the file list is laid out.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum ListView {
+    /// One row per file, its folder beside the name.
+    #[default]
+    Flat,
+    /// Files nested under the folders they live in.
+    Tree,
+}
+
+impl ListView {
+    pub(super) fn next(self) -> Self {
+        match self {
+            Self::Flat => Self::Tree,
+            Self::Tree => Self::Flat,
+        }
+    }
+}
+
+/// A folder in one layer's tree, which is what a collapse is remembered by.
+pub(super) type FolderKey = (DiffLayer, String);
+
+/// One row of a layer's file tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum TreeRow {
+    Folder {
+        /// Full path of the innermost folder this row stands for.
+        path: String,
+        /// What the row shows: one segment, or several joined by `/` when the
+        /// folders between them hold nothing else.
+        name: String,
+        depth: u16,
+        open: bool,
+    },
+    File {
+        /// Index into the snapshot's files.
+        index: usize,
+        depth: u16,
+    },
+}
+
+#[derive(Default)]
+struct Node {
+    folders: BTreeMap<String, Node>,
+    files: Vec<usize>,
+}
+
+/// The folder's only child when it holds nothing else, so a chain such as
+/// `crates/pilus/src` draws as one row.
+fn only_folder(node: &Node) -> Option<(&String, &Node)> {
+    if node.files.is_empty() && node.folders.len() == 1 {
+        node.folders.iter().next()
+    } else {
+        None
+    }
+}
+
+/// `layer`'s share of `order` laid out as a tree: folders before files, each
+/// alphabetical. A folder in `collapsed` keeps its row and drops what is
+/// inside; `expand_all` ignores that, so a search shows every match.
+pub(super) fn tree_rows(
+    files: &[DiffFile],
+    order: &[usize],
+    layer: DiffLayer,
+    collapsed: &HashSet<FolderKey>,
+    expand_all: bool,
+) -> Vec<TreeRow> {
+    let mut root = Node::default();
+    for &index in order.iter().filter(|&&at| files[at].layer == layer) {
+        let mut segments: Vec<&str> = files[index].path.split('/').collect();
+        segments.pop();
+        let mut node = &mut root;
+        for segment in segments {
+            node = node.folders.entry(segment.to_string()).or_default();
+        }
+        node.files.push(index);
+    }
+    let mut rows = Vec::new();
+    let walk = Walk {
+        files,
+        layer,
+        collapsed,
+        expand_all,
+    };
+    walk.emit(&root, "", 0, &mut rows);
+    rows
+}
+
+/// What a tree walk reads while it lays folders out.
+struct Walk<'a> {
+    files: &'a [DiffFile],
+    layer: DiffLayer,
+    collapsed: &'a HashSet<FolderKey>,
+    expand_all: bool,
+}
+
+impl Walk<'_> {
+    fn emit(&self, node: &Node, prefix: &str, depth: u16, rows: &mut Vec<TreeRow>) {
+        let mut folders: Vec<(&String, &Node)> = node.folders.iter().collect();
+        folders.sort_by_key(|(name, _)| name.to_lowercase());
+        for (first, mut child) in folders {
+            let mut name = first.clone();
+            while let Some((next, only)) = only_folder(child) {
+                name.push('/');
+                name.push_str(next);
+                child = only;
+            }
+            let path = format!("{prefix}{name}");
+            let open = self.expand_all || !self.collapsed.contains(&(self.layer, path.clone()));
+            rows.push(TreeRow::Folder {
+                path: path.clone(),
+                name,
+                depth,
+                open,
+            });
+            if open {
+                self.emit(child, &format!("{path}/"), depth + 1, rows);
+            }
+        }
+        let mut here = node.files.clone();
+        here.sort_by_key(|&index| self.files[index].path.to_lowercase());
+        rows.extend(here.into_iter().map(|index| TreeRow::File { index, depth }));
+    }
 }
 
 /// The layer `path` sits in once `action` has run, for a selection to follow
@@ -807,6 +946,14 @@ mod tests {
     }
 
     #[test]
+    fn the_list_width_leaves_the_diff_its_room() {
+        assert_eq!(clamp_list_width(50.0, 1200.0), MIN_LIST_WIDTH);
+        assert_eq!(clamp_list_width(400.0, 1200.0), 400.0);
+        assert_eq!(clamp_list_width(1000.0, 1200.0), 1200.0 - MIN_CODE_WIDTH);
+        assert_eq!(clamp_list_width(400.0, 500.0), MIN_LIST_WIDTH);
+    }
+
+    #[test]
     fn layout_mode_auto_needs_room_for_both_sides() {
         assert!(LayoutMode::Auto.splits(900.0, 7.0));
         assert!(!LayoutMode::Auto.splits(500.0, 7.0));
@@ -891,6 +1038,70 @@ mod tests {
         );
         // The file is gone from the list, as after a commit elsewhere.
         assert_eq!(layer_after(&new, "b.rs", StageAction::Stage), None);
+    }
+
+    #[test]
+    fn a_tree_nests_folders_before_files_and_joins_lone_chains() {
+        let named = |path: &str| {
+            let mut f = file();
+            f.path = path.into();
+            f
+        };
+        let files = vec![
+            named("README.md"),
+            named("crates/pilus/src/b.rs"),
+            named("crates/pilus/src/a.rs"),
+            named("docs/guide.md"),
+            named("docs/api/index.md"),
+        ];
+        let order: Vec<usize> = (0..files.len()).collect();
+        let rows = tree_rows(&files, &order, DiffLayer::Worktree, &HashSet::new(), false);
+        let folder = |path: &str, name: &str, depth| TreeRow::Folder {
+            path: path.into(),
+            name: name.into(),
+            depth,
+            open: true,
+        };
+        assert_eq!(
+            rows,
+            vec![
+                folder("crates/pilus/src", "crates/pilus/src", 0),
+                TreeRow::File { index: 2, depth: 1 },
+                TreeRow::File { index: 1, depth: 1 },
+                folder("docs", "docs", 0),
+                folder("docs/api", "api", 1),
+                TreeRow::File { index: 4, depth: 2 },
+                TreeRow::File { index: 3, depth: 1 },
+                TreeRow::File { index: 0, depth: 0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_collapsed_folder_keeps_its_row_and_a_search_opens_it() {
+        let mut inside = file();
+        inside.path = "src/a.rs".into();
+        let files = vec![inside];
+        let collapsed = HashSet::from([(DiffLayer::Worktree, "src".to_string())]);
+        let shut = tree_rows(&files, &[0], DiffLayer::Worktree, &collapsed, false);
+        assert_eq!(
+            shut,
+            vec![TreeRow::Folder {
+                path: "src".into(),
+                name: "src".into(),
+                depth: 0,
+                open: false,
+            }]
+        );
+        let searched = tree_rows(&files, &[0], DiffLayer::Worktree, &collapsed, true);
+        assert_eq!(searched.len(), 2);
+        // Another layer's collapse does not reach this one.
+        let other = HashSet::from([(DiffLayer::Staged, "src".to_string())]);
+        assert_eq!(
+            tree_rows(&files, &[0], DiffLayer::Worktree, &other, false).len(),
+            2
+        );
+        assert!(tree_rows(&files, &[0], DiffLayer::Staged, &other, false).is_empty());
     }
 
     #[test]

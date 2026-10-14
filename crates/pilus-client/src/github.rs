@@ -113,8 +113,11 @@ pub enum GhState {
     Ready(RepoInfo),
     /// `gh` is not installed on the machine.
     Missing,
-    /// `gh` is installed but holds no login.
-    SignedOut,
+    /// `gh` is installed but holds no login, in the shell pilus ran it in.
+    /// Carries the first line `gh` said, because that shell is not the one a
+    /// person logs in to: a token in a shell profile or a locked keyring
+    /// reads as signed out here and signed in there.
+    SignedOut(String),
     /// The directory is not a checkout with a GitHub remote; carries why.
     NoRepo(String),
     Failed(String),
@@ -126,7 +129,7 @@ impl GhState {
         match self {
             Self::Ready(_) => "ready",
             Self::Missing => "missing",
-            Self::SignedOut => "signed_out",
+            Self::SignedOut(_) => "signed_out",
             Self::NoRepo(_) => "no_repo",
             Self::Failed(_) => "failed",
         }
@@ -140,10 +143,13 @@ impl GhState {
                 "GitHub CLI is not installed on this machine. Install it from https://cli.github.com (`brew install gh`), then run `gh auth login`."
                     .to_string(),
             ),
-            Self::SignedOut => Some(
-                "GitHub CLI is not signed in on this machine. Run `gh auth login` in a terminal there."
-                    .to_string(),
-            ),
+            Self::SignedOut(said) => {
+                let mut advice = "GitHub CLI is not signed in on this machine. Run `gh auth login` in a terminal there.".to_string();
+                if !said.is_empty() {
+                    advice.push_str(&format!(" gh said: {said}"));
+                }
+                Some(advice)
+            }
             Self::NoRepo(why) | Self::Failed(why) => Some(why.clone()),
         }
     }
@@ -693,8 +699,9 @@ fn classify(code: Option<i32>, stderr: &str) -> GhState {
         || lower.contains("not logged in")
         || lower.contains("http 401")
         || lower.contains("bad credentials")
+        || lower.contains("not logged into")
     {
-        return GhState::SignedOut;
+        return GhState::SignedOut(first);
     }
     GhState::Failed(if first.is_empty() {
         "gh failed without saying why.".to_string()
@@ -1020,7 +1027,9 @@ mod tests {
                 Some(4),
                 "To get started with GitHub CLI, please run:  gh auth login"
             ),
-            GhState::SignedOut
+            GhState::SignedOut(
+                "To get started with GitHub CLI, please run:  gh auth login".to_string()
+            )
         );
         // The no-remote message also mentions `gh auth login`; it is not a sign-out.
         assert!(matches!(

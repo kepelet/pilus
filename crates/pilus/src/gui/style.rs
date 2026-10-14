@@ -517,15 +517,15 @@ const TREE_GAP: f32 = 4.0;
 const TREE_NAME_PAD: f32 = 4.0;
 const TREE_EDGE: f32 = 8.0;
 
+/// Where a row's glyph starts, so a row of another shape under a folder can
+/// stand beneath its icon.
+pub(super) fn tree_glyph_x(depth: u16) -> f32 {
+    TREE_EDGE + f32::from(depth) * TREE_INDENT + TREE_DISCLOSURE + TREE_GAP
+}
+
 /// Where a row's name starts, so a placeholder under it lines up.
 pub(super) fn tree_name_x(depth: u16) -> f32 {
-    TREE_EDGE
-        + f32::from(depth) * TREE_INDENT
-        + TREE_DISCLOSURE
-        + TREE_GAP
-        + TREE_GLYPH
-        + TREE_GAP
-        + TREE_NAME_PAD
+    tree_glyph_x(depth) + TREE_GLYPH + TREE_GAP + TREE_NAME_PAD
 }
 
 /// What a tree row says about Git, at its trailing edge.
@@ -550,7 +550,7 @@ pub(super) struct TreeEntry {
 
 /// One row of a file tree: indent, a disclosure chevron for a folder (a file
 /// keeps the slot empty so names line up), a glyph, the name, and any Git
-/// mark. Callers attach their own handler.
+/// mark. Callers attach their own handler and place it in a flex column.
 pub(super) fn tree_row(
     id: impl Into<ElementId>,
     entry: TreeEntry,
@@ -604,9 +604,12 @@ pub(super) fn tree_row(
         .flex_row()
         .items_center()
         .gap(px(TREE_GAP))
-        .w_full()
         .h(px(scaled(settings, 24.0)))
-        .pl(px(TREE_EDGE + f32::from(depth) * TREE_INDENT))
+        // The indent is margin, so the hover fill covers the row and not the
+        // empty space left of it. That leaves the width to the parent: it
+        // must be a flex column, which stretches the row to what remains.
+        .ml(px(f32::from(depth) * TREE_INDENT))
+        .pl(px(TREE_EDGE))
         .pr_2()
         .radius_md()
         .cursor_pointer()

@@ -12903,12 +12903,10 @@ impl PilusView {
         // to a cell of remainder between the grid and it, a margin the left
         // never has. The column takes that remainder instead, so the grid
         // meets both edges. Only at rest: mid-tween the column would stair-step
-        // a cell at a time.
-        let absorbed = if !self.right.tweening() && slack_x < cell_w {
-            slack_x
-        } else {
-            0.0
-        };
+        // a cell at a time. With the column away there is nothing to take it,
+        // and trimming the card would leave a bare strip along the edge; the
+        // grid's own fillers pool the remainder there instead.
+        let absorbed = absorbed_remainder(right_px, self.right.tweening(), slack_x, cell_w);
         let (slack_x, content_w) = (slack_x - absorbed, content_w - absorbed);
         CardLayout {
             card_x,
@@ -13549,6 +13547,13 @@ fn render_grid(
         surface
     };
     let tiled = panes.bounds();
+    // A frame still short of the card (the daemon lags a resize) leaves its
+    // missing columns to the row filler, which paints them as surface; the
+    // outermost cards grow over them too, or a wide gutter reads as a column.
+    let card_slack = (
+        slack_x + unpainted_width(frame.width, skip_cols, max_cols, cell_width),
+        slack_y,
+    );
     let chromes: Vec<pane_chrome::PaneChrome> = panes
         .panes()
         .iter()
@@ -13568,7 +13573,7 @@ fn render_grid(
                 theme.border,
                 line_height,
                 cell_width,
-                (slack_x, slack_y),
+                card_slack,
                 skip_cols,
                 skip_rows,
             ))
@@ -13646,6 +13651,23 @@ fn render_grid(
         column = column.child(chrome);
     }
     column.children(toolbar)
+}
+
+/// The sub-cell remainder the right column takes from the card, so the grid
+/// meets both edges. None while the column is away or moving: a closed column
+/// has nothing to take it, and the card would be left short of the window.
+fn absorbed_remainder(column_px: f32, tweening: bool, slack_x: f32, cell_w: f32) -> f32 {
+    if column_px > 0.0 && !tweening && slack_x < cell_w {
+        slack_x
+    } else {
+        0.0
+    }
+}
+
+/// Pixels of the card's width the frame has no columns for yet: the daemon
+/// has not caught up with a window that grew.
+fn unpainted_width(frame_width: u16, skip_cols: u16, max_cols: u16, cell_width: f32) -> f32 {
+    f32::from(max_cols.saturating_sub(frame_width.saturating_sub(skip_cols))) * cell_width
 }
 
 /// The parts of the `cells` columns from `start` that fall outside
@@ -15211,6 +15233,21 @@ fn launch_home_agent(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_closed_column_takes_no_remainder() {
+        assert_eq!(absorbed_remainder(0.0, false, 5.0, 8.0), 0.0);
+        assert_eq!(absorbed_remainder(482.0, false, 5.0, 8.0), 5.0);
+        assert_eq!(absorbed_remainder(482.0, true, 5.0, 8.0), 0.0);
+    }
+
+    #[test]
+    fn a_lagging_frame_leaves_its_missing_columns_unpainted() {
+        assert_eq!(unpainted_width(100, 10, 90, 8.0), 0.0);
+        assert_eq!(unpainted_width(100, 10, 93, 8.0), 24.0);
+        // A frame wider than the card has nothing missing.
+        assert_eq!(unpainted_width(120, 10, 90, 8.0), 0.0);
+    }
+
     fn strip(ids: &[&str]) -> Vec<Tab> {
         ids.iter()
             .enumerate()

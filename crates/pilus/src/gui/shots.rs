@@ -1402,6 +1402,7 @@ impl Render for GlyphGridView {
                 0.0,
                 true,
                 None,
+                1.0,
             ))
     }
 }
@@ -1542,6 +1543,7 @@ impl Render for PaneGridView {
                             24.0,
                         )),
                 ),
+                1.0,
             ))
     }
 }

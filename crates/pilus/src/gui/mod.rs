@@ -53,6 +53,7 @@ mod tasks;
 mod text_input;
 mod theme;
 mod toast;
+mod toolbar_fade;
 mod ui_playground;
 mod update_window;
 mod updater;
@@ -78,13 +79,13 @@ use git_tab::GitPanel;
 use github_tab::{GithubInputs, GithubPanel, HomeIssues};
 use glass::Glass;
 use gpui::{
-    Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DisplayId, Div,
-    ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu,
-    MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    Stateful, SystemNotification, TextRun, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, anchored, canvas, deferred, div, font, img, linear_color_stop,
-    linear_gradient, point, prelude::*, px, relative, size, svg,
+    Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DispatchPhase,
+    DisplayId, Div, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding,
+    KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, SharedString, Stateful, SystemNotification, TextRun, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, anchored, canvas, deferred, div, font,
+    img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, size, svg,
 };
 use gpui_platform::application;
 use gpui_updater_core::{Release, UpdateStatus, Version};
@@ -1530,6 +1531,7 @@ struct PilusView {
     sidebar_anim: Option<SidebarAnim>,
     /// The terminal cursor's fade, advanced by the tick loop.
     cursor_blink: cursor_blink::CursorBlink,
+    toolbar_fade: toolbar_fade::ToolbarFade,
     /// Last dock rectangle seen while the sidebar was open. Hiding the sidebar
     /// makes the daemon drop its `ShellDock`, so a live-only width would snap
     /// to zero the instant it answers; the collapse tween folds this one away
@@ -2150,6 +2152,7 @@ impl PilusView {
             glass: Glass::new(),
             sidebar_anim: None,
             cursor_blink: cursor_blink::CursorBlink::new(Instant::now()),
+            toolbar_fade: toolbar_fade::ToolbarFade::new(Instant::now()),
             last_sidebar_dock: None,
             sidebar_freeze: None,
             sidebar_open: 1.0,
@@ -2367,7 +2370,14 @@ impl PilusView {
                     let settled = view.tick_sidebar_anim() & view.right.tick();
                     let released = view.release_sidebar_freeze();
                     let blinked = view.tick_cursor_blink(cx);
-                    if view.poll(cx) || changed || !settled || was_animating || released || blinked
+                    let faded = view.tick_toolbar_fade(cx);
+                    if view.poll(cx)
+                        || changed
+                        || !settled
+                        || was_animating
+                        || released
+                        || blinked
+                        || faded
                     {
                         cx.notify();
                     }
@@ -8714,6 +8724,14 @@ impl PilusView {
         self.cursor_blink.tick(Instant::now(), cursor, blinking)
     }
 
+    /// Advance the pane toolbar's fade; true when its opacity moved. It clears
+    /// while either sidebar slides and returns once both have landed.
+    fn tick_toolbar_fade(&mut self, cx: &App) -> bool {
+        let sliding = self.sidebar_anim.is_some() || self.right.tweening();
+        self.toolbar_fade
+            .tick(Instant::now(), sliding, !cx.reduce_motion())
+    }
+
     /// Advance the sidebar tween; true once it settles at its target.
     fn tick_sidebar_anim(&mut self) -> bool {
         let settled = match &self.sidebar_anim {
@@ -13165,7 +13183,14 @@ impl Render for PilusView {
         } else {
             terminal_fill
         };
-        let pane_toolbar = (pane_ui && self.settings.pane_toolbar).then(|| self.pane_toolbar(cx));
+        let pane_toolbar = (pane_ui && self.settings.pane_toolbar && self.toolbar_fade.shown())
+            .then(|| {
+                // The wrapper carries the fade; the bar inside keeps its
+                // own `occlude`.
+                div()
+                    .opacity(self.toolbar_fade.alpha())
+                    .child(self.pane_toolbar(cx))
+            });
         let grid = match self.shown_frame() {
             Some(frame) => perf::grid_build(|| {
                 render_grid(
@@ -13311,22 +13336,6 @@ impl Render for PilusView {
                     this.control_held = event.modifiers.control;
                 },
             ))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                let window_w = f32::from(window.viewport_size().width);
-                this.right_sidebar_drag_move(f32::from(event.position.x), window_w, cx);
-                let window_h = f32::from(window.viewport_size().height);
-                this.diff_divider_move(f32::from(event.position.y), window_h, cx);
-                this.diff_side_divider_move(f32::from(event.position.x), cx);
-                this.git_divider_move(f32::from(event.position.y), window_h, cx);
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    this.right_sidebar_drag_end(cx);
-                    this.diff_divider_end(cx);
-                    this.git_divider_end(cx);
-                }),
-            )
             // Every pilus shortcut lands on one of these, so leaving them
             // unregistered makes the whole set a no-op while Luvus is missing.
             .when(!luvus_missing, |root| {
@@ -13434,7 +13443,48 @@ impl Render for PilusView {
                 }),
             );
 
+        // Every drag (the right column's edge, the diff and git dividers) runs
+        // on window-level listeners: those handles live inside occluding
+        // panels, and a listener on the root only hears the pointer while
+        // nothing occludes it, so the drag would freeze under the pointer.
+        let view = cx.entity();
+        let window_size = window.viewport_size();
+        let drag_tracker = canvas(
+            |_, _, _| (),
+            move |_, (), window, _| {
+                let (window_w, window_h) =
+                    (f32::from(window_size.width), f32::from(window_size.height));
+                let moving = view.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
+                    moving.update(cx, |this, cx| {
+                        this.right_sidebar_drag_move(x, window_w, cx);
+                        this.diff_divider_move(y, window_h, cx);
+                        this.diff_side_divider_move(x, cx);
+                        this.git_divider_move(y, window_h, cx);
+                    });
+                });
+                let released = view.clone();
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture || event.button != MouseButton::Left {
+                        return;
+                    }
+                    released.update(cx, |this, cx| {
+                        this.right_sidebar_drag_end(cx);
+                        this.diff_divider_end(cx);
+                        this.git_divider_end(cx);
+                    });
+                });
+            },
+        )
+        .absolute()
+        .size_0();
+
         root.child(coat)
+            .child(drag_tracker)
             .child(header_drag)
             .child(header)
             .child(

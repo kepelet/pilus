@@ -24,8 +24,8 @@
 # `version` in Cargo.toml instead.
 #
 # Environment:
-#   PILUS_RELEASES_BUCKET  R2 bucket name. Falls back to infra/.env, the same
-#                          file the Alchemy stack reads.
+#   PILUS_RELEASES_BUCKET  R2 bucket name. Falls back to infra/.env (the file
+#                          the Alchemy stack reads), decrypted with dotenvx.
 #   PILUS_ALLOW_DIRTY=1    Publish stable from a tree with uncommitted changes.
 #
 # Auth is wrangler's own (`bunx wrangler login`), which is separate from the
@@ -43,11 +43,12 @@ esac
 
 public="https://releases.kepelet.com/pilus"
 
-if [ -z "${PILUS_RELEASES_BUCKET:-}" ] && [ -f infra/.env ]; then
-    PILUS_RELEASES_BUCKET="$(sed -n 's/^PILUS_RELEASES_BUCKET=//p' infra/.env | head -1)"
+# infra/.env is dotenvx-encrypted, so a plain read would return ciphertext.
+if [ -z "${PILUS_RELEASES_BUCKET:-}" ] && [ -f infra/.env ] && command -v dotenvx >/dev/null 2>&1; then
+    PILUS_RELEASES_BUCKET="$(dotenvx get PILUS_RELEASES_BUCKET -f infra/.env 2>/dev/null || true)"
 fi
 if [ -z "${PILUS_RELEASES_BUCKET:-}" ]; then
-    echo "publish-release: set PILUS_RELEASES_BUCKET (or put it in infra/.env)" >&2
+    echo "publish-release: set PILUS_RELEASES_BUCKET (or put it in infra/.env; needs dotenvx and infra/.env.keys)" >&2
     exit 1
 fi
 bucket="$PILUS_RELEASES_BUCKET"

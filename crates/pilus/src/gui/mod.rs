@@ -69,7 +69,7 @@ use std::time::{Duration, Instant};
 use crate::settings::{CHROME_FONT, Settings, WindowGeometry};
 use crate::update::{UpdateChannel, UpdateRequest, describe_source};
 use automations::AutomationsPanel;
-use browser_tab::BrowserPanel;
+use browser_tab::{BrowserPanel, PageEdit};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
     MouseEventKind,
@@ -4349,6 +4349,11 @@ impl PilusView {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // With no daemon there is nothing to type into or navigate.
         if self.luvus_missing() {
+            return;
+        }
+        // A page the user clicked into owns its keys.
+        if self.browser_page_focused(cx) {
+            self.browser_forward_key(event, cx);
             return;
         }
         // An open context menu owns up/down/enter/escape until one runs or it
@@ -13523,13 +13528,19 @@ impl Render for PilusView {
             // unregistered makes the whole set a no-op while Luvus is missing.
             .when(!luvus_missing, |root| {
                 root.on_action(cx.listener(|this, _: &CopySelection, _window, cx| {
-                    this.copy_selection(cx);
+                    if !this.browser_edit(PageEdit::Copy, cx) {
+                        this.copy_selection(cx);
+                    }
                 }))
                 .on_action(cx.listener(|this, _: &PasteClipboard, _window, cx| {
-                    this.paste_clipboard(cx);
+                    if !this.browser_edit(PageEdit::Paste, cx) {
+                        this.paste_clipboard(cx);
+                    }
                 }))
                 .on_action(cx.listener(|this, _: &SelectAllGrid, window, cx| {
-                    this.select_all(window, cx);
+                    if !this.browser_edit(PageEdit::SelectAll, cx) {
+                        this.select_all(window, cx);
+                    }
                 }))
                 .on_action(cx.listener(|this, _: &NewTab, _window, _cx| this.new_tab()))
                 .on_action(cx.listener(|this, _: &OpenLocalTerminal, _window, cx| {

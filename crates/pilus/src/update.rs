@@ -34,10 +34,12 @@ pub const FEED_URL_ENV: &str = "PILUS_UPDATE_FEED_URL";
 
 /// Minisign public key that verifies release artifacts.
 ///
-/// `None` until the first signed release is published. While unset the engine
-/// runs [`Verification::BestEffort`] (checksum when present, nothing when
-/// not). Once set, switch the default policy to [`Verification::Signature`].
-pub const MINISIGN_PUBLIC_KEY: Option<&str> = None;
+/// While unset the engine runs [`Verification::BestEffort`] (checksum when
+/// present, nothing when not). Set, every download must carry a valid
+/// `.minisig`, so an unsigned release or preview is rejected by this build.
+/// The matching secret key signs releases through `MINISIGN_SECRET_KEY`.
+pub const MINISIGN_PUBLIC_KEY: Option<&str> =
+    Some("RWTpfuUosellUav8HNDeVU6PB08mBv84RqP3hraQSM0/8zraxkiWHL8o");
 
 /// Supported update channel.
 ///

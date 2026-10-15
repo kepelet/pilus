@@ -168,13 +168,16 @@ Three layers, weakest first:
    `APPLE_DEVELOPER_IDENTITY` when packaging and `NOTARY_PROFILE` to submit
    and staple. Without this, Gatekeeper quarantines the swapped-in bundle and
    the update looks like malware.
-3. **Minisign (recommended).** Generate once:
-   `minisign -G -p pilus.pub -s pilus.key`. Store the secret key contents as the
-   `MINISIGN_SECRET_KEY` repo secret, put the public key into
-   `MINISIGN_PUBLIC_KEY` in `update.rs` — verification then flips from
-   `BestEffort` to `Signature` automatically and unsigned releases are
-   rejected. Static manifests carry the signature in the asset's `signature`
-   or `signature_url` field.
+3. **Minisign (on).** The public key is `MINISIGN_PUBLIC_KEY` in `update.rs`, so
+   verification is `Signature` and an unsigned download is rejected. The secret
+   key stays out of the repo (`~/.minisign/pilus.key`); package with
+   `MINISIGN_SECRET_KEY=<path to it>` and each DMG gets a `.minisig`, which the
+   manifest references as `signature_url`. Packaging skips signing silently when
+   the key or `minisign` is missing, so `publish-release.sh` refuses to upload a
+   DMG without one. Builds before this key was set accept unsigned updates. To
+   sign in CI, use a key generated with `minisign -G -W` (no password) in the
+   `MINISIGN_SECRET_KEY` repo secret. Back the key up: losing it strands every
+   client that has the public key.
 
 ## Daemon compatibility
 

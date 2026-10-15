@@ -23,6 +23,11 @@ bincode = { version = "2", features = ["serde"] }
 crossbeam-channel = "0.5"
 crossterm = { version = "0.29", features = ["serde"] }
 gpui-updater-core = "0.1"
+# Embedded system webview for the Browser tab. 0.6.6 is the last release built
+# against the `gpui-pre` pinned below; later ones need a newer gpui.
+gpui-wry = "=0.6.6"
+# `gpui-wry` builds on wry but does not re-export it; the builder is ours to drive.
+wry = { package = "lb-wry", version = "0.53.3" }
 gpui = { package = "gpui-pre", version = "=0.3.6" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # `runtime_shaders` stitches the Metal shader source instead of invoking the

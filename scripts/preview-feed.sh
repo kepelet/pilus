@@ -59,7 +59,8 @@ base_url="${base_url%/}"
 # `0.0.0.0` is what a server binds to, never a host a client can dial: on
 # another machine it resolves to that machine's own loopback, so the check
 # (which reads the feed URL) succeeds but the download (which reads this
-# baked-in asset URL) fails with "connection refused".
+# baked-in asset URL) fails with "connection refused". Checked here as well as
+# in write-manifest.sh so a bad URL fails before the package run.
 case "$base_url" in
     *//0.0.0.0 | *//0.0.0.0[:/]*)
         echo "preview-feed: base URL '$base_url' uses 0.0.0.0, a bind address" >&2
@@ -91,49 +92,14 @@ mkdir -p "$feed_dir"
 
 # Clone when the filesystem supports it (APFS), else copy.
 cp -c "target/release/$dmg" "$feed_dir/$dmg" 2>/dev/null || cp "target/release/$dmg" "$feed_dir/$dmg"
-sha256="$(shasum -a 256 "$feed_dir/$dmg" | awk '{print $1}')"
-
-signature_url=""
 if [ -f "target/release/$dmg.minisig" ]; then
     cp "target/release/$dmg.minisig" "$feed_dir/$dmg.minisig"
-    signature_url="$base_url/$dmg.minisig"
 fi
 
 revision="$(git rev-parse --short HEAD 2>/dev/null || echo local)"
-notes="${PILUS_PREVIEW_NOTES:-Preview build ${revision} (pilus ${version})}"
-
-PILUS_MANIFEST_DEST="$feed_dir/latest.json" \
 PILUS_MANIFEST_VERSION="$manifest_version" \
-PILUS_MANIFEST_NOTES="$notes" \
-PILUS_MANIFEST_NAME="$dmg" \
-PILUS_MANIFEST_URL="$base_url/$dmg" \
-PILUS_MANIFEST_SHA256="$sha256" \
-PILUS_MANIFEST_SIGNATURE_URL="$signature_url" \
-python3 - <<'PY'
-import json
-import os
-
-asset = {
-    "name": os.environ["PILUS_MANIFEST_NAME"],
-    "url": os.environ["PILUS_MANIFEST_URL"],
-    "sha256": os.environ["PILUS_MANIFEST_SHA256"],
-    "os": "macos",
-    "arch": "arm64",
-    "format": "dmg",
-}
-if os.environ.get("PILUS_MANIFEST_SIGNATURE_URL"):
-    asset["signature_url"] = os.environ["PILUS_MANIFEST_SIGNATURE_URL"]
-
-manifest = {
-    "schema_version": 1,
-    "version": os.environ["PILUS_MANIFEST_VERSION"],
-    "notes": os.environ["PILUS_MANIFEST_NOTES"],
-    "assets": [asset],
-}
-with open(os.environ["PILUS_MANIFEST_DEST"], "w") as handle:
-    json.dump(manifest, handle, indent=2)
-    handle.write("\n")
-PY
+PILUS_MANIFEST_NOTES="${PILUS_PREVIEW_NOTES:-Preview build ${revision} (pilus ${version})}" \
+    ./scripts/write-manifest.sh "$feed_dir/latest.json" "$base_url" "$feed_dir/$dmg"
 
 echo "manifest version: $manifest_version (client build $version)"
 echo "preview payload: $feed_dir"

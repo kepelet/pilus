@@ -43,6 +43,14 @@ package-dmg:
 preview-feed base_url="http://127.0.0.1:8000":
     PILUS_PREVIEW_BASE_URL="{{base_url}}" ./scripts/preview-feed.sh
 
+# Write the channel manifest (`stable` or `preview`) for the packaged DMG into
+# target/release/<channel>.json. The base URL is where the DMG will be hosted;
+# upload the JSON as releases.kepelet.com/pilus/<channel>.json beside it.
+manifest channel base_url:
+    @case "{{channel}}" in stable|preview) ;; *) echo "channel must be stable or preview" >&2; exit 1;; esac
+    ./scripts/write-manifest.sh "target/release/{{channel}}.json" "{{base_url}}" \
+        "target/release/pilus-v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-macos-arm64.dmg"
+
 # Serve the preview payload on the port the preview channel expects.
 serve-preview:
     python3 -m http.server 8000 --directory target/release/preview-feed

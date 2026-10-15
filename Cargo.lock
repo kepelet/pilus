@@ -6345,7 +6345,7 @@ checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 
 [[package]]
 name = "pilus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -6374,7 +6374,7 @@ dependencies = [
 
 [[package]]
 name = "pilus-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "iroh",
@@ -6388,7 +6388,7 @@ dependencies = [
 
 [[package]]
 name = "pilus-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -6403,7 +6403,7 @@ dependencies = [
 
 [[package]]
 name = "pilus-mobile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "iroh",
  "iroh-tickets",
@@ -6416,7 +6416,7 @@ dependencies = [
 
 [[package]]
 name = "pilus-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bincode 2.0.1",
  "crossterm",

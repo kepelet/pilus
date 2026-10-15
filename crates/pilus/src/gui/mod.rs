@@ -13770,7 +13770,8 @@ fn render_grid(
     // Floating cards stroke in the surface's own color, so the ring reads as
     // gutter; flush panes outline themselves with the theme's border.
     let (border, focus_border) = if !pane_gaps {
-        (theme.border, theme.border_focus)
+        // Focus shows in the dimming of the other panes, not in the border.
+        (theme.border, theme.border)
     } else if glass < 1.0 {
         let clear = gpui::Rgba { a: 0.0, ..surface };
         (clear, theme.border)
@@ -13785,7 +13786,7 @@ fn render_grid(
         slack_x + unpainted_width(frame.width, skip_cols, max_cols, cell_width),
         slack_y,
     );
-    let mut chromes: Vec<pane_chrome::PaneChrome> = panes
+    let chromes: Vec<pane_chrome::PaneChrome> = panes
         .panes()
         .iter()
         .enumerate()
@@ -13811,10 +13812,6 @@ fn render_grid(
             ))
         })
         .collect();
-    // Flush panes share their seams, so the focused one paints last and its
-    // border is the one the eye sees. Element state is keyed by pane index,
-    // so the order does not replay any fade.
-    chromes.sort_by_key(pane_chrome::PaneChrome::focused);
     // The surface and the cards sit under the rows. Cells the daemon paints
     // in its base color skip their fill inside the tiled box (`render_row`),
     // so the cards show through; the gutters keep the surface.

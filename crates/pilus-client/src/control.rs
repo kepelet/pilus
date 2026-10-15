@@ -15,6 +15,7 @@
 //! refresh is a full SSH round trip, and a click waiting behind one reads as
 //! an unresponsive tab strip.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,6 +71,10 @@ pub struct Tab {
     pub cwd: String,
     /// Focused terminal's detected command/process, empty for a native view.
     pub process: String,
+    /// Focused terminal's own title from its escape output. A shell sets it
+    /// to the command line while one runs, which `process` (an executable
+    /// name only) cannot say. Empty when the daemon reports none.
+    pub title: String,
 }
 
 impl Tab {
@@ -97,6 +102,7 @@ impl Tab {
                 .to_string(),
             cwd: String::new(),
             process: String::new(),
+            title: String::new(),
         })
     }
 
@@ -283,8 +289,9 @@ impl TaskSummary {
 }
 
 /// Fill each tab's cwd/process from `session.snapshot`: the focused terminal
-/// pane wins, then any terminal, then the active workspace's own cwd.
-fn enrich_tab_runtime(tabs: &mut [Tab], snapshot: &Value) {
+/// pane wins, then any terminal, then the active workspace's own cwd. `titles`
+/// maps a pane id to its terminal title and may be empty.
+fn enrich_tab_runtime(tabs: &mut [Tab], snapshot: &Value, titles: &HashMap<String, String>) {
     let Some(workspace) = snapshot
         .get("workspaces")
         .and_then(Value::as_array)
@@ -336,7 +343,29 @@ fn enrich_tab_runtime(tabs: &mut [Tab], snapshot: &Value) {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        tab.title = pane
+            .and_then(|pane| pane.get("pane_id"))
+            .and_then(Value::as_str)
+            .and_then(|id| titles.get(id))
+            .cloned()
+            .unwrap_or_default();
     }
+}
+
+/// Pane id to terminal title from `terminal.backend.inventory`.
+fn terminal_titles(inventory: &Value) -> HashMap<String, String> {
+    inventory
+        .get("terminals")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|terminal| {
+            let id = terminal.get("pane_id")?.as_str()?;
+            let title = terminal.get("terminal_title")?.as_str()?.trim();
+            (!title.is_empty()).then(|| (id.to_string(), title.to_string()))
+        })
+        .collect()
 }
 
 /// A task needs attention unless its status reached a terminal state.
@@ -907,7 +936,13 @@ impl ControlClient {
             .filter_map(Tab::from_json)
             .collect();
         let snapshot = self.request("session.snapshot", json!({}))?;
-        enrich_tab_runtime(&mut tabs, &snapshot);
+        // Titles are a nicety: a daemon without the method, or a remote
+        // endpoint that does not allow it, still gets its tabs.
+        let titles = self
+            .request("terminal.backend.inventory", json!({}))
+            .map(|inventory| terminal_titles(&inventory))
+            .unwrap_or_default();
+        enrich_tab_runtime(&mut tabs, &snapshot, &titles);
         Ok(tabs)
     }
 
@@ -1590,7 +1625,7 @@ fn is_structural(name: &str) -> bool {
 mod tests {
     use super::{
         Agent, AutomationSummary, PaneFrame, Tab, TaskSummary, enrich_tab_runtime, is_structural,
-        read_line_within, worktree_blockers,
+        read_line_within, terminal_titles, worktree_blockers,
     };
     use crate::error::Error;
     use crate::transport::Stream;
@@ -1710,7 +1745,7 @@ mod tests {
                             "index": 1,
                             "panes": [
                                 { "kind": "terminal", "cwd": "/repo/api", "agent": "fish", "focused": false },
-                                { "kind": "terminal", "cwd": "/repo/web", "agent": "node", "focused": true }
+                                { "kind": "terminal", "cwd": "/repo/web", "agent": "node", "focused": true, "pane_id": "9" }
                             ]
                         },
                         {
@@ -1729,10 +1764,20 @@ mod tests {
                 }
             ]
         });
-        enrich_tab_runtime(&mut tabs, &snapshot);
+        let titles = terminal_titles(&json!({
+            "terminals": [
+                { "pane_id": "8", "terminal_title": "~" },
+                { "pane_id": "9", "terminal_title": " node server.js ~/r/web " },
+                { "pane_id": "10", "terminal_title": "" }
+            ]
+        }));
+        enrich_tab_runtime(&mut tabs, &snapshot, &titles);
         // The focused terminal wins over the first one.
         assert_eq!(tabs[0].cwd, "/repo/web");
         assert_eq!(tabs[0].process, "node");
+        assert_eq!(tabs[0].title, "node server.js ~/r/web");
+        // A pane the inventory does not list has no title.
+        assert_eq!(tabs[1].title, "");
         // No focused pane falls back to the first terminal.
         assert_eq!(tabs[1].cwd, "/repo/docs");
         assert_eq!(tabs[1].process, "devin");

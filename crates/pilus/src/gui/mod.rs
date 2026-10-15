@@ -679,6 +679,7 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
                     appears_transparent: true,
                     traffic_light_position: Some(TRAFFIC_LIGHT_POSITION),
                 }),
+                app_owns_titlebar_drag: true,
                 ..Default::default()
             },
             move |window, cx| {
@@ -971,6 +972,7 @@ fn open_main_window(
                 appears_transparent: true,
                 traffic_light_position: Some(TRAFFIC_LIGHT_POSITION),
             }),
+            app_owns_titlebar_drag: true,
             ..Default::default()
         },
         move |window, cx| {
@@ -1436,6 +1438,67 @@ impl TabsPick {
         self.at.elapsed() < TABS_PICK_WINDOW && tabs.iter().map(|tab| &tab.id).eq(self.from.iter())
     }
 }
+/// How long reordered tabs take to spring into their new slots: the selection
+/// pill's flight, so the two land together.
+const TAB_SLIDE: Duration = Duration::from_millis(340);
+
+/// Tabs travelling from the slots they were dropped out of to their new ones.
+struct TabSlide {
+    /// Each tab's distance from its layout slot when the slide began, by id.
+    /// Positive means drawn right of it.
+    from: HashMap<String, f32>,
+    started: Instant,
+}
+
+impl TabSlide {
+    fn progress(&self, now: Instant) -> f32 {
+        now.duration_since(self.started).as_secs_f32() / TAB_SLIDE.as_secs_f32()
+    }
+
+    fn running(&self, now: Instant) -> bool {
+        self.progress(now) < 1.0
+    }
+
+    /// How far tab `id` is drawn from its layout slot: the start distance
+    /// released along the spring, so it overshoots a hair and settles.
+    fn offset(&self, id: &str, now: Instant) -> f32 {
+        let from = self.from.get(id).copied().unwrap_or(0.0);
+        from * (1.0 - style::ease_spring(self.progress(now).clamp(0.0, 1.0)))
+    }
+}
+
+/// Where each tab starts its slide, given the strip as last drawn.
+///
+/// `drawn` lists the old order as `(id, drawn x, width, current offset)`;
+/// `new_order` is the order after the move. Tabs sit end to end with the
+/// strip's gap, so a tab's new slot is found by laying the new order out from
+/// the first slot, and its start is where it was drawn minus that.
+fn slide_starts(drawn: &[(String, f32, f32, f32)], new_order: &[String]) -> HashMap<String, f32> {
+    let Some(first) = drawn.first() else {
+        return HashMap::new();
+    };
+    let slot_x = |entry: &(String, f32, f32, f32)| entry.1 - entry.3;
+    let gap = drawn
+        .get(1)
+        .map_or(0.0, |second| slot_x(second) - (slot_x(first) + first.2));
+    let widths: HashMap<&str, f32> = drawn.iter().map(|e| (e.0.as_str(), e.2)).collect();
+    let mut x = slot_x(first);
+    let mut starts = HashMap::new();
+    for id in new_order {
+        let Some(width) = widths.get(id.as_str()) else {
+            return HashMap::new();
+        };
+        if let Some(entry) = drawn.iter().find(|e| &e.0 == id) {
+            let start = entry.1 - x;
+            if start.abs() >= 0.5 {
+                starts.insert(id.clone(), start);
+            }
+        }
+        x += width + gap;
+    }
+    starts
+}
+
 /// First automatic reconnect delay.
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
 /// Ceiling for the exponential backoff.
@@ -1652,6 +1715,10 @@ struct PilusView {
     sidebar_selection: style::GlideSlot,
     /// The tab index the strip last scrolled to, so it only follows changes.
     tab_scrolled: std::cell::Cell<Option<u16>>,
+    /// Where each tab was drawn last frame, so a reorder slides from there.
+    tab_bounds: style::BoundsLedger,
+    /// The spring a reorder set running, until the next one replaces it.
+    tab_slide: Option<TabSlide>,
     /// Optimistic endpoint pick from a click, until the handoff commits or
     /// every stage of the switch has ended.
     endpoint_sel: Option<EndpointId>,
@@ -2166,6 +2233,8 @@ impl PilusView {
             sidebar_hover: style::HoverSlot::default(),
             sidebar_selection: style::GlideSlot::default(),
             tab_scrolled: std::cell::Cell::new(None),
+            tab_bounds: style::BoundsLedger::default(),
+            tab_slide: None,
             endpoint_sel: None,
             agent_sel: None,
             agent_sel_at: Instant::now(),
@@ -2298,12 +2367,7 @@ impl PilusView {
                     let settled = view.tick_sidebar_anim() & view.right.tick();
                     let released = view.release_sidebar_freeze();
                     let blinked = view.tick_cursor_blink(cx);
-                    if view.poll(cx)
-                        || changed
-                        || !settled
-                        || was_animating
-                        || released
-                        || blinked
+                    if view.poll(cx) || changed || !settled || was_animating || released || blinked
                     {
                         cx.notify();
                     }
@@ -8767,13 +8831,30 @@ impl PilusView {
     /// release click, or toggling the daemon menu twice per gear press.
     /// While the session menu is open the whole content area counts, since
     /// the overlay sits above the grid.
-    fn hit_chrome(&mut self, window: &Window, position: Point<Pixels>) -> bool {
-        if self.session_menu_open
+    fn overlay_open(&self) -> bool {
+        self.session_menu_open
             || self.palette.is_open()
             || self.picker.is_open()
             || self.context_menu.is_some()
             || self.menu_prompt.is_some()
-        {
+    }
+
+    /// Start dragging the window from the blank header, or zoom it on a double
+    /// click. The window opts out of AppKit's titlebar drag (it would swallow
+    /// the tabs' own clicks and drags), so the bare header does this itself.
+    fn drag_window_from_header(&self, event: &MouseDownEvent, window: &mut Window) {
+        if self.overlay_open() {
+            return;
+        }
+        if event.click_count >= 2 {
+            window.titlebar_double_click();
+        } else {
+            window.start_window_move();
+        }
+    }
+
+    fn hit_chrome(&mut self, window: &Window, position: Point<Pixels>) -> bool {
+        if self.overlay_open() {
             return true;
         }
         let x = f32::from(position.x);
@@ -10470,6 +10551,7 @@ impl PilusView {
         let glass = self.glass_opacity();
         div()
             .id(id)
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -10521,10 +10603,33 @@ impl PilusView {
             from: self.tabs.iter().map(|tab| tab.id.clone()).collect(),
             at: Instant::now(),
         });
+        let now = Instant::now();
+        let drawn: Option<Vec<_>> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let bounds = self.tab_bounds.get(&tab.id)?;
+                let offset = self.tab_offset(&tab.id, now);
+                Some((
+                    tab.id.clone(),
+                    f32::from(bounds.origin.x),
+                    f32::from(bounds.size.width),
+                    offset,
+                ))
+            })
+            .collect();
         for tab in &mut self.tabs {
             tab.index = moved_position(tab.index, from, to);
         }
         self.tabs.sort_by_key(|tab| tab.index);
+        // A strip never drawn has nothing to slide from.
+        self.tab_slide = drawn.map(|drawn| {
+            let order: Vec<String> = self.tabs.iter().map(|tab| tab.id.clone()).collect();
+            TabSlide {
+                from: slide_starts(&drawn, &order),
+                started: now,
+            }
+        });
         if let Some(selected) = self.tab_sel.as_mut() {
             *selected = moved_position(*selected, from, to);
         }
@@ -10541,6 +10646,13 @@ impl PilusView {
             feed.move_tab(from, to);
         }
         cx.notify();
+    }
+
+    /// How far tab `id` is drawn from its layout slot right now; zero at rest.
+    fn tab_offset(&self, id: &str, now: Instant) -> f32 {
+        self.tab_slide
+            .as_ref()
+            .map_or(0.0, |slide| slide.offset(id, now))
     }
 
     fn top_chrome(
@@ -10565,6 +10677,7 @@ impl PilusView {
         let pad = self.strip_pad(fullscreen);
         let mut tabs = div()
             .id("pilus-tabs-scroll")
+            .occlude()
             .flex()
             .flex_row()
             .items_center()
@@ -10587,6 +10700,13 @@ impl PilusView {
         for tab in &self.tabs {
             tabs = tabs.child(self.tab_item(tab, &selection, cx));
         }
+        if self
+            .tab_slide
+            .as_ref()
+            .is_some_and(|slide| slide.running(Instant::now()))
+        {
+            tabs = tabs.child(style::next_frame());
+        }
         // Follow the active tab into view when it changes, not every frame,
         // so a manual scroll along the strip is left alone. Child 0 is the
         // glide pill, so a tab's child index is its position plus one.
@@ -10603,6 +10723,7 @@ impl PilusView {
         }
         let new_tab = div()
             .id("pilus-new-tab")
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -10695,6 +10816,7 @@ impl PilusView {
         let theme = self.theme;
         let active = self.tab_active(tab);
         let index = tab.index;
+        let tab_id = tab.id.clone();
         let close_index = tab.index;
         let fg = if active { theme.panel_fg } else { theme.muted };
         // The cwd is the label until the tab is named. Until
@@ -10706,6 +10828,11 @@ impl PilusView {
             self.shorten_cwd(&self.active.key(), &tab.cwd)
         };
         let label = tab_label(&tab.name, &cwd, index);
+        let slide = if cx.reduce_motion() {
+            0.0
+        } else {
+            self.tab_offset(&tab.id, Instant::now())
+        };
         let drag = TabDrag {
             index,
             label: label.clone(),
@@ -10759,6 +10886,8 @@ impl PilusView {
         let tab = div()
             .id(format!("pilus-tab-{index}"))
             .group(group)
+            .relative()
+            .left(px(slide))
             .flex()
             .flex_row()
             .items_center()
@@ -10865,10 +10994,11 @@ impl PilusView {
                 .child(label),
         );
         let tab = if active {
-            tab.child(style::glide_target(selection))
+            tab.child(style::glide_target_shifted(selection, slide))
         } else {
             tab
         };
+        let tab = tab.child(style::record_bounds(&self.tab_bounds, tab_id));
         tab.child(content).child(close).on_click(cx.listener(
             move |this, event: &ClickEvent, _, cx| {
                 if event.click_count() >= 2 {
@@ -10963,6 +11093,7 @@ impl PilusView {
         let glass = self.glass_opacity();
         div()
             .id("pilus-session-button")
+            .occlude()
             .flex()
             .flex_row()
             .items_center()
@@ -13289,7 +13420,24 @@ impl Render for PilusView {
         // both.
         root = apply_chrome_font(root, &self.shared_settings);
 
+        // Behind the sidebar and strip, so only their bare stretches reach it;
+        // their controls occlude it.
+        let header_drag = div()
+            .id("pilus-header-drag")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .h(px(HEADER_HEIGHT))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, _| {
+                    this.drag_window_from_header(event, window);
+                }),
+            );
+
         root.child(coat)
+            .child(header_drag)
             .child(header)
             .child(
                 div().relative().flex_1().child(
@@ -15445,6 +15593,51 @@ mod tests {
         assert_eq!(tab_label("api", "~/work/pilus", 2), "api ⌘2");
         let long = tab_label(&"n".repeat(40), "~/work/pilus", 9);
         assert!(long.ends_with("… ⌘9"));
+    }
+
+    #[test]
+    fn slide_starts_fly_each_tab_from_where_it_was_drawn() {
+        let drawn = |id: &str, x: f32, offset: f32| (id.to_string(), x, 100.0, offset);
+        let drawn = [
+            drawn("a", 10.0, 0.0),
+            drawn("b", 114.0, 0.0),
+            drawn("c", 218.0, 0.0),
+        ];
+        let order = |ids: [&str; 3]| ids.map(String::from).to_vec();
+        // `a` moves to the end: `b` and `c` start a slot to the right of
+        // where they now sit, and `a` starts two slots to the left.
+        let starts = slide_starts(&drawn, &order(["b", "c", "a"]));
+        assert_eq!(starts["b"], 104.0);
+        assert_eq!(starts["c"], 104.0);
+        assert_eq!(starts["a"], -208.0);
+        // A tab that stays in its slot has nothing to travel.
+        assert!(!slide_starts(&drawn, &order(["a", "c", "b"])).contains_key("a"));
+    }
+
+    #[test]
+    fn slide_starts_measure_from_the_slot_not_the_drawn_spot() {
+        // Mid-slide, `a` is drawn 50px right of its slot; the slots themselves
+        // are unmoved, so the next reorder starts from where it is drawn.
+        let drawn = [
+            ("a".to_string(), 60.0, 100.0, 50.0),
+            ("b".to_string(), 114.0, 100.0, 0.0),
+        ];
+        let starts = slide_starts(&drawn, &["b".to_string(), "a".to_string()]);
+        assert_eq!(starts["b"], 104.0);
+        assert_eq!(starts["a"], 60.0 - 114.0);
+    }
+
+    #[test]
+    fn a_slide_springs_home() {
+        let slide = TabSlide {
+            from: HashMap::from([("a".to_string(), 80.0)]),
+            started: Instant::now(),
+        };
+        let start = slide.started;
+        assert_eq!(slide.offset("a", start), 80.0);
+        assert_eq!(slide.offset("a", start + TAB_SLIDE), 0.0);
+        assert_eq!(slide.offset("other", start), 0.0);
+        assert!(slide.running(start) && !slide.running(start + TAB_SLIDE));
     }
 
     #[test]

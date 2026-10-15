@@ -646,6 +646,7 @@ impl PilusView {
         let theme = self.theme;
         div()
             .id("pilus-right-ports-toggle")
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -670,6 +671,7 @@ impl PilusView {
         let theme = self.theme;
         div()
             .id("pilus-right-sidebar-toggle")
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -877,6 +879,7 @@ impl PilusView {
 
         div()
             .id("pilus-right-sidebar")
+            .occlude()
             .absolute()
             .right(px(0.0))
             .top(px(0.0))

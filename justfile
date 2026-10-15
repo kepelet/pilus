@@ -78,8 +78,8 @@ check-updates *args:
 
 # Preview what `infra-deploy` would change on Cloudflare (site + releases bucket).
 infra-plan:
-    cd infra && bun install --frozen-lockfile && bunx alchemy plan --stage prod
+    cd infra && bun install --frozen-lockfile && dotenvx run -- bunx alchemy plan --stage prod
 
 # Apply infra/alchemy.run.ts: the usepilus.dev site and releases.kepelet.com.
 infra-deploy:
-    cd infra && bun install --frozen-lockfile && bunx alchemy deploy --stage prod
+    cd infra && bun install --frozen-lockfile && dotenvx run -- bunx alchemy deploy --stage prod

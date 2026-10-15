@@ -981,7 +981,18 @@ impl AppearancesView {
             this.settings.pane_ui = !this.settings.pane_ui;
             this.publish(cx);
         }));
-        div()
+        let pane_gaps = style::checkbox(
+            "pilus-pane-gaps",
+            self.settings.pane_gaps,
+            "Space panes apart",
+            self.theme,
+            size,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.settings.pane_gaps = !this.settings.pane_gaps;
+            this.publish(cx);
+        }));
+        let mut rows = div()
             .flex()
             .flex_col()
             .gap_2()
@@ -996,18 +1007,29 @@ impl AppearancesView {
                         "Draw split panes with rounded frames instead of \
                          the daemon's square borders",
                     ),
-            )
-            .child(remote)
-            .child(local)
-            .child(
+            );
+        // The gaps are part of the frames pilus draws, so they mean nothing
+        // while the daemon's own borders are showing.
+        if self.settings.pane_ui {
+            rows = rows.child(pane_gaps).child(
                 div()
                     .text_size(px(self.fonts().label))
                     .text_color(self.theme.muted)
                     .child(
-                        "For newer Luvus without show_title. Turn off for older Luvus \
-                         or when show_title is enabled",
+                        "Float each pane as a card. Off, panes sit flush and \
+                         pilus draws a border around each one",
                     ),
-            )
+            );
+        }
+        rows.child(remote).child(local).child(
+            div()
+                .text_size(px(self.fonts().label))
+                .text_color(self.theme.muted)
+                .child(
+                    "For newer Luvus without show_title. Turn off for older Luvus \
+                         or when show_title is enabled",
+                ),
+        )
     }
 
     /// A section title, matching the weight of the list headings below.

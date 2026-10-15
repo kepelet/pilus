@@ -58,6 +58,43 @@ impl PaneFrame {
     }
 }
 
+/// Which way a divider runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DividerAxis {
+    /// A vertical line between panes side by side; dragging moves it left
+    /// and right.
+    Vertical,
+    /// A horizontal line between stacked panes; dragging moves it up and down.
+    Horizontal,
+}
+
+/// The seam where two panes meet, found from their frames. The daemon turns a
+/// drag that starts on either pane's border cell at the seam into a resize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Divider {
+    pub axis: DividerAxis,
+    /// The first column (vertical) or row (horizontal) past the seam: where
+    /// the second pane's frame begins.
+    pub at: u16,
+    /// The seam's extent along its own direction, the cells the two frames
+    /// share, corners included, ends inclusive. Always at least three cells.
+    pub from: u16,
+    pub to: u16,
+}
+
+impl Divider {
+    /// The cell a press at `along` (the pointer's row for a vertical seam,
+    /// its column for a horizontal one) hands the daemon: a border cell of
+    /// the pane before the seam, clear of the corners.
+    pub(super) fn grab(&self, along: u16) -> (u16, u16) {
+        let along = along.clamp(self.from + 1, self.to - 1);
+        match self.axis {
+            DividerAxis::Vertical => (self.at - 1, along),
+            DividerAxis::Horizontal => (along, self.at - 1),
+        }
+    }
+}
+
 /// The pane frames of one frame; empty when it is not split.
 #[derive(Debug, Default)]
 pub(super) struct PaneFrames {
@@ -115,6 +152,40 @@ impl PaneFrames {
             right: all.right.max(pane.right),
             bottom: all.bottom.max(pane.bottom),
         }))
+    }
+
+    /// Every seam between two panes. The panes tile, so frames that meet
+    /// share an edge exactly, with no cell between.
+    pub(super) fn dividers(&self) -> Vec<Divider> {
+        let mut seams = Vec::new();
+        for (i, a) in self.panes.iter().enumerate() {
+            for b in &self.panes[i + 1..] {
+                for (first, second) in [(a, b), (b, a)] {
+                    if first.right + 1 == second.left {
+                        let (from, to) = (a.top.max(b.top), a.bottom.min(b.bottom));
+                        if from + 1 < to {
+                            seams.push(Divider {
+                                axis: DividerAxis::Vertical,
+                                at: second.left,
+                                from,
+                                to,
+                            });
+                        }
+                    } else if first.bottom + 1 == second.top {
+                        let (from, to) = (a.left.max(b.left), a.right.min(b.right));
+                        if from + 1 < to {
+                            seams.push(Divider {
+                                axis: DividerAxis::Horizontal,
+                                at: second.top,
+                                from,
+                                to,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        seams
     }
 
     /// Whether the cell is part of a pane's border box.
@@ -332,6 +403,70 @@ mod tests {
         let found = PaneFrames::find(&frame, frame.height);
         assert_eq!(found.bounds(), Some(pane(0, 0, 9, 3)));
         assert_eq!(PaneFrames::default().bounds(), None);
+    }
+
+    #[test]
+    fn side_by_side_panes_share_a_vertical_divider() {
+        let frame = frame(&["┌───┐┌───┐", "│   ││   │", "│   ││   │", "└───┘└───┘"]);
+        let seams = PaneFrames::find(&frame, frame.height).dividers();
+        assert_eq!(
+            seams,
+            vec![Divider {
+                axis: DividerAxis::Vertical,
+                at: 5,
+                from: 0,
+                to: 3
+            }]
+        );
+        // A press anywhere along it lands on the left pane's border, off
+        // the corners.
+        assert_eq!(seams[0].grab(0), (4, 1));
+        assert_eq!(seams[0].grab(2), (4, 2));
+        assert_eq!(seams[0].grab(9), (4, 2));
+    }
+
+    #[test]
+    fn stacked_panes_share_a_horizontal_divider() {
+        let frame = frame(&["┌────┐", "│    │", "└────┘", "┌────┐", "│    │", "└────┘"]);
+        let seams = PaneFrames::find(&frame, frame.height).dividers();
+        assert_eq!(
+            seams,
+            vec![Divider {
+                axis: DividerAxis::Horizontal,
+                at: 3,
+                from: 0,
+                to: 5
+            }]
+        );
+        assert_eq!(seams[0].grab(3), (3, 2));
+    }
+
+    #[test]
+    fn a_tee_split_has_a_seam_per_meeting_edge() {
+        let seams = PaneFrames::find(
+            &frame(&[
+                "┌──┐┌───┐",
+                "│  ││   │",
+                "│  ││   │",
+                "│  │└───┘",
+                "│  │┌───┐",
+                "│  ││   │",
+                "│  ││   │",
+                "└──┘└───┘",
+            ]),
+            8,
+        )
+        .dividers();
+        let vertical = seams
+            .iter()
+            .filter(|d| d.axis == DividerAxis::Vertical)
+            .count();
+        let horizontal = seams
+            .iter()
+            .filter(|d| d.axis == DividerAxis::Horizontal)
+            .count();
+        // The left pane meets both right panes; the right panes meet each other.
+        assert_eq!((vertical, horizontal), (2, 1));
     }
 
     #[test]

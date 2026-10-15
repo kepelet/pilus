@@ -114,6 +114,10 @@ pub struct Settings {
     /// Draw split panes with pilus's own rounded frames in place of
     /// the daemon's square box-drawing borders. Off keeps the daemon's.
     pub pane_ui: bool,
+    /// Float each pane as a card with a gap between them. Off, panes sit
+    /// flush and pilus draws a border around each one. Only applies with
+    /// `pane_ui`, which owns the frames.
+    pub pane_gaps: bool,
     /// Draw the focused pane's corner toolbar (split, fullscreen, close).
     /// Off by default; only shows with `pane_ui`, which owns the frames it
     /// sits on.
@@ -175,6 +179,7 @@ impl Default for Settings {
             terminal_top_spacing: true,
             local_terminal_top_spacing: false,
             pane_ui: true,
+            pane_gaps: true,
             pane_toolbar: false,
             right_sidebar_visible: false,
             right_sidebar_width: 0.0,
@@ -323,6 +328,7 @@ mod tests {
         assert!(back.terminal_top_spacing);
         assert!(!back.local_terminal_top_spacing);
         assert!(back.pane_ui);
+        assert!(back.pane_gaps);
         assert!(!back.pane_toolbar);
     }
 
@@ -354,11 +360,9 @@ mod tests {
         let missing: Settings =
             serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
         assert!(!missing.initialized());
-        let null: Settings =
-            serde_json::from_str(r#"{"init":null}"#).expect("deserialize");
+        let null: Settings = serde_json::from_str(r#"{"init":null}"#).expect("deserialize");
         assert!(!null.initialized());
-        let done: Settings =
-            serde_json::from_str(r#"{"init":true}"#).expect("deserialize");
+        let done: Settings = serde_json::from_str(r#"{"init":true}"#).expect("deserialize");
         assert!(done.initialized());
     }
 
@@ -487,6 +491,7 @@ mod tests {
             terminal_top_spacing: false,
             local_terminal_top_spacing: true,
             pane_ui: false,
+            pane_gaps: false,
             pane_toolbar: false,
             right_sidebar_visible: true,
             right_sidebar_width: 480.0,

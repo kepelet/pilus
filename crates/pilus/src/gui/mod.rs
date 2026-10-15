@@ -1032,6 +1032,15 @@ fn migrate_legacy_stores(luvus_root: &Path, pilus_root: &Path) {
     }
 }
 
+/// A divider drag in progress.
+#[derive(Clone, Copy)]
+struct DividerDrag {
+    axis: pane_frames::DividerAxis,
+    /// The last cell the daemon was told about, so a move within a cell
+    /// sends nothing.
+    last: Cell,
+}
+
 /// Geometry of the terminal card: grid origin, visible cells, and the
 /// measurements behind them, so painting, pointer mapping, and the daemon
 /// viewport stay pixel-true to one another.
@@ -1597,6 +1606,15 @@ struct PilusView {
     press_anchor: Option<Cell>,
     /// Last cell a hover move was forwarded for, so the daemon isn't flooded.
     hover_cell: Option<Cell>,
+    /// The seams between the panes of the frame last painted, for grabbing
+    /// one to resize a split.
+    dividers: Vec<pane_frames::Divider>,
+    /// The seam under the pointer, which turns the cursor into a resize arrow.
+    divider_hover: Option<pane_frames::DividerAxis>,
+    /// A seam held by the left button. The daemon owns the layout, so the
+    /// drag is forwarded to it as the press, moves, and release it already
+    /// reads as a divider drag, and the new split arrives as a frame.
+    divider_drag: Option<DividerDrag>,
     /// Whether `Ctrl` is held, tracked from modifier changes. macOS turns a
     /// `Ctrl`+left-click into a right-click before the window sees it, so the
     /// flag is what lets a secondary click still reach the daemon as the
@@ -2196,6 +2214,9 @@ impl PilusView {
             drag_moved: false,
             press_anchor: None,
             hover_cell: None,
+            dividers: Vec::new(),
+            divider_hover: None,
+            divider_drag: None,
             control_held: false,
             agent_feed,
             session_root,
@@ -9023,8 +9044,95 @@ impl PilusView {
         }));
     }
 
+    /// The seam of a split under `position`, and the border cell the daemon
+    /// is handed to grab it by. Pointer and paint read the same geometry
+    /// (`pane_chrome`), so the seam is where the gutter or the line is drawn,
+    /// give or take the slop that makes a thin line possible to hit.
+    fn divider_at(
+        &mut self,
+        window: &Window,
+        position: Point<Pixels>,
+    ) -> Option<(pane_frames::DividerAxis, Cell)> {
+        if self.dividers.is_empty() {
+            return None;
+        }
+        let layout = self.card_layout(window);
+        let (skip_cols, skip_rows) = (self.skipped_cols(), self.skipped_rows());
+        let slop = pane_chrome::divider_slop(self.settings.pane_gaps);
+        let x = f32::from(position.x) - layout.origin_x;
+        let y = f32::from(position.y) - layout.origin_y;
+        let edge =
+            |cell: u16, skip: u16, size: f32| ((f32::from(cell) - f32::from(skip)) * size).round();
+        self.dividers.iter().find_map(|divider| {
+            let (across, along, skip_across, skip_along, size_across, size_along) =
+                match divider.axis {
+                    pane_frames::DividerAxis::Vertical => {
+                        (x, y, skip_cols, skip_rows, layout.cell_w, layout.cell_h)
+                    }
+                    pane_frames::DividerAxis::Horizontal => {
+                        (y, x, skip_rows, skip_cols, layout.cell_h, layout.cell_w)
+                    }
+                };
+            let on_seam = (across - edge(divider.at, skip_across, size_across)).abs() <= slop;
+            let within = along >= edge(divider.from, skip_along, size_along)
+                && along < edge(divider.to + 1, skip_along, size_along);
+            if !(on_seam && within) {
+                return None;
+            }
+            let pointer = skip_along.saturating_add((along / size_along).max(0.0) as u16);
+            let (column, row) = divider.grab(pointer);
+            Some((divider.axis, Cell { column, row }))
+        })
+    }
+
+    /// Carry a held divider to the pointer. Returns whether a divider drag
+    /// owns the move. A button released where the window never saw it ends
+    /// the drag here, so the daemon is not left holding a seam.
+    fn drag_divider(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(drag) = self.divider_drag else {
+            return false;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.divider_drag = None;
+            self.forward_mouse(
+                MouseEventKind::Up(TerminalMouseButton::Left),
+                drag.last,
+                event.modifiers,
+            );
+            cx.notify();
+            return true;
+        }
+        if let Some(cell) = self.cell_at(window, event.position)
+            && cell != drag.last
+        {
+            self.forward_mouse(
+                MouseEventKind::Drag(TerminalMouseButton::Left),
+                cell,
+                event.modifiers,
+            );
+            self.divider_drag = Some(DividerDrag { last: cell, ..drag });
+        }
+        true
+    }
+
     fn begin_selection(&mut self, event: &MouseDownEvent, window: &Window, cx: &mut Context<Self>) {
         if self.hit_chrome(window, event.position) {
+            return;
+        }
+        if let Some((axis, grab)) = self.divider_at(window, event.position) {
+            self.selection = None;
+            self.divider_drag = Some(DividerDrag { axis, last: grab });
+            self.forward_mouse(
+                MouseEventKind::Down(TerminalMouseButton::Left),
+                grab,
+                event.modifiers,
+            );
+            cx.notify();
             return;
         }
         let Some(cell) = self.cell_at(window, event.position) else {
@@ -9046,13 +9154,28 @@ impl PilusView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.drag_divider(event, window, cx) {
+            return;
+        }
         // A drag started on the grid may roam anywhere; anything else over
         // chrome belongs to the panels, not the daemon.
         if !self.dragging && self.hit_chrome(window, event.position) {
-            if self.hover_cell.take().is_some() {
+            let hovered = self.hover_cell.take().is_some();
+            let parted = self.divider_hover.take().is_some();
+            if hovered || parted {
                 cx.notify();
             }
             return;
+        }
+        let over_divider = if self.dragging {
+            None
+        } else {
+            self.divider_at(window, event.position)
+                .map(|(axis, _)| axis)
+        };
+        if over_divider != self.divider_hover {
+            self.divider_hover = over_divider;
+            cx.notify();
         }
         if self.dragging && event.pressed_button == Some(MouseButton::Left) {
             let Some(cell) = self.cell_at(window, event.position) else {
@@ -9103,6 +9226,16 @@ impl PilusView {
     }
 
     fn finish_selection(&mut self, event: &MouseUpEvent, window: &Window, cx: &mut Context<Self>) {
+        if let Some(drag) = self.divider_drag.take() {
+            let cell = self.cell_at(window, event.position).unwrap_or(drag.last);
+            self.forward_mouse(
+                MouseEventKind::Up(TerminalMouseButton::Left),
+                cell,
+                event.modifiers,
+            );
+            cx.notify();
+            return;
+        }
         if !self.dragging {
             return;
         }
@@ -13226,6 +13359,14 @@ impl Render for PilusView {
                     .opacity(self.toolbar_fade.alpha())
                     .child(self.pane_toolbar(cx))
             });
+        let panes = match self.shown_frame() {
+            Some(frame) if pane_ui => pane_frames::PaneFrames::find(
+                frame,
+                frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS),
+            ),
+            _ => pane_frames::PaneFrames::default(),
+        };
+        self.dividers = panes.dividers();
         let grid = match self.shown_frame() {
             Some(frame) => perf::grid_build(|| {
                 render_grid(
@@ -13243,7 +13384,8 @@ impl Render for PilusView {
                     glass,
                     layout.slack_x,
                     layout.slack_y,
-                    pane_ui,
+                    panes,
+                    self.settings.pane_gaps,
                     pane_toolbar,
                     self.cursor_blink.alpha(),
                 )
@@ -13275,11 +13417,17 @@ impl Render for PilusView {
                 empty
             }
         };
-        // A link under the pointer reads as clickable.
-        let grid = if self.hovered_link() {
-            grid.cursor_pointer()
-        } else {
-            grid
+        // A link under the pointer reads as clickable, and a seam between
+        // panes as something to drag.
+        let grid = match self
+            .divider_drag
+            .map(|drag| drag.axis)
+            .or(self.divider_hover)
+        {
+            Some(pane_frames::DividerAxis::Vertical) => grid.cursor_col_resize(),
+            Some(pane_frames::DividerAxis::Horizontal) => grid.cursor_row_resize(),
+            None if self.hovered_link() => grid.cursor_pointer(),
+            None => grid,
         };
         let grid = grid
             .on_mouse_down(
@@ -13608,28 +13756,26 @@ fn render_grid(
     glass: f32,
     slack_x: f32,
     slack_y: f32,
-    pane_ui: bool,
+    panes: pane_frames::PaneFrames,
+    pane_gaps: bool,
     toolbar: Option<Div>,
     cursor_alpha: f32,
 ) -> Div {
     let end_row = skip_rows
         .saturating_add(max_rows)
         .min(frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS));
-    let panes = if pane_ui {
-        pane_frames::PaneFrames::find(
-            frame,
-            frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS),
-        )
-    } else {
-        pane_frames::PaneFrames::default()
-    };
     let mut column = div().relative().flex().flex_col().size_full();
     let surface_base = theme.pane_surface(glass);
     let surface = surface_base.opacity(glass);
-    let border = if glass < 1.0 {
-        gpui::Rgba { a: 0.0, ..surface }
+    // Floating cards stroke in the surface's own color, so the ring reads as
+    // gutter; flush panes outline themselves with the theme's border.
+    let (border, focus_border) = if !pane_gaps {
+        (theme.border, theme.border_focus)
+    } else if glass < 1.0 {
+        let clear = gpui::Rgba { a: 0.0, ..surface };
+        (clear, theme.border)
     } else {
-        surface
+        (surface, theme.border)
     };
     let tiled = panes.bounds();
     // A frame still short of the card (the daemon lags a resize) leaves its
@@ -13639,7 +13785,7 @@ fn render_grid(
         slack_x + unpainted_width(frame.width, skip_cols, max_cols, cell_width),
         slack_y,
     );
-    let chromes: Vec<pane_chrome::PaneChrome> = panes
+    let mut chromes: Vec<pane_chrome::PaneChrome> = panes
         .panes()
         .iter()
         .enumerate()
@@ -13653,9 +13799,10 @@ fn render_grid(
                 pane,
                 tiled,
                 focused,
+                pane_gaps,
                 surface,
                 border,
-                theme.border,
+                focus_border,
                 line_height,
                 cell_width,
                 card_slack,
@@ -13664,6 +13811,10 @@ fn render_grid(
             ))
         })
         .collect();
+    // Flush panes share their seams, so the focused one paints last and its
+    // border is the one the eye sees. Element state is keyed by pane index,
+    // so the order does not replay any fade.
+    chromes.sort_by_key(pane_chrome::PaneChrome::focused);
     // The surface and the cards sit under the rows. Cells the daemon paints
     // in its base color skip their fill inside the tiled box (`render_row`),
     // so the cards show through; the gutters keep the surface.

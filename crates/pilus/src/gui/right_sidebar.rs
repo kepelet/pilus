@@ -47,19 +47,22 @@ pub(super) enum SidebarTab {
     Files,
     Github,
     Ports,
+    Browser,
 }
 
 impl SidebarTab {
-    pub(super) const ALL: [SidebarTab; 5] = [
+    pub(super) const ALL: [SidebarTab; 6] = [
         SidebarTab::Diff,
         SidebarTab::Git,
         SidebarTab::Files,
         SidebarTab::Github,
         SidebarTab::Ports,
+        SidebarTab::Browser,
     ];
 
-    /// The tabs the strip draws. Ports is opened by its own button, in the
-    /// window's header while the column is closed and in the strip once open.
+    /// The tabs the strip draws. Ports and Browser are opened by their own
+    /// buttons, in the window's header while the column is closed and in the
+    /// strip once open.
     pub(super) const STRIP: [SidebarTab; 4] = [
         SidebarTab::Diff,
         SidebarTab::Git,
@@ -74,6 +77,7 @@ impl SidebarTab {
             Self::Files => "files",
             Self::Github => "github",
             Self::Ports => "ports",
+            Self::Browser => "browser",
         }
     }
 
@@ -92,6 +96,7 @@ impl SidebarTab {
             Self::Files => "Files",
             Self::Github => "GitHub",
             Self::Ports => "Ports",
+            Self::Browser => "Browser",
         }
     }
 
@@ -432,6 +437,23 @@ impl PilusView {
         self.select_right_tab(SidebarTab::Ports, cx);
     }
 
+    /// The Browser button: open the column on the Browser, or close it when
+    /// the Browser is already showing. A browser with no page yet opens with
+    /// the address bar ready to type in.
+    pub(super) fn toggle_browser(&mut self, cx: &mut Context<Self>) {
+        if self.right.visible && self.right.tab == SidebarTab::Browser {
+            self.toggle_right_sidebar(cx);
+            return;
+        }
+        if !self.right.visible {
+            self.toggle_right_sidebar(cx);
+        }
+        self.select_right_tab(SidebarTab::Browser, cx);
+        if !self.browser_panel.has_page() {
+            self.browser_begin_edit(cx);
+        }
+    }
+
     /// Where the column is now.
     fn right_here(&self) -> Place {
         Place::new(
@@ -485,7 +507,7 @@ impl PilusView {
                 Some(_) => {}
                 None => self.files_panel.close_doc(),
             },
-            SidebarTab::Git | SidebarTab::Github | SidebarTab::Ports => {}
+            SidebarTab::Git | SidebarTab::Github | SidebarTab::Ports | SidebarTab::Browser => {}
         }
         if changed_tab {
             self.remember_right_tab();
@@ -549,6 +571,7 @@ impl PilusView {
             SidebarTab::Files => self.files_panel.mark_stale(),
             SidebarTab::Github => self.github_panel.mark_stale(),
             SidebarTab::Ports => self.ports_panel.mark_stale(),
+            SidebarTab::Browser => {}
         }
     }
 
@@ -781,6 +804,7 @@ impl PilusView {
                         .on_click(cx.listener(move |this, _, _, cx| this.select_right_tab(tab, cx)))
                     })),
             )
+            .child(self.strip_browser_toggle(cx))
             .child(
                 div()
                     .id("pilus-right-sidebar-ports")
@@ -855,10 +879,15 @@ impl PilusView {
                 SidebarTab::Files => self.files_page(cx),
                 SidebarTab::Github => self.github_page(cx),
                 SidebarTab::Ports => self.ports_page(cx),
+                SidebarTab::Browser => self.browser_page(cx),
             });
         let footer = match shown {
             SidebarTab::Diff => self.diff_footer(cx),
-            SidebarTab::Git | SidebarTab::Files | SidebarTab::Github | SidebarTab::Ports => None,
+            SidebarTab::Git
+            | SidebarTab::Files
+            | SidebarTab::Github
+            | SidebarTab::Ports
+            | SidebarTab::Browser => None,
         };
 
         let handle = div()

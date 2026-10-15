@@ -13,6 +13,7 @@ mod attention;
 mod automations;
 mod background;
 mod box_drawing;
+mod browser_tab;
 mod connector;
 mod cursor_blink;
 mod diff;
@@ -68,6 +69,7 @@ use std::time::{Duration, Instant};
 use crate::settings::{CHROME_FONT, Settings, WindowGeometry};
 use crate::update::{UpdateChannel, UpdateRequest, describe_source};
 use automations::AutomationsPanel;
+use browser_tab::BrowserPanel;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
     MouseEventKind,
@@ -1090,6 +1092,8 @@ enum InputLayer {
     Diff,
     /// A text field of the GitHub tab.
     Github,
+    /// The Browser tab's address bar.
+    Browser,
     /// The native Mission Control page.
     Mission,
     /// The native Automations page.
@@ -1877,6 +1881,9 @@ struct PilusView {
     home_issues: HomeIssues,
     files_panel: FilesPanel,
     ports_panel: PortsPanel,
+    browser_panel: BrowserPanel,
+    /// The Browser tab's address bar, an IME-capable field of its own.
+    browser_input: Entity<TextInput>,
     /// The right sidebar (Changes and History tabs).
     right: RightSidebar,
     /// The native Mission Control page: its state and the daemon's last
@@ -2139,6 +2146,19 @@ impl PilusView {
         })
         .detach();
 
+        let browser_input = cx.new(|cx| {
+            TextInput::new(
+                String::new(),
+                "Search or enter address",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+            .submit_on_enter()
+        });
+
         let active_live = connection.is_some();
         let mut view = Self {
             target,
@@ -2317,6 +2337,8 @@ impl PilusView {
             home_issues: HomeIssues::default(),
             files_panel: FilesPanel::new(),
             ports_panel: PortsPanel::new(),
+            browser_panel: BrowserPanel::new(),
+            browser_input,
             right,
             mission: MissionPanel::default(),
             mission_answer,
@@ -2788,6 +2810,7 @@ impl PilusView {
         changed |= self.github_tick(cx);
         changed |= self.files_tick();
         changed |= self.ports_tick();
+        changed |= self.browser_tick(cx);
         changed |= self.mission_tick();
         changed |= self.automations_tick();
         while let Ok(resolved) = self.home_resolve_rx.try_recv() {
@@ -4325,6 +4348,7 @@ impl PilusView {
             InputLayer::Tasks => self.tasks_key(event, cx),
             InputLayer::Diff => self.diff_key(event, cx),
             InputLayer::Github => self.github_key(event, cx),
+            InputLayer::Browser => self.browser_key(event, cx),
             InputLayer::Mission => self.mission_key(event, cx),
             InputLayer::Automations => self.automations_key(event, cx),
             InputLayer::Terminal => self.terminal_key(event, cx),
@@ -4346,6 +4370,7 @@ impl PilusView {
             self.diff_focused()
                 .then_some(InputLayer::Diff)
                 .or(self.github_focused().then_some(InputLayer::Github))
+                .or(self.browser_focused().then_some(InputLayer::Browser))
                 .or_else(|| self.page_layer().filter(|_| !self.terminal_beside_page())),
         )
     }
@@ -5742,6 +5767,7 @@ impl PilusView {
                 .github_panel
                 .focus()
                 .map(|focus| self.github_inputs.focus_handle(focus, cx)),
+            InputLayer::Browser => Some(self.browser_input.focus_handle(cx)),
             // The reply field holds focus while it is open; otherwise the
             // window root reads the page's shortcuts.
             InputLayer::Mission if self.mission.answering() => {
@@ -10801,6 +10827,7 @@ impl PilusView {
         if self.right.openness() < 0.05 {
             tab_strip = tab_strip
                 .child(div().flex_1())
+                .child(self.right_browser_toggle(cx))
                 .child(self.right_ports_toggle(cx))
                 .child(self.right_sidebar_toggle(cx));
         }
@@ -13108,6 +13135,7 @@ impl Render for PilusView {
         self.right.set_full(beside);
         self.sync_metrics(window);
         self.sync_home();
+        self.browser_sync(window, cx);
         self.sync_focus(window, cx);
 
         let theme = self.theme;

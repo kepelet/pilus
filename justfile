@@ -58,3 +58,11 @@ serve-preview:
 # Check the OTA release source without opening a window.
 check-updates *args:
     cargo run -p pilus --no-default-features -- --check-updates {{args}}
+
+# Preview what `infra-deploy` would change on Cloudflare (site + releases bucket).
+infra-plan:
+    cd infra && bun install --frozen-lockfile && bunx alchemy plan --stage prod
+
+# Apply infra/alchemy.run.ts: the usepilus.dev site and releases.kepelet.com.
+infra-deploy:
+    cd infra && bun install --frozen-lockfile && bunx alchemy deploy --stage prod

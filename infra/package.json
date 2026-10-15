@@ -1,0 +1,16 @@
+{
+  "name": "pilus-infra",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@effect/platform-bun": "^4.0.5",
+    "@effect/platform-node": "^4.0.5",
+    "alchemy": "^2.0.0-beta.83",
+    "effect": "^4.0.5"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.151.0"
+  }
+}

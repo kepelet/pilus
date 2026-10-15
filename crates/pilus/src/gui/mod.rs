@@ -10864,15 +10864,17 @@ impl PilusView {
         let tab_id = tab.id.clone();
         let close_index = tab.index;
         let fg = if active { theme.panel_fg } else { theme.muted };
-        // The cwd is the label until the tab is named. Until
-        // `session.snapshot` enriches the tab, it is the workspace's
-        // breadcrumb cwd.
+        // The cwd is the label until the tab is named or its agent reports a
+        // session title. Until `session.snapshot` enriches the tab, it is the
+        // workspace's breadcrumb cwd.
         let cwd = if tab.cwd.is_empty() {
             self.crumb_path()
         } else {
             self.shorten_cwd(&self.active.key(), &tab.cwd)
         };
-        let label = tab_label(&tab.name, &cwd, index);
+        let agent = self.tab_agent(index);
+        let session_title = agent.and_then(|agent| agent.session_title.as_deref());
+        let label = tab_label(&tab.name, session_title, &cwd, index);
         let slide = if cx.reduce_motion() {
             0.0
         } else {
@@ -10889,13 +10891,18 @@ impl PilusView {
         } else {
             tab.process.as_str()
         };
-        let agent = self.tab_agent(index);
         let mut tip_lines = Vec::new();
         if !tab.name.trim().is_empty() {
             tip_lines.push((format!("Name: {}", tab.name.trim()), theme.muted));
         }
         tip_lines.push((format!("Directory: {cwd}"), theme.muted));
         tip_lines.push((format!("Process: {process}"), theme.muted));
+        // An agent already has its own line below.
+        if agent.is_none()
+            && let Some(command) = running_command(&tab.title)
+        {
+            tip_lines.push((format!("Running: {command}"), theme.muted));
+        }
         if let Some(agent) = agent {
             tip_lines.push((
                 format!("Agent: {} · {}", agent.agent, status_label(&agent.status)),
@@ -15148,17 +15155,32 @@ fn abbreviate_path(path: &str) -> String {
         .join("/")
 }
 
-/// A tab's label: its name, or its abbreviated cwd while it has none, plus the
-/// `⌘N` shortcut. The text is capped before the shortcut is appended, so `⌘N`
-/// is never truncated away.
-fn tab_label(name: &str, cwd: &str, index: u16) -> String {
+/// A tab's label: the name the user gave it, else its agent's session title,
+/// else its abbreviated cwd, plus the `⌘N` shortcut. A name the user typed
+/// outranks the title because the title changes under them. The text is capped
+/// before the shortcut is appended, so `⌘N` is never truncated away.
+fn tab_label(name: &str, session_title: Option<&str>, cwd: &str, index: u16) -> String {
     let name = name.trim();
-    let text = if name.is_empty() {
-        abbreviate_path(cwd)
-    } else {
+    let title = session_title.map(str::trim).unwrap_or_default();
+    let text = if !name.is_empty() {
         name.to_string()
+    } else if !title.is_empty() {
+        title.to_string()
+    } else {
+        abbreviate_path(cwd)
     };
     format!("{} ⌘{index}", truncate_label(&text, 24))
+}
+
+/// The command a terminal title names, or `None` while the shell is idle.
+///
+/// A shell titles an idle prompt with the directory alone (`~`,
+/// `~/D/k/pilus`) and a running command with the command line, so a title that
+/// is one path-shaped word says nothing the Directory line does not.
+fn running_command(title: &str) -> Option<&str> {
+    let title = title.trim();
+    let bare_path = title.starts_with(['~', '/']) && !title.contains(char::is_whitespace);
+    (!title.is_empty() && !bare_path).then_some(title)
 }
 
 /// The longest name a tab takes, so one title cannot crowd the strip.
@@ -15639,9 +15661,9 @@ mod tests {
 
     #[test]
     fn tab_label_falls_back_to_cwd_and_keeps_shortcut() {
-        assert_eq!(tab_label("", "~/work/pilus", 3), "~/w/pilus ⌘3");
-        assert_eq!(tab_label("  ", "~", 1), "~ ⌘1");
-        let long = tab_label("", "~/work/a-directory-name-that-will-not-fit", 7);
+        assert_eq!(tab_label("", None, "~/work/pilus", 3), "~/w/pilus ⌘3");
+        assert_eq!(tab_label("  ", Some(" "), "~", 1), "~ ⌘1");
+        let long = tab_label("", None, "~/work/a-directory-name-that-will-not-fit", 7);
         assert!(long.ends_with("… ⌘7"));
     }
 
@@ -15705,9 +15727,32 @@ mod tests {
 
     #[test]
     fn tab_label_prefers_the_name_over_the_cwd() {
-        assert_eq!(tab_label("api", "~/work/pilus", 2), "api ⌘2");
-        let long = tab_label(&"n".repeat(40), "~/work/pilus", 9);
+        assert_eq!(tab_label("api", None, "~/work/pilus", 2), "api ⌘2");
+        assert_eq!(
+            tab_label("api", Some("Fix the parser"), "~/work/pilus", 2),
+            "api ⌘2"
+        );
+        let long = tab_label(&"n".repeat(40), None, "~/work/pilus", 9);
         assert!(long.ends_with("… ⌘9"));
+    }
+
+    #[test]
+    fn an_idle_shell_title_is_not_a_running_command() {
+        assert_eq!(running_command("~"), None);
+        assert_eq!(running_command(" ~/D/k/pilus "), None);
+        assert_eq!(running_command(""), None);
+        assert_eq!(
+            running_command("python3 -m http.serv ~/D/k/pilus"),
+            Some("python3 -m http.serv ~/D/k/pilus")
+        );
+    }
+
+    #[test]
+    fn tab_label_takes_the_agent_session_title_before_the_cwd() {
+        assert_eq!(
+            tab_label("", Some(" Fix the parser "), "~/work/pilus", 4),
+            "Fix the parser ⌘4"
+        );
     }
 
     #[test]

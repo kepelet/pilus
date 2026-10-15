@@ -21,7 +21,7 @@ fn reads_and_commands_over_one_connection_per_request() {
 
     let listener = UnixListener::bind(&socket).expect("bind");
     let server = thread::spawn(move || {
-        for _ in 0..16 {
+        for _ in 0..17 {
             let (stream, _) = listener.accept().expect("accept");
             let mut reader = BufReader::new(stream.try_clone().expect("clone"));
             let mut writer = stream;
@@ -74,17 +74,24 @@ fn reads_and_commands_over_one_connection_per_request() {
                             {
                                 "index": 1,
                                 "panes": [
-                                    { "kind": "terminal", "cwd": "/repo/api", "agent": "fish", "focused": false }
+                                    { "kind": "terminal", "pane_id": "p1", "cwd": "/repo/api", "agent": "fish", "focused": false }
                                 ]
                             },
                             {
                                 "index": 2,
                                 "panes": [
-                                    { "kind": "terminal", "cwd": "/repo/docs", "agent": "devin", "focused": true }
+                                    { "kind": "terminal", "pane_id": "p2", "cwd": "/repo/docs", "agent": "devin", "focused": true }
                                 ]
                             }
                         ]
                     }]
+                }),
+                "terminal.backend.inventory" => serde_json::json!({
+                    "type": "terminal_backend_inventory",
+                    "terminals": [
+                        { "pane_id": "p1", "terminal_title": "python3 -m http.serv ~/r/api" },
+                        { "pane_id": "p2", "terminal_title": "" }
+                    ]
                 }),
                 "tab.focus" => {
                     assert_eq!(request["params"]["tab"], "1");
@@ -183,6 +190,10 @@ fn reads_and_commands_over_one_connection_per_request() {
     assert_eq!(tabs[0].process, "fish");
     assert_eq!(tabs[1].cwd, "/repo/docs");
     assert_eq!(tabs[1].process, "devin");
+    // The inventory's terminal title carries the command line the process
+    // name drops; an empty title stays empty.
+    assert_eq!(tabs[0].title, "python3 -m http.serv ~/r/api");
+    assert_eq!(tabs[1].title, "");
     client.focus_tab(1).expect("focus tab");
     client.rename_tab(2, "docs").expect("rename tab");
     client.move_tab(1, 2).expect("move tab");

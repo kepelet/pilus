@@ -148,6 +148,10 @@ pub struct Settings {
     /// Relay the host connector dials out through. Owned by the agent too, so
     /// it is kept here to survive the window rewriting this file.
     pub relay: pilus_client::RelaySettings,
+    /// Whether pilus has applied its default daemon layout and theme to the
+    /// daemon it first attached to. `None` and `false` both mean "not yet",
+    /// so a launch that missed a stopped daemon retries next time.
+    pub init: Option<bool>,
 }
 
 impl Default for Settings {
@@ -182,6 +186,7 @@ impl Default for Settings {
             diff_list_width: 0.0,
             git_list_height: 0.0,
             relay: pilus_client::RelaySettings::default(),
+            init: Some(false),
         }
     }
 }
@@ -273,6 +278,12 @@ impl Settings {
             DEFAULT_CORNER_RADIUS
         }
     }
+
+    /// Whether the one-time daemon defaults have already been applied. A
+    /// missing or null `init` counts as not yet, matching a fresh install.
+    pub fn initialized(&self) -> bool {
+        self.init == Some(true)
+    }
 }
 
 fn path(root: &Path) -> PathBuf {
@@ -336,6 +347,19 @@ mod tests {
         settings.set_session_label("kind-voyager", "Work");
         settings.set_session_label("kind-voyager", " ");
         assert!(settings.session_labels.is_empty());
+    }
+
+    #[test]
+    fn missing_or_null_init_counts_as_fresh() {
+        let missing: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert!(!missing.initialized());
+        let null: Settings =
+            serde_json::from_str(r#"{"init":null}"#).expect("deserialize");
+        assert!(!null.initialized());
+        let done: Settings =
+            serde_json::from_str(r#"{"init":true}"#).expect("deserialize");
+        assert!(done.initialized());
     }
 
     #[test]
@@ -477,6 +501,7 @@ mod tests {
                 secret: Some("project-secret".to_string()),
                 url: vec!["https://relay.example".to_string()],
             },
+            init: Some(true),
         };
         let text = serde_json::to_string(&settings).expect("serialize");
         let back: Settings = serde_json::from_str(&text).expect("deserialize");

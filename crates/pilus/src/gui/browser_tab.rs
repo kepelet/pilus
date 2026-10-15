@@ -60,11 +60,12 @@ impl BrowserPanel {
         }
     }
 
-    /// Close the page and forget it. Dropping the webview is not enough: wry
-    /// leaks the macOS `WKWebView` on drop (it retains it on purpose), so a
-    /// playing video would carry on unseen. Navigating to a blank page first
-    /// unloads the page and ends its media. The queue is cleared so a late
-    /// event cannot bring the old address back.
+    /// Close the page and forget it. Dropping the entity frees the native
+    /// `WKWebView` once the next frame lets go of the element's handle
+    /// (wry's `Drop` looks like it retains the view, but the `Retained` it
+    /// gets back is dropped on the spot, so the count nets out). Blanking
+    /// first silences the page's media right away instead of a frame later.
+    /// The queue is cleared so a late event cannot bring the old address back.
     fn close(&mut self, cx: &gpui::App) {
         if let Some(view) = self.view.take() {
             let _ = view.read(cx).raw().load_url("about:blank");

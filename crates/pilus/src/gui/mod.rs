@@ -446,6 +446,33 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
         // service is left alone, and one installed from an older build or app
         // location moves onto this binary.
         connector::ensure(settings.borrow().connector);
+        // First launch only: bring the daemon's pane gaps, title rows, and
+        // theme in line with what pilus draws, then record it. The control
+        // socket may not be up yet because the view starts the daemon, so the
+        // work runs off-thread and waits for it; a launch that never finds the
+        // daemon leaves `init` unset and retries next time.
+        cx.spawn({
+            let settings = settings.clone();
+            let root = pilus_root.clone();
+            let socket = appearances_socket.clone();
+            async move |cx| {
+                if settings.borrow().initialized() {
+                    return;
+                }
+                let patched = cx
+                    .background_executor()
+                    .spawn(async move { crate::init::patch_luvus_defaults(&socket) })
+                    .await;
+                if patched {
+                    cx.update(|_| {
+                        let mut settings = settings.borrow_mut();
+                        settings.init = Some(true);
+                        settings.save(&root);
+                    });
+                }
+            }
+        })
+        .detach();
         cx.on_action({
             let api = appearances_socket.clone();
             let settings = settings.clone();

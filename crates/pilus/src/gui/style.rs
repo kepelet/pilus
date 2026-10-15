@@ -411,6 +411,10 @@ pub(super) fn icon_button(
         )
 }
 
+/// Side of a pane toolbar button. Smaller than a regular compact control: the
+/// strip floats over terminal text, so it should stay out of the way.
+pub(super) const PANE_TOOLBAR_BUTTON: f32 = 20.0;
+
 /// The strip of icon buttons that floats over the focused pane's top-right
 /// corner. It has no fill, so the terminal shows through between the glyphs;
 /// it still occludes the grid under it, so a press on a button never also

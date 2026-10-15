@@ -11447,7 +11447,7 @@ impl PilusView {
     /// fullscreen), and close the pane. `render_grid` pins it to the pane.
     fn pane_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let size = style::scaled(&self.shared_settings, 24.0);
+        let size = style::scaled(&self.shared_settings, style::PANE_TOOLBAR_BUTTON);
         let button =
             |id: &'static str, glyph: &'static [u8], kind: style::ButtonKind, tip: &str| {
                 style::icon_button(id, glyph, kind, theme, size).tooltip(row_tooltip(

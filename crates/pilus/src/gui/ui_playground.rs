@@ -363,7 +363,7 @@ impl UiPlaygroundView {
     /// The strip the focused pane wears over its top-right corner.
     fn pane_toolbar(&self) -> impl IntoElement {
         let theme = self.theme;
-        let size = style::scaled(&self.settings, 24.0);
+        let size = style::scaled(&self.settings, style::PANE_TOOLBAR_BUTTON);
         style::pane_toolbar()
             .child(style::icon_button(
                 "pg-pane-split-right",

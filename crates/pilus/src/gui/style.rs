@@ -6,6 +6,7 @@
 //! scaled to the user's setting by [`scaled`].
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -317,7 +318,16 @@ pub(super) fn button(
     theme: Theme,
     text_size: f32,
 ) -> Stateful<Div> {
-    button_at(id, label, kind, theme, text_size, CONTROL_HEIGHT, px(12.0), true)
+    button_at(
+        id,
+        label,
+        kind,
+        theme,
+        text_size,
+        CONTROL_HEIGHT,
+        px(12.0),
+        true,
+    )
 }
 
 /// A regular-height button that can be switched off. A disabled one keeps its
@@ -1753,7 +1763,39 @@ pub(super) struct GlideSlot(Rc<Cell<Option<Bounds<Pixels>>>>);
 /// Mark the element this is a child of as the glide's target. Add it as a
 /// child of the selected item only.
 pub(super) fn glide_target(slot: &GlideSlot) -> impl IntoElement {
-    GlideMarker(slot.clone())
+    glide_target_shifted(slot, 0.0)
+}
+
+/// [`glide_target`] for an item drawn `shift` pixels right of its layout slot:
+/// the pill flies to the slot, not after the item, so an item that slides on
+/// its own spring does not drag a second spring behind it.
+pub(super) fn glide_target_shifted(slot: &GlideSlot, shift: f32) -> impl IntoElement {
+    let slot = slot.clone();
+    BoundsMarker(Box::new(move |bounds| {
+        slot.0.set(Some(Bounds {
+            origin: point(bounds.origin.x - px(shift), bounds.origin.y),
+            size: bounds.size,
+        }));
+    }))
+}
+
+/// Where each keyed item was drawn last frame, in window coordinates.
+#[derive(Clone, Default)]
+pub(super) struct BoundsLedger(Rc<RefCell<HashMap<String, Bounds<Pixels>>>>);
+
+impl BoundsLedger {
+    pub(super) fn get(&self, key: &str) -> Option<Bounds<Pixels>> {
+        self.0.borrow().get(key).copied()
+    }
+}
+
+/// Write the element this is a child of into `ledger` under `key`, so the next
+/// change to the list can start its motion from where each item actually is.
+pub(super) fn record_bounds(ledger: &BoundsLedger, key: String) -> impl IntoElement {
+    let ledger = ledger.clone();
+    BoundsMarker(Box::new(move |bounds| {
+        ledger.0.borrow_mut().insert(key.clone(), bounds);
+    }))
 }
 
 /// A selection pill that slides between targets instead of fading out of
@@ -2058,9 +2100,11 @@ impl Element for HoverGlide {
     }
 }
 
-struct GlideMarker(GlideSlot);
+/// A zero-size overlay that hands its parent's bounds to `record` while the
+/// frame prepaints, ahead of any paint that reads them.
+struct BoundsMarker(Box<dyn Fn(Bounds<Pixels>)>);
 
-impl IntoElement for GlideMarker {
+impl IntoElement for BoundsMarker {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -2068,7 +2112,7 @@ impl IntoElement for GlideMarker {
     }
 }
 
-impl Element for GlideMarker {
+impl Element for BoundsMarker {
     type RequestLayoutState = ();
     type PrepaintState = ();
 
@@ -2099,7 +2143,7 @@ impl Element for GlideMarker {
         _window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
-        self.0.0.set(Some(bounds));
+        (self.0)(bounds);
     }
 
     fn paint(

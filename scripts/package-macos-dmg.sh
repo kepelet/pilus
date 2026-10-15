@@ -58,6 +58,13 @@ tiffutil -cathidpicheck \
     -D background="$background" \
     "pilus" "$dmg" >/dev/null
 
+if [ -n "${APPLE_DEVELOPER_IDENTITY:-}" ]; then
+    # Gatekeeper's install assessment (`spctl -t install`) rejects an unsigned
+    # image even when its contents are notarized; sign it before submission so
+    # the stapled ticket covers the signed image.
+    codesign --force --timestamp --sign "$APPLE_DEVELOPER_IDENTITY" "$dmg"
+fi
+
 if [ -n "${NOTARY_PROFILE:-}" ]; then
     # Gatekeeper trusts the update only when the bundle is notarized.
     xcrun notarytool submit "$dmg" --keychain-profile "$NOTARY_PROFILE" --wait

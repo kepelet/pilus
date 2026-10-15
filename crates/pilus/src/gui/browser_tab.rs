@@ -60,11 +60,15 @@ impl BrowserPanel {
         }
     }
 
-    /// Destroy the webview and forget the page. Dropping the entity releases
-    /// the native view, which stops the page's scripts and connections; the
-    /// queue is cleared so a late event cannot bring the old address back.
-    fn close(&mut self) {
-        self.view = None;
+    /// Close the page and forget it. Dropping the webview is not enough: wry
+    /// leaks the macOS `WKWebView` on drop (it retains it on purpose), so a
+    /// playing video would carry on unseen. Navigating to a blank page first
+    /// unloads the page and ends its media. The queue is cleared so a late
+    /// event cannot bring the old address back.
+    fn close(&mut self, cx: &gpui::App) {
+        if let Some(view) = self.view.take() {
+            let _ = view.read(cx).raw().load_url("about:blank");
+        }
         self.pending = None;
         self.editing = false;
         self.url.clear();
@@ -198,7 +202,7 @@ impl PilusView {
     /// Stop the page and close the browser, not just hide it: the webview is
     /// destroyed, and the next address builds a fresh one.
     fn browser_stop(&mut self, cx: &mut Context<Self>) {
-        self.browser_panel.close();
+        self.browser_panel.close(cx);
         self.right.focused = false;
         self.browser_input.update(cx, |input, cx| input.clear(cx));
         cx.notify();

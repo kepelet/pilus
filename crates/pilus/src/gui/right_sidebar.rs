@@ -36,7 +36,7 @@ pub(super) const DEFAULT_WIDTH: f32 = 480.0;
 /// left. The stored width and the drag math stay as the user set them.
 const WIDTH_BONUS: f32 = 2.0;
 /// The draggable strip on the column's leading edge.
-const HANDLE_WIDTH: f32 = 6.0;
+pub(super) const HANDLE_WIDTH: f32 = 6.0;
 
 /// What the column is showing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

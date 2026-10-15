@@ -84,6 +84,98 @@ impl BrowserPanel {
     }
 }
 
+/// Whether the window's first responder is the webview or one of its
+/// subviews (WebKit's content view takes it once the page is clicked).
+#[cfg(target_os = "macos")]
+fn page_holds_responder(webview: &wry::WebView) -> bool {
+    use objc2_app_kit::NSView;
+    use wry::WebViewExtMacOS;
+
+    let page = webview.webview();
+    let Some(window) = page.window() else {
+        return false;
+    };
+    let Some(responder) = window.firstResponder() else {
+        return false;
+    };
+    responder
+        .downcast_ref::<NSView>()
+        .is_some_and(|view| view.isDescendantOf(&page))
+}
+
+/// Deliver the key event AppKit is dispatching to the page's first responder.
+#[cfg(target_os = "macos")]
+fn send_key_to_page(webview: &wry::WebView) -> bool {
+    use objc2::{MainThreadMarker, msg_send, rc::Retained, runtime::AnyObject};
+    use objc2_app_kit::NSApplication;
+    use wry::WebViewExtMacOS;
+
+    let Some(main) = MainThreadMarker::new() else {
+        return false;
+    };
+    let Some(window) = webview.webview().window() else {
+        return false;
+    };
+    let Some(responder) = window.firstResponder() else {
+        return false;
+    };
+    // SAFETY: `currentEvent` returns the event being dispatched (or nil), and
+    // `keyDown:` takes that `NSEvent` on the main thread.
+    #[allow(unsafe_code)]
+    unsafe {
+        let app = NSApplication::sharedApplication(main);
+        let event: Option<Retained<AnyObject>> = msg_send![&*app, currentEvent];
+        let Some(event) = event else {
+            return false;
+        };
+        let _: () = msg_send![&*responder, keyDown: &*event];
+    }
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+fn send_key_to_page(_: &wry::WebView) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn page_holds_responder(_: &wry::WebView) -> bool {
+    false
+}
+
+/// An Edit-menu command the page answers itself.
+#[derive(Clone, Copy)]
+pub(super) enum PageEdit {
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+/// Send `edit` down the responder chain, which ends at the webview while
+/// the page holds the keyboard.
+#[cfg(target_os = "macos")]
+fn send_edit(edit: PageEdit) {
+    use objc2::{MainThreadMarker, sel};
+    use objc2_app_kit::NSApplication;
+
+    let Some(main) = MainThreadMarker::new() else {
+        return;
+    };
+    let action = match edit {
+        PageEdit::Copy => sel!(copy:),
+        PageEdit::Paste => sel!(paste:),
+        PageEdit::SelectAll => sel!(selectAll:),
+    };
+    // SAFETY: the selectors take one sender argument and the sender is nil.
+    #[allow(unsafe_code)]
+    unsafe {
+        NSApplication::sharedApplication(main).sendAction_to_from(action, None, None);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn send_edit(_: PageEdit) {}
+
 /// The address `typed` stands for: a full address as written, a host as
 /// `https` (`http` for this machine, where dev servers rarely speak TLS), and
 /// anything else as a search.
@@ -154,6 +246,49 @@ impl PilusView {
             && !self.settings_open
             && self.context_menu.is_none()
             && self.menu_prompt.is_none()
+    }
+
+    /// Whether the page itself holds the keyboard: the OS-level first
+    /// responder is inside the webview, which a click in the page puts there
+    /// without GPUI hearing of it. Keys then belong to the page alone, so
+    /// the window must neither route them to the terminal nor swallow them.
+    pub(super) fn browser_page_focused(&self, cx: &gpui::App) -> bool {
+        self.browser_visible()
+            && self
+                .browser_panel
+                .view
+                .as_ref()
+                .is_some_and(|view| page_holds_responder(view.read(cx).raw()))
+    }
+
+    /// Hand a keystroke straight to the page and keep the window from also
+    /// reading it. Left to AppKit's own routing, a bare arrow or function key
+    /// is first fed to the window's text input context, which types its
+    /// private-use glyph instead of moving the caret. Command chords stay on
+    /// the normal route, where the Edit actions answer them.
+    pub(super) fn browser_forward_key(
+        &self,
+        event: &gpui::KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.platform {
+            return;
+        }
+        if let Some(view) = &self.browser_panel.view
+            && send_key_to_page(view.read(cx).raw())
+        {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Run an Edit-menu command on the page when it holds the keyboard;
+    /// false when it does not, so the caller acts on the terminal instead.
+    pub(super) fn browser_edit(&self, edit: PageEdit, cx: &gpui::App) -> bool {
+        let focused = self.browser_page_focused(cx);
+        if focused {
+            send_edit(edit);
+        }
+        focused
     }
 
     /// Give the address bar the keyboard.
@@ -229,6 +364,12 @@ impl PilusView {
             Err(_) => return false,
         };
         let mut changed = false;
+        // A click in the page moves the OS first responder without GPUI
+        // hearing of it, so the address bar learns it lost the keyboard here.
+        if self.browser_panel.editing && self.browser_page_focused(cx) {
+            self.browser_end_edit(cx);
+            changed = true;
+        }
         for event in events {
             match event {
                 Event::Loaded(url) => {
@@ -306,9 +447,22 @@ impl PilusView {
         match self.browser_panel.view.clone() {
             // While the column moves the webview is hidden, so the body is
             // left empty rather than showing a stale frame.
-            Some(view) if self.browser_on_screen() => {
-                page.child(div().relative().flex_1().min_h(px(0.0)).child(view))
-            }
+            //
+            // The native view paints above GPUI and takes the mouse, so it
+            // leaves the resize handle's strip bare; filling the column would
+            // bury the handle and the column could not be dragged.
+            Some(view) if self.browser_on_screen() => page.child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .pl(px(if self.right.expanded() {
+                        0.0
+                    } else {
+                        super::right_sidebar::HANDLE_WIDTH
+                    }))
+                    .child(view),
+            ),
             Some(_) => page.child(div().flex_1()),
             None => page.child(
                 self.diff_message("Type an address above. Dev servers on localhost open here too."),

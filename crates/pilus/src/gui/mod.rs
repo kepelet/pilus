@@ -14,6 +14,7 @@ mod automations;
 mod background;
 mod box_drawing;
 mod connector;
+mod cursor_blink;
 mod diff;
 mod diff_model;
 mod dock;
@@ -1464,6 +1465,8 @@ struct PilusView {
     /// Collapse/expand tween in flight, if any; the panel, tab strip, and
     /// terminal read its openness so they glide together.
     sidebar_anim: Option<SidebarAnim>,
+    /// The terminal cursor's fade, advanced by the tick loop.
+    cursor_blink: cursor_blink::CursorBlink,
     /// Last dock rectangle seen while the sidebar was open. Hiding the sidebar
     /// makes the daemon drop its `ShellDock`, so a live-only width would snap
     /// to zero the instant it answers; the collapse tween folds this one away
@@ -2079,6 +2082,7 @@ impl PilusView {
             shared_settings,
             glass: Glass::new(),
             sidebar_anim: None,
+            cursor_blink: cursor_blink::CursorBlink::new(Instant::now()),
             last_sidebar_dock: None,
             sidebar_freeze: None,
             sidebar_open: 1.0,
@@ -2293,7 +2297,14 @@ impl PilusView {
                     let was_animating = view.sidebar_anim.is_some() || view.right.moving();
                     let settled = view.tick_sidebar_anim() & view.right.tick();
                     let released = view.release_sidebar_freeze();
-                    if view.poll(cx) || changed || !settled || was_animating || released {
+                    let blinked = view.tick_cursor_blink(cx);
+                    if view.poll(cx)
+                        || changed
+                        || !settled
+                        || was_animating
+                        || released
+                        || blinked
+                    {
                         cx.notify();
                     }
                 });
@@ -8627,6 +8638,18 @@ impl PilusView {
         cx.notify();
     }
 
+    /// Advance the cursor's blink; true when its opacity moved and the grid
+    /// needs a repaint. A window in the background or reduced motion keeps
+    /// the cursor solid, like the other tweens.
+    fn tick_cursor_blink(&mut self, cx: &App) -> bool {
+        let cursor = self
+            .shown_frame()
+            .filter(|frame| frame.cursor_visible)
+            .and_then(|frame| frame.cursor);
+        let blinking = self.window_active && !cx.reduce_motion();
+        self.cursor_blink.tick(Instant::now(), cursor, blinking)
+    }
+
     /// Advance the sidebar tween; true once it settles at its target.
     fn tick_sidebar_anim(&mut self) -> bool {
         let settled = match &self.sidebar_anim {
@@ -13033,6 +13056,7 @@ impl Render for PilusView {
                     layout.slack_y,
                     pane_ui,
                     pane_toolbar,
+                    self.cursor_blink.alpha(),
                 )
             }),
             None => {
@@ -13355,6 +13379,7 @@ fn render_grid(
     slack_y: f32,
     pane_ui: bool,
     toolbar: Option<Div>,
+    cursor_alpha: f32,
 ) -> Div {
     let end_row = skip_rows
         .saturating_add(max_rows)
@@ -13434,6 +13459,7 @@ fn render_grid(
             glass,
             slack_x,
             surface_base,
+            cursor_alpha,
         ));
     }
     // Full-bleed pools the sub-cell remainder below the last row; extend
@@ -13507,6 +13533,7 @@ fn render_row(
     glass: f32,
     slack_x: f32,
     surface: gpui::Rgba,
+    cursor_alpha: f32,
 ) -> Div {
     let width = usize::from(frame.width);
     let skip = usize::from(skip_cols).min(width);
@@ -13599,7 +13626,7 @@ fn render_row(
                 .w(px(width))
                 .h(line_height)
                 .rounded(style::RADIUS_SM.pixels())
-                .bg(bg.opacity(glass)),
+                .bg(bg.opacity(glass * cursor_alpha)),
         );
     }
 
@@ -13608,7 +13635,7 @@ fn render_row(
     let mut box_curves: Vec<(box_drawing::Curve, gpui::Rgba)> = Vec::new();
     let light_stroke = box_drawing::light_stroke(font_size);
     for (start_column, run_cells, text, (fg, _bg, mods)) in
-        collect_runs(frame.width, &rendered, theme, row, selection)
+        collect_runs(frame.width, &rendered, theme, row, selection, cursor_alpha)
     {
         if let Some((rects, shade)) = block_element(&text) {
             let column = f32::from(start_column.saturating_sub(skip_cols));
@@ -14048,24 +14075,30 @@ fn collect_runs(
     theme: Theme,
     row: u16,
     selection: Option<Selection>,
+    cursor_alpha: f32,
 ) -> Vec<PinnedRun> {
     let selected = |column: u16| selection.is_some_and(|s| s.contains(column, row));
+    // The glyph under a fading cursor crosses from its own color to the
+    // block's inverse, so it never pops when the block appears or leaves.
+    let style_at = |cell: &CellData, cursor: bool, column: u16| {
+        let mut style = style_of(cell, theme, cursor, selected(column));
+        if cursor && cursor_alpha < 1.0 {
+            let resting = style_of(cell, theme, false, selected(column)).0;
+            style.0 = style::mix(resting, style.0, cursor_alpha);
+        }
+        style
+    };
     let mut runs = Vec::new();
     let mut index = 0usize;
     while index < rendered.len() {
         let start_column = rendered[index].0;
-        let style = style_of(
-            rendered[index].1,
-            theme,
-            rendered[index].2,
-            selected(start_column),
-        );
+        let style = style_at(rendered[index].1, rendered[index].2, start_column);
         let start_flowable = is_flowable(symbol(rendered[index].1));
         let mut text = String::new();
         let mut next = index;
         while next < rendered.len() {
             let (column, cell, cursor) = rendered[next];
-            if style_of(cell, theme, cursor, selected(column)) != style {
+            if style_at(cell, cursor, column) != style {
                 break;
             }
             if next > index && (!start_flowable || !is_flowable(symbol(cell))) {
@@ -15238,7 +15271,7 @@ mod tests {
             .map(|(index, cell)| (index as u16, cell, false))
             .collect();
         assert_eq!(
-            collect_runs(frame.width, &rendered, theme, 0, None).len(),
+            collect_runs(frame.width, &rendered, theme, 0, None, 1.0).len(),
             4
         );
         let background = collect_background_runs(frame.width, &rendered, theme, 0, None);
@@ -15261,7 +15294,7 @@ mod tests {
             .collect();
         // Each stroke paints from its own cell's geometry; `BoxRects` joins
         // the border back into one quad.
-        let runs = collect_runs(frame.width, &rendered, theme, 0, None);
+        let runs = collect_runs(frame.width, &rendered, theme, 0, None, 1.0);
         assert_eq!(runs.len(), 4);
         assert!(
             runs.iter()
@@ -15694,7 +15727,7 @@ mod tests {
             .zip(cells.iter())
             .map(|(c, cell)| (*c, cell, false))
             .collect();
-        let runs = collect_runs(width, &rendered, theme, 0, None);
+        let runs = collect_runs(width, &rendered, theme, 0, None, 1.0);
         let texts: Vec<&str> = runs.iter().map(|(_, _, text, _)| text.as_str()).collect();
         assert_eq!(texts, vec!["a ", "\u{e0a0}", " b ", "\u{1f4e6}", " c"]);
         // Every run stays pinned: widths cover the daemon columns exactly,

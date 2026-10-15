@@ -1,9 +1,11 @@
 //! The native frame drawn over each pane, and how it animates.
 //!
 //! `render_grid` hides the daemon's square border glyphs (`pane_frames`) and
-//! asks this module for one [`PaneChrome`] per pane: a rounded border on the
-//! center lines of the cells it replaces, in the surface color, so a pane
-//! reads as its card alone. A pane that does not hold the caret is dimmed by a
+//! asks this module for one [`PaneChrome`] per pane. With gaps on, a pane is a
+//! rounded card floating on the surface, a gap from its neighbors, its border
+//! in the surface color so it reads as the card alone. With gaps off, panes
+//! sit flush: each is outlined in the theme's border, and neighbors share one
+//! line. A pane that does not hold the caret is dimmed by a
 //! veil of that surface over its card and text, which lifts under the pointer.
 //! The pane that does hold the caret also casts a soft shadow around its card.
 //!
@@ -24,7 +26,7 @@ use gpui::{
 };
 
 use super::pane_frames::PaneFrame;
-use super::style::{self, RADIUS_MD, RadiusExt as _, ease_out_cubic, mix};
+use super::style::{self, RADIUS_MD, ease_out_cubic, mix};
 
 /// Thickness of a pane's frame in logical pixels.
 const BORDER_PX: f32 = 1.0;
@@ -32,9 +34,12 @@ const BORDER_PX: f32 = 1.0;
 /// surface, in logical pixels. Cells are wider than they are tall, so a gap
 /// that fell out of the cell grid would differ by axis.
 pub(super) const GAP_PX: f32 = 8.0;
-/// Whether a card is outlined. Off, the stroke's ring stays as surface around
-/// the card, so the geometry and the shadow's overlap are unchanged.
-const SHOW_BORDER: bool = false;
+/// How far either side of a seam a press still grabs it, in logical pixels:
+/// the gutter between floating cards, or a little slack around the single
+/// shared line of flush panes, which is too thin to aim at.
+pub(super) fn divider_slop(gaps: bool) -> f32 {
+    if gaps { GAP_PX / 2.0 + 1.0 } else { 3.0 }
+}
 /// How long a pane's frame takes to fade in when it first appears.
 const ENTER: Duration = Duration::from_millis(260);
 /// How long the frame takes to move between resting and focused.
@@ -61,6 +66,37 @@ pub(super) struct PaneChrome {
     rest: Look,
     hover: Look,
     surface: Rgba,
+    round: RoundedCorners,
+}
+
+/// Which of a card's corners are rounded. A floating card rounds all four;
+/// flush panes round only the corners on the outer edge of the split, so
+/// neighbors meet in square joints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RoundedCorners {
+    top_left: bool,
+    top_right: bool,
+    bottom_left: bool,
+    bottom_right: bool,
+}
+
+impl RoundedCorners {
+    const ALL: Self = Self {
+        top_left: true,
+        top_right: true,
+        bottom_left: true,
+        bottom_right: true,
+    };
+
+    fn pixels(self, radius: Pixels) -> Corners<Pixels> {
+        let pick = |round: bool| if round { radius } else { px(0.0) };
+        Corners {
+            top_left: pick(self.top_left),
+            top_right: pick(self.top_right),
+            bottom_left: pick(self.bottom_left),
+            bottom_right: pick(self.bottom_right),
+        }
+    }
 }
 
 /// The two things a pane's frame animates between.
@@ -83,8 +119,8 @@ impl Look {
     }
 }
 
-/// One pane's frame. Each card is its box of cells pulled in from the cell
-/// boundaries: half the gap on an edge it shares with a neighbor, so two cards
+/// One pane's frame. With `gaps` on, each card is its box of cells pulled in
+/// from the cell boundaries: half the gap on an edge it shares with a neighbor, so two cards
 /// are a whole gap apart whichever way they are split, and a whole gap on an
 /// edge that meets the surface's border. The grid's sub-cell remainder
 /// (`slack`) is surface too, so the outermost right and bottom cards grow
@@ -96,12 +132,18 @@ impl Look {
 /// hairline the sidebar parts with. The stroke sits just outside the card. A top edge
 /// hidden behind the native tab strip is drawn flush with the grid's top, so
 /// the strip reads as opening into the card.
+///
+/// With `gaps` off the box is the card, outer edges included, and it draws its
+/// own `border`. A pane's stroke on an edge it shares reaches a pixel into
+/// the neighbor, whose own stroke lands on the same pixels, so a seam is one
+/// line, not two. The card casts no shadow, which would fall on the neighbor.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pane_chrome(
     index: usize,
     pane: &PaneFrame,
     tiled: &PaneFrame,
     focused: bool,
+    gaps: bool,
     surface: Rgba,
     border: Rgba,
     focus_border: Rgba,
@@ -115,33 +157,69 @@ pub(super) fn pane_chrome(
     let column_edge =
         |column: u16| ((f32::from(column) - f32::from(skip_cols)) * cell_width).round();
     let row_edge = |row: u16| ((f32::from(row) - f32::from(skip_rows)) * height).round();
-    let inset = |shared: bool| if shared { GAP_PX / 2.0 } else { GAP_PX };
-    let left = column_edge(pane.left) + inset(pane.left != tiled.left);
+    let outer_left = pane.left == tiled.left;
     let outer_right = pane.right == tiled.right;
+    let outer_top = pane.top == tiled.top;
     let outer_bottom = pane.bottom == tiled.bottom;
-    let right =
-        column_edge(pane.right + 1) + if outer_right { slack.0 } else { 0.0 } - inset(!outer_right);
-    let top = if pane.top < skip_rows {
-        0.0
+    let slack = (
+        if outer_right { slack.0 } else { 0.0 },
+        if outer_bottom { slack.1 } else { 0.0 },
+    );
+    let (left, top, right, bottom) = if gaps {
+        let inset = |outer: bool| if outer { GAP_PX } else { GAP_PX / 2.0 };
+        let left = column_edge(pane.left) + inset(outer_left);
+        let right = column_edge(pane.right + 1) + slack.0 - inset(outer_right);
+        let top = if pane.top < skip_rows {
+            0.0
+        } else {
+            row_edge(pane.top) + inset(outer_top)
+        };
+        let bottom = row_edge(pane.bottom + 1) + slack.1 - inset(outer_bottom);
+        // The stroke grows the box outward, leaving the card as the inner area.
+        (
+            left - BORDER_PX,
+            top - BORDER_PX,
+            right + BORDER_PX,
+            bottom + BORDER_PX,
+        )
     } else {
-        row_edge(pane.top) + inset(pane.top != tiled.top)
+        let left = column_edge(pane.left);
+        let top = if pane.top < skip_rows {
+            0.0
+        } else {
+            row_edge(pane.top)
+        };
+        let overlap = |outer: bool| if outer { 0.0 } else { BORDER_PX };
+        (
+            left,
+            top,
+            column_edge(pane.right + 1) + slack.0 + overlap(outer_right),
+            row_edge(pane.bottom + 1) + slack.1 + overlap(outer_bottom),
+        )
     };
-    let bottom =
-        row_edge(pane.bottom + 1) + if outer_bottom { slack.1 } else { 0.0 } - inset(!outer_bottom);
-    // The stroke grows the box outward, leaving the card as the inner area.
-    let left = left - BORDER_PX;
-    let top = top - BORDER_PX;
-    let right = right + BORDER_PX;
-    let bottom = bottom + BORDER_PX;
     let stroke = if focused { focus_border } else { border };
     let rest = Look {
-        border: if SHOW_BORDER {
-            stroke
-        } else {
+        // Floating cards keep the stroke's ring as surface, so the geometry
+        // and the shadow's overlap match an outlined card's; it only shows
+        // when the panes are flush.
+        border: if gaps {
             Rgba { a: 0.0, ..stroke }
+        } else {
+            stroke
         },
         dim: if focused { 0.0 } else { 1.0 },
-        shadow: if focused { 1.0 } else { 0.0 },
+        shadow: if focused && gaps { 1.0 } else { 0.0 },
+    };
+    let round = if gaps {
+        RoundedCorners::ALL
+    } else {
+        // A corner is round only where both its edges are the split's own.
+        RoundedCorners {
+            top_left: outer_top && outer_left,
+            top_right: outer_top && outer_right,
+            bottom_left: outer_bottom && outer_left,
+            bottom_right: outer_bottom && outer_right,
+        }
     };
     PaneChrome {
         index,
@@ -153,6 +231,7 @@ pub(super) fn pane_chrome(
         rest,
         hover: Look { dim: 0.0, ..rest },
         surface,
+        round,
     }
 }
 
@@ -191,13 +270,17 @@ impl PaneChrome {
     /// grid's text. A card has no animation of its own; the frame fades in
     /// around it.
     pub(super) fn card(&self, fill: Rgba) -> Div {
+        let corners = self.round.pixels(RADIUS_MD.pixels());
         div()
             .absolute()
             .left(px(self.left))
             .top(px(self.top))
             .w(px(self.width))
             .h(px(self.height))
-            .radius_md()
+            .rounded_tl(corners.top_left)
+            .rounded_tr(corners.top_right)
+            .rounded_bl(corners.bottom_left)
+            .rounded_br(corners.bottom_right)
             .bg(fill)
     }
 }
@@ -430,7 +513,10 @@ impl Element for PaneChrome {
         };
 
         let radius = RADIUS_MD.pixels();
-        let corners = Corners::all(radius).clamp_radii_for_quad_size(bounds.size);
+        let corners = self
+            .round
+            .pixels(radius)
+            .clamp_radii_for_quad_size(bounds.size);
         if look.shadow > 0.0 {
             paint_shadow_outside(window, bounds, corners, look.shadow);
         }
@@ -479,6 +565,10 @@ mod tests {
     use super::*;
 
     fn chrome(pane: PaneFrame, tiled: PaneFrame) -> PaneChrome {
+        chrome_with(pane, tiled, true)
+    }
+
+    fn chrome_with(pane: PaneFrame, tiled: PaneFrame, gaps: bool) -> PaneChrome {
         let clear = Rgba {
             r: 0.0,
             g: 0.0,
@@ -490,6 +580,7 @@ mod tests {
             &pane,
             &tiled,
             true,
+            gaps,
             clear,
             clear,
             clear,
@@ -544,6 +635,7 @@ mod tests {
             &tiled,
             &tiled,
             true,
+            true,
             clear,
             clear,
             clear,
@@ -563,5 +655,49 @@ mod tests {
         let card = chrome(tiled, tiled);
         assert_eq!(card.left + BORDER_PX, GAP_PX);
         assert_eq!(card.top + BORDER_PX, (17.0f32 * 1.0).round() + GAP_PX);
+    }
+
+    #[test]
+    fn flush_panes_meet_on_one_line() {
+        let tiled = frame(0, 1, 39, 20);
+        let left = chrome_with(frame(0, 1, 19, 20), tiled, false);
+        let right = chrome_with(frame(20, 1, 39, 20), tiled, false);
+        // Each stroke is the outermost pixel of its box; the left pane's
+        // right stroke and the right pane's left stroke are the same pixels.
+        let seam = (left.left + left.width - BORDER_PX, right.left);
+        assert_eq!(seam.0, seam.1);
+        let upper = chrome_with(frame(0, 1, 39, 9), tiled, false);
+        let lower = chrome_with(frame(0, 10, 39, 20), tiled, false);
+        assert_eq!(upper.top + upper.height - BORDER_PX, lower.top);
+    }
+
+    #[test]
+    fn flush_panes_have_no_margin_and_cast_no_shadow() {
+        let tiled = frame(0, 2, 39, 20);
+        let card = chrome_with(tiled, tiled, false);
+        assert_eq!(card.left, 0.0);
+        assert_eq!(card.top, 17.0);
+        assert_eq!(card.rest.shadow, 0.0);
+        assert_eq!(chrome(tiled, tiled).rest.shadow, 1.0);
+    }
+
+    #[test]
+    fn flush_panes_round_only_the_splits_outer_corners() {
+        let tiled = frame(0, 1, 39, 20);
+        let left = chrome_with(frame(0, 1, 19, 20), tiled, false).round;
+        assert!(left.top_left && left.bottom_left);
+        assert!(!left.top_right && !left.bottom_right);
+        let lower_right = chrome_with(frame(20, 10, 39, 20), tiled, false).round;
+        assert!(lower_right.bottom_right);
+        assert!(!lower_right.top_left && !lower_right.top_right && !lower_right.bottom_left);
+    }
+
+    #[test]
+    fn floating_cards_round_every_corner() {
+        let tiled = frame(0, 1, 39, 20);
+        assert_eq!(
+            chrome(frame(0, 1, 19, 20), tiled).round,
+            RoundedCorners::ALL
+        );
     }
 }

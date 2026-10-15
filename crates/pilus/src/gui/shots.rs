@@ -123,15 +123,17 @@ pub fn run() -> Result<()> {
         Duration::ZERO,
         |_, cx| cx.new(|_| GlyphGridView),
     )?;
-    for (name, id) in [
-        ("panes-dawn", "rose-pine-dawn"),
-        ("panes-noir", "noir"),
-        ("panes-dracula", "dracula"),
-        ("panes-paper", "paper"),
+    for (name, id, gaps) in [
+        ("panes-dawn", "rose-pine-dawn", true),
+        ("panes-noir", "noir", true),
+        ("panes-dracula", "dracula", true),
+        ("panes-paper", "paper", true),
+        ("panes-flush-dawn", "rose-pine-dawn", false),
+        ("panes-flush-noir", "noir", false),
     ] {
         let theme = super::scheme::builtin(id).map_or_else(Theme::default, Theme::from_palette);
         shoot(&mut cx, name, 560.0, 420.0, Duration::ZERO, move |_, cx| {
-            cx.new(|_| PaneGridView { theme })
+            cx.new(|_| PaneGridView { theme, gaps })
         })?;
     }
     shoot(
@@ -1400,6 +1402,12 @@ impl Render for GlyphGridView {
                 1.0,
                 0.0,
                 0.0,
+                super::pane_frames::PaneFrames::find(
+                    &frame,
+                    frame
+                        .height
+                        .saturating_sub(super::SKIPPED_DAEMON_BOTTOM_ROWS),
+                ),
                 true,
                 None,
                 1.0,
@@ -1434,6 +1442,8 @@ fn grid_cell_width(window: &Window, settings: &Settings) -> f32 {
 /// daemon.
 struct PaneGridView {
     theme: Theme,
+    /// Floating cards when set, flush bordered panes when not.
+    gaps: bool,
 }
 
 impl Render for PaneGridView {
@@ -1444,7 +1454,7 @@ impl Render for PaneGridView {
     ) -> impl gpui::IntoElement {
         use gpui::{ParentElement as _, Styled as _};
         use pilus_protocol::FrameData;
-        let theme = self.theme;
+        let (theme, gaps) = (self.theme, self.gaps);
         let settings = Settings::default();
         let skip_rows = super::SKIPPED_DAEMON_ROWS;
         let body: u16 = 16;
@@ -1511,7 +1521,13 @@ impl Render for PaneGridView {
                 // remainder is surface the cards must grow over.
                 5.0,
                 9.0,
-                true,
+                super::pane_frames::PaneFrames::find(
+                    &frame,
+                    frame
+                        .height
+                        .saturating_sub(super::SKIPPED_DAEMON_BOTTOM_ROWS),
+                ),
+                gaps,
                 Some(
                     super::style::pane_toolbar()
                         .child(super::style::icon_button(

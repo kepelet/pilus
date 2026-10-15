@@ -51,6 +51,23 @@ manifest channel base_url:
     ./scripts/write-manifest.sh "target/release/{{channel}}.json" "{{base_url}}" \
         "target/release/pilus-v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-macos-arm64.dmg"
 
+# Build the preview payload against the public releases URL, without uploading.
+release-preview-build:
+    PILUS_PREVIEW_BASE_URL="https://releases.kepelet.com/pilus/preview" ./scripts/preview-feed.sh
+
+# Publish a preview build to releases.kepelet.com: the `preview` channel serves
+# it to clients (see docs/ota.md). Needs `bunx wrangler login` in infra/ and
+# PILUS_RELEASES_BUCKET (env or infra/.env).
+release-preview: release-preview-build
+    ./scripts/publish-release.sh preview
+
+# Publish the stable release in the Cargo.toml version to releases.kepelet.com.
+# Rebuilds the DMG (a preview build reuses the same filename), then refuses to
+# replace a version that is already live: bump Cargo.toml first.
+release-stable: package-dmg
+    just manifest stable https://releases.kepelet.com/pilus
+    ./scripts/publish-release.sh stable
+
 # Serve the preview payload on the port the preview channel expects.
 serve-preview:
     python3 -m http.server 8000 --directory target/release/preview-feed

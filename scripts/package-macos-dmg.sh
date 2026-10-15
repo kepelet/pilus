@@ -17,9 +17,14 @@
 #                             set the production one (`pilus.kepelet.com`).
 #   NOTARY_PROFILE            notarytool keychain profile; when set, the DMG
 #                             is submitted for notarization and stapled.
-#   MINISIGN_SECRET_KEY       path to a minisign secret key; when set and the
-#                             `minisign` tool is installed, each DMG gets a
+#   MINISIGN_SECRET_KEY       path to a minisign secret key; each DMG gets a
 #                             `<asset>.minisig` sidecar for signature checks.
+#   MINISIGN_SECRET_KEY_CONTENT
+#                             the same key as text (both lines of the key
+#                             file), for when it lives in an encrypted env
+#                             file. Written to a 0600 temp file for the
+#                             signing step and removed after. Wins over the
+#                             path when both are set.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,7 +40,9 @@ arch="arm64"
 ./scripts/bundle-macos.sh
 
 dmg="target/release/pilus-v${version}-macos-${arch}.dmg"
-rm -f "$dmg"
+# A signature left from an earlier build would sit beside this DMG and fail to
+# verify, so it goes with the image it belonged to.
+rm -f "$dmg" "$dmg.minisig"
 
 # `dmgbuild` writes the Finder layout (.DS_Store) directly, so packaging needs
 # no GUI session or AppleScript, unlike a Finder-driven DMG. The venv lives in
@@ -75,7 +82,21 @@ fi
 # the client's GitHub source resolves for checksum verification.
 (cd target/release && shasum -a 256 "$(basename "$dmg")" > SHA256SUMS)
 
-if [ -n "${MINISIGN_SECRET_KEY:-}" ] && command -v minisign >/dev/null 2>&1; then
+if [ -n "${MINISIGN_SECRET_KEY_CONTENT:-}" ]; then
+    MINISIGN_SECRET_KEY="$(mktemp -t pilus-minisign)"
+    trap 'rm -f "$MINISIGN_SECRET_KEY"' EXIT
+    chmod 600 "$MINISIGN_SECRET_KEY"
+    printf '%s\n' "$MINISIGN_SECRET_KEY_CONTENT" > "$MINISIGN_SECRET_KEY"
+fi
+
+if [ -n "${MINISIGN_SECRET_KEY:-}" ]; then
+    # The client rejects an unsigned download once it carries a public key, so
+    # a requested signature that cannot be made must stop the build, not ship
+    # a DMG nobody can install.
+    if ! command -v minisign >/dev/null 2>&1; then
+        echo "a minisign key is set but \`minisign\` is not installed" >&2
+        exit 1
+    fi
     # Detached signature per asset: the client resolves `<asset>.minisig`
     # from the same release for signature verification.
     minisign -S -s "$MINISIGN_SECRET_KEY" -m "$dmg"

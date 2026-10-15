@@ -144,6 +144,16 @@ just preview-feed https://dl.example.com/preview
 # → target/release/preview-feed/latest.json + the DMG (+ .minisig when signed)
 ```
 
+To publish a preview to the hosted channel, use `just release-preview`. It
+builds the payload with asset URLs under
+`https://releases.kepelet.com/pilus/preview/` and uploads it with
+`scripts/publish-release.sh preview`: the DMG goes to `pilus/preview/` (so it can never
+overwrite the stable DMG of the same Cargo version) and the manifest to
+`pilus/preview.json`, last. It needs `bunx wrangler login` (run in `infra/`;
+this is separate from the Alchemy profile) and `PILUS_RELEASES_BUCKET` in the
+environment or `infra/.env`. `just release-preview-build` runs the build alone.
+Check it with `just check-updates --channel preview`.
+
 Note: install swaps the running bundle, so only download-check locally unless
 the test build is disposable.
 

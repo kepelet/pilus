@@ -9779,7 +9779,7 @@ impl PilusView {
                 "",
                 cx,
             ),
-            SidebarItem::NewTab => self.new_tab(),
+            SidebarItem::NewTab => self.new_tab(cx),
             SidebarItem::CloseTab => self.close_active_tab(),
             _ => {}
         }
@@ -10623,7 +10623,10 @@ impl PilusView {
     }
 
     /// Open a new tab in the active workspace.
-    fn new_tab(&self) {
+    fn new_tab(&mut self, cx: &mut Context<Self>) {
+        // The new tab is the terminal surface, so a page covering it closes.
+        self.leave_settings_page();
+        cx.notify();
         if let Some(feed) = self.agent_feed.as_ref() {
             feed.new_tab();
         }
@@ -10680,6 +10683,11 @@ impl PilusView {
             .or_else(|| self.tabs.last())
             .map(|tab| tab.index);
         if let Some(index) = index {
+            // Closing the active tab hands focus to another, which a page
+            // covering the card must not hide.
+            if self.tabs.len() > 1 {
+                self.leave_settings_page();
+            }
             self.close_tab(index);
         }
     }
@@ -10899,7 +10907,7 @@ impl PilusView {
                 13.0,
                 theme.muted,
             ))
-            .on_click(cx.listener(|this, _, _, _| this.new_tab()));
+            .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)));
         let mut tab_strip = div()
             .flex()
             .flex_row()
@@ -10931,12 +10939,10 @@ impl PilusView {
                     .child(self.sidebar_toggle("pilus-sidebar-toggle-parked", cx)),
             );
         }
-        // Tabs belong to the terminal surface, so they hide with it while a
-        // page owns the card. The plus follows the tabs until overflow makes
-        // the scroll viewport shrink.
-        if !self.settings_open && !self.home.is_open() {
-            tab_strip = tab_strip.child(tabs).child(new_tab);
-        }
+        // The strip stays up under a page; any tab action closes the page.
+        // The plus follows the tabs until overflow makes the scroll viewport
+        // shrink.
+        tab_strip = tab_strip.child(tabs).child(new_tab);
         // The right sidebar's toggle sits at the strip's far edge while the
         // column is away; open, the column's own close button replaces it.
         if self.right.openness() < 0.05 {
@@ -13656,7 +13662,7 @@ impl Render for PilusView {
                         this.select_all(window, cx);
                     }
                 }))
-                .on_action(cx.listener(|this, _: &NewTab, _window, _cx| this.new_tab()))
+                .on_action(cx.listener(|this, _: &NewTab, _window, cx| this.new_tab(cx)))
                 .on_action(cx.listener(|this, _: &OpenLocalTerminal, _window, cx| {
                     this.open_local_terminal(cx);
                 }))

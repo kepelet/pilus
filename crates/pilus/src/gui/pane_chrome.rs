@@ -67,6 +67,7 @@ pub(super) struct PaneChrome {
     hover: Look,
     surface: Rgba,
     round: RoundedCorners,
+    stroke_width: Edges<Pixels>,
 }
 
 /// Which of a card's corners are rounded. A floating card rounds all four;
@@ -221,6 +222,14 @@ pub(super) fn pane_chrome(
     } else {
         RoundedCorners::NONE
     };
+    // Flush panes leave the split's left and right edges unstroked: each
+    // sidebar's hairline already parts them, and a second line beside it
+    // reads doubled.
+    let stroke_width = Edges {
+        left: px(if !gaps && outer_left { 0.0 } else { BORDER_PX }),
+        right: px(if !gaps && outer_right { 0.0 } else { BORDER_PX }),
+        ..Edges::all(px(BORDER_PX))
+    };
     PaneChrome {
         index,
         focused,
@@ -232,6 +241,7 @@ pub(super) fn pane_chrome(
         hover: Look { dim: 0.0, ..rest },
         surface,
         round,
+        stroke_width,
     }
 }
 
@@ -545,7 +555,7 @@ impl Element for PaneChrome {
                     a: 0.0,
                     ..look.border
                 },
-                Edges::all(px(BORDER_PX)),
+                self.stroke_width,
                 look.border,
                 BorderStyle::Solid,
             ));
@@ -687,6 +697,19 @@ mod tests {
         for pane in [frame(0, 1, 19, 20), frame(20, 10, 39, 20), tiled] {
             assert_eq!(chrome_with(pane, tiled, false).round, RoundedCorners::NONE);
         }
+    }
+
+    #[test]
+    fn flush_panes_leave_the_sidebar_sides_unstroked() {
+        let tiled = frame(0, 1, 39, 20);
+        let left = chrome_with(frame(0, 1, 19, 20), tiled, false).stroke_width;
+        assert_eq!(left.left, px(0.0));
+        assert_eq!(left.right, px(BORDER_PX));
+        let right = chrome_with(frame(20, 1, 39, 20), tiled, false).stroke_width;
+        assert_eq!(right.left, px(BORDER_PX));
+        assert_eq!(right.right, px(0.0));
+        let floating = chrome(frame(0, 1, 19, 20), tiled).stroke_width;
+        assert_eq!(floating.left, px(BORDER_PX));
     }
 
     #[test]

@@ -169,6 +169,11 @@ const SIDEBAR_GLYPH: f32 = 14.0;
 const SIDEBAR_GLYPH_GAP: f32 = 8.0;
 /// Height of a single-line sidebar row (nav, open workspace, section header).
 const SIDEBAR_ROW_HEIGHT: f32 = 28.0;
+/// Gap between the sidebar's session picker and the list under it.
+const SESSION_PICKER_GAP: f32 = 4.0;
+/// Inset of the sidebar's head from the panel edge: the collapse toggle's
+/// right edge and the session picker's both sit on it.
+const SIDEBAR_HEAD_INSET: f32 = 8.0;
 /// Height of a one-line band that carries no control: a section header, an
 /// endpoint group label, or an empty-state placeholder.
 const SIDEBAR_BAND_HEIGHT: f32 = 24.0;
@@ -10477,8 +10482,18 @@ impl PilusView {
                     .flex_row()
                     .items_center()
                     .justify_end()
-                    .pr(px(8.0))
+                    .pr(px(SIDEBAR_HEAD_INSET))
                     .child(self.sidebar_toggle("pilus-sidebar-toggle", cx)),
+            )
+            // Pinned above the scroll area, not inside it, so the session
+            // menu can anchor to a fixed spot beneath it.
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(panel_w))
+                    .px(px(SIDEBAR_HEAD_INSET))
+                    .pb(px(SESSION_PICKER_GAP))
+                    .child(self.session_picker(cx)),
             )
             .child(list);
         // The sidebar parts from the terminal with a hairline. It is an
@@ -10626,7 +10641,7 @@ impl PilusView {
         }
     }
 
-    /// The native tab strip: session picker, terminal tabs, and the new-tab
+    /// The native tab strip: terminal tabs and the new-tab
     /// action, with the sidebar toggle parked at its head while the sidebar
     /// is hidden.
     /// The sidebar collapse/expand button: pinned to the sidebar's top
@@ -10857,10 +10872,9 @@ impl PilusView {
                     .child(self.sidebar_toggle("pilus-sidebar-toggle-parked", cx)),
             );
         }
-        tab_strip = tab_strip.child(self.session_picker(cx).flex_shrink_0());
         // Tabs belong to the terminal surface, so they hide with it while a
-        // page owns the card; the session picker stays on every page. The plus
-        // follows the tabs until overflow makes the scroll viewport shrink.
+        // page owns the card. The plus follows the tabs until overflow makes
+        // the scroll viewport shrink.
         if !self.settings_open && !self.home.is_open() {
             tab_strip = tab_strip.child(tabs).child(new_tab);
         }
@@ -11178,8 +11192,8 @@ impl PilusView {
         self.sidebar_dock().map_or(0, |dock| dock.width)
     }
 
-    /// The session picker in the top tab strip: current session name plus a
-    /// chevron, opening the session menu below it.
+    /// The session picker above the sidebar's Open Workspace row: current
+    /// session name plus a chevron, opening the session menu below it.
     fn session_picker(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
         let glass = self.glass_opacity();
@@ -11189,17 +11203,23 @@ impl PilusView {
         )
         .id("pilus-session-button")
         .occlude()
+        .justify_between()
         .gap_2()
-        .h(px(TAB_HEIGHT))
-        .px_2()
+        .w_full()
+        .h(px(SIDEBAR_ROW_HEIGHT))
+        .px_3()
         .cursor_pointer()
         .text_size(px(self.chrome_font()))
         .child(
-            div().text_color(theme.panel_fg).child(
-                self.settings
-                    .session_label(self.current_session_name())
-                    .to_string(),
-            ),
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_color(theme.panel_fg)
+                .child(
+                    self.settings
+                        .session_label(self.current_session_name())
+                        .to_string(),
+                ),
         )
         .child(icon(
             include_bytes!("../../assets/icons/chevron-down.svg"),
@@ -11380,21 +11400,18 @@ impl PilusView {
     ///
     /// A transparent catcher covers the content area so a click anywhere
     /// outside dismisses; the panel stops propagation so its own clicks land.
-    /// It opens below the session picker in the top strip, offset by the same
-    /// sidebar/fullscreen-dependent left inset the strip uses.
-    fn session_menu(
-        &self,
-        cx: &mut Context<Self>,
-        cell_width: f32,
-        fullscreen: bool,
-    ) -> AnyElement {
+    /// It opens below the session picker at the sidebar's head, aligned to the
+    /// sidebar's left edge.
+    fn session_menu(&self, cx: &mut Context<Self>, cell_width: f32) -> AnyElement {
         if !self.session_menu_open {
             return div().into_any_element();
         }
         let theme = self.theme;
-        let strip_left = self.sidebar_px(cell_width);
-        let pad = self.strip_pad(fullscreen);
-        let menu_left = strip_left + pad + 28.0 + 4.0;
+        let sidebar_left = self
+            .sidebar_dock()
+            .map_or(0.0, |dock| f32::from(dock.x) * cell_width);
+        let menu_left = sidebar_left + SIDEBAR_HEAD_INSET;
+        let menu_top = HEADER_HEIGHT + SIDEBAR_ROW_HEIGHT + SESSION_PICKER_GAP;
         let mut items = div().flex().flex_col().gap_1();
         let current = self.current_session_name().to_string();
         for session in &self.sessions {
@@ -11507,7 +11524,7 @@ impl PilusView {
                     div()
                         .absolute()
                         .left(px(menu_left))
-                        .top(px(HEADER_HEIGHT))
+                        .top(px(menu_top))
                         .w(px(264.0))
                         .radius_md()
                         .bg(theme.sidebar_bg)
@@ -11520,10 +11537,14 @@ impl PilusView {
                             cx.listener(|_, _, _, cx| cx.stop_propagation()),
                         ),
                 )
+                // Stop the press here: it would otherwise reach the picker
+                // beneath, whose click handler reopens the menu this just
+                // closed, so a second click on the picker could never close it.
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
                         this.close_session_menu();
+                        cx.stop_propagation();
                         cx.notify();
                     }),
                 ),
@@ -13594,7 +13615,7 @@ impl Render for PilusView {
                     .then(|| self.right_sidebar_view(layout.card_right, fullscreen, cx)),
             )
             .when(!luvus_missing, |root| {
-                root.child(self.session_menu(cx, cell_width, fullscreen))
+                root.child(self.session_menu(cx, cell_width))
                     .child(self.palette_overlay(cx))
                     .child(self.picker_overlay(window, cx))
             })

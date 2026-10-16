@@ -1,10 +1,12 @@
-//! Spots the moment an agent starts waiting on the user.
+//! Spots the moment an agent starts waiting on the user, or finishes.
 //!
 //! Every endpoint's agent feed hands the view a fresh `agent.list` snapshot
 //! each poll. [`Watch`] folds those snapshots into transitions: an agent that
-//! was not `blocked` and now is, or one that stops being `blocked`. The view
-//! drains the resulting [`Event`]s and decides how to surface them (a native
-//! notification behind another app, a toast in front of it). Nothing here
+//! was not `blocked` and now is, one that stops being `blocked`, or one that
+//! goes from `working` to `done`. The consumer drains the resulting [`Event`]s
+//! and decides how to surface them (a native notification behind another app,
+//! a toast in front of it, or, with no window open, the menu bar helper's
+//! notification). Nothing here
 //! touches GPUI, so the transition rules are unit-testable on their own.
 
 use std::collections::{HashMap, HashSet};
@@ -23,12 +25,31 @@ pub(super) struct Blocked {
     pub(super) workspace: String,
 }
 
+/// An agent that just finished its turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct Finished {
+    /// Stable per agent pane, like [`Blocked::tag`].
+    pub(super) tag: String,
+    pub(super) agent: String,
+    pub(super) workspace: String,
+}
+
 /// A transition worth reacting to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Event {
     Blocked(Blocked),
-    /// The agent no longer waits, so its notification is stale.
+    Finished(Finished),
+    /// The agent no longer waits or reports done, so its notification is
+    /// stale.
     Cleared(String),
+}
+
+fn blocked_tag(endpoint: &str, pane: &str) -> String {
+    format!("pilus-blocked-{endpoint}-{pane}")
+}
+
+fn finished_tag(endpoint: &str, pane: &str) -> String {
+    format!("pilus-done-{endpoint}-{pane}")
 }
 
 /// Last seen status per pane, per endpoint.
@@ -48,26 +69,46 @@ impl Watch {
         let previous = self.seen.remove(endpoint).unwrap_or_default();
         let mut current = HashMap::with_capacity(agents.len());
         for agent in agents {
-            let tag = format!("pilus-blocked-{endpoint}-{}", agent.pane);
-            let was_blocked = previous.get(&agent.pane).is_some_and(|s| s == "blocked");
-            let is_blocked = agent.status == "blocked";
-            if seeded && is_blocked && !was_blocked {
+            let was = previous.get(&agent.pane).map(String::as_str);
+            let is = agent.status.as_str();
+            if seeded && is == "blocked" && was != Some("blocked") {
                 self.events.push(Event::Blocked(Blocked {
-                    tag,
+                    tag: blocked_tag(endpoint, &agent.pane),
                     agent: agent_name(agent),
                     workspace: agent.workspace_name.clone(),
                 }));
-            } else if was_blocked && !is_blocked {
-                self.events.push(Event::Cleared(tag));
+            } else if was == Some("blocked") && is != "blocked" {
+                self.events
+                    .push(Event::Cleared(blocked_tag(endpoint, &agent.pane)));
+            }
+            // Only a turn that was running counts as finishing: an agent that
+            // first shows up already `done` is history, not news.
+            if seeded && is == "done" && was == Some("working") {
+                self.events.push(Event::Finished(Finished {
+                    tag: finished_tag(endpoint, &agent.pane),
+                    agent: agent_name(agent),
+                    workspace: agent.workspace_name.clone(),
+                }));
+            } else if was == Some("done") && is != "done" {
+                self.events
+                    .push(Event::Cleared(finished_tag(endpoint, &agent.pane)));
             }
             current.insert(agent.pane.clone(), agent.status.clone());
         }
         // A pane that vanished while blocked (the agent exited) leaves its
         // banner behind unless it is cleared too.
         for (pane, status) in previous {
-            if status == "blocked" && !current.contains_key(&pane) {
-                self.events
-                    .push(Event::Cleared(format!("pilus-blocked-{endpoint}-{pane}")));
+            if current.contains_key(&pane) {
+                continue;
+            }
+            match status.as_str() {
+                "blocked" => self
+                    .events
+                    .push(Event::Cleared(blocked_tag(endpoint, &pane))),
+                "done" => self
+                    .events
+                    .push(Event::Cleared(finished_tag(endpoint, &pane))),
+                _ => {}
             }
         }
         self.seen.insert(endpoint.to_string(), current);
@@ -82,9 +123,14 @@ impl Watch {
         self.seeded.clear();
         for (endpoint, panes) in std::mem::take(&mut self.seen) {
             for (pane, status) in panes {
-                if status == "blocked" {
-                    self.events
-                        .push(Event::Cleared(format!("pilus-blocked-{endpoint}-{pane}")));
+                match status.as_str() {
+                    "blocked" => self
+                        .events
+                        .push(Event::Cleared(blocked_tag(&endpoint, &pane))),
+                    "done" => self
+                        .events
+                        .push(Event::Cleared(finished_tag(&endpoint, &pane))),
+                    _ => {}
                 }
             }
         }
@@ -189,5 +235,40 @@ mod tests {
         assert!(watch.drain().is_empty());
         watch.observe("local", &[agent("1", "blocked")]);
         assert_eq!(watch.drain().len(), 1);
+    }
+
+    #[test]
+    fn working_to_done_notifies_once_and_a_new_turn_clears_it() {
+        let mut watch = Watch::default();
+        watch.observe("local", &[agent("1", "working")]);
+        watch.observe("local", &[agent("1", "done")]);
+        assert_eq!(
+            watch.drain(),
+            vec![Event::Finished(Finished {
+                tag: "pilus-done-local-1".to_string(),
+                agent: "claude".to_string(),
+                workspace: "pilus".to_string(),
+            })]
+        );
+        watch.observe("local", &[agent("1", "done")]);
+        assert!(watch.drain().is_empty());
+        watch.observe("local", &[agent("1", "working")]);
+        assert_eq!(
+            watch.drain(),
+            vec![Event::Cleared("pilus-done-local-1".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_agent_first_seen_done_or_idle_is_not_news() {
+        let mut watch = Watch::default();
+        watch.observe("local", &[agent("1", "idle")]);
+        watch.observe("local", &[agent("1", "done"), agent("2", "done")]);
+        assert!(
+            watch
+                .drain()
+                .iter()
+                .all(|event| !matches!(event, Event::Finished(_)))
+        );
     }
 }

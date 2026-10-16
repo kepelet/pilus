@@ -499,22 +499,6 @@ pub fn run() -> Result<()> {
                 cx.notify();
             })
         });
-        // The GitHub tab: both lists, an issue and a pull request with their
-        // threads, the submit form, and the sentence shown when `gh` is not
-        // signed in.
-        for (scene, name) in [
-            (super::github_tab::Scene::Issues, "github-issues"),
-            (super::github_tab::Scene::Issue, "github-issue"),
-            (super::github_tab::Scene::Pulls, "github-pulls"),
-            (super::github_tab::Scene::Pull, "github-pull"),
-            (super::github_tab::Scene::NewPull, "github-new-pull"),
-            (super::github_tab::Scene::SignedOut, "github-signed-out"),
-        ] {
-            cx.update(|app| view.update(app, |view, cx| view.github_show_sample(scene, cx)));
-            settle(&mut cx, 12);
-            capture(&mut cx, window.into(), name)?;
-        }
-        cx.update(|app| view.update(app, |view, cx| view.github_clear_sample(cx)));
         // The narrowest column: the tabs scroll, the buttons stay.
         cx.update(|app| {
             view.update(app, |view, cx| {

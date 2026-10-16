@@ -22,7 +22,7 @@ mod dock;
 mod files_tab;
 mod fonts;
 mod git_tab;
-mod github_tab;
+mod home_issues;
 mod glass;
 mod highlight;
 mod home;
@@ -71,14 +71,14 @@ use crate::update::{UpdateChannel, UpdateRequest, describe_source};
 use automations::AutomationsPanel;
 use browser_tab::{BrowserPanel, PageEdit};
 use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
+    KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
     MouseEventKind,
 };
 use diff::{DiffInputs, DiffPanel};
 use dock::Dock;
 use files_tab::FilesPanel;
 use git_tab::GitPanel;
-use github_tab::{GithubInputs, GithubPanel, HomeIssues};
+use home_issues::HomeIssues;
 use glass::Glass;
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DispatchPhase,
@@ -1099,8 +1099,6 @@ enum InputLayer {
     Tasks,
     /// The native Diff page.
     Diff,
-    /// A text field of the GitHub tab.
-    Github,
     /// The Browser tab's address bar.
     Browser,
     /// The native Mission Control page.
@@ -1893,8 +1891,6 @@ struct PilusView {
     diff_inputs: DiffInputs,
     /// The Git tab: the daemon's working-tree status and recent commits.
     git_panel: GitPanel,
-    github_panel: GithubPanel,
-    github_inputs: GithubInputs,
     /// The issues the Home composer offers to attach.
     home_issues: HomeIssues,
     files_panel: FilesPanel,
@@ -2050,12 +2046,6 @@ impl PilusView {
         let mut diff_panel = DiffPanel::new();
         diff_panel.set_list_height(settings.diff_list_height);
         diff_panel.set_list_width(settings.diff_list_width);
-        let github_inputs = GithubInputs::new(
-            style::chrome_font(&shared_settings),
-            initial_fonts.body,
-            initial_theme,
-            cx,
-        );
         let mut git_panel = GitPanel::new();
         git_panel.set_list_height(settings.git_list_height);
         let right = RightSidebar::new(
@@ -2353,8 +2343,6 @@ impl PilusView {
             diff_panel,
             diff_inputs,
             git_panel,
-            github_panel: GithubPanel::new(),
-            github_inputs,
             home_issues: HomeIssues::default(),
             files_panel: FilesPanel::new(),
             ports_panel: PortsPanel::new(),
@@ -2828,7 +2816,7 @@ impl PilusView {
         }
         changed |= self.diff_tick();
         changed |= self.git_tick();
-        changed |= self.github_tick(cx);
+        changed |= self.home_issues_tick(cx);
         changed |= self.files_tick();
         changed |= self.ports_tick();
         changed |= self.browser_tick(cx);
@@ -4373,7 +4361,6 @@ impl PilusView {
             InputLayer::Settings => self.settings_key(event, cx),
             InputLayer::Tasks => self.tasks_key(event, cx),
             InputLayer::Diff => self.diff_key(event, cx),
-            InputLayer::Github => self.github_key(event, cx),
             InputLayer::Browser => self.browser_key(event, cx),
             InputLayer::Mission => self.mission_key(event, cx),
             InputLayer::Automations => self.automations_key(event, cx),
@@ -4395,7 +4382,6 @@ impl PilusView {
             self.settings_open,
             self.diff_focused()
                 .then_some(InputLayer::Diff)
-                .or(self.github_focused().then_some(InputLayer::Github))
                 .or(self.browser_focused().then_some(InputLayer::Browser))
                 .or_else(|| self.page_layer().filter(|_| !self.terminal_beside_page())),
         )
@@ -5788,11 +5774,6 @@ impl PilusView {
                 Some(self.diff_inputs.search_focus_handle(cx))
             }
             InputLayer::Diff => None,
-            // The open comment or pull request field holds focus.
-            InputLayer::Github => self
-                .github_panel
-                .focus()
-                .map(|focus| self.github_inputs.focus_handle(focus, cx)),
             InputLayer::Browser => Some(self.browser_input.focus_handle(cx)),
             // The reply field holds focus while it is open; otherwise the
             // window root reads the page's shortcuts.
@@ -9682,13 +9663,6 @@ impl PilusView {
                     cx,
                 );
             }
-            (
-                SidebarMenuTarget::Workspace { .. },
-                SidebarItem::OpenGit | SidebarItem::OpenBoard | SidebarItem::OpenMission,
-            ) => {
-                self.close_context_menu();
-                self.menu_open_board(&target, item, cx);
-            }
             (SidebarMenuTarget::Agent { .. }, SidebarItem::Rename) => {
                 self.close_context_menu();
                 self.menu_open_agent_rename(&target, cx);
@@ -10011,58 +9985,6 @@ impl PilusView {
             &generate_session_name(&[]),
             cx,
         );
-    }
-
-    /// Switch to the workspace and open the daemon board its menu row names.
-    fn menu_open_board(
-        &mut self,
-        target: &SidebarMenuTarget,
-        item: SidebarItem,
-        cx: &mut Context<Self>,
-    ) {
-        let SidebarMenuTarget::Workspace {
-            endpoint,
-            workspace_id,
-            name,
-            ..
-        } = target
-        else {
-            return;
-        };
-        // The task board is the native Tasks page, not the daemon's view.
-        if item == SidebarItem::OpenBoard {
-            self.activate_endpoint(
-                self.endpoint_by_key(endpoint),
-                Some(workspace_id.clone()),
-                None,
-                cx,
-            );
-            self.open_tasks(cx);
-            return;
-        }
-        // Mission Control is the native page too, on this row's endpoint.
-        if item == SidebarItem::OpenMission {
-            self.activate_endpoint(
-                self.endpoint_by_key(endpoint),
-                Some(workspace_id.clone()),
-                None,
-                cx,
-            );
-            self.open_mission(cx);
-            return;
-        }
-        if item != SidebarItem::OpenGit {
-            return;
-        }
-        self.status = format!("opening {name}…");
-        self.activate_endpoint(
-            self.endpoint_by_key(endpoint),
-            Some(workspace_id.clone()),
-            None,
-            cx,
-        );
-        self.send_bind('g');
-        cx.notify();
     }
 
     /// Open the little prompt modal; the menu itself closes first.
@@ -12535,18 +12457,6 @@ impl PilusView {
             })
     }
 
-    /// Send `<bind> + key`: the daemon's prefix chord followed by `key`.
-    ///
-    /// The daemon's Keys tab confirms these: `m` opens Mission Control and
-    /// `o` opens the task board.
-    fn send_bind(&self, key: char) {
-        let press = |code: KeyCode, mods: KeyModifiers| {
-            ClientMessage::Key(KeyEvent::new_with_kind(code, mods, KeyEventKind::Press))
-        };
-        self.send_active(press(KeyCode::Char(' '), KeyModifiers::CONTROL));
-        self.send_active(press(KeyCode::Char(key), KeyModifiers::NONE));
-    }
-
     /// One sidebar section header: collapse chevron, label, and hairline.
     ///
     /// Every section draws through this, so their labels share one column;
@@ -14948,9 +14858,6 @@ fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
         }
         SidebarItem::NewWorktree => include_bytes!("../../assets/icons/git-branch.svg"),
         SidebarItem::DeleteWorktree => include_bytes!("../../assets/icons/trash-2.svg"),
-        SidebarItem::OpenGit => include_bytes!("../../assets/icons/folder-git.svg"),
-        SidebarItem::OpenBoard => include_bytes!("../../assets/icons/list-checks.svg"),
-        SidebarItem::OpenMission => include_bytes!("../../assets/icons/gauge.svg"),
         SidebarItem::ToggleScope => include_bytes!("../../assets/icons/monitor.svg"),
         SidebarItem::NewFile => include_bytes!("../../assets/icons/file-plus.svg"),
         SidebarItem::NewFolder => include_bytes!("../../assets/icons/folder-plus.svg"),

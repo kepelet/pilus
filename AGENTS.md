@@ -38,6 +38,18 @@ with only the command-line tools can build the app.
   stays `Transparent`; the blur slider drives the view's `alphaValue`. The view is pinned to the dark
   appearance, so a light-mode Mac still frosts dark under the chrome.
 
+- The GitHub Repositories section reads the signed-in account through `gh` on
+  the machine `pilus` runs on, never through a daemon or SSH. It shows five
+  repositories: `Settings::github_pinned` first, then the most recently pushed
+  to. Every list, and each repository's issues, pull requests and workflow
+  runs, goes through `pilus_client::GhAccount`'s cache (fresh lists are free,
+  REST lists revalidate by `ETag`, a rate limit is waited out and persisted in
+  `github-cache.json`); do not call `gh` for these from the GUI directly, or the
+  cache and its limits are bypassed. `Settings::github` and
+  `github_repositories` switch the feature off, which means no requests at
+  all. The `visual-test` captures fill the feed with samples so a shot never
+  reaches GitHub.
+
 ## UI
 
 `crates/pilus/src/gui/ui_playground.rs` is the visual contract: a working

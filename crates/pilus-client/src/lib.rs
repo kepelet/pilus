@@ -25,6 +25,7 @@ pub mod folders;
 mod git;
 mod git_status;
 mod github;
+mod github_account;
 mod machines;
 mod mission;
 mod ports;
@@ -75,6 +76,7 @@ pub use github::{
     Checks, Comment, CreatedPull, GhRepo, GhState, Issue, IssueDetail, Label, NewPull, Pull,
     PullDetail, PullDraft, RepoInfo, StateFilter, unix_seconds,
 };
+pub use github_account::{AccountState, GhAccount, ItemSummary, Listing, RepoSummary, RunSummary};
 pub use machines::{
     MachineInfo, connect_machine, find_installed_binary, is_behind, list_machines,
     refresh_machines, restart_remote, stop_remote,

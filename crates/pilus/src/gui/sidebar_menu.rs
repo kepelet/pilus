@@ -48,6 +48,8 @@ pub enum MenuTarget {
     /// is what Copy needs, so the row only appears when it can work. `agent`
     /// is whether the focused pane runs an agent, which Fork needs.
     Terminal { selection: bool, agent: bool },
+    /// The GitHub section's header in the sidebar.
+    Github,
     /// A row of the Files tab's tree, or its blank area (`root`), which acts
     /// on the tree's own folder.
     File {
@@ -104,6 +106,14 @@ pub enum Item {
     ForkPane,
     /// Move the focused pane to another tab, or to a tab of its own.
     MoveToTab,
+    /// Open the page listing every repository.
+    GithubAll,
+    /// Ask GitHub again, past the cache's lifetime.
+    GithubRefresh,
+    /// Stop drawing one GitHub section; the Settings page brings it back.
+    GithubHideSection,
+    /// Turn the GitHub integration off, which also stops its requests.
+    GithubDisable,
     NewTab,
     /// Close the active tab. Destructive: it ends every pane in it.
     CloseTab,
@@ -160,6 +170,10 @@ impl Item {
             Self::SplitDown => "Split Down",
             Self::ForkPane => "Fork to New Pane",
             Self::MoveToTab => "Move to Tab",
+            Self::GithubAll => "All Repositories",
+            Self::GithubRefresh => "Refresh",
+            Self::GithubHideSection => "Hide Section",
+            Self::GithubDisable => "Turn Off GitHub",
             Self::NewTab => "New Tab",
             Self::CloseTab => "Close Tab",
             Self::Divider => "",
@@ -251,6 +265,7 @@ impl SidebarMenu {
             }
             MenuTarget::Agent { .. } => agent_rows(),
             MenuTarget::Terminal { selection, agent } => terminal_rows(*selection, *agent),
+            MenuTarget::Github => github_rows(),
             MenuTarget::File { root, .. } => file_rows(*root),
         }
     }
@@ -303,6 +318,18 @@ fn workspace_rows(is_repo: bool, linked: bool) -> Vec<Item> {
         items.push(Item::NewWorktree);
     }
     items
+}
+
+/// The GitHub section header's rows: the full list, a refresh, then the two
+/// ways to put the section away, the narrower one first.
+fn github_rows() -> Vec<Item> {
+    vec![
+        Item::GithubAll,
+        Item::GithubRefresh,
+        Item::Divider,
+        Item::GithubHideSection,
+        Item::GithubDisable,
+    ]
 }
 
 /// A live agent's rows: pane actions, path toggle, then the dock's

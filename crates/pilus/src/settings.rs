@@ -136,6 +136,15 @@ pub struct Settings {
     /// Off by default; only shows with `pane_ui`, which owns the frames it
     /// sits on.
     pub pane_toolbar: bool,
+    /// Show the GitHub sections in the sidebar. They need the `gh` CLI on
+    /// this Mac and stay out of the way when it is missing, so on is the
+    /// right default; off also stops every request to GitHub.
+    pub github: bool,
+    /// Show the Repositories section while `github` is on.
+    pub github_repositories: bool,
+    /// Repositories (`owner/name`) kept in the sidebar's Repositories section
+    /// ahead of the most recent ones, in the order they were pinned.
+    pub github_pinned: Vec<String>,
     /// Whether the right sidebar (Changes and History tabs) is open.
     pub right_sidebar_visible: bool,
     /// The right sidebar's width in logical pixels; 0 takes the default.
@@ -199,6 +208,9 @@ impl Default for Settings {
             pane_ui: true,
             pane_gaps: false,
             pane_toolbar: false,
+            github: true,
+            github_repositories: true,
+            github_pinned: Vec::new(),
             right_sidebar_visible: false,
             right_sidebar_width: 0.0,
             right_sidebar_tab: String::new(),
@@ -316,6 +328,34 @@ impl Settings {
             .then(|| last.to_string())
     }
 
+    /// Whether the Repositories section is drawn: its own switch and the
+    /// master one.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn github_shows_repositories(&self) -> bool {
+        self.github && self.github_repositories
+    }
+
+    /// Whether `repo` (`owner/name`, any case) is pinned.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn is_pinned(&self, repo: &str) -> bool {
+        self.github_pinned
+            .iter()
+            .any(|pinned| pinned.eq_ignore_ascii_case(repo))
+    }
+
+    /// Pin or unpin `repo`. A repository pins once, and unpinning one that
+    /// was never pinned changes nothing.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn set_pinned(&mut self, repo: &str, on: bool) {
+        let pinned = self.is_pinned(repo);
+        if on && !pinned {
+            self.github_pinned.push(repo.to_string());
+        } else if !on && pinned {
+            self.github_pinned
+                .retain(|known| !known.eq_ignore_ascii_case(repo));
+        }
+    }
+
     /// The corner radius, clamped so a stray value cannot draw blobs.
     pub fn radius(&self) -> f32 {
         if self.corner_radius.is_finite() {
@@ -358,6 +398,47 @@ mod tests {
         // The toggle is gone; files that still carry it must keep loading.
         serde_json::from_str::<Settings>(r#"{"terminal_font":"Menlo","notifications":false}"#)
             .expect("deserialize");
+    }
+
+    #[test]
+    fn github_is_on_for_files_written_before_it_existed() {
+        let back: Settings =
+            serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
+        assert!(back.github_shows_repositories());
+        assert!(back.github_pinned.is_empty());
+    }
+
+    #[test]
+    fn retired_github_section_switches_are_ignored() {
+        // Pull Requests and Issues were sidebar sections once.
+        let back: Settings = serde_json::from_str(
+            r#"{"github_pull_requests":false,"github_issues":false,"github_repositories":false}"#,
+        )
+        .expect("deserialize");
+        assert!(!back.github_shows_repositories());
+    }
+
+    #[test]
+    fn the_master_switch_outranks_the_section() {
+        let mut settings = Settings::default();
+        settings.github = false;
+        assert!(!settings.github_shows_repositories());
+        // The section keeps its own choice for when GitHub comes back on.
+        assert!(settings.github_repositories);
+    }
+
+    #[test]
+    fn pinning_is_idempotent_and_ignores_case() {
+        let mut settings = Settings::default();
+        settings.set_pinned("kepelet/pilus", true);
+        settings.set_pinned("Kepelet/Pilus", true);
+        settings.set_pinned("o/second", true);
+        assert_eq!(settings.github_pinned, vec!["kepelet/pilus", "o/second"]);
+        assert!(settings.is_pinned("KEPELET/PILUS"));
+
+        settings.set_pinned("KEPELET/pilus", false);
+        settings.set_pinned("never/pinned", false);
+        assert_eq!(settings.github_pinned, vec!["o/second"]);
     }
 
     #[test]
@@ -561,6 +642,9 @@ mod tests {
             pane_ui: false,
             pane_gaps: true,
             pane_toolbar: false,
+            github: false,
+            github_repositories: false,
+            github_pinned: vec!["o/r".to_string()],
             right_sidebar_visible: true,
             right_sidebar_width: 480.0,
             right_sidebar_tab: "git".to_string(),

@@ -58,6 +58,9 @@ struct LastLayout {
     bounds: Bounds<Pixels>,
     pieces: Vec<Piece>,
     line_height: Pixels,
+    /// How far a single-line field's text is shifted left to keep the caret
+    /// in view; always zero for a wrapping field.
+    scroll: Pixels,
 }
 
 impl LastLayout {
@@ -68,7 +71,9 @@ impl LastLayout {
             .floor()
             .max(0.0)
             .min(self.pieces.len().saturating_sub(1) as f32) as usize;
-        let local_x = (position.x - self.bounds.origin.x).as_f32().max(0.0);
+        let local_x = (position.x - self.bounds.origin.x + self.scroll)
+            .as_f32()
+            .max(0.0);
         let piece = &self.pieces[row];
         let within = piece.layout.closest_index_for_x(px(local_x));
         piece.byte_start + within
@@ -84,7 +89,8 @@ impl LastLayout {
         Some((
             piece
                 .layout
-                .x_for_index(byte.saturating_sub(piece.byte_start)),
+                .x_for_index(byte.saturating_sub(piece.byte_start))
+                - self.scroll,
             row,
         ))
     }
@@ -1127,6 +1133,11 @@ impl Render for TextInput {
         let selection_color: Hsla = theme.selection_bg.into();
         let selection_fg: Hsla = theme.selection_fg.into();
 
+        let field_width = self
+            .last
+            .borrow()
+            .as_ref()
+            .map_or(px(0.0), |last| last.bounds.size.width);
         let mut pieces: Vec<Piece> = Vec::new();
         // Multiline fields soft-wrap to the last laid-out width (unknown on
         // the first frame, so it paints unwrapped once). Single-line fields
@@ -1203,6 +1214,19 @@ impl Render for TextInput {
         let row_count = pieces.len();
         let height = self.height(row_count);
 
+        // A single-line field never wraps, so text longer than the box slides
+        // left to keep the caret on screen. The width is last frame's.
+        let scroll = match (self.multiline, field_width) {
+            (false, width) if width > px(0.0) => pieces
+                .first()
+                .map(|piece| {
+                    let caret = piece.layout.x_for_index(head.min(piece.layout.len()));
+                    (caret + px(CARET_WIDTH) - width).max(px(0.0))
+                })
+                .unwrap_or(px(0.0)),
+            _ => px(0.0),
+        };
+
         // Store the shaped frame for pointer hit-testing and IME bounds.
         {
             let mut last = self.last.borrow_mut();
@@ -1213,6 +1237,7 @@ impl Render for TextInput {
                 },
                 pieces: pieces.clone(),
                 line_height,
+                scroll,
             });
         }
 
@@ -1267,78 +1292,90 @@ impl Render for TextInput {
                             last.bounds = bounds;
                         }
                     },
-                    move |bounds, (), window, cx| {
-                        // Selection sits under the glyphs so the foreground
-                        // colour chosen above stays legible on it.
-                        if selection.start < selection.end {
-                            paint_range(
-                                window,
-                                bounds,
-                                &pieces,
-                                selection.clone(),
-                                line_height,
-                                selection_color,
-                                px(0.0),
-                                line_height,
-                            );
-                        }
+                    move |field, (), window, cx| {
+                        // The text slides under the field's own edges, so
+                        // what scrolls out is clipped rather than painted
+                        // over the chrome beside it.
+                        let bounds = Bounds {
+                            origin: point(field.origin.x - scroll, field.origin.y),
+                            size: field.size,
+                        };
+                        window.with_content_mask(
+                            Some(gpui::ContentMask { bounds: field }),
+                            |window| {
+                                // Selection sits under the glyphs so the foreground
+                                // colour chosen above stays legible on it.
+                                if selection.start < selection.end {
+                                    paint_range(
+                                        window,
+                                        bounds,
+                                        &pieces,
+                                        selection.clone(),
+                                        line_height,
+                                        selection_color,
+                                        px(0.0),
+                                        line_height,
+                                    );
+                                }
 
-                        for (row, piece) in pieces.iter().enumerate() {
-                            let origin = point(
-                                bounds.origin.x,
-                                bounds.origin.y + px(line_height.as_f32() * row as f32),
-                            );
-                            let _ = piece.layout.paint(
-                                origin,
-                                line_height,
-                                TextAlign::Left,
-                                None,
-                                window,
-                                cx,
-                            );
-                        }
+                                for (row, piece) in pieces.iter().enumerate() {
+                                    let origin = point(
+                                        bounds.origin.x,
+                                        bounds.origin.y + px(line_height.as_f32() * row as f32),
+                                    );
+                                    let _ = piece.layout.paint(
+                                        origin,
+                                        line_height,
+                                        TextAlign::Left,
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+                                }
 
-                        if let Some(marked) = &marked {
-                            paint_range(
-                                window,
-                                bounds,
-                                &pieces,
-                                marked.clone(),
-                                line_height,
-                                accent,
-                                line_height - px(1.5),
-                                px(1.0),
-                            );
-                        }
-
-                        if caret_visible {
-                            let piece_at =
-                                pieces.iter().rposition(|piece| piece.byte_start <= head);
-                            if let Some(row) = piece_at {
-                                let piece = &pieces[row];
-                                let x = piece
-                                    .layout
-                                    .x_for_index(head.saturating_sub(piece.byte_start));
-                                window.paint_quad(
-                                    fill(
-                                        Bounds {
-                                            origin: point(
-                                                bounds.origin.x + x,
-                                                bounds.origin.y
-                                                    + px(line_height.as_f32() * row as f32),
-                                            ),
-                                            size: size(px(CARET_WIDTH), line_height),
-                                        },
+                                if let Some(marked) = &marked {
+                                    paint_range(
+                                        window,
+                                        bounds,
+                                        &pieces,
+                                        marked.clone(),
+                                        line_height,
                                         accent,
-                                    )
-                                    .corner_radii(px(2.0)),
-                                );
-                            }
-                        }
+                                        line_height - px(1.5),
+                                        px(1.0),
+                                    );
+                                }
+
+                                if caret_visible {
+                                    let piece_at =
+                                        pieces.iter().rposition(|piece| piece.byte_start <= head);
+                                    if let Some(row) = piece_at {
+                                        let piece = &pieces[row];
+                                        let x = piece
+                                            .layout
+                                            .x_for_index(head.saturating_sub(piece.byte_start));
+                                        window.paint_quad(
+                                            fill(
+                                                Bounds {
+                                                    origin: point(
+                                                        bounds.origin.x + x,
+                                                        bounds.origin.y
+                                                            + px(line_height.as_f32() * row as f32),
+                                                    ),
+                                                    size: size(px(CARET_WIDTH), line_height),
+                                                },
+                                                accent,
+                                            )
+                                            .corner_radii(px(2.0)),
+                                        );
+                                    }
+                                }
+                            },
+                        );
 
                         window.handle_input(
                             &focus_handle,
-                            ElementInputHandler::new(bounds, entity.clone()),
+                            ElementInputHandler::new(field, entity.clone()),
                             cx,
                         );
                     },

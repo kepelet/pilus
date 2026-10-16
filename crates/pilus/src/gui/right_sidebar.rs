@@ -745,8 +745,13 @@ impl PilusView {
             .flex_row()
             .items_center()
             .gap_2()
-            .h(px(HEADER_HEIGHT))
+            // The window's top bar ends at HEADER_HEIGHT and the card's own
+            // edge is drawn just below it, so the strip's hairline takes the
+            // pixel after the bar to meet that edge.
+            .h(px(HEADER_HEIGHT + 1.0))
             .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme.border)
             .px_3()
             .pl(px(12.0 + lights))
             .child(

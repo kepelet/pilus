@@ -70,8 +70,8 @@ pub(super) struct PaneChrome {
 }
 
 /// Which of a card's corners are rounded. A floating card rounds all four;
-/// flush panes round only the corners on the outer edge of the split, so
-/// neighbors meet in square joints.
+/// flush panes round none, whatever the corner setting, so the split reads as
+/// one square block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RoundedCorners {
     top_left: bool,
@@ -86,6 +86,12 @@ impl RoundedCorners {
         top_right: true,
         bottom_left: true,
         bottom_right: true,
+    };
+    const NONE: Self = Self {
+        top_left: false,
+        top_right: false,
+        bottom_left: false,
+        bottom_right: false,
     };
 
     fn pixels(self, radius: Pixels) -> Corners<Pixels> {
@@ -213,13 +219,7 @@ pub(super) fn pane_chrome(
     let round = if gaps {
         RoundedCorners::ALL
     } else {
-        // A corner is round only where both its edges are the split's own.
-        RoundedCorners {
-            top_left: outer_top && outer_left,
-            top_right: outer_top && outer_right,
-            bottom_left: outer_bottom && outer_left,
-            bottom_right: outer_bottom && outer_right,
-        }
+        RoundedCorners::NONE
     };
     PaneChrome {
         index,
@@ -682,14 +682,11 @@ mod tests {
     }
 
     #[test]
-    fn flush_panes_round_only_the_splits_outer_corners() {
+    fn flush_panes_stay_square_whatever_the_corner_setting() {
         let tiled = frame(0, 1, 39, 20);
-        let left = chrome_with(frame(0, 1, 19, 20), tiled, false).round;
-        assert!(left.top_left && left.bottom_left);
-        assert!(!left.top_right && !left.bottom_right);
-        let lower_right = chrome_with(frame(20, 10, 39, 20), tiled, false).round;
-        assert!(lower_right.bottom_right);
-        assert!(!lower_right.top_left && !lower_right.top_right && !lower_right.bottom_left);
+        for pane in [frame(0, 1, 19, 20), frame(20, 10, 39, 20), tiled] {
+            assert_eq!(chrome_with(pane, tiled, false).round, RoundedCorners::NONE);
+        }
     }
 
     #[test]

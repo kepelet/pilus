@@ -13715,6 +13715,10 @@ fn render_grid(
     let mut column = div().relative().flex().flex_col().size_full();
     let surface_base = theme.pane_surface(glass);
     let surface = surface_base.opacity(glass);
+    // What lies beyond the cell grid inside a split: the gutter when cards
+    // float, but the card itself when panes are flush, since the cards then
+    // grow over the remainder and any other color reads as an odd row.
+    let remainder_base = if pane_gaps { surface_base } else { theme.bg };
     // Floating cards stroke in the surface's own color, so the ring reads as
     // gutter; flush panes outline themselves with the theme's border.
     let (border, focus_border) = if !pane_gaps {
@@ -13792,7 +13796,7 @@ fn render_grid(
             max_cols,
             glass,
             slack_x,
-            surface_base,
+            remainder_base,
             cursor_alpha,
         ));
     }
@@ -13813,7 +13817,7 @@ fn render_grid(
             slack_y,
             glass,
             panes.bounds(),
-            surface_base,
+            remainder_base,
         ));
     }
     // Above the frames, so the focused pane's buttons take the pointer. An

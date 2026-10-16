@@ -21,8 +21,13 @@ pub(super) struct Blocked {
     /// Stable per agent pane, so a repeat for the same pane replaces the
     /// earlier notification instead of stacking.
     pub(super) tag: String,
+    /// Where a click on the banner should go: the owning endpoint's key and
+    /// the agent's pane id.
+    pub(super) endpoint: String,
+    pub(super) pane: String,
     pub(super) agent: String,
-    pub(super) workspace: String,
+    /// What the banner is headed with; see [`banner_title`].
+    pub(super) title: String,
 }
 
 /// An agent that just finished its turn.
@@ -30,8 +35,11 @@ pub(super) struct Blocked {
 pub(super) struct Finished {
     /// Stable per agent pane, like [`Blocked::tag`].
     pub(super) tag: String,
+    pub(super) endpoint: String,
+    pub(super) pane: String,
     pub(super) agent: String,
-    pub(super) workspace: String,
+    /// What the banner is headed with; see [`banner_title`].
+    pub(super) title: String,
 }
 
 /// A transition worth reacting to.
@@ -42,6 +50,20 @@ pub(super) enum Event {
     /// The agent no longer waits or reports done, so its notification is
     /// stale.
     Cleared(String),
+}
+
+/// The banner's title: the agent's own session title, else which agent on
+/// which workspace so the banner still says where to look.
+fn banner_title(agent: &Agent) -> String {
+    if let Some(title) = agent.session_title.as_deref().map(str::trim)
+        && !title.is_empty()
+    {
+        return title.to_string();
+    }
+    match agent.workspace_name.as_str() {
+        "" => agent_name(agent),
+        workspace => format!("{} on {workspace}", agent_name(agent)),
+    }
 }
 
 fn blocked_tag(endpoint: &str, pane: &str) -> String {
@@ -74,8 +96,10 @@ impl Watch {
             if seeded && is == "blocked" && was != Some("blocked") {
                 self.events.push(Event::Blocked(Blocked {
                     tag: blocked_tag(endpoint, &agent.pane),
+                    endpoint: endpoint.to_string(),
+                    pane: agent.pane.clone(),
                     agent: agent_name(agent),
-                    workspace: agent.workspace_name.clone(),
+                    title: banner_title(agent),
                 }));
             } else if was == Some("blocked") && is != "blocked" {
                 self.events
@@ -86,8 +110,10 @@ impl Watch {
             if seeded && is == "done" && was == Some("working") {
                 self.events.push(Event::Finished(Finished {
                     tag: finished_tag(endpoint, &agent.pane),
+                    endpoint: endpoint.to_string(),
+                    pane: agent.pane.clone(),
                     agent: agent_name(agent),
-                    workspace: agent.workspace_name.clone(),
+                    title: banner_title(agent),
                 }));
             } else if was == Some("done") && is != "done" {
                 self.events
@@ -157,6 +183,19 @@ mod tests {
     }
 
     #[test]
+    fn a_banner_is_titled_by_the_agents_session_else_by_agent_and_workspace() {
+        let mut agent = agent("1", "blocked");
+        assert_eq!(banner_title(&agent), "claude on pilus");
+        agent.session_title = Some("  fix the login bug ".to_string());
+        assert_eq!(banner_title(&agent), "fix the login bug");
+        agent.session_title = Some(String::new());
+        agent.name = "reviewer".to_string();
+        assert_eq!(banner_title(&agent), "reviewer on pilus");
+        agent.workspace_name.clear();
+        assert_eq!(banner_title(&agent), "reviewer");
+    }
+
+    #[test]
     fn first_snapshot_seeds_without_alerting() {
         let mut watch = Watch::default();
         watch.observe("local", &[agent("1", "blocked")]);
@@ -173,8 +212,10 @@ mod tests {
             events,
             vec![Event::Blocked(Blocked {
                 tag: "pilus-blocked-local-1".to_string(),
+                endpoint: "local".to_string(),
+                pane: "1".to_string(),
                 agent: "claude".to_string(),
-                workspace: "pilus".to_string(),
+                title: "claude on pilus".to_string(),
             })]
         );
         watch.observe("local", &[agent("1", "blocked")]);
@@ -246,8 +287,10 @@ mod tests {
             watch.drain(),
             vec![Event::Finished(Finished {
                 tag: "pilus-done-local-1".to_string(),
+                endpoint: "local".to_string(),
+                pane: "1".to_string(),
                 agent: "claude".to_string(),
-                workspace: "pilus".to_string(),
+                title: "claude on pilus".to_string(),
             })]
         );
         watch.observe("local", &[agent("1", "done")]);

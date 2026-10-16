@@ -118,7 +118,7 @@ pub struct Settings {
     /// flush and pilus draws a border around each one. Only applies with
     /// `pane_ui`, which owns the frames.
     pub pane_gaps: bool,
-    /// Draw the focused pane's corner toolbar (split, fullscreen, close).
+    /// Draw the focused pane's corner toolbar (split, zoom, close).
     /// Off by default; only shows with `pane_ui`, which owns the frames it
     /// sits on.
     pub pane_toolbar: bool,

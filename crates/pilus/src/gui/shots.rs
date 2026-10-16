@@ -1530,7 +1530,7 @@ impl Render for PaneGridView {
                             super::style::PANE_TOOLBAR_BUTTON,
                         ))
                         .child(super::style::icon_button(
-                            "shot-pane-fullscreen",
+                            "shot-pane-zoom",
                             include_bytes!("../../assets/icons/maximize.svg"),
                             super::style::ButtonKind::Ghost,
                             theme,

@@ -198,6 +198,22 @@ pub struct FeedUpdate {
     pub automations: AutomationSummary,
     /// Current tasks.
     pub tasks: TaskSummary,
+    /// Panes the daemon last announced as zoomed. Only `pane.zoomed` events
+    /// say so (no snapshot carries it), hence a feed without an event stream
+    /// never fills it.
+    pub zoomed: Vec<String>,
+    /// The focused pane's id. Read only where the event stream runs, since a
+    /// proxied request over SSH is too heavy to add to every refresh.
+    pub focused: Option<String>,
+}
+
+impl FeedUpdate {
+    /// Whether the focused pane is the one zoomed.
+    pub fn focused_zoomed(&self) -> bool {
+        self.focused
+            .as_ref()
+            .is_some_and(|pane| self.zoomed.contains(pane))
+    }
 }
 
 /// How many automation definitions exist, and how many are armed.
@@ -843,6 +859,16 @@ impl ControlClient {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| Error::Control("pane.current: no focused pane".to_string()))
+    }
+
+    /// Toggle zoom on `pane`, returning whether it is zoomed afterwards. The
+    /// daemon reports the new state, so a caller never needs the old one.
+    pub fn zoom_pane(&mut self, pane: &str) -> Result<bool> {
+        let result = self.request("pane.zoom", json!({ "pane": pane }))?;
+        result
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| Error::Control("pane.zoom: no zoom state in reply".to_string()))
     }
 
     /// Move a pane to the 1-based tab `tab` of its workspace, or into a tab of
@@ -1521,6 +1547,9 @@ fn run_events(socket: PathBuf, updates: Sender<FeedUpdate>, last: Arc<Mutex<Opti
         loop {
             match stream.next_event() {
                 Ok(Some(event)) if is_structural(&event.name) => {
+                    if event.name == "pane.zoomed" && !note_zoom(&event.data, &updates, &last) {
+                        return;
+                    }
                     if !refresh(
                         &ControlTransport::Socket(socket.clone()),
                         FeedScope::Full,
@@ -1539,6 +1568,36 @@ fn run_events(socket: PathBuf, updates: Sender<FeedUpdate>, last: Arc<Mutex<Opti
     }
 }
 
+/// Fold a `pane.zoomed` event into the held snapshot and forward it. The
+/// event is the only source of zoom state, so it is stored beside the
+/// snapshot, where [`refresh`] carries it across re-reads. `false` means the
+/// UI is gone.
+fn note_zoom(data: &Value, updates: &Sender<FeedUpdate>, last: &Mutex<Option<FeedUpdate>>) -> bool {
+    let (Some(pane), Some(enabled)) = (
+        data.get("pane").and_then(Value::as_str),
+        data.get("enabled").and_then(Value::as_bool),
+    ) else {
+        return true;
+    };
+    let Ok(mut guard) = last.lock() else {
+        return true;
+    };
+    // Nothing published yet; the opening refresh has no zoom to preserve.
+    let Some(snapshot) = guard.as_mut() else {
+        return true;
+    };
+    let was_zoomed = snapshot.zoomed.iter().any(|zoomed| zoomed == pane);
+    if was_zoomed == enabled {
+        return true;
+    }
+    if enabled {
+        snapshot.zoomed.push(pane.to_string());
+    } else {
+        snapshot.zoomed.retain(|zoomed| zoomed != pane);
+    }
+    updates.send(snapshot.clone()).is_ok()
+}
+
 /// Re-read every snapshot concurrently and forward the combined result.
 ///
 /// The full scope's reads are independent one-request connections; issuing
@@ -1551,12 +1610,15 @@ fn refresh(
     updates: &Sender<FeedUpdate>,
     last: &Mutex<Option<FeedUpdate>>,
 ) -> bool {
-    let Some(update) = fetch_update(transport, scope) else {
+    let Some(mut update) = fetch_update(transport, scope) else {
         return true;
     };
     let Ok(mut guard) = last.lock() else {
         return true;
     };
+    if let Some(held) = guard.as_ref() {
+        update.zoomed.clone_from(&held.zoomed);
+    }
     if guard.as_ref() == Some(&update) {
         return true;
     }
@@ -1596,12 +1658,19 @@ fn fetch_update(transport: &ControlTransport, scope: FeedScope) -> Option<FeedUp
             threads.spawn(|| ControlClient::from_transport(transport.clone()).automation_summary());
         let tasks =
             threads.spawn(|| ControlClient::from_transport(transport.clone()).task_summary());
+        // Zoom state only exists where events run, so the focused pane is
+        // only worth a request there.
+        let focused = matches!(transport, ControlTransport::Socket(_)).then(|| {
+            threads.spawn(|| ControlClient::from_transport(transport.clone()).focused_pane())
+        });
         Some(FeedUpdate {
             agents: agents.join().ok()?.ok()?,
             bar: bar.join().ok()?.ok()?,
             tabs: tabs.join().ok()?.ok()?,
             automations: automations.join().ok()?.ok()?,
             tasks: tasks.join().ok()?.ok()?,
+            zoomed: Vec::new(),
+            focused: focused.and_then(|read| read.join().ok()?.ok()),
         })
     })
 }
@@ -1624,14 +1693,15 @@ fn is_structural(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, AutomationSummary, PaneFrame, Tab, TaskSummary, enrich_tab_runtime, is_structural,
-        read_line_within, terminal_titles, worktree_blockers,
+        Agent, AutomationSummary, FeedUpdate, PaneFrame, Tab, TaskSummary, enrich_tab_runtime,
+        is_structural, note_zoom, read_line_within, terminal_titles, worktree_blockers,
     };
     use crate::error::Error;
     use crate::transport::Stream;
     use serde_json::json;
     use std::process::Command;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1850,5 +1920,56 @@ mod tests {
         let result = read_line_within(stream, Duration::from_millis(200));
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn zoom_events_track_the_focused_pane() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let last = Mutex::new(Some(FeedUpdate {
+            focused: Some("2".to_string()),
+            ..FeedUpdate::default()
+        }));
+
+        assert!(note_zoom(
+            &json!({ "pane": "2", "enabled": true }),
+            &tx,
+            &last
+        ));
+        assert!(rx.try_recv().is_ok_and(|update| update.focused_zoomed()));
+
+        // A repeat of the same state is not a change worth a repaint.
+        assert!(note_zoom(
+            &json!({ "pane": "2", "enabled": true }),
+            &tx,
+            &last
+        ));
+        assert!(rx.try_recv().is_err());
+
+        // Another pane's zoom leaves the focused one's state alone.
+        assert!(note_zoom(
+            &json!({ "pane": "9", "enabled": true }),
+            &tx,
+            &last
+        ));
+        assert!(rx.try_recv().is_ok_and(|update| update.focused_zoomed()));
+
+        assert!(note_zoom(
+            &json!({ "pane": "2", "enabled": false }),
+            &tx,
+            &last
+        ));
+        assert!(rx.try_recv().is_ok_and(|update| !update.focused_zoomed()));
+    }
+
+    #[test]
+    fn zoom_events_before_the_first_snapshot_are_dropped() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let last = Mutex::new(None);
+        assert!(note_zoom(
+            &json!({ "pane": "2", "enabled": true }),
+            &tx,
+            &last
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }

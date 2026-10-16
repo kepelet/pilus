@@ -146,6 +146,19 @@ const SKIPPED_DAEMON_ROWS_UNTITLED: u16 = 1;
 /// Daemon rows skipped at the grid bottom: its one-row status line, which the
 /// native shell omits. Assumes a single-row status line.
 const SKIPPED_DAEMON_BOTTOM_ROWS: u16 = 1;
+/// The glyph Luvus draws in a zoomed pane's top-right corner, on the first
+/// row under its tab strip. That row is a header strip in a shade of its own
+/// across the pane, and the badge exists only while the pane is zoomed. Our
+/// toolbar's zoom button already says "restore", so `render_row` blanks the
+/// glyph and paints the strip as the pane.
+const ZOOM_BADGE_GLYPH: &str = "\u{2921}";
+const ZOOM_BADGE_ROW: u16 = 1;
+/// The row under the header, where Luvus puts its scroll-offset chip (`↑24`,
+/// a filled block in the scheme's accent) at the same right edge.
+const SCROLL_CHIP_ROW: u16 = 2;
+/// How far from the right edge the badge may sit: it is a padded chip, then
+/// the pane's border column.
+const ZOOM_BADGE_REACH: u16 = 4;
 /// Bottom padding of the sidebar list.
 const SIDEBAR_LIST_PAD: f32 = 12.0;
 /// Inset between the panel edge and a row's box, so a selection pill and a
@@ -1631,6 +1644,9 @@ struct PilusView {
     /// The agent feed has delivered at least once, so an empty AGENTS list
     /// is real rather than still loading.
     agents_loaded: bool,
+    /// The focused pane is zoomed, so the toolbar offers to restore it.
+    /// Known only where the feed holds an event stream.
+    focused_zoomed: bool,
     /// Latest automation/task counts for the nav badges.
     automations: AutomationSummary,
     tasks: TaskSummary,
@@ -2192,6 +2208,7 @@ impl PilusView {
             tabs: Vec::new(),
             agents: Vec::new(),
             agents_loaded: false,
+            focused_zoomed: false,
             automations: AutomationSummary::default(),
             tasks: TaskSummary::default(),
             machines: Vec::new(),
@@ -2595,6 +2612,7 @@ impl PilusView {
             .unwrap_or_default();
         for update in updates {
             self.attention.observe(&self.active.key(), &update.agents);
+            self.focused_zoomed = update.focused_zoomed();
             self.bar_widgets = update.bar;
             self.adopt_tabs(update.tabs);
             self.agents = update.agents;
@@ -11552,9 +11570,9 @@ impl PilusView {
         .into_any_element()
     }
 
-    /// The focused pane's corner buttons: split either way, take the pane
-    /// to a tab of its own (the daemon has no zoom, so a tab is its
-    /// fullscreen), and close the pane. `render_grid` pins it to the pane.
+    /// The focused pane's corner buttons: split either way, zoom the pane
+    /// (the daemon's `pane.zoom`, the same toggle as prefix + z), and close
+    /// the pane. `render_grid` pins it to the pane.
     fn pane_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let size = style::scaled(&self.shared_settings, style::PANE_TOOLBAR_BUTTON);
@@ -11567,6 +11585,23 @@ impl PilusView {
                     theme,
                 ))
             };
+        // The frame says so itself, which also covers a remote machine and a
+        // pane zoomed before we attached; the feed's event is the fallback.
+        let zoomed =
+            self.focused_zoomed || self.shown_frame().and_then(zoom_badge_column).is_some();
+        let (zoom_icon, zoom_kind, zoom_tip): (&'static [u8], _, _) = if zoomed {
+            (
+                include_bytes!("../../assets/icons/minimize.svg"),
+                style::ButtonKind::Primary,
+                "Restore pane",
+            )
+        } else {
+            (
+                include_bytes!("../../assets/icons/maximize.svg"),
+                style::ButtonKind::Ghost,
+                "Zoom pane",
+            )
+        };
         style::pane_toolbar()
             .child(
                 button(
@@ -11587,21 +11622,18 @@ impl PilusView {
                 .on_click(cx.listener(|this, _, _, cx| this.split("down", cx))),
             )
             .child(
-                button(
-                    "pilus-pane-fullscreen",
-                    include_bytes!("../../assets/icons/maximize.svg"),
-                    style::ButtonKind::Ghost,
-                    "Fullscreen (move to a new tab)",
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let endpoint = this.active.clone();
-                    this.pane_op(
-                        &endpoint,
-                        "moved to a new tab".to_string(),
-                        |client, pane| client.move_pane(pane, None),
-                        cx,
-                    );
-                })),
+                button("pilus-pane-zoom", zoom_icon, zoom_kind, zoom_tip).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        let endpoint = this.active.clone();
+                        // No toast: the pane filling the tab is the answer.
+                        this.pane_op(
+                            &endpoint,
+                            String::new(),
+                            |client, pane| client.zoom_pane(pane).map(|_| ()),
+                            cx,
+                        );
+                    },
+                )),
             )
             .child(
                 button(
@@ -13835,6 +13867,74 @@ fn outside_columns(start: u16, cells: u16, left: u16, right: u16) -> Vec<(u16, u
     parts
 }
 
+/// The column of the daemon's zoom badge, which is there exactly while the
+/// focused pane is zoomed.
+fn zoom_badge_column(frame: &FrameData) -> Option<usize> {
+    let width = usize::from(frame.width);
+    let row_start = usize::from(ZOOM_BADGE_ROW) * width;
+    (width.saturating_sub(usize::from(ZOOM_BADGE_REACH))..width).find(|column| {
+        frame
+            .cells
+            .get(row_start + column)
+            .is_some_and(|cell| cell.symbol == ZOOM_BADGE_GLYPH)
+    })
+}
+
+/// `cells` (the row's painted slice, starting `skip` columns in) with the
+/// daemon's zoomed-pane chrome taken out, or `None` when the row has none.
+///
+/// Both pieces are painted over in the pane's own background, read from the
+/// first plain pane row beneath them:
+/// - the header row: its glyph goes blank and every cell sharing the strip's
+///   background takes the pane's;
+/// - the scroll chip under it: the filled run at the right edge, text and all.
+fn without_zoom_chrome(
+    frame: &FrameData,
+    row: u16,
+    skip: usize,
+    cells: &[CellData],
+) -> Option<Vec<CellData>> {
+    if row != ZOOM_BADGE_ROW && row != SCROLL_CHIP_ROW {
+        return None;
+    }
+    let badge = zoom_badge_column(frame)?;
+    let width = usize::from(frame.width);
+    let pane = frame
+        .cells
+        .get((usize::from(SCROLL_CHIP_ROW) + 1) * width + badge)?
+        .bg;
+    let local = badge
+        .checked_sub(skip)
+        .filter(|index| *index < cells.len())?;
+    let mut cleared = cells.to_vec();
+    if row == ZOOM_BADGE_ROW {
+        let strip = cells[local].bg;
+        for cell in &mut cleared {
+            if cell.bg == strip {
+                cell.bg = pane;
+            }
+        }
+        cleared[local].symbol = " ".to_string();
+        return Some(cleared);
+    }
+    let chip = cells[local].bg;
+    if chip == pane {
+        return None;
+    }
+    let run_start = (0..=local)
+        .rev()
+        .take_while(|index| cells[*index].bg == chip)
+        .last()?;
+    let run_end = (local..cells.len())
+        .take_while(|index| cells[*index].bg == chip)
+        .last()?;
+    for cell in &mut cleared[run_start..=run_end] {
+        cell.bg = pane;
+        cell.symbol = " ".to_string();
+    }
+    Some(cleared)
+}
+
 /// Paint one grid row, skipping the dock columns our sidebar covers.
 #[allow(clippy::too_many_arguments)]
 fn render_row(
@@ -13874,6 +13974,8 @@ fn render_row(
     // A double-width glyph covers two columns; the daemon blanks the trailing
     // continuation cell. Drop it here too so the run advances exactly one cell
     // width per column and the grid stays aligned with the daemon's geometry.
+    let cleared = without_zoom_chrome(frame, row, skip, cells);
+    let cells = cleared.as_deref().unwrap_or(cells);
     let mut rendered: Vec<(u16, &CellData, bool)> = Vec::with_capacity(cells.len());
     let mut column = 0usize;
     while column < cells.len() {
@@ -15394,6 +15496,75 @@ fn launch_home_agent(
 
 #[cfg(test)]
 mod tests {
+    /// A 12-wide frame under a 2-column skip: row 1 is the header strip
+    /// (bg 5) with the badge at column 9, row 2 and 3 the pane (bg 9).
+    fn zoomed_frame() -> FrameData {
+        let mut frame = FrameData::blank(12, 4, 0, 9);
+        for column in 0..12 {
+            frame.cells[12 + column] = CellData::blank(0, 5);
+        }
+        frame.cells[12 + 9] = CellData {
+            symbol: ZOOM_BADGE_GLYPH.to_string(),
+            fg: 7,
+            bg: 5,
+            mods: 1,
+        };
+        // The border column keeps its own background.
+        frame.cells[12 + 11] = CellData::blank(0, 3);
+        frame
+    }
+
+    fn row_slice(frame: &FrameData, row: usize) -> &[CellData] {
+        &frame.cells[row * 12 + 2..(row + 1) * 12]
+    }
+
+    #[test]
+    fn the_zoom_header_takes_the_pane_background() {
+        let mut frame = zoomed_frame();
+        assert_eq!(zoom_badge_column(&frame), Some(9));
+        let cleared =
+            without_zoom_chrome(&frame, ZOOM_BADGE_ROW, 2, row_slice(&frame, 1)).expect("header");
+        assert_eq!(cleared[7].symbol, " ");
+        assert!(cleared[..9].iter().all(|cell| cell.bg == 9));
+        assert_eq!(cleared[9].bg, 3);
+        // An unzoomed row, or a glyph away from the right edge, is a TUI's own.
+        assert!(without_zoom_chrome(&frame, 3, 2, row_slice(&frame, 3)).is_none());
+        frame.cells[12 + 9] = CellData::blank(0, 5);
+        frame.cells[12 + 3].symbol = ZOOM_BADGE_GLYPH.to_string();
+        assert_eq!(zoom_badge_column(&frame), None);
+        assert!(without_zoom_chrome(&frame, 1, 2, row_slice(&frame, 1)).is_none());
+    }
+
+    #[test]
+    fn the_scroll_chip_in_a_zoomed_pane_is_painted_out() {
+        let mut frame = zoomed_frame();
+        // Row 2 is plain until a scroll puts a chip in columns 7..=10.
+        let plain = row_slice(&frame, 2).to_vec();
+        assert!(without_zoom_chrome(&frame, SCROLL_CHIP_ROW, 2, &plain).is_none());
+        for (column, symbol) in [(7, "\u{2191}"), (8, "2"), (9, "4"), (10, " ")] {
+            frame.cells[2 * 12 + column] = CellData {
+                symbol: symbol.to_string(),
+                fg: 7,
+                bg: 6,
+                mods: 0,
+            };
+        }
+        // Text outside the chip keeps its own look.
+        frame.cells[2 * 12 + 5].symbol = "x".to_string();
+        let cleared =
+            without_zoom_chrome(&frame, SCROLL_CHIP_ROW, 2, row_slice(&frame, 2)).expect("chip");
+        assert_eq!(cleared[3].symbol, "x");
+        assert!(
+            cleared[5..=8]
+                .iter()
+                .all(|cell| cell.symbol == " " && cell.bg == 9)
+        );
+        // The strip above still resolves to the pane, not to the chip.
+        let header =
+            without_zoom_chrome(&frame, ZOOM_BADGE_ROW, 2, row_slice(&frame, 1)).expect("header");
+        assert_eq!(header[0].bg, 9);
+    }
+
     #[test]
     fn a_closed_column_takes_no_remainder() {
         assert_eq!(absorbed_remainder(0.0, false, 5.0, 8.0), 0.0);

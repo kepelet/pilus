@@ -380,7 +380,7 @@ impl UiPlaygroundView {
                 size,
             ))
             .child(style::icon_button(
-                "pg-pane-fullscreen",
+                "pg-pane-zoom",
                 include_bytes!("../../assets/icons/maximize.svg"),
                 ButtonKind::Ghost,
                 theme,

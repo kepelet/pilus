@@ -325,15 +325,6 @@ mod imp {
 
             if let Some(button) = self.item.button(self.mtm) {
                 button.setImage(self.glyph.as_deref());
-                // Blocked agents are the ones waiting on the user, so they get
-                // a count beside the glyph.
-                let blocked = rows.iter().filter(|row| row.status == "blocked").count();
-                let title = if blocked > 0 {
-                    format!(" {blocked}")
-                } else {
-                    String::new()
-                };
-                button.setTitle(&NSString::from_str(&title));
             }
             self.shown = Some(rows.to_vec());
         }

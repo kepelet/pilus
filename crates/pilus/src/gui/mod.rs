@@ -33,8 +33,8 @@ mod machines;
 mod markdown;
 mod md_view;
 mod menubar;
-mod notify;
 mod mission;
+mod notify;
 mod orchestration;
 mod page_split;
 mod palette;
@@ -424,20 +424,30 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
         // running bundle so a packaged app reports its `Info.plist` value;
         // this is a no-op on macOS, where the bundle already carries it.
         cx.set_app_identity(&app_icon::bundle_identifier(), "pilus");
-        // Clicking a notification brings the window forward instead of only
-        // activating the process.
+        // Clicking a notification takes the user to the agent it was about,
+        // not just to the app.
         cx.on_system_notification_response({
             let app_shared = app_shared.clone();
-            move |_, cx| {
-                // With no window (the menu bar helper) there is nothing to
-                // raise, so the click opens one.
-                if !app_shared.has_window(cx) {
-                    app_shared.open_window(None, cx);
-                }
+            move |response, cx| {
+                let target = notify::target(&response.tag);
                 cx.activate(true);
-                if let Some(window) = cx.windows().into_iter().next() {
-                    let _ = window.update(cx, |_, window, _| window.activate_window());
-                }
+                // With no window (the menu bar helper) there is nothing to
+                // raise, so the click opens one on the agent.
+                let Some(window) = cx
+                    .windows()
+                    .into_iter()
+                    .find_map(|window| window.downcast::<PilusView>())
+                else {
+                    app_shared.open_window(target, cx);
+                    return;
+                };
+                let _ = window.update(cx, |view, window, cx| {
+                    window.activate_window();
+                    if let Some((endpoint, pane)) = target {
+                        view.menu_pick = Some((endpoint, pane, Instant::now()));
+                        view.apply_menu_pick(cx);
+                    }
+                });
             }
         });
         // Remote access is a background service that outlives this window, so
@@ -812,22 +822,31 @@ impl AppShared {
 /// here. The tags match the window's, so a banner a window later withdraws is
 /// the same one.
 fn raise_background_alert(event: attention::Event, badge: u32, cx: &mut App) {
-    let (tag, workspace, body) = match event {
-        attention::Event::Cleared(tag) => return cx.dismiss_system_notification(&tag),
-        attention::Event::Blocked(blocked) => (
-            blocked.tag,
-            blocked.workspace,
-            format!("{} is waiting on you", blocked.agent),
-        ),
-        attention::Event::Finished(finished) => (
-            finished.tag,
-            finished.workspace,
-            format!("{} finished", finished.agent),
-        ),
-    };
-    let title = match workspace.as_str() {
-        "" => "pilus".to_string(),
-        workspace => format!("pilus · {workspace}"),
+    let (tag, endpoint, pane, title, body) = match event {
+        attention::Event::Cleared(tag) => {
+            notify::forget(&tag);
+            return cx.dismiss_system_notification(&tag);
+        }
+        attention::Event::Blocked(blocked) => {
+            let body = format!("{} is waiting on you", blocked.agent);
+            (
+                blocked.tag,
+                blocked.endpoint,
+                blocked.pane,
+                blocked.title,
+                body,
+            )
+        }
+        attention::Event::Finished(finished) => {
+            let body = format!("{} finished", finished.agent);
+            (
+                finished.tag,
+                finished.endpoint,
+                finished.pane,
+                finished.title,
+                body,
+            )
+        }
     };
     notify::post(
         cx,
@@ -836,6 +855,7 @@ fn raise_background_alert(event: attention::Event, badge: u32, cx: &mut App) {
             title,
             body,
             badge,
+            target: (endpoint, pane),
         },
     );
 }
@@ -3242,7 +3262,10 @@ impl PilusView {
         let mut changed = false;
         for event in self.attention.drain() {
             match event {
-                attention::Event::Cleared(tag) => cx.dismiss_system_notification(&tag),
+                attention::Event::Cleared(tag) => {
+                    notify::forget(&tag);
+                    cx.dismiss_system_notification(&tag);
+                }
                 // The daemon already sounds a finished turn into a live
                 // window and the sidebar shows it; only the windowless
                 // helper notifies.
@@ -3251,17 +3274,13 @@ impl PilusView {
                     let body = format!("{} is waiting on you", blocked.agent);
                     let in_front = dock::app_active().unwrap_or(self.window_active);
                     if in_front {
-                        let title = Some(blocked.workspace).filter(|name| !name.is_empty());
-                        self.toasts.push(ToastKind::Info, title, body);
+                        self.toasts.push(ToastKind::Info, Some(blocked.title), body);
                         changed = true;
                     } else {
-                        let title = match blocked.workspace.as_str() {
-                            "" => "pilus".to_string(),
-                            workspace => format!("pilus · {workspace}"),
-                        };
+                        notify::remember(&blocked.tag, (blocked.endpoint, blocked.pane));
                         cx.show_system_notification(SystemNotification {
                             tag: SharedString::from(blocked.tag),
-                            title: SharedString::from(title),
+                            title: SharedString::from(blocked.title),
                             body: SharedString::from(body),
                             actions: Vec::new(),
                         });

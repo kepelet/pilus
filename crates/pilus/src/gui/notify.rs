@@ -10,7 +10,17 @@
 //! a banner still goes through gpui, which keys on the same tag. Other
 //! platforms fall back to gpui's plain notification.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use gpui::App;
+
+thread_local! {
+    /// The agent each standing banner is about, by tag. The system hands a
+    /// click back with only the tag, and the tag is not safe to split apart
+    /// because an endpoint id may itself contain dashes.
+    static TARGETS: RefCell<HashMap<String, (String, String)>> = RefCell::new(HashMap::new());
+}
 
 /// One notification to post.
 pub struct Alert {
@@ -20,6 +30,8 @@ pub struct Alert {
     pub body: String,
     /// The app icon's badge once this is delivered.
     pub badge: u32,
+    /// The endpoint key and pane id a click on the banner should focus.
+    pub target: (String, String),
 }
 
 #[cfg(target_os = "macos")]
@@ -116,7 +128,24 @@ mod imp {
 
 /// Post `alert` with the system sound, and badge the app icon.
 pub fn post(cx: &mut App, alert: Alert) {
+    remember(&alert.tag, alert.target.clone());
     imp::post(cx, alert);
+}
+
+/// Note which agent the banner tagged `tag` is about, for [`target`].
+pub fn remember(tag: &str, target: (String, String)) {
+    TARGETS.with_borrow_mut(|targets| targets.insert(tag.to_string(), target));
+}
+
+/// Drop the note for a banner that was withdrawn.
+pub fn forget(tag: &str) {
+    TARGETS.with_borrow_mut(|targets| targets.remove(tag));
+}
+
+/// The endpoint key and pane id of the banner the user clicked, if it is one
+/// of ours.
+pub fn target(tag: &str) -> Option<(String, String)> {
+    TARGETS.with_borrow_mut(|targets| targets.remove(tag))
 }
 
 /// Set the app icon's badge; zero clears it.

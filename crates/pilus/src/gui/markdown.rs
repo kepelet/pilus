@@ -1,4 +1,4 @@
-//! Markdown rendering for documents and GitHub bodies.
+//! Markdown rendering for documents.
 //!
 //! This module parses CommonMark plus GFM with `markdown` (the markdown-rs
 //! crate) and paints its mdast as GPUI elements: paragraphs and inline runs
@@ -102,24 +102,6 @@ pub(super) fn render_block(
     let chrome: SharedString = style::chrome_font(settings).family;
     let mono = style::mono_family(settings);
     self::block(&block.node, theme, fonts, &chrome, &mono, fonts.body)
-}
-
-/// Render `source` as a vertical stack of blocks.
-pub(super) fn render(
-    source: &str,
-    theme: Theme,
-    fonts: Fonts,
-    settings: &Rc<RefCell<Settings>>,
-) -> AnyElement {
-    let chrome = style::chrome_font(settings);
-    let chrome_family: SharedString = chrome.family.clone();
-    let mono = style::mono_family(settings);
-    let nodes = parse(source, false);
-    let mut column = div().flex().flex_col().gap_2();
-    for node in &nodes {
-        column = column.child(block(node, theme, fonts, &chrome_family, &mono, fonts.body));
-    }
-    column.into_any_element()
 }
 
 /// One inline run's inherited styling.

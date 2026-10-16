@@ -82,12 +82,6 @@ pub enum Item {
     /// Delete a linked worktree and its files. Destructive; only offered on
     /// rows the daemon's `worktree.list` confirms as linked checkouts.
     DeleteWorktree,
-    /// Open the daemon's Git tab for this workspace.
-    OpenGit,
-    /// Open the daemon's task board for this workspace.
-    OpenBoard,
-    /// Open Mission Control for this workspace.
-    OpenMission,
     /// Show only the active workspace's agents in the AGENTS dock.
     ToggleScope,
     /// Copy the terminal's highlighted text.
@@ -149,9 +143,6 @@ impl Item {
             Self::CopyBranch => "Copy Branch",
             Self::NewWorktree => "New Git Worktree",
             Self::DeleteWorktree => "Delete Worktree",
-            Self::OpenGit => "Open Git Tab",
-            Self::OpenBoard => "Open Task Board",
-            Self::OpenMission => "Open Mission Control",
             Self::ToggleScope => {
                 if scoped {
                     "Show All Workspaces"
@@ -276,8 +267,8 @@ impl SidebarMenu {
 }
 
 /// WORKSPACES top-level rows, in the daemon's render order: node actions,
-/// the copy submenu, worktrees when the row is a git repo, then the board
-/// actions below a divider. The path toggle's label is applied at render.
+/// the copy submenu, then worktrees when the row is a git repo. The path
+/// toggle's label is applied at render.
 fn workspace_rows(is_repo: bool, linked: bool) -> Vec<Item> {
     let mut items = vec![
         Item::Close,
@@ -293,12 +284,6 @@ fn workspace_rows(is_repo: bool, linked: bool) -> Vec<Item> {
     if is_repo {
         items.push(Item::NewWorktree);
     }
-    items.push(Item::Divider);
-    if is_repo {
-        items.push(Item::OpenGit);
-    }
-    items.push(Item::OpenBoard);
-    items.push(Item::OpenMission);
     items
 }
 
@@ -374,24 +359,17 @@ mod tests {
                 Item::QuickActions,
                 Item::DeleteWorktree,
                 Item::NewWorktree,
-                Item::Divider,
-                Item::OpenGit,
-                Item::OpenBoard,
-                Item::OpenMission,
             ]
         );
-        // A non-repo row drops the git rows; the boards stay. The delete row
-        // needs a confirmed linked checkout, not just any repo row.
+        // A non-repo row drops the git rows. The delete row needs a
+        // confirmed linked checkout, not just any repo row.
         let rows = workspace_rows(false, false);
         assert!(!rows.contains(&Item::DeleteWorktree));
         assert!(!rows.contains(&Item::NewWorktree));
-        assert!(!rows.contains(&Item::OpenGit));
         let main = workspace_rows(true, false);
         assert!(!main.contains(&Item::DeleteWorktree));
         let linked = workspace_rows(true, true);
         assert!(linked.contains(&Item::DeleteWorktree));
-        assert_eq!(rows[rows.len() - 2], Item::OpenBoard);
-        assert_eq!(rows[rows.len() - 1], Item::OpenMission);
     }
 
     #[test]

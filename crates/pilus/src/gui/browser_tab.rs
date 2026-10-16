@@ -125,6 +125,23 @@ fn round_page_corner(webview: &wry::WebView, radius: f32) {
 #[cfg(not(target_os = "macos"))]
 fn round_page_corner(_: &wry::WebView, _: f32) {}
 
+/// Move a hidden page out of the window, keeping its size.
+///
+/// AppKit still hands a drag over a hidden view's frame to that view, so a
+/// page hidden in place would take, and drop, files dragged onto the tab
+/// showing in its place: the Files tab never hears of them. The size stays so
+/// the page does not reflow, and showing it needs no undo here, since the
+/// element sets the page's bounds on every frame it paints.
+fn park_page(webview: &wry::WebView) {
+    let Ok(bounds) = webview.bounds() else {
+        return;
+    };
+    let _ = webview.set_bounds(wry::Rect {
+        position: wry::dpi::LogicalPosition::new(-100_000.0, -100_000.0).into(),
+        size: bounds.size,
+    });
+}
+
 /// Whether the window's first responder is the webview or one of its
 /// subviews (WebKit's content view takes it once the page is clicked).
 #[cfg(target_os = "macos")]
@@ -450,6 +467,7 @@ impl PilusView {
                     view.show();
                 } else if !on_screen && view.visible() {
                     view.hide();
+                    park_page(view.raw());
                 }
             });
         }

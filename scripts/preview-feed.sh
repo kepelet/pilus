@@ -22,10 +22,12 @@
 #                         Set it explicitly to publish a real version instead.
 #   PILUS_PREVIEW_NOTES     Manifest notes line; defaults to the git revision
 #                         and the client build version.
+#   PILUS_APP_NAME          Name of the preview app (default `pilus (Nightly)`),
+#                           so it installs beside the stable `pilus.app`.
 #   PILUS_BUNDLE_ID         Bundle identifier baked into the preview app.
-#                           Defaults to the release identifier so a preview
-#                           install keeps the same Notification Center / TCC
-#                           identity as stable across an OTA update.
+#                           Defaults to `pilus.kepelet.com.nightly`: its own
+#                           Notification Center / TCC identity, distinct from
+#                           stable's `pilus.kepelet.com`.
 #   SKIP_PACKAGE=1        Reuse the DMG in target/release instead of running
 #                         scripts/package-macos-dmg.sh first.
 #   MINISIGN_SECRET_KEY   Forwarded to the packaging script; a `.minisig`
@@ -71,11 +73,13 @@ case "$base_url" in
 esac
 
 if [ "${SKIP_PACKAGE:-}" != "1" ]; then
-    # Stamp the synthetic version into the build so the bundled app reports it.
-    # A preview install shares the release identity, so switching channels does
-    # not reset notification or TCC permissions.
+    # Stamp the synthetic version into the build so the bundled app reports it,
+    # and pin the channel so this app keeps following the preview feed no
+    # matter what the shared settings file says.
     PILUS_BUILD_VERSION="$manifest_version" \
-        PILUS_BUNDLE_ID="${PILUS_BUNDLE_ID:-pilus.kepelet.com}" \
+        PILUS_BUILD_CHANNEL=preview \
+        PILUS_APP_NAME="${PILUS_APP_NAME:-pilus (Nightly)}" \
+        PILUS_BUNDLE_ID="${PILUS_BUNDLE_ID:-pilus.kepelet.com.nightly}" \
         ./scripts/package-macos-dmg.sh
 else
     echo "note: reusing an existing DMG; its embedded build version may differ" >&2

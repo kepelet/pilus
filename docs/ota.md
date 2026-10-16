@@ -86,6 +86,22 @@ self-hosted feed):
 Asset names are load-bearing: the client matches on the `macos`, `arm64`,
 and `.dmg` substrings. Don't rename them.
 
+## Stable and Nightly side by side
+
+`just preview-feed` and `just release-preview` package the preview as its own
+app, **pilus (Nightly)** (`pilus (Nightly).app`, bundle id
+`pilus.kepelet.com.nightly`), so it installs beside the stable `pilus.app`
+instead of over it. Each keeps its own Notification Center and TCC identity.
+The OTA swap replaces whichever bundle is running, so Nightly updates itself in
+place under its own name.
+
+The two share a settings file, so the Nightly build is stamped
+`PILUS_BUILD_CHANNEL=preview` and is pinned: the Settings page shows the channel
+as a label, and neither the saved `update_channel` nor `PILUS_UPDATE_CHANNEL`
+moves it. Override the name or id with `PILUS_APP_NAME` and `PILUS_BUNDLE_ID`.
+Stable's channel switch still exists; switching stable to preview would install
+Nightly's build over `pilus.app`, so use the Nightly app for previews.
+
 ## Local testing
 
 `just preview-feed` builds the DMG and writes the matching `latest.json` into
@@ -178,6 +194,12 @@ Three layers, weakest first:
    sign in CI, use a key generated with `minisign -G -W` (no password) in the
    `MINISIGN_SECRET_KEY` repo secret. Back the key up: losing it strands every
    client that has the public key.
+
+   `LOCAL=true` is a developer-only waiver, set by hand and never by the app
+   or scripts. `LOCAL=true just release-preview` skips the publish-time
+   signature check (stable ignores it), and a client launched with `LOCAL=true`
+   in its environment drops the public key and verifies best-effort, so it
+   installs an unsigned preview. A client launched without it stays fail-closed.
 
 ## Daemon compatibility
 

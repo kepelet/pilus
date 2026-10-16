@@ -32,6 +32,18 @@ pub const CHANNEL_ENV: &str = "PILUS_UPDATE_CHANNEL";
 /// (`python3 -m http.server 8000 --directory /tmp/feed`).
 pub const FEED_URL_ENV: &str = "PILUS_UPDATE_FEED_URL";
 
+/// Name of the env var that waives signature verification for a local session.
+///
+/// A developer sets it by hand (`LOCAL=true just run`) to install a preview
+/// that was packaged without the secret key. Nothing in the app, the settings
+/// file, or the scripts sets it, so a normally launched build stays fail-closed.
+pub const LOCAL_ENV: &str = "LOCAL";
+
+/// Whether a raw [`LOCAL_ENV`] value asks for the waiver.
+fn local_waiver(raw: Option<&str>) -> bool {
+    raw.is_some_and(|raw| raw.trim().eq_ignore_ascii_case("true"))
+}
+
 /// Minisign public key that verifies release artifacts.
 ///
 /// While unset the engine runs [`Verification::BestEffort`] (checksum when
@@ -40,6 +52,16 @@ pub const FEED_URL_ENV: &str = "PILUS_UPDATE_FEED_URL";
 /// The matching secret key signs releases through `MINISIGN_SECRET_KEY`.
 pub const MINISIGN_PUBLIC_KEY: Option<&str> =
     Some("RWTpfuUosellUav8HNDeVU6PB08mBv84RqP3hraQSM0/8zraxkiWHL8o");
+
+/// The channel this build is pinned to, when it was packaged with one.
+///
+/// The Nightly bundle is stamped `preview` at build time. It shares a settings
+/// file with stable, so a pinned build ignores both the setting and
+/// [`CHANNEL_ENV`] rather than follow a channel its own feed cannot serve.
+pub fn pinned_channel() -> Option<UpdateChannel> {
+    let raw = include_str!(concat!(env!("OUT_DIR"), "/build_channel")).trim();
+    (!raw.is_empty()).then(|| UpdateChannel::parse(raw))
+}
 
 /// Supported update channel.
 ///
@@ -98,13 +120,15 @@ impl UpdateRequest {
     /// `update_channel`, `PILUS_UPDATE_FEED_URL` over `update_feed_url`. A blank
     /// value is ignored.
     pub fn from_settings(channel: &str, feed_url: Option<String>) -> Self {
-        let channel = std::env::var(CHANNEL_ENV)
-            .ok()
-            .filter(|raw| !raw.trim().is_empty())
-            .map_or_else(
-                || UpdateChannel::parse(channel),
-                |raw| UpdateChannel::parse(&raw),
-            );
+        let channel = pinned_channel().unwrap_or_else(|| {
+            std::env::var(CHANNEL_ENV)
+                .ok()
+                .filter(|raw| !raw.trim().is_empty())
+                .map_or_else(
+                    || UpdateChannel::parse(channel),
+                    |raw| UpdateChannel::parse(&raw),
+                )
+        });
         let feed_url = std::env::var(FEED_URL_ENV)
             .ok()
             .filter(|url| !url.trim().is_empty())
@@ -112,7 +136,9 @@ impl UpdateRequest {
         Self {
             channel,
             feed_url,
-            minisign_key: MINISIGN_PUBLIC_KEY.map(str::to_string),
+            minisign_key: MINISIGN_PUBLIC_KEY
+                .filter(|_| !local_waiver(std::env::var(LOCAL_ENV).ok().as_deref()))
+                .map(str::to_string),
         }
     }
 
@@ -210,6 +236,24 @@ pub const PROTOCOL_NOTE: &str = "Luvus updates separately: run `luvus update` an
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pinned_build_ignores_the_saved_channel() {
+        let request = UpdateRequest::from_settings("stable", None);
+        match pinned_channel() {
+            Some(pinned) => assert_eq!(request.channel, pinned),
+            None => assert_eq!(request.channel, UpdateChannel::Stable),
+        }
+    }
+
+    #[test]
+    fn local_waiver_only_accepts_true() {
+        assert!(local_waiver(Some("true")));
+        assert!(local_waiver(Some(" TRUE ")));
+        assert!(!local_waiver(Some("1")));
+        assert!(!local_waiver(Some("")));
+        assert!(!local_waiver(None));
+    }
 
     #[test]
     fn current_version_uses_the_build_stamp_when_present() {

@@ -356,6 +356,28 @@ impl Settings {
         }
     }
 
+    /// Move pinned `repo` one place toward the front (`earlier`) or the back.
+    /// The sidebar lists pins in this order; a repository already at that end,
+    /// or never pinned, stays where it is.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn move_pinned(&mut self, repo: &str, earlier: bool) {
+        let Some(at) = self
+            .github_pinned
+            .iter()
+            .position(|known| known.eq_ignore_ascii_case(repo))
+        else {
+            return;
+        };
+        let to = if earlier {
+            at.checked_sub(1)
+        } else {
+            Some(at + 1).filter(|to| *to < self.github_pinned.len())
+        };
+        if let Some(to) = to {
+            self.github_pinned.swap(at, to);
+        }
+    }
+
     /// The corner radius, clamped so a stray value cannot draw blobs.
     pub fn radius(&self) -> f32 {
         if self.corner_radius.is_finite() {
@@ -439,6 +461,22 @@ mod tests {
         settings.set_pinned("KEPELET/pilus", false);
         settings.set_pinned("never/pinned", false);
         assert_eq!(settings.github_pinned, vec!["o/second"]);
+    }
+
+    #[test]
+    fn pins_reorder_one_place_and_stop_at_the_ends() {
+        let mut settings = Settings::default();
+        for repo in ["a/1", "a/2", "a/3"] {
+            settings.set_pinned(repo, true);
+        }
+        settings.move_pinned("A/3", true);
+        assert_eq!(settings.github_pinned, vec!["a/1", "a/3", "a/2"]);
+        settings.move_pinned("a/1", true);
+        settings.move_pinned("a/2", false);
+        settings.move_pinned("never/pinned", false);
+        assert_eq!(settings.github_pinned, vec!["a/1", "a/3", "a/2"]);
+        settings.move_pinned("a/1", false);
+        assert_eq!(settings.github_pinned, vec!["a/3", "a/1", "a/2"]);
     }
 
     #[test]

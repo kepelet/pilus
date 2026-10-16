@@ -1192,6 +1192,17 @@ pub fn run_main() -> Result<()> {
     });
     settle(&mut cx, 8);
     capture(&mut cx, window.into(), "main-settings-remote-idle")?;
+    // Three pins, so the card shows the reorder controls at both ends and
+    // between.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            for repo in ["rizaldy/notes", "kepelet/infra", "rizaldy/pilus"] {
+                view.settings.set_pinned(repo, true);
+            }
+            *view.shared_settings.borrow_mut() = view.settings.clone();
+            cx.notify();
+        });
+    });
     // Scrolled to the GITHUB card.
     cx.update_window(window.into(), |_, window, cx| {
         use gpui::InputEvent;
@@ -1206,6 +1217,13 @@ pub fn run_main() -> Result<()> {
     .ok();
     settle(&mut cx, 8);
     capture(&mut cx, window.into(), "main-settings-github")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.settings.github_pinned.clear();
+            *view.shared_settings.borrow_mut() = view.settings.clone();
+            cx.notify();
+        });
+    });
     // The service log open, with the server down: the row that says what to do.
     let mut logged = remote_access_fixture(false);
     logged.log_open = true;

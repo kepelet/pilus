@@ -1,7 +1,7 @@
 //! GitHub in the sidebar: a Repositories section above WORKSPACES, for the
 //! account `gh` is signed in as on this Mac.
 //!
-//! The section shows five repositories: the ones pinned in Settings first, in
+//! The section shows three repositories: the ones pinned in Settings first, in
 //! the order they were pinned, then the most recently pushed to fill what is
 //! left. Four pins make four pins and the latest repository. A row opens that
 //! repository's page; "All Repositories" in the header's right-click menu opens
@@ -41,8 +41,10 @@ use super::{
 /// owns freshness (five minutes), so this only has to be shorter than that; a
 /// check that finds a fresh list makes no request.
 const RECHECK: Duration = Duration::from_secs(120);
+/// Side of the up and down controls on a pinned row in Settings.
+const MOVE_BUTTON: f32 = 24.0;
 /// Repositories the sidebar shows: pins first, then the most recent.
-pub(super) const SIDEBAR_REPOS: usize = 5;
+pub(super) const SIDEBAR_REPOS: usize = 3;
 
 /// Whether `gh` is usable, as far as the feed has found out.
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -751,7 +753,11 @@ impl PilusView {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let pinned = &self.settings.github_pinned;
-        let line = |id: String, name: String, label: &'static str, on: bool| {
+        let line = |id: String,
+                    name: String,
+                    label: &'static str,
+                    on: bool,
+                    lead: Vec<gpui::AnyElement>| {
             let target = name.clone();
             div()
                 .flex()
@@ -767,6 +773,7 @@ impl PilusView {
                         .text_color(theme.panel_fg)
                         .child(name),
                 )
+                .children(lead)
                 .child(
                     style::small_button(
                         id,
@@ -797,13 +804,53 @@ impl PilusView {
                     .child("Nothing pinned. Pin a repository to keep it in the sidebar."),
             );
         }
-        for name in pinned {
-            block = block.child(line(
-                format!("pilus-github-unpin-{name}"),
-                name.clone(),
-                "Unpin",
-                false,
-            ));
+        // The sidebar lists pins in this order, so each row can move one
+        // place; an end keeps a blank slot so the Unpin buttons stay aligned.
+        let last = pinned.len().saturating_sub(1);
+        for (position, name) in pinned.iter().enumerate() {
+            let mover = |earlier: bool, glyph: &'static [u8], tip: &'static str, can: bool| {
+                let slot = div().w(px(MOVE_BUTTON)).h(px(MOVE_BUTTON)).flex_shrink_0();
+                if !can {
+                    return slot.into_any_element();
+                }
+                let target = name.clone();
+                style::icon_button(
+                    format!("pilus-github-move-{earlier}-{name}"),
+                    glyph,
+                    style::ButtonKind::Ghost,
+                    theme,
+                    MOVE_BUTTON,
+                )
+                .tooltip(row_tooltip(tip.to_string(), theme.panel_fg, Vec::new(), theme))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings.move_pinned(&target, earlier);
+                    this.save_settings();
+                    cx.notify();
+                }))
+                .into_any_element()
+            };
+            block = block.child(
+                line(
+                    format!("pilus-github-unpin-{name}"),
+                    name.clone(),
+                    "Unpin",
+                    false,
+                    vec![
+                        mover(
+                            true,
+                            include_bytes!("../../assets/icons/arrow-up.svg"),
+                            "Move up",
+                            position > 0,
+                        ),
+                        mover(
+                            false,
+                            include_bytes!("../../assets/icons/arrow-down.svg"),
+                            "Move down",
+                            position < last,
+                        ),
+                    ],
+                ),
+            );
         }
         let suggestions: Vec<&RepoSummary> = self
             .github
@@ -825,6 +872,7 @@ impl PilusView {
                     repo.name.clone(),
                     "Pin",
                     true,
+                    Vec::new(),
                 ));
             }
         }

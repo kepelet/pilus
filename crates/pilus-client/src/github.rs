@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::git::sh_quote;
@@ -162,7 +162,7 @@ impl GhState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Label {
     pub name: String,
     /// Hex without the `#`.
@@ -280,6 +280,9 @@ pub struct GhRepo {
     dir: String,
     /// The `gh` to run. Tests point it at a stand-in.
     program: String,
+    /// `owner/name` to address with `-R` instead of resolving a checkout, for
+    /// a repository that may not be cloned on the machine at all.
+    slug: Option<String>,
 }
 
 impl GhRepo {
@@ -289,11 +292,23 @@ impl GhRepo {
             target,
             dir: dir.into(),
             program: "gh".to_string(),
+            slug: None,
         }
     }
 
-    #[cfg(test)]
-    fn with_program(mut self, program: &str) -> Self {
+    /// The repository `owner/name` on this Mac, whether or not it is cloned
+    /// here. Only the calls that accept `-R` (issue and pull request reads)
+    /// work on one.
+    pub fn for_slug(slug: impl Into<String>) -> Self {
+        Self {
+            slug: Some(slug.into()),
+            ..Self::new(None, "")
+        }
+    }
+
+    /// Run a different `gh`. Tests point it at a stand-in; the account reads
+    /// share it so one fake covers both.
+    pub(crate) fn with_program(mut self, program: &str) -> Self {
         self.program = program.to_string();
         self
     }
@@ -542,7 +557,11 @@ impl GhRepo {
     }
 
     fn gh_json(&self, args: &[&str]) -> Result<Value, String> {
-        let output = self.run(&self.program, args, None)?;
+        let mut args = args.to_vec();
+        if let Some(slug) = self.slug.as_deref() {
+            args.extend(["-R", slug]);
+        }
+        let output = self.run(&self.program, &args, None)?;
         if output.code != Some(0) {
             return Err(self.explain(&output));
         }
@@ -572,7 +591,12 @@ impl GhRepo {
 
     /// Run `program args` in the checkout and capture it, killing it after
     /// [`CALL_TIMEOUT`] (or `timeout` for [`Self::run_for`]).
-    fn run(&self, program: &str, args: &[&str], stdin: Option<&str>) -> Result<Output, String> {
+    pub(crate) fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: Option<&str>,
+    ) -> Result<Output, String> {
         self.run_for(CALL_TIMEOUT, program, args, stdin)
     }
 
@@ -631,10 +655,10 @@ impl GhRepo {
     }
 }
 
-struct Output {
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
+pub(crate) struct Output {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 /// Read a pipe to its end on its own thread, so a full pipe cannot stall the
@@ -671,7 +695,7 @@ fn script(dir: &str, program: &str, args: &[&str]) -> String {
 ///
 /// The order matters: the "no GitHub remote" message also tells the reader to
 /// run `gh auth login`, and it must not read as signed out.
-fn classify(code: Option<i32>, stderr: &str) -> GhState {
+pub(crate) fn classify(code: Option<i32>, stderr: &str) -> GhState {
     let message = stderr.trim();
     let lower = message.to_lowercase();
     if code == Some(NOT_FOUND) {
@@ -710,7 +734,7 @@ fn classify(code: Option<i32>, stderr: &str) -> GhState {
     })
 }
 
-fn failure(what: &str, output: &Output) -> String {
+pub(crate) fn failure(what: &str, output: &Output) -> String {
     let stderr = output.stderr.trim();
     if stderr.is_empty() {
         format!(
@@ -725,15 +749,15 @@ fn failure(what: &str, output: &Output) -> String {
     }
 }
 
-fn parse_json(text: &str) -> Result<Value, String> {
+pub(crate) fn parse_json(text: &str) -> Result<Value, String> {
     serde_json::from_str(text).map_err(|error| format!("gh answered something unexpected: {error}"))
 }
 
-fn array(value: &Value) -> &[Value] {
+pub(crate) fn array(value: &Value) -> &[Value] {
     value.as_array().map(Vec::as_slice).unwrap_or_default()
 }
 
-fn text(value: &Value, key: &str) -> String {
+pub(crate) fn text(value: &Value, key: &str) -> String {
     value
         .get(key)
         .and_then(Value::as_str)
@@ -741,7 +765,7 @@ fn text(value: &Value, key: &str) -> String {
         .to_string()
 }
 
-fn count(value: &Value, key: &str) -> u64 {
+pub(crate) fn count(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
@@ -754,7 +778,7 @@ fn login(value: &Value) -> String {
         .unwrap_or_else(|| "ghost".to_string())
 }
 
-fn parse_labels(value: &Value) -> Vec<Label> {
+pub(crate) fn parse_labels(value: &Value) -> Vec<Label> {
     array(value.get("labels").unwrap_or(&Value::Null))
         .iter()
         .map(|label| Label {

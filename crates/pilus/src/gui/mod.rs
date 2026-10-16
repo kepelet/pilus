@@ -22,6 +22,8 @@ mod dock;
 mod files_tab;
 mod fonts;
 mod git_tab;
+mod github;
+mod github_page;
 mod glass;
 mod highlight;
 mod home;
@@ -77,6 +79,8 @@ use diff::{DiffInputs, DiffPanel};
 use dock::Dock;
 use files_tab::FilesPanel;
 use git_tab::GitPanel;
+use github::GithubFeed;
+use github_page::GithubPage;
 use glass::Glass;
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DispatchPhase,
@@ -1192,6 +1196,8 @@ struct SectionHeader {
     label: &'static str,
     collapsed: bool,
     toggle: SectionAction,
+    /// Whether a right-click on the header opens the GitHub section's menu.
+    menu: bool,
 }
 
 /// A requested endpoint handoff waiting for its prepared frame.
@@ -1876,6 +1882,10 @@ struct PilusView {
     git_panel: GitPanel,
     /// The issues the Home composer offers to attach.
     home_issues: HomeIssues,
+    /// The account's GitHub sections above WORKSPACES.
+    github: GithubFeed,
+    /// The page a GitHub row opens in the terminal's card.
+    github_page: GithubPage,
     files_panel: FilesPanel,
     ports_panel: PortsPanel,
     browser_panel: BrowserPanel,
@@ -1966,6 +1976,7 @@ impl PilusView {
             None => (config_dir(), target.session.clone()),
         };
         let pilus_root = pilus_config_dir();
+        let github = GithubFeed::new(&pilus_root);
         let agent_feed = Some(AgentFeed::spawn(api_socket_for(
             &session_root,
             session_name.as_deref(),
@@ -2327,6 +2338,8 @@ impl PilusView {
             diff_inputs,
             git_panel,
             home_issues: HomeIssues::default(),
+            github,
+            github_page: GithubPage::default(),
             files_panel: FilesPanel::new(),
             ports_panel: PortsPanel::new(),
             browser_panel: BrowserPanel::new(),
@@ -2801,6 +2814,8 @@ impl PilusView {
         changed |= self.diff_tick();
         changed |= self.git_tick();
         changed |= self.home_issues_tick(cx);
+        changed |= self.github_tick();
+        changed |= self.github_page_tick();
         changed |= self.files_tick();
         changed |= self.ports_tick();
         changed |= self.browser_tick(cx);
@@ -4786,6 +4801,7 @@ impl PilusView {
         self.tasks_panel.close();
         self.mission.close();
         self.automations_page.close();
+        self.github_page.close();
         self.home.close();
         self.update_url_editing = false;
         self.relay_editing = None;
@@ -5069,6 +5085,14 @@ impl PilusView {
                 terminal_fill,
                 cx,
             );
+        }
+        if self.github_page.is_open() {
+            let page = div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.github_page(cx));
+            return self.page_card("pilus-page-github", page, grid, layout, terminal_fill, cx);
         }
         if self.settings_open {
             return style::enter(
@@ -6256,6 +6280,10 @@ impl PilusView {
                 style::section_card_tab(theme, "MENU BAR", self.section_font())
                     .child(self.menu_bar_section_block(cx))
             }))
+            .child(
+                style::section_card_tab(theme, "GITHUB", self.section_font())
+                    .child(self.github_settings_block(cx)),
+            )
             .child(
                 style::section_card_tab(theme, "REMOTE MACHINES", self.section_font())
                     .child(self.machines_section_block(cx)),
@@ -9404,6 +9432,7 @@ impl PilusView {
             )),
             SidebarMenuTarget::Agent { .. }
             | SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => None,
         };
         self.context_menu = Some(SidebarMenu::new(
@@ -9444,6 +9473,7 @@ impl PilusView {
             SidebarMenuTarget::Workspace { cwd, .. } => self.expand_cwd(endpoint_key, cwd),
             SidebarMenuTarget::Agent { .. }
             | SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => return,
         };
         let workspace_id = workspace_id.to_string();
@@ -9490,6 +9520,7 @@ impl PilusView {
                 .is_some_and(Option::is_some),
             SidebarMenuTarget::Agent { .. }
             | SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => false,
         };
         menu.rows(linked)
@@ -9701,6 +9732,10 @@ impl PilusView {
             (SidebarMenuTarget::Terminal { .. }, item) => {
                 self.close_context_menu();
                 self.run_terminal_item(item, cx);
+            }
+            (SidebarMenuTarget::Github, item) => {
+                self.close_context_menu();
+                self.github_menu_item(item, cx);
             }
             (SidebarMenuTarget::File { path, .. }, SidebarItem::CopyPath) => {
                 self.close_context_menu();
@@ -10473,6 +10508,7 @@ impl PilusView {
         ));
         content = content.child(self.open_workspace_row(cx));
 
+        content = content.children(self.github_sidebar(cx));
         content = content.child(self.workspaces_section(cx));
         content = content.child(self.agents_section(cx));
 
@@ -11789,7 +11825,10 @@ impl PilusView {
         } else {
             theme.panel_fg
         };
-        let label = item.label(paths, scoped).to_string();
+        let mut label = item.label(paths, scoped).to_string();
+        if item == SidebarItem::GithubAll {
+            label.push_str(&format!(" · {}", self.github.repos.items.len()));
+        }
         div()
             .id(id)
             .flex()
@@ -11833,7 +11872,9 @@ impl PilusView {
             SidebarMenuTarget::Agent { .. } => {
                 (self.sidebar_agent_paths, self.agents_this_workspace)
             }
-            SidebarMenuTarget::Terminal { .. } | SidebarMenuTarget::File { .. } => (false, false),
+            SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::Github
+            | SidebarMenuTarget::File { .. } => (false, false),
         };
 
         let quick_rows = if menu.quick_open {
@@ -12613,6 +12654,7 @@ impl PilusView {
             label,
             collapsed,
             toggle,
+            menu,
         } = spec;
         let theme = self.theme;
         let header = div()
@@ -12660,7 +12702,19 @@ impl PilusView {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.section_toggled = Some((id, Instant::now()));
                         toggle(this, cx);
-                    })),
+                    }))
+                    .when(menu, |header| {
+                        header.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                this.open_context_menu(
+                                    SidebarMenuTarget::Github,
+                                    event.position,
+                                    cx,
+                                );
+                            }),
+                        )
+                    }),
             );
         header
     }
@@ -12786,6 +12840,7 @@ impl PilusView {
                         this.workspaces_collapsed = !this.workspaces_collapsed;
                         cx.notify();
                     }),
+                    menu: false,
                 },
                 cx,
             ));
@@ -12891,6 +12946,7 @@ impl PilusView {
                         this.agents_collapsed = !this.agents_collapsed;
                         cx.notify();
                     }),
+                    menu: false,
                 },
                 cx,
             ));
@@ -15107,6 +15163,10 @@ fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
         SidebarItem::MoveToTab => include_bytes!("../../assets/icons/corner-down-right.svg"),
         SidebarItem::NewTab => include_bytes!("../../assets/icons/plus.svg"),
         SidebarItem::CloseTab => include_bytes!("../../assets/icons/x.svg"),
+        SidebarItem::GithubAll => include_bytes!("../../assets/icons/list.svg"),
+        SidebarItem::GithubRefresh => include_bytes!("../../assets/icons/refresh-cw.svg"),
+        SidebarItem::GithubHideSection => include_bytes!("../../assets/icons/minus.svg"),
+        SidebarItem::GithubDisable => include_bytes!("../../assets/icons/x.svg"),
         SidebarItem::Divider => include_bytes!("../../assets/icons/plus.svg"),
     }
 }

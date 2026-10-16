@@ -626,6 +626,11 @@ pub fn run_main() -> Result<()> {
         })
         .context("open main window")?;
     let view = view_cell.borrow().clone().context("view captured")?;
+    // Sample rows in place of the real account, before the first tick can
+    // start a probe: a capture never reaches GitHub.
+    cx.update(|app| {
+        view.update(app, |view, _| view.github.fill_sample());
+    });
 
     // The reader thread delivers frames over a channel; the view's polling
     // task only sees them when the clock advances and tasks are drained.
@@ -717,6 +722,57 @@ pub fn run_main() -> Result<()> {
         });
     });
     cx.run_until_parked();
+
+    // The GitHub section's menu, then each page, then `gh` signed out.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.open_context_menu(
+                super::sidebar_menu::MenuTarget::Github,
+                point(px(120.0), px(110.0)),
+                cx,
+            );
+        });
+    });
+    settle(&mut cx, 6);
+    capture(&mut cx, window.into(), "main-github-menu")?;
+    // Two pins, one of them outside the sample list's recent five.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.close_context_menu();
+            view.settings.set_pinned("rizaldy/notes", true);
+            view.settings.set_pinned("kepelet/infra", true);
+            // The window pulls the shared copy back each tick.
+            *view.shared_settings.borrow_mut() = view.settings.clone();
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 6);
+    capture(&mut cx, window.into(), "main-github-pinned")?;
+    for which in ["list", "issues", "pulls", "actions", "pull", "issue"] {
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.leave_settings_page();
+                view.github_page.open_sample(which);
+                cx.notify();
+            });
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), &format!("main-github-{which}"))?;
+    }
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.leave_settings_page();
+            view.settings.github_pinned.clear();
+            *view.shared_settings.borrow_mut() = view.settings.clone();
+            view.github.fill_down(false);
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-github-signed-out")?;
+    cx.update(|app| {
+        view.update(app, |view, _| view.github.fill_sample());
+    });
 
     // The command palette over the frame.
     cx.update(|app| {
@@ -1136,6 +1192,20 @@ pub fn run_main() -> Result<()> {
     });
     settle(&mut cx, 8);
     capture(&mut cx, window.into(), "main-settings-remote-idle")?;
+    // Scrolled to the GITHUB card.
+    cx.update_window(window.into(), |_, window, cx| {
+        use gpui::InputEvent;
+        let scroll = gpui::ScrollWheelEvent {
+            position: point(px(1000.0), px(500.0)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-1100.0))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        window.dispatch_event(scroll.to_platform_input(), cx);
+    })
+    .ok();
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-settings-github")?;
     // The service log open, with the server down: the row that says what to do.
     let mut logged = remote_access_fixture(false);
     logged.log_open = true;

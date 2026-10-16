@@ -395,9 +395,8 @@ impl UiPlaygroundView {
             ))
     }
 
-    /// The top chrome's bordered pills on the strip's own ground: a pill that is
-    /// itself a button (the session picker) and one holding icon buttons (the
-    /// right toolbar).
+    /// Bordered pills: one that is itself a button (the sidebar's session
+    /// picker) and one holding icon buttons (the top chrome's right toolbar).
     fn pill_demo(&self) -> Div {
         let theme = self.theme;
         let fonts = self.fonts();

@@ -855,6 +855,7 @@ pub fn run_main() -> Result<()> {
             if let Some(menu) = view.context_menu.as_mut() {
                 menu.quick_open = true;
                 menu.selected = None;
+                menu.quick_selected = None;
             }
             cx.notify();
         });

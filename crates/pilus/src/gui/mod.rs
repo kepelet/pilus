@@ -3018,15 +3018,14 @@ impl PilusView {
                         // must not retarget a different item than the one the
                         // user highlighted.
                         let open_target = self.context_menu.as_ref().is_some_and(|menu| {
-                            !menu.quick_open
-                                && matches!(
-                                    &menu.target,
-                                    SidebarMenuTarget::Workspace {
-                                        endpoint,
-                                        workspace_id,
-                                        ..
-                                    } if endpoint == &key.0 && workspace_id == &key.1
-                                )
+                            matches!(
+                                &menu.target,
+                                SidebarMenuTarget::Workspace {
+                                    endpoint,
+                                    workspace_id,
+                                    ..
+                                } if endpoint == &key.0 && workspace_id == &key.1
+                            )
                         });
                         self.worktree_linked.insert(key, path);
                         if open_target && let Some(menu) = self.context_menu.as_mut() {
@@ -9517,17 +9516,24 @@ impl PilusView {
     fn context_menu_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let rows = self.menu_rows();
-        let quick_open = self
+        let (quick_open, quick_rows, in_quick) = self
             .context_menu
             .as_ref()
-            .is_some_and(|menu| menu.quick_open);
+            .map(|menu| {
+                (
+                    menu.quick_open,
+                    menu.quick_rows(),
+                    menu.quick_selected.is_some(),
+                )
+            })
+            .unwrap_or_default();
         match keystroke.key.as_str() {
             "escape" | "esc" => {
                 if quick_open {
-                    // Esc steps back out of the copy submenu before closing.
+                    // Esc steps back out of the flyout before closing.
                     if let Some(menu) = self.context_menu.as_mut() {
                         menu.quick_open = false;
-                        menu.selected = None;
+                        menu.quick_selected = None;
                     }
                 } else {
                     self.close_context_menu();
@@ -9539,33 +9545,52 @@ impl PilusView {
                     return;
                 };
                 let dir: isize = if keystroke.key == "up" { -1 } else { 1 };
-                let from = menu
-                    .selected
-                    .unwrap_or(if dir < 0 { 0 } else { usize::MAX });
-                if let Some(next) = menu.next_selectable(&rows, from, dir) {
-                    menu.selected = Some(next);
+                if let Some(current) = menu.quick_selected {
+                    if let Some(next) = menu.next_selectable(&quick_rows, current, dir) {
+                        menu.quick_selected = Some(next);
+                    }
+                } else {
+                    let from = menu
+                        .selected
+                        .unwrap_or(if dir < 0 { 0 } else { usize::MAX });
+                    if let Some(next) = menu.next_selectable(&rows, from, dir) {
+                        menu.selected = Some(next);
+                        // Moving off the parent row folds the flyout away.
+                        menu.quick_open = false;
+                    }
                 }
                 cx.notify();
             }
-            // A right arrow opens the copy submenu; a left arrow climbs back.
+            // A right arrow opens the flyout and moves into it; a left arrow
+            // climbs back to the parent row.
             "right" => {
-                if !quick_open
+                if !in_quick
                     && rows.contains(&SidebarItem::QuickActions)
                     && let Some(menu) = self.context_menu.as_mut()
                 {
                     menu.quick_open = true;
-                    menu.selected = None;
+                    menu.quick_selected = Some(0);
                     cx.notify();
                 }
             }
             "left" => {
                 if quick_open && let Some(menu) = self.context_menu.as_mut() {
                     menu.quick_open = false;
-                    menu.selected = None;
+                    menu.quick_selected = None;
                     cx.notify();
                 }
             }
             "enter" => {
+                if in_quick {
+                    let index = self
+                        .context_menu
+                        .as_ref()
+                        .and_then(|menu| menu.quick_selected);
+                    if let Some(item) = index.and_then(|index| quick_rows.get(index)) {
+                        self.run_context_item(*item, cx);
+                    }
+                    return;
+                }
                 let row = self
                     .context_menu
                     .as_ref()
@@ -9574,6 +9599,12 @@ impl PilusView {
                     .or_else(|| rows.iter().position(|item| item.selectable()));
                 if let Some(index) = row {
                     self.run_context_item(rows[index], cx);
+                    // From the keyboard, opening the flyout also steps into it.
+                    if rows[index] == SidebarItem::QuickActions
+                        && let Some(menu) = self.context_menu.as_mut()
+                    {
+                        menu.quick_selected = Some(0);
+                    }
                 }
             }
             _ => {}
@@ -9581,7 +9612,7 @@ impl PilusView {
     }
 
     /// Run one hit context-menu row. The menu is cloned so the Quick Actions
-    /// parent row can swap the submenu open in place; everything else closes
+    /// parent row can pin its flyout open in place; everything else closes
     /// it and runs the action.
     fn run_context_item(&mut self, item: SidebarItem, cx: &mut Context<Self>) {
         let Some(menu) = self.context_menu.as_ref() else {
@@ -9592,7 +9623,6 @@ impl PilusView {
             (SidebarMenuTarget::Workspace { .. }, SidebarItem::QuickActions) => {
                 if let Some(menu) = self.context_menu.as_mut() {
                     menu.quick_open = true;
-                    menu.selected = None;
                 }
                 cx.notify();
             }
@@ -11629,6 +11659,48 @@ impl PilusView {
             )
     }
 
+    /// One selectable row of the context menu or its flyout. The caller adds
+    /// the click and hover handlers.
+    fn context_menu_row(
+        &self,
+        id: String,
+        item: SidebarItem,
+        active: bool,
+        paths: bool,
+        scoped: bool,
+    ) -> Stateful<Div> {
+        let theme = self.theme;
+        let color = if item.destructive() {
+            theme.alert
+        } else {
+            theme.panel_fg
+        };
+        let label = item.label(paths, scoped).to_string();
+        div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(26.0))
+            .px_2()
+            .radius_md()
+            .cursor_pointer()
+            .state_fill(
+                if active {
+                    theme.panel
+                } else {
+                    theme.window_bg.opacity(0.0)
+                },
+                theme.panel,
+                style::RADIUS_MD,
+            )
+            .text_size(px(self.chrome_font()))
+            .text_color(color)
+            .child(icon(sidebar_menu_icon(item), 15.0, color))
+            .child(div().flex_1().min_w_0().truncate().child(label))
+    }
+
     /// The right-click context menu for a WORKSPACES or AGENTS row.
     ///
     /// A full-window catcher occludes the grid and sidebar while the menu is
@@ -11650,46 +11722,48 @@ impl PilusView {
             SidebarMenuTarget::Terminal { .. } | SidebarMenuTarget::File { .. } => (false, false),
         };
 
+        let quick_rows = if menu.quick_open {
+            menu.quick_rows()
+        } else {
+            Vec::new()
+        };
         let mut items = div().flex().flex_col().gap_0();
         for (index, item) in rows.iter().copied().enumerate() {
             if item == SidebarItem::Divider {
                 items = items.child(div().mx_2().my_1().h(px(1.0)).bg(theme.border.opacity(0.5)));
                 continue;
             }
-            let active = menu.selected == Some(index);
-            let color = if item.destructive() {
-                theme.alert
-            } else {
-                theme.panel_fg
-            };
-            let label = item.label(paths, scoped).to_string();
+            let parent = item == SidebarItem::QuickActions;
+            // The parent row keeps its pill while the flyout is out, so the
+            // pointer can see which row the flyout belongs to.
+            let active = menu.selected == Some(index)
+                || (parent && menu.quick_open && menu.quick_selected.is_none());
             items = items.child(
-                div()
-                    .id(format!("pilus-sidebar-menu-{index}"))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .h(px(26.0))
-                    .px_2()
-                    .radius_md()
-                    .cursor_pointer()
-                    .state_fill(
-                        if active {
-                            theme.panel
-                        } else {
-                            theme.window_bg.opacity(0.0)
-                        },
-                        theme.panel,
-                        style::RADIUS_MD,
-                    )
-                    .text_size(px(self.chrome_font()))
-                    .text_color(color)
-                    .child(icon(sidebar_menu_icon(item), 15.0, color))
-                    .child(div().flex_1().min_w_0().truncate().child(label))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.run_context_item(item, cx);
-                    })),
+                self.context_menu_row(
+                    format!("pilus-sidebar-menu-{index}"),
+                    item,
+                    active,
+                    paths,
+                    scoped,
+                )
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if !*hovered {
+                        return;
+                    }
+                    // Hovering the parent row slides the flyout out;
+                    // hovering any other row folds it away.
+                    let Some(menu) = this.context_menu.as_mut() else {
+                        return;
+                    };
+                    if menu.quick_open != parent || menu.quick_selected.is_some() {
+                        menu.quick_open = parent;
+                        menu.quick_selected = None;
+                        cx.notify();
+                    }
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.run_context_item(item, cx);
+                })),
             );
         }
 
@@ -11728,6 +11802,59 @@ impl PilusView {
                 cx.listener(|_, _, _, cx| cx.stop_propagation()),
             );
 
+        // The Quick Actions flyout sits beside the panel, level with its
+        // parent row, and flips to the left edge when the right has no room.
+        let flyout = rows
+            .iter()
+            .position(|item| *item == SidebarItem::QuickActions)
+            .filter(|_| !quick_rows.is_empty())
+            .map(|parent| {
+                let fly_width = 168.0f32;
+                let gap = 2.0f32;
+                let mut fly_left = left + width + gap;
+                if fly_left + fly_width + 8.0 > viewport_width {
+                    fly_left = (left - fly_width - gap).max(8.0);
+                }
+                let fly_height = sidebar_menu::panel_height(&quick_rows);
+                let fly_top = (top + sidebar_menu::row_offset(&rows, parent) - 5.0)
+                    .min(viewport_height - fly_height - 8.0)
+                    .max(8.0);
+                let mut fly_items = div().flex().flex_col().gap_0();
+                for (index, item) in quick_rows.iter().copied().enumerate() {
+                    fly_items = fly_items.child(
+                        self.context_menu_row(
+                            format!("pilus-sidebar-quick-{index}"),
+                            item,
+                            menu.quick_selected == Some(index),
+                            paths,
+                            scoped,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.run_context_item(item, cx);
+                        })),
+                    );
+                }
+                div()
+                    .absolute()
+                    .left(px(fly_left))
+                    .top(px(fly_top))
+                    .w(px(fly_width))
+                    .radius_md()
+                    .bg(theme.sidebar_bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .p_1()
+                    .child(fly_items)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+            });
+
         style::enter(
             "pilus-context-menu-enter",
             div()
@@ -11738,6 +11865,7 @@ impl PilusView {
                 .bottom(px(0.0))
                 .occlude()
                 .child(panel)
+                .children(flyout)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {

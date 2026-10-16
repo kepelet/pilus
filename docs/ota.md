@@ -201,6 +201,13 @@ Three layers, weakest first:
    in its environment drops the public key and verifies best-effort, so it
    installs an unsigned preview. A client launched without it stays fail-closed.
 
+   `LOCAL=true just preview-feed http://<host>:8000` also skips notarization
+   while packaging, so a throwaway build for another machine does not wait on
+   Apple. It is still minisign signed, so the client needs no waiver. An app
+   installed by hand with a quarantine flag needs
+   `xattr -dr com.apple.quarantine` on it. `package-dmg` and `release-stable`
+   ignore it.
+
 ## Daemon compatibility
 
 The OTA feed carries no protocol gate by design: `pilus` and `luvus` are

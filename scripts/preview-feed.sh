@@ -32,6 +32,12 @@
 #                         scripts/package-macos-dmg.sh first.
 #   MINISIGN_SECRET_KEY   Forwarded to the packaging script; a `.minisig`
 #                         sidecar is copied and referenced when present.
+#   LOCAL=true            Developer waiver for a quick test on another machine:
+#                         packaging skips notarization (slow, rate limited).
+#                         The DMG is still Developer ID and minisign signed, so
+#                         a client verifies it normally. Hand-installing it
+#                         may need the quarantine flag cleared. Only this
+#                         script honours it; `package-dmg` (stable) never does.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -72,6 +78,14 @@ case "$base_url" in
         ;;
 esac
 
+# Translated here, not read by the packaging script, so a stable `package-dmg`
+# run can never pick the waiver up from the environment.
+local_package=""
+if [ "${LOCAL:-}" = "true" ]; then
+    local_package=1
+    echo "preview-feed: LOCAL=true, skipping notarization" >&2
+fi
+
 if [ "${SKIP_PACKAGE:-}" != "1" ]; then
     # Stamp the synthetic version into the build so the bundled app reports it,
     # and pin the channel so this app keeps following the preview feed no
@@ -80,6 +94,7 @@ if [ "${SKIP_PACKAGE:-}" != "1" ]; then
         PILUS_BUILD_CHANNEL=preview \
         PILUS_APP_NAME="${PILUS_APP_NAME:-pilus (Nightly)}" \
         PILUS_BUNDLE_ID="${PILUS_BUNDLE_ID:-pilus.kepelet.com.nightly}" \
+        PILUS_PACKAGE_LOCAL="$local_package" \
         ./scripts/package-macos-dmg.sh
 else
     echo "note: reusing an existing DMG; its embedded build version may differ" >&2

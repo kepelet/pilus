@@ -21,6 +21,10 @@
 #                             is submitted for notarization and stapled.
 #   MINISIGN_SECRET_KEY       path to a minisign secret key; each DMG gets a
 #                             `<asset>.minisig` sidecar for signature checks.
+#   PILUS_PACKAGE_LOCAL=1     Skip notarization (slow, rate limited); signing
+#                             is unchanged. Set by preview-feed.sh for
+#                             `LOCAL=true`; never read from `LOCAL` here, so
+#                             stable packaging cannot opt out by accident.
 #   MINISIGN_SECRET_KEY_CONTENT
 #                             the same key as text (both lines of the key
 #                             file), for when it lives in an encrypted env
@@ -75,7 +79,7 @@ if [ -n "${APPLE_DEVELOPER_IDENTITY:-}" ]; then
     codesign --force --timestamp --sign "$APPLE_DEVELOPER_IDENTITY" "$dmg"
 fi
 
-if [ -n "${NOTARY_PROFILE:-}" ]; then
+if [ -n "${NOTARY_PROFILE:-}" ] && [ "${PILUS_PACKAGE_LOCAL:-}" != "1" ]; then
     # Gatekeeper trusts the update only when the bundle is notarized.
     xcrun notarytool submit "$dmg" --keychain-profile "$NOTARY_PROFILE" --wait
     xcrun stapler staple "$dmg"

@@ -15160,6 +15160,9 @@ fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
         SidebarItem::NewFile => include_bytes!("../../assets/icons/file-plus.svg"),
         SidebarItem::NewFolder => include_bytes!("../../assets/icons/folder-plus.svg"),
         SidebarItem::Upload => include_bytes!("../../assets/icons/upload.svg"),
+        SidebarItem::Download | SidebarItem::DownloadArchive => {
+            include_bytes!("../../assets/icons/download.svg")
+        }
         SidebarItem::Delete => include_bytes!("../../assets/icons/trash-2.svg"),
         SidebarItem::CopySelection => include_bytes!("../../assets/icons/copy.svg"),
         SidebarItem::Paste => include_bytes!("../../assets/icons/clipboard.svg"),

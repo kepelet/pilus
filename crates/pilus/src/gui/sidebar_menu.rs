@@ -94,6 +94,10 @@ pub enum Item {
     NewFolder,
     /// Pick local files to upload into the folder the menu is on.
     Upload,
+    /// Save the file the menu is on to this machine.
+    Download,
+    /// Save the folder the menu is on to this machine as a `.tar.gz`.
+    DownloadArchive,
     /// Delete a file, or a folder and its contents. Destructive.
     Delete,
     /// Send the clipboard to the focused pane.
@@ -163,6 +167,8 @@ impl Item {
             Self::NewFile => "New File",
             Self::NewFolder => "New Folder",
             Self::Upload => "Upload Files…",
+            Self::Download => "Download…",
+            Self::DownloadArchive => "Download as Archive…",
             Self::Delete => "Delete",
             Self::CopySelection => "Copy",
             Self::Paste => "Paste",
@@ -266,7 +272,7 @@ impl SidebarMenu {
             MenuTarget::Agent { .. } => agent_rows(),
             MenuTarget::Terminal { selection, agent } => terminal_rows(*selection, *agent),
             MenuTarget::Github => github_rows(),
-            MenuTarget::File { root, .. } => file_rows(*root),
+            MenuTarget::File { root, dir, .. } => file_rows(*root, *dir),
         }
     }
 
@@ -376,11 +382,16 @@ fn terminal_rows(selection: bool, agent: bool) -> Vec<Item> {
 /// A tree entry's rows: where to add, what to do to the entry, then the one
 /// destructive row alone at the end. The root keeps only the rows that make
 /// sense for the folder the tree is showing.
-fn file_rows(root: bool) -> Vec<Item> {
+fn file_rows(root: bool, dir: bool) -> Vec<Item> {
     let mut items = vec![Item::NewFile, Item::NewFolder, Item::Upload, Item::Divider];
     if !root {
         items.push(Item::Rename);
     }
+    items.push(if dir {
+        Item::DownloadArchive
+    } else {
+        Item::Download
+    });
     items.push(Item::CopyPath);
     if !root {
         items.extend([Item::Divider, Item::Delete]);
@@ -491,7 +502,7 @@ mod tests {
 
     #[test]
     fn the_trees_root_cannot_be_renamed_or_deleted() {
-        let root = file_rows(true);
+        let root = file_rows(true, true);
         assert_eq!(
             root,
             vec![
@@ -499,14 +510,23 @@ mod tests {
                 Item::NewFolder,
                 Item::Upload,
                 Item::Divider,
+                Item::DownloadArchive,
                 Item::CopyPath
             ]
         );
-        let entry = file_rows(false);
+        let entry = file_rows(false, false);
         assert!(entry.contains(&Item::Rename));
         assert_eq!(entry.last(), Some(&Item::Delete));
         assert_eq!(entry[entry.len() - 2], Item::Divider);
         assert!(Item::Delete.destructive());
+    }
+
+    #[test]
+    fn a_folder_downloads_as_an_archive_and_a_file_as_itself() {
+        assert!(file_rows(false, true).contains(&Item::DownloadArchive));
+        assert!(!file_rows(false, true).contains(&Item::Download));
+        assert!(file_rows(false, false).contains(&Item::Download));
+        assert!(!file_rows(false, false).contains(&Item::DownloadArchive));
     }
 
     #[test]

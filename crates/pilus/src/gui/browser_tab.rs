@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use gpui::{Context, Div, Entity, MouseButton, Stateful, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, Div, Entity, MouseButton, Stateful, Window, div, prelude::*, px};
 use gpui_wry::WebView;
 use wry::{NewWindowResponse, PageLoadEvent, WebViewBuilder};
 
@@ -30,6 +30,10 @@ enum Event {
 }
 
 type Events = Arc<Mutex<Vec<Event>>>;
+
+/// Space between the page's frame and the column's edges. The frame's left
+/// edge also leaves the resize handle (the strip beside it) just reachable.
+const FRAME_GUTTER: f32 = 4.0;
 
 fn push(events: &Events, event: Event) {
     if let Ok(mut queue) = events.lock() {
@@ -444,26 +448,36 @@ impl PilusView {
             // While the column moves the webview is hidden, so the body is
             // left empty rather than showing a stale frame.
             //
-            // The native view paints above GPUI and takes the mouse, so it
-            // leaves the resize handle's strip bare; filling the column would
-            // bury the handle and the column could not be dragged.
-            Some(view) if self.browser_on_screen() => page.child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .pl(px(if self.right.expanded() {
-                        0.0
-                    } else {
-                        super::right_sidebar::HANDLE_WIDTH
-                    }))
-                    .child(view),
-            ),
-            Some(_) => page.child(div().flex_1()),
+            // The native view paints above GPUI and takes the mouse, so the
+            // frame's gutter keeps it off the resize handle's strip; filling
+            // the column would bury the handle and the column could not be
+            // dragged.
+            Some(view) if self.browser_on_screen() => page.child(self.browser_frame(Some(view))),
+            Some(_) => page.child(self.browser_frame(None)),
             None => page.child(
                 self.diff_message("Type an address above. Dev servers on localhost open here too."),
             ),
         }
+    }
+
+    /// The bordered area the page sits in, inset by a small gutter so the page
+    /// reads as content in a frame. Square, since GPUI cannot clip a native
+    /// view to rounded corners.
+    fn browser_frame(&self, page: Option<Entity<WebView>>) -> Div {
+        div()
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .px(px(FRAME_GUTTER))
+            .py(px(FRAME_GUTTER))
+            .child(
+                div()
+                    .size_full()
+                    .border_1()
+                    .border_color(self.theme.border)
+                    .overflow_hidden()
+                    .children(page),
+            )
     }
 
     /// Back, forward and reload beside the address bar.
@@ -479,13 +493,33 @@ impl PilusView {
                 px(fonts.body),
             );
         });
+        // Edited, the field scrolls to the caret; at rest a long address
+        // is cut short with an ellipsis instead of running past the box.
+        let address: AnyElement = if self.browser_panel.editing {
+            self.browser_input.clone().into_any_element()
+        } else {
+            let shown = self.browser_panel.url.clone();
+            div()
+                .truncate()
+                .text_color(if shown.is_empty() {
+                    theme.muted
+                } else {
+                    theme.fg
+                })
+                .child(if shown.is_empty() {
+                    "Search or enter address".to_string()
+                } else {
+                    shown
+                })
+                .into_any_element()
+        };
         let field = style::search_field(
             "pilus-browser-address",
             self.browser_panel.editing,
             theme,
             height,
             fonts.secondary,
-            self.browser_input.clone(),
+            address,
         )
         .flex_1()
         .min_w(px(0.0))

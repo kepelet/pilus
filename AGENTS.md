@@ -39,7 +39,7 @@ with only the command-line tools can build the app.
   appearance, so a light-mode Mac still frosts dark under the chrome.
 
 - The GitHub Repositories section reads the signed-in account through `gh` on
-  the machine `pilus` runs on, never through a daemon or SSH. It shows five
+  the machine `pilus` runs on, never through a daemon or SSH. It shows three
   repositories: `Settings::github_pinned` first, then the most recently pushed
   to. Every list, and each repository's issues, pull requests and workflow
   runs, goes through `pilus_client::GhAccount`'s cache (fresh lists are free,

@@ -409,6 +409,36 @@ pub fn run() -> Result<()> {
         cx.update(|app| view.update(app, |view, cx| view.files_show_sample(cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "files-tab")?;
+        // Files dragged in from outside, held over the `src` folder: its row
+        // wears a ring and the header says where a release would land.
+        {
+            use gpui::{ExternalPaths, FileDropEvent, InputEvent as _};
+            let paths =
+                ExternalPaths(std::iter::once(std::path::PathBuf::from("/tmp/a.txt")).collect());
+            let first = point(px(859.0), px(150.0));
+            let mut moves = vec![FileDropEvent::Entered {
+                position: first,
+                paths,
+            }];
+            // Sweep down the tree as a hand would, and stop on `src`.
+            moves.extend((150..=198).step_by(4).map(|y| FileDropEvent::Pending {
+                position: point(px(859.0), px(y as f32)),
+            }));
+            for event in moves {
+                cx.update_window(window.into(), |_, window, app| {
+                    window.dispatch_event(event.to_platform_input(), app);
+                })
+                .ok();
+                settle(&mut cx, 1);
+            }
+            settle(&mut cx, 6);
+            capture(&mut cx, window.into(), "files-tab-drop")?;
+            cx.update_window(window.into(), |_, window, app| {
+                window.dispatch_event(FileDropEvent::Exited.to_platform_input(), app);
+            })
+            .ok();
+            settle(&mut cx, 6);
+        }
         // The tree's right-click menu on a file, then its delete confirm and
         // its rename prompt.
         let file = "/work/pilus/crates/pilus-client/src/lib.rs";

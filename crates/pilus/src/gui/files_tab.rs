@@ -37,20 +37,21 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, ExternalPaths, ListAlignment, ListState, MouseButton,
-    MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString, div, list, prelude::*, px,
-    relative,
+    AnyElement, ClickEvent, Context, Div, DragMoveEvent, ExternalPaths, ListAlignment, ListState,
+    MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString, div, list,
+    prelude::*, px, relative,
 };
 use pilus_client::{
     ControlClient, Error, FileChanges, FileRow, FileTree, OpenTarget, SshTarget, TextFile, Version,
-    create_entry, delete_entry, parent_of, read_text, rename_entry, upload_file, visible_rows,
+    archive_name, create_entry, delete_entry, download_path, parent_of, read_text, rename_entry,
+    upload_path, visible_rows,
 };
 
 use super::diff::status_glyph;
 use super::md_view::{self, MdDoc, Page};
 use super::right_sidebar::SidebarTab;
 use super::sidebar_menu::{Item, MenuTarget};
-use super::style::{self, TreeEntry, TreeMark};
+use super::style::{self, RadiusExt as _, TreeEntry, TreeMark};
 use super::toast::ToastKind;
 use super::{EndpointId, PilusView, PromptAction, icon};
 
@@ -104,6 +105,8 @@ pub(super) enum FilesMsg {
         endpoint: EndpointId,
         outcome: Upload,
     },
+    /// A download finished: the path it was saved to, or why it was not.
+    Downloaded { result: Result<PathBuf, String> },
     Edited {
         endpoint: EndpointId,
         result: Result<Edit, String>,
@@ -163,6 +166,8 @@ fn moved(path: &str, from: &str, to: &str) -> Option<String> {
 pub(super) struct Upload {
     stored: Vec<String>,
     failed: Vec<String>,
+    /// The folder they went into, by name, so a toast says where.
+    into: String,
 }
 
 impl Upload {
@@ -170,10 +175,14 @@ impl Upload {
     /// an error line for what did not.
     fn toasts(&self) -> Vec<(ToastKind, String)> {
         let mut toasts = Vec::new();
+        let into = &self.into;
         match self.stored.as_slice() {
             [] => {}
-            [name] => toasts.push((ToastKind::Success, format!("Uploaded {name}"))),
-            many => toasts.push((ToastKind::Success, format!("Uploaded {} files", many.len()))),
+            [name] => toasts.push((ToastKind::Success, format!("Uploaded {name} to {into}"))),
+            many => toasts.push((
+                ToastKind::Success,
+                format!("Uploaded {} items to {into}", many.len()),
+            )),
         }
         if !self.failed.is_empty() {
             toasts.push((ToastKind::Error, self.failed.join("\n")));
@@ -258,9 +267,23 @@ pub(super) struct FilesPanel {
     sent: u32,
     applied: u32,
     last_poll: Option<Instant>,
+    /// Where files being dragged over the tab would land, and when the
+    /// pointer last said so.
+    drop_hint: Option<DropHint>,
     tx: Sender<FilesMsg>,
     rx: Receiver<FilesMsg>,
 }
+
+/// The folder an external drag is over: `None` for the tree's root.
+struct DropHint {
+    dir: Option<String>,
+    at: Instant,
+}
+
+/// How long a pointer report keeps the drop hint up. Only a guard against a
+/// drag some other part of the window owns; an external drag reports every
+/// few milliseconds while it is over the tab.
+const DROP_HINT_LIFE: Duration = Duration::from_millis(600);
 
 impl FilesPanel {
     pub(super) fn new() -> Self {
@@ -282,9 +305,28 @@ impl FilesPanel {
             sent: 0,
             applied: 0,
             last_poll: None,
+            drop_hint: None,
             tx,
             rx,
         }
+    }
+
+    /// Note that an external drag is over `dir` (the root when `None`).
+    /// True when that moves the hint, so the tab needs a repaint.
+    fn hint_drop(&mut self, dir: Option<String>) -> bool {
+        let moved = self.drop_hint.as_ref().is_none_or(|hint| hint.dir != dir);
+        self.drop_hint = Some(DropHint {
+            dir,
+            at: Instant::now(),
+        });
+        moved
+    }
+
+    /// The folder the drag in flight is over, while one is: `Some(None)` is
+    /// the root.
+    fn dropping_into(&self, dragging: bool) -> Option<Option<&str>> {
+        let hint = self.drop_hint.as_ref()?;
+        (dragging && hint.at.elapsed() < DROP_HINT_LIFE).then_some(hint.dir.as_deref())
     }
 
     /// Ask for a fresh read the next time the tab polls, such as when it
@@ -534,6 +576,18 @@ impl PilusView {
                     // Show what landed without waiting for the next poll.
                     self.files_request(Prelude::Refresh);
                 }
+                FilesMsg::Downloaded { result } => {
+                    changed = true;
+                    match result {
+                        Ok(saved) => {
+                            let name = saved
+                                .file_name()
+                                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                            self.toast(ToastKind::Success, format!("Downloaded {name}"));
+                        }
+                        Err(error) => self.toast(ToastKind::Error, error),
+                    }
+                }
                 FilesMsg::Edited { endpoint, result } => {
                     changed = true;
                     match result {
@@ -748,6 +802,21 @@ impl PilusView {
                 return;
             }
         };
+        // A folder over SSH takes a moment; say the drop was heard, and where
+        // it landed, since a drop onto a row is easy to mis-aim.
+        let into = base_name(&dir).to_string();
+        self.toast(
+            ToastKind::Info,
+            match paths.as_slice() {
+                [] => "Nothing to upload".to_string(),
+                [one] => format!(
+                    "Uploading {} to {into}…",
+                    one.file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                ),
+                many => format!("Uploading {} items to {into}…", many.len()),
+            },
+        );
         let tx = self.files_panel.tx.clone();
         std::thread::spawn(move || {
             let outcome = upload_all(target.as_ref(), &paths, &dir);
@@ -845,8 +914,49 @@ impl PilusView {
                 };
                 self.files_pick_upload(Some(into), cx);
             }
+            Item::Download | Item::DownloadArchive => {
+                self.files_pick_download(endpoint, path.clone(), *dir, cx);
+            }
             _ => {}
         }
+    }
+
+    /// Ask where to save `path` and fetch it there: the file itself, or a
+    /// `.tar.gz` for a folder. The copy runs off the GUI thread.
+    fn files_pick_download(
+        &mut self,
+        endpoint: EndpointId,
+        path: String,
+        dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match self.read_target(&endpoint) {
+            Ok(target) => target,
+            Err(error) => {
+                self.toast(ToastKind::Error, error);
+                cx.notify();
+                return;
+            }
+        };
+        let name = base_name(&path).to_string();
+        let suggested = if dir { archive_name(&name) } else { name };
+        let start = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Downloads"))
+            .filter(|downloads| downloads.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let chosen = cx.prompt_for_new_path(&start, Some(&suggested));
+        let tx = self.files_panel.tx.clone();
+        cx.spawn(async move |_, _| {
+            let Ok(Ok(Some(destination))) = chosen.await else {
+                return;
+            };
+            std::thread::spawn(move || {
+                let result =
+                    download_path(target.as_ref(), &path, dir, &destination).map(|()| destination);
+                tx.send(FilesMsg::Downloaded { result }).ok();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn files_create(
@@ -980,13 +1090,37 @@ impl PilusView {
         });
     }
 
-    /// The tab: the tree, or the open document, with files dropped on it
-    /// uploaded to the root.
+    /// The tab: the tree, or the open document, with files and folders dropped
+    /// on it uploaded to the root.
     pub(super) fn files_page(&mut self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let on_drop = cx.listener(|this, paths: &ExternalPaths, _, cx| {
+            this.files_panel.drop_hint = None;
+            this.files_upload(paths.paths().to_vec(), None, cx);
+            cx.notify();
+        });
+        // Rows report after the panel (they are in front of it), so a row's
+        // folder replaces the root within the same move.
+        let on_move = cx.listener(|this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+            if event.bounds.contains(&event.event.position) && this.files_panel.hint_drop(None) {
+                cx.notify();
+            }
+        });
         if self.files_panel.doc.is_some() {
-            return self.files_doc_page(cx);
+            // A preview replaces the tree, but a drop still has a place to go.
+            let hint = theme.panel_dim;
+            return div().size_full().min_h(px(0.0)).child(
+                div()
+                    .id("pilus-files-doc-drop")
+                    .size_full()
+                    .min_h(px(0.0))
+                    .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(hint))
+                    .on_drag_move(on_move)
+                    .on_drop(on_drop)
+                    .child(self.files_doc_page(cx)),
+            );
         }
-        let edge = self.theme.border_focus;
+        let edge = theme.border_focus;
         let tree = self.files_tree_page(cx);
         div().size_full().min_h(px(0.0)).child(
             div()
@@ -994,12 +1128,10 @@ impl PilusView {
                 .size_full()
                 .min_h(px(0.0))
                 .border_1()
-                .border_color(self.theme.panel.opacity(0.0))
+                .border_color(theme.panel.opacity(0.0))
                 .drag_over::<ExternalPaths>(move |style, _, _, _| style.border_color(edge))
-                .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                    this.files_upload(paths.paths().to_vec(), None, cx);
-                    cx.notify();
-                }))
+                .on_drag_move(on_move)
+                .on_drop(on_drop)
                 // Rows stop the press, so this is the blank area and the header.
                 .on_mouse_down(
                     MouseButton::Right,
@@ -1011,6 +1143,21 @@ impl PilusView {
                 )
                 .child(tree),
         )
+    }
+
+    /// While files are dragged over the tab, the line saying where they would
+    /// land: the folder under the pointer, or the tree's root.
+    fn files_drop_label(&self, cx: &Context<Self>) -> Option<String> {
+        let into = self.files_panel.dropping_into(cx.has_active_drag())?;
+        let name = match into {
+            Some(dir) => base_name(dir),
+            None => self
+                .files_panel
+                .tree
+                .as_ref()
+                .map_or("the root", |tree| base_name(&tree.root)),
+        };
+        Some(format!("Drop to upload into {name}"))
     }
 
     /// The host and root above the file tree.
@@ -1186,6 +1333,7 @@ impl PilusView {
             .as_ref()
             .map(|tree| self.shorten_cwd(&self.active.key(), &tree.root))
             .unwrap_or_default();
+        let dropping = self.files_drop_label(cx);
         let refresh = self
             .diff_icon_button(
                 "pilus-files-refresh",
@@ -1246,9 +1394,17 @@ impl PilusView {
             .items_center()
             .gap_2()
             .child(icon(
-                include_bytes!("../../assets/icons/folder.svg"),
+                if dropping.is_some() {
+                    include_bytes!("../../assets/icons/upload.svg")
+                } else {
+                    include_bytes!("../../assets/icons/folder.svg")
+                },
                 fonts.body,
-                theme.muted,
+                if dropping.is_some() {
+                    theme.panel_fg
+                } else {
+                    theme.muted
+                },
             ))
             .child(
                 div()
@@ -1256,8 +1412,12 @@ impl PilusView {
                     .min_w(px(0.0))
                     .truncate()
                     .text_size(px(fonts.secondary))
-                    .text_color(theme.muted)
-                    .child(root),
+                    .text_color(if dropping.is_some() {
+                        theme.panel_fg
+                    } else {
+                        theme.muted
+                    })
+                    .child(dropping.unwrap_or(root)),
             );
         div()
             .flex()
@@ -1293,6 +1453,7 @@ impl PilusView {
             mark: self.files_mark(row),
         };
         let row = row.clone();
+        let path = row.path.clone();
         let menu_entry = (row.path.clone(), row.dir);
         let tree = style::tree_row(
             SharedString::from(format!("pilus-files-row-{}", row.path)),
@@ -1300,12 +1461,23 @@ impl PilusView {
             self.theme,
             &self.shared_settings,
         )
+        .on_drag_move(cx.listener({
+            let (dir, path) = (row.dir, row.path.clone());
+            move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                if event.bounds.contains(&event.event.position)
+                    && this.files_panel.hint_drop(dir.then(|| path.clone()))
+                {
+                    cx.notify();
+                }
+            }
+        }))
         .on_drop(cx.listener({
             let (dir, path) = (row.dir, row.path.clone());
             move |this, paths: &ExternalPaths, _, cx| {
                 // A file row has no inside: the drop falls through to the tab,
                 // which uploads to the root.
                 let into = dir.then(|| path.clone());
+                this.files_panel.drop_hint = None;
                 this.files_upload(paths.paths().to_vec(), into, cx);
                 cx.notify();
             }
@@ -1337,6 +1509,24 @@ impl PilusView {
                 this.files_click_file(&row, target, cx);
             }
             cx.notify();
+        }));
+        // The folder the drag would drop into wears a ring. It is a layer over
+        // the row, so the row's own geometry does not move while it shows.
+        let targeted = self
+            .files_panel
+            .dropping_into(cx.has_active_drag())
+            .flatten()
+            .is_some_and(|dir| dir == path);
+        let tree = tree.relative().children(targeted.then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .radius_md()
+                .border_1()
+                .border_color(self.theme.border_focus)
         }));
         // The list lays an item out at its content width; the column gives
         // the row's margin-based indent a width to stretch into.
@@ -1396,9 +1586,12 @@ impl PilusView {
 /// Upload each of `paths` into `dir`, collecting what went through and what
 /// did not rather than stopping at the first failure.
 fn upload_all(target: Option<&SshTarget>, paths: &[PathBuf], dir: &str) -> Upload {
-    let mut outcome = Upload::default();
+    let mut outcome = Upload {
+        into: base_name(dir).to_string(),
+        ..Upload::default()
+    };
     for path in paths {
-        match upload_file(target, path, dir) {
+        match upload_path(target, path, dir) {
             Ok(name) => outcome.stored.push(name),
             Err(error) => outcome.failed.push(error),
         }
@@ -1592,19 +1785,21 @@ mod tests {
         let one = Upload {
             stored: names(&["a.txt"]),
             failed: Vec::new(),
+            into: "src".to_string(),
         };
         assert_eq!(
             one.toasts(),
-            vec![(ToastKind::Success, "Uploaded a.txt".to_string())]
+            vec![(ToastKind::Success, "Uploaded a.txt to src".to_string())]
         );
         let mixed = Upload {
             stored: names(&["a.txt", "b.txt"]),
             failed: names(&["c.txt already exists", "d.txt: denied"]),
+            into: "src".to_string(),
         };
         assert_eq!(
             mixed.toasts(),
             vec![
-                (ToastKind::Success, "Uploaded 2 files".to_string()),
+                (ToastKind::Success, "Uploaded 2 items to src".to_string()),
                 (
                     ToastKind::Error,
                     "c.txt already exists\nd.txt: denied".to_string()

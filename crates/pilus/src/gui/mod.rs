@@ -22,10 +22,10 @@ mod dock;
 mod files_tab;
 mod fonts;
 mod git_tab;
-mod home_issues;
 mod glass;
 mod highlight;
 mod home;
+mod home_issues;
 mod keys;
 mod machines;
 mod markdown;
@@ -71,14 +71,12 @@ use crate::update::{UpdateChannel, UpdateRequest, describe_source};
 use automations::AutomationsPanel;
 use browser_tab::{BrowserPanel, PageEdit};
 use crossterm::event::{
-    KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent,
-    MouseEventKind,
+    KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent, MouseEventKind,
 };
 use diff::{DiffInputs, DiffPanel};
 use dock::Dock;
 use files_tab::FilesPanel;
 use git_tab::GitPanel;
-use home_issues::HomeIssues;
 use glass::Glass;
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DispatchPhase,
@@ -92,6 +90,7 @@ use gpui::{
 use gpui_platform::application;
 use gpui_updater_core::{Release, UpdateStatus, Version};
 use home::{HomeField, HomeFocus, HomePanel};
+use home_issues::HomeIssues;
 use machines::MachineOp;
 use menubar::MenuBar;
 use mission::MissionPanel;
@@ -213,6 +212,11 @@ const SHEEN_HEIGHT: f32 = 0.32;
 const SIDEBAR_TOGGLE_W: f32 = 28.0;
 /// Height of a tab pill in the top chrome.
 const TAB_HEIGHT: f32 = 26.0;
+/// Padding inside a pill, between its border and the buttons it holds.
+const PILL_PAD: f32 = 2.0;
+/// A button inside a pill: the tab height less the pill's border and padding.
+const PILL_BUTTON_H: f32 = TAB_HEIGHT - 2.0 - 2.0 * PILL_PAD;
+const PILL_BUTTON_W: f32 = SIDEBAR_TOGGLE_W - 4.0;
 /// Top-left of the traffic lights: their left edge shares the sidebar glyph
 /// column (row edge + row padding) and their 12px discs centre on the 20px
 /// midline of the sidebar header and tab strip.
@@ -245,50 +249,6 @@ const WINDOW_MIN_VISIBLE: (f32, f32) = (120.0, 40.0);
 const WINDOW_BACKDROP: WindowBackgroundAppearance = WindowBackgroundAppearance::Transparent;
 #[cfg(not(target_os = "macos"))]
 const WINDOW_BACKDROP: WindowBackgroundAppearance = WindowBackgroundAppearance::Blurred;
-
-/// Native sidebar destinations: live daemon data and bound views.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NavKind {
-    Automations,
-    Tasks,
-    Mission,
-    Orchestration,
-}
-
-impl NavKind {
-    /// All rows in sidebar order.
-    const ALL: [NavKind; 4] = [
-        NavKind::Automations,
-        NavKind::Tasks,
-        NavKind::Mission,
-        NavKind::Orchestration,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            NavKind::Automations => "Automations",
-            NavKind::Tasks => "Tasks",
-            NavKind::Mission => "Mission Control",
-            NavKind::Orchestration => "Orchestration",
-        }
-    }
-
-    /// Whether the row opens its page. Tasks, Mission Control, and
-    /// Orchestration are held back until their write actions are ready.
-    fn enabled(self) -> bool {
-        matches!(self, NavKind::Automations)
-    }
-
-    /// Vendored lucide glyph; tinted by the caller's text color.
-    fn icon(self) -> &'static [u8] {
-        match self {
-            NavKind::Automations => include_bytes!("../../assets/icons/clock.svg"),
-            NavKind::Tasks => include_bytes!("../../assets/icons/list-checks.svg"),
-            NavKind::Mission => include_bytes!("../../assets/icons/layout-panel-left.svg"),
-            NavKind::Orchestration => include_bytes!("../../assets/icons/workflow.svg"),
-        }
-    }
-}
 
 // Ratatui `Modifier` bits, as packed by the daemon.
 const M_BOLD: u16 = 1 << 0;
@@ -1716,10 +1676,6 @@ struct PilusView {
     theme_rx: Receiver<(EndpointId, pilus_client::Result<Appearance>)>,
     /// Sender half for the background theme refresh.
     theme_tx: Sender<(EndpointId, pilus_client::Result<Appearance>)>,
-    /// Optimistic nav pick: the row a click chose, before the daemon confirms.
-    nav_sel: Option<NavKind>,
-    /// When the optimistic pick was made, so stale picks age out.
-    nav_sel_at: Instant,
     /// Optimistic tab pick from a click, until `tab.list` confirms it.
     tab_sel: Option<u16>,
     /// When the optimistic tab pick was made, so stale picks age out.
@@ -2257,8 +2213,6 @@ impl PilusView {
             theme_refreshing: false,
             theme_rx,
             theme_tx,
-            nav_sel: None,
-            nav_sel_at: Instant::now(),
             tab_sel: None,
             tabs_cache: HashMap::new(),
             tabs_pick: None,
@@ -2645,9 +2599,7 @@ impl PilusView {
             tabs_changed = true;
             changed = true;
         }
-        if tabs_changed {
-            self.reconcile_nav();
-        }
+        if tabs_changed {}
         changed |= self.raise_attention(cx);
         // Drop the optimistic endpoint pick once the handoff commits (the
         // committed highlight needs no pick) or every stage of the switch has
@@ -3742,14 +3694,12 @@ impl PilusView {
         self.hover_cell = None;
         self.press_anchor = None;
         self.dragging = false;
-        self.nav_sel = None;
         self.tab_sel = None;
         self.tabs_pick = None;
         self.endpoint_sel = None;
         self.close_picker();
         // The swapped-in tabs carry their own active kind; follow it so the
         // nav rows highlight the surface that just took the window.
-        self.reconcile_nav();
         self.active_live = true;
         self.status = self.active_session();
         let adopted = self
@@ -10489,9 +10439,6 @@ impl PilusView {
             SIDEBAR_ROW_EDGE,
         ));
         content = content.child(self.open_workspace_row(cx));
-        for kind in NavKind::ALL {
-            content = content.child(self.nav_row(kind, cx));
-        }
 
         content = content.child(self.workspaces_section(cx));
         content = content.child(self.agents_section(cx));
@@ -10922,9 +10869,7 @@ impl PilusView {
         if self.right.openness() < 0.05 {
             tab_strip = tab_strip
                 .child(div().flex_1())
-                .child(self.right_browser_toggle(cx))
-                .child(self.right_ports_toggle(cx))
-                .child(self.right_sidebar_toggle(cx));
+                .child(self.right_toolbar(cx));
         }
         // An expanded right column covers the strip entirely.
         if self.right.expanded() && self.right.spread() >= 1.0 {
@@ -11238,40 +11183,37 @@ impl PilusView {
     fn session_picker(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
         let glass = self.glass_opacity();
-        div()
-            .id("pilus-session-button")
-            .occlude()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .h(px(TAB_HEIGHT))
-            .pl(px(6.0))
-            .pr_2()
-            .radius_soft()
-            .cursor_pointer()
-            .text_size(px(self.chrome_font()))
-            .hover_fill(theme.panel.opacity(glass), style::RADIUS_SOFT)
-            .child(
-                div().text_color(theme.panel_fg).child(
-                    self.settings
-                        .session_label(self.current_session_name())
-                        .to_string(),
-                ),
-            )
-            .child(icon(
-                include_bytes!("../../assets/icons/chevron-down.svg"),
-                12.0,
-                theme.muted,
-            ))
-            .on_click(cx.listener(|this, _, _, cx| {
-                if this.session_menu_open {
-                    this.close_session_menu();
-                } else {
-                    this.session_menu_open = true;
-                }
-                cx.notify();
-            }))
+        style::pill(
+            theme,
+            Some(theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT)),
+        )
+        .id("pilus-session-button")
+        .occlude()
+        .gap_2()
+        .h(px(TAB_HEIGHT))
+        .px_2()
+        .cursor_pointer()
+        .text_size(px(self.chrome_font()))
+        .child(
+            div().text_color(theme.panel_fg).child(
+                self.settings
+                    .session_label(self.current_session_name())
+                    .to_string(),
+            ),
+        )
+        .child(icon(
+            include_bytes!("../../assets/icons/chevron-down.svg"),
+            12.0,
+            theme.muted,
+        ))
+        .on_click(cx.listener(|this, _, _, cx| {
+            if this.session_menu_open {
+                this.close_session_menu();
+            } else {
+                this.session_menu_open = true;
+            }
+            cx.notify();
+        }))
     }
 
     /// The pencil on a session row. The label is pilus's own, so it works on
@@ -12450,57 +12392,6 @@ impl PilusView {
         self.active_session()
     }
 
-    /// The bound view holding focus, if any, from the daemon's tab kinds.
-    fn tab_view(&self) -> Option<NavKind> {
-        match self.tabs.iter().find(|tab| tab.active)?.kind.as_str() {
-            "mission" => Some(NavKind::Mission),
-            "orch" => Some(NavKind::Orchestration),
-            _ => None,
-        }
-    }
-
-    /// The view a nav row opens: data rows deep-link to their board.
-    fn nav_view(kind: NavKind) -> NavKind {
-        match kind {
-            NavKind::Automations | NavKind::Mission => NavKind::Mission,
-            NavKind::Tasks | NavKind::Orchestration => NavKind::Orchestration,
-        }
-    }
-
-    /// Whether a nav row reads active: the optimistic pick wins while fresh,
-    /// then yields to whatever the daemon actually focused. Exactly one row
-    /// ever lights, so a click never sprays the highlight across the menu.
-    fn nav_active(&self, kind: NavKind) -> bool {
-        if self.tasks_panel.is_open() {
-            return kind
-                == match self.tasks_panel.layout() {
-                    TaskLayout::List => NavKind::Tasks,
-                    TaskLayout::Board => NavKind::Orchestration,
-                };
-        }
-        if self.mission.is_open() {
-            return kind == NavKind::Mission;
-        }
-        if self.automations_page.is_open() {
-            return kind == NavKind::Automations;
-        }
-        if self.nav_sel != Some(kind) {
-            return false;
-        }
-        self.nav_sel_at.elapsed() < Duration::from_secs(3)
-            || self.tab_view() == Some(Self::nav_view(kind))
-    }
-
-    /// Follow the daemon when it navigates on its own (chords typed in a pane).
-    fn reconcile_nav(&mut self) {
-        if let Some(view) = self.tab_view()
-            && self.nav_sel.is_none_or(|sel| Self::nav_view(sel) != view)
-        {
-            self.nav_sel = Some(view);
-            self.nav_sel_at = Instant::now();
-        }
-    }
-
     /// An "Open Workspace" action above the nav rows.
     ///
     /// It opens the same folder picker as the Cmd+Shift+O chord. The picker is
@@ -12538,56 +12429,6 @@ impl PilusView {
             self.open_home(cx);
         }
         cx.notify();
-    }
-
-    /// One sidebar destination: lucide glyph, label, live badge, chord click.
-    fn nav_row(&self, kind: NavKind, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let active = self.nav_active(kind);
-        let selected = active;
-        let badge = match kind {
-            NavKind::Automations => Some(self.automations.enabled.to_string()),
-            NavKind::Tasks => Some(self.tasks.open.to_string()),
-            NavKind::Mission | NavKind::Orchestration => None,
-        };
-        let badge = match badge {
-            Some(text) => div()
-                .text_size(px(self.section_font()))
-                .text_color(theme.muted)
-                .child(text),
-            None => div(),
-        };
-        let label = div().flex_1();
-        let enabled = kind.enabled();
-        div()
-            .id(format!("pilus-nav-{}", kind.label()))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(SIDEBAR_GLYPH_GAP))
-            .h(px(SIDEBAR_ROW_HEIGHT))
-            .pl(px(SIDEBAR_ROW_PAD))
-            // The badge keeps the row's content inset, so it reads as a
-            // column rather than a number touching the panel edge.
-            .pr(px(SIDEBAR_ROW_PAD))
-            .radius_md()
-            .text_size(px(self.chrome_font()))
-            .text_color(theme.panel_fg)
-            .when(enabled, |row| row.cursor_pointer())
-            .when(!enabled, |row| row.opacity(style::DISABLED_OPACITY))
-            .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
-            .children(enabled.then(|| style::hover_target(&self.sidebar_hover)))
-            .child(icon(kind.icon(), SIDEBAR_GLYPH, theme.muted))
-            .child(label.child(kind.label().to_string()))
-            .child(badge)
-            .when(enabled, |row| {
-                row.on_click(cx.listener(move |this, _, _, cx| match kind {
-                    NavKind::Tasks => this.open_tasks(cx),
-                    NavKind::Mission => this.open_mission(cx),
-                    NavKind::Automations => this.open_automations(cx),
-                    NavKind::Orchestration => this.open_orchestration(cx),
-                }))
-            })
     }
 
     /// One sidebar section header: collapse chevron, label, and hairline.

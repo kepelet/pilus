@@ -221,19 +221,6 @@ impl AutomationsPanel {
 }
 
 impl PilusView {
-    /// Open the page on the active endpoint.
-    pub(super) fn open_automations(&mut self, cx: &mut Context<Self>) {
-        self.leave_settings_page();
-        self.picker.close();
-        let active = self.active.clone();
-        let panel = &mut self.automations_page;
-        panel.follow(&active);
-        panel.open = true;
-        panel.in_flight = false;
-        panel.fetched_at = None;
-        cx.notify();
-    }
-
     /// Shot-harness entry point: open on canned rows, no daemon.
     #[cfg(feature = "visual-test")]
     pub(super) fn automations_show(

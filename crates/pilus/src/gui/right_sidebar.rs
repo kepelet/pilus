@@ -60,11 +60,8 @@ impl SidebarTab {
     /// The tabs the strip draws. Ports and Browser are opened by their own
     /// buttons, in the window's header while the column is closed and in the
     /// strip once open.
-    pub(super) const STRIP: [SidebarTab; 3] = [
-        SidebarTab::Diff,
-        SidebarTab::Git,
-        SidebarTab::Files,
-    ];
+    pub(super) const STRIP: [SidebarTab; 3] =
+        [SidebarTab::Diff, SidebarTab::Git, SidebarTab::Files];
 
     pub(super) fn wire(self) -> &'static str {
         match self {
@@ -655,11 +652,14 @@ impl PilusView {
             .items_center()
             .justify_center()
             .flex_shrink_0()
-            .h(px(super::TAB_HEIGHT))
-            .w(px(super::SIDEBAR_TOGGLE_W))
-            .radius_md()
+            .h(px(super::PILL_BUTTON_H))
+            .w(px(super::PILL_BUTTON_W))
+            .radius_sm()
             .cursor_pointer()
-            .hover_fill(theme.panel_dim, style::RADIUS_MD)
+            .hover_fill(
+                theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT),
+                style::RADIUS_SM,
+            )
             .tooltip(super::row_tooltip(
                 self.ports_tip(),
                 theme.panel_fg,
@@ -680,11 +680,14 @@ impl PilusView {
             .items_center()
             .justify_center()
             .flex_shrink_0()
-            .h(px(super::TAB_HEIGHT))
-            .w(px(super::SIDEBAR_TOGGLE_W))
-            .radius_md()
+            .h(px(super::PILL_BUTTON_H))
+            .w(px(super::PILL_BUTTON_W))
+            .radius_sm()
             .cursor_pointer()
-            .hover_fill(theme.panel_dim, style::RADIUS_MD)
+            .hover_fill(
+                theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT),
+                style::RADIUS_SM,
+            )
             .child(icon(
                 include_bytes!("../../assets/icons/panel-right.svg"),
                 14.0,
@@ -695,6 +698,18 @@ impl PilusView {
                 },
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx)))
+    }
+
+    /// Browser, Ports, and the sidebar toggle as one bordered pill at the strip's
+    /// far edge, each button raising its own fill on hover.
+    pub(super) fn right_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        style::pill(self.theme, None)
+            .occlude()
+            .p(px(super::PILL_PAD))
+            .flex_shrink_0()
+            .child(self.right_browser_toggle(cx))
+            .child(self.right_ports_toggle(cx))
+            .child(self.right_sidebar_toggle(cx))
     }
 
     /// The column: a tab strip over the open tab and its footer, with a drag
@@ -709,6 +724,7 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = self.theme;
+        let raise = theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT);
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let split = self.is_split();
         let expanded = self.right.expanded();
@@ -785,69 +801,74 @@ impl PilusView {
                         .on_click(cx.listener(move |this, _, _, cx| this.select_right_tab(tab, cx)))
                     })),
             )
-            .child(self.strip_browser_toggle(cx))
             .child(
-                div()
-                    .id("pilus-right-sidebar-ports")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(style::scaled(&self.shared_settings, 24.0)))
-                    .h(px(style::scaled(&self.shared_settings, 24.0)))
-                    .radius_md()
-                    .cursor_pointer()
-                    .hover_fill(theme.panel_dim, style::RADIUS_MD)
+                style::pill(theme, None)
+                    .p(px(super::PILL_PAD))
                     .flex_shrink_0()
-                    .tooltip(super::row_tooltip(
-                        self.ports_tip(),
-                        theme.panel_fg,
-                        Vec::new(),
-                        theme,
-                    ))
-                    .child(self.ports_glyph(self.right.tab == SidebarTab::Ports))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_ports(cx))),
-            )
-            .child(
-                div()
-                    .id("pilus-right-sidebar-expand")
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .justify_center()
-                    .w(px(style::scaled(&self.shared_settings, 24.0)))
-                    .h(px(style::scaled(&self.shared_settings, 24.0)))
-                    .radius_md()
-                    .cursor_pointer()
-                    .hover_fill(theme.panel_dim, style::RADIUS_MD)
-                    .child(icon(
-                        if expanded {
-                            include_bytes!("../../assets/icons/minimize.svg")
-                        } else {
-                            include_bytes!("../../assets/icons/maximize.svg")
-                        },
-                        12.0,
-                        theme.muted,
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_right_expanded(cx))),
-            )
-            .child(
-                div()
-                    .id("pilus-right-sidebar-close")
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .justify_center()
-                    .w(px(style::scaled(&self.shared_settings, 24.0)))
-                    .h(px(style::scaled(&self.shared_settings, 24.0)))
-                    .radius_md()
-                    .cursor_pointer()
-                    .hover_fill(theme.panel_dim, style::RADIUS_MD)
-                    .child(icon(
-                        include_bytes!("../../assets/icons/x.svg"),
-                        12.0,
-                        theme.muted,
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx))),
+                    .child(self.strip_browser_toggle(cx))
+                    .child(
+                        div()
+                            .id("pilus-right-sidebar-ports")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(super::PILL_BUTTON_W))
+                            .h(px(super::PILL_BUTTON_H))
+                            .radius_sm()
+                            .cursor_pointer()
+                            .hover_fill(raise, style::RADIUS_SM)
+                            .flex_shrink_0()
+                            .tooltip(super::row_tooltip(
+                                self.ports_tip(),
+                                theme.panel_fg,
+                                Vec::new(),
+                                theme,
+                            ))
+                            .child(self.ports_glyph(self.right.tab == SidebarTab::Ports))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_ports(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("pilus-right-sidebar-expand")
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .justify_center()
+                            .w(px(super::PILL_BUTTON_W))
+                            .h(px(super::PILL_BUTTON_H))
+                            .radius_sm()
+                            .cursor_pointer()
+                            .hover_fill(raise, style::RADIUS_SM)
+                            .child(icon(
+                                if expanded {
+                                    include_bytes!("../../assets/icons/minimize.svg")
+                                } else {
+                                    include_bytes!("../../assets/icons/maximize.svg")
+                                },
+                                12.0,
+                                theme.muted,
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_right_expanded(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("pilus-right-sidebar-close")
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .justify_center()
+                            .w(px(super::PILL_BUTTON_W))
+                            .h(px(super::PILL_BUTTON_H))
+                            .radius_sm()
+                            .cursor_pointer()
+                            .hover_fill(raise, style::RADIUS_SM)
+                            .child(icon(
+                                include_bytes!("../../assets/icons/x.svg"),
+                                12.0,
+                                theme.muted,
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx))),
+                    ),
             );
 
         let body = div()
@@ -863,10 +884,7 @@ impl PilusView {
             });
         let footer = match shown {
             SidebarTab::Diff => self.diff_footer(cx),
-            SidebarTab::Git
-            | SidebarTab::Files
-            | SidebarTab::Ports
-            | SidebarTab::Browser => None,
+            SidebarTab::Git | SidebarTab::Files | SidebarTab::Ports | SidebarTab::Browser => None,
         };
 
         let handle = div()

@@ -266,11 +266,7 @@ impl PilusView {
     /// is first fed to the window's text input context, which types its
     /// private-use glyph instead of moving the caret. Command chords stay on
     /// the normal route, where the Edit actions answer them.
-    pub(super) fn browser_forward_key(
-        &self,
-        event: &gpui::KeyDownEvent,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn browser_forward_key(&self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
         if event.keystroke.modifiers.platform {
             return;
         }
@@ -573,11 +569,14 @@ impl PilusView {
             .items_center()
             .justify_center()
             .flex_shrink_0()
-            .h(px(super::TAB_HEIGHT))
-            .w(px(super::SIDEBAR_TOGGLE_W))
-            .radius_md()
+            .h(px(super::PILL_BUTTON_H))
+            .w(px(super::PILL_BUTTON_W))
+            .radius_sm()
             .cursor_pointer()
-            .hover_fill(theme.panel_dim, style::RADIUS_MD)
+            .hover_fill(
+                theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT),
+                style::RADIUS_SM,
+            )
             .tooltip(super::row_tooltip(
                 "Browser".to_string(),
                 theme.panel_fg,
@@ -591,17 +590,19 @@ impl PilusView {
     /// The same button for the column's own strip, once the column is open.
     pub(super) fn strip_browser_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
-        let side = px(style::scaled(&self.shared_settings, 24.0));
         div()
             .id("pilus-right-sidebar-browser")
             .flex()
             .items_center()
             .justify_center()
-            .w(side)
-            .h(side)
-            .radius_md()
+            .w(px(super::PILL_BUTTON_W))
+            .h(px(super::PILL_BUTTON_H))
+            .radius_sm()
             .cursor_pointer()
-            .hover_fill(theme.panel_dim, style::RADIUS_MD)
+            .hover_fill(
+                theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT),
+                style::RADIUS_SM,
+            )
             .flex_shrink_0()
             .tooltip(super::row_tooltip(
                 "Browser".to_string(),

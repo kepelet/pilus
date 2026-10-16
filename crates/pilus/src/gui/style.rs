@@ -429,6 +429,25 @@ pub(super) fn pane_toolbar() -> Div {
         .occlude()
 }
 
+/// A bordered pill for a button or a group of them in the top chrome. It has
+/// no fill of its own, so the strip shows through. `hover` raises a fill
+/// under the whole pill, for a pill that is itself a button; one that holds
+/// buttons leaves it `None` and lets them raise their own. Content goes in as
+/// children.
+pub(super) fn pill(theme: Theme, hover: Option<Rgba>) -> Div {
+    let pill = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .radius_soft()
+        .border_1()
+        .border_color(theme.border);
+    match hover {
+        Some(hover) => pill.state_fill(gpui::transparent_black(), hover, Radius::Soft),
+        None => pill,
+    }
+}
+
 /// The frame of a segmented control: a short row of mutually exclusive
 /// choices read as one object. Fill it with [`segment`]s.
 pub(super) fn segmented(theme: Theme) -> Div {

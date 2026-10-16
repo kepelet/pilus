@@ -191,6 +191,8 @@ impl TasksPanel {
         self.open
     }
 
+    // The sidebar no longer links here; only the visual-test captures open it.
+    #[cfg_attr(not(feature = "visual-test"), allow(dead_code))]
     pub(super) fn open_as(&mut self, layout: TaskLayout) {
         self.open = true;
         self.layout = layout;
@@ -394,7 +396,9 @@ const ROW_HEIGHT: f32 = 36.0;
 const GROUP_HEIGHT: f32 = 32.0;
 
 impl PilusView {
-    /// Open the page from the sidebar.
+    /// Open the page.
+    // The sidebar no longer links here; only the visual-test captures open it.
+    #[cfg_attr(not(feature = "visual-test"), allow(dead_code))]
     pub(super) fn open_tasks(&mut self, cx: &mut Context<Self>) {
         self.leave_settings_page();
         self.picker.close();

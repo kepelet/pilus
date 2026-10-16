@@ -414,21 +414,6 @@ impl RowOp {
 }
 
 impl PilusView {
-    /// Open the page on the active endpoint, across all its workspaces.
-    pub(super) fn open_mission(&mut self, cx: &mut Context<Self>) {
-        self.leave_settings_page();
-        self.picker.close();
-        let active = self.active.clone();
-        let panel = &mut self.mission;
-        panel.follow(&active);
-        panel.open = true;
-        panel.in_flight = false;
-        panel.fetched_at = None;
-        panel.rescan = true;
-        self.mission_fetch_budget();
-        cx.notify();
-    }
-
     /// Shot-harness entry point: open on a canned snapshot, no daemon.
     #[cfg(feature = "visual-test")]
     pub(super) fn mission_show(

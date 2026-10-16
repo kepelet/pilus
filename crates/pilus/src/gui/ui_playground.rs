@@ -395,6 +395,70 @@ impl UiPlaygroundView {
             ))
     }
 
+    /// The top chrome's bordered pills on the strip's own ground: a pill that is
+    /// itself a button (the session picker) and one holding icon buttons (the
+    /// right toolbar).
+    fn pill_demo(&self) -> Div {
+        let theme = self.theme;
+        let fonts = self.fonts();
+        let raise = theme.sidebar_raise(1.0, 0.5);
+        let button = |id: &'static str, glyph: &'static [u8]| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(24.0))
+                .h(px(20.0))
+                .radius_sm()
+                .cursor_pointer()
+                .hover_fill(raise, style::RADIUS_SM)
+                .child(icon(glyph, 14.0, theme.muted))
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .p_3()
+            .radius_md()
+            .bg(theme.window_bg)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                style::pill(theme, Some(raise))
+                    .id("pg-pill-session")
+                    .gap_2()
+                    .h(px(26.0))
+                    .px_2()
+                    .cursor_pointer()
+                    .text_size(px(fonts.body))
+                    .child(div().text_color(theme.panel_fg).child("main"))
+                    .child(icon(
+                        include_bytes!("../../assets/icons/chevron-down.svg"),
+                        12.0,
+                        theme.muted,
+                    )),
+            )
+            .child(
+                style::pill(theme, None)
+                    .p(px(2.0))
+                    .child(button(
+                        "pg-pill-browser",
+                        include_bytes!("../../assets/icons/globe.svg"),
+                    ))
+                    .child(button(
+                        "pg-pill-ports",
+                        include_bytes!("../../assets/icons/ethernet-port.svg"),
+                    ))
+                    .child(button(
+                        "pg-pill-panel",
+                        include_bytes!("../../assets/icons/panel-right.svg"),
+                    )),
+            )
+    }
+
     fn circle_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         div()
@@ -2010,6 +2074,7 @@ impl Render for UiPlaygroundView {
             .child(self.section("COLORS", self.colors()))
             .child(self.section("ANSI", self.ansi_colors()))
             .child(self.section("CONTAINERS", self.containers()))
+            .child(self.section("PILL", self.pill_demo()))
             .child(self.section("DIVIDERS", self.divider_demos()))
             .child(
                 self.section(

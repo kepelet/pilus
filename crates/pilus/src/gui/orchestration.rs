@@ -491,7 +491,9 @@ impl Render for DragGhost {
 }
 
 impl PilusView {
-    /// Open the canvas from the sidebar.
+    /// Open the canvas.
+    // The sidebar no longer links here; only the visual-test captures open it.
+    #[cfg_attr(not(feature = "visual-test"), allow(dead_code))]
     pub(super) fn open_orchestration(&mut self, cx: &mut Context<Self>) {
         self.leave_settings_page();
         self.picker.close();

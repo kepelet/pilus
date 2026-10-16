@@ -33,6 +33,7 @@ mod machines;
 mod markdown;
 mod md_view;
 mod menubar;
+mod notify;
 mod mission;
 mod orchestration;
 mod page_split;
@@ -425,10 +426,18 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
         cx.set_app_identity(&app_icon::bundle_identifier(), "pilus");
         // Clicking a notification brings the window forward instead of only
         // activating the process.
-        cx.on_system_notification_response(|_, cx| {
-            cx.activate(true);
-            if let Some(window) = cx.windows().into_iter().next() {
-                let _ = window.update(cx, |_, window, _| window.activate_window());
+        cx.on_system_notification_response({
+            let app_shared = app_shared.clone();
+            move |_, cx| {
+                // With no window (the menu bar helper) there is nothing to
+                // raise, so the click opens one.
+                if !app_shared.has_window(cx) {
+                    app_shared.open_window(None, cx);
+                }
+                cx.activate(true);
+                if let Some(window) = cx.windows().into_iter().next() {
+                    let _ = window.update(cx, |_, window, _| window.activate_window());
+                }
             }
         });
         // Remote access is a background service that outlives this window, so
@@ -721,8 +730,10 @@ impl AppShared {
 
     /// Open a main window, then focus `menu_pick` once its endpoint is up.
     fn open_window(&self, menu_pick: Option<(String, String)>, cx: &mut App) {
-        // The helper has no Dock icon; a window makes it the full app.
+        // The helper has no Dock icon; a window makes it the full app, and
+        // the user is about to see what the badge was counting.
         background::set_accessory(false);
+        notify::set_badge(0);
         let target = reopen_last_session(
             self.target.clone(),
             &self.settings.borrow(),
@@ -769,6 +780,16 @@ impl AppShared {
             agent_watch::Watch::new(api_socket_for(&root, session.as_deref()), root, session)
         });
         let rows = watch.rows(*self.theme.borrow());
+        let events = watch.alerts();
+        if !events.is_empty() {
+            let badge = watch.open_alerts();
+            for event in events {
+                raise_background_alert(event, badge, cx);
+            }
+            // A batch that only cleared banners posts nothing to carry the
+            // new count.
+            notify::set_badge(badge);
+        }
         for pick in menubar::headless(true, &rows) {
             match pick {
                 menubar::Pick::Quit => background::quit_fully(cx),
@@ -783,6 +804,40 @@ impl AppShared {
             }
         }
     }
+}
+
+/// Post a native notification for an agent transition seen with no window
+/// open, so a quit pilus still reaches the user. It chimes and badges the app
+/// icon with `badge` standing alerts, which the daemon's own cue cannot do
+/// here. The tags match the window's, so a banner a window later withdraws is
+/// the same one.
+fn raise_background_alert(event: attention::Event, badge: u32, cx: &mut App) {
+    let (tag, workspace, body) = match event {
+        attention::Event::Cleared(tag) => return cx.dismiss_system_notification(&tag),
+        attention::Event::Blocked(blocked) => (
+            blocked.tag,
+            blocked.workspace,
+            format!("{} is waiting on you", blocked.agent),
+        ),
+        attention::Event::Finished(finished) => (
+            finished.tag,
+            finished.workspace,
+            format!("{} finished", finished.agent),
+        ),
+    };
+    let title = match workspace.as_str() {
+        "" => "pilus".to_string(),
+        workspace => format!("pilus · {workspace}"),
+    };
+    notify::post(
+        cx,
+        notify::Alert {
+            tag,
+            title,
+            body,
+            badge,
+        },
+    );
 }
 
 /// Swap a plain launch's target for the session the window was last attached
@@ -3188,6 +3243,10 @@ impl PilusView {
         for event in self.attention.drain() {
             match event {
                 attention::Event::Cleared(tag) => cx.dismiss_system_notification(&tag),
+                // The daemon already sounds a finished turn into a live
+                // window and the sidebar shows it; only the windowless
+                // helper notifies.
+                attention::Event::Finished(_) => {}
                 attention::Event::Blocked(blocked) => {
                     let body = format!("{} is waiting on you", blocked.agent);
                     let in_front = dock::app_active().unwrap_or(self.window_active);

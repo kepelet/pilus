@@ -6,12 +6,21 @@
 //! machine that has a verified remote binary, the same hidden-endpoint feeds
 //! a window runs. It exists only while no window does, and it owns no
 //! rendering; [`Watch::rows`] hands the menu bar the same rows a window would.
+//!
+//! The same snapshots also feed an [`attention::Watch`], so an agent that
+//! blocks or finishes while no window is open still reaches the user:
+//! [`Watch::alerts`] hands the caller those transitions to post as native
+//! notifications. The daemon's own sound cue travels over the render
+//! connection, which the helper does not open, so these notifications are how
+//! a quit pilus stays audible.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 
 use pilus_client::{Agent, AgentFeed, MachineInfo, list_machines};
 
+use super::attention;
 use super::menubar::Row;
 use super::theme::Theme;
 use super::{agent_menu_row, shorten_home};
@@ -25,10 +34,14 @@ struct Source {
 }
 
 impl Source {
-    fn drain(&mut self) {
+    /// Take the feed's pending updates; whether the list changed hands.
+    fn drain(&mut self) -> bool {
+        let mut fresh = false;
         while let Some(update) = self.feed.try_recv() {
             self.agents = update.agents;
+            fresh = true;
         }
+        fresh
     }
 }
 
@@ -38,6 +51,10 @@ pub struct Watch {
     machines: Vec<Source>,
     /// The machine catalog, read off-thread because it shells out to `luvus`.
     catalog: Receiver<Vec<MachineInfo>>,
+    attention: attention::Watch,
+    /// Tags of the notifications still standing: blocked or finished agents
+    /// the user has not come back to. Its size is the app icon's badge.
+    open: HashSet<String>,
 }
 
 impl Watch {
@@ -58,6 +75,8 @@ impl Watch {
             },
             machines: Vec::new(),
             catalog,
+            attention: attention::Watch::default(),
+            open: HashSet::new(),
         }
     }
 
@@ -77,10 +96,13 @@ impl Watch {
                 })
                 .collect();
         }
+        let attention = &mut self.attention;
         std::iter::once(&mut self.local)
             .chain(self.machines.iter_mut())
             .flat_map(|source| {
-                source.drain();
+                if source.drain() {
+                    attention.observe(&source.key, &source.agents);
+                }
                 let local = source.key == "local";
                 source
                     .agents
@@ -98,5 +120,29 @@ impl Watch {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// Take the blocked and finished transitions seen since the last call.
+    pub(super) fn alerts(&mut self) -> Vec<attention::Event> {
+        let events = self.attention.drain();
+        for event in &events {
+            match event {
+                attention::Event::Blocked(blocked) => {
+                    self.open.insert(blocked.tag.clone());
+                }
+                attention::Event::Finished(finished) => {
+                    self.open.insert(finished.tag.clone());
+                }
+                attention::Event::Cleared(tag) => {
+                    self.open.remove(tag);
+                }
+            }
+        }
+        events
+    }
+
+    /// How many notifications are still standing.
+    pub(super) fn open_alerts(&self) -> u32 {
+        u32::try_from(self.open.len()).unwrap_or(u32::MAX)
     }
 }

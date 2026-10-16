@@ -174,6 +174,23 @@ pub const DIVIDER_HEIGHT: f32 = 9.0;
 /// The panel's padding and border around its rows, top and bottom together.
 pub const PANEL_CHROME: f32 = 10.0;
 
+/// The distance from the panel's top edge to the top of `rows[index]`, so a
+/// flyout can line up with the row that opened it.
+pub fn row_offset(rows: &[Item], index: usize) -> f32 {
+    PANEL_CHROME / 2.0
+        + rows
+            .iter()
+            .take(index)
+            .map(|item| {
+                if item.selectable() {
+                    ROW_HEIGHT
+                } else {
+                    DIVIDER_HEIGHT
+                }
+            })
+            .sum::<f32>()
+}
+
 /// The panel's height for `rows`, which the renderer needs before layout to
 /// decide whether the menu opens below or above the pointer. Dividers are
 /// shorter than rows, so counting every entry as a row overshoots and parks an
@@ -195,7 +212,9 @@ pub fn panel_height(rows: &[Item]) -> f32 {
 /// The open context menu: target, anchor point in window pixels, and the
 /// keyboard cursor. Mouse users get no persistent selection, like every
 /// other native list here; `selected` is only painted when the keyboard is
-/// driving. `quick_open` swaps the rows for the Quick Actions submenu.
+/// driving. `quick_open` shows the Quick Actions flyout beside the rows;
+/// `quick_selected` is the keyboard cursor inside it, and is `None` while the
+/// pointer (or the parent list) owns focus.
 pub struct SidebarMenu {
     pub target: MenuTarget,
     /// Anchor column in window pixels; the renderer clamps the panel to fit.
@@ -204,6 +223,7 @@ pub struct SidebarMenu {
     pub row: f32,
     pub selected: Option<usize>,
     pub quick_open: bool,
+    pub quick_selected: Option<usize>,
 }
 
 impl SidebarMenu {
@@ -214,19 +234,17 @@ impl SidebarMenu {
             row,
             selected: None,
             quick_open: false,
+            quick_selected: None,
         }
     }
 
-    /// The submenu the open menu shows: the Quick Actions copy rows when that
-    /// submenu is up, otherwise the top-level rows.
+    /// The top-level rows. The Quick Actions flyout is drawn beside them, so
+    /// it never replaces them.
     ///
     /// A WORKSPACES target's git rows appear when its branch says it is a repo, and the deleted-worktree row
     /// only when `linked` says the daemon's `worktree.list` found this row's
     /// checkout as a linked worktree.
     pub fn rows(&self, linked: bool) -> Vec<Item> {
-        if self.quick_open {
-            return self.quick_rows();
-        }
         match &self.target {
             MenuTarget::Workspace { branch, .. } => {
                 workspace_rows(branch.as_deref().is_some(), linked)
@@ -237,8 +255,8 @@ impl SidebarMenu {
         }
     }
 
-    /// The rows of the Quick Actions submenu, below the top level.
-    fn quick_rows(&self) -> Vec<Item> {
+    /// The rows of the Quick Actions flyout.
+    pub fn quick_rows(&self) -> Vec<Item> {
         let mut items = vec![Item::CopyPath];
         if let MenuTarget::Workspace { branch, .. } = &self.target
             && branch.as_deref().is_some_and(|branch| !branch.is_empty())
@@ -433,7 +451,14 @@ mod tests {
 
     #[test]
     fn the_terminal_target_builds_its_own_rows() {
-        let menu = SidebarMenu::new(MenuTarget::Terminal { selection: false, agent: true }, 0.0, 0.0);
+        let menu = SidebarMenu::new(
+            MenuTarget::Terminal {
+                selection: false,
+                agent: true,
+            },
+            0.0,
+            0.0,
+        );
         assert_eq!(menu.rows(true), terminal_rows(false, true));
     }
 

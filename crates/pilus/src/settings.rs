@@ -10,6 +10,20 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// The icons a session may take in the header, as `session_icons` values.
+pub const SESSION_ICONS: [&str; 7] = [
+    "layers",
+    "blocks",
+    "briefcase",
+    "monitor-cloud",
+    "cloud",
+    "user",
+    "flask-conical",
+];
+
+/// What a session shows until it is mapped to another icon.
+pub const DEFAULT_SESSION_ICON: &str = "layers";
+
 /// Default monospace family for the terminal grid: bundled with the app, in
 /// its terminal cut (no ligatures, so cells stay one column wide).
 pub const FONT_FAMILY: &str = "Ioskeley Mono Term";
@@ -133,6 +147,10 @@ pub struct Settings {
     /// CLI and daemon cannot rename a session, so a label lives only here:
     /// the session keeps its name on disk, in sockets, and in `--session`.
     pub session_labels: BTreeMap<String, String>,
+    /// Which of `SESSION_ICONS` stands for a session in the window's header,
+    /// keyed by the real session name. Hand-edited like `session_labels`; a
+    /// missing or unknown entry shows `DEFAULT_SESSION_ICON`.
+    pub session_icons: BTreeMap<String, String>,
     /// The named session the window was attached to when it last closed;
     /// `None` is the default session. The next plain launch reopens it.
     pub last_session: Option<String>,
@@ -185,6 +203,7 @@ impl Default for Settings {
             right_sidebar_width: 0.0,
             right_sidebar_tab: String::new(),
             session_labels: BTreeMap::new(),
+            session_icons: BTreeMap::new(),
             last_session: None,
             last_endpoint: None,
             diff_list_height: 0.0,
@@ -251,6 +270,28 @@ impl Settings {
         self.session_labels
             .get(session)
             .map_or(session, String::as_str)
+    }
+
+    /// The icon key for `session`: its mapped one when that names a known
+    /// icon, else the default. A typo in the file degrades to the default
+    /// instead of drawing nothing.
+    pub fn session_icon<'a>(&'a self, session: &str) -> &'a str {
+        self.session_icons
+            .get(session)
+            .and_then(|key| SESSION_ICONS.iter().find(|known| **known == key))
+            .copied()
+            .unwrap_or(DEFAULT_SESSION_ICON)
+    }
+
+    /// Give `session` the icon `key`. The default or an unknown key drops the
+    /// mapping, so the file never holds an entry that changes nothing.
+    pub fn set_session_icon(&mut self, session: &str, key: &str) {
+        if key != DEFAULT_SESSION_ICON && SESSION_ICONS.contains(&key) {
+            self.session_icons
+                .insert(session.to_string(), key.to_string());
+        } else {
+            self.session_icons.remove(session);
+        }
     }
 
     /// Label `session`, or restore its real name when `label` is blank.
@@ -353,6 +394,33 @@ mod tests {
         settings.set_session_label("kind-voyager", "Work");
         settings.set_session_label("kind-voyager", " ");
         assert!(settings.session_labels.is_empty());
+    }
+
+    #[test]
+    fn a_session_icon_falls_back_to_the_default_when_unmapped_or_unknown() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.session_icon("kind-voyager"), DEFAULT_SESSION_ICON);
+        settings
+            .session_icons
+            .insert("kind-voyager".to_string(), "flask-conical".to_string());
+        assert_eq!(settings.session_icon("kind-voyager"), "flask-conical");
+        settings
+            .session_icons
+            .insert("kind-voyager".to_string(), "rocket".to_string());
+        assert_eq!(settings.session_icon("kind-voyager"), DEFAULT_SESSION_ICON);
+        assert_eq!(settings.session_icon("other"), DEFAULT_SESSION_ICON);
+    }
+
+    #[test]
+    fn setting_a_session_icon_stores_only_real_changes() {
+        let mut settings = Settings::default();
+        settings.set_session_icon("kind-voyager", "user");
+        assert_eq!(settings.session_icon("kind-voyager"), "user");
+        settings.set_session_icon("kind-voyager", "rocket");
+        assert!(settings.session_icons.is_empty());
+        settings.set_session_icon("kind-voyager", "cloud");
+        settings.set_session_icon("kind-voyager", DEFAULT_SESSION_ICON);
+        assert!(settings.session_icons.is_empty());
     }
 
     #[test]
@@ -497,6 +565,7 @@ mod tests {
             right_sidebar_width: 480.0,
             right_sidebar_tab: "git".to_string(),
             session_labels: BTreeMap::from([("kind-voyager".to_string(), "Work".to_string())]),
+            session_icons: BTreeMap::from([("kind-voyager".to_string(), "briefcase".to_string())]),
             last_session: Some("kind-voyager".to_string()),
             last_endpoint: Some("build-box".to_string()),
             diff_list_height: 200.0,

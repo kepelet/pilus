@@ -13083,10 +13083,12 @@ impl PilusView {
         }
     }
 
-    /// Whether the shown frame is a split with pane frames drawn, which is
-    /// when the terminal sits on the tinted surface the tab strip matches.
+    /// Whether the shown frame is a split of floating cards, which is when the
+    /// terminal sits on the tinted surface the tab strip matches. Flush panes
+    /// cover that surface, so they chrome like a single pane.
     fn is_split(&self) -> bool {
         self.settings.pane_ui
+            && self.settings.pane_gaps
             && self.shown_frame().is_some_and(|frame| {
                 !pane_frames::PaneFrames::find(
                     frame,

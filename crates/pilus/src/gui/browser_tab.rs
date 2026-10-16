@@ -51,6 +51,9 @@ pub(super) struct BrowserPanel {
     pub(super) editing: bool,
     /// The page's address, as the webview last reported it.
     url: String,
+    /// The corner radius last pushed to the webview's layer, so an idle
+    /// frame does not re-send it and a radius setting change reaches it.
+    corner: Option<f32>,
 }
 
 impl BrowserPanel {
@@ -61,6 +64,7 @@ impl BrowserPanel {
             pending: None,
             editing: false,
             url: String::new(),
+            corner: None,
         }
     }
 
@@ -77,6 +81,7 @@ impl BrowserPanel {
         self.pending = None;
         self.editing = false;
         self.url.clear();
+        self.corner = None;
         if let Ok(mut queue) = self.events.lock() {
             queue.clear();
         }
@@ -87,6 +92,38 @@ impl BrowserPanel {
         self.view.is_some()
     }
 }
+
+/// Round the page's bottom-right corner by clipping its backing layer.
+/// GPUI cannot clip a native view, so the layer does it. AppKit layers are
+/// not flipped, so the bottom edge is the layer's min-y.
+#[cfg(target_os = "macos")]
+fn round_page_corner(webview: &wry::WebView, radius: f32) {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use wry::WebViewExtMacOS;
+
+    /// `kCALayerMaxXMinYCorner`.
+    const BOTTOM_RIGHT: usize = 1 << 1;
+
+    let page = webview.webview();
+    // SAFETY: `layer` is an NSView/CALayer selector sent to a live view on
+    // the main thread, which is where the GUI runs; the setters take the
+    // CGFloat, BOOL, and CACornerMask values their signatures name.
+    #[allow(unsafe_code)]
+    unsafe {
+        let _: () = msg_send![&*page, setWantsLayer: true];
+        let layer: Option<Retained<AnyObject>> = msg_send![&*page, layer];
+        if let Some(layer) = layer {
+            let _: () = msg_send![&*layer, setCornerRadius: f64::from(radius)];
+            let _: () = msg_send![&*layer, setMaskedCorners: BOTTOM_RIGHT];
+            let _: () = msg_send![&*layer, setMasksToBounds: true];
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn round_page_corner(_: &wry::WebView, _: f32) {}
 
 /// Whether the window's first responder is the webview or one of its
 /// subviews (WebKit's content view takes it once the page is clicked).
@@ -400,7 +437,14 @@ impl PilusView {
                 None => self.browser_open(&url, window, cx),
             }
         }
+        // The frame's 1px border sits outside the page, so the page's
+        // corner is that much tighter than the frame's.
+        let corner = (style::Radius::Md.pixels().to_f64() as f32 - 1.0).max(0.0);
         if let Some(view) = &self.browser_panel.view {
+            if self.browser_panel.corner != Some(corner) {
+                round_page_corner(view.read(cx).raw(), corner);
+                self.browser_panel.corner = Some(corner);
+            }
             view.update(cx, |view, _| {
                 if on_screen && !view.visible() {
                     view.show();
@@ -461,8 +505,9 @@ impl PilusView {
     }
 
     /// The bordered area the page sits in, inset by a small gutter so the page
-    /// reads as content in a frame. Square, since GPUI cannot clip a native
-    /// view to rounded corners.
+    /// reads as content in a frame. Only the bottom-right corner is round, to
+    /// meet the window's own; the page's layer is clipped to match (see
+    /// [`round_page_corner`]).
     fn browser_frame(&self, page: Option<Entity<WebView>>) -> Div {
         div()
             .relative()
@@ -475,6 +520,7 @@ impl PilusView {
                     .size_full()
                     .border_1()
                     .border_color(self.theme.border)
+                    .rounded_br(style::Radius::Md.pixels())
                     .overflow_hidden()
                     .children(page),
             )

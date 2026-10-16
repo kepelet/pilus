@@ -801,6 +801,26 @@ pub fn run_main() -> Result<()> {
     });
     settle(&mut cx, 8);
     capture(&mut cx, window.into(), "main-session-menu")?;
+    // A row's icon choices unfolded, with a non-default icon on another row.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            // The shared copy too, or the next settings sync reverts it.
+            view.settings.set_session_icon("default", "briefcase");
+            view.shared_settings
+                .borrow_mut()
+                .set_session_icon("default", "briefcase");
+            view.session_icon_editing = Some("brave-falcon".to_string());
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-session-icons")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.session_icon_editing = None;
+            cx.notify();
+        });
+    });
     cx.update(|app| {
         view.update(app, |view, cx| {
             view.session_confirm = Some((

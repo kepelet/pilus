@@ -66,7 +66,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use crate::settings::{CHROME_FONT, Settings, WindowGeometry};
+use crate::settings::{CHROME_FONT, DEFAULT_SESSION_ICON, SESSION_ICONS, Settings, WindowGeometry};
 use crate::update::{UpdateChannel, UpdateRequest, describe_source};
 use automations::AutomationsPanel;
 use browser_tab::{BrowserPanel, PageEdit};
@@ -182,10 +182,8 @@ const SIDEBAR_GLYPH: f32 = 14.0;
 const SIDEBAR_GLYPH_GAP: f32 = 8.0;
 /// Height of a single-line sidebar row (nav, open workspace, section header).
 const SIDEBAR_ROW_HEIGHT: f32 = 28.0;
-/// Gap between the sidebar's session picker and the list under it.
-const SESSION_PICKER_GAP: f32 = 4.0;
 /// Inset of the sidebar's head from the panel edge: the collapse toggle's
-/// right edge and the session picker's both sit on it.
+/// right edge sits on it.
 const SIDEBAR_HEAD_INSET: f32 = 8.0;
 /// Height of a one-line band that carries no control: a section header, an
 /// endpoint group label, or an empty-state placeholder.
@@ -228,6 +226,12 @@ const SHEEN_MAX: f32 = 0.055;
 const SHEEN_HEIGHT: f32 = 0.32;
 /// Width of the sidebar collapse/expand button.
 const SIDEBAR_TOGGLE_W: f32 = 28.0;
+/// Gap between the session picker and the sidebar toggle it precedes.
+const HEAD_CONTROLS_GAP: f32 = 4.0;
+/// How far the header's session picker and toggle reach together.
+const HEAD_CONTROLS_W: f32 = SIDEBAR_TOGGLE_W + HEAD_CONTROLS_GAP + SIDEBAR_TOGGLE_W;
+/// Gap between the session picker and the menu it opens below.
+const SESSION_MENU_GAP: f32 = 4.0;
 /// Height of a tab pill in the top chrome.
 const TAB_HEIGHT: f32 = 26.0;
 /// Padding inside a pill, between its border and the buttons it holds.
@@ -1612,6 +1616,8 @@ struct PilusView {
     session_menu_open: bool,
     /// The row waiting on a second press before it stops or deletes.
     session_confirm: Option<(String, SessionVerb)>,
+    /// The session whose icon choices are unfolded under its menu row.
+    session_icon_editing: Option<String>,
     /// Sessions with a start, stop, or delete in flight, so a second press
     /// does not run the same command twice.
     session_working: HashSet<String>,
@@ -2193,6 +2199,7 @@ impl PilusView {
             last_session_poll: Instant::now(),
             session_menu_open: false,
             session_confirm: None,
+            session_icon_editing: None,
             session_working: HashSet::new(),
             palette,
             palette_input,
@@ -2684,11 +2691,13 @@ impl PilusView {
                 SessionOpResult::Done(name, verb) => {
                     self.session_working.remove(&name);
                     // A deleted session's name can be generated again later,
-                    // and must not come back wearing the old label.
+                    // and must not come back wearing the old label or icon.
                     if verb == SessionVerb::Delete
-                        && self.settings.session_labels.contains_key(&name)
+                        && (self.settings.session_labels.contains_key(&name)
+                            || self.settings.session_icons.contains_key(&name))
                     {
                         self.settings.set_session_label(&name, "");
+                        self.settings.set_session_icon(&name, DEFAULT_SESSION_ICON);
                         self.save_settings();
                     }
                     self.sessions = list_session_infos(&self.session_root);
@@ -8408,6 +8417,7 @@ impl PilusView {
     fn close_session_menu(&mut self) {
         self.session_menu_open = false;
         self.session_confirm = None;
+        self.session_icon_editing = None;
     }
 
     /// Check the public Luvus release manifest off the GUI thread.
@@ -10491,7 +10501,8 @@ impl PilusView {
             .overflow_hidden()
             // Fixed clearance for the floating traffic lights; the sections
             // scroll under it instead of disappearing beneath the titlebar.
-            // The collapse toggle pins to its right edge, clear of the lights.
+            // The session picker and collapse toggle pin to its right edge,
+            // clear of the lights.
             .child(
                 div()
                     .h(px(40.0))
@@ -10500,18 +10511,10 @@ impl PilusView {
                     .flex_row()
                     .items_center()
                     .justify_end()
+                    .gap(px(HEAD_CONTROLS_GAP))
                     .pr(px(SIDEBAR_HEAD_INSET))
+                    .child(self.session_picker("pilus-session-button", cx))
                     .child(self.sidebar_toggle("pilus-sidebar-toggle", cx)),
-            )
-            // Pinned above the scroll area, not inside it, so the session
-            // menu can anchor to a fixed spot beneath it.
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .w(px(panel_w))
-                    .px(px(SIDEBAR_HEAD_INSET))
-                    .pb(px(SESSION_PICKER_GAP))
-                    .child(self.session_picker(cx)),
             )
             .child(list);
         // The sidebar parts from the terminal with a hairline. It is an
@@ -10881,12 +10884,14 @@ impl PilusView {
                     .flex()
                     .flex_row()
                     .overflow_hidden()
-                    // The slot is the toggle plus the strip's gap after it;
-                    // the negative margin cancels the gap so a closed slot
-                    // takes no room at all.
-                    .w(px((SIDEBAR_TOGGLE_W + 4.0) * parked))
+                    .gap(px(HEAD_CONTROLS_GAP))
+                    // The slot is the picker and toggle plus the strip's gap
+                    // after them; the negative margin cancels the gap so a
+                    // closed slot takes no room at all.
+                    .w(px((HEAD_CONTROLS_W + 4.0) * parked))
                     .mr(px(-4.0))
                     .opacity(parked * parked)
+                    .child(self.session_picker("pilus-session-button-parked", cx))
                     .child(self.sidebar_toggle("pilus-sidebar-toggle-parked", cx)),
             );
         }
@@ -11210,48 +11215,153 @@ impl PilusView {
         self.sidebar_dock().map_or(0, |dock| dock.width)
     }
 
-    /// The session picker above the sidebar's Open Workspace row: current
-    /// session name plus a chevron, opening the session menu below it.
-    fn session_picker(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// The session picker, an icon alone in the header just before the
+    /// sidebar toggle: the current session's mapped icon, opening the session
+    /// menu below it. The name lives in the tooltip and the menu.
+    fn session_picker(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
         let glass = self.glass_opacity();
-        style::pill(
-            theme,
-            Some(theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT)),
-        )
-        .id("pilus-session-button")
-        .occlude()
-        .justify_between()
-        .gap_2()
-        .w_full()
-        .h(px(SIDEBAR_ROW_HEIGHT))
-        .px_3()
-        .cursor_pointer()
-        .text_size(px(self.chrome_font()))
-        .child(
-            div()
-                .min_w(px(0.0))
-                .truncate()
-                .text_color(theme.panel_fg)
-                .child(
-                    self.settings
-                        .session_label(self.current_session_name())
-                        .to_string(),
-                ),
-        )
-        .child(icon(
-            include_bytes!("../../assets/icons/chevron-down.svg"),
-            12.0,
-            theme.muted,
-        ))
-        .on_click(cx.listener(|this, _, _, cx| {
-            if this.session_menu_open {
-                this.close_session_menu();
-            } else {
-                this.session_menu_open = true;
-            }
-            cx.notify();
-        }))
+        let session = self.current_session_name();
+        div()
+            .id(id)
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .h(px(TAB_HEIGHT))
+            .w(px(SIDEBAR_TOGGLE_W))
+            .radius_md()
+            .cursor_pointer()
+            .state_fill(
+                if self.session_menu_open {
+                    theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT)
+                } else {
+                    gpui::Rgba::default()
+                },
+                theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT),
+                style::RADIUS_MD,
+            )
+            .child(icon(
+                session_icon_glyph(self.settings.session_icon(session)),
+                14.0,
+                theme.muted,
+            ))
+            .tooltip(row_tooltip(
+                format!("Session · {}", self.settings.session_label(session)),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.session_menu_open {
+                    this.close_session_menu();
+                } else {
+                    this.session_menu_open = true;
+                }
+                cx.notify();
+            }))
+    }
+
+    /// A session row's leading icon, which is also the button that unfolds
+    /// the icon choices beneath the row. A stopped session's icon dims with
+    /// its name.
+    fn session_icon_button(
+        &self,
+        name: &str,
+        running: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = self.theme;
+        let target = name.to_string();
+        div()
+            .id(format!("pilus-menu-session-icon-{name}"))
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .w(px(22.0))
+            .h(px(22.0))
+            .radius_md()
+            .cursor_pointer()
+            .hover_fill(theme.panel_dim, style::RADIUS_MD)
+            .child(icon(
+                session_icon_glyph(self.settings.session_icon(name)),
+                14.0,
+                if running { theme.panel_fg } else { theme.muted },
+            ))
+            .tooltip(row_tooltip(
+                format!("Change icon · {name}"),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.session_confirm = None;
+                this.session_icon_editing = if this.session_icon_editing.as_deref() == Some(&target)
+                {
+                    None
+                } else {
+                    Some(target.clone())
+                };
+                cx.stop_propagation();
+                cx.notify();
+            }))
+    }
+
+    /// The strip of icons a session may take, unfolded under its menu row.
+    /// The chosen one wears the panel fill, like a selected sidebar row.
+    fn session_icon_choices(&self, name: &str, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let chosen = self.settings.session_icon(name);
+        let mut strip = div().flex().flex_row().flex_wrap().gap_1().px_2().py_1();
+        for key in SESSION_ICONS {
+            let target = name.to_string();
+            let selected = key == chosen;
+            strip = strip.child(
+                div()
+                    .id(format!("pilus-menu-session-icon-{name}-{key}"))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(28.0))
+                    .h(px(28.0))
+                    .radius_md()
+                    .cursor_pointer()
+                    .state_fill(
+                        if selected {
+                            theme.panel
+                        } else {
+                            gpui::Rgba::default()
+                        },
+                        theme.panel,
+                        style::RADIUS_MD,
+                    )
+                    .child(icon(
+                        session_icon_glyph(key),
+                        14.0,
+                        if selected {
+                            theme.panel_fg
+                        } else {
+                            theme.muted
+                        },
+                    ))
+                    .tooltip(row_tooltip(
+                        key.to_string(),
+                        theme.panel_fg,
+                        Vec::new(),
+                        theme,
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.set_session_icon(&target, key);
+                        this.save_settings();
+                        this.session_icon_editing = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
+            );
+        }
+        strip
     }
 
     /// The pencil on a session row. The label is pilus's own, so it works on
@@ -11418,18 +11528,30 @@ impl PilusView {
     ///
     /// A transparent catcher covers the content area so a click anywhere
     /// outside dismisses; the panel stops propagation so its own clicks land.
-    /// It opens below the session picker at the sidebar's head, aligned to the
-    /// sidebar's left edge.
-    fn session_menu(&self, cx: &mut Context<Self>, cell_width: f32) -> AnyElement {
+    /// It opens below the session picker in the header, left-aligned with it,
+    /// wherever the picker sits: the sidebar's head or the tab strip's.
+    fn session_menu(
+        &self,
+        cx: &mut Context<Self>,
+        cell_width: f32,
+        fullscreen: bool,
+    ) -> AnyElement {
         if !self.session_menu_open {
             return div().into_any_element();
         }
         let theme = self.theme;
-        let sidebar_left = self
-            .sidebar_dock()
-            .map_or(0.0, |dock| f32::from(dock.x) * cell_width);
-        let menu_left = sidebar_left + SIDEBAR_HEAD_INSET;
-        let menu_top = HEADER_HEIGHT + SIDEBAR_ROW_HEIGHT + SESSION_PICKER_GAP;
+        let picker_left = if self.sidebar_visible {
+            let sidebar_left = self
+                .sidebar_dock()
+                .map_or(0.0, |dock| f32::from(dock.x) * cell_width);
+            sidebar_left + f32::from(self.sidebar_cells()) * cell_width
+                - SIDEBAR_HEAD_INSET
+                - HEAD_CONTROLS_W
+        } else {
+            self.strip_pad(fullscreen)
+        };
+        let menu_left = picker_left.max(SIDEBAR_HEAD_INSET);
+        let menu_top = (HEADER_HEIGHT + TAB_HEIGHT) / 2.0 + SESSION_MENU_GAP;
         let mut items = div().flex().flex_col().gap_1();
         let current = self.current_session_name().to_string();
         for session in &self.sessions {
@@ -11459,15 +11581,7 @@ impl PilusView {
                 .cursor_pointer()
                 .state_fill(bg, theme.panel, style::RADIUS_MD)
                 .text_size(px(self.chrome_font()))
-                .child(icon(
-                    if session.running {
-                        include_bytes!("../../assets/icons/cloud.svg")
-                    } else {
-                        include_bytes!("../../assets/icons/circle.svg")
-                    },
-                    14.0,
-                    theme.muted,
-                ))
+                .child(self.session_icon_button(&session.name, session.running, cx))
                 .child(
                     div()
                         .flex_1()
@@ -11486,6 +11600,8 @@ impl PilusView {
                     .flex_shrink_0()
                     .child(self.session_row_tail(session, action, confirming, working, cx)),
             );
+            let editing_icon = self.session_icon_editing.as_deref() == Some(session.name.as_str());
+            let session_name = session.name.as_str();
             items = items.child(row.on_click(cx.listener(move |this, _, _, cx| {
                 // A press away from a pending confirmation only cancels it.
                 if this.session_confirm.take().is_some() {
@@ -11504,6 +11620,9 @@ impl PilusView {
                 }
                 cx.notify();
             })));
+            if editing_icon {
+                items = items.child(self.session_icon_choices(session_name, cx));
+            }
         }
         items = items.child(
             div()
@@ -13649,7 +13768,7 @@ impl Render for PilusView {
                     .then(|| self.right_sidebar_view(layout.card_right, fullscreen, cx)),
             )
             .when(!luvus_missing, |root| {
-                root.child(self.session_menu(cx, cell_width))
+                root.child(self.session_menu(cx, cell_width, fullscreen))
                     .child(self.palette_overlay(cx))
                     .child(self.picker_overlay(window, cx))
             })
@@ -14800,6 +14919,20 @@ fn human_bytes(bytes: u64) -> String {
 ///
 /// GPUI paints SVGs as an alpha mask tinted with the element's own text
 /// color, so every icon sets it explicitly instead of inheriting.
+/// The glyph for a `Settings::session_icon` key. Unknown keys cannot reach
+/// it, but fall back to the default so the match stays total.
+fn session_icon_glyph(key: &str) -> &'static [u8] {
+    match key {
+        "blocks" => include_bytes!("../../assets/icons/blocks.svg"),
+        "briefcase" => include_bytes!("../../assets/icons/briefcase.svg"),
+        "monitor-cloud" => include_bytes!("../../assets/icons/monitor-cloud.svg"),
+        "cloud" => include_bytes!("../../assets/icons/cloud.svg"),
+        "user" => include_bytes!("../../assets/icons/user.svg"),
+        "flask-conical" => include_bytes!("../../assets/icons/flask-conical.svg"),
+        _ => include_bytes!("../../assets/icons/layers.svg"),
+    }
+}
+
 fn icon(bytes: &'static [u8], size: f32, color: gpui::Rgba) -> impl IntoElement {
     svg()
         .data(bytes)

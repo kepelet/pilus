@@ -592,7 +592,9 @@ impl PilusView {
         let tip = row_tooltip(repo.name.clone(), theme.panel_fg, lines, theme);
 
         let name = repo.name.clone();
-        let small = self.footer_font();
+        // A step under the label tier, so the counts read as a quiet aside
+        // to the name; it still follows the Interface size.
+        let small = (self.section_font() - 1.0).max(8.0);
         let stat = |glyph: &'static [u8], value: u64| {
             div()
                 .flex()

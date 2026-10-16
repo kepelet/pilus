@@ -5,6 +5,9 @@
 # Environment:
 #   PILUS_BUILD_VERSION  Version stamped into the bundle (defaults to the
 #                        workspace version). `preview-feed.sh` sets it.
+#   PILUS_APP_NAME       Name of the .app and its Finder/Dock label (default
+#                        `pilus`). `preview-feed.sh` sets `pilus (Nightly)` so
+#                        a preview installs beside stable instead of over it.
 #   PILUS_BUNDLE_ID      Bundle identifier. Defaults to the development
 #                        identifier; the packaging scripts set the release one
 #                        (`pilus.kepelet.com`) so shipped apps keep a single
@@ -21,7 +24,8 @@ app_version="${PILUS_BUILD_VERSION:-$version}"
 # A local `just bundle` stays on the dev identifier; only distributed builds
 # override it. Keep the default in sync with `app_icon::DEV_BUNDLE_ID`.
 bundle_id="${PILUS_BUNDLE_ID:-dev.pilus.app}"
-app="target/release/pilus.app"
+app_name="${PILUS_APP_NAME:-pilus}"
+app="target/release/${app_name}.app"
 
 cargo build --release -p pilus -p pilus-agent
 
@@ -38,8 +42,8 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>pilus</string>
-    <key>CFBundleDisplayName</key><string>pilus</string>
+    <key>CFBundleName</key><string>${app_name}</string>
+    <key>CFBundleDisplayName</key><string>${app_name}</string>
     <key>CFBundleIdentifier</key><string>${bundle_id}</string>
     <key>CFBundleExecutable</key><string>pilus</string>
     <key>CFBundleIconFile</key><string>pilus.icns</string>

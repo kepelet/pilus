@@ -15,6 +15,8 @@
 #   PILUS_BUNDLE_ID           Forwarded to bundle-macos.sh; defaults there to the
 #                             development identifier. Release and preview builds
 #                             set the production one (`pilus.kepelet.com`).
+#   PILUS_APP_NAME            Forwarded to bundle-macos.sh; names the .app and the
+#                             mounted volume (default `pilus`).
 #   NOTARY_PROFILE            notarytool keychain profile; when set, the DMG
 #                             is submitted for notarization and stapled.
 #   MINISIGN_SECRET_KEY       path to a minisign secret key; each DMG gets a
@@ -38,6 +40,7 @@ fi
 arch="arm64"
 
 ./scripts/bundle-macos.sh
+app_name="${PILUS_APP_NAME:-pilus}"
 
 dmg="target/release/pilus-v${version}-macos-${arch}.dmg"
 # A signature left from an earlier build would sit beside this DMG and fail to
@@ -61,9 +64,9 @@ tiffutil -cathidpicheck \
     -out "$background" 2>/dev/null
 
 "$venv/bin/dmgbuild" -s scripts/dmg-settings.py \
-    -D app=target/release/pilus.app \
+    -D app="target/release/${app_name}.app" \
     -D background="$background" \
-    "pilus" "$dmg" >/dev/null
+    "$app_name" "$dmg" >/dev/null
 
 if [ -n "${APPLE_DEVELOPER_IDENTITY:-}" ]; then
     # Gatekeeper's install assessment (`spctl -t install`) rejects an unsigned

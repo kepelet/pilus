@@ -27,6 +27,9 @@
 #   PILUS_RELEASES_BUCKET  R2 bucket name. Falls back to infra/.env (the file
 #                          the Alchemy stack reads), decrypted with dotenvx.
 #   PILUS_ALLOW_DIRTY=1    Publish stable from a tree with uncommitted changes.
+#   LOCAL=true             Preview only: skip the minisign presence and
+#                          signature checks. A client only installs the result
+#                          when it is launched with LOCAL=true too.
 #
 # Auth is wrangler's own (`bunx wrangler login`), which is separate from the
 # Alchemy profile.
@@ -117,7 +120,16 @@ fi
 # A client built with a minisign public key rejects any download without a
 # signature, so an unsigned upload would be a release nobody can install.
 # Packaging skips signing without a word when the key or tool is missing.
-if ! grep -q 'MINISIGN_PUBLIC_KEY: Option<&str> = None' crates/pilus/src/update.rs; then
+#
+# `LOCAL=true` waives the gate for a preview, so a machine without the secret
+# key or `minisign` can still publish. Stable never takes the waiver: a stable
+# DMG is immutable, so an unsigned one could not be replaced.
+skip_signature=0
+if [ "${LOCAL:-}" = "true" ] && [ "$channel" = preview ]; then
+    skip_signature=1
+    echo "publish-release: LOCAL=true, skipping the minisign check for this preview" >&2
+fi
+if [ "$skip_signature" = 0 ] && ! grep -q 'MINISIGN_PUBLIC_KEY: Option<&str> = None' crates/pilus/src/update.rs; then
     for file in "${files[@]}"; do
         case "$file" in *.dmg) [ -f "$file.minisig" ] || {
             echo "publish-release: $file has no .minisig, but the client requires one" >&2

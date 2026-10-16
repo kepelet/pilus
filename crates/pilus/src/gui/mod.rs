@@ -7363,7 +7363,9 @@ impl PilusView {
         )
         .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_check(cx)));
 
-        let preview = UpdateChannel::parse(&self.settings.update_channel) == UpdateChannel::Preview;
+        let pinned = crate::update::pinned_channel();
+        let preview = pinned.unwrap_or_else(|| UpdateChannel::parse(&self.settings.update_channel))
+            == UpdateChannel::Preview;
         let label = |text: &'static str| {
             div()
                 .text_size(px(self.section_font()))
@@ -7384,11 +7386,14 @@ impl PilusView {
                         .items_center()
                         .justify_between()
                         .child(label("Update channel"))
-                        .child(
-                            style::segmented(theme)
+                        .child(match pinned {
+                            // A Nightly build can only follow its own feed.
+                            Some(channel) => label(channel.label()).into_any_element(),
+                            None => style::segmented(theme)
                                 .child(self.update_channel_segment(UpdateChannel::Stable, cx))
-                                .child(self.update_channel_segment(UpdateChannel::Preview, cx)),
-                        ),
+                                .child(self.update_channel_segment(UpdateChannel::Preview, cx))
+                                .into_any_element(),
+                        }),
                 )
                 .when(preview, |card| {
                     card.child(style::enter(

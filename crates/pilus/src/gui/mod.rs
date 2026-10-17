@@ -13,6 +13,7 @@ mod attention;
 mod automations;
 mod background;
 mod box_drawing;
+mod browser_data;
 mod browser_tab;
 mod connector;
 mod cursor_blink;

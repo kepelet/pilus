@@ -18,6 +18,7 @@ use gpui::{AnyElement, Context, Div, Entity, MouseButton, Stateful, Window, div,
 use gpui_wry::WebView;
 use wry::{NewWindowResponse, PageLoadEvent, WebViewBuilder};
 
+use super::browser_data;
 use super::style::{self, FillExt, RadiusExt};
 use super::{PilusView, icon};
 
@@ -484,6 +485,12 @@ impl PilusView {
             .with_new_window_req_handler(move |url, _| {
                 push(&opened, Event::Opened(url));
                 NewWindowResponse::Deny
+            })
+            .with_download_started_handler(|url, path| browser_data::confirm_download(&url, path))
+            .with_download_completed_handler(|url, _, succeeded| {
+                if !succeeded {
+                    tracing::warn!(%url, "browser: download failed");
+                }
             })
             .build_as_child(window);
         match built {

@@ -40,7 +40,7 @@ markdown = "1"
 objc2 = "0.6"
 objc2-user-notifications = "0.3"
 block2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAppearance", "NSApplication", "NSAttributedString", "NSButton", "NSColor", "NSControl", "NSDockTile", "NSFont", "NSGraphics", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSStringDrawing", "NSView", "NSVisualEffectView", "NSWindow", "objc2-core-foundation", "std"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAlert", "NSAppearance", "NSApplication", "NSAttributedString", "NSButton", "NSColor", "NSControl", "NSDockTile", "NSFont", "NSGraphics", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSStringDrawing", "NSView", "NSVisualEffectView", "NSWindow", "objc2-core-foundation", "std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSAttributedString", "NSBundle", "NSData", "NSGeometry", "NSProcessInfo", "NSRange", "NSString", "NSValue", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

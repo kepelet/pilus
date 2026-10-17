@@ -64,6 +64,11 @@ const LOADING_POLL: Duration = Duration::from_millis(120);
 /// How long a folder may show placeholders before it counts as empty.
 const LOADING_LIMIT: Duration = Duration::from_secs(3);
 
+/// How wide the tab must be to keep the tree beside an open document.
+const TREE_BESIDE_MIN_PAGE: f32 = 640.0;
+/// The tree's width beside a document, at the default interface size.
+const TREE_BESIDE_WIDTH: f32 = 240.0;
+
 /// Placeholder rows shown under a folder while the daemon opens it.
 const SKELETON_ROWS: usize = 3;
 /// Each placeholder's share of the row, so the stack reads as names.
@@ -261,6 +266,8 @@ pub(super) struct FilesPanel {
     doc: Option<FileDoc>,
     /// Document reads sent so far.
     doc_reads: u32,
+    /// The tree is drawn beside the open document, as of the last frame.
+    tree_beside: bool,
     /// Where the loading folder sits in `visible`, when it shows.
     loading_at: Option<usize>,
     list: ListState,
@@ -303,6 +310,7 @@ impl FilesPanel {
             changes: FileChanges::default(),
             doc: None,
             doc_reads: 0,
+            tree_beside: false,
             loading_at: None,
             list: ListState::new(0, ListAlignment::Top, px(600.0)),
             error: None,
@@ -353,6 +361,13 @@ impl FilesPanel {
     /// The open document, once its text has been read.
     pub(super) fn doc_view(&self) -> Option<&MdDoc> {
         match &self.doc.as_ref()?.state {
+            DocState::Ready(doc) => Some(doc),
+            _ => None,
+        }
+    }
+
+    pub(super) fn doc_view_mut(&mut self) -> Option<&mut MdDoc> {
+        match &mut self.doc.as_mut()?.state {
             DocState::Ready(doc) => Some(doc),
             _ => None,
         }
@@ -1110,8 +1125,71 @@ impl PilusView {
     }
 
     /// The tab: the tree, or the open document, with files and folders dropped
-    /// on it uploaded to the root.
-    pub(super) fn files_page(&mut self, cx: &mut Context<Self>) -> Div {
+    /// on it uploaded to the root. Wide enough, the tree stays beside the
+    /// document so another file is one click away.
+    pub(super) fn files_page(&mut self, page_w: f32, cx: &mut Context<Self>) -> Div {
+        let beside = self.files_panel.doc.is_some() && page_w >= TREE_BESIDE_MIN_PAGE;
+        self.files_panel.tree_beside = beside;
+        if self.files_panel.doc.is_none() {
+            return self.files_tree_zone(cx);
+        }
+        if !beside {
+            return self.files_doc_zone(cx);
+        }
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let tree_w = TREE_BESIDE_WIDTH * fonts.body / 13.0;
+        div()
+            .flex()
+            .flex_row()
+            .size_full()
+            .min_h(px(0.0))
+            .child(
+                div()
+                    .w(px(tree_w))
+                    .flex_shrink_0()
+                    .h_full()
+                    .min_h(px(0.0))
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .child(self.files_tree_zone(cx)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .child(self.files_doc_zone(cx)),
+            )
+    }
+
+    /// A drop on a preview still has a place to go: the root.
+    fn files_doc_zone(&mut self, cx: &mut Context<Self>) -> Div {
+        let hint = self.theme.panel_dim;
+        let on_drop = cx.listener(|this, paths: &ExternalPaths, _, cx| {
+            this.files_panel.drop_hint = None;
+            this.files_upload(paths.paths().to_vec(), None, cx);
+            cx.notify();
+        });
+        let on_move = cx.listener(|this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+            if event.bounds.contains(&event.event.position) && this.files_panel.hint_drop(None) {
+                cx.notify();
+            }
+        });
+        div().size_full().min_h(px(0.0)).child(
+            div()
+                .id("pilus-files-doc-drop")
+                .size_full()
+                .min_h(px(0.0))
+                .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(hint))
+                .on_drag_move(on_move)
+                .on_drop(on_drop)
+                .child(self.files_doc_page(cx)),
+        )
+    }
+
+    /// The tree with its header, taking files dropped on it.
+    fn files_tree_zone(&mut self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let on_drop = cx.listener(|this, paths: &ExternalPaths, _, cx| {
             this.files_panel.drop_hint = None;
@@ -1125,20 +1203,6 @@ impl PilusView {
                 cx.notify();
             }
         });
-        if self.files_panel.doc.is_some() {
-            // A preview replaces the tree, but a drop still has a place to go.
-            let hint = theme.panel_dim;
-            return div().size_full().min_h(px(0.0)).child(
-                div()
-                    .id("pilus-files-doc-drop")
-                    .size_full()
-                    .min_h(px(0.0))
-                    .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(hint))
-                    .on_drag_move(on_move)
-                    .on_drop(on_drop)
-                    .child(self.files_doc_page(cx)),
-            );
-        }
         let edge = theme.border_focus;
         let tree = self.files_tree_page(cx);
         div().size_full().min_h(px(0.0)).child(
@@ -1303,7 +1367,11 @@ impl PilusView {
                 self.diff_icon_button(
                     "pilus-files-doc-close",
                     include_bytes!("../../assets/icons/x.svg"),
-                    "Back to the file tree".to_string(),
+                    if self.files_panel.tree_beside {
+                        "Close".to_string()
+                    } else {
+                        "Back to the file tree".to_string()
+                    },
                     false,
                     false,
                 )
@@ -1470,6 +1538,7 @@ impl PilusView {
             folder: row.dir.then_some(loading || (row.expanded && !folded)),
             animate: self.files_panel.toggled.as_deref() == Some(row.path.as_str()),
             mark: self.files_mark(row),
+            selected: !row.dir && self.files_panel.doc_path() == Some(row.path.as_str()),
         };
         let row = row.clone();
         let path = row.path.clone();

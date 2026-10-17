@@ -9,15 +9,20 @@
 //! it came from, so a note sits under the block its last line falls in, and a
 //! block's comment button starts a note over that block's lines. The row model
 //! is pure so the placement can be tested without a window.
+//!
+//! The text can be selected with the pointer (see `md_select`). A selection
+//! offers to be copied, or sent to a running agent as a quoted excerpt.
 
 use gpui::{
-    AnyElement, Context, ListAlignment, ListState, MouseButton, MouseDownEvent, SharedString, div,
-    list, prelude::*, px,
+    AnyElement, ClipboardItem, Context, ListAlignment, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, SharedString, div, list, prelude::*, px,
 };
 use pilus_client::{DiffNote, NoteSide, SshTarget, TextFile};
 
 use super::markdown::{self, Document};
+use super::md_select::{self, Hits, Leaves, Selection, TextPoint};
 use super::style::{self, RadiusExt};
+use super::toast::ToastKind;
 use super::{PilusView, icon};
 
 /// Whether `path` names a markdown file, by extension.
@@ -132,6 +137,11 @@ pub(super) struct MdDoc {
     /// Frames left to scroll the note form into view, as the Diff's own list
     /// does: a form just inserted has no measured height yet.
     reveal_composer: u8,
+    selection: Option<Selection>,
+    /// The pointer is down and moving the selection's end.
+    dragging: bool,
+    /// Where the text on screen landed, for mapping the pointer onto it.
+    hits: Hits,
 }
 
 impl MdDoc {
@@ -145,7 +155,74 @@ impl MdDoc {
             rows,
             built: None,
             reveal_composer: 0,
+            selection: None,
+            dragging: false,
+            hits: Hits::default(),
         }
+    }
+
+    /// The selection, once it covers some text.
+    fn selected(&self) -> Option<Selection> {
+        self.selection.filter(|selection| !selection.is_collapsed())
+    }
+
+    /// Start a selection at `point`, or at the word or paragraph around it for
+    /// a double or triple click.
+    fn press(&mut self, point: Option<TextPoint>, clicks: usize) {
+        let Some(point) = point else {
+            self.selection = None;
+            self.dragging = false;
+            return;
+        };
+        self.selection = Some(match (clicks, self.document.leaf_text(point.leaf)) {
+            (2, Some(text)) => {
+                let word = md_select::word_range(text, point.offset);
+                Selection {
+                    anchor: TextPoint {
+                        offset: word.start,
+                        ..point
+                    },
+                    head: TextPoint {
+                        offset: word.end,
+                        ..point
+                    },
+                }
+            }
+            (3.., Some(text)) => Selection {
+                anchor: TextPoint { offset: 0, ..point },
+                head: TextPoint {
+                    offset: text.len(),
+                    ..point
+                },
+            },
+            _ => Selection::collapsed(point),
+        });
+        // Only a single press goes on to drag: the end of a word selection
+        // would otherwise jump to wherever the pointer first moves.
+        self.dragging = clicks < 2;
+    }
+
+    /// Move the selection's end to `point`.
+    fn drag_to(&mut self, point: Option<TextPoint>) {
+        if let (Some(selection), Some(point)) = (self.selection.as_mut(), point) {
+            selection.head = point;
+        }
+    }
+
+    /// The pointer came up: a click that selected nothing clears the selection.
+    fn release(&mut self) {
+        self.dragging = false;
+        if self
+            .selection
+            .is_some_and(|selection| selection.is_collapsed())
+        {
+            self.selection = None;
+        }
+    }
+
+    pub(super) fn clear_selection(&mut self) {
+        self.selection = None;
+        self.dragging = false;
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -226,14 +303,22 @@ impl PilusView {
         }
     }
 
-    fn md_doc(&self, page: Page) -> Option<&MdDoc> {
+    pub(super) fn md_doc(&self, page: Page) -> Option<&MdDoc> {
         match page {
             Page::Files => self.files_panel.doc_view(),
             Page::Diff => self.diff_panel.md_view(),
         }
     }
 
-    /// The scrolling list of `page`'s document.
+    pub(super) fn md_doc_mut(&mut self, page: Page) -> Option<&mut MdDoc> {
+        match page {
+            Page::Files => self.files_panel.doc_view_mut(),
+            Page::Diff => self.diff_panel.md_view_mut(),
+        }
+    }
+
+    /// The scrolling list of `page`'s document, which takes the pointer to
+    /// select text and floats the selection's actions over its foot.
     pub(super) fn md_list(&self, page: Page, cx: &mut Context<Self>) -> AnyElement {
         let Some(doc) = self.md_doc(page) else {
             return div().into_any_element();
@@ -241,14 +326,108 @@ impl PilusView {
         if doc.is_empty() && doc.rows.is_empty() {
             return self.diff_message("This file is empty").into_any_element();
         }
-        list(
-            doc.list.clone(),
-            cx.processor(move |this: &mut PilusView, ix: usize, _window, cx| {
-                this.md_row(page, ix, cx)
-            }),
+        // Rows report their text again as they are drawn.
+        doc.hits.clear();
+        let id = match page {
+            Page::Files => "pilus-md-files",
+            Page::Diff => "pilus-md-diff",
+        };
+        div()
+            .id(id)
+            .relative()
+            .size_full()
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    if let Some(doc) = this.md_doc_mut(page) {
+                        let point = doc.hits.point_at(event.position, false);
+                        doc.press(point, event.click_count);
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                let Some(doc) = this.md_doc_mut(page).filter(|doc| doc.dragging) else {
+                    return;
+                };
+                // A button let go outside the window never reports its release.
+                if event.pressed_button == Some(MouseButton::Left) {
+                    let point = doc.hits.point_at(event.position, true);
+                    doc.drag_to(point);
+                } else {
+                    doc.release();
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseUpEvent, _, cx| this.md_release(page, cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseUpEvent, _, cx| this.md_release(page, cx)),
+            )
+            .child(
+                list(
+                    doc.list.clone(),
+                    cx.processor(move |this: &mut PilusView, ix: usize, _window, cx| {
+                        this.md_row(page, ix, cx)
+                    }),
+                )
+                .size_full(),
+            )
+            .children(self.md_overlays(page, cx))
+            .into_any_element()
+    }
+
+    fn md_release(&mut self, page: Page, cx: &mut Context<Self>) {
+        if let Some(doc) = self.md_doc_mut(page).filter(|doc| doc.dragging) {
+            doc.release();
+            cx.notify();
+        }
+    }
+
+    /// The open document's path, which a sent excerpt names.
+    pub(super) fn md_path(&self, page: Page) -> Option<String> {
+        match page {
+            Page::Files => self.files_panel.doc_path().map(str::to_string),
+            Page::Diff => self.diff_panel.selected_key().map(|(_, path)| path),
+        }
+    }
+
+    pub(super) fn md_copy(&mut self, page: Page, cx: &mut Context<Self>) {
+        let Some(text) = self
+            .md_doc(page)
+            .and_then(|doc| Some(doc.document.selected_text(&doc.selected()?)))
+        else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.toast(ToastKind::Success, "Copied");
+        cx.notify();
+    }
+
+    /// How many words the selection covers, once it covers some text.
+    pub(super) fn md_selected_words(&self, page: Page) -> Option<usize> {
+        let doc = self.md_doc(page).filter(|doc| !doc.dragging)?;
+        let selection = doc.selected()?;
+        Some(
+            doc.document
+                .selected_text(&selection)
+                .split_whitespace()
+                .count(),
         )
-        .size_full()
-        .into_any_element()
+    }
+
+    /// The selected text and the source lines it spans.
+    pub(super) fn md_selected_excerpt(&self, page: Page) -> Option<(String, Option<(u32, u32)>)> {
+        let doc = self.md_doc(page)?;
+        let selection = doc.selected()?;
+        Some((
+            doc.document.selected_text(&selection),
+            doc.document.selected_lines(&selection),
+        ))
     }
 
     fn md_row(&self, page: Page, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -287,12 +466,23 @@ impl PilusView {
     ) -> AnyElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
+        let block_ix = block;
         let Some(block) = doc.document.blocks().get(block) else {
             return div().into_any_element();
         };
         let group = SharedString::from(format!("pilus-md-block-{ix}"));
-        // Headings take room above them, so a section reads as a section.
-        let top = if block.is_heading() { 12.0 } else { 2.0 };
+        // Headings take room above them, so a section reads as a section; every
+        // other block leaves a paragraph's gap below.
+        let (before, after) = block.spacing();
+        let unit = fonts.body / 13.0;
+        let top = if ix == 0 { 12.0 } else { before * unit };
+        let bottom = after * unit;
+        let leaves = Leaves::new(
+            block_ix,
+            doc.selection,
+            theme.selection_bg.into(),
+            doc.hits.clone(),
+        );
         let mut row = div()
             .id(("pilus-md-row", ix))
             .group(group.clone())
@@ -300,12 +490,13 @@ impl PilusView {
             .w_full()
             .px_3()
             .pt(px(top))
-            .pb(px(2.0))
+            .pb(px(bottom))
             .child(markdown::render_block(
                 block,
                 theme,
                 fonts,
                 &self.shared_settings,
+                &leaves,
             ));
         if page == Page::Diff {
             let (first, last) = (block.first_line, block.last_line);
@@ -357,13 +548,23 @@ status: draft
 # Reviewing a change
 
 Start from the **Diff** tab: pick a file, read the patch, and leave a note on any
-line with `n`. Notes stay in the daemon, so an agent can pick them up later.
+line with `n`. Notes stay in the daemon, so an agent can pick them up later, and
+a note is anchored to *source lines*, so it survives the file being edited around
+it. Long paragraphs wrap at a comfortable measure, with room between the lines.
 
 ## Checklist
 
 - [x] Read the patch
 - [ ] Run `cargo test`
 - Send open notes to an agent
+  - Pick the agent working in the same checkout
+  - Or any other live agent
+
+### Order
+
+1. Read the description.
+2. Walk the files, largest first.
+3. Leave notes, then send them.
 
 ## Key bindings
 
@@ -377,12 +578,35 @@ line with `n`. Notes stay in the daemon, so an agent can pick them up later.
 
 ```sh
 cargo run -p pilus -- --probe
+cargo run -p pilus --features visual-test -- --ui-shots-main
 ```
+
+---
+
+That is all there is to it.
 ";
 
 /// Shot-harness entry point: put the canned document on the Files tab.
 #[cfg(feature = "visual-test")]
 impl PilusView {
+    /// Select from the opening paragraph into the checklist, as a drag would,
+    /// which offers to copy it or write a note on it.
+    pub(super) fn files_show_doc_selection(&mut self, cx: &mut Context<Self>) {
+        use super::md_select::LeafId;
+
+        if let Some(doc) = self.files_panel.doc_view_mut() {
+            let at = |block, leaf, offset| TextPoint {
+                leaf: LeafId { block, leaf },
+                offset,
+            };
+            doc.selection = Some(Selection {
+                anchor: at(2, 0, 40),
+                head: at(4, 1, 7),
+            });
+        }
+        cx.notify();
+    }
+
     pub(super) fn files_show_doc_sample(&mut self, cx: &mut Context<Self>) {
         self.files_show_doc("/work/pilus/docs/review-guide.md", SAMPLE, cx);
     }

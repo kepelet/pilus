@@ -606,6 +606,9 @@ pub(super) struct TreeEntry {
     /// [`chevron`].
     pub(super) animate: bool,
     pub(super) mark: Option<TreeMark>,
+    /// The entry the page beside the tree is showing: a raised pill, as a
+    /// selected sidebar row is.
+    pub(super) selected: bool,
 }
 
 /// One row of a file tree: indent, a disclosure chevron for a folder (a file
@@ -624,6 +627,7 @@ pub(super) fn tree_row(
         folder,
         animate,
         mark,
+        selected,
     } = entry;
     let disclosure = match folder {
         Some(open) => chevron(
@@ -673,7 +677,15 @@ pub(super) fn tree_row(
         .pr_2()
         .radius_md()
         .cursor_pointer()
-        .hover_fill(theme.panel_dim, RADIUS_MD)
+        .state_fill(
+            if selected {
+                theme.panel.into()
+            } else {
+                gpui::transparent_black()
+            },
+            if selected { theme.panel } else { theme.panel_dim },
+            RADIUS_MD,
+        )
         .child(disclosure)
         .child(super::icon(glyph, TREE_GLYPH, theme.muted))
         .child(
@@ -684,6 +696,7 @@ pub(super) fn tree_row(
                 .truncate()
                 .text_size(px(fonts.body))
                 .text_color(theme.panel_fg)
+                .when(selected, |name| name.font_weight(FontWeight::BOLD))
                 .child(name),
         )
         .children(mark)

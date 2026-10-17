@@ -492,6 +492,31 @@ pub fn run() -> Result<()> {
         cx.update(|app| view.update(app, |view, cx| view.files_show_doc_sample(cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "files-tab-doc")?;
+        // Expanded, the tree stays beside the document, and a selection offers
+        // to be copied or sent to an agent.
+        cx.update(|app| view.update(app, |view, cx| view.toggle_right_expanded(cx)));
+        settle(&mut cx, 30);
+        capture(&mut cx, window.into(), "files-tab-doc-wide")?;
+        cx.update(|app| view.update(app, |view, cx| view.files_show_doc_selection(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-selection")?;
+        // A note being written on that excerpt, then the list of notes with
+        // the agents to send the ticked ones to.
+        cx.update(|app| view.update(app, |view, cx| view.md_notes_show_sample(false, true, cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-note")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                if view.agents.is_empty() {
+                    view.agents = sample_task_agents();
+                }
+                view.md_notes_show_sample(true, false, cx)
+            })
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-notes")?;
+        cx.update(|app| view.update(app, |view, cx| view.toggle_right_expanded(cx)));
+        settle(&mut cx, 30);
         cx.update(|app| {
             view.update(app, |view, cx| {
                 view.select_right_tab(super::right_sidebar::SidebarTab::Git, cx)

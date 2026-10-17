@@ -883,7 +883,7 @@ impl PilusView {
             .child(match shown {
                 SidebarTab::Diff => self.diff_page(self.right.shown_width(), cx),
                 SidebarTab::Git => self.git_page(cx),
-                SidebarTab::Files => self.files_page(cx),
+                SidebarTab::Files => self.files_page(self.right.shown_width(), cx),
                 SidebarTab::Ports => self.ports_page(cx),
                 SidebarTab::Browser => self.browser_page(cx),
             });

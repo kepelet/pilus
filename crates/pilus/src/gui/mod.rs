@@ -32,6 +32,9 @@ mod home_issues;
 mod keys;
 mod machines;
 mod markdown;
+mod md_notes;
+mod md_notes_view;
+mod md_select;
 mod md_view;
 mod menubar;
 mod mission;
@@ -1970,6 +1973,9 @@ struct PilusView {
     /// The page a GitHub row opens in the terminal's card.
     github_page: GithubPage,
     files_panel: FilesPanel,
+    /// Notes on excerpts of markdown files, and the field they are written in.
+    md_notes: md_notes_view::MdNotes,
+    md_note_input: Entity<TextInput>,
     ports_panel: PortsPanel,
     browser_panel: BrowserPanel,
     /// The Browser tab's address bar, an IME-capable field of its own.
@@ -2136,6 +2142,19 @@ impl PilusView {
             initial_theme,
             cx,
         );
+        let md_notes = md_notes_view::MdNotes::new(&pilus_root);
+        let md_note_input = cx.new(|cx| {
+            TextInput::new(
+                String::new(),
+                "What should the agent do about this?",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                true,
+                initial_theme,
+                cx,
+            )
+            .submit_on_enter()
+        });
         let picker = WorkspacePicker::default();
         let picker_path = cx.new(|cx| {
             TextInput::from_shared(
@@ -2426,6 +2445,8 @@ impl PilusView {
             github,
             github_page: GithubPage::default(),
             files_panel: FilesPanel::new(),
+            md_notes,
+            md_note_input,
             ports_panel: PortsPanel::new(),
             browser_panel: BrowserPanel::new(),
             browser_input,
@@ -4483,6 +4504,11 @@ impl PilusView {
             self.menu_prompt_key(event, cx);
             return;
         }
+        // A note being written owns its keys until it is saved or dropped.
+        if self.md_composing() {
+            self.md_note_key(event, cx);
+            return;
+        }
         match self.input_layer() {
             InputLayer::Picker => self.picker_key(event, cx),
             InputLayer::Palette => self.palette_key(event, window, cx),
@@ -5862,6 +5888,14 @@ impl PilusView {
             && !prompt.action.is_confirm()
         {
             let handle = self.menu_prompt_input.focus_handle(cx);
+            if !handle.is_focused(window) {
+                window.focus(&handle, cx);
+            }
+            return;
+        }
+        // The note field owns the keyboard while a note is being written.
+        if self.md_composing() {
+            let handle = self.md_note_input.focus_handle(cx);
             if !handle.is_focused(window) {
                 window.focus(&handle, cx);
             }

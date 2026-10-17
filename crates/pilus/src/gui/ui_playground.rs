@@ -1512,6 +1512,7 @@ impl UiPlaygroundView {
                     folder,
                     animate: false,
                     mark,
+                    selected: false,
                 },
                 theme,
                 &self.settings,

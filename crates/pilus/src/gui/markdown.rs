@@ -13,20 +13,33 @@
 //! each run carries its own font and color. A paragraph with inline code lays
 //! out as a wrapping row instead, so each code span can wear a padded, rounded
 //! chip that a text run's flat background cannot draw.
+//!
+//! Text is selectable (see `md_select`). Each block knows the plain text of its
+//! leaves, the runs a selection can cover, so a copy never depends on what the
+//! list has on screen; the painter numbers the leaves it draws in the same order
+//! and reports where each landed.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, FontStyle, FontWeight, Hsla, SharedString, StyledText, TextRun, div, font,
-    prelude::*, px,
+    AnyElement, Div, FontStyle, FontWeight, Hsla, SharedString, StyledText, TextRun, canvas, div,
+    font, prelude::*, px, relative,
 };
 use markdown::mdast::Node;
 
 use crate::settings::Settings;
 
+use super::md_select::{LeafId, Leaves, Selection};
 use super::style::{self, Fonts, RadiusExt};
 use super::theme::Theme;
+
+/// Line height of running text, as a multiple of its size.
+const PROSE_LEADING: f32 = 1.65;
+/// Line height of headings, which wrap rarely and read tighter.
+const HEADING_LEADING: f32 = 1.3;
+/// Line height of code, which is denser than prose.
+const CODE_LEADING: f32 = 1.5;
 
 /// Parse `source` into its top-level nodes.
 ///
@@ -52,11 +65,25 @@ pub(super) struct Block {
     /// First and last source line, 1-based, as a review note counts them.
     pub(super) first_line: u32,
     pub(super) last_line: u32,
+    /// The plain text of each selectable leaf, in the order the painter
+    /// numbers them.
+    leaves: Vec<String>,
 }
 
 impl Block {
     pub(super) fn is_heading(&self) -> bool {
         matches!(self.node, Node::Heading(_))
+    }
+
+    /// Room above and below the block at the default text size: a heading
+    /// pulls away from what precedes it and sits close to what it introduces,
+    /// and every other block leaves a paragraph's gap.
+    pub(super) fn spacing(&self) -> (f32, f32) {
+        if self.is_heading() {
+            (14.0, 6.0)
+        } else {
+            (0.0, 12.0)
+        }
     }
 }
 
@@ -77,10 +104,13 @@ impl Document {
                     // A node without a position sits where the last one ended.
                     .unwrap_or((line, line));
                 line = last_line;
+                let mut leaves = Vec::new();
+                collect_leaves(&node, &mut leaves);
                 Block {
                     node,
                     first_line,
                     last_line,
+                    leaves,
                 }
             })
             .collect();
@@ -90,18 +120,171 @@ impl Document {
     pub(super) fn blocks(&self) -> &[Block] {
         &self.blocks
     }
+
+    /// The text `selection` covers: a block's leaves on separate lines, and a
+    /// blank line between blocks.
+    pub(super) fn selected_text(&self, selection: &Selection) -> String {
+        let (start, end) = selection.ordered();
+        let mut blocks = Vec::new();
+        for (ix, block) in self
+            .blocks
+            .iter()
+            .enumerate()
+            .take(end.leaf.block + 1)
+            .skip(start.leaf.block)
+        {
+            let parts: Vec<&str> = block
+                .leaves
+                .iter()
+                .enumerate()
+                .filter_map(|(leaf, text)| {
+                    let range = selection.range_in(LeafId { block: ix, leaf }, text.len())?;
+                    text.get(range)
+                })
+                .collect();
+            if !parts.is_empty() {
+                blocks.push(parts.join("\n"));
+            }
+        }
+        blocks.join("\n\n")
+    }
+
+    /// The plain text of one leaf.
+    pub(super) fn leaf_text(&self, leaf: LeafId) -> Option<&str> {
+        self.blocks
+            .get(leaf.block)?
+            .leaves
+            .get(leaf.leaf)
+            .map(String::as_str)
+    }
+
+    /// The source lines from where `selection` starts to where it ends.
+    pub(super) fn selected_lines(&self, selection: &Selection) -> Option<(u32, u32)> {
+        let (start, end) = selection.ordered();
+        let first = self.blocks.get(start.leaf.block)?.first_line;
+        let last = self.blocks.get(end.leaf.block)?.last_line;
+        Some((first, last))
+    }
 }
 
-/// Paint one block of a document at the body size.
+/// The plain text of the leaves under `node`, in the order [`block`] paints
+/// them. A leaf is one run of text a selection can cover.
+fn collect_leaves(node: &Node, out: &mut Vec<String>) {
+    match node {
+        Node::Paragraph(paragraph) => out.push(flat_text(&paragraph.children)),
+        Node::Heading(heading) => out.push(flat_text(&heading.children)),
+        Node::Code(code) => out.push(code.value.clone()),
+        Node::Yaml(front) => out.push(front.value.clone()),
+        Node::Toml(front) => out.push(front.value.clone()),
+        Node::Html(html) => out.push(html.value.clone()),
+        Node::Text(text) => out.push(text.value.clone()),
+        Node::Table(table) => {
+            for row in &table.children {
+                let Node::TableRow(row) = row else {
+                    continue;
+                };
+                for cell in &row.children {
+                    if let Node::TableCell(cell) = cell {
+                        out.push(flat_text(&cell.children));
+                    }
+                }
+            }
+        }
+        Node::ThematicBreak(_) => {}
+        other => {
+            for child in other.children().into_iter().flatten() {
+                collect_leaves(child, out);
+            }
+        }
+    }
+}
+
+/// What a paragraph's atoms add up to: its text with the styling removed.
+fn flat_text(nodes: &[Node]) -> String {
+    let mut builder = Inline::new("", Theme::default());
+    builder.children(nodes, Style::default());
+    builder.into_atoms().iter().map(Atom::text).collect()
+}
+
+/// Paint one block of a document at the body size. `leaves` numbers the
+/// block's selectable text and receives where it landed.
 pub(super) fn render_block(
     block: &Block,
     theme: Theme,
     fonts: Fonts,
     settings: &Rc<RefCell<Settings>>,
+    leaves: &Leaves,
 ) -> AnyElement {
-    let chrome: SharedString = style::chrome_font(settings).family;
-    let mono = style::mono_family(settings);
-    self::block(&block.node, theme, fonts, &chrome, &mono, fonts.body)
+    let paint = Paint {
+        theme,
+        fonts,
+        chrome: style::chrome_font(settings).family,
+        mono: style::mono_family(settings),
+        leaves,
+        plain: &block.leaves,
+    };
+    self::block(&block.node, &paint)
+}
+
+/// Everything painting a block needs besides the node.
+struct Paint<'a> {
+    theme: Theme,
+    fonts: Fonts,
+    chrome: SharedString,
+    mono: String,
+    leaves: &'a Leaves,
+    /// The block's leaf texts from the parse, which the painter's own
+    /// numbering must agree with.
+    plain: &'a [String],
+}
+
+impl Paint<'_> {
+    /// Claim the next leaf for the text `text`.
+    fn leaf(&self, text: &str) -> LeafId {
+        let leaf = self.leaves.next_leaf();
+        debug_assert_eq!(
+            self.plain.get(leaf.leaf).map(String::as_str),
+            Some(text),
+            "the painter and the parse disagree on leaf {}",
+            leaf.leaf
+        );
+        leaf
+    }
+
+    /// A run of `len` bytes in `family`, undecorated.
+    fn run(&self, len: usize, family: &str, color: Hsla) -> TextRun {
+        TextRun {
+            len,
+            font: font(family.to_string()),
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }
+    }
+
+    /// Selectable text: `text` set in `runs`, the part of leaf `leaf` from
+    /// byte `start` on. It tints what the selection covers, and reports its
+    /// layout once measured so a pointer can be mapped back onto it.
+    fn segment(&self, leaf: LeafId, start: usize, text: String, runs: Vec<TextRun>) -> Div {
+        if text.is_empty() {
+            return div();
+        }
+        let runs = self.leaves.tinted(leaf, start, text.len(), runs);
+        let styled = StyledText::new(text).with_runs(runs);
+        let layout = styled.layout().clone();
+        let hits = self.leaves.hits().clone();
+        // The probe is a sibling painted after the text, so by the time it
+        // runs the text has been measured and its layout can be read.
+        div().relative().child(styled).child(
+            canvas(
+                move |_, _, _| hits.report(leaf, start, layout),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+    }
 }
 
 /// One inline run's inherited styling.
@@ -127,6 +310,16 @@ enum Atom {
         value: String,
         trailing: String,
     },
+}
+
+impl Atom {
+    /// The text this atom adds to its paragraph's plain text.
+    fn text(&self) -> String {
+        match self {
+            Atom::Prose { text, .. } => text.clone(),
+            Atom::Code { value, trailing } => format!("{value}{trailing}"),
+        }
+    }
 }
 
 /// Builds a paragraph's atoms in one pass.
@@ -333,46 +526,68 @@ fn drop_runs(mut runs: Vec<TextRun>, at: usize) -> Vec<TextRun> {
     kept
 }
 
-/// Render one block node at the given base size.
-fn block(
-    node: &Node,
-    theme: Theme,
-    fonts: Fonts,
-    chrome: &str,
-    mono: &str,
-    size: f32,
-) -> AnyElement {
+/// The runs covering bytes `from..to` of the text they style.
+fn slice_runs(runs: &[TextRun], from: usize, to: usize) -> Vec<TextRun> {
+    let mut slice = Vec::new();
+    let mut at = 0;
+    for run in runs {
+        let end = at + run.len;
+        let (low, high) = (from.max(at), to.min(end));
+        if low < high {
+            let mut piece = run.clone();
+            piece.len = high - low;
+            slice.push(piece);
+        }
+        at = end;
+    }
+    slice
+}
+
+/// Render one block node.
+fn block(node: &Node, paint: &Paint) -> AnyElement {
+    let theme = paint.theme;
+    let size = paint.fonts.body;
     match node {
-        Node::Paragraph(paragraph) => inline(&paragraph.children, theme, chrome, mono, size, None),
+        Node::Paragraph(paragraph) => {
+            inline(&paragraph.children, paint, size, false, PROSE_LEADING)
+        }
         Node::Heading(heading) => {
             let scale = match heading.depth {
-                1 => 1.5,
-                2 => 1.3,
+                1 => 1.6,
+                2 => 1.35,
                 3 => 1.15,
                 _ => 1.0,
             };
-            inline(
+            let title = inline(
                 &heading.children,
-                theme,
-                chrome,
-                mono,
+                paint,
                 size * scale,
-                Some(FontWeight::BOLD),
-            )
+                true,
+                HEADING_LEADING,
+            );
+            // The two largest headings sit on a rule, so a section reads as one.
+            if heading.depth <= 2 {
+                div()
+                    .pb_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(title)
+                    .into_any_element()
+            } else {
+                title
+            }
         }
         Node::Code(code) => code_card(
             code.lang.as_deref().filter(|lang| !lang.is_empty()),
             &code.value,
-            theme,
-            fonts,
-            mono,
+            paint,
         ),
-        Node::Yaml(front) => code_card(Some("front matter"), &front.value, theme, fonts, mono),
-        Node::Toml(front) => code_card(Some("front matter"), &front.value, theme, fonts, mono),
+        Node::Yaml(front) => code_card(Some("front matter"), &front.value, paint),
+        Node::Toml(front) => code_card(Some("front matter"), &front.value, paint),
         Node::Blockquote(quote) => {
-            let mut inner = div().flex().flex_col().gap_2().flex_1().min_w(px(0.0));
+            let mut inner = div().flex().flex_col().gap(px(8.0)).flex_1().min_w(px(0.0));
             for child in &quote.children {
-                inner = inner.child(block(child, theme, fonts, chrome, mono, size));
+                inner = inner.child(block(child, paint));
             }
             div()
                 .flex()
@@ -380,7 +595,7 @@ fn block(
                 .gap_3()
                 .child(
                     div()
-                        .w(px(2.0))
+                        .w(px(3.0))
                         .flex_shrink_0()
                         .radius_full()
                         .bg(theme.border),
@@ -389,67 +604,87 @@ fn block(
                 .into_any_element()
         }
         Node::List(list) => {
-            let mut column = div().flex().flex_col().gap_2();
+            // A loose list (blank lines between items) breathes more.
+            let gap = if list.spread { 8.0 } else { 4.0 };
+            let mut column = div().flex().flex_col().gap(px(gap));
             for (index, item) in list.children.iter().enumerate() {
                 let bullet = match (list.ordered, list.start) {
                     (true, Some(start)) => format!("{}.", start as usize + index),
                     (true, None) => format!("{}.", index + 1),
                     (false, _) => "•".to_string(),
                 };
-                column = column.child(list_item(item, bullet, theme, fonts, chrome, mono, size));
+                column = column.child(list_item(item, bullet, paint));
             }
             column.into_any_element()
         }
         Node::ThematicBreak(_) => div()
+            .my_1()
             .h(px(1.0))
             .w_full()
             .bg(theme.border)
             .into_any_element(),
         Node::Table(table) => {
-            let mut column = div().flex().flex_col().gap_1();
+            let mut grid = div()
+                .flex()
+                .flex_col()
+                .radius_md()
+                .border_1()
+                .border_color(theme.border)
+                .overflow_hidden();
             for (index, row) in table.children.iter().enumerate() {
                 let Node::TableRow(row) = row else {
                     continue;
                 };
                 // The first row names the columns, so it reads as a header.
                 let header = index == 0;
-                let mut line = div().flex().flex_row().gap_3();
+                let mut line = div().flex().flex_row();
                 if header {
-                    line = line.pb_1().border_b_1().border_color(theme.border);
+                    line = line.bg(theme.panel_dim);
+                } else {
+                    line = line.border_t_1().border_color(theme.border);
                 }
                 for cell in &row.children {
                     let Node::TableCell(cell) = cell else {
                         continue;
                     };
-                    line = line.child(div().flex_1().min_w(px(0.0)).child(inline(
-                        &cell.children,
-                        theme,
-                        chrome,
-                        mono,
-                        size,
-                        header.then_some(FontWeight::BOLD),
-                    )));
+                    line = line.child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .px_2()
+                            .py(px(5.0))
+                            .child(inline(&cell.children, paint, size, header, PROSE_LEADING)),
+                    );
                 }
-                column = column.child(line);
+                grid = grid.child(line);
             }
-            column.into_any_element()
+            grid.into_any_element()
         }
-        Node::Html(html) => div()
-            .text_size(px(size))
-            .text_color(theme.muted)
-            .child(html.value.clone())
-            .into_any_element(),
-        Node::Text(text) => div()
-            .text_size(px(size))
-            .text_color(theme.fg)
-            .whitespace_normal()
-            .child(text.value.clone())
-            .into_any_element(),
+        Node::Html(html) => {
+            let leaf = paint.leaf(&html.value);
+            let run = paint.run(html.value.len(), &paint.chrome, theme.muted.into());
+            paint
+                .segment(leaf, 0, html.value.clone(), vec![run])
+                .text_size(px(size))
+                .line_height(relative(PROSE_LEADING))
+                .whitespace_normal()
+                .into_any_element()
+        }
+        Node::Text(text) => {
+            let leaf = paint.leaf(&text.value);
+            let run = paint.run(text.value.len(), &paint.chrome, theme.fg.into());
+            paint
+                .segment(leaf, 0, text.value.clone(), vec![run])
+                .text_size(px(size))
+                .line_height(relative(PROSE_LEADING))
+                .whitespace_normal()
+                .into_any_element()
+        }
         other => match other.children() {
             Some(children) => {
-                let mut column = div().flex().flex_col().gap_2();
+                let mut column = div().flex().flex_col().gap(px(8.0));
                 for child in children {
-                    column = column.child(block(child, theme, fonts, chrome, mono, size));
+                    column = column.child(block(child, paint));
                 }
                 column.into_any_element()
             }
@@ -459,55 +694,41 @@ fn block(
 }
 
 /// A monospace card for code or front matter, with its language or kind
-/// above it.
-fn code_card(
-    label: Option<&str>,
-    value: &str,
-    theme: Theme,
-    fonts: Fonts,
-    mono: &str,
-) -> AnyElement {
+/// above it. Code is set a step below the secondary text, so it reads as an
+/// aside to the prose around it.
+fn code_card(label: Option<&str>, value: &str, paint: &Paint) -> AnyElement {
+    let theme = paint.theme;
+    let leaf = paint.leaf(value);
     let mut card = div()
         .flex()
         .flex_col()
         .gap_1()
-        .mx_1()
         .radius_md()
         .bg(theme.panel_dim)
         .px_3()
         .py_2()
         .overflow_hidden()
-        .text_size(px(fonts.secondary))
+        .text_size(px(paint.fonts.label))
         .text_color(theme.fg)
-        .whitespace_normal()
-        .font_family(mono.to_string());
+        .line_height(relative(CODE_LEADING))
+        .whitespace_normal();
     if let Some(label) = label {
-        card = card.child(
-            div()
-                .text_size(px(fonts.label))
-                .text_color(theme.muted)
-                .child(label.to_string()),
-        );
+        card = card.child(div().text_color(theme.muted).child(label.to_string()));
     }
-    card.child(value.to_string()).into_any_element()
+    let run = paint.run(value.len(), &paint.mono, theme.fg.into());
+    card.child(paint.segment(leaf, 0, value.to_string(), vec![run]))
+        .into_any_element()
 }
 
 /// One list item: a marker beside its first block, with later blocks aligned.
-fn list_item(
-    item: &Node,
-    bullet: String,
-    theme: Theme,
-    fonts: Fonts,
-    chrome: &str,
-    mono: &str,
-    size: f32,
-) -> AnyElement {
+fn list_item(item: &Node, bullet: String, paint: &Paint) -> AnyElement {
     let Node::ListItem(item) = item else {
         return div().into_any_element();
     };
-    let mut body = div().flex().flex_col().gap_2().flex_1().min_w(px(0.0));
+    let gap = if item.spread { 8.0 } else { 4.0 };
+    let mut body = div().flex().flex_col().gap(px(gap)).flex_1().min_w(px(0.0));
     for child in &item.children {
-        body = body.child(block(child, theme, fonts, chrome, mono, size));
+        body = body.child(block(child, paint));
     }
     let marker = if let Some(true) = item.checked {
         "☑".to_string()
@@ -522,9 +743,13 @@ fn list_item(
         .gap_2()
         .child(
             div()
+                .flex()
+                .justify_end()
                 .flex_shrink_0()
-                .text_size(px(size))
-                .text_color(theme.muted)
+                .min_w(px(16.0))
+                .text_size(px(paint.fonts.body))
+                .line_height(relative(PROSE_LEADING))
+                .text_color(paint.theme.muted)
                 .child(marker),
         )
         .child(body)
@@ -532,26 +757,27 @@ fn list_item(
 }
 
 /// A paragraph: inline runs in one wrapping [`Text`], or a wrapping row of
-/// prose and code chips when it contains inline code.
-fn inline(
-    nodes: &[Node],
-    theme: Theme,
-    chrome: &str,
-    mono: &str,
-    size: f32,
-    weight: Option<FontWeight>,
-) -> AnyElement {
-    let mut builder = Inline::new(chrome, theme);
-    builder.children(nodes, Style::default());
+/// prose and code chips when it contains inline code. `bold` sets the whole
+/// paragraph in bold, as a heading or a table header is.
+fn inline(nodes: &[Node], paint: &Paint, size: f32, bold: bool, leading: f32) -> AnyElement {
+    let theme = paint.theme;
+    let mut builder = Inline::new(&paint.chrome, theme);
+    builder.children(
+        nodes,
+        Style {
+            bold,
+            ..Style::default()
+        },
+    );
     let atoms = builder.into_atoms();
-    let mut line = div()
+    let whole: String = atoms.iter().map(Atom::text).collect();
+    let leaf = paint.leaf(&whole);
+    let line = div()
         .w_full()
         .text_size(px(size))
         .text_color(theme.fg)
+        .line_height(relative(leading))
         .whitespace_normal();
-    if let Some(weight) = weight {
-        line = line.font_weight(weight);
-    }
     if atoms.iter().all(|atom| matches!(atom, Atom::Prose { .. })) {
         let mut text = String::new();
         let mut runs = Vec::new();
@@ -565,50 +791,65 @@ fn inline(
                 runs.extend(chunk_runs);
             }
         }
-        line = line.child(StyledText::new(text).with_runs(runs));
-    } else {
-        let mut row = div().flex().flex_row().flex_wrap().items_baseline();
-        for atom in atoms {
-            match atom {
-                Atom::Prose { text, runs } => {
-                    // `min_w(0)` lets a prose run shrink below its natural
-                    // width so it wraps; a flex item's default `min-width:
-                    // auto` would hold it at full width and overflow.
-                    row = row.child(
-                        div()
-                            .min_w(px(0.0))
-                            .child(StyledText::new(text).with_runs(runs)),
-                    );
-                }
-                Atom::Code { value, trailing } => {
-                    let chip = div()
-                        .px_1()
-                        .radius_sm()
-                        .bg(theme.panel_dim)
-                        .font_family(mono.to_string())
-                        .child(value);
-                    row = row.child(if trailing.is_empty() {
-                        chip.into_any_element()
-                    } else {
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_baseline()
-                            .child(chip)
-                            .child(trailing)
-                            .into_any_element()
-                    });
+        return line
+            .child(paint.segment(leaf, 0, text, runs).w_full())
+            .into_any_element();
+    }
+    // A code chip is a step smaller than the prose around it.
+    let chip_size = size * paint.fonts.secondary / paint.fonts.body;
+    let mut row = div().flex().flex_row().flex_wrap().items_baseline();
+    let mut start = 0;
+    for atom in atoms {
+        let length = atom.text().len();
+        match atom {
+            Atom::Prose { text, runs } => {
+                // One item per word, each keeping the space after it, so the
+                // row wraps like running text: a prose run as a single item
+                // would fill the row and strand the chip on a line of its own.
+                let mut at = 0;
+                for word in text.split_inclusive(char::is_whitespace) {
+                    let end = at + word.len();
+                    row = row.child(paint.segment(
+                        leaf,
+                        start + at,
+                        word.to_string(),
+                        slice_runs(&runs, at, end),
+                    ));
+                    at = end;
                 }
             }
+            Atom::Code { value, trailing } => {
+                let run = paint.run(value.len(), &paint.mono, theme.fg.into());
+                let chip = div()
+                    .px_1()
+                    .radius_sm()
+                    .bg(theme.panel_dim)
+                    .text_size(px(chip_size))
+                    .line_height(relative(1.4))
+                    .child(paint.segment(leaf, start, value.clone(), vec![run]));
+                row = row.child(if trailing.is_empty() {
+                    chip.into_any_element()
+                } else {
+                    let run = paint.run(trailing.len(), &paint.chrome, theme.fg.into());
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_baseline()
+                        .child(chip)
+                        .child(paint.segment(leaf, start + value.len(), trailing, vec![run]))
+                        .into_any_element()
+                });
+            }
         }
-        line = line.child(row);
+        start += length;
     }
-    line.into_any_element()
+    line.child(row).into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::md_select::TextPoint;
 
     fn atoms(source: &str) -> Vec<Atom> {
         let root = markdown::to_mdast(source, &markdown::ParseOptions::gfm()).expect("parse");
@@ -689,6 +930,68 @@ mod tests {
         assert!(matches!(&soft[0], Atom::Prose { text, .. } if text == "first line second line"));
         let hard = atoms("first  \nsecond");
         assert!(matches!(&hard[0], Atom::Prose { text, .. } if text.contains('\n')));
+    }
+
+    const MIXED: &str = "Hello `code`, world\n\n- one\n- two\n\n| a | b |\n|---|---|\n| c | d |\n\n```rs\nfn x() {}\n```\n";
+
+    #[test]
+    fn each_block_lists_the_text_of_its_leaves_in_painting_order() {
+        let document = Document::parse(MIXED);
+        let leaves: Vec<Vec<&str>> = document
+            .blocks()
+            .iter()
+            .map(|block| block.leaves.iter().map(String::as_str).collect())
+            .collect();
+        assert_eq!(
+            leaves,
+            vec![
+                vec!["Hello code, world"],
+                vec!["one", "two"],
+                vec!["a", "b", "c", "d"],
+                vec!["fn x() {}"],
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_text_runs_across_leaves_and_blocks() {
+        let document = Document::parse(MIXED);
+        let at = |block, leaf, offset| TextPoint {
+            leaf: LeafId { block, leaf },
+            offset,
+        };
+        let selection = Selection {
+            anchor: at(1, 1, 2),
+            head: at(0, 0, 6),
+        };
+        assert_eq!(document.selected_text(&selection), "code, world\n\none\ntw");
+        assert_eq!(
+            document.selected_lines(&selection).map(|lines| lines.0),
+            Some(1)
+        );
+        assert_eq!(
+            document.selected_lines(&Selection::collapsed(at(0, 0, 1))),
+            Some((1, 1))
+        );
+        let inside = Selection {
+            anchor: at(2, 1, 0),
+            head: at(2, 2, 1),
+        };
+        assert_eq!(document.selected_text(&inside), "b\nc");
+    }
+
+    #[test]
+    fn slicing_runs_keeps_each_pieces_styling_and_length() {
+        let atoms = atoms("plain **bold** tail");
+        let Atom::Prose { text, runs } = &atoms[0] else {
+            panic!("expected prose");
+        };
+        let slice = slice_runs(runs, 3, 9);
+        assert_eq!(slice.iter().map(|run| run.len).sum::<usize>(), 6);
+        assert_eq!(&text[3..9], "in bol");
+        assert_eq!(slice.len(), 2);
+        assert_ne!(slice[0].font.weight, slice[1].font.weight);
+        assert!(slice_runs(runs, 4, 4).is_empty());
     }
 
     #[test]

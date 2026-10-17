@@ -414,6 +414,14 @@ impl DiffPanel {
             .flatten()
     }
 
+    pub(super) fn md_view_mut(&mut self) -> Option<&mut MdDoc> {
+        let md = self.md.as_mut()?;
+        if self.selected.as_ref() != Some(&md.key) {
+            return None;
+        }
+        md.state.as_mut().ok()
+    }
+
     /// The open file, by layer and path.
     pub(super) fn selected_key(&self) -> Option<(DiffLayer, String)> {
         self.selected.clone()
@@ -1444,7 +1452,7 @@ impl PilusView {
     /// Feedback usually belongs to an agent working in the same checkout, but
     /// hiding the rest made the picker look empty whenever the agent lived in
     /// a sibling worktree's workspace.
-    fn diff_agents(&self) -> Vec<Agent> {
+    pub(super) fn diff_agents(&self) -> Vec<Agent> {
         let workspace = self.active_workspace_id();
         let mut agents = self.agents.clone();
         // A stable sort keeps the daemon's order within each group.
@@ -2489,6 +2497,7 @@ impl PilusView {
                 folder: Some(open),
                 animate: self.diff_panel.folder_toggled.as_ref() == Some(&key),
                 mark: None,
+                selected: false,
             },
             self.theme,
             &self.shared_settings,

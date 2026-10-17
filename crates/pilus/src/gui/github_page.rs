@@ -23,6 +23,7 @@ use pilus_client::{
 
 use super::github::{Load, Slot, display_name, repo_facts};
 use super::markdown::{self, Document};
+use super::md_select::Leaves;
 use super::style::{self, ButtonKind, FillExt};
 use super::tasks::{age_label, unix_now};
 use super::toast::ToastKind;
@@ -1185,12 +1186,23 @@ impl PilusView {
                     .child(empty.to_string()),
             );
         }
-        for block in blocks {
-            // Headings take room above them, so a section reads as a section.
-            let top = if block.is_heading() { 12.0 } else { 2.0 };
-            column = column.child(div().w_full().pt(px(top)).pb(px(2.0)).child(
-                markdown::render_block(block, theme, fonts, &self.shared_settings),
-            ));
+        let unit = fonts.body / 13.0;
+        for (ix, block) in blocks.iter().enumerate() {
+            let (before, after) = block.spacing();
+            let leaves = Leaves::inert(ix);
+            column = column.child(
+                div()
+                    .w_full()
+                    .pt(px(before * unit))
+                    .pb(px(after * unit))
+                    .child(markdown::render_block(
+                        block,
+                        theme,
+                        fonts,
+                        &self.shared_settings,
+                        &leaves,
+                    )),
+            );
         }
         column
     }

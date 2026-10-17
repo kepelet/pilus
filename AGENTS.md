@@ -50,6 +50,12 @@ with only the command-line tools can build the app.
   all. The `visual-test` captures fill the feed with samples so a shot never
   reaches GitHub.
 
+- Notes on excerpts of markdown files (`gui/md_notes.rs`) are the app's own,
+  kept per machine and file in `md-notes.json` beside the settings. They are not
+  the daemon's review notes: those are anchored to a Git layer, which an unchanged
+  file has not. Sending ticked notes is one `agent.prompt` carrying every excerpt,
+  so an agent never receives a note it cannot place.
+
 ## UI
 
 `crates/pilus/src/gui/ui_playground.rs` is the visual contract: a working

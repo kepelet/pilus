@@ -7419,7 +7419,16 @@ impl PilusView {
             .clone()
             .filter(|url| !url.trim().is_empty());
 
-        let mut line = div().flex().flex_row().items_center().min_h(px(18.0));
+        // The live input is a bare canvas with no intrinsic width, so the line
+        // must fill the field or the input collapses to nothing and its text
+        // is clipped away.
+        let mut line = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(18.0));
         if editing {
             let input = self.update_feed_input.clone();
             input.update(cx, |input, _| {

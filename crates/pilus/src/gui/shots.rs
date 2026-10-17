@@ -1212,6 +1212,50 @@ pub fn run_main() -> Result<()> {
     });
     settle(&mut cx, 12);
     capture(&mut cx, window.into(), "main-settings")?;
+    // The preview channel's feed override mid-edit: the live input must show
+    // its text inside the field.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.settings.update_channel = "preview".to_string();
+            view.settings.update_feed_url = Some("https://example.com/feed.xml".to_string());
+            *view.shared_settings.borrow_mut() = view.settings.clone();
+            view.edit_update_feed(cx);
+        });
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        use gpui::InputEvent;
+        let scroll = gpui::ScrollWheelEvent {
+            position: point(px(1000.0), px(500.0)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-1600.0))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        window.dispatch_event(scroll.to_platform_input(), cx);
+    })
+    .ok();
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-settings-feed-edit")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.settings.update_channel = "stable".to_string();
+            view.settings.update_feed_url = None;
+            *view.shared_settings.borrow_mut() = view.settings.clone();
+            view.update_url_editing = false;
+            cx.notify();
+        });
+    });
+    // Back to the top, so the captures below start where they always did.
+    cx.update_window(window.into(), |_, window, cx| {
+        use gpui::InputEvent;
+        let scroll = gpui::ScrollWheelEvent {
+            position: point(px(1000.0), px(500.0)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(6000.0))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        window.dispatch_event(scroll.to_platform_input(), cx);
+    })
+    .ok();
     // Remote access with the service waiting on Luvus and no code on screen.
     super::connector::preview(remote_access_fixture(false));
     cx.update(|app| {

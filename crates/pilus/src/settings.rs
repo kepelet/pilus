@@ -49,6 +49,11 @@ pub const DEFAULT_CORNER_RADIUS: f32 = 8.0;
 /// The largest corner radius the Appearances slider offers.
 pub const CORNER_RADIUS_MAX: f32 = 16.0;
 
+/// The color scheme a light device takes until the user picks another.
+pub const DEFAULT_LIGHT_THEME: &str = "rose-pine-dawn";
+/// The color scheme a dark device takes until the user picks another.
+pub const DEFAULT_DARK_THEME: &str = "noir";
+
 /// The main window's frame when it was last seen, so the next launch reopens
 /// it where the user left it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -179,6 +184,14 @@ pub struct Settings {
     /// Relay the host connector dials out through. Owned by the agent too, so
     /// it is kept here to survive the window rewriting this file.
     pub relay: pilus_client::RelaySettings,
+    /// Follow the device appearance: the color scheme switches between
+    /// `theme_light` and `theme_dark` with the system, and replaces the one
+    /// the attached Luvus daemon had selected, remote machines included.
+    pub auto_theme: bool,
+    /// Color scheme id for a light device; `None` takes `DEFAULT_LIGHT_THEME`.
+    pub theme_light: Option<String>,
+    /// Color scheme id for a dark device; `None` takes `DEFAULT_DARK_THEME`.
+    pub theme_dark: Option<String>,
     /// Whether pilus has applied its default daemon layout and theme to the
     /// daemon it first attached to. `None` and `false` both mean "not yet",
     /// so a launch that missed a stopped daemon retries next time.
@@ -222,6 +235,9 @@ impl Default for Settings {
             diff_list_width: 0.0,
             git_list_height: 0.0,
             relay: pilus_client::RelaySettings::default(),
+            auto_theme: false,
+            theme_light: None,
+            theme_dark: None,
             init: Some(false),
         }
     }
@@ -275,6 +291,26 @@ impl Settings {
         } else {
             OPACITY
         }
+    }
+
+    /// The color scheme id `auto_theme` selects on a light or dark device.
+    pub fn device_theme(&self, dark: bool) -> &str {
+        let (chosen, fallback) = if dark {
+            (&self.theme_dark, DEFAULT_DARK_THEME)
+        } else {
+            (&self.theme_light, DEFAULT_LIGHT_THEME)
+        };
+        chosen.as_deref().unwrap_or(fallback)
+    }
+
+    /// Choose the color scheme for a light or dark device.
+    pub fn set_device_theme(&mut self, dark: bool, id: &str) {
+        let slot = if dark {
+            &mut self.theme_dark
+        } else {
+            &mut self.theme_light
+        };
+        *slot = Some(id.to_string());
     }
 
     /// What to call `session` in the UI: its label, else its real name.
@@ -413,6 +449,17 @@ mod tests {
         assert!(settings.update_feed_url.is_none());
         assert!(settings.window.is_none());
         assert_eq!(settings.opacity, OPACITY);
+    }
+
+    #[test]
+    fn device_themes_fall_back_until_chosen() {
+        let mut settings = Settings::default();
+        assert!(!settings.auto_theme);
+        assert_eq!(settings.device_theme(false), DEFAULT_LIGHT_THEME);
+        assert_eq!(settings.device_theme(true), DEFAULT_DARK_THEME);
+        settings.set_device_theme(true, "noir");
+        assert_eq!(settings.device_theme(true), "noir");
+        assert_eq!(settings.device_theme(false), DEFAULT_LIGHT_THEME);
     }
 
     #[test]
@@ -697,6 +744,9 @@ mod tests {
                 secret: Some("project-secret".to_string()),
                 url: vec!["https://relay.example".to_string()],
             },
+            auto_theme: true,
+            theme_light: Some("catppuccin-latte".to_string()),
+            theme_dark: Some("noir".to_string()),
             init: Some(true),
         };
         let text = serde_json::to_string(&settings).expect("serialize");

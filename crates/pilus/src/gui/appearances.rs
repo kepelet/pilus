@@ -1,5 +1,5 @@
-//! The native Appearances window: pick a Luvus theme, the fonts, and how
-//! translucent and rounded the window is.
+//! The native Appearances window: pick a Luvus theme (or one per device
+//! appearance), the fonts, and how translucent and rounded the window is.
 //!
 //! It is a thin view over the daemon's theme registry (`theme.list` /
 //! `theme.use`, both on a background thread) plus the client-owned font and
@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Div, FocusHandle, KeyDownEvent, MouseButton, Render,
-    Window, WindowBounds, WindowOptions, anchored, canvas, deferred, div, point, prelude::*, px,
-    size, svg,
+    Window, WindowAppearance, WindowBounds, WindowOptions, anchored, canvas, deferred, div, point,
+    prelude::*, px, size, svg,
 };
 use pilus_client::{Appearance, ControlClient, ControlTransport, ThemeInfo};
 
@@ -274,6 +274,73 @@ impl AppearancesView {
         self.select_tx.send(id).ok();
     }
 
+    /// A click on a scheme. While following the device appearance it fills
+    /// the light or dark slot the scheme belongs to, leaving the other slot's
+    /// pick standing. Only a pick for the mode the device is in goes to the
+    /// daemon now; the other waits for the device to flip.
+    fn pick_theme(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.settings.auto_theme {
+            let current = device_is_dark(cx);
+            let dark = match self
+                .appearance
+                .themes
+                .iter()
+                .find(|info| info.id == id)
+                .map(|info| info.appearance.as_str())
+            {
+                Some("light") => false,
+                Some("dark") => true,
+                // A terminal theme follows the terminal, not the chrome, so
+                // it takes whichever mode the device is in.
+                _ => current,
+            };
+            self.settings.set_device_theme(dark, &id);
+            self.publish(cx);
+            if dark != current {
+                cx.notify();
+                return;
+            }
+        }
+        self.select(id);
+        cx.notify();
+    }
+
+    /// The checkbox that hands the color scheme to the device appearance,
+    /// with a note on how picks then behave.
+    fn auto_theme_rows(&self, cx: &mut Context<Self>) -> Div {
+        let toggle = style::checkbox(
+            "pilus-auto-theme",
+            self.settings.auto_theme,
+            "Match device appearance",
+            self.theme,
+            self.fonts().secondary,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.settings.auto_theme = !this.settings.auto_theme;
+            this.publish(cx);
+        }));
+        let note = if self.settings.auto_theme {
+            "Pick a light scheme and a dark one. The one matching the device is \
+             applied, remote machines included"
+        } else {
+            "Switch between a light and a dark scheme with the device, \
+             overriding the Luvus daemon's, remote machines included"
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .child(toggle)
+            .child(
+                div()
+                    .text_size(px(self.fonts().label))
+                    .text_color(self.theme.muted)
+                    .child(note),
+            )
+    }
+
     /// Publish a font change to the main window and to disk.
     fn publish(&mut self, cx: &mut Context<Self>) {
         self.stage(cx);
@@ -432,7 +499,22 @@ impl AppearancesView {
 
     fn theme_row(&self, info: &ThemeInfo, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let active = info.active;
+        // Following the device, a light and a dark scheme are both chosen,
+        // and the daemon's own selection is only whichever one applies now.
+        let slots: Vec<&str> = if self.settings.auto_theme {
+            [(false, "Light"), (true, "Dark")]
+                .into_iter()
+                .filter(|(dark, _)| self.settings.device_theme(*dark) == info.id)
+                .map(|(_, label)| label)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let active = if self.settings.auto_theme {
+            !slots.is_empty()
+        } else {
+            info.active
+        };
         let id = info.id.clone();
         let palette = scheme::builtin(&info.id);
         let bg = if active { theme.panel } else { theme.window_bg };
@@ -473,8 +555,7 @@ impl AppearancesView {
             .cursor_pointer()
             .state_fill(bg, theme.panel, style::RADIUS_MD)
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.select(id.clone());
-                cx.notify();
+                this.pick_theme(id.clone(), cx);
             }))
             .child(swatches)
             .child(
@@ -498,6 +579,14 @@ impl AppearancesView {
             )
             .child(badge);
 
+        if !slots.is_empty() {
+            row = row.child(
+                div()
+                    .text_size(px(self.fonts().label))
+                    .text_color(theme.accent)
+                    .child(slots.join(" · ")),
+            );
+        }
         if active {
             row = row.child(
                 svg()
@@ -1207,7 +1296,9 @@ impl Render for AppearancesView {
             .flex_1()
             .overflow_y_scroll();
 
-        list = list.child(self.section_heading("COLOR SCHEME"));
+        list = list
+            .child(self.section_heading("COLOR SCHEME"))
+            .child(self.auto_theme_rows(cx));
         if self.appearance.themes.is_empty() {
             list = list.child(
                 div()
@@ -1258,6 +1349,14 @@ impl Render for AppearancesView {
         }
         root
     }
+}
+
+/// Whether the device is in dark mode, which `auto_theme` follows.
+pub(super) fn device_is_dark(cx: &App) -> bool {
+    matches!(
+        cx.window_appearance(),
+        WindowAppearance::Dark | WindowAppearance::VibrantDark
+    )
 }
 
 /// Open the Appearances window on a daemon's control surface.

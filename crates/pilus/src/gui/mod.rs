@@ -1780,6 +1780,13 @@ struct PilusView {
     theme_endpoint: EndpointId,
     /// A theme refresh is running off-thread; no overlapping spawns.
     theme_refreshing: bool,
+    /// The endpoint whose registry `appearance` holds. It lags `active` for
+    /// a poll after a switch, and the device scheme must not be judged
+    /// against the previous endpoint's selection.
+    appearance_for: Option<EndpointId>,
+    /// The endpoint and scheme the device appearance last selected, so a
+    /// scheme picked by hand afterwards stands until the device flips.
+    auto_theme_applied: Option<(EndpointId, String)>,
     /// Fresh appearance snapshots from the background refresh.
     theme_rx: Receiver<(EndpointId, pilus_client::Result<Appearance>)>,
     /// Sender half for the background theme refresh.
@@ -2326,6 +2333,8 @@ impl PilusView {
             last_theme_poll: Instant::now() - Duration::from_secs(11),
             theme_endpoint: EndpointId::Local,
             theme_refreshing: false,
+            appearance_for: None,
+            auto_theme_applied: None,
             theme_rx,
             theme_tx,
             tab_sel: None,
@@ -2936,14 +2945,16 @@ impl PilusView {
             if endpoint != self.active {
                 continue;
             }
-            if let Ok(appearance) = result
-                && appearance != self.appearance
-            {
-                self.appearance = appearance;
-                self.apply_appearance();
-                changed = true;
+            if let Ok(appearance) = result {
+                self.appearance_for = Some(endpoint);
+                if appearance != self.appearance {
+                    self.appearance = appearance;
+                    self.apply_appearance();
+                    changed = true;
+                }
             }
         }
+        self.follow_device_appearance(cx);
         while let Ok(result) = self.luvus_install_rx.try_recv() {
             match result {
                 Ok(_) => {
@@ -4277,6 +4288,49 @@ impl PilusView {
             Some(target) => AgentFeed::spawn_ssh_agents(target),
             None => AgentFeed::spawn_agents(self.api_socket()),
         }
+    }
+
+    /// With `auto_theme` on, select the color scheme that matches the device
+    /// appearance on the daemon the window shows, a remote machine's included.
+    ///
+    /// Each endpoint is switched once per device appearance, when its registry
+    /// has been polled; a scheme chosen by hand afterwards is left alone until
+    /// the device flips again. A scheme the daemon does not register is
+    /// skipped rather than retried every poll.
+    fn follow_device_appearance(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.auto_theme {
+            // Turning it back on must reapply, even to the same scheme.
+            self.auto_theme_applied = None;
+            return;
+        }
+        if self.theme_refreshing || self.appearance_for.as_ref() != Some(&self.active) {
+            return;
+        }
+        let wanted = self
+            .settings
+            .device_theme(appearances::device_is_dark(cx))
+            .to_string();
+        let key = (self.active.clone(), wanted.clone());
+        if self.auto_theme_applied.as_ref() == Some(&key) {
+            return;
+        }
+        let registered = self.appearance.themes.iter().any(|info| info.id == wanted);
+        self.auto_theme_applied = Some(key);
+        if !registered || self.appearance.active == wanted {
+            return;
+        }
+        self.theme_refreshing = true;
+        self.last_theme_poll = Instant::now();
+        let endpoint = self.active.clone();
+        let transport = self.control_transport();
+        let tx = self.theme_tx.clone();
+        std::thread::spawn(move || {
+            let mut client = ControlClient::from_transport(transport);
+            let result = client
+                .select_theme(&wanted)
+                .and_then(|()| client.appearance());
+            tx.send((endpoint, result)).ok();
+        });
     }
 
     /// Rebuild the chrome palette from the selected appearance. A vendored

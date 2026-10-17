@@ -56,6 +56,30 @@ with only the command-line tools can build the app.
   file has not. Sending ticked notes is one `agent.prompt` carrying every excerpt,
   so an agent never receives a note it cannot place.
 
+- The Files tab edits text files in place (`files_tab.rs`), saved through
+  `pilus_client::write_text` (local or over SSH), never through the daemon. A
+  click opens a file in the editor when `highlight::is_text` says it is text
+  (markdown, a file with a grammar, or a known plain-text kind); anything else,
+  and a double click, still goes to the daemon. Markdown (`md`, `markdown`,
+  `mdown`, `mkd`, `mdx`, by `md_view::is_markdown`) opens as a document with
+  Source, Preview and side-by-side modes; any other file opens straight into
+  the source editor, with no preview and an `MdDoc` that holds its text
+  unparsed. A truncated read, or a file over `md_view::EDIT_LIMIT`, is not
+  opened for editing.
+- The editor field (`md_editor_input`) is colored by `highlight::source`.
+  Markdown gets its marks, front matter as YAML, fenced blocks in their own
+  language, and for `.mdx` the `import`/`export` blocks as JavaScript and JSX
+  tags as markup. The bundled grammars lack TypeScript and JSX, so
+  `highlight::ALIASES` reads them as JavaScript; TOML and a few others open
+  uncolored. The preview reads `.mdx` with MDX's constructs
+  (`markdown::mdx_options`) and falls back to plain markdown when MDX rejects
+  the text, since a stray `<` or `{` is an error there; do not make that parse
+  stricter, or a half-typed file blanks the preview.
+- Editor chords are scoped by key context, never by a check in the handler: the
+  editor div carries `MdEditor`, so Cmd+S saves instead of toggling the sidebar.
+  A deeper context wins over the global binding, so a new editor chord is
+  another `KeyBinding` in that context.
+
 ## UI
 
 `crates/pilus/src/gui/ui_playground.rs` is the visual contract: a working

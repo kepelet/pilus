@@ -37,6 +37,15 @@ pub(super) fn is_markdown(path: &str) -> bool {
     })
 }
 
+/// Whether `path` names an MDX file, which is markdown that also holds
+/// `import`/`export` lines and JSX.
+pub(super) fn is_mdx(path: &str) -> bool {
+    is_markdown(path) && path.to_ascii_lowercase().ends_with(".mdx")
+}
+
+/// The longest file the editor opens.
+const EDIT_LIMIT: usize = 1024 * 1024;
+
 /// One row of the document list.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Row {
@@ -129,11 +138,18 @@ pub(super) fn rows(
 /// A file's blocks and the list that scrolls them.
 pub(super) struct MdDoc {
     document: Document,
+    /// The text the blocks were parsed from, which the editor starts from.
+    source: String,
+    /// Whether the file is MDX, so an edit is parsed as the same.
+    mdx: bool,
     pub(super) truncated: bool,
     rows: Vec<Row>,
     list: ListState,
     /// What the rows were last built from; a change rebuilds them.
     built: Option<u64>,
+    /// The text changed under the rows, which rebuild without losing the
+    /// scroll position.
+    stale: bool,
     /// Frames left to scroll the note form into view, as the Diff's own list
     /// does: a form just inserted has no measured height yet.
     reveal_composer: u8,
@@ -145,20 +161,52 @@ pub(super) struct MdDoc {
 }
 
 impl MdDoc {
-    pub(super) fn new(file: &TextFile) -> Self {
-        let document = Document::parse(&file.text);
+    /// `path` is the file's name, which says whether it is read as markdown,
+    /// and as MDX. Any other file is held for the editor alone: its text is not
+    /// parsed, since there is no document to draw from it.
+    pub(super) fn new(file: &TextFile, path: &str) -> Self {
+        let mdx = is_mdx(path);
+        let document = if is_markdown(path) {
+            Document::parse(&file.text, mdx)
+        } else {
+            Document::parse("", false)
+        };
         let rows = rows(&document, &[], None);
         Self {
             list: ListState::new(rows.len(), ListAlignment::Top, px(600.0)),
             document,
+            source: file.text.clone(),
+            mdx,
             truncated: file.truncated,
             rows,
             built: None,
+            stale: false,
             reveal_composer: 0,
             selection: None,
             dragging: false,
             hits: Hits::default(),
         }
+    }
+
+    pub(super) fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Whether the editor may take this file. A truncated read holds only the
+    /// start of it, and saving that would cut the rest off the disk; a very
+    /// long text makes the field lay out too much on every frame.
+    pub(super) fn editable(&self) -> bool {
+        !self.truncated && self.source.len() <= EDIT_LIMIT
+    }
+
+    /// Show `text` in place of the document, keeping the scroll position so a
+    /// live preview does not jump back to the top with each keystroke.
+    pub(super) fn replace_source(&mut self, text: String) {
+        self.document = Document::parse(&text, self.mdx);
+        self.source = text;
+        self.selection = None;
+        self.dragging = false;
+        self.stale = true;
     }
 
     /// The selection, once it covers some text.
@@ -243,10 +291,11 @@ impl MdDoc {
         notes: &[DiffNote],
         composing: Option<Composing<'_>>,
     ) -> bool {
-        if self.built != Some(stamp) {
+        if self.built != Some(stamp) || self.stale {
             let first = self.built.is_none();
             self.rows = rows(&self.document, notes, composing);
             self.built = Some(stamp);
+            self.stale = false;
             if first {
                 self.list.reset(self.rows.len());
             } else {
@@ -586,6 +635,50 @@ cargo run -p pilus --features visual-test -- --ui-shots-main
 That is all there is to it.
 ";
 
+/// A canned source file for the editor.
+#[cfg(feature = "visual-test")]
+const CODE_SAMPLE: &str = "//! Saving a text file back where it was read.
+
+use std::path::Path;
+
+/// Most bytes the editor opens.
+const LIMIT: usize = 1024 * 1024;
+
+pub fn write_text(path: &Path, text: &str) -> Result<(), String> {
+    if text.len() > LIMIT {
+        return Err(format!(\"{} bytes is too long\", text.len()));
+    }
+    std::fs::write(path, text).map_err(|error| error.to_string())
+}
+";
+
+/// A canned MDX page: front matter, ESM, components, and an expression.
+#[cfg(feature = "visual-test")]
+const MDX_SAMPLE: &str = "---
+title: Launch notes
+draft: true
+---
+
+import { Chart } from '../components/chart'
+export const meta = { updated: 2026 }
+
+# Launch notes
+
+Numbers below come from the {meta.updated} run, and a <Badge /> marks drafts.
+
+<Chart year=\"2026\" kind=\"bar\" />
+
+<Callout type=\"warning\">
+
+Check the **rollback** plan before shipping.
+
+</Callout>
+
+```ts
+const ready: boolean = true
+```
+";
+
 /// Shot-harness entry point: put the canned document on the Files tab.
 #[cfg(feature = "visual-test")]
 impl PilusView {
@@ -609,6 +702,47 @@ impl PilusView {
 
     pub(super) fn files_show_doc_sample(&mut self, cx: &mut Context<Self>) {
         self.files_show_doc("/work/pilus/docs/review-guide.md", SAMPLE, cx);
+    }
+
+    /// The sample document with its source beside it, as the editor shows it
+    /// once the column is wide enough.
+    pub(super) fn files_split_doc_sample(&mut self, cx: &mut Context<Self>) {
+        self.files_edit_doc_sample(cx);
+        self.files_set_split();
+        cx.notify();
+    }
+
+    /// A Rust file in the editor, as a click on it in the tree opens it.
+    pub(super) fn files_edit_code_sample(&mut self, cx: &mut Context<Self>) {
+        self.files_show_doc(
+            "/work/pilus/crates/pilus-client/src/lib.rs",
+            CODE_SAMPLE,
+            cx,
+        );
+        self.files_begin_edit(cx);
+        cx.notify();
+    }
+
+    /// An MDX page with its source beside it.
+    pub(super) fn files_split_mdx_sample(&mut self, cx: &mut Context<Self>) {
+        self.files_show_doc("/work/pilus/site/docs/launch.mdx", MDX_SAMPLE, cx);
+        self.files_begin_edit(cx);
+        self.files_set_split();
+        cx.notify();
+    }
+
+    /// The sample document in the editor, with a line typed after the
+    /// heading so the unsaved mark and the Save button show.
+    pub(super) fn files_edit_doc_sample(&mut self, cx: &mut Context<Self>) {
+        self.files_show_doc_sample(cx);
+        self.files_begin_edit(cx);
+        let text = format!(
+            "{SAMPLE}
+A line typed since the last save.
+"
+        );
+        self.md_editor_input
+            .update(cx, |input, cx| input.set_value_at_start(text, cx));
     }
 }
 
@@ -642,7 +776,7 @@ mod tests {
     const SOURCE: &str = "# Title\n\nFirst paragraph\nstill first.\n\n- one\n- two\n";
 
     fn document() -> Document {
-        Document::parse(SOURCE)
+        Document::parse(SOURCE, false)
     }
 
     #[test]
@@ -656,6 +790,43 @@ mod tests {
     }
 
     #[test]
+    fn a_source_file_is_held_unparsed_and_edits_up_to_a_limit() {
+        let file = |text: String, truncated| TextFile { text, truncated };
+        let code = MdDoc::new(&file("# not a heading\n".to_string(), false), "a.rs");
+        assert!(code.document.blocks().is_empty());
+        assert_eq!(code.source(), "# not a heading\n");
+        assert!(code.editable());
+        assert!(!MdDoc::new(&file("x".to_string(), true), "a.rs").editable());
+        let long = file("x".repeat(EDIT_LIMIT + 1), false);
+        assert!(!MdDoc::new(&long, "a.rs").editable());
+    }
+
+    #[test]
+    fn only_mdx_files_are_mdx() {
+        assert!(is_mdx("a/b.mdx"));
+        assert!(is_mdx("B.MDX"));
+        assert!(!is_mdx("a/b.md"));
+        assert!(!is_mdx("mdx"));
+    }
+
+    #[test]
+    fn an_edit_of_an_mdx_file_is_read_as_mdx() {
+        let file = TextFile {
+            text: "# One\n".to_string(),
+            truncated: false,
+        };
+        let mut doc = MdDoc::new(&file, "post.mdx");
+        // An expression block holds its code alone; as plain markdown it is a
+        // paragraph that keeps the braces.
+        doc.replace_source("{1 + 1}\n".to_string());
+        let leaf = md_select::LeafId { block: 0, leaf: 0 };
+        assert_eq!(doc.document.leaf_text(leaf), Some("1 + 1"));
+        let mut plain = MdDoc::new(&file, "post.md");
+        plain.replace_source("{1 + 1}\n".to_string());
+        assert_eq!(plain.document.leaf_text(leaf), Some("{1 + 1}"));
+    }
+
+    #[test]
     fn a_line_belongs_to_the_block_covering_it_or_the_one_above() {
         let document = document();
         assert_eq!(block_for_line(&document, 1), Some(0));
@@ -665,7 +836,7 @@ mod tests {
         assert_eq!(block_for_line(&document, 7), Some(2));
         // Past the end, the last block.
         assert_eq!(block_for_line(&document, 99), Some(2));
-        assert_eq!(block_for_line(&Document::parse(""), 1), None);
+        assert_eq!(block_for_line(&Document::parse("", false), 1), None);
     }
 
     #[test]
@@ -771,7 +942,7 @@ mod tests {
 
     #[test]
     fn an_empty_file_still_has_somewhere_for_the_form() {
-        let empty = Document::parse("");
+        let empty = Document::parse("", false);
         let form = Composing {
             end: 1,
             editing: None,

@@ -3,7 +3,10 @@
 //! This module parses CommonMark plus GFM with `markdown` (the markdown-rs
 //! crate) and paints its mdast as GPUI elements: paragraphs and inline runs
 //! (bold, italic, code, links), headings, fenced code blocks, lists, block
-//! quotes, tables, and rules.
+//! quotes, tables, and rules. An MDX file also reads its `import`/`export`
+//! lines, JSX, and `{expressions}`: the first is set as code, a component with
+//! content shows that content, and one without shows its tag, since the page
+//! it would draw lives in a build this window cannot run.
 //!
 //! A file is drawn a block at a time: [`Document`] keeps the parsed blocks
 //! with the source lines each covers, so the viewer can virtualize the list
@@ -41,14 +44,48 @@ const HEADING_LEADING: f32 = 1.3;
 /// Line height of code, which is denser than prose.
 const CODE_LEADING: f32 = 1.5;
 
+/// GFM with MDX's constructs on, and the ones they conflict with off. ESM is
+/// only recognized when the parser is given a check for it; this window does
+/// not run JavaScript, so every `import` and `export` block passes.
+fn mdx_options() -> markdown::ParseOptions {
+    let mut options = markdown::ParseOptions::gfm();
+    let constructs = &mut options.constructs;
+    constructs.autolink = false;
+    constructs.code_indented = false;
+    constructs.html_flow = false;
+    constructs.html_text = false;
+    constructs.mdx_esm = true;
+    constructs.mdx_expression_flow = true;
+    constructs.mdx_expression_text = true;
+    constructs.mdx_jsx_flow = true;
+    constructs.mdx_jsx_text = true;
+    options.mdx_esm_parse = Some(Box::new(|_| markdown::MdxSignal::Ok));
+    options
+}
+
 /// Parse `source` into its top-level nodes.
 ///
 /// Front matter is only read for a file: in a chat reply a leading `---` is a
 /// rule, and treating it as front matter would swallow the text after it.
-fn parse(source: &str, front_matter: bool) -> Vec<Node> {
-    let mut options = markdown::ParseOptions::gfm();
-    options.constructs.frontmatter = front_matter;
-    match markdown::to_mdast(source, &options) {
+///
+/// MDX is strict: a stray `<` or `{` in prose is an error rather than text.
+/// A file that fails as MDX is shown as the markdown it mostly is.
+fn parse(source: &str, front_matter: bool, mdx: bool) -> Vec<Node> {
+    let attempt = |mdx: bool| {
+        let mut options = if mdx {
+            mdx_options()
+        } else {
+            markdown::ParseOptions::gfm()
+        };
+        options.constructs.frontmatter = front_matter;
+        markdown::to_mdast(source, &options)
+    };
+    let parsed = if mdx {
+        attempt(true).or_else(|_| attempt(false))
+    } else {
+        attempt(false)
+    };
+    match parsed {
         Ok(Node::Root(root)) => root.children,
         Ok(node) => vec![node],
         // A parse failure falls back to the raw text, never a blank reply.
@@ -93,9 +130,9 @@ pub(super) struct Document {
 }
 
 impl Document {
-    pub(super) fn parse(source: &str) -> Self {
+    pub(super) fn parse(source: &str, mdx: bool) -> Self {
         let mut line = 1;
-        let blocks = parse(source, true)
+        let blocks = parse(source, true, mdx)
             .into_iter()
             .map(|node| {
                 let (first_line, last_line) = node
@@ -177,6 +214,11 @@ fn collect_leaves(node: &Node, out: &mut Vec<String>) {
         Node::Yaml(front) => out.push(front.value.clone()),
         Node::Toml(front) => out.push(front.value.clone()),
         Node::Html(html) => out.push(html.value.clone()),
+        Node::MdxjsEsm(esm) => out.push(esm.value.clone()),
+        Node::MdxFlowExpression(expression) => out.push(expression.value.clone()),
+        Node::MdxJsxFlowElement(element) if element.children.is_empty() => {
+            out.push(jsx_label(element.name.as_deref()));
+        }
         Node::Text(text) => out.push(text.value.clone()),
         Node::Table(table) => {
             for row in &table.children {
@@ -482,6 +524,21 @@ impl<'a> Inline<'a> {
                 let label = reference.label.as_deref().unwrap_or_default();
                 self.push(&format!("[{label}]"), style)
             }
+            Node::MdxJsxTextElement(element) if element.children.is_empty() => self.push(
+                &jsx_label(element.name.as_deref()),
+                Style {
+                    code: true,
+                    ..style
+                },
+            ),
+            Node::MdxJsxTextElement(element) => self.children(&element.children, style),
+            Node::MdxTextExpression(expression) => self.push(
+                &format!("{{{}}}", expression.value),
+                Style {
+                    code: true,
+                    ..style
+                },
+            ),
             _ => {}
         }
     }
@@ -584,6 +641,21 @@ fn block(node: &Node, paint: &Paint) -> AnyElement {
         ),
         Node::Yaml(front) => code_card(Some("front matter"), &front.value, paint),
         Node::Toml(front) => code_card(Some("front matter"), &front.value, paint),
+        Node::MdxjsEsm(esm) => code_card(Some("esm"), &esm.value, paint),
+        Node::MdxFlowExpression(expression) => {
+            code_card(Some("expression"), &expression.value, paint)
+        }
+        Node::MdxJsxFlowElement(element) if element.children.is_empty() => {
+            let label = jsx_label(element.name.as_deref());
+            let leaf = paint.leaf(&label);
+            let run = paint.run(label.len(), &paint.mono, theme.muted.into());
+            paint
+                .segment(leaf, 0, label, vec![run])
+                .text_size(px(paint.fonts.label))
+                .line_height(relative(CODE_LEADING))
+                .whitespace_normal()
+                .into_any_element()
+        }
         Node::Blockquote(quote) => {
             let mut inner = div().flex().flex_col().gap(px(8.0)).flex_1().min_w(px(0.0));
             for child in &quote.children {
@@ -691,6 +763,11 @@ fn block(node: &Node, paint: &Paint) -> AnyElement {
             None => div().into_any_element(),
         },
     }
+}
+
+/// What stands in for a JSX element with nothing inside it.
+fn jsx_label(name: Option<&str>) -> String {
+    format!("<{} />", name.unwrap_or_default())
 }
 
 /// A monospace card for code or front matter, with its language or kind
@@ -900,7 +977,7 @@ mod tests {
     #[test]
     fn a_document_keeps_each_blocks_source_lines() {
         let source = "# Title\n\nFirst paragraph\nstill first.\n\n- one\n- two\n";
-        let document = Document::parse(source);
+        let document = Document::parse(source, false);
         let lines: Vec<(u32, u32)> = document
             .blocks()
             .iter()
@@ -914,14 +991,17 @@ mod tests {
     #[test]
     fn a_file_reads_front_matter_but_a_chat_reply_does_not() {
         let source = "---\ntitle: Notes\n---\n\nBody\n";
-        let file = Document::parse(source);
+        let file = Document::parse(source, false);
         assert!(matches!(file.blocks()[0].node, Node::Yaml(_)));
         assert_eq!(
             (file.blocks()[0].first_line, file.blocks()[0].last_line),
             (1, 3)
         );
         // As a reply, the leading rule stays a rule.
-        assert!(matches!(parse(source, false)[0], Node::ThematicBreak(_)));
+        assert!(matches!(
+            parse(source, false, false)[0],
+            Node::ThematicBreak(_)
+        ));
     }
 
     #[test]
@@ -936,7 +1016,7 @@ mod tests {
 
     #[test]
     fn each_block_lists_the_text_of_its_leaves_in_painting_order() {
-        let document = Document::parse(MIXED);
+        let document = Document::parse(MIXED, false);
         let leaves: Vec<Vec<&str>> = document
             .blocks()
             .iter()
@@ -955,7 +1035,7 @@ mod tests {
 
     #[test]
     fn selected_text_runs_across_leaves_and_blocks() {
-        let document = Document::parse(MIXED);
+        let document = Document::parse(MIXED, false);
         let at = |block, leaf, offset| TextPoint {
             leaf: LeafId { block, leaf },
             offset,
@@ -994,9 +1074,63 @@ mod tests {
         assert!(slice_runs(runs, 4, 4).is_empty());
     }
 
+    const MDX: &str = "import { Chart } from './chart'\nexport const meta = { a: 1 }\n\n# Title\n\n<Chart year={2018} />\n\n<Callout>\n\nInside **it**.\n\n</Callout>\n\nA {props.name} and <Badge /> here.\n";
+
+    fn leaves(document: &Document) -> Vec<&str> {
+        document
+            .blocks()
+            .iter()
+            .flat_map(|block| block.leaves.iter().map(String::as_str))
+            .collect()
+    }
+
+    #[test]
+    fn mdx_reads_its_imports_components_and_expressions() {
+        let document = Document::parse(MDX, true);
+        let nodes: Vec<&Node> = document.blocks().iter().map(|block| &block.node).collect();
+        assert!(matches!(nodes[0], Node::MdxjsEsm(_)), "{nodes:?}");
+        assert!(matches!(nodes[1], Node::Heading(_)));
+        assert!(matches!(nodes[2], Node::MdxJsxFlowElement(_)));
+        assert!(matches!(nodes[3], Node::MdxJsxFlowElement(_)));
+        // The import and export are one block, as one run of lines.
+        assert_eq!(document.blocks()[0].last_line, 2);
+    }
+
+    #[test]
+    fn mdx_leaves_are_what_the_painter_numbers() {
+        let document = Document::parse(MDX, true);
+        assert_eq!(
+            leaves(&document),
+            [
+                "import { Chart } from './chart'\nexport const meta = { a: 1 }",
+                "Title",
+                "<Chart />",
+                // A component with content shows the content, not its tag.
+                "Inside it.",
+                "A {props.name} and <Badge /> here.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stray_angle_bracket_does_not_blank_an_mdx_file() {
+        let source = "# Title\n\n1 < 2 and a {brace\n";
+        assert!(markdown::to_mdast(source, &mdx_options()).is_err());
+        let document = Document::parse(source, true);
+        assert_eq!(leaves(&document)[0], "Title");
+        assert_eq!(document.blocks().len(), 2);
+    }
+
+    #[test]
+    fn plain_markdown_keeps_html_and_prose_braces() {
+        let document = Document::parse("<div>x</div>\n\nA {brace}.\n", false);
+        assert!(matches!(document.blocks()[0].node, Node::Html(_)));
+        assert_eq!(leaves(&document)[1], "A {brace}.");
+    }
+
     #[test]
     fn an_empty_file_has_no_blocks() {
-        assert!(Document::parse("").blocks().is_empty());
+        assert!(Document::parse("", false).blocks().is_empty());
     }
 
     #[test]

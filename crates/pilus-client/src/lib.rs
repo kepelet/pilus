@@ -38,6 +38,7 @@ mod tasks;
 mod transport;
 mod uhp;
 mod upload;
+mod write;
 pub use agents::AgentConfig;
 pub use agents::AgentModel;
 /// Display labels for pi thinking levels (`high` to `High`).
@@ -97,6 +98,7 @@ pub use tasks::{NewTask, Task, TaskStatus, split_list};
 pub use transport::SshTarget;
 pub use uhp::{Capabilities, Event, EventStream, Frame, Observer, Terminal, UhpClient};
 pub use upload::upload_path;
+pub use write::write_text;
 
 use std::path::PathBuf;
 

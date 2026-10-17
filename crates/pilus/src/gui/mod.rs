@@ -334,6 +334,8 @@ gpui::actions!([
     ResetFontSize,
     /// Show or hide the sidebar.
     ToggleSidebar,
+    /// Save the markdown file being edited in the Files tab.
+    SaveDoc,
     /// Show or hide the right sidebar (Changes and History).
     ToggleRightSidebar,
     /// Step back through the right sidebar's history.
@@ -925,6 +927,9 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd--", DecreaseFontSize, None),
         KeyBinding::new("cmd-0", ResetFontSize, None),
         KeyBinding::new("cmd-s", ToggleSidebar, None),
+        // The markdown editor takes Cmd+S from the sidebar toggle while it
+        // holds the keyboard.
+        KeyBinding::new("cmd-s", SaveDoc, Some("MdEditor")),
         KeyBinding::new("cmd-b", ToggleRightSidebar, None),
         KeyBinding::new("cmd-[", RightSidebarBack, None),
         KeyBinding::new("cmd-]", RightSidebarForward, None),
@@ -1976,6 +1981,8 @@ struct PilusView {
     /// Notes on excerpts of markdown files, and the field they are written in.
     md_notes: md_notes_view::MdNotes,
     md_note_input: Entity<TextInput>,
+    /// The source of the markdown file being edited in the Files tab.
+    md_editor_input: Entity<TextInput>,
     ports_panel: PortsPanel,
     browser_panel: BrowserPanel,
     /// The Browser tab's address bar, an IME-capable field of its own.
@@ -2154,6 +2161,17 @@ impl PilusView {
                 cx,
             )
             .submit_on_enter()
+        });
+        let md_editor_input = cx.new(|cx| {
+            TextInput::new(
+                String::new(),
+                "",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                true,
+                initial_theme,
+                cx,
+            )
         });
         let picker = WorkspacePicker::default();
         let picker_path = cx.new(|cx| {
@@ -2447,6 +2465,7 @@ impl PilusView {
             files_panel: FilesPanel::new(),
             md_notes,
             md_note_input,
+            md_editor_input,
             ports_panel: PortsPanel::new(),
             browser_panel: BrowserPanel::new(),
             browser_input,
@@ -2922,7 +2941,7 @@ impl PilusView {
         changed |= self.home_issues_tick(cx);
         changed |= self.github_tick();
         changed |= self.github_page_tick();
-        changed |= self.files_tick();
+        changed |= self.files_tick(cx);
         changed |= self.ports_tick();
         changed |= self.browser_tick(cx);
         changed |= self.mission_tick();
@@ -4509,6 +4528,11 @@ impl PilusView {
             self.md_note_key(event, cx);
             return;
         }
+        // So does the markdown editor, whose field reads the typing itself.
+        if self.md_editing() {
+            self.md_edit_key(event, cx);
+            return;
+        }
         match self.input_layer() {
             InputLayer::Picker => self.picker_key(event, cx),
             InputLayer::Palette => self.palette_key(event, window, cx),
@@ -5896,6 +5920,14 @@ impl PilusView {
         // The note field owns the keyboard while a note is being written.
         if self.md_composing() {
             let handle = self.md_note_input.focus_handle(cx);
+            if !handle.is_focused(window) {
+                window.focus(&handle, cx);
+            }
+            return;
+        }
+        // The markdown editor holds the keyboard while it is up.
+        if self.md_editing() {
+            let handle = self.md_editor_input.focus_handle(cx);
             if !handle.is_focused(window) {
                 window.focus(&handle, cx);
             }
@@ -13855,6 +13887,9 @@ impl Render for PilusView {
                 .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
                     this.toggle_sidebar(cx);
                 }))
+                .on_action(cx.listener(|this, _: &SaveDoc, _window, cx| {
+                    this.files_save_doc(cx);
+                }))
                 .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
                     this.toggle_right_sidebar(cx);
                 }))
@@ -16536,10 +16571,11 @@ mod tests {
     #[test]
     fn app_key_bindings_are_unique() {
         // `app_key_bindings` parses every chord as it is built; a duplicate
-        // would shadow an earlier shortcut, so catch that here too.
+        // would shadow an earlier shortcut, so catch that here too. The same
+        // chord under two contexts is deliberate: the deeper one wins.
         let mut seen = HashSet::new();
         for binding in app_key_bindings() {
-            let chord = format!("{:?}", binding.keystrokes());
+            let chord = format!("{:?} in {:?}", binding.keystrokes(), binding.predicate());
             assert!(seen.insert(chord.clone()), "duplicate shortcut: {chord}");
         }
     }

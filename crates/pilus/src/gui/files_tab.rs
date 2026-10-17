@@ -7,12 +7,12 @@
 //! open a folder (`files.reveal`) but not close one, so folding is this
 //! window's own state: a set of folded paths that hides rows without touching
 //! the daemon. Clicking a file hands it to the daemon (`files.open`), which
-//! shows it in the terminal card. The one exception is a markdown file Git has
-//! no change for: the tab reads it itself and draws it as a document in place of
-//! the tree (see `md_view`), since the card can only show it as source. The rows
+//! shows it in the terminal card. The exception is a text file: the tab reads it
+//! itself and opens it in place of the tree, in an editor (a markdown file is
+//! drawn as a document and edited beside its preview, see `md_view`). The rows
 //! carry no Git state, so each read also asks for the Diff's change list and
-//! marks changed files and the folders above them; a click on a changed file
-//! opens it in the Diff instead.
+//! marks changed files and the folders above them; a click on any other changed
+//! file opens it in the Diff instead.
 //!
 //! The daemon never writes files, so the tab uploads itself, as it reads
 //! documents itself: a local file is copied straight to disk, or piped over the
@@ -37,23 +37,24 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, DragMoveEvent, ExternalPaths, ListAlignment, ListState,
-    MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString, div, list,
-    prelude::*, px, relative,
+    AnyElement, ClickEvent, Context, Div, DragMoveEvent, ExternalPaths, Focusable, KeyDownEvent,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point,
+    ScrollHandle, SharedString, Window, div, list, point, prelude::*, px, relative,
 };
 use pilus_client::{
     ControlClient, Error, FileChanges, FileRow, FileTree, OpenTarget, SshTarget, TextFile, Version,
     archive_name, create_entry, delete_entry, download_path, parent_of, read_text, rename_entry,
-    upload_path, visible_rows,
+    upload_path, visible_rows, write_text,
 };
 
 use super::diff::status_glyph;
+use super::highlight;
 use super::md_view::{self, MdDoc, Page};
 use super::right_sidebar::SidebarTab;
 use super::sidebar_menu::{Item, MenuTarget};
 use super::style::{self, RadiusExt as _, TreeEntry, TreeMark};
 use super::toast::ToastKind;
-use super::{EndpointId, PilusView, PromptAction, icon};
+use super::{EndpointId, InputLayer, PilusView, PromptAction, icon};
 
 /// How often the open tab asks the daemon for a fresh tree, so a change made
 /// in the TUI shows up here.
@@ -66,8 +67,45 @@ const LOADING_LIMIT: Duration = Duration::from_secs(3);
 
 /// How wide the tab must be to keep the tree beside an open document.
 const TREE_BESIDE_MIN_PAGE: f32 = 640.0;
+/// How wide the document column must be to hold the source beside its
+/// preview, at the default interface size.
+const SPLIT_MIN_DOC: f32 = 600.0;
 /// The tree's width beside a document, at the default interface size.
 const TREE_BESIDE_WIDTH: f32 = 240.0;
+
+/// Space above the editor's first line, which the caret's offset in the field
+/// does not include.
+pub(super) const EDITOR_PAD: f32 = 8.0;
+
+/// Scroll `scroll` so the caret's row is in view, but only when the caret has
+/// moved since `seen`: a wheel scroll is left alone. `row` is the caret row's
+/// top and height within the field, as the field last painted.
+pub(super) fn follow_caret(
+    scroll: &ScrollHandle,
+    row: Option<(Pixels, Pixels)>,
+    caret: usize,
+    seen: &mut Option<usize>,
+) {
+    if *seen == Some(caret) {
+        return;
+    }
+    let Some((top, height)) = row else {
+        return;
+    };
+    let view = scroll.bounds().size.height;
+    if view <= px(0.0) {
+        return;
+    }
+    let offset = scroll.offset();
+    let top = top + px(EDITOR_PAD);
+    let shown = -offset.y;
+    if top < shown {
+        scroll.set_offset(point(offset.x, -top));
+    } else if top + height > shown + view {
+        scroll.set_offset(point(offset.x, view - top - height));
+    }
+    *seen = Some(caret);
+}
 
 /// Placeholder rows shown under a folder while the daemon opens it.
 const SKELETON_ROWS: usize = 3;
@@ -115,6 +153,14 @@ pub(super) enum FilesMsg {
     Edited {
         endpoint: EndpointId,
         result: Result<Edit, String>,
+    },
+    /// A save finished. `text` is what was written, since the buffer may have
+    /// moved on while the write ran.
+    Saved {
+        endpoint: EndpointId,
+        path: String,
+        text: String,
+        result: Result<(), String>,
     },
 }
 
@@ -202,6 +248,40 @@ struct FileDoc {
     /// The read this document waits on or came from: only its answer lands.
     seq: u32,
     state: DocState,
+    /// Set once the user starts editing: the source is then in the editor's
+    /// field, and the document is dirty when that differs from `base`.
+    edit: Option<DocEdit>,
+}
+
+/// How an edited document is shown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EditMode {
+    Source,
+    Preview,
+    /// The source and the rendered text side by side, the preview following
+    /// each keystroke.
+    Split,
+}
+
+impl EditMode {
+    /// Whether the editor's field is on screen.
+    pub(super) fn edits(self) -> bool {
+        !matches!(self, Self::Preview)
+    }
+}
+
+/// A document opened for editing.
+pub(super) struct DocEdit {
+    /// The text on disk as of the last read or save.
+    pub(super) base: String,
+    /// What shows: the buffer is kept in every mode, so unsaved changes survive
+    /// a look at the preview.
+    pub(super) mode: EditMode,
+    pub(super) saving: bool,
+    pub(super) scroll: ScrollHandle,
+    /// Where the caret was when the view last followed it, so the view only
+    /// scrolls when the caret moves and a wheel scroll is left alone.
+    pub(super) caret_seen: Option<usize>,
 }
 
 enum DocState {
@@ -268,6 +348,12 @@ pub(super) struct FilesPanel {
     doc_reads: u32,
     /// The tree is drawn beside the open document, as of the last frame.
     tree_beside: bool,
+    /// The document column is wide enough to hold the source beside its
+    /// preview, as of the last frame.
+    split_ok: bool,
+    /// Opening an editor stretched the right column, which closing the
+    /// document lets back.
+    auto_expanded: bool,
     /// Where the loading folder sits in `visible`, when it shows.
     loading_at: Option<usize>,
     list: ListState,
@@ -311,6 +397,8 @@ impl FilesPanel {
             doc: None,
             doc_reads: 0,
             tree_beside: false,
+            split_ok: false,
+            auto_expanded: false,
             loading_at: None,
             list: ListState::new(0, ListAlignment::Top, px(600.0)),
             error: None,
@@ -353,6 +441,15 @@ impl FilesPanel {
         self.doc.as_ref().map(|doc| doc.path.as_str())
     }
 
+    /// Whether the open document is a file the editor is the only view of.
+    fn doc_is_source(&self) -> bool {
+        self.doc.as_ref().is_some_and(|doc| {
+            doc.edit.is_none()
+                && !md_view::is_markdown(&doc.path)
+                && matches!(doc.state, DocState::Ready(_))
+        })
+    }
+
     /// Drop the open document, which shows the tree again.
     pub(super) fn close_doc(&mut self) {
         self.doc = None;
@@ -380,7 +477,7 @@ impl FilesPanel {
             return false;
         };
         doc.state = match result {
-            Ok(file) => DocState::Ready(MdDoc::new(&file)),
+            Ok(file) => DocState::Ready(MdDoc::new(&file, &doc.path)),
             Err(error) => DocState::Failed(error),
         };
         true
@@ -562,10 +659,25 @@ enum Slot<'a> {
 }
 
 impl PilusView {
+    /// Let the right column back once the document that stretched it is gone,
+    /// or the user has put the column back themselves.
+    fn files_release_width(&mut self, cx: &mut Context<Self>) -> bool {
+        let panel = &mut self.files_panel;
+        if !panel.auto_expanded || (self.right.expanded() && panel.doc.is_some()) {
+            return false;
+        }
+        panel.auto_expanded = false;
+        if !self.right.expanded() {
+            return false;
+        }
+        self.toggle_right_expanded(cx);
+        true
+    }
+
     /// Poll the daemon and fold finished calls into the tab. Returns whether
     /// anything changed.
-    pub(super) fn files_tick(&mut self) -> bool {
-        let mut changed = false;
+    pub(super) fn files_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = self.files_release_width(cx);
         while let Ok(message) = self.files_panel.rx.try_recv() {
             let current = self.files_panel.endpoint.clone();
             match message {
@@ -598,6 +710,22 @@ impl PilusView {
                         continue;
                     }
                     changed |= self.files_panel.apply_doc(seq, result);
+                    // A source file has no preview to start from.
+                    if self.files_panel.doc_is_source() {
+                        self.files_begin_edit(cx);
+                    }
+                }
+                FilesMsg::Saved {
+                    endpoint,
+                    path,
+                    text,
+                    result,
+                } => {
+                    changed = true;
+                    if current.is_some_and(|current| current != endpoint) {
+                        continue;
+                    }
+                    self.files_saved(&path, text, result);
                 }
                 FilesMsg::Uploaded { endpoint, outcome } => {
                     for (kind, text) in outcome.toasts() {
@@ -723,6 +851,9 @@ impl PilusView {
     /// Show the markdown file at `path` in place of the tree, reading it off
     /// the GUI thread.
     pub(super) fn files_open_doc(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self.files_doc_unsaved("open another file", cx) {
+            return;
+        }
         let path = path.to_string();
         self.right_navigate(cx, |this, _| {
             this.right.select_tab(SidebarTab::Files);
@@ -741,6 +872,7 @@ impl PilusView {
                     path,
                     seq: self.files_panel.doc_reads,
                     state: DocState::Failed(error),
+                    edit: None,
                 });
                 return;
             }
@@ -757,6 +889,7 @@ impl PilusView {
                 Some(DocState::Ready(doc)) => DocState::Ready(doc),
                 _ => DocState::Loading,
             },
+            edit: None,
         });
         let tx = panel.tx.clone();
         std::thread::spawn(move || {
@@ -770,12 +903,271 @@ impl PilusView {
         });
     }
 
+    /// Whether the open document has changes that are not on disk.
+    fn files_doc_dirty(&self, cx: &Context<Self>) -> bool {
+        self.files_panel
+            .doc
+            .as_ref()
+            .and_then(|doc| doc.edit.as_ref())
+            .is_some_and(|edit| !self.md_editor_input.read(cx).holds(&edit.base))
+    }
+
+    /// Refuse `what` and say why when the open document has unsaved changes:
+    /// closing, reloading or replacing it would throw them away silently.
+    fn files_doc_unsaved(&mut self, what: &str, cx: &mut Context<Self>) -> bool {
+        if !self.files_doc_dirty(cx) {
+            return false;
+        }
+        self.toast(
+            ToastKind::Error,
+            format!("Save or revert your changes before you {what}"),
+        );
+        true
+    }
+
+    /// Whether the markdown editor's field holds the keyboard.
+    pub(super) fn md_editing(&self) -> bool {
+        self.files_visible()
+            && self.input_layer() == InputLayer::Terminal
+            && self
+                .files_panel
+                .doc
+                .as_ref()
+                .and_then(|doc| doc.edit.as_ref())
+                .is_some_and(|edit| edit.mode.edits())
+    }
+
+    /// Keys the editor's field leaves to the window: Escape steps back to the
+    /// preview.
+    pub(super) fn md_edit_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && self.files_doc_previewable() {
+            self.files_preview_doc(cx);
+        }
+    }
+
+    /// Whether the open document has a rendered form.
+    fn files_doc_previewable(&self) -> bool {
+        self.files_panel
+            .doc
+            .as_ref()
+            .is_some_and(|doc| md_view::is_markdown(&doc.path))
+    }
+
+    /// Show the open document's source in the editor.
+    fn files_edit_doc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.files_begin_edit(cx);
+        window.focus(&self.md_editor_input.focus_handle(cx), cx);
+    }
+
+    /// Switch the open document to its source, once it is editable.
+    pub(super) fn files_begin_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = self.files_panel.doc.as_mut() else {
+            return;
+        };
+        let DocState::Ready(md) = &doc.state else {
+            return;
+        };
+        if !md.editable() {
+            return;
+        }
+        let mut started = false;
+        match doc.edit.as_mut() {
+            Some(edit) if edit.mode == EditMode::Preview => edit.mode = EditMode::Source,
+            Some(_) => {}
+            None => {
+                started = true;
+                let text = md.source().to_string();
+                let path = doc.path.clone();
+                doc.edit = Some(DocEdit {
+                    base: text.clone(),
+                    mode: EditMode::Source,
+                    saving: false,
+                    scroll: ScrollHandle::new(),
+                    caret_seen: Some(0),
+                });
+                // One field serves every document, so the grammar follows the
+                // file it was opened for.
+                self.md_editor_input.update(cx, |input, cx| {
+                    input.set_syntax(Some(path), cx);
+                    input.set_value_at_start(text, cx);
+                });
+            }
+        }
+        // An editor wants room: the column opens out to fill the window, with
+        // the tree beside the file, and settles back when the file closes.
+        if started && !self.right.expanded() {
+            self.files_panel.auto_expanded = true;
+            self.toggle_right_expanded(cx);
+        }
+        cx.notify();
+    }
+
+    /// Show the open document rendered, from the editor's text.
+    fn files_preview_doc(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = self.files_panel.doc.as_mut() else {
+            return;
+        };
+        let Some(edit) = doc.edit.as_mut() else {
+            return;
+        };
+        edit.mode = EditMode::Preview;
+        self.files_sync_preview(cx);
+        cx.notify();
+    }
+
+    /// Bring the rendered document up to the editor's text.
+    fn files_sync_preview(&mut self, cx: &mut Context<Self>) {
+        let input = self.md_editor_input.read(cx);
+        let Some(DocState::Ready(md)) = self.files_panel.doc.as_mut().map(|doc| &mut doc.state)
+        else {
+            return;
+        };
+        if !input.holds(md.source()) {
+            md.replace_source(input.value());
+        }
+    }
+
+    /// Put the open document in side-by-side mode, without the window.
+    #[cfg(feature = "visual-test")]
+    pub(super) fn files_set_split(&mut self) {
+        if let Some(edit) = self
+            .files_panel
+            .doc
+            .as_mut()
+            .and_then(|doc| doc.edit.as_mut())
+        {
+            edit.mode = EditMode::Split;
+        }
+    }
+
+    /// Show the source and the rendered text side by side, or go back to the
+    /// source alone. A column too narrow for both is widened.
+    fn files_split_doc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.files_begin_edit(cx);
+        let Some(edit) = self
+            .files_panel
+            .doc
+            .as_mut()
+            .and_then(|doc| doc.edit.as_mut())
+        else {
+            return;
+        };
+        edit.mode = if edit.mode == EditMode::Split {
+            EditMode::Source
+        } else {
+            EditMode::Split
+        };
+        if edit.mode == EditMode::Split && !self.files_panel.split_ok && !self.right.expanded() {
+            self.right.toggle_expanded();
+        }
+        window.focus(&self.md_editor_input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Put the editor back to the text on disk.
+    fn files_revert_doc(&mut self, cx: &mut Context<Self>) {
+        let Some(base) = self
+            .files_panel
+            .doc
+            .as_ref()
+            .and_then(|doc| doc.edit.as_ref())
+            .map(|edit| edit.base.clone())
+        else {
+            return;
+        };
+        self.md_editor_input
+            .update(cx, |input, cx| input.set_value_at_start(base, cx));
+        if let Some(edit) = self
+            .files_panel
+            .doc
+            .as_mut()
+            .and_then(|doc| doc.edit.as_mut())
+        {
+            edit.caret_seen = Some(0);
+        }
+        cx.notify();
+    }
+
+    /// Write the editor's text to the open document, off the GUI thread.
+    pub(super) fn files_save_doc(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = self.files_panel.doc.as_ref() else {
+            return;
+        };
+        let Some(edit) = doc.edit.as_ref() else {
+            return;
+        };
+        if edit.saving || !self.files_doc_dirty(cx) {
+            return;
+        }
+        let endpoint = self.active.clone();
+        let target = match self.read_target(&endpoint) {
+            Ok(target) => target,
+            Err(error) => {
+                self.toast(ToastKind::Error, error);
+                return;
+            }
+        };
+        let path = doc.path.clone();
+        let text = self.md_editor_input.read(cx).value();
+        if let Some(edit) = self
+            .files_panel
+            .doc
+            .as_mut()
+            .and_then(|doc| doc.edit.as_mut())
+        {
+            edit.saving = true;
+        }
+        let tx = self.files_panel.tx.clone();
+        std::thread::spawn(move || {
+            let result = write_text(target.as_ref(), &path, &text);
+            tx.send(FilesMsg::Saved {
+                endpoint,
+                path,
+                text,
+                result,
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    /// Settle a finished save: what was written is now the text on disk.
+    fn files_saved(&mut self, path: &str, text: String, result: Result<(), String>) {
+        let name = super::diff::split_path(path).1.to_string();
+        let edit = self
+            .files_panel
+            .doc
+            .as_mut()
+            .filter(|doc| doc.path == path)
+            .and_then(|doc| doc.edit.as_mut());
+        if let Some(edit) = edit {
+            edit.saving = false;
+            if result.is_ok() {
+                edit.base = text;
+            }
+        }
+        match result {
+            Ok(()) => {
+                self.toast(ToastKind::Success, format!("Saved {name}"));
+                // The file may now differ from Git's copy.
+                self.files_panel.mark_stale();
+            }
+            Err(error) => self.toast(ToastKind::Error, format!("Could not save {name}: {error}")),
+        }
+    }
+
     /// Put the tree back where the open document was.
     pub(super) fn files_close_doc(&mut self, cx: &mut Context<Self>) {
+        if self.files_doc_unsaved("close it", cx) {
+            return;
+        }
         self.right_navigate(cx, |this, _| this.files_panel.close_doc());
     }
 
     fn files_reload_doc(&mut self, cx: &mut Context<Self>) {
+        if self.files_doc_unsaved("reload it", cx) {
+            return;
+        }
         if let Some(path) = self.files_panel.doc_path().map(str::to_string) {
             self.files_read_doc(path);
             cx.notify();
@@ -1095,18 +1487,23 @@ impl PilusView {
         }
     }
 
-    /// A click on a file row. A file Git reports changed opens in the Diff;
-    /// any other is a preview, or a pane on a double click.
+    /// A click on a file row. A text file opens here, in the editor, even when
+    /// Git reports it changed, since the Files tab is where it is edited; a
+    /// markdown file opens as a document first. A double click, and any other
+    /// file Git reports changed, goes to a pane and the Diff as before; the
+    /// rest are a preview.
     fn files_click_file(&mut self, row: &FileRow, target: OpenTarget, cx: &mut Context<Self>) {
+        if md_view::is_markdown(&row.path)
+            || (target == OpenTarget::Preview && highlight::is_text(&row.path))
+        {
+            self.files_open_doc(&row.path, cx);
+            return;
+        }
         if let Some(change) = self.files_panel.changes.file(&row.path).cloned() {
             self.right_navigate(cx, |this, cx| {
                 this.right.select_tab(SidebarTab::Diff);
                 this.diff_reveal(change.layer, &change.path, cx);
             });
-            return;
-        }
-        if md_view::is_markdown(&row.path) {
-            self.files_open_doc(&row.path, cx);
             return;
         }
         let endpoint = self.active.clone();
@@ -1130,6 +1527,13 @@ impl PilusView {
     pub(super) fn files_page(&mut self, page_w: f32, cx: &mut Context<Self>) -> Div {
         let beside = self.files_panel.doc.is_some() && page_w >= TREE_BESIDE_MIN_PAGE;
         self.files_panel.tree_beside = beside;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let tree_w = if beside {
+            TREE_BESIDE_WIDTH * fonts.body / 13.0
+        } else {
+            0.0
+        };
+        self.files_panel.split_ok = page_w - tree_w >= SPLIT_MIN_DOC * fonts.body / 13.0;
         if self.files_panel.doc.is_none() {
             return self.files_tree_zone(cx);
         }
@@ -1299,6 +1703,76 @@ impl PilusView {
         };
         let (dir, name) = super::diff::split_path(&doc.path);
         let dir = self.shorten_cwd(&self.active.key(), dir);
+        let editable = matches!(&doc.state, DocState::Ready(md) if md.editable());
+        // Only markdown has a rendered form to switch to.
+        let previewable = md_view::is_markdown(&doc.path);
+        let mode = doc.edit.as_ref().map(|edit| edit.mode);
+        let editing = mode.is_some_and(EditMode::edits);
+        // Too narrow a column shows the source alone until it is widened.
+        let split = mode == Some(EditMode::Split) && self.files_panel.split_ok;
+        let dirty = self.files_doc_dirty(cx);
+        let mut edit_buttons: Vec<AnyElement> = Vec::new();
+        if editable && previewable {
+            edit_buttons.push(
+                self.diff_icon_button(
+                    "pilus-files-doc-edit",
+                    include_bytes!("../../assets/icons/pencil.svg"),
+                    if editing { "Preview" } else { "Edit" }.to_string(),
+                    editing,
+                    false,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if editing {
+                        this.files_preview_doc(cx);
+                    } else {
+                        this.files_edit_doc(window, cx);
+                    }
+                }))
+                .into_any_element(),
+            );
+        }
+        if editable && previewable {
+            edit_buttons.push(
+                self.diff_icon_button(
+                    "pilus-files-doc-split",
+                    include_bytes!("../../assets/icons/columns-2.svg"),
+                    if mode == Some(EditMode::Split) {
+                        "Source only"
+                    } else {
+                        "Side by side"
+                    }
+                    .to_string(),
+                    mode == Some(EditMode::Split),
+                    false,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.files_split_doc(window, cx)))
+                .into_any_element(),
+            );
+        }
+        if dirty {
+            edit_buttons.push(
+                self.diff_icon_button(
+                    "pilus-files-doc-revert",
+                    include_bytes!("../../assets/icons/undo-2.svg"),
+                    "Revert changes".to_string(),
+                    false,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.files_revert_doc(cx)))
+                .into_any_element(),
+            );
+            edit_buttons.push(
+                self.diff_icon_button(
+                    "pilus-files-doc-save",
+                    include_bytes!("../../assets/icons/check.svg"),
+                    "Save (⌘S)".to_string(),
+                    true,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.files_save_doc(cx)))
+                .into_any_element(),
+            );
+        }
         let header = div()
             .flex()
             .flex_row()
@@ -1338,8 +1812,16 @@ impl PilusView {
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(theme.panel_fg)
                             .child(name.to_string()),
-                    ),
+                    )
+                    .children(dirty.then(|| {
+                        div()
+                            .flex_shrink_0()
+                            .pl_1()
+                            .text_color(theme.muted)
+                            .child("•")
+                    })),
             )
+            .children(edit_buttons)
             .child(
                 self.diff_icon_button(
                     "pilus-files-doc-pane",
@@ -1390,12 +1872,28 @@ impl PilusView {
                     .text_color(theme.alert)
                     .child("TRUNCATED: only the start of this file is shown")
             });
-        let body = match &self.files_panel.doc.as_ref().map(|doc| &doc.state) {
-            Some(DocState::Loading) | None => self.diff_message("Loading…").into_any_element(),
-            Some(DocState::Failed(error)) => self
-                .diff_message(format!("Could not read this file: {error}"))
-                .into_any_element(),
-            Some(DocState::Ready(_)) => self.md_list(Page::Files, cx),
+        let body = if split && editable {
+            self.files_split_body(cx)
+        } else if editing && editable {
+            self.files_editor_body(cx)
+        } else {
+            match &self.files_panel.doc.as_ref().map(|doc| &doc.state) {
+                Some(DocState::Loading) | None => self.diff_message("Loading…").into_any_element(),
+                Some(DocState::Failed(error)) => self
+                    .diff_message(format!("Could not read this file: {error}"))
+                    .into_any_element(),
+                // Nothing to render: the editor is about to take it, or the
+                // file is too long for it.
+                Some(DocState::Ready(md)) if !previewable => {
+                    let text = if md.editable() {
+                        "Loading…"
+                    } else {
+                        "This file is too large to edit here"
+                    };
+                    self.diff_message(text).into_any_element()
+                }
+                Some(DocState::Ready(_)) => self.md_list(Page::Files, cx),
+            }
         };
         div()
             .relative()
@@ -1406,6 +1904,71 @@ impl PilusView {
             .child(header)
             .children(truncated)
             .child(div().flex_1().min_h(px(0.0)).child(body))
+    }
+
+    /// The editor beside the rendered document, which follows its text.
+    fn files_split_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        self.files_sync_preview(cx);
+        let editor = self.files_editor_body(cx);
+        let preview = self.md_list(Page::Files, cx);
+        div()
+            .flex()
+            .flex_row()
+            .size_full()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .child(editor),
+            )
+            .child(div().flex_1().min_w(px(0.0)).h_full().child(preview))
+            .into_any_element()
+    }
+
+    /// The open document's source in the editor field, scrolled to follow the
+    /// caret. The field is as tall as its text, so the scrolling is the
+    /// wrapper's.
+    fn files_editor_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let mono = gpui::font(style::mono_family(&self.shared_settings));
+        self.md_editor_input.update(cx, |input, cx| {
+            input.set_style(theme, mono, px(fonts.body));
+            input.set_line_numbers(true, cx);
+        });
+        let (caret, row) = {
+            let input = self.md_editor_input.read(cx);
+            (input.caret_byte(), input.caret_row())
+        };
+        let Some(edit) = self
+            .files_panel
+            .doc
+            .as_mut()
+            .and_then(|doc| doc.edit.as_mut())
+        else {
+            return div().into_any_element();
+        };
+        let scroll = edit.scroll.clone();
+        follow_caret(&scroll, row, caret, &mut edit.caret_seen);
+        div()
+            .id("pilus-files-editor")
+            .key_context("MdEditor")
+            .size_full()
+            .min_w(px(0.0))
+            .overflow_y_scroll()
+            .track_scroll(&scroll)
+            .child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py(px(EDITOR_PAD))
+                    .child(self.md_editor_input.clone()),
+            )
+            .into_any_element()
     }
 
     /// Two rows: the machine with the tab's controls, then the root.
@@ -1795,10 +2358,14 @@ impl PilusView {
         panel.doc = Some(FileDoc {
             path: path.to_string(),
             seq: panel.doc_reads,
-            state: DocState::Ready(MdDoc::new(&TextFile {
-                text: text.to_string(),
-                truncated: false,
-            })),
+            state: DocState::Ready(MdDoc::new(
+                &TextFile {
+                    text: text.to_string(),
+                    truncated: false,
+                },
+                path,
+            )),
+            edit: None,
         });
         cx.notify();
     }

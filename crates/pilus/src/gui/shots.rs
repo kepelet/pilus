@@ -492,11 +492,27 @@ pub fn run() -> Result<()> {
         cx.update(|app| view.update(app, |view, cx| view.files_show_doc_sample(cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "files-tab-doc")?;
-        // Expanded, the tree stays beside the document, and a selection offers
-        // to be copied or sent to an agent.
-        cx.update(|app| view.update(app, |view, cx| view.toggle_right_expanded(cx)));
+        // The same file in the editor, with a change not yet saved.
+        cx.update(|app| view.update(app, |view, cx| view.files_edit_doc_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-edit")?;
+        cx.update(|app| view.update(app, |view, cx| view.files_show_doc_sample(cx)));
+        settle(&mut cx, 12);
+        // The editor stretched the column, so the tree stays beside the
+        // document, and a selection offers to be copied or sent to an agent.
         settle(&mut cx, 30);
         capture(&mut cx, window.into(), "files-tab-doc-wide")?;
+        cx.update(|app| view.update(app, |view, cx| view.files_split_doc_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-split")?;
+        cx.update(|app| view.update(app, |view, cx| view.files_split_mdx_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-mdx")?;
+        cx.update(|app| view.update(app, |view, cx| view.files_edit_code_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-code")?;
+        cx.update(|app| view.update(app, |view, cx| view.files_show_doc_sample(cx)));
+        settle(&mut cx, 12);
         cx.update(|app| view.update(app, |view, cx| view.files_show_doc_selection(cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "files-tab-doc-selection")?;

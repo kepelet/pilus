@@ -14,6 +14,14 @@
 //! platform turns them into `replace_text_in_range`, which is what makes IME
 //! and non-US layouts work. Navigation and editing keys are handled here and
 //! stop propagation.
+//!
+//! A field can be given a file name ([`TextInput::set_syntax`]) and then colors
+//! its text by that file's grammar, as the Files tab's editor does. The spans are
+//! reparsed when the text changes, not on every frame, and recolor with the
+//! theme for free because they name roles, not colors. A multiline field can
+//! also show a gutter of line numbers ([`TextInput::set_line_numbers`]): one
+//! per logical line, on its first display row, so a wrapped line is numbered
+//! once.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -29,6 +37,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::highlight::{self, Span};
 use super::theme::Theme;
 
 /// Multiplier from font size to painted line height, matching the chrome's
@@ -36,6 +45,11 @@ use super::theme::Theme;
 const LINE_LEADING: f32 = 1.45;
 /// Caret width, in logical pixels.
 const CARET_WIDTH: f32 = 1.5;
+/// Space between the line numbers and the text.
+const LINE_NUMBER_GAP: f32 = 14.0;
+/// The fewest digits a gutter makes room for, so it does not jump from nine
+/// lines to ten.
+const MIN_GUTTER_DIGITS: usize = 2;
 /// How long after a Command chord the field refuses incoming text. The glyph
 /// of an unclaimed chord lands within a frame or two; typing cannot follow
 /// a chord that quickly.
@@ -94,6 +108,83 @@ impl LastLayout {
             row,
         ))
     }
+}
+
+/// One run of a display row's text: how many bytes, and how they are drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RunStyle {
+    len: usize,
+    color: Hsla,
+    italic: bool,
+    bold: bool,
+}
+
+/// The runs that tile `piece`, a display row's byte range: the base color,
+/// each of `spans` where it overlaps, and the selection's foreground wherever
+/// it covers text. `spans` are sorted and do not overlap, as the highlighter
+/// reports them; `look` resolves a span to its color and slant.
+fn row_runs(
+    piece: Range<usize>,
+    selection: Range<usize>,
+    spans: &[Span],
+    look: &dyn Fn(&Span) -> (Hsla, bool, bool),
+    base: Hsla,
+    selected: Hsla,
+) -> Vec<RunStyle> {
+    let mut cuts = vec![piece.start, piece.end];
+    cuts.extend(
+        [selection.start, selection.end]
+            .into_iter()
+            .filter(|cut| piece.contains(cut)),
+    );
+    // The first span that can reach this row; earlier ones end before it.
+    let first = spans.partition_point(|span| span.range.end <= piece.start);
+    let reaching: Vec<&Span> = spans[first..]
+        .iter()
+        .take_while(|span| span.range.start < piece.end)
+        .collect();
+    for span in &reaching {
+        cuts.extend(
+            [span.range.start, span.range.end]
+                .into_iter()
+                .filter(|cut| piece.contains(cut)),
+        );
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut runs: Vec<RunStyle> = Vec::new();
+    for pair in cuts.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let span = reaching
+            .iter()
+            .find(|span| span.range.start <= from && to <= span.range.end);
+        let (mut color, italic, bold) = span.map_or((base, false, false), |span| look(span));
+        if selection.start <= from && to <= selection.end {
+            color = selected;
+        }
+        match runs.last_mut() {
+            Some(last) if (last.color, last.italic, last.bold) == (color, italic, bold) => {
+                last.len += to - from;
+            }
+            _ => runs.push(RunStyle {
+                len: to - from,
+                color,
+                italic,
+                bold,
+            }),
+        }
+    }
+    if runs.is_empty() {
+        // An empty row still shapes, from one empty run.
+        runs.push(RunStyle {
+            len: 0,
+            color: base,
+            italic: false,
+            bold: false,
+        });
+    }
+    runs
 }
 
 /// Split one logical line (no `\n`) into display pieces that fit `max_width`,
@@ -565,6 +656,13 @@ pub(super) struct TextInput {
     /// Whether the blink task has been started for this field.
     blink_started: bool,
     last: Rc<RefCell<Option<LastLayout>>>,
+    /// The file name whose grammar colors the text, if any.
+    syntax: Option<String>,
+    /// Whether a gutter of line numbers shows beside the text.
+    line_numbers: bool,
+    /// The text the spans below were parsed from, so a frame only reparses
+    /// when the text changed.
+    highlighted: Option<(String, Vec<Span>)>,
     /// When a Command chord last reached this field's key handler. The
     /// platform delivers an unclaimed chord's glyph a moment later as text,
     /// by which time the modifier state can already be stale.
@@ -613,6 +711,9 @@ impl TextInput {
             buffer,
             marked: None,
             command_chord_at: None,
+            syntax: None,
+            line_numbers: false,
+            highlighted: None,
             multiline,
             placeholder: placeholder.into(),
             focus_handle: cx.focus_handle(),
@@ -643,6 +744,24 @@ impl TextInput {
         self.line_height = px(font_size.as_f32() * LINE_LEADING);
     }
 
+    /// Show or hide the gutter of line numbers. Only a multiline field has one.
+    pub(super) fn set_line_numbers(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.line_numbers != on {
+            self.line_numbers = on;
+            cx.notify();
+        }
+    }
+
+    /// Color the text by the grammar of the file at `path`; `None` paints it
+    /// plain.
+    pub(super) fn set_syntax(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        if self.syntax != path {
+            self.syntax = path;
+            self.highlighted = None;
+            cx.notify();
+        }
+    }
+
     /// The current value.
     pub(super) fn value(&self) -> String {
         self.buffer.borrow().text.clone()
@@ -658,6 +777,35 @@ impl TextInput {
     /// Empty the field.
     pub(super) fn clear(&mut self, cx: &mut Context<Self>) {
         self.set_value(String::new(), cx);
+    }
+
+    /// Replace the value with the caret at the start, so a long document opens
+    /// at its top.
+    pub(super) fn set_value_at_start(&mut self, text: String, cx: &mut Context<Self>) {
+        let mut buffer = Buffer::new(text);
+        buffer.move_to(0, false);
+        *self.buffer.borrow_mut() = buffer;
+        self.marked = None;
+        cx.notify();
+    }
+
+    /// Whether the value equals `text`, without copying a long document out.
+    pub(super) fn holds(&self, text: &str) -> bool {
+        self.buffer.borrow().text == text
+    }
+
+    /// The caret's byte offset.
+    pub(super) fn caret_byte(&self) -> usize {
+        self.buffer.borrow().head
+    }
+
+    /// The caret row's top and height within the field, as of the last paint,
+    /// so a scrolling parent can keep it in view.
+    pub(super) fn caret_row(&self) -> Option<(Pixels, Pixels)> {
+        let last = self.last.borrow();
+        let last = last.as_ref()?;
+        let (_, row) = last.caret(self.buffer.borrow().head)?;
+        Some((px(last.line_height.as_f32() * row as f32), last.line_height))
     }
 
     /// Whether this field currently owns the keyboard.
@@ -1114,6 +1262,21 @@ impl Render for TextInput {
         };
         let empty = text.is_empty();
         let show_placeholder = empty && !focused;
+        if let Some(path) = &self.syntax {
+            if self
+                .highlighted
+                .as_ref()
+                .is_none_or(|(held, _)| *held != text)
+            {
+                self.highlighted = Some((text.clone(), highlight::source(path, &text)));
+            }
+        } else {
+            self.highlighted = None;
+        }
+        let spans: &[Span] = self
+            .highlighted
+            .as_ref()
+            .map_or(&[], |(_, spans)| spans.as_slice());
         let display = if empty {
             if focused {
                 String::new()
@@ -1172,28 +1335,47 @@ impl Render for TextInput {
                 .width
         };
         let mut line_start = 0usize;
-        for segment in display.split('\n') {
+        // The logical line each display row opens, for the gutter.
+        let mut numbers: Vec<Option<usize>> = Vec::new();
+        for (line_index, segment) in display.split('\n').enumerate() {
             let line_end = line_start + segment.len();
             let ranges: Vec<(usize, usize)> = match wrap_width {
                 Some(max) => wrap_pieces(segment, line_start, max, &measure),
                 None => vec![(line_start, line_end)],
             };
-            for (piece_start, piece_end) in ranges {
-                let low = selection.start.max(piece_start).min(piece_end);
-                let high = selection.end.max(piece_start).min(piece_end);
-                let run = |len: usize, run_color: Hsla| TextRun {
-                    len,
-                    font: self.font.clone(),
-                    color: run_color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
+            for (nth, (piece_start, piece_end)) in ranges.into_iter().enumerate() {
+                numbers.push((nth == 0).then_some(line_index + 1));
+                let look = |span: &Span| {
+                    let look = highlight::look(span.token, theme);
+                    (Hsla::from(look.color), look.italic, look.bold)
                 };
-                let runs = [
-                    run(low - piece_start, color),
-                    run(high - low, selection_fg),
-                    run(piece_end - high, color),
-                ];
+                let runs: Vec<TextRun> = row_runs(
+                    piece_start..piece_end,
+                    selection.clone(),
+                    spans,
+                    &look,
+                    color,
+                    selection_fg,
+                )
+                .into_iter()
+                .map(|run| {
+                    let mut font = self.font.clone();
+                    if run.italic {
+                        font.style = gpui::FontStyle::Italic;
+                    }
+                    if run.bold {
+                        font.weight = gpui::FontWeight::BOLD;
+                    }
+                    TextRun {
+                        len: run.len,
+                        font,
+                        color: run.color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }
+                })
+                .collect();
                 let relative = &segment[piece_start - line_start..piece_end - line_start];
                 let layout = window.text_system().shape_line(
                     SharedString::new(relative),
@@ -1208,6 +1390,37 @@ impl Render for TextInput {
             }
             line_start = line_end + 1;
         }
+
+        let gutter = (self.line_numbers && self.multiline).then(|| {
+            let total = numbers.iter().flatten().last().copied().unwrap_or(1);
+            let digits = total.to_string().len().max(MIN_GUTTER_DIGITS);
+            let caret_line = text[..head.min(text.len())].matches('\n').count() + 1;
+            let shape = |number: usize| {
+                let label = number.to_string();
+                let color: Hsla = if number == caret_line {
+                    theme.fg.into()
+                } else {
+                    theme.muted.into()
+                };
+                window.text_system().shape_line(
+                    SharedString::new(label.clone()),
+                    font_size,
+                    &[TextRun {
+                        len: label.len(),
+                        font: self.font.clone(),
+                        color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                )
+            };
+            Gutter {
+                width: measure("0") * digits as f32 + px(LINE_NUMBER_GAP),
+                rows: numbers.iter().map(|number| number.map(shape)).collect(),
+            }
+        });
 
         let marked = self.marked.clone();
         let caret_visible = focused && self.caret_on;
@@ -1246,7 +1459,7 @@ impl Render for TextInput {
         let last = self.last.clone();
         let accent: Hsla = theme.accent.into();
 
-        div()
+        let root = div()
             .flex()
             .items_center()
             .w_full()
@@ -1284,104 +1497,135 @@ impl Render for TextInput {
                 move |event, _window, cx| {
                     entity.update(cx, |this, cx| this.on_mouse_up(event, cx));
                 }
-            })
-            .child(
-                canvas(
-                    move |bounds, _window, _cx| {
-                        if let Some(last) = last.borrow_mut().as_mut() {
-                            last.bounds = bounds;
-                        }
-                    },
-                    move |field, (), window, cx| {
-                        // The text slides under the field's own edges, so
-                        // what scrolls out is clipped rather than painted
-                        // over the chrome beside it.
-                        let bounds = Bounds {
-                            origin: point(field.origin.x - scroll, field.origin.y),
-                            size: field.size,
-                        };
-                        window.with_content_mask(
-                            Some(gpui::ContentMask { bounds: field }),
-                            |window| {
-                                // Selection sits under the glyphs so the foreground
-                                // colour chosen above stays legible on it.
-                                if selection.start < selection.end {
-                                    paint_range(
-                                        window,
-                                        bounds,
-                                        &pieces,
-                                        selection.clone(),
-                                        line_height,
-                                        selection_color,
-                                        px(0.0),
-                                        line_height,
-                                    );
-                                }
-
-                                for (row, piece) in pieces.iter().enumerate() {
-                                    let origin = point(
-                                        bounds.origin.x,
-                                        bounds.origin.y + px(line_height.as_f32() * row as f32),
-                                    );
-                                    let _ = piece.layout.paint(
-                                        origin,
-                                        line_height,
-                                        TextAlign::Left,
-                                        None,
-                                        window,
-                                        cx,
-                                    );
-                                }
-
-                                if let Some(marked) = &marked {
-                                    paint_range(
-                                        window,
-                                        bounds,
-                                        &pieces,
-                                        marked.clone(),
-                                        line_height,
-                                        accent,
-                                        line_height - px(1.5),
-                                        px(1.0),
-                                    );
-                                }
-
-                                if caret_visible {
-                                    let piece_at =
-                                        pieces.iter().rposition(|piece| piece.byte_start <= head);
-                                    if let Some(row) = piece_at {
-                                        let piece = &pieces[row];
-                                        let x = piece
-                                            .layout
-                                            .x_for_index(head.saturating_sub(piece.byte_start));
-                                        window.paint_quad(
-                                            fill(
-                                                Bounds {
-                                                    origin: point(
-                                                        bounds.origin.x + x,
-                                                        bounds.origin.y
-                                                            + px(line_height.as_f32() * row as f32),
-                                                    ),
-                                                    size: size(px(CARET_WIDTH), line_height),
-                                                },
-                                                accent,
-                                            )
-                                            .corner_radii(px(2.0)),
-                                        );
-                                    }
-                                }
-                            },
+            });
+        let text_canvas = canvas(
+            move |bounds, _window, _cx| {
+                if let Some(last) = last.borrow_mut().as_mut() {
+                    last.bounds = bounds;
+                }
+            },
+            move |field, (), window, cx| {
+                // The text slides under the field's own edges, so
+                // what scrolls out is clipped rather than painted
+                // over the chrome beside it.
+                let bounds = Bounds {
+                    origin: point(field.origin.x - scroll, field.origin.y),
+                    size: field.size,
+                };
+                window.with_content_mask(Some(gpui::ContentMask { bounds: field }), |window| {
+                    // Selection sits under the glyphs so the foreground
+                    // colour chosen above stays legible on it.
+                    if selection.start < selection.end {
+                        paint_range(
+                            window,
+                            bounds,
+                            &pieces,
+                            selection.clone(),
+                            line_height,
+                            selection_color,
+                            px(0.0),
+                            line_height,
                         );
+                    }
 
-                        window.handle_input(
-                            &focus_handle,
-                            ElementInputHandler::new(field, entity.clone()),
+                    for (row, piece) in pieces.iter().enumerate() {
+                        let origin = point(
+                            bounds.origin.x,
+                            bounds.origin.y + px(line_height.as_f32() * row as f32),
+                        );
+                        let _ = piece.layout.paint(
+                            origin,
+                            line_height,
+                            TextAlign::Left,
+                            None,
+                            window,
                             cx,
                         );
-                    },
-                )
-                .size_full(),
+                    }
+
+                    if let Some(marked) = &marked {
+                        paint_range(
+                            window,
+                            bounds,
+                            &pieces,
+                            marked.clone(),
+                            line_height,
+                            accent,
+                            line_height - px(1.5),
+                            px(1.0),
+                        );
+                    }
+
+                    if caret_visible {
+                        let piece_at = pieces.iter().rposition(|piece| piece.byte_start <= head);
+                        if let Some(row) = piece_at {
+                            let piece = &pieces[row];
+                            let x = piece
+                                .layout
+                                .x_for_index(head.saturating_sub(piece.byte_start));
+                            window.paint_quad(
+                                fill(
+                                    Bounds {
+                                        origin: point(
+                                            bounds.origin.x + x,
+                                            bounds.origin.y + px(line_height.as_f32() * row as f32),
+                                        ),
+                                        size: size(px(CARET_WIDTH), line_height),
+                                    },
+                                    accent,
+                                )
+                                .corner_radii(px(2.0)),
+                            );
+                        }
+                    }
+                });
+
+                window.handle_input(
+                    &focus_handle,
+                    ElementInputHandler::new(field, entity.clone()),
+                    cx,
+                );
+            },
+        )
+        .size_full();
+        match gutter {
+            None => root.child(text_canvas),
+            Some(gutter) => root
+                .child(gutter.element(line_height, height))
+                .child(div().flex_1().min_w(px(0.0)).h(height).child(text_canvas)),
+        }
+    }
+}
+
+/// The line numbers beside a multiline field, shaped for this frame.
+struct Gutter {
+    width: Pixels,
+    /// A number on each display row that opens a logical line.
+    rows: Vec<Option<ShapedLine>>,
+}
+
+impl Gutter {
+    fn element(self, line_height: Pixels, height: Pixels) -> impl IntoElement {
+        let Self { width, rows } = self;
+        div().flex_shrink_0().w(width).h(height).child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, (), window, cx| {
+                    for (row, line) in rows.iter().enumerate() {
+                        let Some(line) = line else {
+                            continue;
+                        };
+                        // Right-aligned, so the digits line up by place.
+                        let origin = point(
+                            bounds.origin.x + width - px(LINE_NUMBER_GAP) - line.width,
+                            bounds.origin.y + px(line_height.as_f32() * row as f32),
+                        );
+                        let _ = line.paint(origin, line_height, TextAlign::Left, None, window, cx);
+                    }
+                },
             )
+            .size_full(),
+        )
     }
 }
 
@@ -1523,5 +1767,74 @@ mod tests {
         let utf16 = byte_to_utf16(text, byte);
         assert_eq!(utf16, 3);
         assert_eq!(utf16_to_byte(text, utf16), byte);
+    }
+
+    fn color(value: f32) -> Hsla {
+        Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: value,
+            a: 1.0,
+        }
+    }
+
+    fn span(range: Range<usize>, token: highlight::Token) -> Span {
+        Span { range, token }
+    }
+
+    fn runs(piece: Range<usize>, selection: Range<usize>, spans: &[Span]) -> Vec<RunStyle> {
+        let look = |span: &Span| match span.token {
+            highlight::Token::Comment => (color(0.3), true, false),
+            _ => (color(0.6), false, true),
+        };
+        row_runs(piece, selection, spans, &look, color(0.9), color(1.0))
+    }
+
+    fn lens(runs: &[RunStyle]) -> Vec<usize> {
+        runs.iter().map(|run| run.len).collect()
+    }
+
+    #[test]
+    fn a_row_without_spans_or_selection_is_one_run() {
+        let found = runs(10..20, 0..0, &[]);
+        assert_eq!(lens(&found), [10]);
+        assert_eq!(found[0].color, color(0.9));
+    }
+
+    #[test]
+    fn spans_split_a_row_and_tile_it() {
+        let spans = [
+            span(2..5, highlight::Token::Keyword),
+            span(8..30, highlight::Token::Comment),
+        ];
+        let found = runs(0..12, 0..0, &spans);
+        assert_eq!(lens(&found), [2, 3, 3, 4]);
+        assert_eq!(found.iter().map(|run| run.len).sum::<usize>(), 12);
+        assert!(found[1].bold && !found[1].italic);
+        assert!(found[3].italic, "a span running past the row is cut to it");
+    }
+
+    #[test]
+    fn a_span_that_began_on_an_earlier_row_still_colors_this_one() {
+        let spans = [span(0..40, highlight::Token::Comment)];
+        let found = runs(20..30, 0..0, &spans);
+        assert_eq!(lens(&found), [10]);
+        assert!(found[0].italic);
+    }
+
+    #[test]
+    fn the_selection_overrides_color_but_keeps_the_slant() {
+        let spans = [span(0..10, highlight::Token::Comment)];
+        let found = runs(0..10, 4..6, &spans);
+        assert_eq!(lens(&found), [4, 2, 4]);
+        assert_eq!(found[1].color, color(1.0));
+        assert!(found[1].italic);
+        assert_eq!(found[0].color, color(0.3));
+    }
+
+    #[test]
+    fn an_empty_row_still_has_a_run() {
+        let found = runs(5..5, 0..0, &[]);
+        assert_eq!(lens(&found), [0]);
     }
 }

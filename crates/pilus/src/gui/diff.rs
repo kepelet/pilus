@@ -33,7 +33,7 @@ use super::diff_model::{
     self as model, Cursor, Display, FileFilter, Flat, FolderKey, LayoutMode, ListView, Row, Src,
     SrcKind, TreeRow,
 };
-use super::highlight::Token;
+use super::highlight::{self, Token};
 use super::md_view::{self, Composing, MdDoc, Page};
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::text_input::TextInput;
@@ -669,10 +669,11 @@ impl PilusView {
                 if !current {
                     return;
                 }
+                let state = result.map(|file| MdDoc::new(&file, &key.1));
                 panel.md = Some(MdText {
                     key,
                     fingerprint,
-                    state: result.map(|file| MdDoc::new(&file)),
+                    state,
                 });
             }
             DiffMsg::Done(result) => {
@@ -3095,22 +3096,13 @@ impl PilusView {
         )
     }
 
-    /// The text style a syntax role takes in the active theme. Roles reuse
-    /// the theme's ANSI colors, which each scheme already tunes for code on
-    /// its own background.
+    /// The text style a syntax role takes in the active theme.
     fn token_style(&self, token: Token) -> HighlightStyle {
-        let theme = self.theme;
-        let color = match token {
-            Token::Keyword => theme.ansi[5],
-            Token::String => theme.ansi[2],
-            Token::Number => theme.ansi[3],
-            Token::Function => theme.ansi[4],
-            Token::Type => theme.ansi[6],
-            Token::Comment => theme.muted,
-        };
+        let look = highlight::look(token, self.theme);
         HighlightStyle {
-            color: Some(color.into()),
-            font_style: (token == Token::Comment).then_some(FontStyle::Italic),
+            color: Some(look.color.into()),
+            font_style: look.italic.then_some(FontStyle::Italic),
+            font_weight: look.bold.then_some(FontWeight::BOLD),
             ..HighlightStyle::default()
         }
     }
@@ -3966,13 +3958,17 @@ impl PilusView {
         panel.composer = None;
         panel.rendered = true;
         panel.refresh_file_notes();
+        let state = Ok(MdDoc::new(
+            &TextFile {
+                text: md_view::SAMPLE.to_string(),
+                truncated: false,
+            },
+            &key.1,
+        ));
         panel.md = Some(MdText {
             key,
             fingerprint: "fp-guide".to_string(),
-            state: Ok(MdDoc::new(&TextFile {
-                text: md_view::SAMPLE.to_string(),
-                truncated: false,
-            })),
+            state,
         });
         cx.notify();
     }

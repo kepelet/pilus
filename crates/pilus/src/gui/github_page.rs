@@ -229,7 +229,7 @@ impl GithubPage {
                     Ok(detail) => {
                         self.docs = markdown_of(&detail)
                             .into_iter()
-                            .map(|source| Document::parse(&source))
+                            .map(|source| Document::parse(&source, false))
                             .collect();
                         self.item = Body::Ready(detail);
                     }

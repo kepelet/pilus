@@ -30,7 +30,7 @@
 //! reports through a channel, as the Git tab does. Answers carry a sequence
 //! number so a slow poll cannot overwrite the tree a later action returned.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -245,6 +245,10 @@ pub(super) struct FilesPanel {
     /// Folders the user closed here. Only folders the daemon has open stay in
     /// it, so a folder the TUI closes and reopens comes back open.
     folded: HashSet<String>,
+    /// The folds of trees not on screen, by machine and root. The daemon keeps
+    /// every folder open for the TUI, so a fold forgotten on a switch away
+    /// would come back open when the user switches back.
+    shelved: HashMap<(Option<EndpointId>, String), HashSet<String>>,
     /// Indices into the tree's rows that survive `folded`.
     visible: Vec<usize>,
     /// The folder whose chevron was just turned, so only it animates.
@@ -292,6 +296,7 @@ impl FilesPanel {
             endpoint: None,
             tree: None,
             folded: HashSet::new(),
+            shelved: HashMap::new(),
             visible: Vec::new(),
             toggled: None,
             loading: None,
@@ -369,9 +374,9 @@ impl FilesPanel {
     /// Drop everything read from the daemon: another machine answers for
     /// other trees.
     fn reset(&mut self) {
+        self.shelve_folds();
         self.doc = None;
         self.tree = None;
-        self.folded.clear();
         self.visible.clear();
         self.loading = None;
         self.loading_at = None;
@@ -380,6 +385,18 @@ impl FilesPanel {
         self.toggled = None;
         self.error = None;
         self.last_poll = None;
+    }
+
+    /// Set the folds of the tree on screen aside, to return to it later.
+    fn shelve_folds(&mut self) {
+        let Some(tree) = &self.tree else {
+            return;
+        };
+        let key = (self.endpoint.clone(), tree.root.clone());
+        let folds = std::mem::take(&mut self.folded);
+        if !folds.is_empty() {
+            self.shelved.insert(key, folds);
+        }
     }
 
     /// Fold a finished read in; true when what is drawn changed.
@@ -396,7 +413,9 @@ impl FilesPanel {
                 if self.tree.as_ref().map(|old| &old.root) != Some(&tree.root) {
                     // Another node: its folders are not the ones folded here,
                     // and its tree does not hold the open document.
-                    self.folded.clear();
+                    self.shelve_folds();
+                    let key = (self.endpoint.clone(), tree.root.clone());
+                    self.folded = self.shelved.remove(&key).unwrap_or_default();
                     if self.tree.is_some() {
                         self.doc = None;
                     }
@@ -1933,12 +1952,28 @@ mod tests {
     }
 
     #[test]
-    fn another_root_forgets_the_folds() {
+    fn another_root_shows_its_own_folds_and_gives_them_back() {
         let mut panel = FilesPanel::new();
-        panel.apply(1, Ok(tree("/w", vec![row("/w/a", 0, true, true)])));
+        let rows = || vec![row("/w/a", 0, true, true), row("/w/a/x", 1, false, false)];
+        panel.apply(1, Ok(tree("/w", rows())));
         panel.folded.insert("/w/a".to_string());
-        panel.apply(2, Ok(tree("/v", vec![row("/w/a", 0, true, true)])));
+        panel.apply(2, Ok(tree("/v", rows())));
         assert!(panel.folded.is_empty());
+        panel.apply(3, Ok(tree("/w", rows())));
+        assert_eq!(panel.folded, folded(&["/w/a"]));
+        assert_eq!(panel.visible, [0]);
+    }
+
+    #[test]
+    fn another_machine_gives_the_folds_back_after_a_reset() {
+        let mut panel = FilesPanel::new();
+        let rows = vec![row("/w/a", 0, true, true), row("/w/a/x", 1, false, false)];
+        panel.apply(1, Ok(tree("/w", rows.clone())));
+        panel.folded.insert("/w/a".to_string());
+        panel.reset();
+        assert!(panel.folded.is_empty());
+        panel.apply(2, Ok(tree("/w", rows)));
+        assert_eq!(panel.folded, folded(&["/w/a"]));
     }
 
     #[test]

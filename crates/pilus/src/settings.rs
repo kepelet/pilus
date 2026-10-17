@@ -28,7 +28,7 @@ pub const DEFAULT_SESSION_ICON: &str = "layers";
 /// its terminal cut (no ligatures, so cells stay one column wide).
 pub const FONT_FAMILY: &str = "Ioskeley Mono Term";
 /// Default chrome family, bundled with the app.
-pub const CHROME_FONT_FAMILY: &str = "Geist";
+pub const CHROME_FONT_FAMILY: &str = "Arimo";
 /// Default terminal cell text size in logical pixels.
 pub const FONT_SIZE: f32 = 13.0;
 /// Default chrome text size in logical pixels.

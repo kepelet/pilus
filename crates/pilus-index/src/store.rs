@@ -9,10 +9,11 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::error::Result;
 use crate::model::{Agent, Session};
+use crate::usage::Bucket;
 
 /// Bump when the tables change: an index that does not match is dropped and
 /// rebuilt from the transcripts, which is cheaper than migrating a cache.
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 3;
 
 /// What a search narrows to.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -28,7 +29,7 @@ pub struct Filter {
 /// A connection is not shared between threads: the indexer writes through its
 /// own and the window reads through another, which WAL lets run side by side.
 pub struct Index {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Index {
@@ -52,7 +53,7 @@ impl Index {
     fn prepare(conn: Connection) -> Result<Self> {
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version != SCHEMA {
-            conn.execute_batch("DROP TABLE IF EXISTS sessions;")?;
+            conn.execute_batch("DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS usage;")?;
             conn.execute_batch(
                 "CREATE TABLE sessions (
                      machine    TEXT NOT NULL,
@@ -67,7 +68,22 @@ impl Index {
                      size       INTEGER NOT NULL,
                      PRIMARY KEY (machine, path)
                  );
-                 CREATE INDEX sessions_updated ON sessions (updated DESC);",
+                 CREATE INDEX sessions_updated ON sessions (updated DESC);
+                 CREATE TABLE usage (
+                     machine     TEXT NOT NULL,
+                     path        TEXT NOT NULL,
+                     hour        INTEGER NOT NULL,
+                     model       TEXT NOT NULL,
+                     input       INTEGER NOT NULL,
+                     output      INTEGER NOT NULL,
+                     cache_read  INTEGER NOT NULL,
+                     cache_write INTEGER NOT NULL,
+                     turns       INTEGER NOT NULL,
+                     cost_micros INTEGER NOT NULL,
+                     recorded    INTEGER NOT NULL,
+                     PRIMARY KEY (machine, path, hour, model)
+                 );
+                 CREATE INDEX usage_hour ON usage (hour);",
             )?;
             conn.pragma_update(None, "user_version", SCHEMA)?;
         }
@@ -91,24 +107,43 @@ impl Index {
     /// Insert or replace `sessions`, all or none.
     pub fn upsert(&mut self, sessions: &[Session]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        {
-            let mut statement = tx.prepare(
-                "INSERT OR REPLACE INTO sessions
-                     (machine, path, agent, session_id, cwd, title, branch, started, updated, size)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        for session in sessions {
+            insert_session(&tx, session)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// [`Self::upsert`] together with each transcript's usage, replacing what
+    /// the transcript had before. One transaction, so a session never exists
+    /// without the usage its file size says was read.
+    pub fn upsert_with_usage(&mut self, files: &[(Session, Vec<Bucket>)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (session, buckets) in files {
+            insert_session(&tx, session)?;
+            tx.execute(
+                "DELETE FROM usage WHERE machine = ?1 AND path = ?2",
+                params![session.machine, session.path],
             )?;
-            for session in sessions {
+            let mut statement = tx.prepare_cached(
+                "INSERT INTO usage
+                     (machine, path, hour, model, input, output, cache_read, cache_write, turns,
+                      cost_micros, recorded)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )?;
+            for bucket in buckets {
                 statement.execute(params![
                     session.machine,
                     session.path,
-                    session.agent.kind(),
-                    session.session_id,
-                    session.cwd,
-                    session.title,
-                    session.branch,
-                    session.started,
-                    session.updated,
-                    i64::try_from(session.size).unwrap_or(i64::MAX),
+                    bucket.hour,
+                    bucket.model,
+                    clamp(bucket.input),
+                    clamp(bucket.output),
+                    clamp(bucket.cache_read),
+                    clamp(bucket.cache_write),
+                    clamp(bucket.turns),
+                    clamp(bucket.cost_micros),
+                    clamp(bucket.recorded),
                 ])?;
             }
         }
@@ -120,10 +155,12 @@ impl Index {
     pub fn remove(&mut self, machine: &str, paths: &[String]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            let mut statement =
+            let mut sessions =
                 tx.prepare("DELETE FROM sessions WHERE machine = ?1 AND path = ?2")?;
+            let mut usage = tx.prepare("DELETE FROM usage WHERE machine = ?1 AND path = ?2")?;
             for path in paths {
-                statement.execute(params![machine, path])?;
+                sessions.execute(params![machine, path])?;
+                usage.execute(params![machine, path])?;
             }
         }
         tx.commit()?;
@@ -135,6 +172,8 @@ impl Index {
     pub fn forget(&mut self, machine: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM sessions WHERE machine = ?1", [machine])?;
+        self.conn
+            .execute("DELETE FROM usage WHERE machine = ?1", [machine])?;
         Ok(())
     }
 
@@ -218,6 +257,32 @@ impl Index {
         };
         Ok(count.unwrap_or(0).unsigned_abs())
     }
+}
+
+/// A count as SQLite stores it: its integers are signed 64-bit.
+pub(crate) fn clamp(count: u64) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
+}
+
+fn insert_session(tx: &rusqlite::Transaction<'_>, session: &Session) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT OR REPLACE INTO sessions
+             (machine, path, agent, session_id, cwd, title, branch, started, updated, size)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?
+    .execute(params![
+        session.machine,
+        session.path,
+        session.agent.kind(),
+        session.session_id,
+        session.cwd,
+        session.title,
+        session.branch,
+        session.started,
+        session.updated,
+        clamp(session.size),
+    ])?;
+    Ok(())
 }
 
 /// `word` as a `LIKE` pattern that matches it literally anywhere.

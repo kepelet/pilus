@@ -39,10 +39,10 @@ const ROW_HEIGHT: f32 = 46.0;
 
 /// A machine the index could read, whether or not the person allowed it.
 #[derive(Clone)]
-struct Choice {
+pub(super) struct Choice {
     /// `local`, or the saved profile's id.
-    key: String,
-    label: String,
+    pub(super) key: String,
+    pub(super) label: String,
     /// How to reach it; `None` is this Mac.
     target: Option<SshTarget>,
 }
@@ -68,9 +68,9 @@ enum Msg {
 pub(super) struct SearchPage {
     open: bool,
     /// The sources and permission panel, shown over the results.
-    sources: bool,
+    pub(super) sources: bool,
     /// Whether "Turn off" has been pressed once and awaits its second press.
-    confirm_off: bool,
+    pub(super) confirm_off: bool,
     pub(super) field: TextField,
     /// The text the results were last drawn for.
     query: String,
@@ -81,8 +81,8 @@ pub(super) struct SearchPage {
     filter: Filter,
     /// The window's own read connection, opened on first use.
     reader: Option<Index>,
-    syncing: bool,
-    synced_at: Option<Instant>,
+    pub(super) syncing: bool,
+    pub(super) synced_at: Option<Instant>,
     /// The last failure per machine key, cleared by its next good read.
     errors: BTreeMap<String, String>,
     resuming: bool,
@@ -153,13 +153,13 @@ impl SearchPage {
 
 impl PilusView {
     /// The index file this window reads and writes.
-    fn search_index_path(&self) -> PathBuf {
+    pub(super) fn search_index_path(&self) -> PathBuf {
         self.pilus_root.join(INDEX_FILE)
     }
 
     /// Every machine the index could read: this Mac, then each saved profile
     /// that has a verified remote binary to reach it with.
-    fn search_choices(&self) -> Vec<Choice> {
+    pub(super) fn search_choices(&self) -> Vec<Choice> {
         let mut choices = vec![Choice {
             key: LOCAL.to_string(),
             label: "This Mac".to_string(),
@@ -176,7 +176,7 @@ impl PilusView {
     }
 
     /// The choices the person has allowed.
-    fn search_allowed(&self) -> Vec<Choice> {
+    pub(super) fn search_allowed(&self) -> Vec<Choice> {
         self.search_choices()
             .into_iter()
             .filter(|choice| self.settings.index_machines.contains(&choice.key))
@@ -190,13 +190,19 @@ impl PilusView {
         if self.settings.index_agents {
             self.search_sync();
             self.search_requery();
-        } else if self.settings.index_machines.is_empty() {
-            // The card offers this Mac ticked. Nothing is read until the person
-            // presses Allow, but the choice is saved so a tick sticks.
+        } else {
+            self.search_prepare();
+        }
+        cx.notify();
+    }
+
+    /// Offer this Mac ticked on the permission card. Nothing is read until
+    /// the person presses Allow, but the choice is saved so a tick sticks.
+    pub(super) fn search_prepare(&mut self) {
+        if !self.settings.index_agents && self.settings.index_machines.is_empty() {
             self.settings.index_machines.push(LOCAL.to_string());
             self.save_settings();
         }
-        cx.notify();
     }
 
     /// Give permission to read the ticked machines, and start.
@@ -265,7 +271,7 @@ impl PilusView {
     /// Read the allowed machines' transcripts into the index, off the GUI
     /// thread and one machine after another, so a slow host never holds up
     /// this Mac's rows.
-    fn search_sync(&mut self) {
+    pub(super) fn search_sync(&mut self) {
         if !self.settings.index_agents || self.search.syncing {
             return;
         }
@@ -359,6 +365,7 @@ impl PilusView {
                         self.search.errors.remove(&machine);
                         if report.indexed + report.removed > 0 {
                             self.search_requery();
+                            self.stats_reload();
                         }
                     }
                     Err(error) => {
@@ -369,6 +376,7 @@ impl PilusView {
                     self.search.syncing = false;
                     self.search.synced_at = Some(Instant::now());
                     self.search_requery();
+                    self.stats_reload();
                 }
                 Msg::Resumed {
                     endpoint,
@@ -393,7 +401,8 @@ impl PilusView {
             .search
             .synced_at
             .is_none_or(|at| at.elapsed() >= RESYNC);
-        if self.search.open && self.settings.index_agents && !self.search.syncing && due {
+        let watched = self.search.open || self.stats.is_open();
+        if watched && self.settings.index_agents && !self.search.syncing && due {
             self.search_sync();
         }
         changed
@@ -571,7 +580,7 @@ impl PilusView {
     }
 
     /// The permission card, and the sources panel once it has been given.
-    fn search_consent(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn search_consent(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let allowed = self.settings.index_agents;
@@ -674,20 +683,21 @@ impl PilusView {
                     .child(if allowed {
                         "Sources"
                     } else {
-                        "Search your agent sessions"
+                        "Index your agent sessions"
                     }),
             )
             .child(line(
                 "pilus can index the sessions your coding agents have saved, so you can \
-                 find one by its title, folder or branch and resume it.",
+                 search them, resume one, and see how much you use each agent and model.",
             ))
             .child(line(
                 "It reads the transcript files in ~/.claude/projects and ~/.pi/agent/sessions \
                  on each machine ticked below.",
             ))
             .child(line(
-                "It keeps only each session's title, folder, branch and times, in \
-                 ~/.pilus/index.db on this Mac. Message text is not stored.",
+                "It keeps each session's title, folder, branch and times, plus per-hour \
+                 token counts and model names, in ~/.pilus/index.db on this Mac. Message \
+                 text is not stored.",
             ))
             .child(line(
                 "A remote machine is read over SSH only while it is ticked. Turning \

@@ -60,6 +60,7 @@ mod sipil_chat;
 mod sipil_panel;
 mod sipil_social;
 pub(crate) mod sound;
+mod stats;
 mod style;
 mod task_compose;
 mod tasks;
@@ -129,6 +130,7 @@ use search::SearchPage;
 use selection::{Cell, Selection};
 use session_ops::SessionVerb;
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
+use stats::StatsPage;
 use style::{FillExt, RadiusExt};
 use tasks::{TaskLayout, TasksInputs, TasksPanel};
 use text_input::{TextField, TextInput};
@@ -1202,6 +1204,8 @@ enum InputLayer {
     Automations,
     /// The Search page's query field.
     Search,
+    /// The Stats page.
+    Stats,
     /// The chat page for a sipil agent or session.
     Sipil,
     /// The right sidebar's Sipil tab, with a field in it.
@@ -2050,6 +2054,8 @@ struct PilusView {
     search: SearchPage,
     /// The Search page's query field, over `search`'s buffer.
     search_input: Entity<TextInput>,
+    /// The page that totals the agents' token use.
+    stats: StatsPage,
     files_panel: FilesPanel,
     /// Notes on excerpts of markdown files, and the field they are written in.
     md_notes: md_notes_view::MdNotes,
@@ -2572,6 +2578,7 @@ impl PilusView {
             github_page: GithubPage::default(),
             search,
             search_input,
+            stats: StatsPage::default(),
             files_panel: FilesPanel::new(),
             md_notes,
             md_note_input,
@@ -4662,6 +4669,7 @@ impl PilusView {
             InputLayer::Mission => self.mission_key(event, cx),
             InputLayer::Automations => self.automations_key(event, cx),
             InputLayer::Search => self.search_key(event, cx),
+            InputLayer::Stats => self.stats_key(event, cx),
             InputLayer::Sipil => self.sipil_chat_key(event, cx),
             // The panel's own handler has read it; nothing is left for the window.
             InputLayer::SipilPanel => {}
@@ -4687,6 +4695,7 @@ impl PilusView {
                 .or(self.sipil_panel_focused().then_some(InputLayer::SipilPanel))
                 .or_else(|| self.page_layer().filter(|_| !self.terminal_beside_page()))
                 .or_else(|| self.search.is_open().then_some(InputLayer::Search))
+                .or_else(|| self.stats.is_open().then_some(InputLayer::Stats))
                 .or_else(|| self.sipil_chat.open.then_some(InputLayer::Sipil)),
         )
     }
@@ -4897,6 +4906,7 @@ impl PilusView {
             ),
             entry(Command::OpenHome, "New Agent", "Application", Some("⌘⇧N")),
             entry(Command::OpenSearch, "Search Sessions", "Workspace", None),
+            entry(Command::OpenStats, "Agent Stats", "Workspace", None),
             entry(
                 Command::OpenSettings,
                 "Settings",
@@ -4986,6 +4996,7 @@ impl PilusView {
             Command::OpenSettings => self.open_settings(cx),
             Command::OpenHome => self.open_home(cx),
             Command::OpenSearch => self.open_search(cx),
+            Command::OpenStats => self.open_stats(cx),
             Command::OpenUiPlayground => {
                 ui_playground::open(self.theme, self.shared_settings.clone(), cx);
             }
@@ -5113,6 +5124,7 @@ impl PilusView {
         self.automations_page.close();
         self.github_page.close();
         self.search.close();
+        self.stats.close();
         self.close_sipil_chat();
         self.home.close();
         self.update_url_editing = false;
@@ -5423,6 +5435,14 @@ impl PilusView {
                 .overflow_hidden()
                 .child(self.search_page(cx));
             return self.page_card("pilus-page-search", page, grid, layout, terminal_fill, cx);
+        }
+        if self.stats.is_open() {
+            let page = div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.stats_page(cx));
+            return self.page_card("pilus-page-stats", page, grid, layout, terminal_fill, cx);
         }
         if self.settings_open {
             return style::enter(
@@ -6196,6 +6216,7 @@ impl PilusView {
                 Some(self.search_input.focus_handle(cx))
             }
             InputLayer::Search => None,
+            InputLayer::Stats => None,
             // The composer holds the keyboard.
             InputLayer::Sipil => Some(self.sipil_chat.active_input().focus_handle(cx)),
             InputLayer::SipilPanel => None,
@@ -10929,6 +10950,7 @@ impl PilusView {
         ));
         content = content.child(self.open_workspace_row(cx));
         content = content.child(self.search_nav_row(cx));
+        content = content.child(self.stats_nav_row(cx));
         // sipil's own section leads the lists: the user's agents, people and
         // channels, with where the connection stands in its header.
         content = content.children(self.sipil_sections(cx));
@@ -13090,6 +13112,33 @@ impl PilusView {
             ))
             .child(div().flex_1().child("Search"))
             .on_click(cx.listener(|this, _, _, cx| this.open_search(cx)))
+    }
+
+    /// The Stats row below Search: usage by agent and model, and a year of
+    /// activity.
+    fn stats_nav_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .id("pilus-stats")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(SIDEBAR_GLYPH_GAP))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .pl(px(SIDEBAR_ROW_PAD))
+            .pr(px(SIDEBAR_ROW_PAD))
+            .radius_md()
+            .cursor_pointer()
+            .text_size(px(self.chrome_font()))
+            .text_color(theme.panel_fg)
+            .child(style::hover_target(&self.sidebar_hover))
+            .child(icon(
+                include_bytes!("../../assets/icons/gauge.svg"),
+                SIDEBAR_GLYPH,
+                theme.muted,
+            ))
+            .child(div().flex_1().child("Stats"))
+            .on_click(cx.listener(|this, _, _, cx| this.open_stats(cx)))
     }
 
     /// Announce what the network side heard since the last tick: a message, as a

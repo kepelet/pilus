@@ -815,6 +815,43 @@ impl UiPlaygroundView {
             )
     }
 
+    /// The Stats page's heatmap squares at every shade, and its ranking rows.
+    fn heat_demo(&self) -> Div {
+        let theme = self.theme;
+        let fonts = self.fonts();
+        let mut cells = div().flex().flex_row().items_center().gap_1();
+        for level in 0..style::HEAT_LEVELS {
+            cells = cells.child(style::heat_cell(
+                format!("pg-heat-{level}"),
+                level,
+                style::scaled(&self.settings, 12.0),
+                theme,
+            ));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w(px(320.0))
+            .child(cells)
+            .child(style::rank_row(
+                "pg-rank-a",
+                theme,
+                fonts,
+                "claude-sonnet-5-5",
+                "1.5B tokens · 197 sessions",
+                1.0,
+            ))
+            .child(style::rank_row(
+                "pg-rank-b",
+                theme,
+                fonts,
+                "deepseek-v4.1-flash",
+                "810M tokens · 90 sessions",
+                0.54,
+            ))
+    }
+
     fn empty_state_demo(&self) -> Div {
         let theme = self.theme;
         let fonts = self.fonts();
@@ -2212,6 +2249,7 @@ impl Render for UiPlaygroundView {
             .child(self.section("CONTEXT GAUGE", self.tray(self.context_gauge_demo())))
             .child(self.section("METER", self.tray(self.meter_demo())))
             .child(self.section("STAT TILE", self.tray(self.stat_tile_demo())))
+            .child(self.section("HEATMAP AND RANKING", self.tray(self.heat_demo())))
             .child(self.section("EMPTY STATE", self.tray(self.empty_state_demo())))
             .child(self.section("QR CODE", self.tray(self.qr_demo())))
             .child(

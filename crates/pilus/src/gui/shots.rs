@@ -1077,6 +1077,20 @@ pub fn run_main() -> Result<()> {
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), &format!("main-search-{name}"))?;
     }
+    for (name, allowed) in [("consent", false), ("results", true)] {
+        cx.update(|app| {
+            view.update(app, |view, cx| view.stats_show_sample(allowed, cx));
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), &format!("main-stats-{name}"))?;
+    }
+    // The page is taller than the window; scrolled to the end it shows the
+    // cost and token blocks.
+    cx.update(|app| {
+        view.update(app, |view, cx| view.stats_scroll_to_end(cx));
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-stats-bottom")?;
     cx.update(|app| {
         view.update(app, |view, cx| {
             view.leave_settings_page();

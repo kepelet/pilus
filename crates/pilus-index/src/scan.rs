@@ -15,6 +15,7 @@ use pilus_client::SshTarget;
 use crate::error::{Error, Result};
 use crate::model::Agent;
 use crate::parse::Evidence;
+use crate::usage;
 
 /// A transcript as a listing shows it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,22 +93,33 @@ fn wanted(agent: Agent, name: &str) -> bool {
     name.ends_with(".jsonl") && !(agent == Agent::Claude && name.starts_with("agent-"))
 }
 
-/// The evidence lines of one local transcript.
-pub fn read_local(path: &str) -> Result<Evidence> {
+/// The evidence lines and usage turns of one local transcript, in one pass.
+pub fn read_local(path: &str, agent: Agent) -> Result<Evidence> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut evidence = Evidence::default();
     let mut titles: [Option<String>; 3] = [None, None, None];
+    let mut turns = Vec::new();
     let mut buffer = Vec::new();
     loop {
         buffer.clear();
         if reader.read_until(b'\n', &mut buffer)? == 0 {
             break;
         }
+        let line = String::from_utf8_lossy(&buffer);
+        let line = line.trim_end();
+        // An assistant line is long (it holds the reply) and is the only
+        // place usage lives, so it is read whole; every other line obeys the
+        // cap that keeps a pasted blob out of a title.
+        if line.contains(r#""usage":"#) {
+            let turn = match agent {
+                Agent::Claude => usage::claude(line),
+                Agent::Pi => usage::pi(line),
+            };
+            turns.extend(turn);
+        }
         if buffer.len() > LINE_CAP {
             continue;
         }
-        let line = String::from_utf8_lossy(&buffer);
-        let line = line.trim_end();
         if evidence.head.len() < HEAD_LINES
             && HEAD_NEEDLES.iter().any(|needle| line.contains(needle))
         {
@@ -121,6 +133,7 @@ pub fn read_local(path: &str) -> Result<Evidence> {
         }
     }
     evidence.titles = titles.into_iter().flatten().collect();
+    evidence.turns = usage::dedupe(turns);
     Ok(evidence)
 }
 
@@ -217,6 +230,20 @@ fn evidence_script() -> String {
             "  grep -a -e '{needle}' \"$p\" 2>/dev/null | tail -n 1 | cut -b1-4096\n"
         ));
     }
+    // Usage is cut out on the host with awk, one program per agent, so a
+    // transcript's message text never crosses the wire.
+    script.push_str("  printf '@@USAGE\\n'\n  case \"$p\" in\n");
+    script.push_str(&format!(
+        "    */{claude}/*) awk '{shared}{program}' \"$p\" 2>/dev/null ;;\n",
+        claude = Agent::Claude.root(),
+        shared = usage::REMOTE_AWK.shared,
+        program = usage::REMOTE_AWK.claude,
+    ));
+    script.push_str(&format!(
+        "    *) awk '{shared}{program}' \"$p\" 2>/dev/null ;;\n  esac\n",
+        shared = usage::REMOTE_AWK.shared,
+        program = usage::REMOTE_AWK.pi,
+    ));
     script.push_str("  printf '@@END\\n'\ndone\n");
     script
 }
@@ -238,26 +265,36 @@ pub fn read_remote(target: &SshTarget, paths: &[String]) -> Result<Vec<(String, 
 }
 
 fn parse_evidence(text: &str) -> Vec<(String, Evidence)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Section {
+        Head,
+        Titles,
+        Usage,
+    }
     let mut found = Vec::new();
     let mut current: Option<(String, Evidence)> = None;
-    let mut in_titles = false;
+    let mut section = Section::Head;
     for line in text.lines() {
         if let Some(path) = line.strip_prefix("@@FILE ") {
             current = Some((path.to_string(), Evidence::default()));
-            in_titles = false;
+            section = Section::Head;
         } else if line == "@@TITLES" {
-            in_titles = true;
+            section = Section::Titles;
+        } else if line == "@@USAGE" {
+            section = Section::Usage;
         } else if line == "@@END" {
-            found.extend(current.take());
+            found.extend(current.take().map(|(path, mut evidence)| {
+                evidence.turns = usage::dedupe(std::mem::take(&mut evidence.turns));
+                (path, evidence)
+            }));
         } else if let Some((_, evidence)) = current.as_mut()
             && !line.is_empty()
         {
-            let lines = if in_titles {
-                &mut evidence.titles
-            } else {
-                &mut evidence.head
-            };
-            lines.push(line.to_string());
+            match section {
+                Section::Head => evidence.head.push(line.to_string()),
+                Section::Titles => evidence.titles.push(line.to_string()),
+                Section::Usage => evidence.turns.extend(usage::from_tsv(line)),
+            }
         }
     }
     found
@@ -306,7 +343,7 @@ mod tests {
             r#"{"type":"ai-title","aiTitle":"new"}"#,
         ];
         fs::write(&path, lines.join("\n")).expect("write");
-        let evidence = read_local(path.to_str().expect("utf8")).expect("read");
+        let evidence = read_local(path.to_str().expect("utf8"), Agent::Claude).expect("read");
         assert_eq!(evidence.head, vec![lines[1].to_string()]);
         assert_eq!(evidence.titles, vec![lines[4].to_string()]);
         let _ = fs::remove_dir_all(&home);
@@ -321,7 +358,7 @@ mod tests {
             "x".repeat(LINE_CAP)
         );
         fs::write(&path, format!("{blob}\n")).expect("write");
-        let evidence = read_local(path.to_str().expect("utf8")).expect("read");
+        let evidence = read_local(path.to_str().expect("utf8"), Agent::Claude).expect("read");
         assert!(evidence.head.is_empty());
         let _ = fs::remove_dir_all(&home);
     }
@@ -343,13 +380,18 @@ mod tests {
 
     #[test]
     fn a_remote_answer_is_split_per_file() {
-        let text = "@@FILE /a.jsonl\n{\"h\":1}\n@@TITLES\n{\"t\":1}\n@@END\n\
+        let text = "@@FILE /a.jsonl\n{\"h\":1}\n@@TITLES\n{\"t\":1}\n@@USAGE\n\
+                    m1\tmodel-a\t2026-10-09T14:15:31Z\t1\t2\t3\t4\n\
+                    m1\tmodel-a\t2026-10-09T14:15:40Z\t1\t5\t3\t4\n@@END\n\
                     @@FILE /b.jsonl\n@@TITLES\n@@END\n";
         let found = parse_evidence(text);
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].0, "/a.jsonl");
         assert_eq!(found[0].1.head, vec!["{\"h\":1}"]);
         assert_eq!(found[0].1.titles, vec!["{\"t\":1}"]);
+        // A streamed message repeats its id; only the last line counts.
+        assert_eq!(found[0].1.turns.len(), 1);
+        assert_eq!(found[0].1.turns[0].output, 5);
         assert!(found[1].1.head.is_empty());
     }
 

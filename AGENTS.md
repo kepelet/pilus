@@ -286,6 +286,29 @@ with only the command-line tools can build the app.
   `workspace.open` on the session's folder then `agent.resume` on its machine's
   daemon. The `visual-test` captures use `search_show_sample` and never touch
   the index.
+- Stats (`gui/stats.rs`, the row below Search) totals the same index's token
+  use: per-hour buckets (`usage` table: machine, transcript, hour, model, four
+  token counts, turns) that `refresh` writes in the same transaction as the
+  session row, so a session never exists without the usage its size says was
+  read. It has no permission of its own: it shows Search's consent card and is
+  gated by the same `Settings::index_agents` and `index_machines`, and the same
+  background read (`search_sync`) feeds both pages. Usage is read from assistant
+  turns only (`usage.rs`): Claude repeats a streamed message's id on every line,
+  so `dedupe` keeps the last per id; zero-token and `<synthetic>` turns are not
+  usage. This Mac's lines are parsed as JSON and a remote host's are cut out by
+  the `awk` in `usage::REMOTE_AWK`, so keep the two producing the same `Turn`
+  (a test runs both over one set of lines). Counts are what each turn reported,
+  not a bill. Cost is Pi's own recorded figure for each turn (`Turn::cost_micros`,
+  kept per bucket with a `recorded` count) and, for turns that have none
+  (Claude's), a list-price estimate made when a page asks, never stored, from the
+  table in `pricing.rs`, taken from pi.dev/models as it lists them. A model
+  with neither is *unpriced*: its tokens are counted in `Cost::unpriced` and left
+  out of the dollars, never guessed. Cache writes are priced at the 5-minute rate,
+  since a transcript does not say which lifetime was used. Changing a price needs
+  no re-index; changing what is stored does (`store::SCHEMA`). Hours are stored in UTC and grouped into days in the viewer's
+  offset (`date +%z`) when the page opens. Bump `store::SCHEMA` when a table
+  changes, which rebuilds the cache. The heatmap cell and ranking row are
+  `style::heat_cell` and `style::rank_row`, shown in the playground.
 
 ## UI
 

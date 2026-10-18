@@ -10,6 +10,7 @@ use crate::model::Session;
 use crate::parse::{self, Evidence};
 use crate::scan::{self, Probe};
 use crate::store::Index;
+use crate::usage::{self, Bucket};
 
 /// Where a machine's transcripts are read from.
 pub enum Source<'a> {
@@ -53,13 +54,13 @@ pub fn refresh(index: &mut Index, machine: &str, source: &Source<'_>) -> Result<
         .collect();
     let paths: Vec<String> = changed.iter().map(|probe| probe.path.clone()).collect();
     let evidence: Vec<(String, Evidence)> = match source {
-        Source::Local(_) => paths
+        Source::Local(_) => changed
             .iter()
-            .filter_map(|path| match scan::read_local(path) {
-                Ok(evidence) => Some((path.clone(), evidence)),
+            .filter_map(|probe| match scan::read_local(&probe.path, probe.agent) {
+                Ok(evidence) => Some((probe.path.clone(), evidence)),
                 Err(error) => {
                     // A transcript can vanish between the listing and the read.
-                    tracing::debug!(%path, %error, "session transcript unreadable");
+                    tracing::debug!(path = %probe.path, %error, "session transcript unreadable");
                     None
                 }
             })
@@ -67,7 +68,7 @@ pub fn refresh(index: &mut Index, machine: &str, source: &Source<'_>) -> Result<
         Source::Remote(target) => scan::read_remote(target, &paths)?,
     };
 
-    let sessions: Vec<Session> = evidence
+    let files: Vec<(Session, Vec<Bucket>)> = evidence
         .iter()
         .filter_map(|(path, evidence)| {
             let probe = changed.iter().find(|probe| &probe.path == path)?;
@@ -77,7 +78,7 @@ pub fn refresh(index: &mut Index, machine: &str, source: &Source<'_>) -> Result<
                 .and_then(|name| name.strip_suffix(".jsonl"))
                 .unwrap_or(path);
             let parsed = parse::parse(probe.agent, stem, evidence);
-            Some(Session {
+            let session = Session {
                 machine: machine.to_string(),
                 agent: probe.agent,
                 session_id: parsed.session_id,
@@ -92,14 +93,15 @@ pub fn refresh(index: &mut Index, machine: &str, source: &Source<'_>) -> Result<
                 updated: probe.mtime,
                 path: path.clone(),
                 size: probe.size,
-            })
+            };
+            Some((session, usage::buckets(&evidence.turns)))
         })
         .collect();
 
-    index.upsert(&sessions)?;
+    index.upsert_with_usage(&files)?;
     index.remove(machine, &gone)?;
     Ok(Report {
-        indexed: sessions.len(),
+        indexed: files.len(),
         removed: gone.len(),
     })
 }

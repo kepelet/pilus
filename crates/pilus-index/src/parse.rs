@@ -8,6 +8,7 @@
 use serde_json::Value;
 
 use crate::model::Agent;
+use crate::usage::Turn;
 
 /// The lines of one transcript that can name it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -16,6 +17,8 @@ pub struct Evidence {
     pub head: Vec<String>,
     /// The last line of each kind that renames the session.
     pub titles: Vec<String>,
+    /// Every assistant turn's usage, one per message.
+    pub turns: Vec<Turn>,
 }
 
 /// What a transcript says about itself.
@@ -194,7 +197,7 @@ fn tidy(text: &str) -> String {
 }
 
 /// Unix seconds of an RFC 3339 UTC timestamp (`2026-10-09T14:15:31.131Z`).
-fn iso_seconds(text: &str) -> Option<i64> {
+pub(crate) fn iso_seconds(text: &str) -> Option<i64> {
     let (date, time) = text.split_once('T')?;
     let mut ymd = date.splitn(3, '-').map(|part| part.parse::<i64>().ok());
     let (year, month, day) = (ymd.next()??, ymd.next()??, ymd.next()??);
@@ -222,6 +225,7 @@ mod tests {
         Evidence {
             head: head.iter().map(|line| (*line).to_string()).collect(),
             titles: titles.iter().map(|line| (*line).to_string()).collect(),
+            turns: Vec::new(),
         }
     }
 

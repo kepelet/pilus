@@ -17,11 +17,17 @@
 mod error;
 mod model;
 mod parse;
+mod pricing;
 mod refresh;
 mod scan;
+mod stats;
 mod store;
+mod usage;
 
 pub use error::{Error, Result};
 pub use model::{Agent, Session};
+pub use pricing::{Price, estimate as estimate_cost, lookup as price_of};
 pub use refresh::{Report, Source, refresh};
+pub use stats::{Cost, Hourly, Overview, Ranked, Scope, Tokens};
 pub use store::{Filter, Index, wipe};
+pub use usage::{Bucket, Turn};

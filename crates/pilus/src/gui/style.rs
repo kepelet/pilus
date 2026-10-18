@@ -1250,6 +1250,91 @@ pub(super) fn stat_tile(
         )
 }
 
+/// How many shades a [`heat_cell`] has: none, then four steps of the accent.
+pub(super) const HEAT_LEVELS: usize = 5;
+
+/// A heatmap cell's fill. Level 0 is the quiet track a meter rests on; the
+/// four above it are one hue, the accent, at rising strength, so a darker
+/// cell always means more.
+pub(super) fn heat_color(level: usize, theme: Theme) -> Rgba {
+    match level {
+        0 => tint(theme.muted, 0.16),
+        1 => tint(theme.accent, 0.30),
+        2 => tint(theme.accent, 0.52),
+        3 => tint(theme.accent, 0.76),
+        _ => theme.accent,
+    }
+}
+
+/// One square of a heatmap. The caller lays the grid out and attaches the
+/// tooltip, since only it knows what a cell stands for.
+pub(super) fn heat_cell(
+    id: impl Into<ElementId>,
+    level: usize,
+    side: f32,
+    theme: Theme,
+) -> Stateful<Div> {
+    // A cell is a data mark, not a hover or selection target, so it takes a
+    // plain fill. Its corner follows the setting but never rounds a small
+    // square into a dot.
+    div()
+        .id(id)
+        .w(px(side))
+        .h(px(side))
+        .flex_shrink_0()
+        .rounded(Radius::Sm.pixels().min(px(side * 0.25)))
+        .bg(heat_color(level, theme))
+}
+
+/// One entry of a ranking: its name, a muted figure beside it, and a meter
+/// showing its share of the leader. The meter is the one accent, since the
+/// name already says which entry it is.
+pub(super) fn rank_row(
+    id: impl Into<ElementId>,
+    theme: Theme,
+    fonts: Fonts,
+    name: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+    fraction: f32,
+) -> Div {
+    let id = id.into();
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .w_full()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .truncate()
+                        .min_w(px(0.0))
+                        .text_size(px(fonts.body))
+                        .text_color(theme.panel_fg)
+                        .child(name.into()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(fonts.label))
+                        .text_color(theme.muted)
+                        .child(detail.into()),
+                ),
+        )
+        .child(meter(
+            id,
+            Some(fraction),
+            theme.accent,
+            theme,
+            fonts.label * 0.5,
+        ))
+}
+
 /// A centered empty state: a glyph, a title, and a muted line of detail.
 /// Callers append the call to action, so one frame serves a surface with
 /// nothing to show and one that cannot show anything yet.

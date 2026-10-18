@@ -54,6 +54,10 @@ mod session_ops;
 #[cfg(feature = "visual-test")]
 pub(crate) mod shots;
 mod sidebar_menu;
+mod sipil;
+mod sipil_chat;
+mod sipil_panel;
+mod sipil_social;
 pub(crate) mod sound;
 mod style;
 mod task_compose;
@@ -187,6 +191,8 @@ const SIDEBAR_HOVER_WEIGHT: f32 = 0.6;
 /// Box every leading sidebar glyph sits in, so labels share one column
 /// whatever the glyph is: chevron, folder, brand mark, or status dot.
 const SIDEBAR_GLYPH: f32 = 14.0;
+/// A sipil's logo in its row: bigger than a glyph, since it is a picture.
+const SIDEBAR_LOGO: f32 = 22.0;
 /// Gap between a row's leading glyph and its label.
 const SIDEBAR_GLYPH_GAP: f32 = 8.0;
 /// Height of a single-line sidebar row (nav, open workspace, section header).
@@ -259,7 +265,7 @@ const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
 /// Inset for the tab strip when nothing floats over its left edge: the sidebar
 /// is open, or fullscreen hides the traffic lights.
 const TAB_STRIP_EDGE: f32 = 12.0;
-/// Section label size (SESSIONS / WORKSPACES).
+/// Section label size (SIPIL / WORKSPACES).
 const SECTION_FONT: f32 = 11.0;
 /// Opening size of the main window when nothing is remembered.
 const WINDOW_SIZE: (f32, f32) = (1240.0, 780.0);
@@ -436,6 +442,12 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
             let app_shared = app_shared.clone();
             move |response, cx| {
                 let target = notify::target(&response.tag);
+                // A sipil message opens its conversation; it is no agent pane.
+                let sipil_thread = target
+                    .as_ref()
+                    .filter(|(endpoint, _)| endpoint == "sipil")
+                    .map(|(_, thread)| thread.clone());
+                let target = target.filter(|(endpoint, _)| endpoint != "sipil");
                 cx.activate(true);
                 // With no window (the menu bar helper) there is nothing to
                 // raise, so the click opens one on the agent.
@@ -449,6 +461,9 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
                 };
                 let _ = window.update(cx, |view, window, cx| {
                     window.activate_window();
+                    if let Some(thread) = &sipil_thread {
+                        view.open_sipil_thread(thread, cx);
+                    }
                     if let Some((endpoint, pane)) = target {
                         view.menu_pick = Some((endpoint, pane, Instant::now()));
                         view.apply_menu_pick(cx);
@@ -461,6 +476,14 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
         // service is left alone, and one installed from an older build or app
         // location moves onto this binary.
         connector::ensure(settings.borrow().connector);
+        // sipil is a program the user starts, so a daemon that is not up yet is
+        // waited for rather than reported. The network side starts only for a
+        // pilus left reachable or connected to a daemon, so a launch that never
+        // used sipil opens no socket.
+        {
+            let settings = settings.borrow();
+            sipil::ensure(&sipil::daemon_addresses(), settings.sipil_online);
+        }
         // First launch only: bring the daemon's pane gaps, title rows, and
         // theme in line with what pilus draws, then record it. The control
         // socket may not be up yet because the view starts the daemon, so the
@@ -1175,6 +1198,10 @@ enum InputLayer {
     Mission,
     /// The native Automations page.
     Automations,
+    /// The chat page for a sipil agent or session.
+    Sipil,
+    /// The right sidebar's Sipil tab, with a field in it.
+    SipilPanel,
     /// The live terminal grid.
     Terminal,
 }
@@ -1282,6 +1309,34 @@ struct SectionHeader {
     toggle: SectionAction,
     /// Whether a right-click on the header opens the GitHub section's menu.
     menu: bool,
+}
+
+/// One row of the SIPIL section.
+struct SipilRow<'a> {
+    id: String,
+    /// What the saved order names it by (`daemon:<id>`, `channel:<id>`,
+    /// `person:<id>`); `None` for a row that is not placed, like a knock.
+    key: Option<String>,
+    glyph: &'static [u8],
+    name: &'a str,
+    error: Option<&'a str>,
+    /// Indented under the agent above it.
+    nested: bool,
+    /// Bold at rest, for the primary agent.
+    strong: bool,
+    /// The conversation a click opens.
+    open: sipil::Watch,
+    /// Lines not read yet, shown as a count at the right.
+    badge: u64,
+    /// A presence dot at the right.
+    dot: Option<gpui::Rgba>,
+    /// A click opens the Sipil tab instead of a conversation.
+    window: bool,
+    /// A picture in place of the glyph, for an agent that has a logo.
+    logo: Option<std::sync::Arc<gpui::RenderImage>>,
+    /// What the tooltip says besides the name, when it is not a failed turn:
+    /// why a sipil is offline.
+    note: Option<&'a str>,
 }
 
 /// A requested endpoint handoff waiting for its prepared frame.
@@ -1692,7 +1747,7 @@ struct PilusView {
     control_held: bool,
     /// Background poller for the current session's tabs and widgets.
     agent_feed: Option<AgentFeed>,
-    /// State root the SESSIONS section lists, derived from the launch target.
+    /// State root the sessions list, derived from the launch target.
     session_root: PathBuf,
     /// pilus's own state directory: settings and personal sessions.
     pilus_root: PathBuf,
@@ -1856,6 +1911,16 @@ struct PilusView {
     workspaces_collapsed: bool,
     /// Whether the AGENTS section is collapsed to its header.
     agents_collapsed: bool,
+    /// Whether the SIPIL section is collapsed to its header.
+    sipil_collapsed: bool,
+    /// A system notification for a sipil message raised the app icon's badge.
+    sipil_badged: bool,
+    /// What sipil last reported, for the sidebar's two sections.
+    sipil: std::sync::Arc<sipil::SipilState>,
+    /// The right sidebar's Sipil tab, made when it is first opened.
+    sipil_panel: Option<Entity<sipil_panel::SipilPanel>>,
+    /// The chat page for a sipil agent or session.
+    sipil_chat: sipil_chat::SipilChat,
     /// Successful `worktree.list` answers by `(endpoint key, workspace id)`.
     /// The inner option is the linked checkout root; `None` means a main
     /// checkout or plain folder. Missing keys are unknown and remain retryable.
@@ -2121,6 +2186,12 @@ impl PilusView {
             )
             .submit_on_enter()
         });
+        let sipil_chat = sipil_chat::SipilChat::new(
+            style::chrome_font(&shared_settings),
+            initial_fonts.body,
+            initial_theme,
+            cx,
+        );
         let mission_answer = mission::answer_input(
             style::chrome_font(&shared_settings),
             initial_fonts.body,
@@ -2402,6 +2473,11 @@ impl PilusView {
             sidebar_visible: true,
             workspaces_collapsed: false,
             agents_collapsed: false,
+            sipil_collapsed: false,
+            sipil_badged: false,
+            sipil: sipil::snapshot(),
+            sipil_panel: None,
+            sipil_chat,
             menu_rx,
             menu_tx,
             sidebar_scroll: ScrollHandle::new(),
@@ -2730,6 +2806,13 @@ impl PilusView {
             self.remote = remote;
             changed = true;
         }
+        let sipil = sipil::snapshot();
+        if !std::sync::Arc::ptr_eq(&sipil, &self.sipil) {
+            self.sipil = sipil;
+            changed = true;
+        }
+        changed |= self.announce_sipil(cx);
+        changed |= self.sipil_chat_tick(cx);
         // The pairing card counts down in whole seconds.
         if self.settings_open && self.remote.code.is_some() {
             let second = tasks::unix_now();
@@ -4543,6 +4626,9 @@ impl PilusView {
             InputLayer::Browser => self.browser_key(event, cx),
             InputLayer::Mission => self.mission_key(event, cx),
             InputLayer::Automations => self.automations_key(event, cx),
+            InputLayer::Sipil => self.sipil_chat_key(event, cx),
+            // The panel's own handler has read it; nothing is left for the window.
+            InputLayer::SipilPanel => {}
             InputLayer::Terminal => self.terminal_key(event, cx),
         }
     }
@@ -4562,7 +4648,9 @@ impl PilusView {
             self.diff_focused()
                 .then_some(InputLayer::Diff)
                 .or(self.browser_focused().then_some(InputLayer::Browser))
-                .or_else(|| self.page_layer().filter(|_| !self.terminal_beside_page())),
+                .or(self.sipil_panel_focused().then_some(InputLayer::SipilPanel))
+                .or_else(|| self.page_layer().filter(|_| !self.terminal_beside_page()))
+                .or_else(|| self.sipil_chat.open.then_some(InputLayer::Sipil)),
         )
     }
 
@@ -4985,6 +5073,7 @@ impl PilusView {
         self.mission.close();
         self.automations_page.close();
         self.github_page.close();
+        self.close_sipil_chat();
         self.home.close();
         self.update_url_editing = false;
         self.relay_editing = None;
@@ -5269,6 +5358,16 @@ impl PilusView {
                 cx,
             );
         }
+        if self.sipil_chat.open {
+            let page = div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.sipil_chat_page(cx));
+            // The chat runs flush to the sidebar and the window edge: a long log
+            // wants the width an inset card would take.
+            return self.flush_page_card("pilus-page-sipil", page, grid, layout, terminal_fill, cx);
+        }
         if self.github_page.is_open() {
             let page = div()
                 .flex_1()
@@ -5329,6 +5428,18 @@ impl PilusView {
             )
     }
 
+    /// A page with no card around it: the page's own layer on the card's fill,
+    /// to the edges of the area it has.
+    fn flush_page(&self, page: Div) -> Div {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(self.theme.bg.opacity(self.glass_opacity()))
+            .child(page)
+    }
+
     /// A native page in the card: alone, or leading the terminal when split.
     ///
     /// The page keeps its fade under its own id; the terminal half takes
@@ -5343,8 +5454,42 @@ impl PilusView {
         terminal_fill: gpui::Rgba,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.framed_page_card(id, page, grid, layout, terminal_fill, true, cx)
+    }
+
+    /// [`Self::page_card`] without the card: the page runs flush to the sidebar
+    /// and the window's edges on the card's fill, with no gutter or rounded
+    /// border, for a page whose content wants all the room there is.
+    fn flush_page_card(
+        &mut self,
+        id: &'static str,
+        page: Div,
+        grid: Div,
+        layout: &CardLayout,
+        terminal_fill: gpui::Rgba,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.framed_page_card(id, page, grid, layout, terminal_fill, false, cx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn framed_page_card(
+        &mut self,
+        id: &'static str,
+        page: Div,
+        grid: Div,
+        layout: &CardLayout,
+        terminal_fill: gpui::Rgba,
+        inset: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let page = if inset {
+            self.inset_page(page)
+        } else {
+            self.flush_page(page)
+        };
         let Some(split) = self.page_split() else {
-            return style::enter(id, self.inset_page(page)).into_any_element();
+            return style::enter(id, page).into_any_element();
         };
         let page_extent = match split.axis {
             SplitAxis::Right => layout.page_w,
@@ -5384,7 +5529,7 @@ impl PilusView {
         let row = div()
             .flex()
             .size_full()
-            .child(style::enter(id, lead.child(self.inset_page(page))));
+            .child(style::enter(id, lead.child(page)));
         match split.axis {
             SplitAxis::Right => row.flex_row(),
             SplitAxis::Down => row.flex_col(),
@@ -5933,6 +6078,17 @@ impl PilusView {
             }
             return;
         }
+        // The Sipil tab's fields hold focus themselves; the panel takes it only
+        // when nothing inside it has.
+        if self.input_layer() == InputLayer::SipilPanel
+            && let Some(panel) = self.sipil_panel.as_ref()
+        {
+            let handle = panel.focus_handle(cx);
+            if !handle.contains_focused(window, cx) {
+                window.focus(&handle, cx);
+            }
+            return;
+        }
         let target = match self.input_layer() {
             // The picker owns the keyboard; its path field only while editing,
             // otherwise the window root so list navigation keeps working.
@@ -5986,6 +6142,9 @@ impl PilusView {
             }
             InputLayer::Mission => None,
             InputLayer::Automations => None,
+            // The composer holds the keyboard.
+            InputLayer::Sipil => Some(self.sipil_chat.active_input().focus_handle(cx)),
+            InputLayer::SipilPanel => None,
             InputLayer::Terminal => None,
         };
         match target {
@@ -10715,6 +10874,9 @@ impl PilusView {
             SIDEBAR_ROW_EDGE,
         ));
         content = content.child(self.open_workspace_row(cx));
+        // sipil's own section leads the lists: the user's agents, people and
+        // channels, with where the connection stands in its header.
+        content = content.children(self.sipil_sections(cx));
 
         content = content.children(self.github_sidebar(cx));
         content = content.child(self.workspaces_section(cx));
@@ -12846,6 +13008,446 @@ impl PilusView {
             ))
             .child(div().flex_1().child("Open Workspace"))
             .on_click(cx.listener(|this, _, _, cx| this.open_picker(cx)))
+    }
+
+    /// Announce what the network side heard since the last tick: a message, as a
+    /// toast and, while the window is not in front, as a system notification
+    /// that opens the conversation when clicked; and a stranger knocking. A
+    /// message in the conversation being read is neither.
+    fn announce_sipil(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        for event in sipil::take_events() {
+            match event {
+                pilus_client::sipil::Event::Message {
+                    thread,
+                    name,
+                    channel,
+                    text,
+                    ..
+                } => {
+                    let reading =
+                        self.sipil_chat.open && self.sipil.watch == sipil::thread_watch(&thread);
+                    if reading && self.window_active {
+                        continue;
+                    }
+                    let body: String = text.chars().take(160).collect();
+                    let title = match &channel {
+                        Some(channel) => format!("#{channel}: {name}"),
+                        None => name,
+                    };
+                    self.toasts
+                        .push(ToastKind::Info, Some(title.clone()), body.clone());
+                    changed = true;
+                    if !self.window_active {
+                        self.sipil_badged = true;
+                        let tag = format!("sipil-{thread}");
+                        notify::post(
+                            cx,
+                            notify::Alert {
+                                tag,
+                                title,
+                                body,
+                                badge: u32::try_from(self.sipil.unread() + 1).unwrap_or(u32::MAX),
+                                target: ("sipil".to_string(), thread),
+                            },
+                        );
+                    }
+                }
+                // Answered where it arrives, by `sipil_social::push_event`.
+                pilus_client::sipil::Event::Mentioned { .. } => {}
+                pilus_client::sipil::Event::Request { from } => {
+                    let short: String = from.chars().take(8).collect();
+                    self.toasts.push(
+                        ToastKind::Info,
+                        Some("Someone wants to talk".to_string()),
+                        format!("Device {short}… asked to message you. Open sipil to add them."),
+                    );
+                    changed = true;
+                }
+            }
+        }
+        // Back in front with everything read: the badge we raised has done its job.
+        if self.sipil_badged && self.window_active && self.sipil.unread() == 0 {
+            self.sipil_badged = false;
+            notify::set_badge(0);
+        }
+        changed
+    }
+
+    /// Open the conversation a system notification was about, by its thread: a
+    /// contact's device ID or a channel's `#id`.
+    pub(super) fn open_sipil_thread(&mut self, thread: &str, cx: &mut Context<Self>) {
+        cx.dismiss_system_notification(&format!("sipil-{thread}"));
+        self.open_sipil_chat(sipil::thread_watch(thread), cx);
+    }
+
+    /// SIPIL: the primary agents (and their subagents) of every connected daemon,
+    /// then the people this pilus talks to, the channels, and any agents the
+    /// people share. People and
+    /// channels are listed whether or not a daemon is connected, since they never
+    /// needed one.
+    fn sipil_sections(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        // Shown only for a pilus that is switched on and has something to list;
+        // the Sipil tab, where a first agent or contact is added, opens from
+        // the pilus mark in the right toolbar.
+        let me = &self.sipil.me;
+        let listed = !self.sipil.daemons.is_empty()
+            || !me.people.is_empty()
+            || !me.channels.is_empty()
+            || !me.requests.is_empty();
+        if !me.reachable || !listed {
+            return Vec::new();
+        }
+        vec![self.sipil_agents_section(cx)]
+    }
+
+    fn sipil_agents_section(&self, cx: &mut Context<Self>) -> Div {
+        let section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pt(px(SIDEBAR_SECTION_GAP))
+            .child(self.section_header(
+                SectionHeader {
+                    id: "pilus-sipil-agents-toggle",
+                    label: "SIPIL",
+                    collapsed: self.sipil_collapsed,
+                    toggle: Box::new(|this, cx| {
+                        this.sipil_collapsed = !this.sipil_collapsed;
+                        cx.notify();
+                    }),
+                    menu: false,
+                },
+                cx,
+            ));
+        if self.sipil_collapsed {
+            return section;
+        }
+        let mut rows = div().flex().flex_col().gap_1();
+        let theme = self.theme;
+        let me = &self.sipil.me;
+        // A knock leads the people: it is the one row that asks for something,
+        // and it stays where it is.
+        for request in &me.requests {
+            let short: String = request.id.chars().take(8).collect();
+            rows = rows.child(self.sipil_row_item(
+                SipilRow {
+                    id: format!("pilus-sipil-request-{}", request.id),
+                    key: None,
+                    glyph: include_bytes!("../../assets/icons/circle-alert.svg"),
+                    name: &format!("{short}… wants to talk"),
+                    error: None,
+                    nested: false,
+                    strong: true,
+                    open: sipil::Watch::Off,
+                    badge: 0,
+                    dot: None,
+                    window: true,
+                    logo: None,
+                    note: None,
+                },
+                cx,
+            ));
+        }
+        // Daemons, channels and people in the order they are made, then placed
+        // by the order the person dragged them into.
+        let mut placed: Vec<(String, AnyElement)> = Vec::new();
+        for daemon in &self.sipil.daemons {
+            // A subagent is not listed: it is reached from the conversation that
+            // handed it work, and listed at the top of that page.
+            let primaries: Vec<_> = daemon
+                .agents
+                .iter()
+                .filter(|agent| agent.role != pilus_client::sipil::Role::Subagent)
+                .collect();
+            let key = format!("daemon:{}", daemon.id);
+            if !primaries.is_empty() {
+                // Its agent, up or not: a daemon that is away still has the
+                // conversation it had, which opens, and a message written there
+                // waits for it. The dot says which it is. The name the person
+                // gave the daemon stands for its one agent; with several, each
+                // keeps its own.
+                let given = daemon.name();
+                let single = primaries.len() == 1;
+                for agent in primaries {
+                    placed.push((
+                        key.clone(),
+                        self.sipil_row_item(
+                            SipilRow {
+                                id: format!("pilus-sipil-agent-{}-{}", daemon.id, agent.id),
+                                key: Some(key.clone()),
+                                glyph: include_bytes!("../../assets/icons/pilus-mark.svg"),
+                                name: if single { &given } else { &agent.name },
+                                error: agent.error.as_deref(),
+                                nested: false,
+                                strong: true,
+                                open: sipil::Watch::On(daemon.id.clone(), agent.id.clone()),
+                                badge: 0,
+                                dot: Some(if daemon.connected() {
+                                    theme.ok
+                                } else {
+                                    theme.muted
+                                }),
+                                window: false,
+                                logo: daemon.own_logo(),
+                                note: daemon.error.as_deref().filter(|_| !daemon.connected()),
+                            },
+                            cx,
+                        )
+                        .into_any_element(),
+                    ));
+                }
+                continue;
+            }
+            // Never seen up: the daemon is still listed, with its own logo and
+            // an offline dot at the right, and the reason when you hover it. A
+            // click opens the Sipil tab, where it is managed.
+            placed.push((
+                key.clone(),
+                self.sipil_row_item(
+                    SipilRow {
+                        id: format!("pilus-sipil-daemon-{}", daemon.id),
+                        key: Some(key),
+                        glyph: include_bytes!("../../assets/icons/pilus-mark.svg"),
+                        name: &daemon.name(),
+                        error: None,
+                        nested: false,
+                        strong: false,
+                        open: sipil::Watch::Off,
+                        badge: 0,
+                        dot: Some(if daemon.connected() {
+                            theme.ok
+                        } else {
+                            theme.muted
+                        }),
+                        window: true,
+                        logo: daemon.own_logo(),
+                        note: daemon.error.as_deref(),
+                    },
+                    cx,
+                )
+                .into_any_element(),
+            ));
+        }
+        for row in &me.channels {
+            let key = format!("channel:{}", row.channel.id);
+            placed.push((
+                key.clone(),
+                self.sipil_row_item(
+                    SipilRow {
+                        id: format!("pilus-sipil-channel-{}", row.channel.id),
+                        key: Some(key),
+                        glyph: include_bytes!("../../assets/icons/hash.svg"),
+                        name: &row.channel.name,
+                        error: None,
+                        nested: false,
+                        strong: row.unread > 0,
+                        open: sipil::Watch::Channel(row.channel.id.clone()),
+                        badge: row.unread,
+                        dot: None,
+                        window: false,
+                        logo: None,
+                        note: None,
+                    },
+                    cx,
+                )
+                .into_any_element(),
+            ));
+        }
+        for person in &me.people {
+            let dot = match person.reach {
+                sipil::Reach::Online => Some(theme.ok),
+                sipil::Reach::Waiting | sipil::Reach::Offline | sipil::Reach::Unknown => None,
+            };
+            let key = format!("person:{}", person.contact.id);
+            placed.push((
+                key.clone(),
+                self.sipil_row_item(
+                    SipilRow {
+                        id: format!("pilus-sipil-person-{}", person.contact.id),
+                        key: Some(key),
+                        glyph: include_bytes!("../../assets/icons/user.svg"),
+                        name: &person.contact.name,
+                        error: None,
+                        nested: false,
+                        strong: person.unread > 0,
+                        open: sipil::Watch::Peer(person.contact.id.clone()),
+                        badge: person.unread,
+                        dot,
+                        window: false,
+                        logo: None,
+                        note: None,
+                    },
+                    cx,
+                )
+                .into_any_element(),
+            ));
+        }
+        // Stable, so rows the person has not placed keep the order above.
+        placed.sort_by_key(|(key, _)| self.sipil_rank(key));
+        rows = rows.children(placed.into_iter().map(|(_, row)| row));
+        section.child(style::enter("pilus-sipil-agent-rows", rows))
+    }
+
+    /// One agent or session row: a glyph that becomes a spinner while it
+    /// works, then its name. A click opens its conversation in the chat page.
+    ///
+    /// The open conversation's name is bold, the way a selected row's is.
+    fn sipil_row_item(&self, row: SipilRow<'_>, cx: &mut Context<Self>) -> impl IntoElement {
+        let SipilRow {
+            id,
+            key,
+            glyph,
+            name,
+            error,
+            nested,
+            strong,
+            open,
+            badge,
+            dot,
+            window,
+            logo,
+            note,
+        } = row;
+        let theme = self.theme;
+        let selected = self.sipil_chat.open && self.sipil.watch == open;
+        let drag = key.as_ref().map(|key| SipilDrag {
+            key: key.clone(),
+            label: name.to_string(),
+            theme,
+            font_size: self.chrome_font(),
+        });
+        // Nothing spins here: who is writing is said in the conversation itself.
+        let lead = if error.is_some() {
+            icon(
+                include_bytes!("../../assets/icons/circle-alert.svg"),
+                SIDEBAR_GLYPH,
+                theme.alert,
+            )
+            .into_any_element()
+        } else if let Some(logo) = logo {
+            // Larger than a glyph, centred on the glyph's column so the names
+            // still line up.
+            img(logo)
+                .w(px(SIDEBAR_LOGO))
+                .h(px(SIDEBAR_LOGO))
+                .flex_shrink_0()
+                .ml(px(-(SIDEBAR_LOGO - SIDEBAR_GLYPH) / 2.0))
+                .into_any_element()
+        } else {
+            icon(glyph, SIDEBAR_GLYPH, theme.muted).into_any_element()
+        };
+        // The name truncates, so the tooltip carries it whole, and the reason
+        // a turn failed, which is too long for a row.
+        let tip = row_tooltip(
+            name.to_string(),
+            theme.panel_fg,
+            error
+                .or(note)
+                .map(|error| vec![(error.to_string(), theme.alert)])
+                .unwrap_or_default(),
+            theme,
+        );
+        div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(SIDEBAR_GLYPH_GAP))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .pl(px(
+                SIDEBAR_ROW_PAD + if nested { SIDEBAR_GLYPH } else { 0.0 }
+            ))
+            .pr(px(SIDEBAR_ROW_PAD))
+            .radius_md()
+            .cursor_pointer()
+            .text_size(px(self.chrome_font()))
+            .text_color(theme.panel_fg)
+            .tooltip(tip)
+            .child(style::hover_target(&self.sidebar_hover))
+            .child(div().w(px(SIDEBAR_GLYPH)).flex_shrink_0().child(lead))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(strong || selected, |name| {
+                        name.font_weight(FontWeight::BOLD)
+                    })
+                    .child(name.to_string()),
+            )
+            .when(badge > 0, |row| {
+                row.child(style::chip(theme, badge.to_string(), self.section_font()))
+            })
+            .children(dot.map(|color| {
+                div()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .flex_shrink_0()
+                    .radius_full()
+                    .bg(color)
+            }))
+            .when_some(drag.zip(key), |row, (drag, key)| {
+                row.on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                    // The row under a drag shows the pill it would take, unless
+                    // it is the one being dragged.
+                    .drag_over::<SipilDrag>({
+                        let key = key.clone();
+                        move |style, drag, _, _| {
+                            if drag.key == key {
+                                style
+                            } else {
+                                style.bg(theme.panel)
+                            }
+                        }
+                    })
+                    .on_drop(cx.listener(move |this, drag: &SipilDrag, _, cx| {
+                        this.reorder_sipil(&drag.key, &key, cx);
+                    }))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if window {
+                    this.show_sipil(cx);
+                } else {
+                    this.open_sipil_chat(open.clone(), cx);
+                }
+            }))
+    }
+
+    /// Where the SIPIL row `key` stands: its place in the order the person
+    /// dragged the rows into, with the rows not placed yet after those.
+    fn sipil_rank(&self, key: &str) -> usize {
+        self.settings
+            .sipil_order
+            .iter()
+            .position(|placed| placed == key)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// The SIPIL rows as they are listed now, each once.
+    fn sipil_keys(&self) -> Vec<String> {
+        let me = &self.sipil.me;
+        let mut keys: Vec<String> = self
+            .sipil
+            .daemons
+            .iter()
+            .map(|daemon| format!("daemon:{}", daemon.id))
+            .chain(me.channels.iter().map(|row| format!("channel:{}", row.channel.id)))
+            .chain(me.people.iter().map(|person| format!("person:{}", person.contact.id)))
+            .collect();
+        keys.sort_by_key(|key| self.sipil_rank(key));
+        keys
+    }
+
+    /// Drop the SIPIL row `from` into the slot of `to`, and keep the order.
+    fn reorder_sipil(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
+        if from == to {
+            return;
+        }
+        let shown = self.sipil_keys();
+        self.settings.move_sipil_row(&shown, from, to);
+        self.save_settings();
+        cx.notify();
     }
 
     /// Toggle the Home composer, bound to the Cmd+Shift+N chord.
@@ -15802,6 +16404,31 @@ impl Render for TabDrag {
             .h(px(TAB_HEIGHT))
             .px_3()
             .radius_soft()
+            .bg(self.theme.panel)
+            .text_color(self.theme.panel_fg)
+            .text_size(px(self.font_size))
+            .child(self.label.clone())
+    }
+}
+
+/// A SIPIL sidebar row being dragged to a new place.
+#[derive(Clone)]
+struct SipilDrag {
+    key: String,
+    label: String,
+    theme: Theme,
+    font_size: f32,
+}
+
+/// What GPUI draws at the pointer for a row drag: the selected row's pill.
+impl Render for SipilDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .px_3()
+            .radius_md()
             .bg(self.theme.panel)
             .text_color(self.theme.panel_fg)
             .text_size(px(self.font_size))

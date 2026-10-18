@@ -105,35 +105,35 @@ impl AboutView {
 /// buffers are BGRA, so the channels are swapped after rasterizing.
 pub(super) fn app_icon() -> Option<Arc<RenderImage>> {
     static ICON: OnceLock<Option<Arc<RenderImage>>> = OnceLock::new();
-    ICON.get_or_init(|| {
-        let tree = resvg::usvg::Tree::from_data(
-            include_bytes!("../../assets/pilus.svg"),
-            &resvg::usvg::Options::default(),
-        )
-        .ok()?;
-        let extent = tree.size();
-        // Well above the largest paint size (64px About, 52px Home) so both
-        // downscale from one crisp buffer.
-        let scale = 256.0 / extent.width().max(extent.height());
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(256, 256)?;
-        resvg::render(
-            &tree,
-            resvg::tiny_skia::Transform::from_scale(scale, scale),
-            &mut pixmap.as_mut(),
-        );
-        // A fully transparent raster paints as an empty box, so fall back
-        // to the wordmark instead.
-        if pixmap.pixels().iter().all(|pixel| pixel.alpha() == 0) {
-            return None;
-        }
-        let mut buffer =
-            image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())?;
-        for pixel in buffer.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-        }
-        Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
-    })
-    .clone()
+    // Well above the largest paint size (64px About, 52px Home) so both
+    // downscale from one crisp buffer.
+    ICON.get_or_init(|| rasterize(include_bytes!("../../assets/pilus.svg"), 256))
+        .clone()
+}
+
+/// `svg` drawn into a square image of `extent` pixels, or nothing when it is
+/// not an SVG or draws nothing. A sipil's logo comes from the network, so it
+/// is only ever parsed and drawn here, never fetched from or run.
+pub(super) fn rasterize(svg: &[u8], extent: u32) -> Option<Arc<RenderImage>> {
+    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let scale = extent as f32 / size.width().max(size.height());
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(extent, extent)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    // A fully transparent raster paints as an empty box, so there is none.
+    if pixmap.pixels().iter().all(|pixel| pixel.alpha() == 0) {
+        return None;
+    }
+    let mut buffer = image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())?;
+    // GPUI's image buffers are BGRA.
+    for pixel in buffer.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
 }
 
 impl Render for AboutView {
@@ -261,5 +261,19 @@ mod tests {
         let size = icon.size(0);
         assert!(size.width.0 > 0);
         assert_eq!(size.width.0, size.height.0);
+    }
+
+    #[test]
+    fn a_logo_is_drawn_only_when_it_is_an_svg_that_draws_something() {
+        let ok = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#f00"/></svg>"##;
+        let drawn = rasterize(ok.as_bytes(), 32).expect("a drawn logo");
+        assert_eq!(drawn.size(0).width.0, 32);
+        assert!(rasterize(b"not an svg", 32).is_none());
+        assert!(rasterize(b"\x89PNG", 32).is_none());
+        let empty = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"/>"#;
+        assert!(
+            rasterize(empty.as_bytes(), 32).is_none(),
+            "nothing drawn is no logo"
+        );
     }
 }

@@ -50,6 +50,197 @@ with only the command-line tools can build the app.
   all. The `visual-test` captures fill the feed with samples so a shot never
   reaches GitHub.
 
+- Every sipil, whether the durable agent daemon (the `../sipil` project, a Node
+  service over pi-durable) or a pilus window, is a node on one protocol over
+  iroh: ALPN `pilus/sipil/1`, one JSON call per QUIC stream (`{"method","params"}`
+  in, `{"result"}` or `{"error":{"code","message"}}` out; see
+  `pilus_client::sipil::wire`). It is not the Luvus protocol, so
+  `pilus-protocol` is not involved, and there is no HTTP: sipil binds no port.
+  A node is addressed by its **device ID** (the iroh `EndpointId`, 64 hex
+  characters) or a ticket, and the caller's identity is whatever the handshake
+  proved, never a field in the frame. `wire::API_VERSION` is 3 (1 was the HTTP
+  API); the daemon's `src/rpc.ts` and `wire.rs` are two ends of one contract, so
+  change them together and extend `crates/pilus-client/tests/sipil.rs`, whose
+  last test drives the real daemon when `../sipil` has its `node_modules`.
+  `health` answers anyone and says what kind of node it is (`daemon` or `pilus`)
+  and whether the asker is allowed; every other method needs an allow-list entry
+  (a daemon's allow-list, filled by `npm run connect` once a pilus accepts or by
+  `npm run allow`; a contact on a pilus). An
+  allowed device on a daemon can run its agents' shell tools, so treat the list
+  like SSH keys. `pilus_client::sipil::Node` owns one iroh endpoint and a small
+  tokio runtime behind blocking calls; the GUI thread never touches it.
+  `Node::ticket` also lists loopback, so a node on the same machine is reached
+  directly. The identity key is `~/.pilus/sipil/identity.key`; losing it changes
+  the device ID everywhere it was added.
+- A pilus is a sipil by `peer::Local`: the node, the contacts
+  (`contacts.json`), the conversations (`chats.jsonl`, an append-only log of
+  JSON records replayed at launch; both under `~/.pilus/sipil`) and the `PeerService` that answers inbound calls. It answers
+  `health` and `chat.send` only; a stranger's `chat.send` is refused unread and
+  remembered as a *request* the person can accept, and a message is stored on the
+  sender's side only once the receiver's pilus has taken it, so a refusal leaves
+  the composer to retry. Adding a contact is mutual by hand (each side adds the
+  other). `Settings::sipil_online` (default off) makes this pilus reachable and
+  starts the node at launch; with it off the node still starts for a user action
+  (connect, add a contact, send) but answers nobody. Contacts and threads are
+  read from disk, so the sidebar's one SIPIL section lists them (user icon,
+  with an unread count and an online dot) beside the daemon's agents (robot icon)
+  with the network down. Messages arrive as `Event`s that `gui/sipil.rs::take_events` hands to the
+  main window as toasts and, while it is not in front, system notifications;
+  nothing is delivered while the window is closed (the node lives in the window,
+  not in `pilus-agent`).
+- A person can run several daemons (`SIPIL_NAME` names each one's primary agent:
+  a Researcher, a CoS) and this window connects to all of them
+  (`Settings::sipil_daemons`, the old single `sipil`/`sipil_address` read in once
+  by `sipil_daemon_list`). A daemon's agent is not shared with a contact: no call
+  hands anyone a session of it, `PeerService` answers `agent.*` with
+  `unknown_method`, and `health` lists no agents. It takes part only in a channel
+  its person invited it into (see Mentions). Contacts are renamed in the Sipil tab
+  (`Directory::rename`); the name is the user's, never the peer's.
+- Channels (`channels.json`, `pilus_client::sipil::Channels`) are named rooms of
+  contacts with no server: the author's pilus fans `chan.send` out to every member
+  that is a contact (in parallel, so one absent member holds nobody up), each
+  member keeps its own copy under the thread `#<id>`, and a pilus learns a channel
+  from the first message that names it. Only contacts are written to or listened
+  to; a message from a stranger, or for a channel this pilus left, is dropped
+  (`Learned::Left`). A message some members missed says who; there is no
+  store-and-forward. A channel has an owner, the device that made it
+  (`Channel::owner`, carried in every `chan.send`); only the owner can invite a
+  contact (`Local::invite_to_channel`) or remove a member (`remove_from_channel`,
+  both refused with `not_owner` otherwise). Each is a line to the members that
+  carries `added` or `removed` device IDs beside the usual list. A pilus that has
+  the channel believes only the owner's lists and changes, and refuses a message
+  from someone who is not in its list (`not_member`), so a member taken out can
+  neither read nor speak: it is told and forgets the channel, and one that was
+  away finds out when every member refuses its next message. A removal is kept
+  per channel (`Channels::remove_members`, `removed` in `channels.json`) so an
+  older list does not bring the person back; only an `added` does. The info
+  button on a channel's page opens `channel_panel`: members with their device IDs
+  and who owns it; the owner also sees Remove (two clicks), who can be invited,
+  and anyone can leave. The page closes itself when the channel is gone.
+- Mentioning an agent (`@Researcher`, matched case-insensitively against the
+  connected daemons' agent names by `mention::mentioned`) in a channel sends the
+  line as usual and hands the conversation to that agent
+  (`mention::answer`): its daemon gets the lines it has not seen, with who said
+  each, in one session per conversation (the cursor lives in the chat store), and
+  its reply is said back under its name (`as`), to everyone. An agent answers
+  only in a channel its person invited it into, on the channel panel's "Your
+  agents" list (`Channels::set_agent`, kept in `channels.json` on that device
+  only and never sent; the invite asks once because every member can then run a
+  model with file and shell tools on that machine with its API keys, and joining
+  or leaving is said to the channel as the agent). Naming an agent that was not
+  invited does nothing, for the person and for every member alike. For a line a
+  member sends, `PeerService::invite_agents` turns the mention into
+  `Event::Mentioned`, which `gui/sipil_social.rs::push_event` answers on the
+  spot; for the person's own line `bring_in_agents` does the same. A line an agent
+  said (`as`) never starts one of this pilus's agents, whatever it says. A direct
+  chat between two people is never handed to an agent: no agent reads it or
+  speaks in it, and naming one there does nothing, from either side
+  (`bring_in_agents`, `answer_invited` and `answer_mention` all refuse a
+  `Conversation::Direct`). Leaving a channel forgets its invitations.
+- A daemon being away does not close its agent. `pilus_client::sipil::Offline`
+  (`offline.json`, same directory) keeps each daemon's primary agent, the newest
+  200 lines of the 8 conversations last looked at, and an outbox. `sipil::begin`
+  seeds the `Daemon` from it, so the sidebar row (muted dot instead of green)
+  opens the chat before, and without, a connection; `sipil::watch` shows the
+  snapshot until the daemon's own lines replace it (`history::newest` merges
+  them). `sipil::send` to a daemon that is not `connected()` queues the message
+  (`hold`, written to disk at once, shown under the log as "waiting" with
+  Discard) and `deliver_queued` hands the outbox over in order after the next
+  successful connect, under the request id it was queued with so a cut-off
+  delivery is not said twice. A device the daemon has not allowed keeps the
+  queue; any other refusal drops that message and says so. Snapshot writes are
+  throttled and flushed by the poller; the outbox is not. `remove_daemon` forgets
+  all of it. A daemon that is away is never shown as working.
+- The SIPIL rows (daemons, channels, people; not knocks, which stay first) are
+  dragged into order and kept in `Settings::sipil_order` by key (`daemon:<id>`,
+  `channel:<id>`, `person:<id>`); rows not named there follow in the default
+  order (`move_sipil_row`, `sipil_rank`).
+- `gui/sipil.rs` owns the one shared `SipilState` and its poller; the sidebar's
+  SIPIL section draws its primary agents from the daemons' half of that snapshot
+  (a subagent has no row: it is listed in the subthread panel of the conversation
+  that handed it work), and its people and channels from `SipilState::me`. There
+  is no sessions list: a daemon is talked to through its agents. `gui/sipil_social.rs` holds the people half (contacts,
+  channels, mentions, presence); `gui/sipil.rs` holds the daemons and the poller. A first
+  connect that fails stops and reports; a launch or a dropped connection keeps
+  retrying quietly. A daemon is never typed in here: `sipil connect` on its
+  machine sends `pair.request`, which `PeerService` records as a `Request` with
+  `daemon: true`; accepting it (`Directory::accept`) makes a `Contact` with
+  `daemon: true`, and `sipil::ensure` dials the daemon contacts at launch. A
+  daemon contact is never a person (`Directory::contacts`, `contact` and
+  `is_contact` skip it), so nothing that admits a person admits it. Provider keys and the model belong to the daemon: it reads
+  them from its own environment (`OPENCODE_API_KEY`, `SIPIL_MODEL`), and the
+  protocol has no call to read, set or choose either, so pilus has no key form
+  and no model picker. The chat page only shows the model a conversation runs on.
+  Opening the window creates the identity key, nothing else. The `visual-test` captures use `sipil::preview` and never
+  dial or write the identity.
+  Clicking an agent, session or contact opens `gui/sipil_chat.rs`, a page in the
+  terminal's card with its own `InputLayer::Sipil`, laid out like an IRC client:
+  a topic bar, a log of `HH:MM <nick> text` lines in the terminal font (tool
+  calls as `*`, tool output as `-`, a failed turn as `!!`, nicks colored from the
+  theme's ANSI hues by name), and a flat input
+  line with no Send button. It is deliberately not a `style::field`. A line is
+  `nick: text`, with no brackets, and its text is Markdown when it reads as
+  Markdown (`looks_like_markdown`), drawn by `gui/markdown.rs` in the terminal
+  font and parsed once per text. A message that arrives while the window is not in
+  front also posts a system notification (`notify::post`, target `("sipil",
+  thread)`) whose click opens that conversation. It owns no conversation
+  data: `sipil::watch` names the open conversation and the poller reads a
+  daemon's transcript every second (sipil has no push channel yet) or a
+  contact's thread from the chat store, and a send goes through `sipil::send`,
+  A tool call is a folding line (`call_block`): closed it shows the tool and its
+  summary, open the arguments and the result, which is drawn under its call by
+  `call_id` and has no line of its own while that call is in view. A `subagent`
+  call reads "<agent> talking with <researcher> about “<task>”" and that sentence
+  opens the child's page (`step_into_sipil`, with a way back: the header's back
+  button and Escape), by `Watch::On` on the daemon it ran on; a daemon not
+  connected, or a contact's agent (the relay strips the conversation id), leaves
+  it plain text. The daemon's `transcript` answers `conversation` too, which
+  names a subagent of a session that neither list carries (`SipilState::watched`).
+  In a channel or chat, `mention::answer` notes each hand-off as a `Line` with a
+  `Delegation` as it happens; that note is kept on the owner's pilus only and is
+  never sent, since nobody else could open it. A line can be replied to (the
+  hover button): the `Quote` (who, and the start of the text) travels as `reply`
+  in `chat.send` and `chan.send` and is stored with the line on both sides; to a
+  daemon or a contact's agent, which have no field for one, it goes as a Markdown
+  quote in front of the message. The log is a virtualized gpui `list` held in
+  `SipilChat`, flush to the sidebar (`flush_page_card`, no inset card), so a long
+  conversation costs what a short one does: `SipilChat::sync` runs when the state
+  snapshot changes and re-measures only the rows from the first one whose
+  `signature` changed, and the list follows the end (`FollowMode::Tail`) until the
+  reader scrolls up. A reply (the hover button on a line) is a thread: `group_threads` finds the line a
+  reply quotes (by its text, nearest before; with a daemon the quote is the Markdown
+  prefix `reply_of` reads back, and the agent's answers follow into the thread), the
+  replies leave the log, and the line shows "N replies" that opens `thread_panel`
+  beside it, where a message sent is one more reply. A reply whose line is out of
+  view stays in the log. Every line highlights on hover. A daemon describes itself with
+  the `about` call (`pilus_client::sipil::About`: name, host, workspace, model, the
+  agents with their instructions and tools, and a logo as SVG), asked once per
+  connect and kept on `Daemon::about`; an older daemon answers `unknown_method`
+  and is not asked again. The header's info button opens `about_panel`; the logo
+  (`Daemon::own_logo`: the advertised SVG drawn by `about::rasterize`; without
+  one `daemon_mark` draws the pilus mark in the icon colour, with nothing behind
+  it) is in the header, the About panel and
+  the daemon's sidebar row. The sidebar's SIPIL section is always
+  there. There is no separate sipil window: the way in is the outlined pilus mark at the
+  head of the right toolbar pill, before Browser (`right_sipil_toggle`), which
+  opens the right sidebar's Sipil tab (`SidebarTab::Sipil`, the `SipilPanel` in
+  `sipil_panel.rs`, made on first open so no identity key is written before
+  then; it takes the keyboard as `InputLayer::SipilPanel` while the column has
+  focus). There is no separate "sipil" row. Each daemon has its own row, which is where its status
+  is: one that is up shows its primary agent with a green dot at the right, like
+  a contact who is there; one that is not stays listed with its logo and a grey offline dot (a
+  spinner while connecting), the reason as the tooltip, and a click opens the
+  Sipil tab. A daemon's logo is drawn larger than a glyph (`SIDEBAR_LOGO`). The info button
+  also opens `contact_panel` on a contact's page (name with rename, device ID,
+  channels in common, remove); while the name is
+  edited `SipilChat::active_input` gives the keyboard to the rename field. A header button
+  (`subthreads_toggle`, with the count) opens `subthread_panel`
+  beside the log, listing every `subagent` call of the open conversation, each
+  opening that child's page. The composer has
+  no status bar or `[nick]` prefix. The composer is cleared only when
+  `SipilState::sent` grows, so a refused message stays to retry. A contact's page has no Stop. Never show an error as an empty line: a failed
+  turn arrives as `error` on the agent, the session and the transcript line.
+
 - Notes on excerpts of markdown files (`gui/md_notes.rs`) are the app's own,
   kept per machine and file in `md-notes.json` beside the settings. They are not
   the daemon's review notes: those are anchored to a Git layer, which an unchanged

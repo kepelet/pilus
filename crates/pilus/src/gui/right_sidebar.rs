@@ -46,9 +46,12 @@ pub(super) enum SidebarTab {
     Files,
     Ports,
     Browser,
+    Sipil,
 }
 
 impl SidebarTab {
+    /// The tabs a saved choice can name. Sipil is left out: its panel is made
+    /// when it is first opened, so a launch never starts on it.
     pub(super) const ALL: [SidebarTab; 5] = [
         SidebarTab::Diff,
         SidebarTab::Git,
@@ -57,7 +60,7 @@ impl SidebarTab {
         SidebarTab::Browser,
     ];
 
-    /// The tabs the strip draws. Ports and Browser are opened by their own
+    /// The tabs the strip draws. Sipil, Ports and Browser are opened by their own
     /// buttons, in the window's header while the column is closed and in the
     /// strip once open.
     pub(super) const STRIP: [SidebarTab; 3] =
@@ -70,6 +73,7 @@ impl SidebarTab {
             Self::Files => "files",
             Self::Ports => "ports",
             Self::Browser => "browser",
+            Self::Sipil => "sipil",
         }
     }
 
@@ -88,13 +92,15 @@ impl SidebarTab {
             Self::Files => "Files",
             Self::Ports => "Ports",
             Self::Browser => "Browser",
+            Self::Sipil => "Sipil",
         }
     }
 
-    /// Whether the tab reads the keyboard. Only the Diff has shortcuts, so
-    /// the keys of a column showing Git or Files stay with the terminal.
+    /// Whether the tab reads the keyboard. Only the Diff has shortcuts and
+    /// Sipil has fields, so the keys of a column showing Git or Files stay with
+    /// the terminal.
     fn takes_keys(self) -> bool {
-        self == Self::Diff
+        matches!(self, Self::Diff | Self::Sipil)
     }
 
     /// Whether the tab reads a git repo, so a plain folder has nothing for it.
@@ -428,6 +434,61 @@ impl PilusView {
         self.select_right_tab(SidebarTab::Ports, cx);
     }
 
+    /// The pilus mark: open the column on Sipil, or close it when Sipil is
+    /// already showing. The panel is made on the first open, so a person who
+    /// never opens sipil never gets an identity key.
+    pub(super) fn toggle_sipil(&mut self, cx: &mut Context<Self>) {
+        if self.right.visible && self.right.tab == SidebarTab::Sipil {
+            self.toggle_right_sidebar(cx);
+            return;
+        }
+        self.show_sipil(cx);
+    }
+
+    /// Open the column on Sipil and leave it there if it already is.
+    pub(super) fn show_sipil(&mut self, cx: &mut Context<Self>) {
+        if self.sipil_panel.is_none() {
+            let panel = cx.new(|cx| {
+                super::sipil_panel::SipilPanel::new(
+                    self.shared_theme.clone(),
+                    self.shared_settings.clone(),
+                    cx,
+                )
+            });
+            cx.subscribe(
+                &panel,
+                |this, _, event: &super::sipil_panel::PanelEvent, cx| match event {
+                    super::sipil_panel::PanelEvent::Leave => {
+                        this.right.focused = false;
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
+            self.sipil_panel = Some(panel);
+        }
+        if !self.right.visible {
+            self.toggle_right_sidebar(cx);
+        }
+        self.select_right_tab(SidebarTab::Sipil, cx);
+    }
+
+    /// Whether the Sipil panel holds the keyboard.
+    pub(super) fn sipil_panel_focused(&self) -> bool {
+        self.sipil_panel.is_some()
+            && self.right.visible
+            && self.right.tab == SidebarTab::Sipil
+            && self.right.focused
+    }
+
+    /// The Sipil tab's page: the panel, once it has been opened.
+    fn sipil_page(&self) -> Div {
+        div()
+            .size_full()
+            .min_h(px(0.0))
+            .children(self.sipil_panel.clone())
+    }
+
     /// The Browser button: open the column on the Browser, or close it when
     /// the Browser is already showing. A browser with no page yet opens with
     /// the address bar ready to type in.
@@ -498,7 +559,7 @@ impl PilusView {
                 Some(_) => {}
                 None => self.files_panel.close_doc(),
             },
-            SidebarTab::Git | SidebarTab::Ports | SidebarTab::Browser => {}
+            SidebarTab::Git | SidebarTab::Ports | SidebarTab::Browser | SidebarTab::Sipil => {}
         }
         if changed_tab {
             self.remember_right_tab();
@@ -561,7 +622,7 @@ impl PilusView {
             SidebarTab::Git => self.git_panel.mark_stale(),
             SidebarTab::Files => self.files_panel.mark_stale(),
             SidebarTab::Ports => self.ports_panel.mark_stale(),
-            SidebarTab::Browser => {}
+            SidebarTab::Browser | SidebarTab::Sipil => {}
         }
     }
 
@@ -642,6 +703,48 @@ impl PilusView {
         }
     }
 
+    /// The way into the Sipil tab, drawn as the pilus mark in outline. It leads the pill,
+    /// before the Browser, and lights while the tab is open. Whether a sipil is
+    /// up is on its own sidebar row.
+    pub(super) fn right_sipil_toggle(
+        &self,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = self.theme;
+        div()
+            .id(id)
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .h(px(super::PILL_BUTTON_H))
+            .w(px(super::PILL_BUTTON_W))
+            .radius_sm()
+            .cursor_pointer()
+            .hover_fill(
+                theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT),
+                style::RADIUS_SM,
+            )
+            .tooltip(super::row_tooltip(
+                "Sipil".to_string(),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
+            .child(icon(
+                include_bytes!("../../assets/icons/pilus-mark-outline.svg"),
+                14.0,
+                if self.right.visible && self.right.tab == SidebarTab::Sipil {
+                    theme.panel_fg
+                } else {
+                    theme.muted
+                },
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_sipil(cx)))
+    }
+
     /// The Ports button beside the sidebar toggle, lit while Ports is open.
     pub(super) fn right_ports_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
@@ -700,13 +803,14 @@ impl PilusView {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx)))
     }
 
-    /// Browser, Ports, and the sidebar toggle as one bordered pill at the strip's
+    /// Sipil, Browser, Ports, and the sidebar toggle as one bordered pill at the strip's
     /// far edge, each button raising its own fill on hover.
     pub(super) fn right_toolbar(&self, cx: &mut Context<Self>) -> Div {
         style::pill(self.theme, None)
             .occlude()
             .p(px(super::PILL_PAD))
             .flex_shrink_0()
+            .child(self.right_sipil_toggle("pilus-right-sipil-toggle", cx))
             .child(self.right_browser_toggle(cx))
             .child(self.right_ports_toggle(cx))
             .child(self.right_sidebar_toggle(cx))
@@ -810,6 +914,7 @@ impl PilusView {
                 style::pill(theme, None)
                     .p(px(super::PILL_PAD))
                     .flex_shrink_0()
+                    .child(self.right_sipil_toggle("pilus-right-sidebar-sipil", cx))
                     .child(self.strip_browser_toggle(cx))
                     .child(
                         div()
@@ -886,10 +991,15 @@ impl PilusView {
                 SidebarTab::Files => self.files_page(self.right.shown_width(), cx),
                 SidebarTab::Ports => self.ports_page(cx),
                 SidebarTab::Browser => self.browser_page(cx),
+                SidebarTab::Sipil => self.sipil_page(),
             });
         let footer = match shown {
             SidebarTab::Diff => self.diff_footer(cx),
-            SidebarTab::Git | SidebarTab::Files | SidebarTab::Ports | SidebarTab::Browser => None,
+            SidebarTab::Git
+            | SidebarTab::Files
+            | SidebarTab::Ports
+            | SidebarTab::Browser
+            | SidebarTab::Sipil => None,
         };
 
         let handle = div()

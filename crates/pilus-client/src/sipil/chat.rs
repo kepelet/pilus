@@ -1,0 +1,715 @@
+//! The conversations with contacts and in channels, kept on this machine.
+//!
+//! Each side keeps its own copy: a message is stored here when this pilus sends
+//! it and the peer acknowledged it, and when a contact's arrives. There is no
+//! server to hold one for an absent peer, so a send to a pilus that is not
+//! running fails and stays in the composer to retry.
+//!
+//! They live in `chats.jsonl`, one JSON record per line, appended as things
+//! happen (a line said, a thread read, an agent's cursor moved, a thread
+//! forgotten) and replayed when the store opens. A send costs one small append
+//! instead of rewriting every thread, and a torn last record after a crash costs
+//! that record, not the file. Once the log holds well over twice what the threads
+//! still need it is rewritten from memory, which is also how a thread's 500-line
+//! limit reaches the disk.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde::{Deserialize, Serialize};
+
+use super::store;
+use super::{Quote, Subagent};
+
+/// The most lines a thread keeps; older ones are dropped as new ones arrive.
+const THREAD_LIMIT: usize = 500;
+/// How many request ids a thread remembers to recognise a retried delivery.
+const SEEN_LIMIT: usize = 64;
+/// How many records beyond twice the live ones the log may hold before it is
+/// compacted, so a small store is not rewritten on every few lines.
+const COMPACT_SLACK: usize = 256;
+/// The longest message taken from a peer, in bytes.
+pub const MESSAGE_LIMIT: usize = 16 * 1024;
+
+/// One line of a conversation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Line {
+    /// Grows with each line in the thread, so a new line has a larger one.
+    pub id: u64,
+    /// Whether this pilus said it.
+    pub mine: bool,
+    /// What was said.
+    pub text: String,
+    /// Unix seconds.
+    pub at: u64,
+    /// For a line in a channel that is not this pilus's own: the device that
+    /// said it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub who: Option<String>,
+    /// The name of the sipil agent that said it, when an agent did, whether it
+    /// is this pilus's own or a contact's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The line this one answers, quoted by whoever answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<Quote>,
+    /// For a note that one of this pilus's agents handed work to another: where
+    /// that conversation is. Kept here only. It is not said to anyone else,
+    /// since no one else could open it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<Delegation>,
+}
+
+/// An agent of this pilus handing work to a subagent while it answers in a
+/// conversation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Delegation {
+    /// The tool call, which keeps one call from being noted twice.
+    pub call: String,
+    /// The daemon the subagent runs on.
+    pub daemon: String,
+    /// The subagent's conversation, to open.
+    pub conversation: String,
+    /// Who was asked: `researcher`, or `subagent`.
+    pub agent: String,
+    /// What it was asked.
+    pub task: String,
+}
+
+impl Delegation {
+    /// The note as plain text, for anything that cannot draw it as a link.
+    pub fn text(&self) -> String {
+        format!("talking with {} about “{}”", self.agent, self.task)
+    }
+
+    /// This as the subagent a transcript line carries.
+    pub fn subagent(&self) -> Subagent {
+        Subagent {
+            conversation: Some(self.conversation.clone()),
+            daemon: Some(self.daemon.clone()),
+            agent: self.agent.clone(),
+            task: self.task.clone(),
+        }
+    }
+}
+
+/// How far a sipil agent has read a conversation, and the daemon session it
+/// answers in.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Cursor {
+    /// The daemon session this conversation uses for that agent.
+    pub session: String,
+    /// The newest line the agent has been shown.
+    pub through: u64,
+}
+
+#[derive(Default)]
+struct Thread {
+    /// The id of the newest line ever added, which the next one follows.
+    next: u64,
+    /// Lines with an id up to this have been read here.
+    read_through: u64,
+    lines: Vec<Line>,
+    /// The request id each peer line was taken under, as `(line id, request id)`,
+    /// newest last.
+    requests: Vec<(u64, String)>,
+    /// Each of this pilus's sipil agents (by daemon ID) that has been mentioned
+    /// here.
+    agents: BTreeMap<String, Cursor>,
+}
+
+impl Thread {
+    fn unread(&self) -> u64 {
+        self.lines
+            .iter()
+            .filter(|line| !line.mine && line.id > self.read_through)
+            .count() as u64
+    }
+
+    fn apply(&mut self, entry: Entry) {
+        match entry {
+            Entry::Line { line, request } => {
+                self.next = self.next.max(line.id);
+                if let Some(request) = request {
+                    self.requests.push((line.id, request));
+                    let excess = self.requests.len().saturating_sub(SEEN_LIMIT);
+                    self.requests.drain(..excess);
+                }
+                self.lines.push(line);
+                let excess = self.lines.len().saturating_sub(THREAD_LIMIT);
+                self.lines.drain(..excess);
+            }
+            Entry::Read { through } => self.read_through = self.read_through.max(through),
+            Entry::Cursor {
+                daemon,
+                session,
+                through,
+            } => {
+                self.agents.insert(daemon, Cursor { session, through });
+            }
+            // A forgotten thread is removed whole by `State::apply`.
+            Entry::Forget => {}
+        }
+    }
+}
+
+/// One line of `chats.jsonl`.
+#[derive(Deserialize, Serialize)]
+struct Record {
+    /// The peer's device ID, or `#<id>` for a channel.
+    thread: String,
+    #[serde(flatten)]
+    entry: Entry,
+}
+
+// Each entry lives only long enough to be applied and written, so a boxed line
+// would cost an allocation to save nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum Entry {
+    /// A line was said. `request` is the id the peer sent it under.
+    Line {
+        line: Line,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<String>,
+    },
+    /// Every line up to `through` was read.
+    Read { through: u64 },
+    /// An agent of ours has been shown the thread up to `through`.
+    Cursor {
+        daemon: String,
+        session: String,
+        through: u64,
+    },
+    /// The thread is gone.
+    Forget,
+}
+
+#[derive(Default)]
+struct State {
+    threads: BTreeMap<String, Thread>,
+    /// Records in the log, live or not.
+    records: usize,
+}
+
+impl State {
+    fn apply(&mut self, record: Record) {
+        match record.entry {
+            Entry::Forget => {
+                self.threads.remove(&record.thread);
+            }
+            entry => self.threads.entry(record.thread).or_default().apply(entry),
+        }
+    }
+
+    /// Replay the log at `path`. A record that does not parse is skipped, so one
+    /// damaged line never takes the rest with it.
+    fn load(path: &Path) -> Self {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let mut state = Self::default();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(record) = serde_json::from_slice::<Record>(line) {
+                state.apply(record);
+            }
+            state.records += 1;
+        }
+        // A crash can leave the last record without its newline, which the next
+        // append would otherwise glue itself onto.
+        if bytes.last().is_some_and(|byte| *byte != b'\n') {
+            let _ = store::append_private(path, b"\n");
+        }
+        state
+    }
+
+    /// What the threads need from the log: the smallest set of records that
+    /// replays to the same state.
+    fn snapshot(&self) -> Vec<Record> {
+        let mut out = Vec::new();
+        for (name, thread) in &self.threads {
+            let record = |entry| Record {
+                thread: name.clone(),
+                entry,
+            };
+            for (daemon, cursor) in &thread.agents {
+                out.push(record(Entry::Cursor {
+                    daemon: daemon.clone(),
+                    session: cursor.session.clone(),
+                    through: cursor.through,
+                }));
+            }
+            for line in &thread.lines {
+                let request = thread
+                    .requests
+                    .iter()
+                    .find(|(id, _)| *id == line.id)
+                    .map(|(_, request)| request.clone());
+                out.push(record(Entry::Line {
+                    line: line.clone(),
+                    request,
+                }));
+            }
+            if thread.read_through > 0 {
+                out.push(record(Entry::Read {
+                    through: thread.read_through,
+                }));
+            }
+        }
+        out
+    }
+
+    fn live(&self) -> usize {
+        self.threads
+            .values()
+            .map(|thread| thread.lines.len() + thread.agents.len() + 1)
+            .sum()
+    }
+}
+
+/// Every conversation, keyed by the peer's device ID (`#<id>` for a channel).
+pub struct Chats {
+    path: PathBuf,
+    inner: Mutex<State>,
+    version: AtomicU64,
+}
+
+impl Chats {
+    /// Open the store under `dir` (`chats.jsonl`).
+    pub fn open(dir: &Path) -> Self {
+        let path = dir.join("chats.jsonl");
+        Self {
+            inner: Mutex::new(State::load(&path)),
+            path,
+            version: AtomicU64::new(0),
+        }
+    }
+
+    /// Counts every change, so a window can repaint only when it moved.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
+    }
+
+    /// The newest lines of the thread with `peer`, oldest first.
+    pub fn lines(&self, peer: &str) -> Vec<Line> {
+        self.lock()
+            .threads
+            .get(peer)
+            .map(|thread| thread.lines.clone())
+            .unwrap_or_default()
+    }
+
+    /// How many of `peer`'s lines have not been read here yet.
+    pub fn unread(&self, peer: &str) -> u64 {
+        self.lock().threads.get(peer).map_or(0, Thread::unread)
+    }
+
+    /// Unread lines across all threads.
+    pub fn unread_total(&self) -> u64 {
+        self.lock().threads.values().map(Thread::unread).sum()
+    }
+
+    /// The last line of each thread, for ordering and previews.
+    pub fn last(&self, peer: &str) -> Option<Line> {
+        self.lock()
+            .threads
+            .get(peer)
+            .and_then(|thread| thread.lines.last().cloned())
+    }
+
+    /// Mark everything from `peer` as read.
+    pub fn mark_read(&self, peer: &str) {
+        let mut state = self.lock();
+        let through = state
+            .threads
+            .get(peer)
+            .filter(|thread| thread.unread() > 0)
+            .map(|thread| thread.next);
+        if let Some(through) = through {
+            self.commit(&mut state, peer, Entry::Read { through });
+        }
+    }
+
+    /// Record a line this pilus sent, or that one of its agents did.
+    pub fn push_mine(&self, thread: &str, text: &str, agent: Option<&str>) {
+        self.push_mine_replying(thread, text, agent, None);
+    }
+
+    /// [`Chats::push_mine`] for a line that answers another.
+    pub fn push_mine_replying(
+        &self,
+        thread: &str,
+        text: &str,
+        agent: Option<&str>,
+        reply: Option<&Quote>,
+    ) {
+        self.push(thread, text, true, None, None, agent, reply, None);
+    }
+
+    /// Note that `agent`, one of ours, has handed work to a subagent while it
+    /// answers in `thread`. Once per call: noting it again changes nothing.
+    pub fn push_delegation(&self, thread: &str, agent: &str, delegation: Delegation) {
+        {
+            let state = self.lock();
+            let noted = state.threads.get(thread).is_some_and(|thread| {
+                thread.lines.iter().any(|line| {
+                    line.delegation
+                        .as_ref()
+                        .is_some_and(|d| d.call == delegation.call)
+                })
+            });
+            if noted {
+                return;
+            }
+        }
+        let text = delegation.text();
+        self.push(
+            thread,
+            &text,
+            true,
+            None,
+            None,
+            Some(agent),
+            None,
+            Some(delegation),
+        );
+    }
+
+    /// Record a line from someone else. In a channel `who` is the device that
+    /// said it. Returns false when `request_id` was already taken, which is a
+    /// retried delivery rather than a second message.
+    pub fn push_theirs(
+        &self,
+        thread: &str,
+        text: &str,
+        request_id: &str,
+        who: Option<&str>,
+        agent: Option<&str>,
+    ) -> bool {
+        self.push_theirs_replying(thread, text, request_id, who, agent, None)
+    }
+
+    /// [`Chats::push_theirs`] for a line that answers another.
+    pub fn push_theirs_replying(
+        &self,
+        thread: &str,
+        text: &str,
+        request_id: &str,
+        who: Option<&str>,
+        agent: Option<&str>,
+        reply: Option<&Quote>,
+    ) -> bool {
+        self.push(
+            thread,
+            text,
+            false,
+            Some(request_id),
+            who,
+            agent,
+            reply,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &self,
+        thread: &str,
+        text: &str,
+        mine: bool,
+        request_id: Option<&str>,
+        who: Option<&str>,
+        agent: Option<&str>,
+        reply: Option<&Quote>,
+        delegation: Option<Delegation>,
+    ) -> bool {
+        let mut state = self.lock();
+        let current = state.threads.get(thread);
+        let request = request_id.filter(|id| !id.is_empty());
+        if let Some(request) = request
+            && current.is_some_and(|thread| thread.requests.iter().any(|(_, seen)| seen == request))
+        {
+            return false;
+        }
+        let id = current.map_or(0, |thread| thread.next) + 1;
+        let entry = Entry::Line {
+            line: Line {
+                id,
+                mine,
+                text: text.to_string(),
+                at: store::now(),
+                who: who.map(str::to_string),
+                agent: agent.map(str::to_string),
+                reply: reply.cloned(),
+                delegation,
+            },
+            request: request.map(str::to_string),
+        };
+        self.commit(&mut state, thread, entry);
+        true
+    }
+
+    /// Where the agent of daemon `daemon` stands in `thread`.
+    pub fn cursor(&self, thread: &str, daemon: &str) -> Option<Cursor> {
+        self.lock()
+            .threads
+            .get(thread)
+            .and_then(|thread| thread.agents.get(daemon).cloned())
+    }
+
+    /// Record where the agent of daemon `daemon` stands in `thread`.
+    pub fn set_cursor(&self, thread: &str, daemon: &str, cursor: Cursor) {
+        let mut state = self.lock();
+        let entry = Entry::Cursor {
+            daemon: daemon.to_string(),
+            session: cursor.session,
+            through: cursor.through,
+        };
+        self.commit(&mut state, thread, entry);
+    }
+
+    /// Drop a conversation: used when a channel is left.
+    pub fn forget(&self, thread: &str) {
+        let mut state = self.lock();
+        if state.threads.contains_key(thread) {
+            self.commit(&mut state, thread, Entry::Forget);
+        }
+    }
+
+    /// Apply `entry` to `thread` and append it to the log, so what is in memory
+    /// is always what a replay of the file gives.
+    fn commit(&self, state: &mut State, thread: &str, entry: Entry) {
+        let record = Record {
+            thread: thread.to_string(),
+            entry,
+        };
+        let encoded = serde_json::to_vec(&record).map_err(std::io::Error::other);
+        state.apply(record);
+        state.records += 1;
+        self.version.fetch_add(1, Ordering::Relaxed);
+        // A chat that could not be saved is still in memory for this run; there
+        // is nobody to tell that the window would not already show as lost data.
+        let saved = if state.records > 2 * state.live() + COMPACT_SLACK {
+            self.compact(state)
+        } else {
+            encoded.and_then(|mut line| {
+                line.push(b'\n');
+                store::append_private(&self.path, &line)
+            })
+        };
+        if let Err(error) = saved {
+            tracing::warn!("could not save chats: {error}");
+        }
+    }
+
+    /// Rewrite the log as just what the threads hold now.
+    fn compact(&self, state: &mut State) -> std::io::Result<()> {
+        let records = state.snapshot();
+        let mut bytes = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut bytes, record).map_err(std::io::Error::other)?;
+            bytes.push(b'\n');
+        }
+        store::replace(&self.path, &bytes)?;
+        state.records = records.len();
+        Ok(())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pilus-chats-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_retried_delivery_is_one_message() {
+        let dir = scratch("retry");
+        let chats = Chats::open(&dir);
+        assert!(chats.push_theirs("p", "hi", "r1", None, None));
+        assert!(!chats.push_theirs("p", "hi", "r1", None, None));
+        assert!(chats.push_theirs("p", "hi", "r2", None, None));
+        assert_eq!(chats.lines("p").len(), 2);
+        assert_eq!(chats.unread("p"), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reading_clears_unread_and_my_own_lines_never_count() {
+        let dir = scratch("read");
+        let chats = Chats::open(&dir);
+        chats.push_mine("p", "yo", None);
+        assert_eq!(chats.unread_total(), 0);
+        chats.push_theirs("p", "hey", "r", None, None);
+        assert_eq!(chats.unread_total(), 1);
+        chats.mark_read("p");
+        assert_eq!(chats.unread_total(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_thread_keeps_only_its_newest_lines_and_ids_keep_growing() {
+        let dir = scratch("limit");
+        let chats = Chats::open(&dir);
+        for n in 0..(THREAD_LIMIT + 3) {
+            chats.push_mine("p", &n.to_string(), None);
+        }
+        let lines = chats.lines("p");
+        assert_eq!(lines.len(), THREAD_LIMIT);
+        assert_eq!(lines[0].text, "3");
+        assert!(lines.windows(2).all(|pair| pair[0].id < pair[1].id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reply_keeps_its_quote_and_a_delegation_is_noted_once() {
+        let dir = scratch("reply");
+        let chats = Chats::open(&dir);
+        let quote = Quote::of("Rina", "ship it\n  on   friday");
+        assert_eq!(quote.text, "ship it on friday");
+        chats.push_theirs_replying("p", "agreed", "r1", None, None, Some(&quote));
+        chats.push_mine_replying("p", "great", None, Some(&quote));
+        let lines = chats.lines("p");
+        assert_eq!(lines[0].reply.as_ref(), Some(&quote));
+        assert_eq!(lines[1].reply.as_ref(), Some(&quote));
+        assert_eq!(chats.lines("p")[0].delegation, None);
+
+        let note = Delegation {
+            call: "c1".to_string(),
+            daemon: "d".to_string(),
+            conversation: "9".to_string(),
+            agent: "researcher".to_string(),
+            task: "How does X work?".to_string(),
+        };
+        chats.push_delegation("p", "CoS", note.clone());
+        chats.push_delegation("p", "CoS", note.clone());
+        let lines = chats.lines("p");
+        assert_eq!(lines.len(), 3, "the same call is not noted twice");
+        let line = lines.last().unwrap();
+        assert!(line.mine && line.agent.as_deref() == Some("CoS"));
+        assert_eq!(line.delegation.as_ref(), Some(&note));
+        assert_eq!(chats.unread("p"), 1, "a note of ours is never unread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn threads_survive_a_restart() {
+        let dir = scratch("restart");
+        Chats::open(&dir).push_theirs("p", "still here", "r", None, None);
+        let again = Chats::open(&dir);
+        assert_eq!(again.lines("p")[0].text, "still here");
+        assert!(
+            !again.push_theirs("p", "still here", "r", None, None),
+            "dedupe survives too"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn log(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("chats.jsonl")).unwrap()
+    }
+
+    #[test]
+    fn each_change_is_one_appended_record() {
+        let dir = scratch("append");
+        let chats = Chats::open(&dir);
+        chats.push_theirs("p", "hi", "r1", None, None);
+        chats.push_mine("p", "yo", None);
+        chats.mark_read("p");
+        let log = log(&dir);
+        let ops: Vec<_> = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["op"].clone())
+            .collect();
+        assert_eq!(ops, ["line", "line", "read"]);
+        assert!(log.lines().all(|line| line.contains("\"thread\":\"p\"")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reading_cursors_and_forgetting_survive_a_restart() {
+        let dir = scratch("replay");
+        let chats = Chats::open(&dir);
+        chats.push_theirs("p", "one", "r1", None, None);
+        chats.push_theirs("p", "two", "r2", None, None);
+        chats.mark_read("p");
+        chats.push_theirs("p", "three", "r3", None, None);
+        chats.set_cursor(
+            "p",
+            "d",
+            Cursor {
+                session: "s".to_string(),
+                through: 2,
+            },
+        );
+        chats.push_mine("gone", "bye", None);
+        chats.forget("gone");
+
+        let again = Chats::open(&dir);
+        assert_eq!(again.lines("p").len(), 3);
+        assert_eq!(again.unread("p"), 1);
+        assert_eq!(again.cursor("p", "d").unwrap().session, "s");
+        assert!(again.lines("gone").is_empty());
+        assert!(!again.push_theirs("p", "two", "r2", None, None));
+        assert_eq!(again.lines("p").last().unwrap().id, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_torn_or_damaged_record_costs_only_itself() {
+        let dir = scratch("torn");
+        let chats = Chats::open(&dir);
+        chats.push_theirs("p", "kept", "r1", None, None);
+        let path = dir.join("chats.jsonl");
+        let mut log = std::fs::read(&path).unwrap();
+        log.extend_from_slice(b"not json\n{\"thread\":\"p\",\"op\":\"li");
+        std::fs::write(&path, log).unwrap();
+
+        let again = Chats::open(&dir);
+        assert_eq!(again.lines("p").len(), 1);
+        again.push_mine("p", "after", None);
+        let third = Chats::open(&dir);
+        assert_eq!(
+            third
+                .lines("p")
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>(),
+            ["kept", "after"],
+            "the next record is not glued onto the torn one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_log_is_compacted_to_what_the_threads_keep() {
+        let dir = scratch("compact");
+        let chats = Chats::open(&dir);
+        let total = 2 * THREAD_LIMIT + COMPACT_SLACK + 50;
+        for n in 0..total {
+            chats.push_theirs("p", &n.to_string(), &format!("r{n}"), None, None);
+        }
+        assert!(log(&dir).lines().count() < total, "rewritten at least once");
+        let again = Chats::open(&dir);
+        let lines = again.lines("p");
+        assert_eq!(lines.len(), THREAD_LIMIT);
+        assert_eq!(lines.last().unwrap().text, (total - 1).to_string());
+        assert_eq!(again.unread("p"), THREAD_LIMIT as u64);
+        assert!(!again.push_theirs("p", "x", &format!("r{}", total - 1), None, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

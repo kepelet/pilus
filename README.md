@@ -9,14 +9,14 @@ surface in a real window instead of a terminal — the same cells, splits, and
 sidebar, without running another terminal emulator.
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ ● pilus · default                                  connected│
-├──────────────────────────────────────────────────────────┤
-│  workspaces        │  agent: claude          working      │
-│  ▸ api             │  $ cargo test                        │
-│  ▸ web             │  running 15 tests …                  │
-│                    │                                      │
-└──────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│ ● pilus · default                                  connected  │
+├───────────────────────────────────────────────────────────────┤
+│  workspaces        │  agent: claude          working          │
+│  ▸ api             │  $ cargo test                            │
+│  ▸ web             │  running 15 tests …                      │
+│                    │                                          │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ## Status

@@ -150,6 +150,14 @@ pub struct Settings {
     /// Repositories (`owner/name`) kept in the sidebar's Repositories section
     /// ahead of the most recent ones, in the order they were pinned.
     pub github_pinned: Vec<String>,
+    /// Let other pilus windows reach this one by its device ID, and start the
+    /// network side at launch. Off until the Sipil tab turns it on. Contacts
+    /// can be added and a daemon used without it, but nobody can message back.
+    pub sipil_online: bool,
+    /// The SIPIL sidebar rows (`daemon:<id>`, `channel:<id>`, `person:<id>`) in
+    /// the order the person dragged them into. A row not named here comes after
+    /// the ones that are, in the order the section would list it.
+    pub sipil_order: Vec<String>,
     /// Whether the right sidebar (Changes and History tabs) is open.
     pub right_sidebar_visible: bool,
     /// The right sidebar's width in logical pixels; 0 takes the default.
@@ -224,6 +232,8 @@ impl Default for Settings {
             github: true,
             github_repositories: true,
             github_pinned: Vec::new(),
+            sipil_online: false,
+            sipil_order: Vec::new(),
             right_sidebar_visible: false,
             right_sidebar_width: 0.0,
             right_sidebar_tab: String::new(),
@@ -414,6 +424,28 @@ impl Settings {
         }
     }
 
+    /// Drop the SIPIL row `from` into the slot of row `to`. `shown` is the rows
+    /// as the sidebar lists them now, so the order saved is the one on screen,
+    /// with whatever the person had not yet placed.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn move_sipil_row(&mut self, shown: &[String], from: &str, to: &str) {
+        let mut order: Vec<String> = Vec::new();
+        for key in shown {
+            if !order.contains(key) {
+                order.push(key.clone());
+            }
+        }
+        let (Some(at), Some(into)) = (
+            order.iter().position(|key| key == from),
+            order.iter().position(|key| key == to),
+        ) else {
+            return;
+        };
+        let row = order.remove(at);
+        order.insert(into, row);
+        self.sipil_order = order;
+    }
+
     /// The corner radius, clamped so a stray value cannot draw blobs.
     pub fn radius(&self) -> f32 {
         if self.corner_radius.is_finite() {
@@ -494,6 +526,30 @@ mod tests {
         assert!(!settings.github_shows_repositories());
         // The section keeps its own choice for when GitHub comes back on.
         assert!(settings.github_repositories);
+    }
+
+    #[test]
+    fn a_sipil_row_dropped_on_another_takes_its_slot_and_the_rest_keep_their_order() {
+        let shown: Vec<String> = ["daemon:a", "channel:b", "person:c", "person:d"]
+            .map(String::from)
+            .to_vec();
+        let mut settings = Settings::default();
+        settings.move_sipil_row(&shown, "person:d", "daemon:a");
+        assert_eq!(
+            settings.sipil_order,
+            ["person:d", "daemon:a", "channel:b", "person:c"]
+        );
+        settings.move_sipil_row(&shown, "daemon:a", "person:c");
+        assert_eq!(
+            settings.sipil_order,
+            ["channel:b", "person:c", "daemon:a", "person:d"]
+        );
+        // A row that is not on show changes nothing.
+        settings.move_sipil_row(&shown, "person:gone", "daemon:a");
+        assert_eq!(
+            settings.sipil_order,
+            ["channel:b", "person:c", "daemon:a", "person:d"]
+        );
     }
 
     #[test]
@@ -730,6 +786,8 @@ mod tests {
             github: false,
             github_repositories: false,
             github_pinned: vec!["o/r".to_string()],
+            sipil_online: true,
+            sipil_order: vec!["person:b".to_string(), "daemon:a".to_string()],
             right_sidebar_visible: true,
             right_sidebar_width: 480.0,
             right_sidebar_tab: "git".to_string(),

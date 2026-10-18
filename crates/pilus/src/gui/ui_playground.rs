@@ -126,6 +126,8 @@ const ICONS: &[(&str, &[u8])] = &[
 enum InputId {
     Single,
     Multi,
+    /// Masked, and kept off the clipboard: an API key.
+    Secret,
 }
 
 /// One working dropdown in the gallery.
@@ -143,6 +145,7 @@ pub struct UiPlaygroundView {
     focus_handle: FocusHandle,
     single: Entity<TextInput>,
     multi: Entity<TextInput>,
+    secret: Entity<TextInput>,
     search: Entity<TextInput>,
     pickers: Vec<Picker>,
     open_picker: Option<usize>,
@@ -192,6 +195,18 @@ impl UiPlaygroundView {
                 cx,
             )
         });
+        let secret = cx.new(|cx| {
+            TextInput::new(
+                "sk-demo-0123456789".to_string(),
+                "Paste your key",
+                font.clone(),
+                px(fonts.body),
+                false,
+                theme,
+                cx,
+            )
+            .secret()
+        });
         let search = cx.new(|cx| {
             TextInput::new(
                 String::new(),
@@ -211,6 +226,7 @@ impl UiPlaygroundView {
             focus_handle,
             single,
             multi,
+            secret,
             search,
             pickers: vec![
                 Picker {
@@ -254,16 +270,15 @@ impl UiPlaygroundView {
             window.remove_window();
             return;
         }
-        // Tab walks between the two inputs, so both are reachable by keyboard.
-        // Everything else is the focused field's own business, which consumes
-        // what it handles before it reaches here.
+        // Tab walks the inputs, so each is reachable by keyboard. Everything
+        // else is the focused field's own business, which consumes what it
+        // handles before it reaches here.
         if key == "tab" {
-            let single_focused = self.single.read(cx).is_focused(window);
-            let next = if single_focused {
-                self.multi.clone()
-            } else {
-                self.single.clone()
-            };
+            let inputs = [&self.single, &self.multi, &self.secret];
+            let at = inputs
+                .iter()
+                .position(|input| input.read(cx).is_focused(window));
+            let next = inputs[at.map_or(0, |at| (at + 1) % inputs.len())].clone();
             let handle = next.focus_handle(cx);
             window.focus(&handle, cx);
             cx.notify();
@@ -512,6 +527,7 @@ impl UiPlaygroundView {
         let entity = match id {
             InputId::Single => self.single.clone(),
             InputId::Multi => self.multi.clone(),
+            InputId::Secret => self.secret.clone(),
         };
         entity.update(cx, |input, _| {
             input.set_style(theme, style::chrome_font(&self.settings), px(fonts.body));
@@ -522,6 +538,7 @@ impl UiPlaygroundView {
             match id {
                 InputId::Single => "pg-input-single",
                 InputId::Multi => "pg-input-multi",
+                InputId::Secret => "pg-input-secret",
             },
             label,
             focused,
@@ -2119,6 +2136,7 @@ impl Render for UiPlaygroundView {
                             .gap_4()
                             .child(self.input_box(InputId::Single, "Single line", window, cx))
                             .child(self.input_box(InputId::Multi, "Multi line", window, cx))
+                            .child(self.input_box(InputId::Secret, "Secret", window, cx))
                             .child(self.search_box(window, cx)),
                     ),
                 ),

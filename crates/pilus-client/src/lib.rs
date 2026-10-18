@@ -32,6 +32,7 @@ mod mission;
 mod ports;
 mod read;
 mod relay;
+pub mod sipil;
 mod stage;
 mod surface;
 mod tasks;

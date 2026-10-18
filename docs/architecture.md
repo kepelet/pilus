@@ -862,6 +862,95 @@ the levels: each device is told its own methods, operate adds a task and opens a
 workspace in the daemon, control and view are refused the same calls, lowering
 applies at once, and a level cannot be raised from the admin socket.
 
+## sipil: people and agents over iroh
+
+sipil is the second thing pilus talks to besides a Luvus daemon, and it is not
+the Luvus protocol. Every sipil is a node on one iroh protocol, whether it is the
+durable agent daemon (`../sipil`) or another pilus window, so a pilus can chat
+with a person and drive an agent through the same code path.
+
+```
+pilus window ──┐                       ┌── sipil daemon (Node, @number0/iroh)
+  Node (iroh)  ├─ ALPN pilus/sipil/1 ──┤     agents, sessions
+               │  one JSON call/stream └── pilus window (PeerService)
+               │                             health, chat.send
+```
+
+A call is one bidirectional QUIC stream: the caller writes
+`{"method","params"?}` and finishes, the answerer writes `{"result"}` or
+`{"error":{"code","message"}}` and finishes (`pilus_client::sipil::wire`; the
+daemon's side is `sipil/src/transport.ts` and `rpc.ts`). The caller is the device
+ID the handshake proved. `health` is open and reports `kind` (`daemon` or
+`pilus`) and whether the asker is allowed; everything else is refused with
+`unauthorized` unless the asker is on the allow-list. Revision 2 of the protocol
+replaced the daemon's HTTP API (revision 1), which is gone.
+
+- **Device ID.** An iroh `EndpointId`, 64 hex characters, from an identity key
+  (`~/.pilus/sipil/identity.key` for a window, `~/.sipil/identity.key` for the
+  daemon). It is what a person sends to be added, and what `npm run connect` takes.
+  A ticket adds addresses and is accepted wherever an ID is; a bare ID is found
+  through iroh's discovery. Relays follow `relay.url` in `~/.pilus/settings.json`
+  (the window ignores `relay.secret`) and `SIPIL_RELAY` for the daemon.
+- **Authorization.** On a daemon, `peers.json` in its data directory, edited with
+  `npm run allow|revoke|peers` and read on every connection, so a revoked device
+  is refused on its next call. A pilus gets onto it by being asked: `sipil
+  connect` sends `pair.request` (kind, label, ticket) to the pilus, which holds it
+  as a request until its person accepts, answering `pending`, `accepted` or
+  `declined` each time the daemon asks again; the daemon allows the pilus only on
+  `accepted`. On a window, the contact list, where an accepted daemon is a
+  contact of its own kind. Neither is a
+  password: knowing a device ID grants nothing until the other side adds it.
+- **Chat.** `chat.send` carries a `requestId`, so a retried delivery is one
+  message. Each side keeps its own thread (`chats.jsonl`, one record per line); a sender stores its line
+  only after the receiver took it. A stranger's message is dropped and the
+  stranger becomes a request in the window.
+- **Watching.** `watch {id}` is the one call that answers many times: the daemon
+  keeps the stream open and writes one JSON object per line, `{"event": ...}` for
+  each thing that happens in the conversation, then `{"result": {}}` when it ends.
+  The first event is a `snapshot`; `item`, `delta`, `live`, `status` and `subagent`
+  apply on top of it, and `pilus_client::sipil::Watched` is the reducer that holds
+  the result. The window opens one stream for the conversation it is on
+  (`gui/sipil.rs`, `stream_conversation`), reopens it when it breaks or goes silent
+  for 45 seconds (the daemon pings every 15), and shows the answer being written
+  from `SipilState::live`. A running call's output arrives as `output` events
+  (the end of what it printed, replacing the last; the snapshot lists the calls
+  running), kept in `SipilState::running`: the call's header shows its last line,
+  and opened it shows the tail, until the call's result line arrives. While a stream delivers, the poller does not read that
+  conversation's transcript; it still refreshes the lists. A daemon from before the
+  call answers `unknown_method` and is polled as before. `transcript` and
+  `sessions` also take paging params (`before`/`limit`, `after`/`limit`) and answer
+  `more`. The chat page shows a "Load older messages" bar above the log while the
+  daemon has lines before the first one held; `pilus_client::sipil::history` keeps
+  older pages when a newer one arrives, so a conversation that grows while open
+  leaves no gap, and the list inserts the rows in front so the reader stays on the
+  line they were on. The session list is not paged yet: the window shows the first
+  200 sessions.
+- **Agents.** A person may run several daemons, each with a named agent
+  (`SIPIL_NAME`). A pilus does not hand an agent to a contact: it answers no
+  `agent.*` call and `health` lists none. An agent takes part only in a channel
+  its person invited it into, and runs only when a member names it.
+- **Channels.** `chan.send {channel, name, members, requestId, content, as?}` is
+  `chat.send` for a room. The author's pilus sends it to each member that is a
+  contact; a pilus that takes one for a channel it does not know creates it from
+  the name and members the message carries, and one that left a channel drops
+  the message. Each member keeps its own copy of the thread (`#<id>`). The same
+  call changes membership: `added` (device IDs a line invites, whom its readers may
+  list again) and `removed` (IDs it takes out, who leave, and whom the others drop
+  and keep out). The message carries `owner`, the device that made the channel;
+  only the owner's lists and changes count, and a message from someone who is not in
+  a known channel's list is refused with `not_member`.
+- **Mentions.** In a channel, `@Researcher` in a line the user sends makes this pilus ask its
+  own daemon's agent to read the conversation (the lines it has not seen, with who
+  said each, in one session per conversation) and say its answer back with
+  `as: "Researcher"`, provided the person invited that agent into the channel
+  (kept on this device only, in `channels.json`). The same happens when any member
+  names an invited agent in a line they send (`PeerService::invite_agents`); an
+  agent that was not invited, or another agent's line, starts nothing. A direct
+  chat between two people is never handed to an agent.
+- **Lifetime.** The window's node lives and dies with the window. Reachability is
+  `Settings::sipil_online`; moving the node into `pilus-agent` is the way to
+  receive while the window is closed.
+
 ## Mouse and selection
 
 Pointer positions are in window pixels; the client divides by the measured cell

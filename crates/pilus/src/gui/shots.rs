@@ -184,6 +184,33 @@ pub fn run() -> Result<()> {
             })
         },
     )?;
+    // The sipil tab's panel: not reachable, then reachable with no daemon, then
+    // attached to one. The fixture stands in for the poller, so a capture never
+    // dials anything.
+    for (name, state) in [
+        ("sipil-unreachable", super::sipil::SipilState::default()),
+        ("sipil-off", sipil_fixture(false)),
+        ("sipil-connected", sipil_fixture(true)),
+    ] {
+        super::sipil::preview(state);
+        shoot(
+            &mut cx,
+            name,
+            420.0,
+            1500.0,
+            Duration::from_millis(300),
+            |_, cx| {
+                cx.new(|cx| {
+                    super::sipil_panel::SipilPanel::new(
+                        Rc::new(RefCell::new(Theme::default())),
+                        settings(),
+                        cx,
+                    )
+                })
+            },
+        )?;
+    }
+    super::sipil::preview(super::sipil::SipilState::default());
     shoot(
         &mut cx,
         "appearances",
@@ -707,6 +734,226 @@ pub fn run_main() -> Result<()> {
     // task only sees them when the clock advances and tasks are drained.
     settle(&mut cx, 80);
     capture(&mut cx, window.into(), "main")?;
+
+    // Connected to sipil: its two sections lead the sidebar lists.
+    super::sipil::preview(sipil_fixture(true));
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil = super::sipil::snapshot();
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-sipil")?;
+    // The chat page: a conversation with every kind of line, then a refused
+    // send, a draft, and a subagent's read-only page.
+    for (name, watch, banner) in [
+        (
+            "main-sipil-chat",
+            super::sipil::Watch::On(RESEARCHER.to_string(), "1".to_string()),
+            None,
+        ),
+        (
+            "main-sipil-chat-refused",
+            super::sipil::Watch::On(RESEARCHER.to_string(), "1".to_string()),
+            Some("Set OPENCODE_API_KEY in the environment sipil starts in."),
+        ),
+        (
+            "main-sipil-chat-peer",
+            super::sipil::Watch::Peer("a".repeat(64)),
+            None,
+        ),
+        (
+            "main-sipil-chat-channel",
+            super::sipil::Watch::Channel("0123456789abcdef".to_string()),
+            None,
+        ),
+        (
+            "main-sipil-chat-subagent",
+            super::sipil::Watch::On(RESEARCHER.to_string(), "9".to_string()),
+            None,
+        ),
+    ] {
+        super::sipil::preview(sipil_chat_fixture(watch, banner));
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.sipil = super::sipil::snapshot();
+                view.sipil_chat.open = true;
+                cx.notify();
+            });
+        });
+        settle(&mut cx, 8);
+        capture(&mut cx, window.into(), name)?;
+    }
+    // The daemon is away: its agent still opens, with the conversation as it
+    // was, and what was written since waits to be sent.
+    let mut away = sipil_chat_fixture(
+        super::sipil::Watch::On(RESEARCHER.to_string(), "1".to_string()),
+        None,
+    );
+    for daemon in &mut away.daemons {
+        daemon.phase = super::sipil::Phase::Connecting;
+        daemon.error = Some("Could not reach 5a3f…: timed out".to_string());
+    }
+    away.queued = ["Can you also count the test files?", "Then summarise both."]
+        .iter()
+        .enumerate()
+        .map(|(n, text)| pilus_client::sipil::Queued {
+            conversation: "1".to_string(),
+            request: format!("shot-{n}"),
+            text: (*text).to_string(),
+            at: 1_790_001_000 + n as u64 * 40,
+        })
+        .collect();
+    super::sipil::preview(away);
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil = super::sipil::snapshot();
+            view.sipil_chat.open = true;
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-sipil-chat-away")?;
+    // A channel's own page: who is in it, with their device IDs, and who could be.
+    super::sipil::preview(sipil_chat_fixture(
+        super::sipil::Watch::Channel("0123456789abcdef".to_string()),
+        None,
+    ));
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil = super::sipil::snapshot();
+            view.sipil_chat.open = true;
+            view.sipil_chat.open_about_for_shot(&[]);
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-sipil-chat-channel-info")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil_chat.about_open = false;
+            cx.notify();
+        });
+    });
+    // A contact's own page: device ID, channels in common.
+    super::sipil::preview(sipil_chat_fixture(
+        super::sipil::Watch::Peer("a".repeat(64)),
+        None,
+    ));
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil = super::sipil::snapshot();
+            view.sipil_chat.open = true;
+            view.sipil_chat.open_about_for_shot(&[]);
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-sipil-chat-contact-info")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil_chat.about_open = false;
+            cx.notify();
+        });
+    });
+    // The calls folded open, and a reply being made to a line.
+    super::sipil::preview(sipil_chat_fixture(
+        super::sipil::Watch::On(RESEARCHER.to_string(), "1".to_string()),
+        None,
+    ));
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil = super::sipil::snapshot();
+            view.sipil_chat.open = true;
+            view.sipil_chat.fold_open_for_shot(
+                &["c-count", "c-sizes"],
+                "rizaldy",
+                "How many files are in src?",
+            );
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-sipil-chat-calls-open")?;
+    // A thread: the reply and its answer are here and not in the log.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil_chat.open_thread_for_shot(16);
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-sipil-chat-thread")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil_chat.close_thread_for_shot();
+            cx.notify();
+        });
+    });
+    // The daemon's own page, opened from the header, with one agent's
+    // instructions folded open.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil_chat.open_about_for_shot(&["researcher"]);
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-sipil-chat-about")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil_chat.about_open = false;
+            cx.notify();
+        });
+    });
+    // The subthreads panel, opened from the header.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil_chat.fold_open_for_shot(&[], "", "");
+            view.sipil_chat.subthreads_open = true;
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-sipil-chat-subthreads")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil_chat.subthreads_open = false;
+            view.sipil_chat.open = false;
+            view.sipil_chat.fold_open_for_shot(&[], "", "");
+            cx.notify();
+        });
+    });
+    // The daemon went away: its sections are gone, the people stay, and the row
+    // says why.
+    super::sipil::preview(super::sipil::SipilState {
+        me: sipil_me_fixture(),
+        daemons: vec![super::sipil::Daemon {
+            id: RESEARCHER.to_string(),
+            label: "Researcher".to_string(),
+            phase: super::sipil::Phase::Connecting,
+            error: Some("Could not reach 26e9ba62: no answer".to_string()),
+            ..super::sipil::Daemon::default()
+        }],
+        ..super::sipil::SipilState::default()
+    });
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil = super::sipil::snapshot();
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-sipil-down")?;
+    super::sipil::preview(super::sipil::SipilState::default());
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil = super::sipil::snapshot();
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
 
     // A tab's hover card: full cwd plus the running process.
     cx.update_window(window.into(), |_, window, cx| {
@@ -2020,6 +2267,413 @@ const SERVICE_LOG: &[&str] = &[
     "pilus-agent: the Luvus server is not running; starting it",
 ];
 
+/// The two daemons the shots run: a Researcher and a Chief of Staff.
+const RESEARCHER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const COS: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+/// This device, three contacts (one online with unread lines, one who has not
+/// added this device back, one offline), two channels (the Researcher invited
+/// into the first), and a stranger who knocked, for the shots.
+fn sipil_me_fixture() -> super::sipil::Me {
+    use pilus_client::sipil::{Channel, Contact, Request};
+
+    use super::sipil::{ChannelRow, Me, Person, Reach};
+
+    let person = |seed: &str, name: &str, reach, unread| Person {
+        contact: Contact {
+            id: seed.repeat(64),
+            name: name.to_string(),
+            ticket: None,
+            added: 1_790_000_000,
+            daemon: false,
+        },
+        reach,
+        unread,
+    };
+    let channel = |name: &str, unread| ChannelRow {
+        channel: Channel {
+            id: if name == "project-x" {
+                "0123456789abcdef".to_string()
+            } else {
+                "fedcba9876543210".to_string()
+            },
+            name: name.to_string(),
+            members: vec!["a".repeat(64), "b".repeat(64)],
+            // project-x is ours; alerts belongs to Rina.
+            owner: if name == "project-x" {
+                "26e9ba62c5fedd08fce5f6eb4468d342f56712cea92c4efab93049ebd892258d".to_string()
+            } else {
+                "a".repeat(64)
+            },
+            created: 1_790_000_000,
+        },
+        unread,
+        agents: if name == "project-x" {
+            vec![RESEARCHER.to_string()]
+        } else {
+            Vec::new()
+        },
+    };
+    Me {
+        nickname: "rizaldy".to_string(),
+        device_id: Some(
+            "26e9ba62c5fedd08fce5f6eb4468d342f56712cea92c4efab93049ebd892258d".to_string(),
+        ),
+        online: true,
+        reachable: true,
+        people: vec![
+            person("a", "Rina", Reach::Online, 2),
+            person("b", "Dimas", Reach::Waiting, 0),
+            person("c", "Ayu", Reach::Offline, 0),
+        ],
+        channels: vec![channel("project-x", 3), channel("alerts", 0)],
+        requests: vec![
+            Request {
+                id: "d".repeat(64),
+                at: 1_790_100_000,
+                label: None,
+                ticket: None,
+                daemon: false,
+            },
+            Request {
+                id: "e".repeat(64),
+                at: 1_790_100_100,
+                label: Some("CoS".to_string()),
+                ticket: None,
+                daemon: true,
+            },
+        ],
+        ..Me::default()
+    }
+}
+
+/// sipil as the daemon would report it, for the shots: a primary agent with
+/// two subagents (one working) and three sessions.
+fn sipil_fixture(connected: bool) -> super::sipil::SipilState {
+    use pilus_client::sipil::{self as client, Activity, Agent, Role, Session};
+
+    if !connected {
+        return super::sipil::SipilState {
+            me: sipil_me_fixture(),
+            daemons: vec![super::sipil::Daemon {
+                id: RESEARCHER.to_string(),
+                address: RESEARCHER.to_string(),
+                label: "Researcher".to_string(),
+                phase: super::sipil::Phase::Off,
+                error: Some(pilus_client::sipil::not_allowed(
+                    "26e9ba62c5fedd08fce5f6eb4468d342f56712cea92c4efab93049ebd892258d",
+                )),
+                ..super::sipil::Daemon::default()
+            }],
+            ..super::sipil::SipilState::default()
+        };
+    }
+    let model = Some(client::ModelRef {
+        provider: "opencode-go".to_string(),
+        model_id: "qwen3.8-max".to_string(),
+    });
+    let agent = |id: &str, name: &str, role, status, parent: Option<&str>| Agent {
+        id: id.to_string(),
+        name: name.to_string(),
+        role,
+        status,
+        model: model.clone(),
+        parent_id: parent.map(str::to_string),
+        error: None,
+    };
+    let session = |id: &str, title: &str, status| Session {
+        id: id.to_string(),
+        title: title.to_string(),
+        status,
+        model: model.clone(),
+        error: None,
+    };
+    let researcher = super::sipil::Daemon {
+        id: RESEARCHER.to_string(),
+        address: RESEARCHER.to_string(),
+        label: "Researcher".to_string(),
+        phase: super::sipil::Phase::Connected,
+        version: Some("0.1.0".to_string()),
+        agents: vec![
+            agent("1", "Researcher", Role::Primary, Activity::Working, None),
+            agent(
+                "9",
+                "subagent Count the files in src",
+                Role::Subagent,
+                Activity::Working,
+                Some("1"),
+            ),
+            agent(
+                "12",
+                "subagent Summarize the failing test",
+                Role::Subagent,
+                Activity::Idle,
+                Some("1"),
+            ),
+        ],
+        sessions: vec![
+            session(
+                "7",
+                "Port the settings page to the new layout",
+                Activity::Idle,
+            ),
+            session(
+                "15",
+                "Why does the handshake test hang on CI?",
+                Activity::Working,
+            ),
+            Session {
+                error: Some("401 Unauthorized: invalid API key".to_string()),
+                ..session("21", "Summarize the release notes", Activity::Idle)
+            },
+        ],
+        about: Some(about_fixture()),
+        logo: super::about::rasterize(DAEMON_LOGO.as_bytes(), 128).map(super::sipil::Logo),
+        ..super::sipil::Daemon::default()
+    };
+    let cos = super::sipil::Daemon {
+        id: COS.to_string(),
+        address: COS.to_string(),
+        label: "CoS".to_string(),
+        phase: super::sipil::Phase::Connected,
+        version: Some("0.1.0".to_string()),
+        agents: vec![agent("1", "CoS", Role::Primary, Activity::Idle, None)],
+        sessions: vec![session("3", "Plan the week", Activity::Idle)],
+        ..super::sipil::Daemon::default()
+    };
+    super::sipil::SipilState {
+        me: sipil_me_fixture(),
+        daemons: vec![researcher, cos],
+        ..super::sipil::SipilState::default()
+    }
+}
+
+/// sipil with a conversation open in the chat page, for the shots.
+fn sipil_chat_fixture(
+    watch: super::sipil::Watch,
+    send_error: Option<&str>,
+) -> super::sipil::SipilState {
+    use pilus_client::sipil::{ItemRole, Quote, Subagent, ToolCall, TranscriptItem};
+
+    let line = |id, role, text: &str, tools: &[&str], error: Option<&str>| TranscriptItem {
+        // Mornings apart from the minute, so the log reads as a day's talk.
+        at: Some(1_790_000_000 + id * 47),
+        speaker: None,
+        id,
+        role,
+        text: text.to_string(),
+        tools: tools.iter().map(ToString::to_string).collect(),
+        calls: Vec::new(),
+        call_id: None,
+        is_error: false,
+        reply: None,
+        error: error.map(str::to_string),
+    };
+    // A call, and the result that answers it.
+    let call = |id: &str, name: &str, summary: &str, args: &str| ToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        summary: summary.to_string(),
+        args: args.to_string(),
+        subagent: None,
+    };
+    let handed_off = |id: &str, agent: &str, task: &str| ToolCall {
+        subagent: Some(Subagent {
+            conversation: Some("9".to_string()),
+            daemon: None,
+            agent: agent.to_string(),
+            task: task.to_string(),
+        }),
+        ..call(id, "subagent", task, "")
+    };
+    let answer = |item: TranscriptItem, call_id: &str| TranscriptItem {
+        call_id: Some(call_id.to_string()),
+        ..item
+    };
+    let transcript = match &watch {
+        super::sipil::Watch::Channel(_) => {
+            let said = |id, role, speaker: Option<&str>, text: &str| TranscriptItem {
+                speaker: speaker.map(str::to_string),
+                ..line(id, role, text, &[], None)
+            };
+            vec![
+                said(
+                    1,
+                    ItemRole::Peer,
+                    Some("Rina"),
+                    "Release is **Friday**. Anything blocking?",
+                ),
+                said(
+                    2,
+                    ItemRole::Peer,
+                    Some("Dimas"),
+                    "The handshake test is still flaky on CI.",
+                ),
+                said(
+                    3,
+                    ItemRole::User,
+                    None,
+                    "@Researcher can you look at why? Check the last three runs.",
+                ),
+                said(
+                    4,
+                    ItemRole::User,
+                    Some("Researcher"),
+                    "The three failures share one cause: a **timing race** in the test.\n\n- the daemon starts after the client dials\n- the retry waits 50 ms, the daemon needs ~80 ms\n\nFix: wait for `online()` before dialing. I can send a patch.",
+                ),
+                said(
+                    5,
+                    ItemRole::Peer,
+                    Some("Rina/CoS"),
+                    "Noted. I will add it to the Friday checklist.",
+                ),
+            ]
+        }
+        super::sipil::Watch::Peer(_) => vec![
+            line(
+                1,
+                ItemRole::Peer,
+                "Are you free to look at the sipil change?",
+                &[],
+                None,
+            ),
+            line(
+                2,
+                ItemRole::User,
+                "Give me ten minutes, I am finishing the handshake test.",
+                &[],
+                None,
+            ),
+            TranscriptItem {
+                reply: Some(Quote::of(
+                    "rizaldy",
+                    "Give me ten minutes, I am finishing the handshake test.",
+                )),
+                ..line(
+                    3,
+                    ItemRole::Peer,
+                    "No rush. I will read the diff meanwhile.",
+                    &[],
+                    None,
+                )
+            },
+        ],
+        super::sipil::Watch::On(_, id) if id == "9" => vec![
+            line(20, ItemRole::User, "Count the files in src", &[], None),
+            TranscriptItem {
+                calls: vec![call(
+                    "c-wc",
+                    "bash",
+                    "ls src | wc -l",
+                    "{\n  \"command\": \"ls src | wc -l\"\n}",
+                )],
+                ..line(21, ItemRole::Assistant, "", &["bash"], None)
+            },
+            answer(line(22, ItemRole::Tool, "43", &[], None), "c-wc"),
+            line(
+                23,
+                ItemRole::Assistant,
+                "There are 43 files in src.",
+                &[],
+                None,
+            ),
+        ],
+        _ => vec![
+            line(
+                13,
+                ItemRole::User,
+                "How many files are in src, and what is the biggest one?",
+                &[],
+                None,
+            ),
+            TranscriptItem {
+                calls: vec![
+                    handed_off(
+                        "c-count",
+                        "researcher",
+                        "Count the files in src and say which one is the biggest",
+                    ),
+                    call(
+                        "c-sizes",
+                        "bash",
+                        "ls -lS src | head -3",
+                        "{\n  \"command\": \"ls -lS src | head -3\"\n}",
+                    ),
+                ],
+                ..line(
+                    14,
+                    ItemRole::Assistant,
+                    "I'll ask a subagent to count them while I look at sizes.",
+                    &["subagent", "bash"],
+                    None,
+                )
+            },
+            answer(
+                line(
+                    15,
+                    ItemRole::Tool,
+                    "-rw-r--r--  1 me  staff  91244 Oct 17 21:02 mod.rs\n-rw-r--r--  1 me  staff  30210 Oct 17 21:02 style.rs\n-rw-r--r--  1 me  staff  12881 Oct 17 21:02 sipil.rs",
+                    &[],
+                    None,
+                ),
+                "c-sizes",
+            ),
+            answer(
+                line(
+                    19,
+                    ItemRole::Tool,
+                    "43 files; mod.rs is the biggest at 91244 bytes.",
+                    &[],
+                    None,
+                ),
+                "c-count",
+            ),
+            line(
+                16,
+                ItemRole::Assistant,
+                "There are 43 files in src. The biggest is mod.rs at about 89 KB.\n\nThe next two are style.rs and sipil.rs.",
+                &[],
+                None,
+            ),
+            // A reply: the daemon has no field for a quote, so it is in front of
+            // the message, and the answer to it follows.
+            line(
+                20,
+                ItemRole::User,
+                &Quote::of(
+                    "Researcher",
+                    "There are 43 files in src. The biggest is mod.rs at about 89 KB.\n\nThe next two are style.rs and sipil.rs.",
+                )
+                .prefix("And which is the third biggest?"),
+                &[],
+                None,
+            ),
+            line(
+                21,
+                ItemRole::Assistant,
+                "sipil.rs, at about 12 KB.",
+                &[],
+                None,
+            ),
+            line(17, ItemRole::User, "Summarize the release notes", &[], None),
+            line(
+                18,
+                ItemRole::Assistant,
+                "401 Unauthorized: invalid API key",
+                &[],
+                Some("401 Unauthorized: invalid API key"),
+            ),
+        ],
+    };
+    super::sipil::SipilState {
+        watch,
+        transcript,
+        transcript_loaded: true,
+        send_error: send_error.map(str::to_string),
+        ..sipil_fixture(true)
+    }
+}
+
 /// Remote access as the service would report it, for the shots.
 fn remote_access_fixture(with_code: bool) -> super::connector::RemoteAccess {
     use pilus_client::agent_service::{DeviceLevel, EnrolledDevice, PairingCode, ServiceStatus};
@@ -2077,4 +2731,53 @@ fn capture(cx: &mut HeadlessAppContext, window: gpui::AnyWindowHandle, name: &st
         image.height()
     );
     Ok(())
+}
+
+/// A logo drawn the way a daemon draws its own: a face, on nothing.
+const DAEMON_LOGO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><g fill="#c9e35e"><path d="M83 52C83 76 70 86 50 86C30 86 17 76 17 52C17 30 30 20 50 20C70 20 83 30 83 52Z"/></g><g fill="#1c2a14"><circle cx="38" cy="48" r="5"/><circle cx="62" cy="48" r="5"/></g></svg>"##;
+
+/// What the demo daemon says about itself.
+fn about_fixture() -> pilus_client::sipil::About {
+    use pilus_client::sipil::{About, AgentDetail, ModelDetail, Role};
+    let model = |id: &str, name: &str| ModelDetail {
+        provider: "opencode-go".to_string(),
+        provider_name: "OpenCode Go".to_string(),
+        model_id: id.to_string(),
+        name: name.to_string(),
+    };
+    About {
+        name: "Researcher".to_string(),
+        hostname: "mac-mini.local".to_string(),
+        platform: "darwin 25.0.0 arm64".to_string(),
+        device_id: "26e9ba62f3c1d0a47b58e6c9a1f2d3e4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0".to_string(),
+        version: "0.1.0".to_string(),
+        workspace: "/Users/rizaldy/Developer/kepelet/sipil".to_string(),
+        home: "/Users/rizaldy/.sipil".to_string(),
+        model: Some(model("qwen3.8-max", "Qwen 3.8 Max")),
+        agents: vec![
+            AgentDetail {
+                id: "sipil".to_string(),
+                name: "Researcher".to_string(),
+                role: Role::Primary,
+                summary: "Takes a request, does the concrete work, and sends investigation to the researcher.".to_string(),
+                instructions: "You are Researcher, the chief of staff of a durable agent daemon.\nYou own the outcome of whatever you are asked.".to_string(),
+                tools: ["read", "write", "edit", "bash", "subagent", "create_artifacts"]
+                    .map(str::to_string)
+                    .to_vec(),
+                extensions: vec!["coding".to_string(), "artifacts".to_string()],
+            },
+            AgentDetail {
+                id: "researcher".to_string(),
+                name: "Researcher".to_string(),
+                role: Role::Subagent,
+                summary: "Finds things out and answers with cited evidence.".to_string(),
+                instructions: "You are a researcher. Report what you verified apart from what you infer.".to_string(),
+                tools: ["read", "bash", "web_fetch", "create_artifacts"]
+                    .map(str::to_string)
+                    .to_vec(),
+                extensions: vec!["coding".to_string()],
+            },
+        ],
+        logo: Some(DAEMON_LOGO.to_string()),
+    }
 }

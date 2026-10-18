@@ -578,6 +578,14 @@ fn line_end(text: &str, byte: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+/// `text` with every character drawn as asterisks, one per byte.
+///
+/// Matching the byte length is what lets the caret, the selection and a click
+/// keep using offsets into the real text, with no mapping between the two.
+fn mask(text: &str) -> String {
+    "*".repeat(text.len())
+}
+
 /// The UTF-16 length of `text` up to `byte`.
 fn byte_to_utf16(text: &str, byte: usize) -> usize {
     let at = text.floor_char_boundary(byte.min(text.len()));
@@ -637,6 +645,8 @@ pub(super) struct TextInput {
     /// The IME composition range, underlined while the input method is active.
     marked: Option<Range<usize>>,
     multiline: bool,
+    /// Draw the text as asterisks and keep it off the clipboard: an API key.
+    secret: bool,
     placeholder: SharedString,
     focus_handle: FocusHandle,
     font: Font,
@@ -715,6 +725,7 @@ impl TextInput {
             line_numbers: false,
             highlighted: None,
             multiline,
+            secret: false,
             placeholder: placeholder.into(),
             focus_handle: cx.focus_handle(),
             font,
@@ -728,6 +739,12 @@ impl TextInput {
             blink_started: false,
             last: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Mask the text and refuse to copy it, for a secret such as an API key.
+    pub(super) fn secret(mut self) -> Self {
+        self.secret = true;
+        self
     }
 
     /// Leave a bare Enter to the window; Shift+Enter still breaks the line.
@@ -979,6 +996,9 @@ impl TextInput {
     }
 
     fn copy(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.secret {
+            return false;
+        }
         let text = {
             let buffer = self.buffer.borrow();
             let range = buffer.range();
@@ -992,10 +1012,18 @@ impl TextInput {
     }
 
     fn cut(&mut self, cx: &mut Context<Self>) -> bool {
+        let range = self.buffer.borrow().range();
+        if self.secret {
+            // Cut still removes the selection; it just keeps it off the clipboard.
+            if range.start == range.end {
+                return false;
+            }
+            self.delete_range(range, cx);
+            return true;
+        }
         if !self.copy(cx) {
             return false;
         }
-        let range = self.buffer.borrow().range();
         self.delete_range(range, cx);
         true
     }
@@ -1283,6 +1311,8 @@ impl Render for TextInput {
             } else {
                 self.placeholder.to_string()
             }
+        } else if self.secret {
+            mask(&text)
         } else {
             text.clone()
         };
@@ -1751,6 +1781,17 @@ mod tests {
         let mut buffer = Buffer::new(String::new());
         buffer.replace(0..0, "a\nb", true);
         assert_eq!(buffer.text, "a\nb");
+    }
+
+    #[test]
+    fn a_masked_field_keeps_every_byte_offset() {
+        let text = "sk-é😀";
+        let masked = mask(text);
+        assert_eq!(masked.len(), text.len());
+        assert!(masked.chars().all(|ch| ch == '*'));
+        for (at, _) in text.char_indices() {
+            assert!(masked.is_char_boundary(at));
+        }
     }
 
     #[test]

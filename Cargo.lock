@@ -6395,11 +6395,14 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "interprocess",
+ "iroh",
+ "iroh-tickets",
  "libc",
  "pilus-protocol",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
 ]
 

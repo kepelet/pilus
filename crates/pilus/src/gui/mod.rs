@@ -49,6 +49,7 @@ mod picker;
 mod ports_tab;
 mod right_sidebar;
 mod scheme;
+mod search;
 mod selection;
 mod session_ops;
 #[cfg(feature = "visual-test")]
@@ -124,6 +125,7 @@ use pilus_protocol::{
 };
 use ports_tab::PortsPanel;
 use right_sidebar::{RightSidebar, SidebarTab};
+use search::SearchPage;
 use selection::{Cell, Selection};
 use session_ops::SessionVerb;
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
@@ -1198,6 +1200,8 @@ enum InputLayer {
     Mission,
     /// The native Automations page.
     Automations,
+    /// The Search page's query field.
+    Search,
     /// The chat page for a sipil agent or session.
     Sipil,
     /// The right sidebar's Sipil tab, with a field in it.
@@ -2042,6 +2046,10 @@ struct PilusView {
     github: GithubFeed,
     /// The page a GitHub row opens in the terminal's card.
     github_page: GithubPage,
+    /// The page that searches the agents' saved sessions.
+    search: SearchPage,
+    /// The Search page's query field, over `search`'s buffer.
+    search_input: Entity<TextInput>,
     files_panel: FilesPanel,
     /// Notes on excerpts of markdown files, and the field they are written in.
     md_notes: md_notes_view::MdNotes,
@@ -2329,6 +2337,30 @@ impl PilusView {
         })
         .detach();
 
+        let search = SearchPage::default();
+        let search_input = cx.new(|cx| {
+            TextInput::from_shared(
+                search.field.shared(),
+                "Search sessions by title, folder or branch",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+        // The field also notifies on caret blinks, which must not rerun the
+        // query.
+        cx.observe(&search_input, |this, input, cx| {
+            let query = input.read(cx).value();
+            if query != this.search.query() {
+                this.search.set_query(query);
+                this.search_requery();
+                cx.notify();
+            }
+        })
+        .detach();
+
         // The file list filters on what the search field holds. The field also
         // notifies on caret blinks, which must not repaint the page.
         cx.observe(&diff_inputs.search, |this, input, cx| {
@@ -2538,6 +2570,8 @@ impl PilusView {
             home_issues: HomeIssues::default(),
             github,
             github_page: GithubPage::default(),
+            search,
+            search_input,
             files_panel: FilesPanel::new(),
             md_notes,
             md_note_input,
@@ -3029,6 +3063,7 @@ impl PilusView {
         changed |= self.browser_tick(cx);
         changed |= self.mission_tick();
         changed |= self.automations_tick();
+        changed |= self.search_tick(cx);
         while let Ok(resolved) = self.home_resolve_rx.try_recv() {
             self.home_resolve_pending = false;
             for (endpoint_key, home) in resolved.homes {
@@ -4626,6 +4661,7 @@ impl PilusView {
             InputLayer::Browser => self.browser_key(event, cx),
             InputLayer::Mission => self.mission_key(event, cx),
             InputLayer::Automations => self.automations_key(event, cx),
+            InputLayer::Search => self.search_key(event, cx),
             InputLayer::Sipil => self.sipil_chat_key(event, cx),
             // The panel's own handler has read it; nothing is left for the window.
             InputLayer::SipilPanel => {}
@@ -4650,6 +4686,7 @@ impl PilusView {
                 .or(self.browser_focused().then_some(InputLayer::Browser))
                 .or(self.sipil_panel_focused().then_some(InputLayer::SipilPanel))
                 .or_else(|| self.page_layer().filter(|_| !self.terminal_beside_page()))
+                .or_else(|| self.search.is_open().then_some(InputLayer::Search))
                 .or_else(|| self.sipil_chat.open.then_some(InputLayer::Sipil)),
         )
     }
@@ -4859,6 +4896,7 @@ impl PilusView {
                 Some("⌘⇧O"),
             ),
             entry(Command::OpenHome, "New Agent", "Application", Some("⌘⇧N")),
+            entry(Command::OpenSearch, "Search Sessions", "Workspace", None),
             entry(
                 Command::OpenSettings,
                 "Settings",
@@ -4947,6 +4985,7 @@ impl PilusView {
             Command::OpenWorkspacePicker => self.open_picker(cx),
             Command::OpenSettings => self.open_settings(cx),
             Command::OpenHome => self.open_home(cx),
+            Command::OpenSearch => self.open_search(cx),
             Command::OpenUiPlayground => {
                 ui_playground::open(self.theme, self.shared_settings.clone(), cx);
             }
@@ -5073,6 +5112,7 @@ impl PilusView {
         self.mission.close();
         self.automations_page.close();
         self.github_page.close();
+        self.search.close();
         self.close_sipil_chat();
         self.home.close();
         self.update_url_editing = false;
@@ -5375,6 +5415,14 @@ impl PilusView {
                 .overflow_hidden()
                 .child(self.github_page(cx));
             return self.page_card("pilus-page-github", page, grid, layout, terminal_fill, cx);
+        }
+        if self.search.is_open() {
+            let page = div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.search_page(cx));
+            return self.page_card("pilus-page-search", page, grid, layout, terminal_fill, cx);
         }
         if self.settings_open {
             return style::enter(
@@ -6142,6 +6190,12 @@ impl PilusView {
             }
             InputLayer::Mission => None,
             InputLayer::Automations => None,
+            // The query field holds the keyboard, except over the permission
+            // card, which has none.
+            InputLayer::Search if self.search.typing(self.settings.index_agents) => {
+                Some(self.search_input.focus_handle(cx))
+            }
+            InputLayer::Search => None,
             // The composer holds the keyboard.
             InputLayer::Sipil => Some(self.sipil_chat.active_input().focus_handle(cx)),
             InputLayer::SipilPanel => None,
@@ -10874,6 +10928,7 @@ impl PilusView {
             SIDEBAR_ROW_EDGE,
         ));
         content = content.child(self.open_workspace_row(cx));
+        content = content.child(self.search_nav_row(cx));
         // sipil's own section leads the lists: the user's agents, people and
         // channels, with where the connection stands in its header.
         content = content.children(self.sipil_sections(cx));
@@ -13010,6 +13065,33 @@ impl PilusView {
             .on_click(cx.listener(|this, _, _, cx| this.open_picker(cx)))
     }
 
+    /// The Search row below Open Workspace: it opens the page that finds a
+    /// saved agent session and resumes it.
+    fn search_nav_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .id("pilus-search")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(SIDEBAR_GLYPH_GAP))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .pl(px(SIDEBAR_ROW_PAD))
+            .pr(px(SIDEBAR_ROW_PAD))
+            .radius_md()
+            .cursor_pointer()
+            .text_size(px(self.chrome_font()))
+            .text_color(theme.panel_fg)
+            .child(style::hover_target(&self.sidebar_hover))
+            .child(icon(
+                include_bytes!("../../assets/icons/search.svg"),
+                SIDEBAR_GLYPH,
+                theme.muted,
+            ))
+            .child(div().flex_1().child("Search"))
+            .on_click(cx.listener(|this, _, _, cx| this.open_search(cx)))
+    }
+
     /// Announce what the network side heard since the last tick: a message, as a
     /// toast and, while the window is not in front, as a system notification
     /// that opens the conversation when clicked; and a stranger knocking. A
@@ -13432,8 +13514,16 @@ impl PilusView {
             .daemons
             .iter()
             .map(|daemon| format!("daemon:{}", daemon.id))
-            .chain(me.channels.iter().map(|row| format!("channel:{}", row.channel.id)))
-            .chain(me.people.iter().map(|person| format!("person:{}", person.contact.id)))
+            .chain(
+                me.channels
+                    .iter()
+                    .map(|row| format!("channel:{}", row.channel.id)),
+            )
+            .chain(
+                me.people
+                    .iter()
+                    .map(|person| format!("person:{}", person.contact.id)),
+            )
             .collect();
         keys.sort_by_key(|key| self.sipil_rank(key));
         keys

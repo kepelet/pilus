@@ -271,6 +271,22 @@ with only the command-line tools can build the app.
   A deeper context wins over the global binding, so a new editor chord is
   another `KeyBinding` in that context.
 
+- Search (`gui/search.rs`, the row below Open Workspace) lists the Claude and Pi
+  sessions on this Mac and on saved SSH machines, from `pilus-index`: a SQLite
+  file, `index.db` beside the settings. It is a rebuildable cache of titles and
+  metadata (no message text); a `SCHEMA` bump drops and rebuilds it, so there are
+  no migrations. Nothing may read a transcript, locally or over SSH, until the
+  person turns on `Settings::index_agents`, and a remote machine is read only
+  while its id is in `Settings::index_machines`; do not call
+  `pilus_index::refresh` from anywhere that skips that check. Turning it off
+  calls `pilus_index::wipe`, and unticking a machine forgets its rows. Reads run
+  on one background thread, this Mac first, and a machine that cannot be listed
+  keeps its rows. A remote answer comes from `grep`/`tail` on the host, so keep
+  `scan::evidence_script` and `read_local` choosing the same lines. Resume is
+  `workspace.open` on the session's folder then `agent.resume` on its machine's
+  daemon. The `visual-test` captures use `search_show_sample` and never touch
+  the index.
+
 ## UI
 
 `crates/pilus/src/gui/ui_playground.rs` is the visual contract: a working

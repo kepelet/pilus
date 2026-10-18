@@ -1,0 +1,370 @@
+//! Finding transcripts and reading the lines that name them.
+//!
+//! A machine is listed first (path, size, modified time, which is all it takes
+//! to know what changed), and evidence is read only for the files that did.
+//! The local reader and the remote script pick the same lines, so a parser
+//! cannot tell which one fed it.
+
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::Stdio;
+
+use pilus_client::SshTarget;
+
+use crate::error::{Error, Result};
+use crate::model::Agent;
+use crate::parse::Evidence;
+
+/// A transcript as a listing shows it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Probe {
+    pub path: String,
+    pub agent: Agent,
+    pub size: u64,
+    pub mtime: i64,
+}
+
+/// Markers of the lines that start a transcript: a header or a user message.
+const HEAD_NEEDLES: [&str; 3] = [
+    r#""type":"user""#,
+    r#""type":"session""#,
+    r#""role":"user""#,
+];
+/// Markers of the lines that rename a session, one kept per marker.
+const TITLE_NEEDLES: [&str; 3] = [
+    r#""type":"ai-title""#,
+    r#""type":"custom-title""#,
+    r#""type":"session_info""#,
+];
+/// How many head lines are worth reading: the first prompt is among them.
+const HEAD_LINES: usize = 12;
+/// A longer line is a pasted blob, not a title, and is never parsed.
+const LINE_CAP: usize = 64 * 1024;
+/// Files per remote read, so one answer stays a modest size.
+const REMOTE_BATCH: usize = 60;
+
+/// Every transcript under `home`.
+pub fn list_local(home: &Path) -> Result<Vec<Probe>> {
+    let mut found = Vec::new();
+    for agent in Agent::ALL {
+        let Ok(projects) = fs::read_dir(home.join(agent.root())) else {
+            continue;
+        };
+        for project in projects.flatten() {
+            let Ok(files) = fs::read_dir(project.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                if let Some(probe) = probe(agent, &path) {
+                    found.push(probe);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn probe(agent: Agent, path: &Path) -> Option<Probe> {
+    let name = path.file_name()?.to_str()?;
+    if !wanted(agent, name) {
+        return None;
+    }
+    let meta = fs::metadata(path).ok().filter(fs::Metadata::is_file)?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(Probe {
+        path: path.to_str()?.to_string(),
+        agent,
+        size: meta.len(),
+        mtime: i64::try_from(mtime).ok()?,
+    })
+}
+
+/// Whether `name` is a session transcript rather than a helper file: Claude's
+/// older sidechain logs are named `agent-*` and are not sessions of their own.
+fn wanted(agent: Agent, name: &str) -> bool {
+    name.ends_with(".jsonl") && !(agent == Agent::Claude && name.starts_with("agent-"))
+}
+
+/// The evidence lines of one local transcript.
+pub fn read_local(path: &str) -> Result<Evidence> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut evidence = Evidence::default();
+    let mut titles: [Option<String>; 3] = [None, None, None];
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        if reader.read_until(b'\n', &mut buffer)? == 0 {
+            break;
+        }
+        if buffer.len() > LINE_CAP {
+            continue;
+        }
+        let line = String::from_utf8_lossy(&buffer);
+        let line = line.trim_end();
+        if evidence.head.len() < HEAD_LINES
+            && HEAD_NEEDLES.iter().any(|needle| line.contains(needle))
+        {
+            evidence.head.push(line.to_string());
+        }
+        if let Some(at) = TITLE_NEEDLES
+            .iter()
+            .position(|needle| line.contains(needle))
+        {
+            titles[at] = Some(line.to_string());
+        }
+    }
+    evidence.titles = titles.into_iter().flatten().collect();
+    Ok(evidence)
+}
+
+/// Run `script` on the host with `input` on its standard input.
+fn run_remote(target: &SshTarget, script: &str, input: &str) -> Result<Vec<u8>> {
+    let mut child = target
+        .shell_multiplexed(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| Error::Remote(format!("couldn't reach the host: {error}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // A script that ends early closes the pipe; its status says why.
+        let _ = stdin.write_all(input.as_bytes());
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| Error::Remote(error.to_string()))?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(Error::Remote(if stderr.is_empty() {
+        "the host refused the listing".to_string()
+    } else {
+        stderr
+    }))
+}
+
+/// Lists `size mtime path` per transcript. `stat` spells its format flag two
+/// ways (GNU and BSD), so the one that works on the host is picked once.
+fn listing_script() -> String {
+    let mut script = String::from(
+        "if stat -c %s / >/dev/null 2>&1; then GNU=1; else GNU=; fi\n\
+         list() {\n\
+           [ -d \"$1\" ] || return 0\n\
+           if [ -n \"$GNU\" ]; then\n\
+             find \"$1\" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -exec stat -c '%s %Y %n' {} +\n\
+           else\n\
+             find \"$1\" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -exec stat -f '%z %m %N' {} +\n\
+           fi\n\
+         }\n",
+    );
+    for agent in Agent::ALL {
+        script.push_str(&format!("list \"$HOME/{}\"\n", agent.root()));
+    }
+    script.push_str("exit 0\n");
+    script
+}
+
+/// Every transcript on a remote host.
+pub fn list_remote(target: &SshTarget) -> Result<Vec<Probe>> {
+    let out = run_remote(target, &listing_script(), "")?;
+    Ok(parse_listing(&String::from_utf8_lossy(&out)))
+}
+
+fn parse_listing(text: &str) -> Vec<Probe> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, ' ');
+            let size = parts.next()?.parse().ok()?;
+            let mtime = parts.next()?.parse().ok()?;
+            let path = parts.next()?;
+            let agent = Agent::from_path(path)?;
+            let name = path.rsplit('/').next()?;
+            wanted(agent, name).then(|| Probe {
+                path: path.to_string(),
+                agent,
+                size,
+                mtime,
+            })
+        })
+        .collect()
+}
+
+/// Reads, for each path on stdin, the same lines [`read_local`] keeps. `grep`
+/// stops early for the head and `tail` keeps the last rename of each kind, so
+/// a multi-megabyte transcript costs a scan on the host and a few lines on
+/// the wire. `cut` caps a pasted blob the way `LINE_CAP` does locally.
+fn evidence_script() -> String {
+    let mut script = String::from("while IFS= read -r p; do\n  printf '@@FILE %s\\n' \"$p\"\n");
+    let head = HEAD_NEEDLES
+        .iter()
+        .map(|needle| format!("-e '{needle}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    script.push_str(&format!(
+        "  grep -a -m {HEAD_LINES} {head} \"$p\" 2>/dev/null | cut -b1-{LINE_CAP}\n"
+    ));
+    script.push_str("  printf '@@TITLES\\n'\n");
+    for needle in TITLE_NEEDLES {
+        script.push_str(&format!(
+            "  grep -a -e '{needle}' \"$p\" 2>/dev/null | tail -n 1 | cut -b1-4096\n"
+        ));
+    }
+    script.push_str("  printf '@@END\\n'\ndone\n");
+    script
+}
+
+/// Evidence for `paths` on a remote host, keyed by path.
+pub fn read_remote(target: &SshTarget, paths: &[String]) -> Result<Vec<(String, Evidence)>> {
+    let script = evidence_script();
+    let mut all = Vec::new();
+    for batch in paths.chunks(REMOTE_BATCH) {
+        let input: String = batch
+            .iter()
+            .filter(|path| !path.contains('\n'))
+            .map(|path| format!("{path}\n"))
+            .collect();
+        let out = run_remote(target, &script, &input)?;
+        all.extend(parse_evidence(&String::from_utf8_lossy(&out)));
+    }
+    Ok(all)
+}
+
+fn parse_evidence(text: &str) -> Vec<(String, Evidence)> {
+    let mut found = Vec::new();
+    let mut current: Option<(String, Evidence)> = None;
+    let mut in_titles = false;
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("@@FILE ") {
+            current = Some((path.to_string(), Evidence::default()));
+            in_titles = false;
+        } else if line == "@@TITLES" {
+            in_titles = true;
+        } else if line == "@@END" {
+            found.extend(current.take());
+        } else if let Some((_, evidence)) = current.as_mut()
+            && !line.is_empty()
+        {
+            let lines = if in_titles {
+                &mut evidence.titles
+            } else {
+                &mut evidence.head
+            };
+            lines.push(line.to_string());
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pilus-index-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn local_listing_finds_both_agents_and_skips_helpers() {
+        let home = scratch("list");
+        let claude = home.join(".claude/projects/-work-app");
+        let pi = home.join(".pi/agent/sessions/--work-app--");
+        fs::create_dir_all(&claude).expect("claude dir");
+        fs::create_dir_all(&pi).expect("pi dir");
+        fs::write(claude.join("abc.jsonl"), "{}\n").expect("claude");
+        fs::write(claude.join("agent-1.jsonl"), "{}\n").expect("sidechain");
+        fs::write(claude.join("notes.txt"), "x").expect("other");
+        fs::write(pi.join("2026_01a1.jsonl"), "{}\n").expect("pi");
+
+        let mut found = list_local(&home).expect("list");
+        found.sort_by(|a, b| a.path.cmp(&b.path));
+        let kinds: Vec<_> = found.iter().map(|probe| probe.agent).collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(kinds.contains(&Agent::Claude) && kinds.contains(&Agent::Pi));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn local_evidence_keeps_the_head_and_the_last_title_of_each_kind() {
+        let home = scratch("evidence");
+        let path = home.join("s.jsonl");
+        let lines = [
+            r#"{"type":"mode"}"#,
+            r#"{"type":"user","message":{"role":"user","content":"first"}}"#,
+            r#"{"type":"ai-title","aiTitle":"old"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant"}}"#,
+            r#"{"type":"ai-title","aiTitle":"new"}"#,
+        ];
+        fs::write(&path, lines.join("\n")).expect("write");
+        let evidence = read_local(path.to_str().expect("utf8")).expect("read");
+        assert_eq!(evidence.head, vec![lines[1].to_string()]);
+        assert_eq!(evidence.titles, vec![lines[4].to_string()]);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_pasted_blob_line_is_ignored() {
+        let home = scratch("blob");
+        let path = home.join("s.jsonl");
+        let blob = format!(
+            r#"{{"type":"user","message":{{"content":"{}"}}}}"#,
+            "x".repeat(LINE_CAP)
+        );
+        fs::write(&path, format!("{blob}\n")).expect("write");
+        let evidence = read_local(path.to_str().expect("utf8")).expect("read");
+        assert!(evidence.head.is_empty());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_remote_listing_is_classified_by_directory() {
+        let text = "120 1790000000 /home/me/.claude/projects/-w/abc.jsonl\n\
+                    9 1790000001 /home/me/.pi/agent/sessions/--w--/2026_01.jsonl\n\
+                    5 1790000002 /home/me/.claude/projects/-w/agent-9.jsonl\n\
+                    7 1790000003 /home/me/other/x.jsonl\n\
+                    junk\n";
+        let found = parse_listing(text);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].agent, Agent::Claude);
+        assert_eq!(found[0].size, 120);
+        assert_eq!(found[1].agent, Agent::Pi);
+        assert_eq!(found[1].mtime, 1_790_000_001);
+    }
+
+    #[test]
+    fn a_remote_answer_is_split_per_file() {
+        let text = "@@FILE /a.jsonl\n{\"h\":1}\n@@TITLES\n{\"t\":1}\n@@END\n\
+                    @@FILE /b.jsonl\n@@TITLES\n@@END\n";
+        let found = parse_evidence(text);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].0, "/a.jsonl");
+        assert_eq!(found[0].1.head, vec!["{\"h\":1}"]);
+        assert_eq!(found[0].1.titles, vec!["{\"t\":1}"]);
+        assert!(found[1].1.head.is_empty());
+    }
+
+    #[test]
+    fn the_remote_scripts_run_under_a_posix_shell() {
+        // Not a parse of the output: only that sh accepts the syntax, so a typo
+        // in a script nobody can run without a second machine is still caught.
+        for script in [listing_script(), evidence_script()] {
+            let status = std::process::Command::new("sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(&script)
+                .status()
+                .expect("sh");
+            assert!(status.success(), "{script}");
+        }
+    }
+}

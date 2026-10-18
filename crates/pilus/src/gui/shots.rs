@@ -1066,6 +1066,26 @@ pub fn run_main() -> Result<()> {
     });
     settle(&mut cx, 6);
     capture(&mut cx, window.into(), "main-github-pinned")?;
+    for (name, allowed, panel) in [
+        ("consent", false, false),
+        ("results", true, false),
+        ("sources", true, true),
+    ] {
+        cx.update(|app| {
+            view.update(app, |view, cx| view.search_show_sample(allowed, panel, cx));
+        });
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), &format!("main-search-{name}"))?;
+    }
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.leave_settings_page();
+            view.settings.index_agents = false;
+            view.settings.index_machines.clear();
+            *view.shared_settings.borrow_mut() = view.settings.clone();
+            cx.notify();
+        });
+    });
     for which in ["list", "issues", "pulls", "actions", "pull", "issue"] {
         cx.update(|app| {
             view.update(app, |view, cx| {

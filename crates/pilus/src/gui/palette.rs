@@ -38,6 +38,7 @@ pub enum Command {
     OpenWorkspacePicker,
     OpenSettings,
     OpenHome,
+    OpenSearch,
     OpenUiPlayground,
     Quit,
     FocusTab(u16),

@@ -154,6 +154,14 @@ pub struct Settings {
     /// network side at launch. Off until the Sipil tab turns it on. Contacts
     /// can be added and a daemon used without it, but nobody can message back.
     pub sipil_online: bool,
+    /// Whether pilus may read the coding agents' session transcripts (Claude,
+    /// Pi) to index their titles and metadata for Search. Off until the person
+    /// agrees on the Search page; turning it off deletes the index. Nothing is
+    /// read from disk or over SSH while it is off.
+    pub index_agents: bool,
+    /// The machines the index reads while `index_agents` is on: `local`, and the
+    /// ids of saved SSH profiles. A remote one is never read unless named here.
+    pub index_machines: Vec<String>,
     /// The SIPIL sidebar rows (`daemon:<id>`, `channel:<id>`, `person:<id>`) in
     /// the order the person dragged them into. A row not named here comes after
     /// the ones that are, in the order the section would list it.
@@ -233,6 +241,8 @@ impl Default for Settings {
             github_repositories: true,
             github_pinned: Vec::new(),
             sipil_online: false,
+            index_agents: false,
+            index_machines: Vec::new(),
             sipil_order: Vec::new(),
             right_sidebar_visible: false,
             right_sidebar_width: 0.0,
@@ -787,6 +797,8 @@ mod tests {
             github_repositories: false,
             github_pinned: vec!["o/r".to_string()],
             sipil_online: true,
+            index_agents: true,
+            index_machines: vec!["local".to_string(), "build-box".to_string()],
             sipil_order: vec!["person:b".to_string(), "daemon:a".to_string()],
             right_sidebar_visible: true,
             right_sidebar_width: 480.0,

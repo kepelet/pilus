@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pilus-protocol", "crates/pilus-client", "crates/pilus", "crates/pilus-agent", "crates/pilus-mobile"]
+members = ["crates/pilus-protocol", "crates/pilus-client", "crates/pilus-index", "crates/pilus", "crates/pilus-agent", "crates/pilus-mobile"]
 resolver = "2"
 
 [workspace.package]
@@ -42,6 +42,9 @@ objc2-user-notifications = "0.3"
 block2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAlert", "NSAppearance", "NSApplication", "NSAttributedString", "NSButton", "NSColor", "NSControl", "NSDockTile", "NSFont", "NSGraphics", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSStringDrawing", "NSView", "NSVisualEffectView", "NSWindow", "objc2-core-foundation", "std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSAttributedString", "NSBundle", "NSData", "NSGeometry", "NSProcessInfo", "NSRange", "NSString", "NSValue", "std"] }
+# `bundled` compiles SQLite from source with the C compiler the command-line
+# tools already ship, so the index needs no system library.
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -55,6 +58,7 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 
 pilus-client = { path = "crates/pilus-client" }
+pilus-index = { path = "crates/pilus-index" }
 pilus-agent = { path = "crates/pilus-agent" }
 pilus-protocol = { path = "crates/pilus-protocol" }
 

@@ -76,10 +76,18 @@ serve-preview:
 check-updates *args:
     cargo run -p pilus --no-default-features -- --check-updates {{args}}
 
+# Build the landing page and docs into site/dist.
+site-build:
+    cd site && bun install --frozen-lockfile && bun run build
+
+# Run the landing page and docs locally with live reload.
+site-dev:
+    cd site && bun install --frozen-lockfile && bun run dev
+
 # Preview what `infra-deploy` would change on Cloudflare (site + releases bucket).
-infra-plan:
+infra-plan: site-build
     cd infra && bun install --frozen-lockfile && dotenvx run -- bunx alchemy plan --stage prod
 
 # Apply infra/alchemy.run.ts: the usepilus.dev site and releases.kepelet.com.
-infra-deploy:
+infra-deploy: site-build
     cd infra && bun install --frozen-lockfile && dotenvx run -- bunx alchemy deploy --stage prod

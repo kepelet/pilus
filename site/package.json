@@ -1,0 +1,14 @@
+{
+  "name": "pilus-site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "blume dev",
+    "build": "blume build",
+    "preview": "blume preview",
+    "doctor": "blume doctor"
+  },
+  "dependencies": {
+    "blume": "^2.2.3"
+  }
+}

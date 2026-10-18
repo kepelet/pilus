@@ -20,10 +20,11 @@ export default Alchemy.Stack(
       domains: [{ name: "releases.kepelet.com" }],
     });
 
-    // `site/` has no build step, so it ships as an assets-only Worker.
+    // `site/` is a Blume project; `bun run build` there writes the static site
+    // to `site/dist`, which ships as an assets-only Worker.
     const site = yield* Cloudflare.Worker("Site", {
       assets: {
-        directory: "../site",
+        directory: "../site/dist",
         htmlHandling: "auto-trailing-slash",
         notFoundHandling: "404-page",
       },

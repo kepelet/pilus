@@ -1,0 +1,120 @@
+---
+// The blog index's post list, laid out like the changelog's release list:
+// every visible `type: blog` entry, newest first, grouped by year, each row
+// linking to its own post. Blume generates no blog index, so this is
+// `Changelog.astro` narrowed to blog entries; it lists itself in an `.mdx`
+// index page as `<BlogPosts />`. The `type` prop picks another front-matter
+// type, so the guides index is `<BlogPosts type="guide" />`.
+import { getCollection } from "astro:content";
+import data from "blume:data";
+
+import { withMountedBase } from "blume/components/islands/base-path.ts";
+import {
+  compareChangelogDates,
+  groupChangelogYears,
+  parseChangelogDate,
+} from "blume/core/changelog-list.ts";
+import { resolveDateFormatOptions } from "blume/core/date-format.ts";
+
+const { type = "blog" } = Astro.props;
+
+const i18n = data.config.i18n;
+const locale = i18n ? i18n.defaultLocale : null;
+const readerLocale = i18n ? (Astro.currentLocale ?? i18n.defaultLocale) : "en";
+
+const dateFormatOptions = resolveDateFormatOptions(data.config.dateFormat);
+const { dateStyle, year: _year, ...dateComponents } = dateFormatOptions;
+const rowDateFormat: Intl.DateTimeFormatOptions = dateStyle
+  ? {
+      ...dateComponents,
+      day: "numeric",
+      month: dateStyle === "medium" ? "short" : "long",
+    }
+  : dateComponents;
+const formatRowDate = (date: Date) =>
+  new Intl.DateTimeFormat(readerLocale, rowDateFormat).format(date);
+const formatYear = (date: Date) =>
+  new Intl.DateTimeFormat(readerLocale, {
+    timeZone: dateFormatOptions.timeZone,
+    year: "numeric",
+  }).format(date);
+
+// A post is listed only when it has a current-docs route in the default
+// locale, so archived versions and untranslated fallback copies never add a
+// second row for the same post.
+const routeByEntry = new Map<string, string>();
+for (const route of data.routes) {
+  if (
+    route.version === "" &&
+    !route.fallback &&
+    (locale === null || route.locale === locale)
+  ) {
+    routeByEntry.set(`${route.collection}:${route.entryId}`, route.path);
+  }
+}
+
+const rows = (await getCollection("docs"))
+  .filter(
+    (entry) =>
+      entry.data.type === type &&
+      !entry.data.draft &&
+      !entry.data.sidebar?.hidden &&
+      routeByEntry.has(`${entry.collection}:${entry.id}`)
+  )
+  .map((entry) => {
+    const date = parseChangelogDate(entry.data.date);
+    const route = routeByEntry.get(`${entry.collection}:${entry.id}`);
+    return {
+      date: date ? formatRowDate(date) : null,
+      dateTime: date ? date.toISOString().slice(0, 10) : null,
+      href: route ? withMountedBase(route) : null,
+      label: entry.data.title,
+      sortDate: date,
+      year: date ? formatYear(date) : null,
+    };
+  })
+  .toSorted((a, b) => compareChangelogDates(a.sortDate, b.sortDate));
+
+const groups = groupChangelogYears(rows, (row) => row.year);
+---
+
+{
+  rows.length === 0 ? (
+    <p>Belum ada.</p>
+  ) : (
+    <div class="not-prose mt-10 divide-y divide-border border-border border-y">
+      {groups.map((group) => (
+        <section
+          aria-label={group.year ?? undefined}
+          class="grid md:grid-cols-[6rem_minmax(0,1fr)] md:gap-x-8"
+        >
+          <h2 class="mt-0! pt-3! font-medium! text-muted-foreground text-sm! leading-5! tabular-nums max-md:pb-1">
+            {group.year}
+          </h2>
+          <ul class="m-0! list-none divide-y divide-border p-0!">
+            {group.items.map((item) => (
+              <li class="m-0! p-0!">
+                <a
+                  class="group/post flex items-baseline gap-4 py-3 no-underline! hover:no-underline!"
+                  href={item.href ?? undefined}
+                >
+                  <span class="min-w-0 flex-1 font-medium text-foreground text-sm transition-colors group-hover/post:text-accent">
+                    {item.label}
+                  </span>
+                  {item.date && (
+                    <time
+                      class="shrink-0 font-mono text-muted-foreground text-xs tabular-nums"
+                      datetime={item.dateTime}
+                    >
+                      {item.date}
+                    </time>
+                  )}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))}
+    </div>
+  )
+}

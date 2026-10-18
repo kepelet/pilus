@@ -1,3 +1,6 @@
+---
+---
+
 <!doctype html>
 <html lang="en">
 <head>
@@ -12,7 +15,7 @@
 <meta property="og:image" content="https://usepilus.dev/assets/main-home.png">
 <link rel="icon" type="image/svg+xml" href="assets/pilus.svg">
 <link rel="stylesheet" href="tokens.css">
-<style>
+<style is:inline>
   *, *::before, *::after { box-sizing: border-box; }
 
   html {
@@ -89,9 +92,54 @@
     height: 78px;
     margin-inline: auto;
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
     align-items: center;
     gap: 28px;
+  }
+
+  .nav-menu {
+    --spring: linear(0, 0.066, 0.221, 0.411, 0.599, 0.763, 0.893, 0.985, 1.043, 1.074, 1.083, 1.079, 1.067, 1.051, 1.035, 1.021, 1.01, 1.002, 0.997, 0.994, 1);
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  /* One pill shared by all links: the script slides it to the hovered link, and
+     the spring overshoots so it settles like it was dropped there. */
+  .nav-pill {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    border-radius: 999px;
+    background: rgba(16, 16, 15, 0.07);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 160ms ease-out;
+  }
+
+  .nav-pill.is-visible {
+    opacity: 1;
+  }
+
+  .nav-pill.is-sliding {
+    transition: opacity 160ms ease-out, transform 600ms var(--spring), width 600ms var(--spring);
+  }
+
+  .nav-menu a {
+    position: relative;
+    padding: 8px 24px;
+    color: var(--muted);
+    font-size: 14px;
+    font-weight: 500;
+    letter-spacing: -0.015em;
+    transition: color 180ms ease-out;
+  }
+
+  .nav-menu a:hover,
+  .nav-menu a:focus-visible {
+    color: var(--ink);
   }
 
   .brand {
@@ -100,11 +148,12 @@
     align-items: center;
     gap: 0.22em;
     font-size: 24px;
-    font-weight: 690;
-    letter-spacing: -0.04em;
+    font-weight: 600;
+    letter-spacing: -0.025em;
   }
 
   .nav-action {
+    grid-column: 3;
     justify-self: end;
   }
 
@@ -120,7 +169,7 @@
     background: var(--white);
     color: var(--ink);
     font-size: 14px;
-    font-weight: 620;
+    font-weight: 600;
     white-space: nowrap;
     letter-spacing: -0.015em;
     transition: transform 180ms cubic-bezier(.16, 1, .3, 1), background 180ms ease-out, border-color 180ms ease-out;
@@ -195,12 +244,13 @@
   }
 
   .hero h1 {
+    font-family: var(--font-mono);
     max-width: 980px;
     margin: 0 auto;
     font-size: clamp(3.8rem, 7vw, 6.25rem);
-    font-weight: 690;
+    font-weight: 600;
     line-height: 0.93;
-    letter-spacing: -0.04em;
+    letter-spacing: -0.0666em;
     text-wrap: balance;
     overflow-wrap: anywhere;
     min-width: 0;
@@ -307,17 +357,18 @@
     color: var(--amber-ink);
     font-family: var(--font-mono);
     font-size: 12px;
-    font-weight: 620;
+    font-weight: 600;
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
 
   .section-heading {
+    font-family: var(--font-mono);
     margin: 0;
     font-size: clamp(2.8rem, 5.7vw, 5.25rem);
-    font-weight: 680;
+    font-weight: 600;
     line-height: 0.94;
-    letter-spacing: -0.04em;
+    letter-spacing: -0.0666em;
     text-wrap: balance;
     overflow-wrap: anywhere;
     min-width: 0;
@@ -366,11 +417,12 @@
   }
 
   .architecture-layer h3 {
+    font-family: var(--font-mono);
     margin: 0;
     font-size: clamp(2.1rem, 3.4vw, 3.35rem);
-    font-weight: 610;
+    font-weight: 600;
     line-height: 0.95;
-    letter-spacing: -0.045em;
+    letter-spacing: -0.0666em;
   }
 
   .architecture-layer p {
@@ -402,7 +454,7 @@
     color: var(--amber-ink);
     font-family: var(--font-mono);
     font-size: 11px;
-    font-weight: 650;
+    font-weight: 600;
   }
 
   .architecture-visual {
@@ -512,13 +564,13 @@
     font-family: var(--font-sans);
     font-size: 28px;
     font-weight: 560;
-    letter-spacing: -0.04em;
+    letter-spacing: -0.025em;
   }
 
   .isometric-architecture .iso-pilus {
     fill: var(--amber-pale);
     font-size: 12px;
-    font-weight: 650;
+    font-weight: 600;
     letter-spacing: 0.12em;
   }
 
@@ -558,6 +610,28 @@
     inset: 4px;
     border: 1px solid var(--blueprint-line);
     pointer-events: none;
+  }
+
+  /* One stage per line, like a multi-line pipe, so the long word never has to
+     wrap mid-word at display size. */
+  .section-heading.pipeline {
+    font-size: clamp(2rem, 4.2vw, 3.6rem);
+    line-height: 1.2;
+  }
+
+  .pipeline-stage {
+    display: block;
+    white-space: nowrap;
+  }
+
+  /* Only the input line gets room: it is a quoted value, the pipe stages below
+     it belong together. */
+  .pipeline-stage:first-child {
+    margin-bottom: 0.5em;
+  }
+
+  .pipeline-op {
+    color: var(--amber);
   }
 
   .explainer-head {
@@ -602,7 +676,7 @@
     color: var(--blueprint-copy);
     font-family: var(--font-sans);
     font-size: 13px;
-    font-weight: 660;
+    font-weight: 600;
     letter-spacing: -0.01em;
   }
 
@@ -695,7 +769,7 @@
 
   .mc-title {
     color: var(--blueprint-ink);
-    font-weight: 650;
+    font-weight: 600;
     letter-spacing: 0.06em;
   }
 
@@ -985,11 +1059,12 @@
   }
 
   .explainer-copy h3 {
+    font-family: var(--font-mono);
     margin: 0;
     font-size: clamp(1.7rem, 2.8vw, 2.6rem);
-    font-weight: 620;
+    font-weight: 600;
     line-height: 1.0;
-    letter-spacing: -0.035em;
+    letter-spacing: -0.03em;
   }
 
   .explainer-copy p {
@@ -1052,9 +1127,9 @@
   .feature-copy h3 {
     margin: 0;
     font-size: clamp(2rem, 3.2vw, 3rem);
-    font-weight: 660;
+    font-weight: 600;
     line-height: 0.98;
-    letter-spacing: -0.04em;
+    letter-spacing: -0.025em;
     text-wrap: balance;
   }
 
@@ -1190,9 +1265,9 @@
   .inventory-item h3 {
     margin: 0;
     font-size: 16px;
-    font-weight: 640;
+    font-weight: 600;
     line-height: 1.02;
-    letter-spacing: -0.04em;
+    letter-spacing: -0.025em;
   }
 
   .inventory-item p {
@@ -1220,12 +1295,13 @@
   }
 
   .faq h2 {
+    font-family: var(--font-mono);
     margin: 0;
     font-size: clamp(2rem, 4vw, 6rem);
     text-wrap: balance;
-    font-weight: 680;
+    font-weight: 600;
     line-height: 1.1;
-    letter-spacing: -0.04em;
+    letter-spacing: -0.0666em;
     overflow-wrap: anywhere;
     min-width: 0;
   }
@@ -1270,7 +1346,7 @@
     list-style: none;
     color: var(--white);
     font-size: 17px;
-    font-weight: 610;
+    font-weight: 600;
     letter-spacing: -0.02em;
   }
 
@@ -1488,6 +1564,10 @@
       height: 66px;
     }
 
+    .nav-menu {
+      display: none;
+    }
+
     .nav-action {
       min-height: 38px;
       padding-inline: 15px;
@@ -1547,6 +1627,10 @@
 
     .section-heading {
       font-size: clamp(2.7rem, 12vw, 4rem);
+    }
+
+    .section-heading.pipeline {
+      font-size: clamp(1.6rem, 7.5vw, 2.4rem);
     }
 
     .architecture-visual {
@@ -1754,6 +1838,13 @@
       </svg>
       pilus
     </a>
+    <nav class="nav-menu" aria-label="Primary">
+      <span class="nav-pill" aria-hidden="true"></span>
+      <a href="/docs">Docs</a>
+      <a href="/guides">Guides</a>
+      <a href="/changelog">Changelog</a>
+      <a href="/blog">Blog</a>
+    </nav>
     <a class="button button-small nav-action" href="https://usepilus.dev/ios">Install pilus via TestFlight</a>
   </div>
 </header>
@@ -1782,7 +1873,7 @@
           <span class="hero-lede-note">Also, pilus is a terminal after all.</span>
         </p>
         <div class="hero-actions">
-          <a class="button button-dark" href="https://usepilus.dev/download">Download for macOS</a>
+          <a class="button button-dark" href="https://usepilus.dev/download">Download for macOS (alpha)</a>
         </div>
       </div>
     </div>
@@ -1948,8 +2039,12 @@
   <section class="explainer" id="how-it-works" aria-labelledby="explainer-title">
     <div class="wrap">
       <div class="explainer-head">
-        <h2 class="section-heading" id="explainer-title">Create. Automate. Orchestrate.</h2>
-        <p>From your Mac or from your phone.<br>On your Mac or on some cloud.</p>
+        <h2 class="section-heading pipeline" id="explainer-title">
+          <span class="pipeline-stage">"your idea"</span>
+          <span class="pipeline-stage"><span class="pipeline-op" aria-hidden="true">|&gt;</span> automate</span>
+          <span class="pipeline-stage"><span class="pipeline-op" aria-hidden="true">|&gt;</span> orchestrate</span>
+        </h2>
+        <p>From your Mac or your phone.<br>On your Mac or some cloud.</p>
         <p class="explainer-thanks">Thanks to Luvus Universal Harness Protocol (UHP)</p>
         <a class="button explainer-thanks-button" href="https://luvus.dev/docs/uhp/">Learn More about UHP</a>
       </div>
@@ -2199,7 +2294,7 @@
     <div class="wrap">
       <div class="inventory-head">
         <div class="inventory-head-copy">
-          <h2 class="section-heading" id="inventory-title">After all, pilus is a terminal client.</h2>
+          <h2 class="section-heading" id="inventory-title">pilus is just a terminal client.</h2>
           <p class="inventory-sub">But why?</p>
         </div>
         <p>
@@ -2299,7 +2394,7 @@
   </div>
 </footer>
 
-<script>
+<script is:inline>
   (() => {
     const marks = document.querySelectorAll('.pilus-mark');
     if (!marks.length) return;
@@ -2421,5 +2516,31 @@
     window.setTimeout(add, between(1200, 2000));
   })();
 </script>
+
+<script is:inline>
+  (() => {
+    const menu = document.querySelector('.nav-menu');
+    const pill = menu && menu.querySelector('.nav-pill');
+    if (!pill) return;
+
+    // The first entry places the pill without sliding it in from the corner.
+    const moveTo = (link) => {
+      const sliding = pill.classList.contains('is-visible');
+      pill.classList.toggle('is-sliding', sliding);
+      pill.style.width = link.offsetWidth + 'px';
+      pill.style.transform = 'translateX(' + link.offsetLeft + 'px)';
+      pill.classList.add('is-visible');
+    };
+    const hide = () => pill.classList.remove('is-visible');
+
+    menu.querySelectorAll('a').forEach((link) => {
+      link.addEventListener('pointerenter', () => moveTo(link));
+      link.addEventListener('focus', () => moveTo(link));
+      link.addEventListener('blur', hide);
+    });
+    menu.addEventListener('pointerleave', hide);
+  })();
+</script>
+
 </body>
 </html>

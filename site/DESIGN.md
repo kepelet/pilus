@@ -14,24 +14,24 @@ colors:
   line-dark: "rgba(255, 255, 255, 0.12)"
 typography:
   display:
-    fontFamily: "Geist, -apple-system, BlinkMacSystemFont, Helvetica Neue, sans-serif"
+    fontFamily: "Arimo, -apple-system, BlinkMacSystemFont, Helvetica Neue, sans-serif"
     fontSize: "clamp(3.8rem, 7vw, 6.25rem)"
-    fontWeight: 690
+    fontWeight: 600
     lineHeight: 0.93
-    letterSpacing: "-0.04em"
+    letterSpacing: "-0.025em"
   headline:
-    fontFamily: "Geist, -apple-system, BlinkMacSystemFont, Helvetica Neue, sans-serif"
+    fontFamily: "Arimo, -apple-system, BlinkMacSystemFont, Helvetica Neue, sans-serif"
     fontSize: "clamp(2.8rem, 5vw, 4.8rem)"
-    fontWeight: 680
+    fontWeight: 600
     lineHeight: 0.94
-    letterSpacing: "-0.04em"
+    letterSpacing: "-0.025em"
   body:
-    fontFamily: "Geist, -apple-system, BlinkMacSystemFont, Helvetica Neue, sans-serif"
+    fontFamily: "Arimo, -apple-system, BlinkMacSystemFont, Helvetica Neue, sans-serif"
     fontSize: "16px"
     fontWeight: 400
     lineHeight: 1.5
   label:
-    fontFamily: "Geist Mono, ui-monospace, SFMono-Regular, monospace"
+    fontFamily: "Ioskeley Mono, ui-monospace, SFMono-Regular, monospace"
     fontSize: "12px"
     fontWeight: 500
     lineHeight: 1.5
@@ -77,7 +77,7 @@ The Pilus marketing site presents a serious native tool with the calm confidence
 The system is intentionally sparse. Scale, contrast, and vertical pacing create drama; amber is reserved for live signals and compact metadata. The product story is specific: Pi + Iroh + Luvus become one native software-factory workspace. This system applies to the static marketing site only and does not replace the native app's GPUI conventions.
 
 **Key Characteristics:**
-- Oversized, blunt Geist headlines with tight leading.
+- Oversized, blunt Arimo headlines with tight leading.
 - An atmospheric landscape and faint grid spanning navigation, headline, and hero actions.
 - The primary Pilus screenshot clipped onto white immediately after the atmospheric fade, without fake chrome.
 - Warm neutral fields separated by hairline rules.
@@ -104,15 +104,15 @@ The palette is warm, nearly monochrome, and punctuated by a single operational a
 
 ## Typography
 
-**Display Font:** Geist with native sans-serif fallbacks  
-**Body Font:** Geist with native sans-serif fallbacks  
-**Label/Mono Font:** Geist Mono with system monospace fallbacks
+**Display Font:** Arimo with native sans-serif fallbacks  
+**Body Font:** Arimo with native sans-serif fallbacks  
+**Label/Mono Font:** Ioskeley Mono with system monospace fallbacks
 
-**Character:** Geist keeps the page contemporary and direct. Tight, heavy display settings carry the cinematic scale; the mono face is reserved for operational labels, status, and source-oriented details.
+**Character:** Arimo keeps the page contemporary and direct. Tight, heavy display settings carry the cinematic scale; the mono face is reserved for operational labels, status, and source-oriented details.
 
 ### Hierarchy
-- **Display** (690, `clamp(3.8rem, 7vw, 6.25rem)`, 0.93): Three-line hero statements.
-- **Headline** (680, `clamp(2.8rem, 5vw, 4.8rem)`, 0.94): Major section and closing statements.
+- **Display** (600, `clamp(3.8rem, 7vw, 6.25rem)`, 0.93): Three-line hero statements.
+- **Headline** (600, `clamp(2.8rem, 5vw, 4.8rem)`, 0.94): Major section and closing statements.
 - **Title** (640–660, `clamp(1.4rem, 3.2vw, 3rem)`, 0.98–1.02): Feature and inventory titles.
 - **Body** (400, 16–18px, 1.5): Product explanation, kept to readable measures.
 - **Label** (500–650, 12px, 0.08em when uppercase): Status, metadata, and compact navigational context.
@@ -144,7 +144,7 @@ Pills define actions. Product imagery uses 12–18px clipped top corners, cards 
 
 ### Buttons
 - **Shape:** Fully rounded pill with a 46px minimum height.
-- **Primary:** Proof-black fill, white text, 21px horizontal padding, and semibold Geist.
+- **Primary:** Proof-black fill, white text, 21px horizontal padding, and semibold Arimo.
 - **Secondary:** White fill, ink text, and a quiet hairline border.
 - **Hover / Focus:** Tonal fill shift, 180ms transition, and a 3px amber focus-visible outline.
 

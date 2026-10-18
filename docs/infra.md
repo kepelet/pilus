@@ -5,7 +5,7 @@ The stack declares two things:
 
 | Resource | What it serves |
 | --- | --- |
-| `Site` (Worker, assets only) | `site/` at `usepilus.dev` |
+| `Site` (Worker, assets only) | `site/dist`, the built landing page and docs, at `usepilus.dev` |
 | `Releases` (R2 bucket) | the OTA payloads at `releases.kepelet.com` |
 
 Both zones already exist in the account, so they are not declared: Alchemy
@@ -36,7 +36,10 @@ a custom-domain conflict. `releases.kepelet.com` is already on the bucket, so
 it should show as unchanged in the plan; if it shows as created, stop and check
 the bucket name.
 
-`site/.assetsignore` keeps `DESIGN.md` out of the upload.
+`site/` is a [Blume](https://useblume.dev) project: `pages/index.astro` is the landing
+page at `/`, `docs/*.md` are the docs under `/docs`, and `public/` holds the static assets.
+`just site-build` writes `site/dist`, which is what the Worker uploads; `infra-plan` and
+`infra-deploy` run it first. `just site-dev` serves the site locally.
 
 State lives in a state-store Worker in the Cloudflare account (`Cloudflare.state()`),
 which Alchemy bootstraps on the first deploy. `just infra-plan` and

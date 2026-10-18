@@ -1,15 +1,40 @@
 /* Hallmark · Pilus marketing tokens */
 @font-face {
-  font-family: "Geist";
-  src: url("fonts/Geist-Variable.woff2") format("woff2-variations");
+  font-family: "Arimo";
+  src: url("fonts/Arimo-Variable.woff2") format("woff2-variations");
   font-weight: 100 900;
   font-display: swap;
 }
 
 @font-face {
-  font-family: "Geist Mono";
-  src: url("fonts/GeistMono-Variable.woff2") format("woff2-variations");
-  font-weight: 100 900;
+  font-family: "Ioskeley Mono";
+  src: url("fonts/IoskeleyMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Ioskeley Mono";
+  src: url("fonts/IoskeleyMono-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Ioskeley Mono";
+  src: url("fonts/IoskeleyMono-Italic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Ioskeley Mono";
+  src: url("fonts/IoskeleyMono-BoldItalic.woff2") format("woff2");
+  font-weight: 700;
+  font-style: italic;
   font-display: swap;
 }
 
@@ -58,8 +83,8 @@
   --footer-surface: #efede8;
   --footer-link: #4c4945;
   --page: min(1180px, calc(100vw - 40px));
-  --font-sans: "Geist", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
-  --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", monospace;
+  --font-sans: "Arimo", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  --font-mono: "Ioskeley Mono", ui-monospace, "SFMono-Regular", monospace;
 
   /* Blueprint inset: the explainer section drawn as a technical plan. */
   --blueprint: var(--night);

@@ -1,0 +1,52 @@
+---
+title: Apa itu pilus?
+description: pilus adalah aplikasi desktop native untuk Luvus, tempat kamu menjalankan dan memantau semua coding agent dari satu jendela.
+sidebar:
+  icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="16.5 16.9 66.6 66.6"><path fill="currentColor" fill-rule="evenodd" d="M81.28 50.19C81.28 69.32 70.37 79.47 49.82 79.47C29.27 79.47 18.36 69.32 18.36 50.19C18.36 31.07 29.27 20.92 49.82 20.92C70.37 20.92 81.28 31.07 81.28 50.19ZM42.98 46.05C42.72 50.76 42.44 51.27 40.21 51.14C37.97 51.02 37.75 50.48 38.01 45.77C38.27 41.06 38.55 40.55 40.79 40.67C43.03 40.8 43.25 41.33 42.98 46.05ZM62.69 45.07C62.47 49.93 62.16 50.46 59.56 50.34C56.97 50.22 56.7 49.66 56.93 44.81C57.15 39.95 57.46 39.43 60.06 39.54C62.65 39.66 62.92 40.22 62.69 45.07Z"/></svg>'
+---
+
+pilus adalah klien desktop native untuk [Luvus](/blog/luvus), terminal multiplexer yang menjadi
+mission control untuk coding agent. Luvus tetap berjalan di latar belakang walaupun kamu menutup
+jendelanya; pilus tinggal terhubung kembali dan menampilkan workspace, pane, tab, dan status agent
+apa adanya, tanpa terminal emulator tambahan.
+
+Namanya diambil dari tiga teknologi yang membentuknya:
+
+- **Pi**, agent harness untuk pilus
+- **Iroh**, network stack untuk koneksi P2P
+- **Luvus**, terminal multiplexer
+
+## Yang kamu dapatkan
+
+- Antarmuka grafis untuk Luvus, dibangun di atas GPUI
+- Workspace dan agent dari mesin lokal maupun SSH dalam satu daftar
+- In-app browser, port forwarder, integrasi Git, dan file explorer
+- Aplikasi iOS untuk mengontrol pilus dari perangkat mobile
+
+## Prinsip
+
+- Low footprint (sekitar 60MB RSS)
+- Performant, memakai Metal di macOS
+- Lean, dengan MacBook Neo sebagai baseline
+
+## Platform
+
+macOS adalah platform utama. GNU/Linux belum ditentukan, dan iOS serta iPadOS tersedia lewat
+TestFlight.
+
+## Mulai dari mana?
+
+<CardGroup cols={2}>
+  <Card title="Latar belakang" href="/blog/oh-my-terminal-multiplexer" icon="terminal">
+    Kenapa terminal multiplexer, dan kenapa Luvus.
+  </Card>
+  <Card title="Instalasi" href="/installation" icon="download">
+    Build pilus dan hubungkan ke sesi Luvus.
+  </Card>
+  <Card title="Fitur" href="/features/ui" icon="sparkles">
+    Antarmuka, browser, Git, dan lainnya.
+  </Card>
+  <Card title="Panduan" href="/guides" icon="book-open">
+    Langkah demi langkah, termasuk koneksi ke mesin remote.
+  </Card>
+</CardGroup>

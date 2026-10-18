@@ -1,0 +1,14 @@
+---
+// The built-in sidebar marks a row current only on an exact route match. Blog
+// and Changelog are single link rows whose posts and releases are not in the
+// sidebar, so a post or release page would highlight nothing. Pointing
+// `currentRoute` at the section row lights it up there too, and nothing else
+// about the tree changes.
+import NavTree from "blume/components/layout/NavTree.astro";
+
+const sections = ["/blog", "/changelog"];
+const { currentRoute } = Astro.props;
+const section = sections.find((root) => currentRoute.startsWith(`${root}/`));
+---
+
+<NavTree {...Astro.props} currentRoute={section ?? currentRoute} />

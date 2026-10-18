@@ -45,6 +45,9 @@ use super::{PilusView, icon, row_tooltip};
 /// Pixels of lines the list builds beyond each edge of the view, so a scroll
 /// does not show a line before it is drawn.
 const OVERDRAW: f32 = 1200.0;
+/// How near the top, in rows, the first visible line must be for the older
+/// lines to be fetched, so they are in before the reader runs out.
+const OLDER_PREFETCH_ROWS: usize = 3;
 /// Width of the panel beside the log, for the subthreads and for a thread.
 const SIDE_PANEL: f32 = 340.0;
 /// Lines of a tool's result shown when its call is folded open; the rest is cut.
@@ -202,6 +205,13 @@ impl SipilChat {
         });
         let list = ListState::new(0, ListAlignment::Top, px(OVERDRAW));
         list.set_follow_mode(FollowMode::Tail);
+        // Older lines come as the reader nears the top; `load_older` ignores the
+        // call when there are none or they are already on their way.
+        list.set_scroll_handler(|event, _window, _cx| {
+            if event.visible_range.start < OLDER_PREFETCH_ROWS {
+                sipil::load_older();
+            }
+        });
         Self {
             open: false,
             input,
@@ -896,28 +906,17 @@ impl PilusView {
 
         let mut main = div().flex().flex_col().flex_1().min_w_0().h_full();
         // The daemon is the only place older lines are, so with it away there is
-        // nothing to ask.
-        // Older lines than those shown can be fetched.
-        if state.transcript_more && matches!(state.watch, Watch::On(..)) && !away {
-            let loading = state.loading_older;
+        // nothing to ask; scrolling to the top asks (see `SipilChat::new`).
+        if state.loading_older && matches!(state.watch, Watch::On(..)) && !away {
             main = main.child(
-                div().flex_shrink_0().px_3().py_1().child(
-                    style::small_button(
-                        "pilus-sipil-chat-older",
-                        if loading {
-                            "Loading older messages…"
-                        } else {
-                            "Load older messages"
-                        },
-                        ButtonKind::Secondary,
-                        theme,
-                        fonts.label,
-                    )
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        sipil::load_older();
-                        cx.notify();
-                    })),
-                ),
+                div()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_1()
+                    .font_family(mono.clone())
+                    .text_size(px(fonts.secondary))
+                    .text_color(theme.muted)
+                    .child("-- Loading older messages…"),
             );
         }
         main = main.child(log);

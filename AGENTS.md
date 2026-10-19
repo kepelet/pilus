@@ -382,7 +382,7 @@ is judged. The rules that keep it low:
   `dock::app_active`). Coming forward polls at once because the elapsed time has
   already passed. A new background thread that wakes on a timer takes it too.
 - Network polls use `Backoff`, not a constant: see the sipil notes above.
-- The Process page (sidebar, below Stats, only while `Settings::developer_mode` is on: Settings → Developer, or the palette; `gui/process.rs`) shows the same costs
+- The Process page (`gui/process.rs`; always available, reached from the command palette, not the sidebar) shows the same costs
   live: CPU, memory and per-thread CPU from `pilus_client::process` (macOS
   `proc_pidinfo`, the one other `unsafe` block, scoped and commented), the
   `perf::Count` totals as rates, and `pilus_client::netlog`, a ring of the last 300
@@ -390,8 +390,8 @@ is judged. The rules that keep it low:
   place that calls out (a request, a subprocess that reaches a host) records itself
   with `netlog::record` or `netlog::note`, or it will be missing from the page;
   local-only subprocesses (`git`, the daemon's socket) are not network and stay out.
-- The Database page (`gui/database.rs`; only while `Settings::developer_mode` is
-  on, and reached from the command palette, not the sidebar) shows what
+- The Database page (`gui/database.rs`; always available, reached from the command
+  palette, not the sidebar) shows what
   `pilus.db` holds, read-only: a summary and 50 rows of one table at a time from
   `pilus_db::browse`, which checks a table name against `sqlite_master` before it
   reaches a query, cuts every cell at 240 characters and never writes. It reads

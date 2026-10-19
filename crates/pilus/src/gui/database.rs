@@ -232,9 +232,6 @@ impl DatabasePage {
 impl PilusView {
     /// Open the page on the database under the pilus folder.
     pub(super) fn open_database(&mut self, cx: &mut Context<Self>) {
-        if !self.settings.developer_mode {
-            return;
-        }
         self.leave_settings_page();
         let db = Db::at(&self.pilus_root);
         let path = self.pilus_root.join(pilus_db::FILE);
@@ -603,8 +600,6 @@ impl PilusView {
         use pilus_client::sipil::{Chats, Directory};
 
         self.leave_settings_page();
-        self.settings.developer_mode = true;
-        *self.shared_settings.borrow_mut() = self.settings.clone();
         let db = Db::in_memory();
         let nowhere = Path::new("/nonexistent");
         let rina = "a".repeat(64);

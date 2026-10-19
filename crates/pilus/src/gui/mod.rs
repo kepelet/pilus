@@ -4956,21 +4956,9 @@ impl PilusView {
                 "Application",
                 None,
             ),
-            entry(
-                Command::ToggleDeveloperMode,
-                if self.settings.developer_mode {
-                    "Turn Off Developer Mode"
-                } else {
-                    "Turn On Developer Mode"
-                },
-                "Application",
-                None,
-            ),
+            entry(Command::OpenProcess, "Process", "Workspace", None),
+            entry(Command::OpenDatabase, "Database", "Workspace", None),
         ];
-        if self.settings.developer_mode {
-            entries.push(entry(Command::OpenProcess, "Process", "Workspace", None));
-            entries.push(entry(Command::OpenDatabase, "Database", "Workspace", None));
-        }
         for tab in &self.tabs {
             entries.push(entry(
                 Command::FocusTab(tab.index),
@@ -5050,9 +5038,6 @@ impl PilusView {
             Command::OpenStats => self.open_stats(cx),
             Command::OpenProcess => self.open_process(cx),
             Command::OpenDatabase => self.open_database(cx),
-            Command::ToggleDeveloperMode => {
-                self.set_developer_mode(!self.settings.developer_mode, cx);
-            }
             Command::OpenUiPlayground => {
                 ui_playground::open(self.theme, self.shared_settings.clone(), cx);
             }
@@ -6792,10 +6777,6 @@ impl PilusView {
             .child(
                 style::section_card_tab(theme, "GITHUB", self.section_font())
                     .child(self.github_settings_block(cx)),
-            )
-            .child(
-                style::section_card_tab(theme, "DEVELOPER", self.section_font())
-                    .child(self.developer_section_block(cx)),
             )
             .child(
                 style::section_card_tab(theme, "REMOTE MACHINES", self.section_font())
@@ -9114,52 +9095,6 @@ impl PilusView {
         )
     }
 
-    /// The DEVELOPER section: whether the tools for looking inside pilus show.
-    fn developer_section_block(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        div().flex().flex_col().gap_2().child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .pb_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .text_size(px(self.footer_font()))
-                        .text_color(theme.muted)
-                        .child(
-                            "Developer mode adds a Process row below Insights (pilus's own CPU, memory, threads and the network calls it makes) and a Database page in the command palette (what pilus.db holds, read-only).",
-                        ),
-                )
-                .child(
-                    style::toggle(
-                        "pilus-developer-mode-toggle",
-                        self.settings.developer_mode,
-                        theme,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_developer_mode(!this.settings.developer_mode, cx);
-                    })),
-                ),
-        )
-    }
-
-    /// Turn developer mode on or off, persisting it. Turning it off closes the
-    /// pages it unlocked, so none is left open with no way to find it again.
-    fn set_developer_mode(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.developer_mode = on;
-        if !on {
-            self.process.close();
-            self.database.close();
-        }
-        self.save_settings();
-        cx.notify();
-    }
-
     /// Mirror the agents into the menu bar and act on its clicks.
     fn sync_menubar(&mut self, cx: &mut Context<Self>) {
         let theme = self.theme;
@@ -11077,9 +11012,6 @@ impl PilusView {
         content = content.child(self.open_workspace_row(cx));
         content = content.child(self.search_nav_row(cx));
         content = content.child(self.stats_nav_row(cx));
-        if self.settings.developer_mode {
-            content = content.child(self.process_nav_row(cx));
-        }
         // sipil's own section leads the lists: the user's agents, people and
         // channels, with where the connection stands in its header.
         content = content.children(self.sipil_sections(cx));
@@ -13268,32 +13200,6 @@ impl PilusView {
             ))
             .child(div().flex_1().child("Insights"))
             .on_click(cx.listener(|this, _, _, cx| this.open_stats(cx)))
-    }
-
-    /// The Process row below Insights: what pilus itself is costing and doing.
-    fn process_nav_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        div()
-            .id("pilus-process")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(SIDEBAR_GLYPH_GAP))
-            .h(px(SIDEBAR_ROW_HEIGHT))
-            .pl(px(SIDEBAR_ROW_PAD))
-            .pr(px(SIDEBAR_ROW_PAD))
-            .radius_md()
-            .cursor_pointer()
-            .text_size(px(self.chrome_font()))
-            .text_color(theme.panel_fg)
-            .child(style::hover_target(&self.sidebar_hover))
-            .child(icon(
-                include_bytes!("../../assets/icons/cpu.svg"),
-                SIDEBAR_GLYPH,
-                theme.muted,
-            ))
-            .child(div().flex_1().child("Process"))
-            .on_click(cx.listener(|this, _, _, cx| this.open_process(cx)))
     }
 
     /// Announce what the network side heard since the last tick: a message, as a

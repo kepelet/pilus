@@ -374,9 +374,6 @@ impl ProcessPage {
 impl PilusView {
     /// Open the page and take its first reading.
     pub(super) fn open_process(&mut self, cx: &mut Context<Self>) {
-        if !self.settings.developer_mode {
-            return;
-        }
         self.leave_settings_page();
         self.process.open = true;
         self.process_sample();
@@ -944,8 +941,6 @@ impl PilusView {
 
     pub(super) fn process_show_sample(&mut self, cx: &mut Context<Self>) {
         self.leave_settings_page();
-        self.settings.developer_mode = true;
-        *self.shared_settings.borrow_mut() = self.settings.clone();
         let start = Instant::now();
         let mut page = ProcessPage {
             open: true,

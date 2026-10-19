@@ -42,7 +42,6 @@ pub enum Command {
     OpenStats,
     OpenProcess,
     OpenDatabase,
-    ToggleDeveloperMode,
     OpenUiPlayground,
     Quit,
     FocusTab(u16),

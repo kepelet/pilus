@@ -65,7 +65,10 @@ const ICONS: &[(&str, &[u8])] = &[
         "folder-git",
         include_bytes!("../../assets/icons/folder-git.svg"),
     ),
-    ("activity", include_bytes!("../../assets/icons/activity.svg")),
+    (
+        "activity",
+        include_bytes!("../../assets/icons/activity.svg"),
+    ),
     ("gauge", include_bytes!("../../assets/icons/gauge.svg")),
     ("house", include_bytes!("../../assets/icons/house.svg")),
     (

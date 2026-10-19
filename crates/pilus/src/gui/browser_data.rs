@@ -113,11 +113,7 @@ pub(super) fn confirm_download(url: &str, path: &mut PathBuf) -> bool {
     let mut detail = format!(
         "From {}\nSaves to {}",
         shorten(url),
-        destination
-            .path
-            .parent()
-            .unwrap_or(Path::new(""))
-            .display()
+        destination.path.parent().unwrap_or(Path::new("")).display()
     );
     if !destination.site_named {
         detail.push_str("\nThe site did not name this file.");
@@ -219,9 +215,6 @@ mod tests {
         let downloads = scratch("unique");
         std::fs::write(downloads.join("a.txt"), b"x").expect("write");
         std::fs::write(downloads.join("a (1).txt"), b"x").expect("write");
-        assert_eq!(
-            unique(downloads.join("a.txt")),
-            downloads.join("a (2).txt")
-        );
+        assert_eq!(unique(downloads.join("a.txt")), downloads.join("a (2).txt"));
     }
 }

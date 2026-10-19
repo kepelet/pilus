@@ -823,7 +823,12 @@ impl PilusView {
                     theme,
                     MOVE_BUTTON,
                 )
-                .tooltip(row_tooltip(tip.to_string(), theme.panel_fg, Vec::new(), theme))
+                .tooltip(row_tooltip(
+                    tip.to_string(),
+                    theme.panel_fg,
+                    Vec::new(),
+                    theme,
+                ))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.settings.move_pinned(&target, earlier);
                     this.save_settings();
@@ -831,28 +836,26 @@ impl PilusView {
                 }))
                 .into_any_element()
             };
-            block = block.child(
-                line(
-                    format!("pilus-github-unpin-{name}"),
-                    name.clone(),
-                    "Unpin",
-                    false,
-                    vec![
-                        mover(
-                            true,
-                            include_bytes!("../../assets/icons/arrow-up.svg"),
-                            "Move up",
-                            position > 0,
-                        ),
-                        mover(
-                            false,
-                            include_bytes!("../../assets/icons/arrow-down.svg"),
-                            "Move down",
-                            position < last,
-                        ),
-                    ],
-                ),
-            );
+            block = block.child(line(
+                format!("pilus-github-unpin-{name}"),
+                name.clone(),
+                "Unpin",
+                false,
+                vec![
+                    mover(
+                        true,
+                        include_bytes!("../../assets/icons/arrow-up.svg"),
+                        "Move up",
+                        position > 0,
+                    ),
+                    mover(
+                        false,
+                        include_bytes!("../../assets/icons/arrow-down.svg"),
+                        "Move down",
+                        position < last,
+                    ),
+                ],
+            ));
         }
         let suggestions: Vec<&RepoSummary> = self
             .github

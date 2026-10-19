@@ -764,7 +764,9 @@ impl PilusView {
         // A daemon that is away is not writing, whatever it was doing when it
         // went.
         let away = matches!(state.watch, Watch::On(..))
-            && state.watched_daemon().is_some_and(|daemon| !daemon.connected());
+            && state
+                .watched_daemon()
+                .is_some_and(|daemon| !daemon.connected());
         let working = !away && (subject.activity == Activity::Working || !thinking.is_empty());
         // The log is set in the terminal font, Markdown included: the renderer
         // takes its body family from the Interface font, so it is handed a copy
@@ -966,10 +968,12 @@ impl PilusView {
                                 theme,
                                 fonts.label,
                             )
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                sipil::discard_queued(&request);
-                                cx.notify();
-                            })),
+                            .on_click(cx.listener(
+                                move |_, _, _, cx| {
+                                    sipil::discard_queued(&request);
+                                    cx.notify();
+                                },
+                            )),
                         ),
                 );
             }

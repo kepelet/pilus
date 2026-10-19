@@ -102,7 +102,10 @@ fn size_label(bytes: u64) -> String {
 /// The path with the home folder written as `~`.
 fn tilde(path: &Path) -> String {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
     }
@@ -204,7 +207,9 @@ impl DatabasePage {
     }
 
     fn table_count(&self) -> usize {
-        self.summary.as_ref().map_or(0, |summary| summary.tables.len())
+        self.summary
+            .as_ref()
+            .map_or(0, |summary| summary.tables.len())
     }
 
     fn select(&mut self, index: usize) {

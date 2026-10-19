@@ -1,4 +1,4 @@
-//! The native Stats page: how much each agent and model was used, over a
+//! The native Insights page: how much each agent and model was used, over a
 //! window you pick, and a year of activity as a heatmap.
 //!
 //! The figures come from the same `pilus-index` file Search reads, from the
@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
-use gpui::{Context, Div, FontWeight, KeyDownEvent, ScrollHandle, div, prelude::*, px};
+use gpui::{Context, Div, KeyDownEvent, ScrollHandle, div, prelude::*, px};
 use pilus_index::{Cost, Hourly, Index, Overview, Ranked, Scope, Tokens};
 
 use super::style::{self, ButtonKind, RadiusExt};
@@ -547,52 +547,32 @@ impl PilusView {
                 );
         }
         actions = actions.child(
-            style::small_button(
+            style::icon_button(
                 "pilus-stats-close",
-                "Close",
+                include_bytes!("../../assets/icons/x.svg"),
                 ButtonKind::Ghost,
                 theme,
-                fonts.label,
+                style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL),
             )
+            .tooltip(super::row_tooltip(
+                "Close".to_string(),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
             .on_click(cx.listener(|this, _, _, cx| this.close_stats(cx))),
         );
 
-        let subtitle = if !allowed {
-            "Off".to_string()
-        } else if self.search.syncing {
-            "Reading your sessions…".to_string()
-        } else {
-            "Estimated from each turn's reported usage".to_string()
-        };
         let bar = div()
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
+            .justify_end()
             .flex_shrink_0()
             .flex_wrap()
             .gap_3()
             .px_4()
             .py_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(fonts.title))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.fg)
-                            .child("Stats"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(fonts.secondary))
-                            .text_color(theme.muted)
-                            .child(subtitle),
-                    ),
-            )
             .child(actions);
 
         let body = if !reading {
@@ -638,7 +618,7 @@ impl PilusView {
                     theme,
                     fonts,
                     icon(
-                        include_bytes!("../../assets/icons/gauge.svg"),
+                        include_bytes!("../../assets/icons/activity.svg"),
                         24.0,
                         theme.muted,
                     ),
@@ -805,6 +785,7 @@ impl PilusView {
             .flex_1()
             .min_h(px(0.0))
             .overflow_y_scroll()
+            .restrict_scroll_to_axis()
             .track_scroll(&self.stats.scroll)
             .child(column)
             .into_any_element()
@@ -823,8 +804,6 @@ impl PilusView {
             .p_3()
             .radius_md()
             .bg(theme.panel_dim)
-            .border_1()
-            .border_color(theme.border)
             .child(style::section_label(theme, title, fonts.label))
             .child(body)
     }
@@ -1094,6 +1073,9 @@ impl PilusView {
                     .flex_row()
                     .gap_2()
                     .overflow_x_scroll()
+                    // Without this a vertical wheel turn scrolls the strip and
+                    // a sideways swipe scrolls the page, as well as each other.
+                    .restrict_scroll_to_axis()
                     .child(weekdays)
                     .child(
                         div()

@@ -4935,7 +4935,7 @@ impl PilusView {
             ),
             entry(Command::OpenHome, "New Agent", "Application", Some("⌘⇧N")),
             entry(Command::OpenSearch, "Search Sessions", "Workspace", None),
-            entry(Command::OpenStats, "Agent Stats", "Workspace", None),
+            entry(Command::OpenStats, "Insights", "Workspace", None),
             entry(
                 Command::OpenSettings,
                 "Settings",
@@ -9112,7 +9112,7 @@ impl PilusView {
                         .text_size(px(self.footer_font()))
                         .text_color(theme.muted)
                         .child(
-                            "Developer mode adds a Process row below Stats: pilus's own CPU, memory, threads and the network calls it makes.",
+                            "Developer mode adds a Process row below Insights: pilus's own CPU, memory, threads and the network calls it makes.",
                         ),
                 )
                 .child(
@@ -13222,7 +13222,7 @@ impl PilusView {
             .on_click(cx.listener(|this, _, _, cx| this.open_search(cx)))
     }
 
-    /// The Stats row below Search: usage by agent and model, and a year of
+    /// The Insights row below Search: usage by agent and model, and a year of
     /// activity.
     fn stats_nav_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -13241,15 +13241,15 @@ impl PilusView {
             .text_color(theme.panel_fg)
             .child(style::hover_target(&self.sidebar_hover))
             .child(icon(
-                include_bytes!("../../assets/icons/gauge.svg"),
+                include_bytes!("../../assets/icons/activity.svg"),
                 SIDEBAR_GLYPH,
                 theme.muted,
             ))
-            .child(div().flex_1().child("Stats"))
+            .child(div().flex_1().child("Insights"))
             .on_click(cx.listener(|this, _, _, cx| this.open_stats(cx)))
     }
 
-    /// The Process row below Stats: what pilus itself is costing and doing.
+    /// The Process row below Insights: what pilus itself is costing and doing.
     fn process_nav_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         div()

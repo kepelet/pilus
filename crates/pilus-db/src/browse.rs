@@ -29,7 +29,10 @@ pub enum Cell {
     Integer(i64),
     Real(String),
     /// Text cut to [`CELL_LIMIT`] characters; `cut` says whether it was.
-    Text { text: String, cut: bool },
+    Text {
+        text: String,
+        cut: bool,
+    },
     /// Bytes are not shown, only how many there are.
     Blob(usize),
 }
@@ -122,8 +125,10 @@ impl Db {
                 return Err(Error::NoTable(table.to_string()));
             }
             let columns = columns(conn, table)?;
-            let mut statement =
-                conn.prepare(&format!("SELECT * FROM {} LIMIT ?1 OFFSET ?2", quote(table)))?;
+            let mut statement = conn.prepare(&format!(
+                "SELECT * FROM {} LIMIT ?1 OFFSET ?2",
+                quote(table)
+            ))?;
             let width = columns.len();
             let rows = statement
                 .query_map([limit as i64, offset as i64], |row| {
@@ -143,9 +148,11 @@ impl Db {
 }
 
 fn count(conn: &rusqlite::Connection, table: &str) -> Result<u64> {
-    let rows: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {}", quote(table)), [], |row| {
-        row.get(0)
-    })?;
+    let rows: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM {}", quote(table)),
+        [],
+        |row| row.get(0),
+    )?;
     Ok(rows.max(0) as u64)
 }
 
@@ -194,7 +201,12 @@ mod tests {
         assert_eq!(docs.rows, 2);
         assert_eq!(docs.columns, ["name", "body", "updated"]);
         assert!(summary.tables.iter().any(|t| t.name == "chat_lines"));
-        assert!(summary.tables.iter().all(|t| !t.name.starts_with("sqlite_")));
+        assert!(
+            summary
+                .tables
+                .iter()
+                .all(|t| !t.name.starts_with("sqlite_"))
+        );
         assert!(summary.bytes > 0);
     }
 
@@ -239,8 +251,19 @@ mod tests {
     fn a_name_that_is_not_a_table_never_reaches_sql() {
         let db = Db::in_memory();
         for name in ["nope", "docs; DROP TABLE docs", "sqlite_master", "\"docs\""] {
-            assert!(matches!(db.rows(name, 0, 1), Err(Error::NoTable(_))), "{name}");
+            assert!(
+                matches!(db.rows(name, 0, 1), Err(Error::NoTable(_))),
+                "{name}"
+            );
         }
-        assert_eq!(db.summary().unwrap().tables.iter().filter(|t| t.name == "docs").count(), 1);
+        assert_eq!(
+            db.summary()
+                .unwrap()
+                .tables
+                .iter()
+                .filter(|t| t.name == "docs")
+                .count(),
+            1
+        );
     }
 }

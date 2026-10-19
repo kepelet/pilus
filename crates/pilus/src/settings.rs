@@ -448,15 +448,12 @@ impl Settings {
             }
         }
         if let Ok(text) = serde_json::to_string_pretty(&value) {
-            let _ = std::fs::create_dir_all(root);
-            let path = path(root);
-            let _ = std::fs::write(&path, text);
-            // The relay block can hold an API secret, and `write` keeps the
-            // mode of a file that already exists.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            let _ = pilus_db::private_dir(root);
+            // Staged and renamed: a crash mid-save must not leave half a file,
+            // which would read as no settings at all. Owner-only from the first
+            // byte, since the relay block can hold an API secret.
+            if let Err(error) = pilus_db::write_private(&path(root), &text) {
+                tracing::warn!("could not save the settings: {error}");
             }
         }
     }

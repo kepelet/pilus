@@ -6457,6 +6457,7 @@ name = "pilus-index"
 version = "0.3.0"
 dependencies = [
  "pilus-client",
+ "pilus-db",
  "rusqlite",
  "serde_json",
  "thiserror 2.0.21",

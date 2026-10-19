@@ -36,8 +36,10 @@ impl Index {
     /// Open the index at `path`, creating it (and its folder) when absent.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            pilus_db::private_dir(parent)?;
         }
+        // Titles and machine names of private sessions: owner-only, like pilus.db.
+        pilus_db::create_private(path)?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_millis(500))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;

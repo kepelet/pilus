@@ -51,7 +51,7 @@ impl Db {
     /// private conversations) and migrating it.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            private_dir(parent)?;
         }
         create_private(path)?;
         let mut conn = Connection::open(path)?;
@@ -208,7 +208,61 @@ pub fn now() -> i64 {
 
 /// Create `path` owner-only if it is not there, so SQLite (which gives its
 /// `-wal` and `-shm` files the main file's mode) never creates it world-readable.
-fn create_private(path: &Path) -> std::io::Result<()> {
+/// Create `dir` when it is missing and keep pilus's own folder owner-only.
+///
+/// The files in it are owner-only already, but a readable folder still lists
+/// them (which sessions, which machines). A folder this creates, or one named
+/// `.pilus`, is set to `0700`; any other folder `PILUS_HOME` points at is left
+/// as the person made it, since it may be their home or a shared one.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    let existed = dir.is_dir();
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let ours = !existed || dir.file_name().is_some_and(|name| name == ".pilus");
+        let mode = std::fs::metadata(dir)?.permissions().mode();
+        if ours && mode & 0o077 != 0 {
+            // Only the owner can change a mode, so a folder someone else owns
+            // stays as it is and pilus carries on.
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = existed;
+    Ok(())
+}
+
+/// Write `text` to `path` so that a crash leaves either the old file or the
+/// new one, never half of one, and owner-only from its first byte.
+pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let staged = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let written = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&staged)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&staged, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    written
+}
+
+/// Create `path` owner-only, or make an existing one so.
+pub fn create_private(path: &Path) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -216,7 +270,16 @@ fn create_private(path: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path).map(drop)
+    options.open(path).map(drop)?;
+    // A file made before this rule, or by another tool, keeps the mode it had.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -263,7 +326,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join(FILE)).unwrap().permissions().mode();
+            let mode = std::fs::metadata(dir.join(FILE))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -306,5 +372,51 @@ mod tests {
         assert!(!file.exists());
         assert!(dir.join("old.json.migrated").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_and_the_pilus_folder_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let root = scratch("private");
+        let dir = root.join(".pilus");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700, "an existing .pilus is tightened");
+
+        let shared = root.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&shared).unwrap();
+        assert_eq!(
+            mode(&shared),
+            0o755,
+            "a folder pilus did not make and is not .pilus is left alone"
+        );
+
+        let made = root.join("made");
+        private_dir(&made).unwrap();
+        assert_eq!(mode(&made), 0o700);
+
+        let loose = dir.join("index.db");
+        std::fs::write(&loose, b"").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        create_private(&loose).unwrap();
+        assert_eq!(mode(&loose), 0o600, "an existing loose file is tightened");
+
+        let settings = dir.join("settings.json");
+        write_private(&settings, "{}").unwrap();
+        write_private(&settings, "{\"a\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{\"a\":1}");
+        assert_eq!(mode(&settings), 0o600);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no staged file is left behind");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

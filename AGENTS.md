@@ -306,7 +306,9 @@ with only the command-line tools can build the app.
   keeps its rows. A remote answer comes from `grep`/`tail` on the host, so keep
   `scan::evidence_script` and `read_local` choosing the same lines. Resume is
   `workspace.open` on the session's folder then `agent.resume` on its machine's
-  daemon. The `visual-test` captures use `search_show_sample` and never touch
+  daemon; the daemon only knows the sessions its own hook recorded, so on
+  "no resumable session" an agent with `Agent::resume_flag` (Claude) is launched
+  by `agent.start` with `--resume <id>` instead. The `visual-test` captures use `search_show_sample` and never touch
   the index.
 - Stats (`gui/stats.rs`, the row below Search) totals the same index's token
   use: per-hour buckets (`usage` table: machine, transcript, hour, model, four

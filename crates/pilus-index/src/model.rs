@@ -24,6 +24,16 @@ impl Agent {
         }
     }
 
+    /// The command-line flag that reopens a session by id, for an agent the
+    /// daemon cannot resume itself.
+    #[must_use]
+    pub const fn resume_flag(self) -> Option<&'static str> {
+        match self {
+            Self::Claude => Some("--resume"),
+            Self::Pi => None,
+        }
+    }
+
     /// The label drawn in the window.
     #[must_use]
     pub const fn label(self) -> &'static str {

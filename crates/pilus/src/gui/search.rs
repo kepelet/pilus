@@ -424,8 +424,9 @@ impl PilusView {
         let cwd = session.cwd.clone();
         let id = session.session_id.clone();
         let title = session.title.clone();
+        let agent = session.agent;
         std::thread::spawn(move || {
-            let result = resume(&mut client, &cwd, &id).map_err(|error| error.to_string());
+            let result = resume(&mut client, agent, &cwd, &id).map_err(|error| error.to_string());
             tx.send(Msg::Resumed {
                 endpoint,
                 title,
@@ -467,11 +468,53 @@ impl PilusView {
 }
 
 /// Open `cwd` as a workspace when the session knows its folder, then resume.
-fn resume(client: &mut ControlClient, cwd: &str, id: &str) -> pilus_client::Result<()> {
+///
+/// `agent.resume` only knows the sessions the daemon recorded itself (through
+/// its resume hook), which is a handful of the transcripts the index reads. For
+/// any other, launch the agent with its own resume flag in the same folder.
+fn resume(
+    client: &mut ControlClient,
+    agent: Agent,
+    cwd: &str,
+    id: &str,
+) -> pilus_client::Result<()> {
     if !cwd.is_empty() {
         client.open_workspace(cwd)?;
     }
-    client.resume_agent(id)
+    match client.resume_agent(id) {
+        Err(error) if error.to_string().contains("no resumable session") => {
+            let Some(flag) = agent.resume_flag() else {
+                return Err(error);
+            };
+            // A fresh workspace opens with one shell pane; reuse it rather than
+            // splitting a second, empty terminal beside the agent.
+            let pane = client.idle_pane().ok().flatten();
+            client.start_agent(
+                &launch_name(agent, id),
+                agent.kind(),
+                pane.as_deref(),
+                &[flag.to_string(), id.to_string()],
+            )?;
+            if let Some(pane) = pane.as_deref() {
+                client.focus_pane(pane).ok();
+            }
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// The pane alias for a resumed session. The daemon accepts only
+/// `[a-z][a-z0-9_-]{0,31}`, and a title is free text, so the alias is the agent
+/// and the start of the id: valid, and one per session.
+fn launch_name(agent: Agent, id: &str) -> String {
+    let short: String = id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    format!("{}-{short}", agent.kind())
 }
 
 // -- Rendering -----------------------------------------------------------
@@ -492,91 +535,91 @@ impl PilusView {
         };
         let mut actions = div().flex().flex_row().items_center().gap_2();
         if allowed {
-            actions = actions.child(
-                style::small_button(
-                    "pilus-search-refresh",
-                    "Refresh",
-                    ButtonKind::Secondary,
-                    theme,
-                    fonts.label,
+            actions = actions
+                .child(
+                    style::small_button(
+                        "pilus-search-refresh",
+                        "Refresh",
+                        ButtonKind::Secondary,
+                        theme,
+                        fonts.label,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.search_sync();
+                        cx.notify();
+                    })),
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.search_sync();
-                    cx.notify();
-                })),
-            );
+                .child(
+                    style::small_button(
+                        "pilus-search-sources",
+                        "Sources",
+                        ButtonKind::Secondary,
+                        theme,
+                        fonts.label,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.search.sources = !this.search.sources;
+                        this.search.confirm_off = false;
+                        cx.notify();
+                    })),
+                );
         }
-        if allowed {
-            actions = actions.child(
-                style::small_button(
-                    "pilus-search-sources",
-                    "Sources",
-                    ButtonKind::Secondary,
-                    theme,
-                    fonts.label,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.search.sources = !this.search.sources;
-                    this.search.confirm_off = false;
-                    cx.notify();
-                })),
-            );
-        }
-        actions = actions.child(
-            style::small_button(
-                "pilus-search-close",
-                "Close",
-                ButtonKind::Ghost,
-                theme,
-                fonts.label,
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.search.close();
-                cx.notify();
-            })),
-        );
+        let close = style::icon_button(
+            "pilus-search-close",
+            include_bytes!("../../assets/icons/x.svg"),
+            ButtonKind::Ghost,
+            theme,
+            style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL),
+        )
+        .tooltip(super::row_tooltip(
+            "Close".to_string(),
+            theme.panel_fg,
+            Vec::new(),
+            theme,
+        ))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.search.close();
+            cx.notify();
+        }));
+
         let bar = div()
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
+            .justify_end()
+            .flex_shrink_0()
+            .px_4()
+            .pt_3()
+            .child(close);
+        if !allowed || self.search.sources {
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .min_h(px(0.0))
+                .child(bar)
+                .child(self.search_consent(cx));
+        }
+        let trailing = div()
+            .flex()
+            .flex_row()
+            .items_center()
             .flex_shrink_0()
             .gap_3()
-            .px_4()
-            .py_3()
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(fonts.title))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.fg)
-                            .child("Search"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(fonts.secondary))
-                            .text_color(theme.muted)
-                            .child(status),
-                    ),
+                    .text_size(px(fonts.label))
+                    .text_color(theme.muted)
+                    .child(status),
             )
             .child(actions);
-
-        let body = if !allowed || self.search.sources {
-            self.search_consent(cx).into_any_element()
-        } else {
-            self.search_results(cx).into_any_element()
-        };
         div()
             .flex()
             .flex_col()
             .size_full()
             .min_h(px(0.0))
             .child(bar)
-            .child(body)
+            .child(self.search_results(trailing, cx))
     }
 
     /// The permission card, and the sources panel once it has been given.
@@ -715,7 +758,7 @@ impl PilusView {
     }
 
     /// The query, its filters and the matching sessions.
-    fn search_results(&self, cx: &mut Context<Self>) -> Div {
+    fn search_results(&self, trailing: Div, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let height = style::scaled(&self.shared_settings, style::CONTROL_HEIGHT);
@@ -810,6 +853,14 @@ impl PilusView {
             );
         }
         filters = filters.child(agents);
+        let filters = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(filters.flex_1().min_w(px(0.0)))
+            .child(trailing);
 
         let mut problems = div().flex().flex_col().gap_1();
         for (key, error) in &self.search.errors {
@@ -986,6 +1037,20 @@ impl PilusView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_name_is_a_valid_daemon_alias() {
+        let name = launch_name(Agent::Claude, "34818B53-54dc-4921-b157-d43f1cf0ffc3");
+        assert_eq!(name, "claude-34818b53");
+        assert!(
+            name.starts_with(|c: char| c.is_ascii_lowercase())
+                && name.len() <= 32
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        );
+        assert_eq!(launch_name(Agent::Claude, ""), "claude-");
+    }
 
     fn session(id: &str) -> Session {
         Session {

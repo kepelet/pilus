@@ -106,12 +106,18 @@ impl SshTarget {
         command
     }
 
+    /// OpenSSH joins these words with spaces and the host's login shell splits
+    /// them again, so each is quoted for that shell when it needs to be.
     fn append_remote_command(&self, command: &mut Command, tail: &[&str]) {
-        command.arg(&self.binary);
+        command.arg(login_shell_word(&self.binary).as_ref());
         if let Some(session) = self.session.as_deref().filter(|name| !name.is_empty()) {
-            command.arg("--session").arg(session);
+            command
+                .arg("--session")
+                .arg(login_shell_word(session).as_ref());
         }
-        command.args(tail);
+        for word in tail {
+            command.arg(login_shell_word(word).as_ref());
+        }
     }
 
     /// Build an SSH invocation that runs one shell command on the host.
@@ -472,13 +478,40 @@ fn posix_command(remote_command: &str) -> String {
     format!("/bin/sh -c {}", quote_for_login_shell(remote_command))
 }
 
-/// Single-quote `value` for the host's login shell.
+/// Single-quote `value` for the host's login shell, whichever it is.
 ///
-/// Both `sh` and `fish` treat a single-quoted run literally and both accept
-/// `'\''` to embed a quote, so the server's login shell reconstructs `value`
-/// as one argument and passes it to `/bin/sh -c`.
+/// `sh` reads a single-quoted run literally, but `fish` treats `\\` and `\'`
+/// inside one as escapes, so a value holding `\'` would end the quote early
+/// there and the rest would run as a command. Quotes and backslashes are
+/// therefore written outside the quoted runs, as `\'` and `\\`, which both
+/// shells read the same way. The server's login shell then reconstructs
+/// `value` as one argument and passes it to `/bin/sh -c`.
 fn quote_for_login_shell(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for c in value.chars() {
+        match c {
+            '\'' => quoted.push_str("'\\''"),
+            '\\' => quoted.push_str("'\\\\'"),
+            _ => quoted.push(c),
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// One word of a remote command line, quoted only when it needs to be, so the
+/// usual binary path and subcommands stay as they were written.
+fn login_shell_word(value: &str) -> std::borrow::Cow<'_, str> {
+    let plain = !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./:@%+=,-".contains(&b));
+    if plain {
+        std::borrow::Cow::Borrowed(value)
+    } else {
+        std::borrow::Cow::Owned(quote_for_login_shell(value))
+    }
 }
 
 #[cfg(test)]
@@ -602,6 +635,55 @@ mod tests {
             posix_command("find '/tmp/a b' -print0"),
             "/bin/sh -c 'find '\\''/tmp/a b'\\'' -print0'"
         );
+    }
+
+    /// Run `script` through `shell` the way the host's login shell would, and
+    /// return what `printf` printed. Skips a shell that is not installed.
+    fn through(shell: &str, script: &str) -> Option<String> {
+        let output = Command::new(shell).arg("-c").arg(script).output().ok()?;
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    #[test]
+    fn login_shell_quoting_holds_in_sh_and_fish() {
+        // A file name can hold anything; under fish a `\'` used to end the quote
+        // early and run the rest.
+        for value in [
+            "plain",
+            "/tmp/a b",
+            "it's",
+            "a\\b",
+            "\\';echo PWNED;#",
+            "x\\\\'$(echo PWNED)`echo PWNED`",
+            "trailing\\",
+            "",
+        ] {
+            let script = format!("printf '[%s]' {}", quote_for_login_shell(value));
+            for shell in ["/bin/sh", "fish", "/opt/homebrew/bin/fish", "/usr/bin/fish"] {
+                if let Some(out) = through(shell, &script) {
+                    assert_eq!(
+                        out,
+                        format!("[{value}]"),
+                        "{shell} read {value:?} back wrong"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_remote_command_word_is_quoted_only_when_it_needs_it() {
+        assert_eq!(
+            login_shell_word("/usr/local/bin/luvus"),
+            "/usr/local/bin/luvus"
+        );
+        assert_eq!(login_shell_word("uhp"), "uhp");
+        assert_eq!(
+            login_shell_word("/Users/me/My Tools/luvus"),
+            "'/Users/me/My Tools/luvus'"
+        );
+        assert_eq!(login_shell_word("a;b"), "'a;b'");
+        assert_eq!(login_shell_word(""), "''");
     }
 
     #[test]

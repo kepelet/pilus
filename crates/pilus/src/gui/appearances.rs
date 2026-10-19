@@ -1081,6 +1081,17 @@ impl AppearancesView {
             this.settings.pane_gaps = !this.settings.pane_gaps;
             this.publish(cx);
         }));
+        let cursor_blink = style::checkbox(
+            "pilus-cursor-blink",
+            self.settings.cursor_blink,
+            "Blink the terminal cursor",
+            self.theme,
+            size,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.settings.cursor_blink = !this.settings.cursor_blink;
+            this.publish(cx);
+        }));
         let mut rows = div()
             .flex()
             .flex_col()
@@ -1110,7 +1121,7 @@ impl AppearancesView {
                     ),
             );
         }
-        rows.child(remote).child(local).child(
+        rows.child(cursor_blink).child(remote).child(local).child(
             div()
                 .text_size(px(self.fonts().label))
                 .text_color(self.theme.muted)

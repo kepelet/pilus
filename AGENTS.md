@@ -372,7 +372,8 @@ is judged. The rules that keep it low:
   frames wake it through `Arrival`, so output does not wait for the tick. New
   animation driven from the loop must count as "moving" there, or it will stutter
   at the idle rate.
-- The cursor stops blinking ten seconds after it last moved
+- The cursor does not blink unless `Settings::cursor_blink` is on (off by default,
+  Appearances). When it is, it stops blinking ten seconds after it last moved
   (`cursor_blink::BLINK_FOR`); the fade repaints the whole grid about twenty times
   a second, which was most of an idle window's cost. Moving it, or returning to the
   window, starts it again.

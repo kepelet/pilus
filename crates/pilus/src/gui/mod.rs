@@ -89,6 +89,7 @@ use browser_tab::{BrowserPanel, PageEdit};
 use crossterm::event::{
     KeyEventKind, KeyModifiers, MouseButton as TerminalMouseButton, MouseEvent, MouseEventKind,
 };
+use database::DatabasePage;
 use diff::{DiffInputs, DiffPanel};
 use dock::Dock;
 use files_tab::FilesPanel;
@@ -128,7 +129,6 @@ use pilus_protocol::{
     SurfaceInterest,
 };
 use ports_tab::PortsPanel;
-use database::DatabasePage;
 use process::ProcessPage;
 use right_sidebar::{RightSidebar, SidebarTab};
 use search::SearchPage;
@@ -9344,14 +9344,14 @@ impl PilusView {
     }
 
     /// Advance the cursor's blink; true when its opacity moved and the grid
-    /// needs a repaint. A window in the background or reduced motion keeps
-    /// the cursor solid, like the other tweens.
+    /// needs a repaint. The setting being off, a window in the background or
+    /// reduced motion keeps the cursor solid, like the other tweens.
     fn tick_cursor_blink(&mut self, cx: &App) -> bool {
         let cursor = self
             .shown_frame()
             .filter(|frame| frame.cursor_visible)
             .and_then(|frame| frame.cursor);
-        let blinking = self.window_active && !cx.reduce_motion();
+        let blinking = self.settings.cursor_blink && self.window_active && !cx.reduce_motion();
         self.cursor_blink.tick(Instant::now(), cursor, blinking)
     }
 

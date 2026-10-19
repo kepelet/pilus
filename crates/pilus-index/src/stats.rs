@@ -113,8 +113,10 @@ pub struct Overview {
 /// One row of a ranking.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Ranked {
-    /// An agent kind, a model, or a folder, by the ranking asked for.
+    /// An agent kind, a model, a folder or a machine, by the ranking asked for.
     pub name: String,
+    /// The machine a folder is on; empty for any other ranking.
+    pub machine: String,
     pub sessions: u64,
     pub tokens: Tokens,
     pub cost: Cost,
@@ -189,9 +191,30 @@ impl Index {
     }
 
     /// Folders by tokens, most first. A transcript with no known folder is
-    /// grouped under an empty name.
+    /// grouped under an empty name. The same path on two machines is two
+    /// folders, so each row names its machine.
     pub fn top_projects(&self, scope: &Scope, limit: usize) -> Result<Vec<Ranked>> {
-        self.ranked("s.cwd", true, scope, limit)
+        let rows = self.ranked(
+            "u.machine || char(9) || COALESCE(s.cwd, '')",
+            true,
+            scope,
+            limit,
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|mut row| {
+                if let Some((machine, cwd)) = row.name.split_once('\t') {
+                    row.machine = machine.to_string();
+                    row.name = cwd.to_string();
+                }
+                row
+            })
+            .collect())
+    }
+
+    /// Machines by tokens, most first.
+    pub fn top_machines(&self, scope: &Scope) -> Result<Vec<Ranked>> {
+        self.ranked("u.machine", false, scope, usize::MAX)
     }
 
     /// Use by hour, oldest first, for the hours that had any.
@@ -434,8 +457,17 @@ mod tests {
         assert_eq!(models[0].name, "opus");
 
         let projects = index.top_projects(&scope, 5).expect("projects");
+        // The same folder on two machines is two rows, each with its machine.
         assert_eq!(projects[0].name, "/work/app");
-        assert_eq!(projects[0].sessions, 2);
+        assert_eq!(projects[0].machine, "local");
+        assert_eq!(projects[0].sessions, 1);
+        assert_eq!(projects.len(), 3);
+        assert!(projects.iter().any(|row| row.machine == "box"));
+
+        let machines = index.top_machines(&scope).expect("machines");
+        assert_eq!(machines.len(), 2);
+        assert_eq!(machines[0].name, "local");
+        assert_eq!(machines[0].sessions, 2);
     }
 
     #[test]

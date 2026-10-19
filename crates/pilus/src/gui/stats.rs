@@ -290,6 +290,8 @@ struct Data {
     agents: Vec<Ranked>,
     models: Vec<Ranked>,
     projects: Vec<Ranked>,
+    /// What each machine used, when the window spans more than one.
+    machines: Vec<Ranked>,
     /// A year of local days, which the heatmap and the streak read.
     days: BTreeMap<i64, Day>,
     /// The cost of everything indexed, whatever the window.
@@ -485,6 +487,7 @@ fn build(
         agents: index.top_agents(&window)?,
         models: index.top_models(&window, RANK_ROWS)?,
         projects: index.top_projects(&window, RANK_ROWS)?,
+        machines: index.top_machines(&window)?,
         days,
         active_days,
         today,
@@ -631,39 +634,56 @@ impl PilusView {
         let tokens = data.overview.tokens;
         let cost = data.overview.cost;
         let today = data.today;
-        let tiles = style::stat_strip(theme)
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "TOKENS",
-                compact(tokens.total()),
-                theme.accent,
-                format!("{} cached", compact(tokens.cache_read + tokens.cache_write)),
-            ))
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "EST. COST",
-                money(cost.micros),
-                theme.panel_fg,
-                format!("{} all time", money(data.cost_all.micros)),
-            ))
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "OUTPUT",
-                compact(tokens.output),
-                theme.panel_fg,
-                format!("{} in", compact(tokens.input)),
-            ))
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "SESSIONS",
-                data.overview.sessions.to_string(),
-                theme.panel_fg,
-                format!("{} turns", compact(tokens.turns)),
-            ))
+        // Flush tiles with no rules: the page's cards carry the borders, and a
+        // frame around the headline figures would crowd them.
+        let tiles = div()
+            .flex()
+            .flex_row()
+            .px_4()
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "TOKENS",
+                    compact(tokens.total()),
+                    theme.accent,
+                    format!("{} cached", compact(tokens.cache_read + tokens.cache_write)),
+                )
+                .border_r_0(),
+            )
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "EST. COST",
+                    money(cost.micros),
+                    theme.panel_fg,
+                    format!("{} all time", money(data.cost_all.micros)),
+                )
+                .border_r_0(),
+            )
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "OUTPUT",
+                    compact(tokens.output),
+                    theme.panel_fg,
+                    format!("{} in", compact(tokens.input)),
+                )
+                .border_r_0(),
+            )
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "SESSIONS",
+                    data.overview.sessions.to_string(),
+                    theme.panel_fg,
+                    format!("{} turns", compact(tokens.turns)),
+                )
+                .border_r_0(),
+            )
             .child(
                 style::stat_tile(
                     theme,
@@ -709,17 +729,34 @@ impl PilusView {
             machines = machines.child(choices);
         }
 
+        // Only a page that spans machines needs to say which one a row is on.
+        let spans_machines = self.stats.machine.is_none() && data.machines.len() > 1;
+        let machine_label = |key: &str| {
+            allowed.iter().find(|choice| choice.key == key).map_or_else(
+                || {
+                    if key == "local" {
+                        "This Mac".to_string()
+                    } else {
+                        key.to_string()
+                    }
+                },
+                |choice| choice.label.clone(),
+            )
+        };
+
         let agents = self.ranking(
             "pilus-stats-agent",
             data.agents.iter().map(|row| {
                 let name = pilus_index::Agent::from_kind(&row.name)
                     .map_or_else(|| row.name.clone(), |agent| agent.label().to_string());
-                (name, row)
+                (name, String::new(), row)
             }),
         );
         let models = self.ranking(
             "pilus-stats-model",
-            data.models.iter().map(|row| (row.name.clone(), row)),
+            data.models
+                .iter()
+                .map(|row| (row.name.clone(), String::new(), row)),
         );
         let projects = self.ranking(
             "pilus-stats-project",
@@ -727,15 +764,46 @@ impl PilusView {
                 let name = if row.name.is_empty() {
                     "Unknown folder".to_string()
                 } else {
-                    self.shorten_cwd("local", &row.name)
+                    self.shorten_cwd(&row.machine, &row.name)
                 };
-                (name, row)
+                let place = if spans_machines {
+                    format!("{} · ", machine_label(&row.machine))
+                } else {
+                    String::new()
+                };
+                (name, place, row)
             }),
         );
+        let by_machine = spans_machines.then(|| {
+            self.ranking(
+                "pilus-stats-by-machine",
+                data.machines
+                    .iter()
+                    .map(|row| (machine_label(&row.name), String::new(), row)),
+            )
+        });
 
         let breakdown = self.breakdown(tokens);
         let costs = self.cost_block(data);
         let heat = self.heatmap(data, cx);
+
+        // The cost by machine sits under the token breakdown. The blocks keep
+        // their own height here, or the column would stretch them to match
+        // the taller cost card.
+        let mut tokens_column = div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .flex_1()
+            .min_w(px(style::scaled(&self.shared_settings, 320.0)))
+            .child(self.stats_block("TOKENS", breakdown).flex_none().w_full());
+        if let Some(by_machine) = by_machine {
+            tokens_column = tokens_column.child(
+                self.stats_block("EST. COST BY MACHINE", by_machine)
+                    .flex_none()
+                    .w_full(),
+            );
+        }
 
         let column = div()
             .flex()
@@ -765,7 +833,7 @@ impl PilusView {
                     .gap_4()
                     .px_4()
                     .child(self.stats_block("EST. COST", costs))
-                    .child(self.stats_block("TOKENS", breakdown)),
+                    .child(tokens_column),
             )
             .child(
                 div()
@@ -804,6 +872,8 @@ impl PilusView {
             .p_3()
             .radius_md()
             .bg(theme.panel_dim)
+            .border_1()
+            .border_color(theme.border)
             .child(style::section_label(theme, title, fonts.label))
             .child(body)
     }
@@ -812,12 +882,14 @@ impl PilusView {
     fn ranking<'a>(
         &self,
         id: &'static str,
-        rows: impl Iterator<Item = (String, &'a Ranked)>,
+        rows: impl Iterator<Item = (String, String, &'a Ranked)>,
     ) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let rows: Vec<(String, &Ranked)> = rows.collect();
-        let lead = rows.first().map_or(1, |(_, row)| row.tokens.total().max(1));
+        let rows: Vec<(String, String, &Ranked)> = rows.collect();
+        let lead = rows
+            .first()
+            .map_or(1, |(_, _, row)| row.tokens.total().max(1));
         let mut list = div().flex().flex_col().gap_3();
         if rows.is_empty() {
             list = list.child(
@@ -827,7 +899,7 @@ impl PilusView {
                     .child("Nothing in this window"),
             );
         }
-        for (at, (name, row)) in rows.into_iter().enumerate() {
+        for (at, (name, place, row)) in rows.into_iter().enumerate() {
             let total = row.tokens.total();
             // Counts are far below f32's exact range, and this is a bar width.
             #[allow(clippy::cast_precision_loss)]
@@ -845,7 +917,7 @@ impl PilusView {
                 fonts,
                 name,
                 format!(
-                    "{spent}{} tokens · {} sessions",
+                    "{place}{spent}{} tokens · {} sessions",
                     compact(total),
                     row.sessions
                 ),
@@ -1133,6 +1205,7 @@ impl PilusView {
         }
         let ranked = |name: &str, sessions, input, output, cache| Ranked {
             name: name.to_string(),
+            machine: "local".to_string(),
             sessions,
             tokens: Tokens {
                 input,
@@ -1230,13 +1303,20 @@ impl PilusView {
                     4_000_000,
                     740_000_000,
                 ),
-                ranked(
-                    "/Users/me/Developer/sipil",
-                    40,
-                    10_000_000,
-                    2_000_000,
-                    300_000_000,
-                ),
+                Ranked {
+                    machine: "studio".to_string(),
+                    ..ranked(
+                        "/Users/me/Developer/sipil",
+                        40,
+                        10_000_000,
+                        2_000_000,
+                        300_000_000,
+                    )
+                },
+            ],
+            machines: vec![
+                ranked("local", 330, 80_000_000, 16_000_000, 3_900_000_000),
+                ranked("studio", 115, 29_000_000, 6_000_000, 1_250_000_000),
             ],
             active_days: u64::try_from(days.len()).unwrap_or(0),
             days,

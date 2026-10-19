@@ -1096,8 +1096,12 @@ pub fn run_main() -> Result<()> {
     capture(&mut cx, window.into(), "main-process-bottom")?;
     // The page is taller than the window; scrolled to the end it shows the
     // cost and token blocks.
+    // The Process capture above replaced the page, so bring Insights back.
     cx.update(|app| {
-        view.update(app, |view, cx| view.stats_scroll_to_end(cx));
+        view.update(app, |view, cx| {
+            view.stats_show_sample(true, cx);
+            view.stats_scroll_to_end(cx);
+        });
     });
     settle(&mut cx, 8);
     capture(&mut cx, window.into(), "main-stats-bottom")?;

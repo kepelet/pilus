@@ -445,6 +445,7 @@ fn run_check_updates(channel: Option<String>, feed_url: Option<String>) -> Resul
 
 #[cfg(feature = "gui")]
 fn run_gui(target: ConnectTarget, menubar_only: bool) -> Result<()> {
+    crate::logging::init(&pilus_client::pilus_config_dir());
     crate::gui::run(target, menubar_only)
 }
 

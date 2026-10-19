@@ -8,6 +8,8 @@ mod gui;
 #[cfg(feature = "gui")]
 mod init;
 #[cfg(feature = "gui")]
+mod logging;
+#[cfg(feature = "gui")]
 mod luvus_update;
 mod settings;
 mod update;

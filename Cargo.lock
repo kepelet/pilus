@@ -6404,6 +6404,7 @@ dependencies = [
  "serde_json",
  "syntect",
  "tracing",
+ "tracing-subscriber",
  "unicode-segmentation",
  "ureq",
 ]

@@ -35,6 +35,8 @@ markdown.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+# The window's log file; already built for GPUI, so this adds nothing to compile.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry", "ansi"] }
 ureq.workspace = true
 unicode-segmentation.workspace = true
 syntect.workspace = true

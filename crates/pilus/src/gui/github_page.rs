@@ -1682,8 +1682,10 @@ mod tests {
 
     #[test]
     fn only_a_forced_read_reports_its_failure() {
-        let mut page = GithubPage::default();
-        page.inside = Inside::new("o/a");
+        let mut page = GithubPage {
+            inside: Inside::new("o/a"),
+            ..GithubPage::default()
+        };
         let (_, quiet) = page.receive(Answer::Runs("o/a".into(), Err("boom".into()), false));
         assert_eq!(quiet, None);
         assert_eq!(page.inside.runs.caveat(), Some("boom"));

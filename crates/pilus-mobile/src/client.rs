@@ -621,7 +621,7 @@ impl Client {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
         {
-            let _ = self.runtime.block_on(async move {
+            self.runtime.block_on(async move {
                 let _ = watch.send.finish();
             });
         }

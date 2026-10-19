@@ -455,10 +455,7 @@ mod tests {
             super::super::node::device_id(&dir).unwrap(),
             "the identity of the directory it lives in"
         );
-        assert_eq!(
-            open(&dir).get(&made.id).unwrap().owner,
-            made.owner
-        );
+        assert_eq!(open(&dir).get(&made.id).unwrap().owner, made.owner);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

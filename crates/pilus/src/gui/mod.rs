@@ -546,7 +546,7 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
                     let transport = frontmost_window(cx)
                         .and_then(|handle| handle.downcast::<PilusView>())
                         .and_then(|handle| handle.read(cx).ok().map(PilusView::control_transport))
-                        .unwrap_or_else(|| ControlTransport::Socket(api));
+                        .unwrap_or(ControlTransport::Socket(api));
                     appearances::open(transport, settings, root, cx)
                 });
             }
@@ -2945,7 +2945,6 @@ impl PilusView {
         self.pump_reconnects();
         self.drive_pending_switch();
         self.expire_pending_switch();
-        let mut tabs_changed = false;
         let updates: Vec<_> = self
             .agent_feed
             .as_ref()
@@ -2960,10 +2959,9 @@ impl PilusView {
             self.agents_loaded = true;
             self.automations = update.automations;
             self.tasks = update.tasks;
-            tabs_changed = true;
             changed = true;
         }
-        if tabs_changed {}
+
         changed |= self.raise_attention(cx);
         // Drop the optimistic endpoint pick once the handoff commits (the
         // committed highlight needs no pick) or every stage of the switch has
@@ -13781,7 +13779,8 @@ impl PilusView {
             menu,
         } = spec;
         let theme = self.theme;
-        let header = div()
+
+        div()
             .flex()
             .flex_row()
             .items_center()
@@ -13839,8 +13838,7 @@ impl PilusView {
                             }),
                         )
                     }),
-            );
-        header
+            )
     }
 
     /// Expand the daemon's `~`-shorthand dirs against the owning machine.

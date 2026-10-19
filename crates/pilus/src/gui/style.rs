@@ -2901,8 +2901,10 @@ mod tests {
 
     #[test]
     fn energy_mode_leaves_the_pill_and_the_tab_soft() {
-        let mut settings = Settings::default();
-        settings.energy_mode = true;
+        let settings = Settings {
+            energy_mode: true,
+            ..Settings::default()
+        };
         let base = settings.drawn_radius();
         for step in [Radius::None, Radius::Sm, Radius::Md, Radius::Lg] {
             assert_eq!(step.resolve(base), px(0.0), "{step:?}");

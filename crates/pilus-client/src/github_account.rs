@@ -754,7 +754,10 @@ impl GhAccount {
 
     /// Write one change to the database, best-effort like the app's other state.
     /// It names private repositories, and the database is owner-only.
-    fn persist(&self, write: impl FnOnce(&pilus_db::rusqlite::Connection) -> Result<(), pilus_db::Error>) {
+    fn persist(
+        &self,
+        write: impl FnOnce(&pilus_db::rusqlite::Connection) -> Result<(), pilus_db::Error>,
+    ) {
         if let Err(error) = self.db.with(write) {
             tracing::warn!("could not save the GitHub cache: {error}");
         }

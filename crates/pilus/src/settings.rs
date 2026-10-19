@@ -714,8 +714,10 @@ mod tests {
 
     #[test]
     fn the_master_switch_outranks_the_section() {
-        let mut settings = Settings::default();
-        settings.github = false;
+        let settings = Settings {
+            github: false,
+            ..Settings::default()
+        };
         assert!(!settings.github_shows_repositories());
         // The section keeps its own choice for when GitHub comes back on.
         assert!(settings.github_repositories);
@@ -906,8 +908,10 @@ mod tests {
 
     #[test]
     fn radius_clamps_to_the_slider_range() {
-        let mut settings = Settings::default();
-        settings.corner_radius = -3.0;
+        let mut settings = Settings {
+            corner_radius: -3.0,
+            ..Settings::default()
+        };
         assert_eq!(settings.radius(), 0.0);
         settings.corner_radius = 99.0;
         assert_eq!(settings.radius(), CORNER_RADIUS_MAX);

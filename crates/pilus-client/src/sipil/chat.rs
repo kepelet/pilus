@@ -226,9 +226,14 @@ impl State {
     fn read(db: &Db) -> Result<Self, DbError> {
         db.with(|conn| {
             let mut state = Self::default();
-            let mut threads = conn.prepare("SELECT thread, next, read_through FROM chat_threads")?;
+            let mut threads =
+                conn.prepare("SELECT thread, next, read_through FROM chat_threads")?;
             for row in threads.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             })? {
                 let (name, next, read_through) = row?;
                 let thread = state.threads.entry(name).or_default();
@@ -260,10 +265,14 @@ impl State {
                     thread.lines.push(line);
                 }
             }
-            let mut requests =
-                conn.prepare("SELECT thread, line, request FROM chat_requests ORDER BY thread, line")?;
+            let mut requests = conn
+                .prepare("SELECT thread, line, request FROM chat_requests ORDER BY thread, line")?;
             for row in requests.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })? {
                 let (name, line, request) = row?;
                 if let Some(thread) = state.threads.get_mut(&name) {
@@ -337,8 +346,12 @@ fn insert_line(tx: &Transaction, thread: &str, line: &Line) -> Result<(), DbErro
             line.at as i64,
             line.who,
             line.agent,
-            line.reply.as_ref().and_then(|q| serde_json::to_string(q).ok()),
-            line.delegation.as_ref().and_then(|d| serde_json::to_string(d).ok()),
+            line.reply
+                .as_ref()
+                .and_then(|q| serde_json::to_string(q).ok()),
+            line.delegation
+                .as_ref()
+                .and_then(|d| serde_json::to_string(d).ok()),
         ],
     )?;
     Ok(())
@@ -348,7 +361,12 @@ fn insert_line(tx: &Transaction, thread: &str, line: &Line) -> Result<(), DbErro
 /// memory, including the limits on how much a thread keeps.
 fn write(tx: &Transaction, thread: &str, entry: &Entry) -> Result<(), DbError> {
     if matches!(entry, Entry::Forget) {
-        for table in ["chat_lines", "chat_requests", "chat_cursors", "chat_threads"] {
+        for table in [
+            "chat_lines",
+            "chat_requests",
+            "chat_cursors",
+            "chat_threads",
+        ] {
             tx.execute(&format!("DELETE FROM {table} WHERE thread = ?1"), [thread])?;
         }
         return Ok(());
@@ -752,7 +770,14 @@ mod tests {
             task: "How?".to_string(),
         };
         let first = reopen(&dir);
-        first.push_theirs_replying("#c", "still here", "r", Some("dev"), Some("Bot"), Some(&quote));
+        first.push_theirs_replying(
+            "#c",
+            "still here",
+            "r",
+            Some("dev"),
+            Some("Bot"),
+            Some(&quote),
+        );
         first.push_delegation("#c", "CoS", note.clone());
         let before = first.lines("#c");
         drop(first);
@@ -853,7 +878,11 @@ mod tests {
 
         let chats = reopen(&dir);
         let texts: Vec<_> = chats.lines("p").into_iter().map(|l| l.text).collect();
-        assert_eq!(texts, ["kept", "after"], "damaged records cost only themselves");
+        assert_eq!(
+            texts,
+            ["kept", "after"],
+            "damaged records cost only themselves"
+        );
         assert_eq!(chats.unread("p"), 0);
         assert_eq!(chats.cursor("p", "d").unwrap().session, "s");
         assert!(chats.lines("gone").is_empty());

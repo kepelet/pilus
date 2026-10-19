@@ -2023,7 +2023,7 @@ pub(super) fn answer_input(
 
 #[cfg(test)]
 mod tests {
-    use pilus_client::{MissionRow, MissionUsage};
+    use pilus_client::MissionRow;
 
     use super::{
         Signal, blocked_line, civil_from_days, fmt_cost, fmt_tokens, resume_ordinal, row_keys,

@@ -149,9 +149,9 @@ impl Offline {
     /// Note who daemon `id`'s primary agent is, as a connect has just found.
     pub fn remember_agent(&self, id: &str, label: &str, agent: RememberedAgent) {
         let unchanged = self.with(|file| {
-            file.daemons
-                .get(id)
-                .is_some_and(|daemon| daemon.label == label && daemon.agent.as_ref() == Some(&agent))
+            file.daemons.get(id).is_some_and(|daemon| {
+                daemon.label == label && daemon.agent.as_ref() == Some(&agent)
+            })
         });
         if unchanged {
             return;
@@ -410,7 +410,11 @@ mod tests {
             });
         }
         assert!(offline.transcript("d", "c0").is_none());
-        assert!(offline.transcript("d", &format!("c{CONVERSATION_LIMIT}")).is_some());
+        assert!(
+            offline
+                .transcript("d", &format!("c{CONVERSATION_LIMIT}"))
+                .is_some()
+        );
     }
 
     #[test]

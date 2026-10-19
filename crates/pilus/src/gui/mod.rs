@@ -349,6 +349,8 @@ gpui::actions!([
     ResetFontSize,
     /// Show or hide the sidebar.
     ToggleSidebar,
+    /// Turn energy mode on or off.
+    ToggleEnergyMode,
     /// Save the markdown file being edited in the Files tab.
     SaveDoc,
     /// Show or hide the right sidebar (Changes and History).
@@ -657,58 +659,16 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
                 });
             }
         });
+        cx.on_action({
+            let settings = settings.clone();
+            let root = pilus_root.clone();
+            move |_: &ToggleEnergyMode, cx: &mut App| {
+                let (settings, root) = (settings.clone(), root.clone());
+                cx.defer(move |cx| toggle_energy(&settings, &root, cx));
+            }
+        });
         cx.bind_keys(app_key_bindings());
-        cx.set_menus([
-            Menu::new("pilus").items([
-                MenuItem::action("About pilus", OpenAbout),
-                MenuItem::action("Check for Updates", CheckForUpdates),
-                MenuItem::separator(),
-                MenuItem::action("Appearances", OpenAppearances),
-                MenuItem::action("Settings", OpenSettings),
-                MenuItem::separator(),
-                MenuItem::action("Hide pilus", HideApp),
-                MenuItem::action("Hide Others", HideOtherApps),
-                MenuItem::separator(),
-                MenuItem::action("Quit pilus", QuitApp),
-            ]),
-            Menu::new("File").items([
-                MenuItem::action("New Window", NewWindow),
-                MenuItem::action("New Tab", NewTab),
-                MenuItem::action("Open Local Terminal", OpenLocalTerminal),
-                MenuItem::action("New Agent…", OpenHome),
-                MenuItem::action("Open Workspace", OpenWorkspacePicker),
-                MenuItem::separator(),
-                MenuItem::action("Split Vertical", SplitVertical),
-                MenuItem::action("Split Horizontal", SplitHorizontal),
-                MenuItem::separator(),
-                MenuItem::action("Close Tab", CloseTab),
-                MenuItem::action("Close Window", CloseWindow),
-                MenuItem::action("Close All Windows", CloseAllWindows),
-            ]),
-            Menu::new("Edit").items([
-                MenuItem::action("Copy", CopySelection),
-                MenuItem::action("Paste", PasteClipboard),
-                MenuItem::action("Select All", SelectAllGrid),
-            ]),
-            Menu::new("View").items([
-                MenuItem::action("Command Palette", OpenCommandPalette),
-                MenuItem::separator(),
-                MenuItem::action("Increase Font Size", IncreaseFontSize),
-                MenuItem::action("Decrease Font Size", DecreaseFontSize),
-                MenuItem::action("Reset Font Size", ResetFontSize),
-                MenuItem::separator(),
-                MenuItem::action("Toggle Sidebar", ToggleSidebar),
-                MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
-                MenuItem::action("Right Sidebar Back", RightSidebarBack),
-                MenuItem::action("Right Sidebar Forward", RightSidebarForward),
-            ]),
-            Menu::new("Window").items([
-                MenuItem::action("Minimize", MinimizeWindow),
-                MenuItem::action("Zoom", ZoomWindow),
-                MenuItem::separator(),
-                MenuItem::action("Close Window", CloseWindow),
-            ]),
-        ]);
+        cx.set_menus(app_menus(settings.borrow().energy_mode));
         // The helper opens no window: it is only the menu bar item, until a
         // click or a second launch asks for one.
         if menubar_only {
@@ -813,7 +773,7 @@ impl AppShared {
         let enabled = self.settings.borrow().menu_bar;
         if !enabled {
             *watch = None;
-            menubar::headless(false, &[]);
+            menubar::headless(false, &[], false);
             // The helper exists for the item alone, so without one it ends.
             if self.menubar_only {
                 background::quit_fully(cx);
@@ -843,9 +803,11 @@ impl AppShared {
             // new count.
             notify::set_badge(badge);
         }
-        for pick in menubar::headless(true, &rows) {
+        let energy = self.settings.borrow().energy_mode;
+        for pick in menubar::headless(true, &rows, energy) {
             match pick {
                 menubar::Pick::Quit => background::quit_fully(cx),
+                menubar::Pick::Energy => toggle_energy(&self.settings, &self.pilus_root, cx),
                 menubar::Pick::Show => {
                     self.open_window(None, cx);
                     cx.activate(true);
@@ -1099,6 +1061,78 @@ fn open_main_window(
     if let Err(error) = opened {
         eprintln!("pilus: could not open another window: {error}");
     }
+}
+
+/// The application menus. Energy Mode is a checked item in the pilus menu, so the menu
+/// bar shows whether it is on; the menus are set again whenever that changes.
+fn app_menus(energy: bool) -> Vec<Menu> {
+    vec![
+        Menu::new("pilus").items([
+            MenuItem::action("About pilus", OpenAbout),
+            MenuItem::action("Check for Updates", CheckForUpdates),
+            MenuItem::action("Energy Mode", ToggleEnergyMode).checked(energy),
+            MenuItem::separator(),
+            MenuItem::action("Appearances", OpenAppearances),
+            MenuItem::action("Settings", OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action("Hide pilus", HideApp),
+            MenuItem::action("Hide Others", HideOtherApps),
+            MenuItem::separator(),
+            MenuItem::action("Quit pilus", QuitApp),
+        ]),
+        Menu::new("File").items([
+            MenuItem::action("New Window", NewWindow),
+            MenuItem::action("New Tab", NewTab),
+            MenuItem::action("Open Local Terminal", OpenLocalTerminal),
+            MenuItem::action("New Agent…", OpenHome),
+            MenuItem::action("Open Workspace", OpenWorkspacePicker),
+            MenuItem::separator(),
+            MenuItem::action("Split Vertical", SplitVertical),
+            MenuItem::action("Split Horizontal", SplitHorizontal),
+            MenuItem::separator(),
+            MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action("Close Window", CloseWindow),
+            MenuItem::action("Close All Windows", CloseAllWindows),
+        ]),
+        Menu::new("Edit").items([
+            MenuItem::action("Copy", CopySelection),
+            MenuItem::action("Paste", PasteClipboard),
+            MenuItem::action("Select All", SelectAllGrid),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("Command Palette", OpenCommandPalette),
+            MenuItem::separator(),
+            MenuItem::action("Increase Font Size", IncreaseFontSize),
+            MenuItem::action("Decrease Font Size", DecreaseFontSize),
+            MenuItem::action("Reset Font Size", ResetFontSize),
+            MenuItem::separator(),
+            MenuItem::action("Toggle Sidebar", ToggleSidebar),
+            MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
+            MenuItem::action("Right Sidebar Back", RightSidebarBack),
+            MenuItem::action("Right Sidebar Forward", RightSidebarForward),
+        ]),
+        Menu::new("Window").items([
+            MenuItem::action("Minimize", MinimizeWindow),
+            MenuItem::action("Zoom", ZoomWindow),
+            MenuItem::separator(),
+            MenuItem::action("Close Window", CloseWindow),
+        ]),
+    ]
+}
+
+/// Flip energy mode from the menu bar: persist it, publish the squared corners
+/// and refresh the menu's check mark. Each window picks up the rest on its next
+/// tick (`PilusView::sync_energy`).
+fn toggle_energy(settings: &Rc<RefCell<Settings>>, root: &Path, cx: &mut App) {
+    let energy = {
+        let mut settings = settings.borrow_mut();
+        settings.energy_mode = !settings.energy_mode;
+        settings.save(root);
+        style::sync_corner_radius(&settings);
+        settings.energy_mode
+    };
+    cx.set_menus(app_menus(energy));
+    cx.refresh_windows();
 }
 
 /// Scale the UI and terminal fonts together and persist them. `delta == 0.0`
@@ -1686,6 +1720,11 @@ struct PilusView {
     /// The window's frosted backdrop view, reconfigured whenever the blur
     /// setting (or the opaque frame) changes it.
     glass: Glass,
+    /// Whether energy mode was in effect when the app last applied it, so a
+    /// change is applied once, not on every tick.
+    energy_applied: bool,
+    /// The Energy Mode check mark the menu bar last showed.
+    menu_energy: bool,
     /// Collapse/expand tween in flight, if any; the panel, tab strip, and
     /// terminal read its openness so they glide together.
     sidebar_anim: Option<SidebarAnim>,
@@ -2417,6 +2456,8 @@ impl PilusView {
             settings,
             shared_settings,
             glass: Glass::new(),
+            energy_applied: false,
+            menu_energy: false,
             sidebar_anim: None,
             cursor_blink: cursor_blink::CursorBlink::new(Instant::now()),
             toolbar_fade: toolbar_fade::ToolbarFade::new(Instant::now()),
@@ -2648,6 +2689,7 @@ impl PilusView {
                 let wait = this.update(cx, |view, cx| {
                     view.persist_window_bounds();
                     let changed = view.sync_settings(cx);
+                    let energy = view.sync_energy(cx);
                     // The sidebar tween rides this loop: it ticks and
                     // repaints here, so no second driver can stall unseen.
                     // A settling tween repaints once more so a trailing
@@ -2679,7 +2721,7 @@ impl PilusView {
                     // elsewhere can tell when the app is behind another one.
                     let front = dock::app_active().unwrap_or(view.window_active);
                     activity::set_front(front);
-                    next_tick(moving, front)
+                    next_tick(moving, front, energy)
                 });
                 let Ok(wait) = wait else {
                     break;
@@ -4635,6 +4677,29 @@ impl PilusView {
     ///
     /// A change to the update channel or feed URL rebuilds the updater engine
     /// in place; turning auto-check on checks right away, like a launch would.
+    /// Switch the whole app between its normal and its energy-saving look when
+    /// energy mode changes, whichever surface flipped it. Motion goes through GPUI's reduce-motion flag, which the
+    /// tweens, spinners, fades and the cursor blink already honor; corners and
+    /// opacity read the settings' `drawn_*` values. Returns whether energy mode
+    /// is in effect, for the tick loop's cadence.
+    fn sync_energy(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.settings.energy_mode != self.menu_energy {
+            self.menu_energy = self.settings.energy_mode;
+            cx.set_menus(app_menus(self.menu_energy));
+        }
+        let on = self.settings.energy_saving();
+        if on != self.energy_applied {
+            self.energy_applied = on;
+            cx.set_reduce_motion(on);
+            style::sync_corner_radius(&self.settings);
+            // A tween in flight would otherwise finish the slide it began.
+            self.sidebar_anim = None;
+            self.right.settle();
+            cx.notify();
+        }
+        on
+    }
+
     fn sync_settings(&mut self, cx: &mut Context<Self>) -> bool {
         let latest = self.shared_settings.borrow().clone();
         if latest == self.settings {
@@ -4898,6 +4963,16 @@ impl PilusView {
                 Some("⌘B"),
             ),
             entry(
+                Command::ToggleEnergyMode,
+                if self.settings.energy_mode {
+                    "Turn Off Energy Mode"
+                } else {
+                    "Turn On Energy Mode"
+                },
+                "View",
+                None,
+            ),
+            entry(
                 Command::TogglePaneToolbar,
                 if self.settings.pane_toolbar {
                     "Hide Pane Toolbar"
@@ -5022,6 +5097,7 @@ impl PilusView {
                 window.dispatch_action(ToggleRightSidebar.boxed_clone(), cx)
             }
             Command::TogglePaneToolbar => self.toggle_pane_toolbar(cx),
+            Command::ToggleEnergyMode => self.toggle_energy_mode(cx),
             Command::IncreaseFontSize => window.dispatch_action(IncreaseFontSize.boxed_clone(), cx),
             Command::DecreaseFontSize => window.dispatch_action(DecreaseFontSize.boxed_clone(), cx),
             Command::ResetFontSize => window.dispatch_action(ResetFontSize.boxed_clone(), cx),
@@ -9113,7 +9189,8 @@ impl PilusView {
                     .collect::<Vec<_>>()
             })
             .collect();
-        self.menubar.sync(self.settings.menu_bar, &rows);
+        self.menubar
+            .sync(self.settings.menu_bar, &rows, self.settings.energy_mode);
         for pick in self.menubar.drain() {
             match pick {
                 menubar::Pick::Quit => {
@@ -9121,6 +9198,7 @@ impl PilusView {
                     return;
                 }
                 menubar::Pick::Show => self.raise_window(cx),
+                menubar::Pick::Energy => self.toggle_energy_mode(cx),
                 menubar::Pick::Agent { endpoint, pane } => {
                     self.raise_window(cx);
                     self.menu_pick = Some((endpoint, pane, Instant::now()));
@@ -9255,7 +9333,9 @@ impl PilusView {
         }
         self.push_sidebar_layout();
         let to = if self.sidebar_visible { 1.0 } else { 0.0 };
-        self.sidebar_anim = Some(SidebarAnim {
+        // Reduced motion lands the panel at once; the freeze above is
+        // released by the same path as after a slide.
+        self.sidebar_anim = (!cx.reduce_motion()).then(|| SidebarAnim {
             started: Instant::now(),
             from,
             to,
@@ -10452,6 +10532,17 @@ impl PilusView {
     }
 
     /// Show or hide the focused pane's corner toolbar, persisting the choice.
+    /// Flip energy mode, persisting the choice. `sync_energy` applies it on the
+    /// next tick; the corners are published here so this frame already draws
+    /// them square.
+    fn toggle_energy_mode(&mut self, cx: &mut Context<Self>) {
+        self.settings.energy_mode = !self.settings.energy_mode;
+        self.settings.save(&self.pilus_root);
+        *self.shared_settings.borrow_mut() = self.settings.clone();
+        style::sync_corner_radius(&self.settings);
+        cx.notify();
+    }
+
     fn toggle_pane_toolbar(&mut self, cx: &mut Context<Self>) {
         self.settings.pane_toolbar = !self.settings.pane_toolbar;
         self.settings.save(&self.pilus_root);
@@ -14303,7 +14394,7 @@ impl PilusView {
         if self.theme.is_light() {
             1.0
         } else {
-            self.settings.glass_opacity()
+            self.settings.drawn_opacity()
         }
     }
 
@@ -14872,18 +14963,22 @@ const FRAME: Duration = Duration::from_millis(16);
 const IDLE_FRONT: Duration = Duration::from_millis(50);
 /// The cadence when the app is behind another one.
 const IDLE_BEHIND: Duration = Duration::from_millis(250);
+/// The same two cadences under energy mode: half as many wake-ups, still under
+/// what a person notices for state arriving from a worker thread.
+const IDLE_FRONT_ENERGY: Duration = Duration::from_millis(100);
+const IDLE_BEHIND_ENERGY: Duration = Duration::from_millis(500);
 
 /// How long the tick loop sleeps before its next pass: a frame while anything
 /// is moving, and otherwise only often enough to notice what the worker threads
 /// have left. A loop that runs at the frame rate forever keeps the CPU from ever
 /// going idle, which is what an open window costs on a battery.
-fn next_tick(moving: bool, front: bool) -> Duration {
-    if moving {
-        FRAME
-    } else if front {
-        IDLE_FRONT
-    } else {
-        IDLE_BEHIND
+fn next_tick(moving: bool, front: bool, energy: bool) -> Duration {
+    match (moving, front, energy) {
+        (true, ..) => FRAME,
+        (false, true, false) => IDLE_FRONT,
+        (false, false, false) => IDLE_BEHIND,
+        (false, true, true) => IDLE_FRONT_ENERGY,
+        (false, false, true) => IDLE_BEHIND_ENERGY,
     }
 }
 
@@ -16766,10 +16861,12 @@ fn launch_home_agent(
 mod tests {
     #[test]
     fn the_tick_loop_runs_at_the_frame_rate_only_while_something_moves() {
-        assert_eq!(next_tick(true, true), FRAME);
-        assert_eq!(next_tick(true, false), FRAME);
-        assert_eq!(next_tick(false, true), IDLE_FRONT);
-        assert_eq!(next_tick(false, false), IDLE_BEHIND);
+        assert_eq!(next_tick(true, true, false), FRAME);
+        assert_eq!(next_tick(true, false, true), FRAME);
+        assert_eq!(next_tick(false, true, false), IDLE_FRONT);
+        assert_eq!(next_tick(false, false, false), IDLE_BEHIND);
+        assert_eq!(next_tick(false, true, true), IDLE_FRONT_ENERGY);
+        assert_eq!(next_tick(false, false, true), IDLE_BEHIND_ENERGY);
         assert!(FRAME < IDLE_FRONT && IDLE_FRONT < IDLE_BEHIND);
     }
 

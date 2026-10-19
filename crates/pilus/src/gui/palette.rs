@@ -27,6 +27,7 @@ pub enum Command {
     ToggleSidebar,
     ToggleRightSidebar,
     TogglePaneToolbar,
+    ToggleEnergyMode,
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,

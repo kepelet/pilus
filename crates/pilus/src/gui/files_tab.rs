@@ -1059,6 +1059,9 @@ impl PilusView {
         };
         if edit.mode == EditMode::Split && !self.files_panel.split_ok && !self.right.expanded() {
             self.right.toggle_expanded();
+            if cx.reduce_motion() {
+                self.right.settle();
+            }
         }
         window.focus(&self.md_editor_input.focus_handle(cx), cx);
         cx.notify();

@@ -527,7 +527,7 @@ impl Element for PaneChrome {
             .round
             .pixels(radius)
             .clamp_radii_for_quad_size(bounds.size);
-        if look.shadow > 0.0 {
+        if look.shadow > 0.0 && !style::energy() {
             paint_shadow_outside(window, bounds, corners, look.shadow);
         }
         if look.dim > 0.0 {

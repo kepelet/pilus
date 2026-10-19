@@ -218,6 +218,10 @@ pub struct Settings {
     /// Corner radius of controls, cards, and overlays, in logical pixels.
     /// Every rounded element scales from it, and zero squares them all.
     pub corner_radius: f32,
+    /// Energy mode: square corners, a solid window and no animation, drawn
+    /// over the settings above without changing them, so turning it off
+    /// brings back the look the person chose.
+    pub energy_mode: bool,
     /// Whether WORKSPACES rows draw their path line. Off by default; the
     /// sidebar's Show Path row turns it on and persists the choice.
     pub sidebar_workspace_paths: bool,
@@ -338,6 +342,7 @@ impl Default for Settings {
             opacity: OPACITY,
             blur: BLUR,
             corner_radius: DEFAULT_CORNER_RADIUS,
+            energy_mode: false,
             sidebar_workspace_paths: false,
             sidebar_agent_paths: false,
             terminal_top_spacing: true,
@@ -604,6 +609,33 @@ impl Settings {
         let row = order.remove(at);
         order.insert(into, row);
         self.sipil_order = order;
+    }
+
+    /// Whether energy mode is in effect.
+    pub fn energy_saving(&self) -> bool {
+        self.energy_mode
+    }
+
+    /// The corner radius to draw: square under energy mode, since a rounded
+    /// edge on a translucent card is what makes the compositor blend it.
+    /// [`Self::radius`] stays the person's own choice, for the slider.
+    pub fn drawn_radius(&self) -> f32 {
+        if self.energy_saving() {
+            0.0
+        } else {
+            self.radius()
+        }
+    }
+
+    /// The window opacity to draw: solid under energy mode, so nothing behind
+    /// the window has to be blurred or blended. [`Self::glass_opacity`] stays
+    /// the person's own choice, for the slider.
+    pub fn drawn_opacity(&self) -> f32 {
+        if self.energy_saving() {
+            1.0
+        } else {
+            self.glass_opacity()
+        }
     }
 
     /// The corner radius, clamped so a stray value cannot draw blobs.
@@ -882,6 +914,29 @@ mod tests {
     }
 
     #[test]
+    fn energy_mode_draws_square_and_solid_without_touching_the_choices() {
+        let mut settings = Settings {
+            opacity: 0.6,
+            corner_radius: 8.0,
+            ..Settings::default()
+        };
+        assert_eq!(settings.drawn_radius(), 8.0);
+        assert_eq!(settings.drawn_opacity(), 0.6);
+        settings.energy_mode = true;
+        assert_eq!(settings.drawn_radius(), 0.0);
+        assert_eq!(settings.drawn_opacity(), 1.0);
+        // The sliders keep reading the person's own values.
+        assert_eq!(settings.radius(), 8.0);
+        assert_eq!(settings.glass_opacity(), 0.6);
+    }
+
+    #[test]
+    fn missing_energy_keys_leave_energy_mode_off() {
+        let back: Settings = serde_json::from_str("{}").expect("deserialize");
+        assert!(!back.energy_mode);
+    }
+
+    #[test]
     fn glass_opacity_clamps_to_a_usable_range() {
         let mut settings = Settings::default();
         assert_eq!(settings.glass_opacity(), OPACITY);
@@ -936,6 +991,7 @@ mod tests {
             opacity: 0.7,
             blur: 0.5,
             corner_radius: 0.0,
+            energy_mode: true,
             sidebar_workspace_paths: true,
             sidebar_agent_paths: true,
             terminal_top_spacing: false,

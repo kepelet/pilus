@@ -324,6 +324,13 @@ impl RightSidebar {
         self.tween.is_some() || self.spread_tween.is_some() || self.drag.is_some()
     }
 
+    /// Land the column at its target now, dropping any tween in flight: what
+    /// reduced motion does in place of a slide.
+    pub(super) fn settle(&mut self) {
+        self.tween = None;
+        self.spread_tween = None;
+    }
+
     /// Advance the tweens; true once nothing is in flight.
     pub(super) fn tick(&mut self) -> bool {
         let finished = |tween: &Option<Tween>| {
@@ -400,11 +407,17 @@ pub(super) fn clamp_width(wanted: f32, window_w: f32) -> f32 {
 impl PilusView {
     pub(super) fn toggle_right_expanded(&mut self, cx: &mut Context<Self>) {
         self.right.toggle_expanded();
+        if cx.reduce_motion() {
+            self.right.settle();
+        }
         cx.notify();
     }
 
     pub(super) fn toggle_right_sidebar(&mut self, cx: &mut Context<Self>) {
         self.right.toggle();
+        if cx.reduce_motion() {
+            self.right.settle();
+        }
         self.settings.right_sidebar_visible = self.right.visible;
         self.settings.save(&self.pilus_root);
         if self.right.visible {

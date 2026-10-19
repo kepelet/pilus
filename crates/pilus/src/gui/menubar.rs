@@ -38,6 +38,8 @@ pub enum Pick {
     Agent { endpoint: String, pane: String },
     /// Bring the window forward, opening one if none is left.
     Show,
+    /// Turn energy mode on or off.
+    Energy,
     /// Quit pilus, as Cmd+Q does.
     Quit,
 }
@@ -56,9 +58,10 @@ mod imp {
         AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
     };
     use objc2_app_kit::{
-        NSAttributedStringNSExtendedStringDrawing, NSBaselineOffsetAttributeName, NSColor, NSFont,
-        NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSMenu, NSMenuItem,
-        NSStatusBar, NSStatusItem, NSStringDrawingOptions, NSVariableStatusItemLength,
+        NSAttributedStringNSExtendedStringDrawing, NSBaselineOffsetAttributeName, NSColor,
+        NSControlStateValueOff, NSControlStateValueOn, NSFont, NSFontAttributeName,
+        NSForegroundColorAttributeName, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
+        NSStringDrawingOptions, NSVariableStatusItemLength,
     };
     use objc2_foundation::{
         NSAttributedString, NSData, NSMutableAttributedString, NSNumber, NSRange, NSSize, NSString,
@@ -118,6 +121,7 @@ mod imp {
         match pick {
             Pick::Agent { endpoint, pane } => format!("agent{FIELD}{endpoint}{FIELD}{pane}"),
             Pick::Show => "show".to_string(),
+            Pick::Energy => "energy".to_string(),
             Pick::Quit => "quit".to_string(),
         }
     }
@@ -130,6 +134,7 @@ mod imp {
                 pane: fields.next()?.to_string(),
             }),
             "show" => Some(Pick::Show),
+            "energy" => Some(Pick::Energy),
             "quit" => Some(Pick::Quit),
             _ => None,
         }
@@ -207,7 +212,7 @@ mod imp {
         glyph: Option<Retained<NSImage>>,
         /// The dot's font and baseline lift, measured once.
         dot: (Retained<NSFont>, f64),
-        shown: Option<Vec<Row>>,
+        shown: Option<(Vec<Row>, bool)>,
         /// The window that feeds the menu; `None` leaves it to [`headless`].
         owner: Option<u64>,
     }
@@ -282,8 +287,12 @@ mod imp {
             item
         }
 
-        fn rebuild(&mut self, rows: &[Row]) {
-            if self.shown.as_deref() == Some(rows) {
+        fn rebuild(&mut self, rows: &[Row], energy: bool) {
+            if self
+                .shown
+                .as_ref()
+                .is_some_and(|(shown, on)| shown.as_slice() == rows && *on == energy)
+            {
                 return;
             }
             let menu = NSMenu::new(self.mtm);
@@ -320,13 +329,20 @@ mod imp {
             }
             menu.addItem(&NSMenuItem::separatorItem(self.mtm));
             menu.addItem(&self.action_item("Show pilus", Some(&Pick::Show)));
+            let toggle = self.action_item("Energy Mode", Some(&Pick::Energy));
+            toggle.setState(if energy {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+            menu.addItem(&toggle);
             menu.addItem(&self.action_item("Quit pilus", Some(&Pick::Quit)));
             self.item.setMenu(Some(&menu));
 
             if let Some(button) = self.item.button(self.mtm) {
                 button.setImage(self.glyph.as_deref());
             }
-            self.shown = Some(rows.to_vec());
+            self.shown = Some((rows.to_vec(), energy));
         }
     }
 
@@ -390,7 +406,7 @@ mod imp {
 
         /// Show `rows`, installing the item when `enabled`, or remove it.
         /// While another window owns the item this does nothing.
-        pub fn sync(&mut self, enabled: bool, rows: &[Row]) {
+        pub fn sync(&mut self, enabled: bool, rows: &[Row], energy: bool) {
             let Some(mtm) = MainThreadMarker::new() else {
                 return;
             };
@@ -409,7 +425,7 @@ mod imp {
                 let state = shared.get_or_insert_with(|| Shared::install(mtm));
                 state.owner.get_or_insert(self.id);
                 if state.owner == Some(self.id) {
-                    state.rebuild(rows);
+                    state.rebuild(rows, energy);
                 }
             });
         }
@@ -444,7 +460,7 @@ mod imp {
     /// Feed the item while no window owns it: install it when `enabled`,
     /// remove it otherwise, and return the clicks since the last call. Does
     /// nothing while a window owns the item.
-    pub fn headless(enabled: bool, rows: &[Row]) -> Vec<Pick> {
+    pub fn headless(enabled: bool, rows: &[Row], energy: bool) -> Vec<Pick> {
         let Some(mtm) = MainThreadMarker::new() else {
             return Vec::new();
         };
@@ -460,7 +476,7 @@ mod imp {
             if state.owner.is_some() {
                 return Vec::new();
             }
-            state.rebuild(rows);
+            state.rebuild(rows, energy);
             state.rx.try_iter().collect()
         })
     }
@@ -472,7 +488,7 @@ mod imp {
 
     pub struct MenuBar;
 
-    pub fn headless(_enabled: bool, _rows: &[Row]) -> Vec<Pick> {
+    pub fn headless(_enabled: bool, _rows: &[Row], _energy: bool) -> Vec<Pick> {
         Vec::new()
     }
 
@@ -481,7 +497,7 @@ mod imp {
             Self
         }
 
-        pub fn sync(&mut self, _enabled: bool, _rows: &[Row]) {}
+        pub fn sync(&mut self, _enabled: bool, _rows: &[Row], _energy: bool) {}
 
         pub fn drain(&mut self) -> Vec<Pick> {
             Vec::new()

@@ -8,7 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -56,7 +56,8 @@ pub(super) enum Radius {
     /// A large floating panel.
     Lg,
     /// A pill, status dot, or round button: fully round whatever the
-    /// setting, since a square one stops reading as what it is.
+    /// setting, since a square one stops reading as what it is. Only energy
+    /// mode squares it.
     Full,
     /// A tab: never squarer than the default radius, so zero corners leave
     /// the strip soft.
@@ -69,15 +70,36 @@ pub(super) enum Radius {
 /// before they build their trees.
 static CORNER_RADIUS_PX: AtomicU32 = AtomicU32::new(DEFAULT_CORNER_RADIUS.to_bits());
 
-/// Publish the user's corner radius for [`Radius`] to resolve against.
+/// Whether energy mode is in effect, for painters that have no settings to ask.
+static ENERGY: AtomicBool = AtomicBool::new(false);
+
+/// Publish the radius being drawn, and whether energy mode is in effect, for
+/// [`Radius`] and [`energy`] to resolve against. Energy mode squares the
+/// corners here, so every window follows without a check of its own.
 pub(super) fn sync_corner_radius(settings: &Settings) {
-    CORNER_RADIUS_PX.store(settings.radius().to_bits(), Ordering::Relaxed);
+    CORNER_RADIUS_PX.store(settings.drawn_radius().to_bits(), Ordering::Relaxed);
+    ENERGY.store(settings.energy_saving(), Ordering::Relaxed);
+}
+
+/// Whether energy mode is in effect. Decorative paint that costs the GPU
+/// something (a shadow) checks it; motion goes through `reduce_motion`.
+pub(super) fn energy() -> bool {
+    ENERGY.load(Ordering::Relaxed)
 }
 
 impl Radius {
     /// This step's radius, scaled from the `Md` base the setting names.
     pub(super) fn pixels(self) -> Pixels {
         let base = f32::from_bits(CORNER_RADIUS_PX.load(Ordering::Relaxed));
+        self.resolve(base, energy())
+    }
+
+    /// The radius for a `base` setting. Energy mode squares every step, the
+    /// pill and the tab included, which the setting alone never does.
+    fn resolve(self, base: f32, energy: bool) -> Pixels {
+        if energy {
+            return px(0.0);
+        }
         match self {
             Self::None => px(0.0),
             Self::Sm => px(base * 2.0 / 3.0),
@@ -2847,4 +2869,29 @@ pub(super) fn dot_grid(color: Hsla, step: f32) -> gpui::Canvas<()> {
     .top_0()
     .left_0()
     .size_full()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_zero_radius_leaves_the_pill_and_the_tab_soft() {
+        assert_eq!(Radius::Full.resolve(0.0, false), px(9999.0));
+        assert_eq!(Radius::Soft.resolve(0.0, false), px(CORNER_RADIUS));
+    }
+
+    #[test]
+    fn energy_mode_squares_every_step() {
+        for step in [
+            Radius::None,
+            Radius::Sm,
+            Radius::Md,
+            Radius::Lg,
+            Radius::Full,
+            Radius::Soft,
+        ] {
+            assert_eq!(step.resolve(8.0, true), px(0.0), "{step:?}");
+        }
+    }
 }

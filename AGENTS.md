@@ -382,6 +382,17 @@ is judged. The rules that keep it low:
   `dock::app_active`). Coming forward polls at once because the elapsed time has
   already passed. A new background thread that wakes on a timer takes it too.
 - Network polls use `Backoff`, not a constant: see the sipil notes above.
+- Energy mode (`Settings::energy_mode`, switched from the pilus menu, the menu bar
+  item (`menubar::Pick::Energy`) or the command palette) draws over the person's
+  choices without changing them: `Settings::drawn_radius` (square, and `Radius::Full`
+  and `Soft` too, the pill and the tab, which the setting never squares) and
+  `drawn_opacity` (solid, so the blur view is dropped) replace `radius` and
+  `glass_opacity` at every point of use, while the Appearances sliders keep
+  reading the originals. Motion is GPUI's `reduce_motion`, set by
+  `PilusView::sync_energy`; a new animation must honor `cx.reduce_motion()` or it
+  will keep running under energy mode. Decorative paint with a GPU cost (the
+  focused pane's shadow) checks `style::energy()`, and the tick loop idles at
+  100 ms in front and 500 ms behind.
 - The Process page (`gui/process.rs`; always available, reached from the command palette, not the sidebar) shows the same costs
   live: CPU, memory and per-thread CPU from `pilus_client::process` (macOS
   `proc_pidinfo`, the one other `unsafe` block, scoped and commented), the

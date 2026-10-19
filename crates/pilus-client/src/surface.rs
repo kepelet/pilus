@@ -204,7 +204,13 @@ impl Surface {
                 SurfaceChange::None
             }
             ServerMessage::OpenUrl(url) => {
-                self.open_url = Some(url.clone());
+                // Whatever runs in a pane can ask for this, on a remote host too,
+                // so only a web or mail address reaches the system's opener.
+                if openable_url(url) {
+                    self.open_url = Some(url.clone());
+                } else {
+                    tracing::warn!(url = %url, "refused to open a URL that is not http, https or mailto");
+                }
                 SurfaceChange::None
             }
             ServerMessage::ShellWorkspaces(workspaces) => {
@@ -222,6 +228,25 @@ impl Surface {
             }
             _ => SurfaceChange::None,
         }
+    }
+}
+
+/// Whether a URL the daemon asks to open may be handed to the system.
+///
+/// `open` launches whatever a scheme is registered to: a `file:` URL runs an
+/// application, and other apps' schemes can act without a prompt. The daemon
+/// forwards these for programs in its panes, which may be on another machine,
+/// so only web and mail addresses are opened.
+pub fn openable_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    let Some((scheme, rest)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    match scheme.as_str() {
+        "http" | "https" => rest.starts_with("//") && rest.len() > 2,
+        "mailto" => !rest.is_empty(),
+        _ => false,
     }
 }
 
@@ -415,5 +440,28 @@ mod tests {
         assert!(!surface.needs_full_frame());
         surface.apply(&stale);
         assert!(surface.take_resync());
+    }
+
+    #[test]
+    fn only_web_and_mail_addresses_are_opened() {
+        for url in [
+            "https://luvus.dev/docs",
+            "http://localhost:5173",
+            "HTTPS://EXAMPLE.COM",
+            "mailto:someone@example.com",
+        ] {
+            assert!(openable_url(url), "{url}");
+        }
+        for url in [
+            "file:///Applications/Calculator.app",
+            "x-apple.systempreferences:com.apple.preference.security",
+            "ssh://host",
+            "javascript:alert(1)",
+            "https:",
+            "/etc/passwd",
+            "",
+        ] {
+            assert!(!openable_url(url), "{url}");
+        }
     }
 }

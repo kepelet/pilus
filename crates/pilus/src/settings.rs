@@ -141,6 +141,9 @@ pub struct Settings {
     /// Off by default; only shows with `pane_ui`, which owns the frames it
     /// sits on.
     pub pane_toolbar: bool,
+    /// Show the tools for looking inside pilus: today the Process page. Off by
+    /// default, so the sidebar keeps to what most people use.
+    pub developer_mode: bool,
     /// Show the GitHub sections in the sidebar. They need the `gh` CLI on
     /// this Mac and stay out of the way when it is missing, so on is the
     /// right default; off also stops every request to GitHub.
@@ -237,6 +240,7 @@ impl Default for Settings {
             pane_ui: true,
             pane_gaps: false,
             pane_toolbar: false,
+            developer_mode: false,
             github: true,
             github_repositories: true,
             github_pinned: Vec::new(),
@@ -603,6 +607,7 @@ mod tests {
         assert!(back.pane_ui);
         assert!(!back.pane_gaps);
         assert!(!back.pane_toolbar);
+        assert!(!back.developer_mode);
     }
 
     #[test]
@@ -793,6 +798,7 @@ mod tests {
             pane_ui: false,
             pane_gaps: true,
             pane_toolbar: false,
+            developer_mode: true,
             github: false,
             github_repositories: false,
             github_pinned: vec!["o/r".to_string()],

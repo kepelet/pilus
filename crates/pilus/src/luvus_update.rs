@@ -250,13 +250,24 @@ fn env_override(name: &str) -> Option<String> {
 
 /// Fetch a small text body.
 fn get_string(url: &str) -> gpui_updater_core::Result<String> {
-    let mut response = ureq::get(url)
+    let started = std::time::Instant::now();
+    let fetched = ureq::get(url)
         .call()
-        .map_err(|error| gpui_updater_core::Error::Http(format!("{url}: {error}")))?;
-    let bytes = response
-        .body_mut()
-        .read_to_vec()
-        .map_err(|error| gpui_updater_core::Error::Http(format!("{url}: {error}")))?;
+        .and_then(|mut response| response.body_mut().read_to_vec());
+    let host = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or(url);
+    pilus_client::netlog::record(
+        pilus_client::netlog::Kind::Http,
+        host,
+        "update check",
+        started,
+        fetched.is_ok(),
+    );
+    let bytes =
+        fetched.map_err(|error| gpui_updater_core::Error::Http(format!("{url}: {error}")))?;
     String::from_utf8(bytes).map_err(|error| gpui_updater_core::Error::Parse(error.to_string()))
 }
 

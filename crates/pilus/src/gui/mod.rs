@@ -6,6 +6,7 @@
 //! that one panel natively, and selects text over the grid itself.
 
 mod about;
+mod activity;
 mod agent_watch;
 mod app_icon;
 mod appearances;
@@ -47,6 +48,7 @@ mod pane_frames;
 mod perf;
 mod picker;
 mod ports_tab;
+mod process;
 mod right_sidebar;
 mod scheme;
 mod search;
@@ -125,6 +127,7 @@ use pilus_protocol::{
     SurfaceInterest,
 };
 use ports_tab::PortsPanel;
+use process::ProcessPage;
 use right_sidebar::{RightSidebar, SidebarTab};
 use search::SearchPage;
 use selection::{Cell, Selection};
@@ -480,6 +483,8 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
         // service is left alone, and one installed from an older build or app
         // location moves onto this binary.
         connector::ensure(settings.borrow().connector);
+        perf::start();
+        process::mark_launch();
         // sipil is a program the user starts, so a daemon that is not up yet is
         // waited for rather than reported. The network side starts only for a
         // pilus left reachable or connected to a daemon, so a launch that never
@@ -800,6 +805,9 @@ impl AppShared {
             *watch = None;
             return;
         }
+        // Nobody is looking at a window that is not there, so what polls for one
+        // can take its time; the menu bar and notifications still keep current.
+        activity::set_front(false);
         let enabled = self.settings.borrow().menu_bar;
         if !enabled {
             *watch = None;
@@ -1206,6 +1214,8 @@ enum InputLayer {
     Search,
     /// The Stats page.
     Stats,
+    /// The Process page.
+    Process,
     /// The chat page for a sipil agent or session.
     Sipil,
     /// The right sidebar's Sipil tab, with a field in it.
@@ -2056,6 +2066,7 @@ struct PilusView {
     search_input: Entity<TextInput>,
     /// The page that totals the agents' token use.
     stats: StatsPage,
+    process: ProcessPage,
     files_panel: FilesPanel,
     /// Notes on excerpts of markdown files, and the field they are written in.
     md_notes: md_notes_view::MdNotes,
@@ -2579,6 +2590,7 @@ impl PilusView {
             search,
             search_input,
             stats: StatsPage::default(),
+            process: ProcessPage::default(),
             files_panel: FilesPanel::new(),
             md_notes,
             md_note_input,
@@ -2627,7 +2639,7 @@ impl PilusView {
 
         cx.spawn(async move |this, cx| {
             loop {
-                let updated = this.update(cx, |view, cx| {
+                let wait = this.update(cx, |view, cx| {
                     view.persist_window_bounds();
                     let changed = view.sync_settings(cx);
                     // The sidebar tween rides this loop: it ticks and
@@ -2640,21 +2652,33 @@ impl PilusView {
                     let released = view.release_sidebar_freeze();
                     let blinked = view.tick_cursor_blink(cx);
                     let faded = view.tick_toolbar_fade(cx);
-                    if view.poll(cx)
-                        || changed
-                        || !settled
+                    perf::count(perf::Count::Tick);
+                    let moving = !settled
                         || was_animating
                         || released
                         || blinked
                         || faded
-                    {
+                        || view.toasts.any()
+                        || view.sidebar_freeze.is_some();
+                    let state = view.poll(cx) || changed;
+                    if state || moving {
+                        perf::count(if state {
+                            perf::Count::RepaintState
+                        } else {
+                            perf::Count::RepaintMotion
+                        });
                         cx.notify();
                     }
+                    // Every window reports the same answer, so the pollers
+                    // elsewhere can tell when the app is behind another one.
+                    let front = dock::app_active().unwrap_or(view.window_active);
+                    activity::set_front(front);
+                    next_tick(moving, front)
                 });
-                if updated.is_err() {
+                let Ok(wait) = wait else {
                     break;
-                }
-                tick_or_arrival(cx.background_executor().timer(TICK)).await;
+                };
+                tick_or_arrival(cx.background_executor().timer(wait)).await;
             }
         })
         .detach();
@@ -2977,7 +3001,7 @@ impl PilusView {
         }
         // Sessions change rarely; re-read the state root on a slow tick so a
         // created or stopped session appears without rescanning every frame.
-        if self.last_session_poll.elapsed() >= Duration::from_secs(2) {
+        if self.last_session_poll.elapsed() >= activity::scaled(Duration::from_secs(2)) {
             self.last_session_poll = Instant::now();
             let fresh = list_session_infos(&self.session_root);
             if fresh != self.sessions {
@@ -2993,11 +3017,12 @@ impl PilusView {
                 && !self.machine_connected(&machine.id)
         });
         if (self.catalog_dirty
-            || (needs_probe && self.last_machine_poll.elapsed() >= Duration::from_secs(10))
+            || (needs_probe
+                && self.last_machine_poll.elapsed() >= activity::scaled(Duration::from_secs(10)))
             // Reachability drifts, and a connected or disabled machine never
             // sets `needs_probe`, so a slow fallback keeps every status
             // honest instead of stuck on `probing…`.
-            || self.last_machine_poll.elapsed() >= Duration::from_secs(30))
+            || self.last_machine_poll.elapsed() >= activity::scaled(Duration::from_secs(30)))
             && !self.machine_refreshing
         {
             self.catalog_dirty = false;
@@ -3071,6 +3096,7 @@ impl PilusView {
         changed |= self.mission_tick();
         changed |= self.automations_tick();
         changed |= self.search_tick(cx);
+        changed |= self.process_tick();
         while let Ok(resolved) = self.home_resolve_rx.try_recv() {
             self.home_resolve_pending = false;
             for (endpoint_key, home) in resolved.homes {
@@ -3094,7 +3120,8 @@ impl PilusView {
             EndpointId::Local => THEME_POLL_LOCAL,
             EndpointId::Machine(_) => THEME_POLL_REMOTE,
         };
-        if !self.theme_refreshing && self.last_theme_poll.elapsed() >= theme_poll {
+        if !self.theme_refreshing && self.last_theme_poll.elapsed() >= activity::scaled(theme_poll)
+        {
             self.theme_refreshing = true;
             self.last_theme_poll = Instant::now();
             let endpoint = self.active.clone();
@@ -4670,6 +4697,7 @@ impl PilusView {
             InputLayer::Automations => self.automations_key(event, cx),
             InputLayer::Search => self.search_key(event, cx),
             InputLayer::Stats => self.stats_key(event, cx),
+            InputLayer::Process => self.process_key(event, cx),
             InputLayer::Sipil => self.sipil_chat_key(event, cx),
             // The panel's own handler has read it; nothing is left for the window.
             InputLayer::SipilPanel => {}
@@ -4696,6 +4724,7 @@ impl PilusView {
                 .or_else(|| self.page_layer().filter(|_| !self.terminal_beside_page()))
                 .or_else(|| self.search.is_open().then_some(InputLayer::Search))
                 .or_else(|| self.stats.is_open().then_some(InputLayer::Stats))
+                .or_else(|| self.process.is_open().then_some(InputLayer::Process))
                 .or_else(|| self.sipil_chat.open.then_some(InputLayer::Sipil)),
         )
     }
@@ -4919,7 +4948,20 @@ impl PilusView {
                 "Application",
                 None,
             ),
+            entry(
+                Command::ToggleDeveloperMode,
+                if self.settings.developer_mode {
+                    "Turn Off Developer Mode"
+                } else {
+                    "Turn On Developer Mode"
+                },
+                "Application",
+                None,
+            ),
         ];
+        if self.settings.developer_mode {
+            entries.push(entry(Command::OpenProcess, "Process", "Workspace", None));
+        }
         for tab in &self.tabs {
             entries.push(entry(
                 Command::FocusTab(tab.index),
@@ -4997,6 +5039,10 @@ impl PilusView {
             Command::OpenHome => self.open_home(cx),
             Command::OpenSearch => self.open_search(cx),
             Command::OpenStats => self.open_stats(cx),
+            Command::OpenProcess => self.open_process(cx),
+            Command::ToggleDeveloperMode => {
+                self.set_developer_mode(!self.settings.developer_mode, cx);
+            }
             Command::OpenUiPlayground => {
                 ui_playground::open(self.theme, self.shared_settings.clone(), cx);
             }
@@ -5125,6 +5171,7 @@ impl PilusView {
         self.github_page.close();
         self.search.close();
         self.stats.close();
+        self.process.close();
         self.close_sipil_chat();
         self.home.close();
         self.update_url_editing = false;
@@ -5443,6 +5490,14 @@ impl PilusView {
                 .overflow_hidden()
                 .child(self.stats_page(cx));
             return self.page_card("pilus-page-stats", page, grid, layout, terminal_fill, cx);
+        }
+        if self.process.is_open() {
+            let page = div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.process_page(cx));
+            return self.page_card("pilus-page-process", page, grid, layout, terminal_fill, cx);
         }
         if self.settings_open {
             return style::enter(
@@ -6217,6 +6272,7 @@ impl PilusView {
             }
             InputLayer::Search => None,
             InputLayer::Stats => None,
+            InputLayer::Process => None,
             // The composer holds the keyboard.
             InputLayer::Sipil => Some(self.sipil_chat.active_input().focus_handle(cx)),
             InputLayer::SipilPanel => None,
@@ -6716,6 +6772,10 @@ impl PilusView {
             .child(
                 style::section_card_tab(theme, "GITHUB", self.section_font())
                     .child(self.github_settings_block(cx)),
+            )
+            .child(
+                style::section_card_tab(theme, "DEVELOPER", self.section_font())
+                    .child(self.developer_section_block(cx)),
             )
             .child(
                 style::section_card_tab(theme, "REMOTE MACHINES", self.section_font())
@@ -9034,6 +9094,51 @@ impl PilusView {
         )
     }
 
+    /// The DEVELOPER section: whether the tools for looking inside pilus show.
+    fn developer_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        div().flex().flex_col().gap_2().child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .pb_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(self.footer_font()))
+                        .text_color(theme.muted)
+                        .child(
+                            "Developer mode adds a Process row below Stats: pilus's own CPU, memory, threads and the network calls it makes.",
+                        ),
+                )
+                .child(
+                    style::toggle(
+                        "pilus-developer-mode-toggle",
+                        self.settings.developer_mode,
+                        theme,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_developer_mode(!this.settings.developer_mode, cx);
+                    })),
+                ),
+        )
+    }
+
+    /// Turn developer mode on or off, persisting it. Turning it off closes the
+    /// pages it unlocked, so none is left open with no way to find it again.
+    fn set_developer_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.developer_mode = on;
+        if !on {
+            self.process.close();
+        }
+        self.save_settings();
+        cx.notify();
+    }
+
     /// Mirror the agents into the menu bar and act on its clicks.
     fn sync_menubar(&mut self, cx: &mut Context<Self>) {
         let theme = self.theme;
@@ -10951,6 +11056,9 @@ impl PilusView {
         content = content.child(self.open_workspace_row(cx));
         content = content.child(self.search_nav_row(cx));
         content = content.child(self.stats_nav_row(cx));
+        if self.settings.developer_mode {
+            content = content.child(self.process_nav_row(cx));
+        }
         // sipil's own section leads the lists: the user's agents, people and
         // channels, with where the connection stands in its header.
         content = content.children(self.sipil_sections(cx));
@@ -13141,6 +13249,32 @@ impl PilusView {
             .on_click(cx.listener(|this, _, _, cx| this.open_stats(cx)))
     }
 
+    /// The Process row below Stats: what pilus itself is costing and doing.
+    fn process_nav_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .id("pilus-process")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(SIDEBAR_GLYPH_GAP))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .pl(px(SIDEBAR_ROW_PAD))
+            .pr(px(SIDEBAR_ROW_PAD))
+            .radius_md()
+            .cursor_pointer()
+            .text_size(px(self.chrome_font()))
+            .text_color(theme.panel_fg)
+            .child(style::hover_target(&self.sidebar_hover))
+            .child(icon(
+                include_bytes!("../../assets/icons/cpu.svg"),
+                SIDEBAR_GLYPH,
+                theme.muted,
+            ))
+            .child(div().flex_1().child("Process"))
+            .on_click(cx.listener(|this, _, _, cx| this.open_process(cx)))
+    }
+
     /// Announce what the network side heard since the last tick: a message, as a
     /// toast and, while the window is not in front, as a system notification
     /// that opens the conversation when clicked; and a stranger knocking. A
@@ -14329,6 +14463,7 @@ impl Render for PilusView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         perf::render();
         self.window_active = window.is_window_active();
+        perf::window_active(self.window_active);
         // Remember the open dock so the collapse tween still has a width to
         // fold from once the daemon drops it in response to our hide message.
         if let Some(dock) = self.surface.shell_dock() {
@@ -14800,9 +14935,30 @@ const THEME_POLL_LOCAL: Duration = Duration::from_secs(2);
 /// The same for a remote machine, whose every request crosses SSH.
 const THEME_POLL_REMOTE: Duration = Duration::from_secs(5);
 
-/// The tick loop's cadence for everything that has no arrival signal:
-/// tweens, toasts, reconnect backoff, and the other polled state.
-const TICK: Duration = Duration::from_millis(16);
+/// The tick loop's cadence while something is moving on screen: a tween, a
+/// toast, the cursor's fade. One frame at 60 Hz.
+const FRAME: Duration = Duration::from_millis(16);
+/// The cadence when nothing is moving and the app is in front. State arriving
+/// from worker threads (a git status, a search, a connect) is picked up within
+/// this long, which is under what a person can tell; typing and daemon output do
+/// not wait for it, since the daemon's frames wake the loop themselves.
+const IDLE_FRONT: Duration = Duration::from_millis(50);
+/// The cadence when the app is behind another one.
+const IDLE_BEHIND: Duration = Duration::from_millis(250);
+
+/// How long the tick loop sleeps before its next pass: a frame while anything
+/// is moving, and otherwise only often enough to notice what the worker threads
+/// have left. A loop that runs at the frame rate forever keeps the CPU from ever
+/// going idle, which is what an open window costs on a battery.
+fn next_tick(moving: bool, front: bool) -> Duration {
+    if moving {
+        FRAME
+    } else if front {
+        IDLE_FRONT
+    } else {
+        IDLE_BEHIND
+    }
+}
 
 /// Resolve on the first of the tick timer or a daemon burst landing, so a
 /// frame is drained when it arrives rather than up to a tick later, and the
@@ -16681,6 +16837,15 @@ fn launch_home_agent(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_tick_loop_runs_at_the_frame_rate_only_while_something_moves() {
+        assert_eq!(next_tick(true, true), FRAME);
+        assert_eq!(next_tick(true, false), FRAME);
+        assert_eq!(next_tick(false, true), IDLE_FRONT);
+        assert_eq!(next_tick(false, false), IDLE_BEHIND);
+        assert!(FRAME < IDLE_FRONT && IDLE_FRONT < IDLE_BEHIND);
+    }
+
     /// A 12-wide frame under a 2-column skip: row 1 is the header strip
     /// (bg 5) with the badge at column 9, row 2 and 3 the pane (bg 9).
     fn zoomed_frame() -> FrameData {

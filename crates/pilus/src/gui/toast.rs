@@ -156,6 +156,12 @@ impl Toasts {
         changed | (self.items.len() != before)
     }
 
+    /// Whether any toast is on screen, in which case its clock and fade want a
+    /// tick every frame.
+    pub(super) fn any(&self) -> bool {
+        !self.items.is_empty()
+    }
+
     pub(super) fn items(&self) -> &[Toast] {
         &self.items
     }

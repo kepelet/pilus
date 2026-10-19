@@ -811,7 +811,7 @@ impl PilusView {
     }
 
     /// A titled block of the page, in the section frame the other pages use.
-    fn stats_block(&self, title: &'static str, body: impl IntoElement) -> Div {
+    pub(super) fn stats_block(&self, title: &'static str, body: impl IntoElement) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         div()

@@ -776,7 +776,7 @@ impl PilusView {
         let every = if panel.loading.is_some() {
             LOADING_POLL
         } else {
-            POLL
+            super::activity::scaled(POLL)
         };
         if panel.in_flight > 0 || panel.last_poll.is_some_and(|at| at.elapsed() < every) {
             return changed;

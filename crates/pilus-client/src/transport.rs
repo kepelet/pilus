@@ -44,6 +44,12 @@ pub struct SshTarget {
 }
 
 impl SshTarget {
+    /// Note that an SSH command to this host is about to be run. The command is
+    /// built here and spawned by the caller, so only the intent is seen.
+    fn noted(&self, what: &str) {
+        crate::netlog::note(crate::netlog::Kind::Ssh, &self.destination, what);
+    }
+
     /// The SSH client with its connection options, before any remote command.
     fn base(&self) -> Command {
         self.base_with_control_path(None)
@@ -80,6 +86,7 @@ impl SshTarget {
     /// password prompt fails fast instead of hanging the connection worker,
     /// and keepalives so a dead link is noticed.
     pub fn command(&self, tail: &[&str]) -> Command {
+        self.noted(tail.first().copied().unwrap_or("luvus"));
         let mut command = self.base();
         self.append_remote_command(&mut command, tail);
         command
@@ -93,6 +100,7 @@ impl SshTarget {
         let Some(control_path) = control_dir() else {
             return self.command(tail);
         };
+        self.noted(tail.first().copied().unwrap_or("luvus"));
         let mut command = self.base_with_control_path(Some(&control_path));
         self.append_remote_command(&mut command, tail);
         command
@@ -116,6 +124,7 @@ impl SshTarget {
     /// operations such as listing a directory or reading a session file
     /// working on every host.
     pub fn shell(&self, remote_command: &str) -> Command {
+        self.noted("shell");
         let mut command = self.base();
         command.arg(posix_command(remote_command));
         command
@@ -127,6 +136,7 @@ impl SshTarget {
         let Some(control_path) = control_dir() else {
             return self.shell(remote_command);
         };
+        self.noted("shell");
         let mut command = self.base_with_control_path(Some(&control_path));
         command.arg(posix_command(remote_command));
         command

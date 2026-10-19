@@ -16,6 +16,7 @@
 //! A stranger's message is refused and unread, but the stranger is remembered as
 //! a request so the person can decide whether to add them.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -104,6 +105,35 @@ pub struct SharedDaemon {
 /// The daemons this pilus is connected to, by the ID they answer to.
 type AgentLink = Arc<Mutex<Vec<SharedDaemon>>>;
 
+/// Contacts that called this node, noted so the window can stop wondering
+/// whether they are there: a device that dials us is up, and its call is a
+/// better answer than any amount of dialing it.
+#[derive(Default)]
+struct Heard {
+    callers: Mutex<BTreeSet<String>>,
+    hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl Heard {
+    fn note(&self, id: &str) {
+        let fresh = self
+            .callers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id.to_string());
+        // Told once per caller until the window has taken them, so a chatty
+        // peer does not wake the window per message.
+        let hook = self
+            .hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let (true, Some(hook)) = (fresh, hook) {
+            hook();
+        }
+    }
+}
+
 /// Who a message goes to.
 #[derive(Clone, Debug)]
 pub enum Conversation {
@@ -140,6 +170,7 @@ pub struct Local {
     channels: Arc<Channels>,
     reachable: Arc<AtomicBool>,
     daemons: AgentLink,
+    heard: Arc<Heard>,
 }
 
 static LOCAL: Mutex<Option<Arc<Local>>> = Mutex::new(None);
@@ -174,9 +205,11 @@ impl Local {
             device_id(&options.dir).map_err(|error| SipilError::Offline(error.to_string()))?;
         let reachable = Arc::new(AtomicBool::new(options.reachable));
         let daemons = AgentLink::default();
+        let heard = Arc::new(Heard::default());
         let service = Arc::new(PeerService {
             own,
             daemons: Arc::clone(&daemons),
+            heard: Arc::clone(&heard),
             reachable: Arc::clone(&reachable),
             directory: Arc::clone(&directory),
             chats: Arc::clone(&chats),
@@ -199,7 +232,32 @@ impl Local {
             channels,
             reachable,
             daemons,
+            heard,
         }))
+    }
+
+    /// The device IDs of contacts, people and daemons, that called this node
+    /// since the last call here, oldest first. Whatever they called, they are up.
+    pub fn take_heard(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .heard
+                .callers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+        .into_iter()
+        .collect()
+    }
+
+    /// Run `hook` when a contact calls that [`Local::take_heard`] has not yet
+    /// reported. It runs on a network thread and must only wake something.
+    pub fn on_heard(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .heard
+            .hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(hook));
     }
 
     /// Name the sipil daemons this pilus is connected to, which contacts with
@@ -520,6 +578,7 @@ pub fn contact_target(contact: &Contact) -> Result<Target, SipilError> {
 struct PeerService {
     own: String,
     daemons: AgentLink,
+    heard: Arc<Heard>,
     reachable: Arc<AtomicBool>,
     directory: Arc<Directory>,
     chats: Arc<Chats>,
@@ -536,6 +595,11 @@ impl std::fmt::Debug for PeerService {
 
 impl Service for PeerService {
     fn handle(&self, from: &str, method: &str, params: Value) -> Result<Value, Failure> {
+        // Noted before any refusal: a pilus that is not taking calls is still
+        // proof that its caller is there.
+        if self.directory.knows(from) {
+            self.heard.note(from);
+        }
         if !self.reachable.load(Ordering::Relaxed) {
             return Err(Failure::new(
                 "unavailable",

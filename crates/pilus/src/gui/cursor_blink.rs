@@ -4,6 +4,11 @@
 //! calls [`CursorBlink::tick`] each frame and repaints only when the returned
 //! opacity moved, which means the long holds at either end cost no redraws.
 //! `render_grid` fades the cursor block and its glyph by [`CursorBlink::alpha`].
+//!
+//! A cursor that has not moved for [`BLINK_FOR`] stops blinking and stays solid,
+//! as terminals commonly do: the fade repaints the whole grid some twenty times
+//! a second, which on an idle window is most of what it costs. Moving the cursor,
+//! or coming back to the window, starts the blink again.
 //! Nothing here touches GPUI, so the timing is unit-testable on its own.
 
 use std::time::{Duration, Instant};
@@ -17,6 +22,9 @@ const FADE_OUT: Duration = Duration::from_millis(240);
 const HOLD_OFF: Duration = Duration::from_millis(180);
 /// Fade from clear back to solid.
 const FADE_IN: Duration = Duration::from_millis(180);
+
+/// How long a cursor keeps blinking after it last moved.
+const BLINK_FOR: Duration = Duration::from_secs(10);
 
 /// Opacity moves smaller than this are not worth a repaint.
 const MIN_STEP: f32 = 1.0 / 64.0;
@@ -61,7 +69,13 @@ impl CursorBlink {
             self.epoch = now;
         }
         let target = if blinking && cursor.is_some() {
-            alpha_at(now.saturating_duration_since(self.epoch))
+            let since = now.saturating_duration_since(self.epoch);
+            // The epoch is left where it is, or the blink would restart.
+            if since < BLINK_FOR {
+                alpha_at(since)
+            } else {
+                1.0
+            }
         } else {
             self.epoch = now;
             1.0
@@ -140,6 +154,36 @@ mod tests {
         blink.tick(start, Some((0, 0)), true);
         assert!(!blink.tick(start + ms(100), Some((0, 0)), true));
         assert!(!blink.tick(start + ms(400), Some((0, 0)), true));
+    }
+
+    #[test]
+    fn a_cursor_that_has_not_moved_for_a_while_stops_blinking_until_it_moves() {
+        let start = Instant::now();
+        let mut blink = CursorBlink::new(start);
+        blink.tick(start, Some((3, 4)), true);
+        // Mid-fade, still inside the blinking time: it blinks.
+        let mut now = start;
+        let mut repaints = 0;
+        while now < start + BLINK_FOR {
+            now += ms(16);
+            repaints += u32::from(blink.tick(now, Some((3, 4)), true));
+        }
+        assert!(repaints > 100, "{repaints}");
+        // Past it, nothing repaints however long the window sits there.
+        now = start + BLINK_FOR + ms(1);
+        blink.tick(now, Some((3, 4)), true);
+        assert_eq!(blink.alpha(), 1.0);
+        let mut quiet = 0;
+        for step in 1..=200 {
+            quiet += u32::from(blink.tick(now + ms(16 * step), Some((3, 4)), true));
+        }
+        assert_eq!(quiet, 0);
+        // Typing moves the cursor, which blinks again from solid.
+        let later = now + ms(16 * 201);
+        blink.tick(later, Some((4, 4)), true);
+        assert_eq!(blink.alpha(), 1.0);
+        assert!(blink.tick(later + HOLD_ON + FADE_OUT / 2, Some((4, 4)), true));
+        assert!(blink.alpha() < 1.0);
     }
 
     #[test]

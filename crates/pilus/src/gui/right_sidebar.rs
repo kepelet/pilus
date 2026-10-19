@@ -447,6 +447,9 @@ impl PilusView {
 
     /// Open the column on Sipil and leave it there if it already is.
     pub(super) fn show_sipil(&mut self, cx: &mut Context<Self>) {
+        // Opening it is a reason to ask the daemons that gave up whether they
+        // are back.
+        super::sipil::wake_daemons();
         if self.sipil_panel.is_none() {
             let panel = cx.new(|cx| {
                 super::sipil_panel::SipilPanel::new(

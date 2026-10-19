@@ -21,6 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod backoff;
 pub mod channels;
 pub mod chat;
 pub mod contacts;
@@ -33,6 +34,7 @@ mod store;
 pub mod watch;
 pub mod wire;
 
+pub use backoff::{Backoff, Policy};
 pub use channels::{Channel, Channels, Learned};
 pub use chat::{Chats, Cursor, Delegation, Line};
 pub use contacts::{Contact, Directory, Pairing, Request};

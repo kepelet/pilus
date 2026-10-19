@@ -145,6 +145,12 @@ impl Directory {
         self.contact(id).is_some()
     }
 
+    /// Whether `id` is a contact of either kind, a person or a sipil daemon.
+    /// Only for deciding whose call is worth noting: it admits no one.
+    pub fn knows(&self, id: &str) -> bool {
+        self.lock().contacts.iter().any(|contact| contact.id == id)
+    }
+
     /// The person for `id`.
     pub fn contact(&self, id: &str) -> Option<Contact> {
         self.lock()

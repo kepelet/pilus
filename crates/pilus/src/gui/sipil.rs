@@ -11,8 +11,10 @@
 //! Researcher, a Chief of Staff), each against its own saved address: a first
 //! connect that fails gives up and says why, since the address is probably
 //! wrong, while a connection that *was* up and drops, or a launch that finds a
-//! daemon not yet running, keeps retrying quietly. The *people* half
-//! ([`super::sipil_social`]) is this device's own side: the contacts, the
+//! daemon not yet running, keeps retrying quietly, but not forever: each failure
+//! doubles the wait, and after a few minutes the daemon is shown as offline and
+//! left alone until it calls, or the person opens or writes to it. The *people*
+//! half ([`super::sipil_social`]) is this device's own side: the contacts, the
 //! channels and their conversations, which live on disk and are listed whether
 //! or not the network is up, and the iroh node, which starts when something
 //! needs it.
@@ -40,21 +42,22 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pilus_client::sipil::history;
 use pilus_client::sipil::{
-    About, Activity, Agent, Channel, ConversationInfo, Next, Queued, Quote, RememberedAgent,
-    Request, Role, RunningTool, Session, Sipil, SipilError, TranscriptItem, Watched, Watching,
-    parse_target,
+    About, Activity, Agent, Backoff, Channel, ConversationInfo, Next, Policy, Queued, Quote,
+    RememberedAgent, Request, Role, RunningTool, Session, Sipil, SipilError, TranscriptItem,
+    Watched, Watching, parse_target,
 };
 use pilus_client::{RelaySettings, pilus_config_dir};
 
 use gpui::RenderImage;
 
 use super::about::rasterize;
+use super::activity;
 use super::sipil_social as social;
 #[cfg(not(feature = "visual-test"))]
 pub use super::sipil_social::prepare;
@@ -63,8 +66,13 @@ pub use super::sipil_social::{
     remove_contact, remove_daemon, rename_contact, take_events,
 };
 
-/// How often the poller wakes.
+/// How often the poller wakes while the app is in front and nothing is due
+/// sooner. It only folds local files into the state, so it is cheap; what costs is
+/// dialing, and that has its own schedule.
 const TICK: Duration = Duration::from_secs(1);
+/// The same while the app is behind another one. Anything that matters sooner
+/// (a message, a contact calling, the app coming forward) wakes the poller itself.
+const IDLE_TICK: Duration = Duration::from_secs(10);
 /// How long a stream may say nothing, not even the daemon's ping every fifteen
 /// seconds, before it is taken for dead and opened again.
 const STREAM_SILENCE: Duration = Duration::from_secs(45);
@@ -74,9 +82,16 @@ const STREAM_RETRY: Duration = Duration::from_secs(2);
 /// has left ends.
 static WATCH_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// How many ticks pass between asking a daemon how it is, while none of its
-/// conversations is open. An open one is read every tick.
-const LIST_EVERY: u32 = 3;
+/// How long a connected daemon is left alone between asking for its lists, while
+/// none of its conversations is open.
+const LIST_EVERY: Duration = Duration::from_secs(3);
+/// The same for an open conversation that is not being streamed.
+const OPEN_EVERY: Duration = Duration::from_secs(1);
+/// How much longer both wait while the app is behind another one.
+const BEHIND_FACTOR: u32 = 5;
+/// How long a daemon given up on rests before the app coming forward may try it
+/// again, so switching apps back and forth is not a dial per switch.
+const FORWARD_REST: Duration = Duration::from_secs(120);
 
 /// Where the connection to one daemon stands.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -388,6 +403,12 @@ pub(super) struct Link {
     streaming: Arc<AtomicBool>,
     /// The outbox is being handed over, which only one thread does at a time.
     delivering: Arc<AtomicBool>,
+    /// When to dial this daemon again after it failed to answer, and whether to
+    /// have stopped: a daemon that is switched off is not worth a dial every few
+    /// seconds, and answers when it comes back.
+    backoff: Backoff,
+    /// When a connected daemon is next asked for its lists.
+    next_poll: Instant,
 }
 
 #[derive(Default)]
@@ -398,11 +419,21 @@ pub(super) struct Shared {
     next_epoch: u64,
     /// What the last presence check found, by device ID.
     pub(super) reach: BTreeMap<String, Reach>,
+    /// Counts every change to `reach`, so the sync knows to fold it in.
+    pub(super) reach_rev: u64,
+    /// When each contact is next asked whether they are there.
+    pub(super) probes: BTreeMap<String, social::Probe>,
+    /// What the last sync folded in.
+    pub(super) synced: Option<social::Synced>,
 }
 
 impl Shared {
     fn link(&self, id: &str) -> Option<&Link> {
         self.links.iter().find(|link| link.id == id)
+    }
+
+    fn link_mut(&mut self, id: &str) -> Option<&mut Link> {
+        self.links.iter_mut().find(|link| link.id == id)
     }
 
     fn fresh_epoch(&mut self) -> u64 {
@@ -566,7 +597,7 @@ pub fn ensure(addresses: &[String], reachable: bool) {
             let Ok(target) = Sipil::with_node(local.node(), &address) else {
                 continue;
             };
-            {
+            let polling = {
                 let mut shared = lock();
                 let Some(link) = shared.links.iter_mut().find(|link| link.id == id) else {
                     continue;
@@ -574,15 +605,27 @@ pub fn ensure(addresses: &[String], reachable: bool) {
                 if link.epoch != epoch {
                     continue;
                 }
-                // From here the poller owns the retry.
+                // From here the poller owns the retry. It is told this first
+                // attempt is under way, or it would dial again at once.
                 link.sipil = Some(target.clone());
-            }
-            // Failing quietly is the point.
+                link.polling.store(true, Ordering::Release);
+                Arc::clone(&link.polling)
+            };
+            // Failing quietly is the point: it is noted, so the poller's first
+            // turn waits out the backoff instead of dialing again at once.
             let id = id.clone();
             thread::spawn(move || {
-                if let Ok(health) = target.connect() {
-                    adopt(&id, &target, epoch, &health);
+                match target.connect() {
+                    Ok(health) => adopt(&id, &target, epoch, &health),
+                    Err(error) => {
+                        let mut shared = lock();
+                        if shared.current(&id, epoch) {
+                            failed(&mut shared, &id, &error.to_string());
+                        }
+                    }
                 }
+                polling.store(false, Ordering::Release);
+                nudge();
             });
         }
     });
@@ -619,6 +662,8 @@ fn begin(id: &str, address: &str) -> u64 {
         polling: Arc::default(),
         streaming: Arc::default(),
         delivering: Arc::default(),
+        backoff: Backoff::new(Policy::DAEMON),
+        next_poll: Instant::now(),
     });
     publish(&mut shared, |state| {
         // Until it answers, it is listed as the agent it was last time, so the
@@ -725,12 +770,18 @@ pub fn watch(watch: Watch) {
             // A conversation with people is on disk: show it now rather than at
             // the tick.
             social::refresh_thread();
-            social::check_presence();
+            if let Watch::Peer(id) = &watch {
+                social::wake_presence(id);
+            }
             return;
         }
         let Some((daemon, _)) = &daemon_side else {
             return;
         };
+        // Someone opening a daemon's conversation is a reason to ask whether it
+        // is there, and to read the conversation without waiting for its turn.
+        wake_link(&mut shared, daemon);
+        nudge();
         match shared
             .link(daemon)
             .and_then(|link| Some((link.sipil.clone()?, link.epoch, link.streaming.clone())))
@@ -781,6 +832,10 @@ pub fn send(text: String, reply: Option<Quote>) {
             if let Watch::On(_, id) = &watching {
                 hold(&mut shared, &daemon, id, &text);
             }
+            // Writing to it is a reason to ask whether it is back.
+            wake_link(&mut shared, &daemon);
+            drop(shared);
+            nudge();
             return;
         };
         publish(&mut shared, |state| {
@@ -830,7 +885,8 @@ fn hold(shared: &mut Shared, daemon: &str, conversation: &str, text: &str) {
             state.sent += 1;
         }
         None => {
-            state.send_error = Some("Too many messages are waiting for it to come back".to_string());
+            state.send_error =
+                Some("Too many messages are waiting for it to come back".to_string());
         }
     });
 }
@@ -1172,6 +1228,7 @@ fn adopt(id: &str, target: &Sipil, epoch: u64, health: &pilus_client::sipil::Hea
 /// connected, so the sidebar does not show half of it.
 fn settle(shared: &mut Shared, id: &str, health: &pilus_client::sipil::Health, lists: Lists) {
     let failure = lists.failure();
+    let refused = failure.clone();
     let version = health.version.clone();
     let label = health.label.clone().unwrap_or_default();
     publish(shared, |state| {
@@ -1210,6 +1267,14 @@ fn settle(shared: &mut Shared, id: &str, health: &pilus_client::sipil::Health, l
             }
         }
     });
+    match refused {
+        None => {
+            if let Some(link) = shared.link_mut(id) {
+                link.backoff.succeeded();
+            }
+        }
+        Some(error) => failed(shared, id, &error),
+    }
 }
 
 /// Everything the sidebar and the window list, fetched together.
@@ -1274,33 +1339,124 @@ fn start_poller() {
     });
 }
 
+/// Set when something happened that the poller should not wait a tick to see.
+static NUDGE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+/// Wake the poller now. A message arrived, a contact called, the app came
+/// forward, or the person asked: it would find out at its next tick, but not
+/// before.
+pub(super) fn nudge() {
+    let (flag, wake) = &NUDGE;
+    *flag.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    wake.notify_one();
+}
+
+/// Wait up to `limit`, or until nudged.
+fn rest(limit: Duration) {
+    let (flag, wake) = &NUDGE;
+    let mut nudged = flag.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !*nudged {
+        nudged = wake
+            .wait_timeout(nudged, limit)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
+    *nudged = false;
+}
+
+/// The shortest the poller sleeps, so a deadline that has just passed cannot
+/// turn the loop into a spin.
+const MIN_REST: Duration = Duration::from_millis(100);
+
 fn poll_forever() {
-    let mut ticks = 0u32;
+    let mut forward = activity::front_epoch();
     loop {
-        thread::sleep(TICK);
-        ticks = ticks.wrapping_add(1);
-        social::sync(ticks);
-        poll_daemons(ticks);
+        rest(next_wake(Instant::now()));
+        super::perf::count(super::perf::Count::SipilWake);
+        let now = Instant::now();
+        let came = activity::front_epoch();
+        if came != forward {
+            forward = came;
+            catch_up(now);
+        }
+        let front = activity::in_front();
+        social::sync(now, front);
+        poll_daemons(now, front);
         offline().flush();
     }
 }
 
-/// A daemon to poll this tick: its ID, connection, attempt, open conversation, and
-/// the flag that keeps one poll running at a time.
+/// How long the poller may sleep: until the app-wide tick, or a daemon's turn
+/// if that comes first.
+fn next_wake(now: Instant) -> Duration {
+    let tick = if activity::in_front() {
+        TICK
+    } else {
+        IDLE_TICK
+    };
+    let shared = lock();
+    let soonest = shared
+        .links
+        .iter()
+        // A daemon being polled now reports back by nudging, so it is not a
+        // reason to wake before then.
+        .filter(|link| link.sipil.is_some() && !link.polling.load(Ordering::Acquire))
+        .filter_map(|link| {
+            if shared.state.daemon(&link.id).is_some_and(Daemon::connected) {
+                Some(link.next_poll.saturating_duration_since(now))
+            } else {
+                link.backoff.wait(now)
+            }
+        })
+        .min();
+    soonest.map_or(tick, |wait| wait.min(tick)).max(MIN_REST)
+}
+
+/// The app has come to the front: read what was left to go stale, and try the
+/// daemons that were given up on once more, if they have rested.
+fn catch_up(now: Instant) {
+    let mut shared = lock();
+    let mut woke = Vec::new();
+    for link in &mut shared.links {
+        link.next_poll = now;
+        let was = link.backoff.given_up();
+        link.backoff.wake_if_rested(now, FORWARD_REST);
+        if was && !link.backoff.given_up() {
+            woke.push(link.id.clone());
+        }
+    }
+    for id in woke {
+        trying_again(&mut shared, &id);
+    }
+    drop(shared);
+    social::catch_up(now);
+}
+
+/// How long to leave a connected daemon alone before asking again.
+fn poll_every(open: bool, front: bool) -> Duration {
+    let base = if open { OPEN_EVERY } else { LIST_EVERY };
+    if front { base } else { base * BEHIND_FACTOR }
+}
+
+/// A daemon to poll: its ID, connection, attempt, open conversation, and the
+/// flag that keeps one poll running at a time.
 type Due = (String, Sipil, u64, Option<String>, Arc<AtomicBool>);
 
 /// One round of keeping up with each daemon. A daemon that is slow to answer
-/// holds up only its own poll.
-fn poll_daemons(ticks: u32) {
+/// holds up only its own poll. One that is up is asked for its lists every few
+/// seconds; one that is not is dialed on its backoff, which stretches after each
+/// failure and ends in giving up.
+fn poll_daemons(now: Instant, front: bool) {
     let due: Vec<Due> = {
-        let shared = lock();
-        shared
-            .links
-            .iter()
+        let mut shared = lock();
+        let Shared { links, state, .. } = &mut *shared;
+        links
+            .iter_mut()
             .filter_map(|link| {
                 let target = link.sipil.clone()?;
+                let up = state.daemon(&link.id).is_some_and(Daemon::connected);
                 // A conversation a stream is delivering is not read here.
-                let open = match &shared.state.watch {
+                let open = match &state.watch {
                     Watch::On(daemon, id)
                         if *daemon == link.id && !link.streaming.load(Ordering::Acquire) =>
                     {
@@ -1308,8 +1464,13 @@ fn poll_daemons(ticks: u32) {
                     }
                     _ => None,
                 };
-                // An open conversation is read every tick; the rest can wait.
-                (open.is_some() || ticks.is_multiple_of(LIST_EVERY)).then(|| {
+                let ready = if up {
+                    now >= link.next_poll
+                } else {
+                    link.backoff.due(now)
+                };
+                ready.then(|| {
+                    link.next_poll = now + poll_every(open.is_some(), front);
                     (
                         link.id.clone(),
                         target,
@@ -1328,6 +1489,7 @@ fn poll_daemons(ticks: u32) {
         thread::spawn(move || {
             poll_daemon(&id, &target, epoch, open);
             polling.store(false, Ordering::Release);
+            nudge();
         });
     }
 }
@@ -1349,12 +1511,7 @@ fn poll_daemon(id: &str, target: &Sipil, epoch: u64, open: Option<String>) {
         }
         match outcome {
             Ok((health, lists)) => settle(&mut shared, id, &health, lists),
-            Err(error) => publish(&mut shared, |state| {
-                if let Some(daemon) = state.daemons.iter_mut().find(|daemon| daemon.id == id) {
-                    daemon.phase = Phase::Connecting;
-                    daemon.error = Some(error.to_string());
-                }
-            }),
+            Err(error) => failed(&mut shared, id, &error.to_string()),
         }
         shared.state.daemon(id).is_some_and(Daemon::connected)
     };
@@ -1366,6 +1523,87 @@ fn poll_daemon(id: &str, target: &Sipil, epoch: u64, open: Option<String>) {
     if let Some(conversation) = open.filter(|_| connected) {
         refresh_transcript(id, target, epoch, &conversation);
     }
+}
+
+/// A daemon did not answer: say so, and step its backoff. When that was the
+/// last attempt, stop calling it connecting and say it will not be tried again
+/// until something suggests it is back.
+fn failed(shared: &mut Shared, id: &str, error: &str) {
+    publish(shared, |state| {
+        if let Some(daemon) = state.daemons.iter_mut().find(|daemon| daemon.id == id) {
+            daemon.phase = Phase::Connecting;
+            daemon.error = Some(error.to_string());
+        }
+    });
+    let gave_up = shared
+        .link_mut(id)
+        .is_some_and(|link| link.backoff.failed(Instant::now()));
+    if gave_up {
+        publish(shared, |state| {
+            if let Some(daemon) = state.daemons.iter_mut().find(|daemon| daemon.id == id) {
+                daemon.phase = Phase::Off;
+                daemon.error = Some(format!(
+                    "{error}. Pilus has stopped retrying; it tries again when this device calls, or when you open it."
+                ));
+            }
+        });
+    }
+}
+
+/// Show a daemon that was given up on as trying again.
+fn trying_again(shared: &mut Shared, id: &str) {
+    publish(shared, |state| {
+        if let Some(daemon) = state.daemons.iter_mut().find(|daemon| daemon.id == id)
+            && daemon.phase == Phase::Off
+        {
+            daemon.phase = Phase::Connecting;
+            // The reason it was given up on is no longer the news.
+            daemon.error = None;
+        }
+    });
+}
+
+/// Try a daemon again now, because something says it may be there: the person
+/// opened it or wrote to it, or it called.
+pub(super) fn wake_daemon(id: &str) {
+    {
+        let mut shared = lock();
+        wake_link(&mut shared, id);
+    }
+    nudge();
+}
+
+/// Try every daemon that is not connected again now.
+pub fn wake_daemons() {
+    {
+        let mut shared = lock();
+        let ids: Vec<String> = shared.links.iter().map(|link| link.id.clone()).collect();
+        for id in ids {
+            wake_link(&mut shared, &id);
+        }
+    }
+    nudge();
+}
+
+fn wake_link(shared: &mut Shared, id: &str) {
+    let up = shared.state.daemon(id).is_some_and(Daemon::connected);
+    let Some(link) = shared.link_mut(id) else {
+        return;
+    };
+    link.next_poll = Instant::now();
+    if up {
+        return;
+    }
+    let was = link.backoff.given_up();
+    link.backoff.wake();
+    if was {
+        trying_again(shared, id);
+    }
+}
+
+/// Whether `id` is a daemon this window is connected to or trying to be.
+pub(super) fn is_daemon(id: &str) -> bool {
+    lock().link(id).is_some()
 }
 
 /// Make `sipil` the connected daemon `id`, for the tests: the same as a connect
@@ -1575,6 +1813,127 @@ mod tests {
         assert_eq!(state.sent, 0);
         assert!(!state.sending);
         reset();
+    }
+
+    #[test]
+    fn a_daemon_that_never_answers_is_given_up_on_and_woken_by_the_person() {
+        let _turn = take_turn();
+        reset();
+        begin("away", "away");
+        let mut shared = lock();
+        for failure in 1..Policy::DAEMON.attempts {
+            failed(&mut shared, "away", "no answer");
+            let daemon = shared.state.daemon("away").expect("listed");
+            assert_eq!(daemon.phase, Phase::Connecting, "failure {failure}");
+        }
+        failed(&mut shared, "away", "no answer");
+        let daemon = shared.state.daemon("away").expect("listed");
+        assert_eq!(daemon.phase, Phase::Off);
+        let note = daemon.error.clone().unwrap_or_default();
+        assert!(
+            note.starts_with("no answer.") && note.contains("stopped retrying"),
+            "{note}"
+        );
+        let later = Instant::now() + Duration::from_secs(24 * 3600);
+        assert!(
+            !shared
+                .link("away")
+                .is_some_and(|link| link.backoff.due(later)),
+            "a day later it is still left alone"
+        );
+
+        // Opening it is a reason to ask once more, and it says so.
+        wake_link(&mut shared, "away");
+        let daemon = shared.state.daemon("away").expect("listed");
+        assert_eq!(
+            (daemon.phase, daemon.error.as_deref()),
+            (Phase::Connecting, None)
+        );
+        assert!(
+            shared
+                .link("away")
+                .is_some_and(|link| link.backoff.due(Instant::now()))
+        );
+        // One more failure puts it back to rest rather than starting the ladder over.
+        failed(&mut shared, "away", "still no answer");
+        assert_eq!(
+            shared.state.daemon("away").map(|daemon| daemon.phase),
+            Some(Phase::Off)
+        );
+        drop(shared);
+        reset();
+    }
+
+    #[test]
+    fn a_daemon_that_answers_starts_the_ladder_over() {
+        let _turn = take_turn();
+        reset();
+        begin("flaky", "flaky");
+        let mut shared = lock();
+        for _ in 0..3 {
+            failed(&mut shared, "flaky", "no answer");
+        }
+        let failures = |shared: &Shared| shared.link("flaky").map(|link| link.backoff.failures());
+        assert_eq!(failures(&shared), Some(3));
+        let health = pilus_client::sipil::Health {
+            name: "sipil".to_string(),
+            kind: pilus_client::sipil::NodeKind::Daemon,
+            version: "0".to_string(),
+            api: pilus_client::sipil::API_VERSION,
+            allowed: true,
+            label: None,
+            nickname: None,
+        };
+        let lists = Lists {
+            agents: Ok(Vec::new()),
+            sessions: Ok(Vec::new()),
+            about: None,
+        };
+        settle(&mut shared, "flaky", &health, lists);
+        assert_eq!(failures(&shared), Some(0));
+        assert!(shared.state.daemon("flaky").is_some_and(Daemon::connected));
+        drop(shared);
+        reset();
+    }
+
+    #[test]
+    fn the_poller_sleeps_to_the_next_deadline_and_not_to_a_daemon_it_is_already_asking() {
+        let _turn = take_turn();
+        reset();
+        let (sipil, _script, _server) = scripted("sleepy", vec![]);
+        let daemon = sipil.target().id();
+        attach(&daemon, sipil);
+        let now = Instant::now();
+        {
+            let mut shared = lock();
+            let link = shared.link_mut(&daemon).expect("attached");
+            link.next_poll = now + Duration::from_millis(400);
+        }
+        let wake = next_wake(now);
+        assert!(
+            wake >= MIN_REST && wake <= Duration::from_millis(400),
+            "{wake:?}: a connected daemon's turn comes before the tick"
+        );
+        {
+            let mut shared = lock();
+            let link = shared.link_mut(&daemon).expect("attached");
+            link.next_poll = now;
+            link.polling.store(true, Ordering::Release);
+        }
+        let wake = next_wake(now);
+        assert!(
+            wake >= IDLE_TICK.min(TICK),
+            "{wake:?}: a poll that is under way reports back by itself"
+        );
+        reset();
+    }
+
+    #[test]
+    fn a_connected_daemon_is_asked_less_often_behind_another_app() {
+        assert_eq!(poll_every(false, true), LIST_EVERY);
+        assert_eq!(poll_every(true, true), OPEN_EVERY);
+        assert_eq!(poll_every(false, false), LIST_EVERY * BEHIND_FACTOR);
+        assert!(poll_every(true, false) > poll_every(true, true));
     }
 
     #[test]

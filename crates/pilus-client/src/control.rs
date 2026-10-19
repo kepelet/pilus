@@ -18,12 +18,12 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, bounded, never, select, tick, unbounded};
+use crossbeam_channel::{Receiver, Sender, after, bounded, select, unbounded};
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
@@ -1277,6 +1277,38 @@ const REFRESH_FOLLOW_UPS: [Duration; 2] = [Duration::from_millis(350), Duration:
 /// How long to wait before resubscribing after the event stream ends.
 const RESUBSCRIBE: Duration = Duration::from_millis(500);
 
+/// How many times slower every feed polls: 1 while someone is looking at
+/// pilus, more while the app is behind another one or has no window, when the
+/// only thing a feed does is keep the menu bar and the notifications current.
+static FEED_SLOWDOWN: AtomicU32 = AtomicU32::new(1);
+
+/// Wakes each live feed's reconcile thread, for when the slowdown is lifted.
+static FEED_WAKES: Mutex<Vec<Sender<()>>> = Mutex::new(Vec::new());
+
+/// Poll every feed `factor` times less often (1 restores the normal pace).
+/// Lifting a slowdown reconciles every feed at once, so what was left to go
+/// stale behind another app is current when it is seen again.
+pub fn set_feed_slowdown(factor: u32) {
+    let factor = factor.clamp(1, 20);
+    let before = FEED_SLOWDOWN.swap(factor, Ordering::AcqRel);
+    if factor < before {
+        let mut wakes = FEED_WAKES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A feed that was dropped has no receiver left; forget it here.
+        wakes.retain(|wake| {
+            !matches!(
+                wake.try_send(()),
+                Err(crossbeam_channel::TrySendError::Disconnected(()))
+            )
+        });
+    }
+}
+
+fn paced(interval: Duration) -> Duration {
+    interval.saturating_mul(FEED_SLOWDOWN.load(Ordering::Acquire))
+}
+
 impl AgentFeed {
     /// Start the feed for `socket`, reconnecting after failures.
     pub fn spawn(socket: PathBuf) -> Self {
@@ -1306,6 +1338,11 @@ impl AgentFeed {
     fn spawn_transport(transport: ControlTransport, poll_only: bool, scope: FeedScope) -> Self {
         let (commands, command_rx) = unbounded();
         let (pokes, pokes_rx) = unbounded::<()>();
+        let (wake, wake_rx) = bounded::<()>(1);
+        FEED_WAKES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(wake);
         let (update_tx, updates) = unbounded();
         // Shared so a burst of structural events (one tab open emits several)
         // forwards a single snapshot instead of a redraw per event.
@@ -1329,6 +1366,7 @@ impl AgentFeed {
                     scope,
                     interval,
                     pokes_rx,
+                    wake_rx,
                     reconcile_updates,
                     reconcile_last,
                 )
@@ -1457,6 +1495,7 @@ fn run_reconcile(
     scope: FeedScope,
     interval: Duration,
     pokes: Receiver<()>,
+    wakes: Receiver<()>,
     updates: Sender<FeedUpdate>,
     last: Arc<Mutex<Option<FeedUpdate>>>,
 ) {
@@ -1465,18 +1504,21 @@ fn run_reconcile(
     if !refresh(&transport, scope, &updates, &last) {
         return;
     }
-    let ticker = tick(interval);
     // An active feed gets an agents-only lane beside the snapshot tick: a
     // focused pi's pin rides `agent.list`. Remote feeds have no event stream
     // at all, and a local focus change may not emit one either — five
     // proxied requests are too heavy at the cadence a pane switch needs,
     // but one cheap `agent.list` is not. Hidden feeds keep their own
     // cadence: nobody is looking at them.
-    let agents_ticker = match &scope {
-        FeedScope::Full => tick(RECONCILE_AGENTS_FAST),
-        _ => never(),
-    };
+    let agents_lane = scope == FeedScope::Full;
+    let mut next_full = Instant::now() + paced(interval);
+    let mut next_agents = Instant::now() + paced(RECONCILE_AGENTS_FAST);
     loop {
+        let due = if agents_lane {
+            next_full.min(next_agents)
+        } else {
+            next_full
+        };
         select! {
             // A dead poke channel means the command thread — and with it the
             // feed — is gone; exiting here also keeps a disconnected channel
@@ -1485,17 +1527,34 @@ fn run_reconcile(
                 if result.is_err() {
                     return;
                 }
-            }
-            recv(ticker) -> _ => {},
-            recv(agents_ticker) -> _ => {
-                if !refresh_agents(&transport, &updates, &last) {
+                next_full = Instant::now() + paced(interval);
+                if !refresh(&transport, scope, &updates, &last) {
                     break;
                 }
                 continue;
             }
+            // The pace was lifted: read now rather than at the slow beat.
+            recv(wakes) -> _ => {
+                next_full = Instant::now() + paced(interval);
+                if !refresh(&transport, scope, &updates, &last) {
+                    break;
+                }
+                continue;
+            }
+            recv(after(due.saturating_duration_since(Instant::now()))) -> _ => {}
         }
-        if !refresh(&transport, scope, &updates, &last) {
-            break;
+        let now = Instant::now();
+        if agents_lane && now >= next_agents {
+            next_agents = now + paced(RECONCILE_AGENTS_FAST);
+            if !refresh_agents(&transport, &updates, &last) {
+                break;
+            }
+        }
+        if now >= next_full {
+            next_full = now + paced(interval);
+            if !refresh(&transport, scope, &updates, &last) {
+                break;
+            }
         }
     }
 }

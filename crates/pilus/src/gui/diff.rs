@@ -583,7 +583,11 @@ impl PilusView {
             changed = true;
         }
         let panel = &mut self.diff_panel;
-        if panel.polling || panel.last_poll.is_some_and(|at| at.elapsed() < POLL) {
+        if panel.polling
+            || panel
+                .last_poll
+                .is_some_and(|at| at.elapsed() < super::activity::scaled(POLL))
+        {
             return changed;
         }
         panel.polling = true;

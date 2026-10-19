@@ -202,7 +202,7 @@ impl PilusView {
             || self
                 .ports_panel
                 .last_poll
-                .is_some_and(|at| at.elapsed() < POLL)
+                .is_some_and(|at| at.elapsed() < super::activity::scaled(POLL))
         {
             return changed;
         }

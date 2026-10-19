@@ -105,7 +105,9 @@ GUI thread ◀──try_recv── inbound channel ◀── reader thread ◀�
 `Connection::open` performs the handshake synchronously, then spawns the reader
 and writer threads. The GUI thread drains `ClientEvent`s in a 16 ms poll task
 and calls `cx.notify()` only when the `Surface` changed. It never blocks on IO
-and never paints from a non-GUI thread.
+and never paints from a non-GUI thread. The task runs every 16 ms only while
+something moves on screen (a tween, a toast, the cursor's fade); idle it ticks every
+50 ms in front and 250 ms behind another app, and a daemon frame wakes it at once.
 
 ## Client-owned sidebar
 
@@ -947,6 +949,13 @@ replaced the daemon's HTTP API (revision 1), which is gone.
   names an invited agent in a line they send (`PeerService::invite_agents`); an
   agent that was not invited, or another agent's line, starts nothing. A direct
   chat between two people is never handed to an agent.
+- **Absence.** A peer that does not answer is dialed on a growing delay
+  (`pilus_client::sipil::Backoff`) and then left alone; a daemon is shown offline, a
+  contact stays offline. What brings one back is news, not polling: a call from that
+  device (any call from a known contact counts as it announcing itself, and a sipil
+  daemon makes one to every allowed device when it starts), the person opening or
+  writing to it, or the app coming to the front. Presence is only checked while the
+  app is in front.
 - **Lifetime.** The window's node lives and dies with the window. Reachability is
   `Settings::sipil_online`; moving the node into `pilus-agent` is the way to
   receive while the window is closed.

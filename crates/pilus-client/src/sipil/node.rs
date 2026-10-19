@@ -11,8 +11,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -22,6 +23,7 @@ use serde_json::Value;
 
 use super::store;
 use super::wire::{self, ALPN, Failure, REPLY_LIMIT, REQUEST_LIMIT};
+use crate::netlog::{self, Kind};
 
 /// How long one call may take, dialing included. A peer that is not there is
 /// slower to give up than a daemon on loopback was.
@@ -32,6 +34,18 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const STREAMS_PER_CONNECTION: u32 = 16;
 /// The most one line of a watch may weigh: a snapshot of the newest messages.
 const FRAME_LIMIT: usize = 16 << 20;
+
+/// Calls started and connections dialed since launch, for `PILUS_PERF`: what an
+/// absent peer costs is the number of times it was dialed, so it is counted
+/// where the dialing happens.
+static CALLS: AtomicU64 = AtomicU64::new(0);
+static DIALS: AtomicU64 = AtomicU64::new(0);
+
+/// How many calls this process has started and how many fresh connections it
+/// has dialed, in that order.
+pub fn traffic() -> (u64, u64) {
+    (CALLS.load(Ordering::Relaxed), DIALS.load(Ordering::Relaxed))
+}
 
 /// Which relays the endpoint dials out through.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -181,10 +195,21 @@ impl Node {
         method: &str,
         params: &Value,
     ) -> Result<Value, CallError> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
         let frame = wire::request(method, params);
         let outcome = self
             .runtime
             .block_on(async { tokio::time::timeout(DEADLINE, self.round_trip(to, &frame)).await });
+        // A refusal is an answer, so the call got through.
+        let reached = matches!(&outcome, Ok(Ok(_)) | Ok(Err(CallError::Refused(_))));
+        netlog::record(
+            Kind::Sipil,
+            &to.id.fmt_short().to_string(),
+            method,
+            started,
+            reached,
+        );
         match outcome {
             Err(_) => {
                 self.forget(&to.id);
@@ -213,6 +238,8 @@ impl Node {
         method: &str,
         params: &Value,
     ) -> Result<WatchStream, CallError> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
         let frame = wire::request(method, params);
         let opened = self.runtime.block_on(async {
             tokio::time::timeout(DEADLINE, async {
@@ -231,6 +258,13 @@ impl Node {
             })
             .await
         });
+        netlog::record(
+            Kind::Sipil,
+            &to.id.fmt_short().to_string(),
+            method,
+            started,
+            matches!(opened, Ok(Ok(_))),
+        );
         match opened {
             Err(_) => {
                 self.forget(&to.id);
@@ -276,6 +310,7 @@ impl Node {
         {
             return Ok(connection.clone());
         }
+        DIALS.fetch_add(1, Ordering::Relaxed);
         let connection = self
             .endpoint
             .connect(to.clone(), ALPN)

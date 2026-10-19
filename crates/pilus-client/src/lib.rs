@@ -29,7 +29,9 @@ mod github;
 mod github_account;
 mod machines;
 mod mission;
+pub mod netlog;
 mod ports;
+pub mod process;
 mod read;
 mod relay;
 pub mod sipil;
@@ -54,7 +56,7 @@ pub use connector::agent_binary;
 pub use control::{
     Agent, AgentFeed, AgentSession, Appearance, AutomationSummary, BarSegment, BarWidget,
     ControlClient, ControlTransport, FeedScope, FeedUpdate, PaneFrame, Tab, TaskAction,
-    TaskSummary, ThemeInfo, WorktreeInfo, worktree_blockers,
+    TaskSummary, ThemeInfo, WorktreeInfo, set_feed_slowdown, worktree_blockers,
 };
 pub use diff::{
     DiffFile, DiffHunk, DiffLayer, DiffLine, DiffLineKind, DiffNote, DiffSnapshot, FileDiff,

@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::git::sh_quote;
+use crate::netlog;
 use crate::transport::SshTarget;
 
 /// How long one `gh` or `git` call may run before it is killed. `gh` talks to
@@ -624,6 +625,7 @@ impl GhRepo {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let started = Instant::now();
         let mut child = command
             .spawn()
             .map_err(|error| format!("couldn't reach the host: {error}"))?;
@@ -647,6 +649,15 @@ impl GhRepo {
                 Err(error) => return Err(format!("couldn't wait for gh: {error}")),
             }
         };
+        // Only `gh` talks to GitHub; the `git` calls beside it are local.
+        if program == "gh" {
+            let host = self
+                .target
+                .as_ref()
+                .map_or("local", |t| t.destination.as_str());
+            let what = args.iter().take(2).copied().collect::<Vec<_>>().join(" ");
+            netlog::record(netlog::Kind::Github, host, &what, started, status.success());
+        }
         Ok(Output {
             code: status.code(),
             stdout: stdout.join().unwrap_or_default(),

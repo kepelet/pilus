@@ -40,6 +40,8 @@ pub enum Command {
     OpenHome,
     OpenSearch,
     OpenStats,
+    OpenProcess,
+    ToggleDeveloperMode,
     OpenUiPlayground,
     Quit,
     FocusTab(u16),

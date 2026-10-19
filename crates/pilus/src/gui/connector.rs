@@ -284,7 +284,7 @@ fn start_poller() {
 
 fn poll_forever() {
     loop {
-        thread::sleep(POLL);
+        thread::sleep(super::activity::scaled(POLL));
         if !lock().wanted {
             continue;
         }

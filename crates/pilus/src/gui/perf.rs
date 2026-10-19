@@ -4,9 +4,15 @@
 //! the build costs, and how many daemon frames landed; one line per second
 //! goes to stderr. Disabled, every call is a relaxed atomic load, so the
 //! probes can stay in the render path and be compared across changes.
+//!
+//! A second line, from a thread of its own so it prints while nothing paints,
+//! counts what the process does when nobody touches it: loop ticks, repaints
+//! by cause, poller wake-ups, and the calls and connections the sipil node
+//! made. Those are the costs that keep a laptop from sleeping.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 fn enabled() -> bool {
@@ -71,6 +77,7 @@ pub fn grid_build<R>(build: impl FnOnce() -> R) -> R {
 
 /// Count one window render, whether or not it rebuilt the grid.
 pub fn render() {
+    count(Count::Render);
     if enabled() {
         record(|w| w.renders += 1);
     }
@@ -78,7 +85,90 @@ pub fn render() {
 
 /// Count one daemon frame (full or diff) folded into the surface.
 pub fn frame() {
+    count(Count::Frame);
     if enabled() {
         record(|w| w.frames += 1);
     }
+}
+
+/// What the process did. The counts only ever grow: the idle line prints their
+/// change each second, and the Process page differences them for its rates.
+#[derive(Clone, Copy)]
+pub enum Count {
+    /// One pass of the window's tick loop.
+    Tick,
+    /// A repaint the tick loop asked for because polled state changed.
+    RepaintState,
+    /// A repaint for a sidebar tween, the cursor blink or the toolbar fade.
+    RepaintMotion,
+    /// One wake-up of the sipil poller thread.
+    SipilWake,
+    /// One render of a window.
+    Render,
+    /// One daemon frame folded into the surface.
+    Frame,
+}
+
+const COUNTS: usize = 6;
+const LABELS: [&str; COUNTS] = [
+    "ticks",
+    "repaint-state",
+    "repaint-motion",
+    "sipil-wakes",
+    "renders",
+    "frames",
+];
+
+static COUNTERS: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Count one occurrence of `what`. A relaxed add, cheap enough to leave in.
+pub fn count(what: Count) {
+    COUNTERS[what as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many times `what` has happened since launch.
+pub fn total(what: Count) -> u64 {
+    COUNTERS[what as usize].load(Ordering::Relaxed)
+}
+
+/// Note whether the window is in front, so the idle line says which case it
+/// measured.
+pub fn window_active(active: bool) {
+    ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// Start the idle line, once.
+pub fn start() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    if !enabled() {
+        return;
+    }
+    STARTED.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("pilus-perf".to_string())
+            .spawn(|| {
+                let mut traffic = pilus_client::sipil::node::traffic();
+                let mut seen = [0u64; COUNTS];
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let now = pilus_client::sipil::node::traffic();
+                    let mut line = String::from("pilus-idle:");
+                    for ((counter, label), before) in COUNTERS.iter().zip(LABELS).zip(&mut seen) {
+                        let total = counter.load(Ordering::Relaxed);
+                        line.push_str(&format!(" {label}={}", total - *before));
+                        *before = total;
+                    }
+                    line.push_str(&format!(
+                        " sipil-calls={} sipil-dials={} active={}",
+                        now.0 - traffic.0,
+                        now.1 - traffic.1,
+                        ACTIVE.load(Ordering::Relaxed),
+                    ));
+                    traffic = now;
+                    eprintln!("{line}");
+                }
+            })
+            .ok();
+    });
 }

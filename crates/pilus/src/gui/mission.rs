@@ -482,7 +482,7 @@ impl PilusView {
         let cadence = if panel.snapshot.as_ref().is_some_and(|s| s.refreshing) {
             SCANNING_REFRESH
         } else {
-            REFRESH
+            super::activity::scaled(REFRESH)
         };
         let due = panel.fetched_at.is_none_or(|at| at.elapsed() >= cadence);
         if due && !panel.in_flight {

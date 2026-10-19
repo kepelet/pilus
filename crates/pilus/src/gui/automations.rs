@@ -269,7 +269,9 @@ impl PilusView {
             changed = true;
         }
         let panel = &self.automations_page;
-        let due = panel.fetched_at.is_none_or(|at| at.elapsed() >= REFRESH);
+        let due = panel
+            .fetched_at
+            .is_none_or(|at| at.elapsed() >= super::activity::scaled(REFRESH));
         if due && !panel.in_flight {
             self.automations_fetch();
         }

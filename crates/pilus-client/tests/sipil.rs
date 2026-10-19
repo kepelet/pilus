@@ -703,6 +703,53 @@ fn a_pilus_that_is_not_reachable_answers_nobody() {
     assert_eq!(bob.chats().lines(alice.id()).len(), 1);
 }
 
+#[test]
+fn a_call_from_a_contact_is_noted_so_the_window_need_not_keep_asking_whether_they_are_there() {
+    let (alice, _) = window("alice-called");
+    let (bob, _) = window("bob-called");
+    let (carol, _) = window("carol-called");
+    for caller in [&alice, &carol] {
+        caller
+            .directory()
+            .add(bob.id(), "Bob", Some(loopback(&bob.node().addr())))
+            .unwrap();
+    }
+    // Bob has Alice as a contact; Carol is a stranger to him.
+    bob.directory().add(alice.id(), "Alice", None).unwrap();
+    let woken = Arc::new(AtomicU32::new(0));
+    let count = Arc::clone(&woken);
+    bob.on_heard(move || {
+        count.fetch_add(1, Ordering::Relaxed);
+    });
+    let ask = |caller: &Arc<Local>| caller.check(&caller.directory().contact(bob.id()).unwrap());
+
+    ask(&carol).unwrap();
+    assert!(
+        bob.take_heard().is_empty(),
+        "a stranger's call proves nothing"
+    );
+    assert_eq!(woken.load(Ordering::Relaxed), 0);
+
+    ask(&alice).unwrap();
+    ask(&alice).unwrap();
+    assert_eq!(woken.load(Ordering::Relaxed), 1, "told once until taken");
+    assert_eq!(bob.take_heard(), [alice.id().to_string()]);
+    assert!(bob.take_heard().is_empty());
+
+    ask(&alice).unwrap();
+    assert_eq!(
+        woken.load(Ordering::Relaxed),
+        2,
+        "and again once it was taken"
+    );
+    bob.take_heard();
+
+    // A pilus that is not taking calls still learns who is up.
+    bob.set_reachable(false);
+    assert!(ask(&alice).is_err());
+    assert_eq!(bob.take_heard(), [alice.id().to_string()]);
+}
+
 // ---- agents are not reachable on their own ----
 
 #[test]

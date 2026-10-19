@@ -151,6 +151,28 @@ with only the command-line tools can build the app.
   queue; any other refusal drops that message and says so. Snapshot writes are
   throttled and flushed by the poller; the outbox is not. `remove_daemon` forgets
   all of it. A daemon that is away is never shown as working.
+- Absence is cheap. Dialing a device that is switched off is the costliest thing an
+  idle pilus does, so neither a daemon nor a contact is dialed on a fixed beat.
+  `pilus_client::sipil::Backoff` spaces the attempts after each failure
+  (`Policy::DAEMON`: 3 s doubling, eight failures, about six minutes;
+  `Policy::PERSON`: 30 s doubling, six failures) and then *gives up*: a daemon
+  shows `Phase::Off` with the reason, a contact stays offline, and nothing dials
+  until something says they may be back, via `Backoff::wake`: the peer called us
+  (`Local::take_heard`: a call from any contact, person or daemon, `health`
+  included, and even one a not-reachable pilus refuses, counts as that device
+  announcing itself; `Local::on_heard` nudges the poller), the person opened the
+  conversation, wrote to it, or opened the Sipil tab (`wake_daemons`), or the app
+  came to the front after resting `FORWARD_REST` (`wake_if_rested`, so switching
+  apps is not a dial per switch). The daemon announces itself the same way: on
+  start `../sipil/src/announce.ts` calls `health` on every allowed device, three
+  tries; an older daemon or pilus just never does, and is found on the person's
+  next look. Presence checks (`Probe` in `sipil_social.rs`) run only while the app
+  is in front, since nobody sees the dot otherwise, and a contact who answered is
+  re-asked every two minutes, not twenty seconds. The poller thread sleeps on a
+  condvar until the next due thing (`next_wake`, one second in front and ten
+  behind another app) and `nudge()` wakes it for a message, a call or the app
+  coming forward; `sync` returns at once when the stores' `version()`s have not
+  moved.
 - The SIPIL rows (daemons, channels, people; not knocks, which stay first) are
   dragged into order and kept in `Settings::sipil_order` by key (`daemon:<id>`,
   `channel:<id>`, `person:<id>`); rows not named there follow in the default
@@ -309,6 +331,38 @@ with only the command-line tools can build the app.
   offset (`date +%z`) when the page opens. Bump `store::SCHEMA` when a table
   changes, which rebuilds the cache. The heatmap cell and ranking row are
   `style::heat_cell` and `style::rank_row`, shown in the playground.
+
+## Idle cost
+
+An open window must be able to let the CPU sleep; `PILUS_PERF=1` prints a
+`pilus-idle:` line per second (loop ticks, repaints by cause, sipil poller
+wake-ups, calls and dials) next to the render counters, and is how a change here
+is judged. The rules that keep it low:
+
+- The window's tick loop (`next_tick` in `gui/mod.rs`) runs at the frame rate
+  only while something moves (a tween, a toast, the cursor's fade, the sidebar
+  freeze); otherwise every 50 ms in front and 250 ms behind another app. Daemon
+  frames wake it through `Arrival`, so output does not wait for the tick. New
+  animation driven from the loop must count as "moving" there, or it will stutter
+  at the idle rate.
+- The cursor stops blinking ten seconds after it last moved
+  (`cursor_blink::BLINK_FOR`); the fade repaints the whole grid about twenty times
+  a second, which was most of an idle window's cost. Moving it, or returning to the
+  window, starts it again.
+- A poll that is not driven by an event goes through `activity::scaled`, which
+  stretches its interval five times while the app is behind another one
+  (`activity::set_front`, fed by every window's tick loop from
+  `dock::app_active`). Coming forward polls at once because the elapsed time has
+  already passed. A new background thread that wakes on a timer takes it too.
+- Network polls use `Backoff`, not a constant: see the sipil notes above.
+- The Process page (sidebar, below Stats, only while `Settings::developer_mode` is on: Settings → Developer, or the palette; `gui/process.rs`) shows the same costs
+  live: CPU, memory and per-thread CPU from `pilus_client::process` (macOS
+  `proc_pidinfo`, the one other `unsafe` block, scoped and commented), the
+  `perf::Count` totals as rates, and `pilus_client::netlog`, a ring of the last 300
+  calls out of the machine. It samples once a second only while it is open. A new
+  place that calls out (a request, a subprocess that reaches a host) records itself
+  with `netlog::record` or `netlog::note`, or it will be missing from the page;
+  local-only subprocesses (`git`, the daemon's socket) are not network and stay out.
 
 ## UI
 

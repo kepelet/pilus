@@ -19,22 +19,72 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use pilus_client::sipil::channels::thread_key;
 use pilus_client::sipil::mention::{self, Mention};
 use pilus_client::sipil::peer::local;
+use pilus_client::sipil::{Backoff, Policy};
 use pilus_client::sipil::{
-    Channels, Chats, Conversation, Delivery, Directory, Event, ItemRole, Line, Local, LocalOptions,
-    Offline, Quote, SipilError, ToolCall, TranscriptItem, parse_target,
+    Channels, Chats, Contact, Conversation, Delivery, Directory, Event, ItemRole, Line, Local,
+    LocalOptions, Offline, Quote, SipilError, ToolCall, TranscriptItem, parse_target,
 };
 
 use super::sipil::{
-    Person, Watch, lock, nickname, publish, reachable_setting, relay_choice, request_id, snapshot,
-    update,
+    Person, Shared, Watch, lock, nickname, publish, reachable_setting, relay_choice, request_id,
+    snapshot, update,
 };
 
-/// How many ticks pass between asking each contact whether they are there.
-const PRESENCE_EVERY: u32 = 20;
+/// How long a contact who answered is left alone before being asked again, while
+/// the app is in front. Only the dot beside their name depends on it, and a
+/// call from them (or opening their chat) refreshes it sooner.
+const ONLINE_REFRESH: Duration = Duration::from_secs(120);
+/// How long a contact given up on rests before the app coming forward may ask
+/// again.
+const FORWARD_REST: Duration = Duration::from_secs(120);
+
+/// When one contact is next asked whether they are there.
+pub(super) struct Probe {
+    /// Spaces the asking of a contact who does not answer, and ends it.
+    backoff: Backoff,
+    /// When a contact who did answer is next asked; `None` means as soon as the
+    /// app is in front.
+    refresh_at: Option<Instant>,
+}
+
+impl Probe {
+    fn new() -> Self {
+        Self {
+            backoff: Backoff::new(Policy::PERSON),
+            refresh_at: None,
+        }
+    }
+
+    /// Whether to ask this contact now. Nobody sees the dot while the app is
+    /// behind another one, so nothing is asked then; coming forward asks.
+    fn due(&self, now: Instant, front: bool, reach: Reach) -> bool {
+        if !front || !self.backoff.due(now) {
+            return false;
+        }
+        match reach {
+            Reach::Online | Reach::Waiting => self.refresh_at.is_none_or(|at| now >= at),
+            Reach::Unknown | Reach::Offline => true,
+        }
+    }
+}
+
+/// What `sync` last folded into the state. When none of it moved, there is
+/// nothing to fold in, and the poller's wake costs a few atomic loads.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Synced {
+    directory: u64,
+    chats: u64,
+    channels: u64,
+    reach: u64,
+    online: bool,
+    reachable: bool,
+    watch: Watch,
+}
 
 /// What the last check of a contact found.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -104,6 +154,9 @@ fn push_event(event: Event) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(event);
+    // The unread count and the list order are the poller's to fold in; it
+    // may be asleep for a long while behind another app.
+    super::sipil::nudge();
 }
 
 /// Bring the network side up, or return the one already up. Starting binds a
@@ -131,6 +184,8 @@ pub(super) fn go_online() -> Result<Arc<Local>, SipilError> {
             });
             // Daemons that connected before the network did are offered now.
             super::sipil::share_daemons();
+            // A contact calling is the best news of them there is.
+            local.on_heard(super::sipil::nudge);
         }
         Err(error) => update(|state| state.me.error = Some(error.to_string())),
     }
@@ -338,7 +393,7 @@ fn membership_changed(outcome: &Result<Delivery, SipilError>) {
             Err(error) => Some(peer_error(error)),
         };
     });
-    sync(0);
+    sync(Instant::now(), true);
 }
 
 /// The conversation `watch` is, if it is one with people in it.
@@ -679,11 +734,36 @@ fn item_of(directory: &Directory, watching: &Watch, line: Line) -> TranscriptIte
 }
 
 /// Fold the contacts, the channels, the requests and the open thread into the
-/// state, and now and then ask the contacts whether they are there. All of it is
+/// state, and ask the contacts who are due whether they are there. All of it is
 /// local except the asking, which runs on its own thread.
-pub(super) fn sync(ticks: u32) {
+pub(super) fn sync(now: Instant, front: bool) {
     let stores = stores();
     let node = local();
+    if let Some(node) = &node {
+        for id in node.take_heard() {
+            heard(&id);
+        }
+    }
+    if node.is_some() {
+        check_presence_at(now, front);
+    }
+    let mut signature = Synced {
+        directory: stores.directory.version(),
+        chats: stores.chats.version(),
+        channels: stores.channels.version(),
+        online: node.is_some(),
+        reachable: node.as_ref().is_some_and(|node| node.reachable()),
+        watch: snapshot().watch.clone(),
+        ..Synced::default()
+    };
+    {
+        let mut shared = lock();
+        signature.reach = shared.reach_rev;
+        if shared.synced.as_ref() == Some(&signature) {
+            return;
+        }
+        shared.synced = Some(signature);
+    }
     let daemon_names: Vec<(String, String)> = stores
         .directory
         .daemons()
@@ -695,9 +775,6 @@ pub(super) fn sync(ticks: u32) {
         stores.channels.list(),
         stores.directory.requests(),
     );
-    if node.is_some() && !contacts.is_empty() && ticks % PRESENCE_EVERY == 1 {
-        check_presence();
-    }
     {
         let mut shared = lock();
         let reach = shared.reach.clone();
@@ -741,20 +818,89 @@ pub(super) fn sync(ticks: u32) {
     refresh_thread();
 }
 
-/// Ask every contact whether their pilus is there, once at a time.
+/// A contact called this node. A daemon is tried again now, a person is asked
+/// about now: either is up, and nothing else says so sooner.
+fn heard(id: &str) {
+    if super::sipil::is_daemon(id) {
+        super::sipil::wake_daemon(id);
+    } else {
+        wake_presence(id);
+    }
+}
+
+/// Ask `id` whether they are there at the next chance, whatever the backoff
+/// says: the person opened their chat, or they called.
+pub(super) fn wake_presence(id: &str) {
+    {
+        let mut shared = lock();
+        let probe = shared
+            .probes
+            .entry(id.to_string())
+            .or_insert_with(Probe::new);
+        probe.backoff.wake();
+        probe.refresh_at = None;
+    }
+    check_presence();
+}
+
+/// The app came to the front: what it knew about the contacts is stale, so ask
+/// again, and give those who were given up on one more try if they have rested.
+pub(super) fn catch_up(now: Instant) {
+    let mut shared = lock();
+    for probe in shared.probes.values_mut() {
+        probe.backoff.wake_if_rested(now, FORWARD_REST);
+        probe.refresh_at = None;
+    }
+}
+
+/// Ask the contacts who are due whether their pilus is there, once at a time.
 pub(super) fn check_presence() {
-    if CHECKING.swap(true, Ordering::AcqRel) {
+    check_presence_at(Instant::now(), super::activity::in_front());
+}
+
+fn check_presence_at(now: Instant, front: bool) {
+    if CHECKING.load(Ordering::Acquire) {
         return;
     }
-    thread::spawn(|| {
+    let due: Vec<Contact> = {
+        let mut shared = lock();
+        let Shared { probes, reach, .. } = &mut *shared;
+        stores()
+            .directory
+            .contacts()
+            .into_iter()
+            .filter(|contact| {
+                let found = reach.get(&contact.id).copied().unwrap_or_default();
+                probes
+                    .entry(contact.id.clone())
+                    .or_insert_with(Probe::new)
+                    .due(now, front, found)
+            })
+            .collect()
+    };
+    if due.is_empty() || CHECKING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    thread::spawn(move || {
         if let Some(node) = local() {
-            for contact in stores().directory.contacts() {
+            for contact in due {
                 let found = match node.check(&contact) {
                     Ok(health) if health.allowed => Reach::Online,
                     Ok(_) => Reach::Waiting,
                     Err(_) => Reach::Offline,
                 };
-                lock().reach.insert(contact.id, found);
+                let now = Instant::now();
+                let mut shared = lock();
+                if shared.reach.insert(contact.id.clone(), found) != Some(found) {
+                    shared.reach_rev += 1;
+                }
+                let probe = shared.probes.entry(contact.id).or_insert_with(Probe::new);
+                if found == Reach::Offline {
+                    probe.backoff.failed(now);
+                } else {
+                    probe.backoff.succeeded();
+                    probe.refresh_at = Some(now + ONLINE_REFRESH);
+                }
             }
         }
         CHECKING.store(false, Ordering::Release);

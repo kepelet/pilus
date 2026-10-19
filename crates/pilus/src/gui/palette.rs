@@ -41,6 +41,7 @@ pub enum Command {
     OpenSearch,
     OpenStats,
     OpenProcess,
+    OpenDatabase,
     ToggleDeveloperMode,
     OpenUiPlayground,
     Quit,

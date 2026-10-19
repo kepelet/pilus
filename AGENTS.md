@@ -390,6 +390,16 @@ is judged. The rules that keep it low:
   place that calls out (a request, a subprocess that reaches a host) records itself
   with `netlog::record` or `netlog::note`, or it will be missing from the page;
   local-only subprocesses (`git`, the daemon's socket) are not network and stay out.
+- The Database page (`gui/database.rs`; only while `Settings::developer_mode` is
+  on, and reached from the command palette, not the sidebar) shows what
+  `pilus.db` holds, read-only: a summary and 50 rows of one table at a time from
+  `pilus_db::browse`, which checks a table name against `sqlite_master` before it
+  reaches a query, cuts every cell at 240 characters and never writes. It reads
+  on open, on a table or page choice and on Refresh, never on a timer, and lets
+  go of what it read when it closes, since a cell can be someone's message. A new
+  table appears in it without a change here. The `visual-test` capture
+  (`database_show_sample`) uses an in-memory database and never opens the real
+  one.
 
 ## UI
 

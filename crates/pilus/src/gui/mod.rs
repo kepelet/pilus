@@ -18,6 +18,7 @@ mod browser_data;
 mod browser_tab;
 mod connector;
 mod cursor_blink;
+mod database;
 mod diff;
 mod diff_model;
 mod dock;
@@ -127,6 +128,7 @@ use pilus_protocol::{
     SurfaceInterest,
 };
 use ports_tab::PortsPanel;
+use database::DatabasePage;
 use process::ProcessPage;
 use right_sidebar::{RightSidebar, SidebarTab};
 use search::SearchPage;
@@ -1216,6 +1218,8 @@ enum InputLayer {
     Stats,
     /// The Process page.
     Process,
+    /// The Database page.
+    Database,
     /// The chat page for a sipil agent or session.
     Sipil,
     /// The right sidebar's Sipil tab, with a field in it.
@@ -2067,6 +2071,7 @@ struct PilusView {
     /// The page that totals the agents' token use.
     stats: StatsPage,
     process: ProcessPage,
+    database: DatabasePage,
     files_panel: FilesPanel,
     /// Notes on excerpts of markdown files, and the field they are written in.
     md_notes: md_notes_view::MdNotes,
@@ -2591,6 +2596,7 @@ impl PilusView {
             search_input,
             stats: StatsPage::default(),
             process: ProcessPage::default(),
+            database: DatabasePage::default(),
             files_panel: FilesPanel::new(),
             md_notes,
             md_note_input,
@@ -4698,6 +4704,7 @@ impl PilusView {
             InputLayer::Search => self.search_key(event, cx),
             InputLayer::Stats => self.stats_key(event, cx),
             InputLayer::Process => self.process_key(event, cx),
+            InputLayer::Database => self.database_key(event, cx),
             InputLayer::Sipil => self.sipil_chat_key(event, cx),
             // The panel's own handler has read it; nothing is left for the window.
             InputLayer::SipilPanel => {}
@@ -4725,6 +4732,7 @@ impl PilusView {
                 .or_else(|| self.search.is_open().then_some(InputLayer::Search))
                 .or_else(|| self.stats.is_open().then_some(InputLayer::Stats))
                 .or_else(|| self.process.is_open().then_some(InputLayer::Process))
+                .or_else(|| self.database.is_open().then_some(InputLayer::Database))
                 .or_else(|| self.sipil_chat.open.then_some(InputLayer::Sipil)),
         )
     }
@@ -4961,6 +4969,7 @@ impl PilusView {
         ];
         if self.settings.developer_mode {
             entries.push(entry(Command::OpenProcess, "Process", "Workspace", None));
+            entries.push(entry(Command::OpenDatabase, "Database", "Workspace", None));
         }
         for tab in &self.tabs {
             entries.push(entry(
@@ -5040,6 +5049,7 @@ impl PilusView {
             Command::OpenSearch => self.open_search(cx),
             Command::OpenStats => self.open_stats(cx),
             Command::OpenProcess => self.open_process(cx),
+            Command::OpenDatabase => self.open_database(cx),
             Command::ToggleDeveloperMode => {
                 self.set_developer_mode(!self.settings.developer_mode, cx);
             }
@@ -5172,6 +5182,7 @@ impl PilusView {
         self.search.close();
         self.stats.close();
         self.process.close();
+        self.database.close();
         self.close_sipil_chat();
         self.home.close();
         self.update_url_editing = false;
@@ -5498,6 +5509,14 @@ impl PilusView {
                 .overflow_hidden()
                 .child(self.process_page(cx));
             return self.page_card("pilus-page-process", page, grid, layout, terminal_fill, cx);
+        }
+        if self.database.is_open() {
+            let page = div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.database_page(cx));
+            return self.page_card("pilus-page-database", page, grid, layout, terminal_fill, cx);
         }
         if self.settings_open {
             return style::enter(
@@ -6273,6 +6292,7 @@ impl PilusView {
             InputLayer::Search => None,
             InputLayer::Stats => None,
             InputLayer::Process => None,
+            InputLayer::Database => None,
             // The composer holds the keyboard.
             InputLayer::Sipil => Some(self.sipil_chat.active_input().focus_handle(cx)),
             InputLayer::SipilPanel => None,
@@ -9112,7 +9132,7 @@ impl PilusView {
                         .text_size(px(self.footer_font()))
                         .text_color(theme.muted)
                         .child(
-                            "Developer mode adds a Process row below Insights: pilus's own CPU, memory, threads and the network calls it makes.",
+                            "Developer mode adds a Process row below Insights (pilus's own CPU, memory, threads and the network calls it makes) and a Database page in the command palette (what pilus.db holds, read-only).",
                         ),
                 )
                 .child(
@@ -9134,6 +9154,7 @@ impl PilusView {
         self.settings.developer_mode = on;
         if !on {
             self.process.close();
+            self.database.close();
         }
         self.save_settings();
         cx.notify();

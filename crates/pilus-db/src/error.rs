@@ -12,6 +12,9 @@ pub enum Error {
     /// A stored document did not match the type asked for.
     #[error("stored document: {0}")]
     Json(#[from] serde_json::Error),
+    /// A table that is not in the database was asked for.
+    #[error("no table named {0}")]
+    NoTable(String),
     /// The file was written by a newer pilus. Writing to it with older
     /// migrations could corrupt what that version stored, so it is left alone.
     #[error("pilus.db is from a newer pilus (schema {found}, this one knows {known})")]

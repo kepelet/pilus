@@ -377,31 +377,46 @@ impl PilusView {
         };
         let total: u64 = summary.tables.iter().map(|table| table.rows).sum();
 
-        let tiles = style::stat_strip(theme)
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "TABLES",
-                summary.tables.len().to_string(),
-                theme.accent,
-                "in the schema",
-            ))
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "ROWS",
-                total.to_string(),
-                theme.panel_fg,
-                "across all tables",
-            ))
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "SIZE",
-                size_label(summary.bytes),
-                theme.panel_fg,
-                "the file, without its log",
-            ))
+        // Flush tiles with no rules, as on the Insights page: the page's cards
+        // carry the borders, and a frame around the headline figures would
+        // crowd them.
+        let tiles = div()
+            .flex()
+            .flex_row()
+            .px_4()
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "TABLES",
+                    summary.tables.len().to_string(),
+                    theme.accent,
+                    "in the schema",
+                )
+                .border_r_0(),
+            )
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "ROWS",
+                    total.to_string(),
+                    theme.panel_fg,
+                    "across all tables",
+                )
+                .border_r_0(),
+            )
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "SIZE",
+                    size_label(summary.bytes),
+                    theme.panel_fg,
+                    "the file, without its log",
+                )
+                .border_r_0(),
+            )
             .child(
                 style::stat_tile(
                     theme,

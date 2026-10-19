@@ -507,43 +507,61 @@ impl PilusView {
             .filter(|entry| entry.at.elapsed() <= LATELY)
             .count();
 
-        let tiles = style::stat_strip(theme)
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "CPU",
-                format!("{:.1}%", now.cpu),
-                if now.cpu >= 50.0 {
-                    theme.alert
-                } else {
-                    theme.accent
-                },
-                format!("peak {:.1}% · 100% is one core", page.peak_cpu),
-            ))
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "MEMORY",
-                memory(usage.resident),
-                theme.panel_fg,
-                format!("peak {}", memory(page.peak_resident)),
-            ))
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "THREADS",
-                usage.threads.to_string(),
-                theme.panel_fg,
-                format!("{running} running now"),
-            ))
-            .child(style::stat_tile(
-                theme,
-                fonts,
-                "CPU TIME",
-                uptime(usage.cpu),
-                theme.panel_fg,
-                format!("of {} up", uptime(launched.elapsed())),
-            ))
+        // Flush tiles with no rules, as on the Insights page: the page's cards
+        // carry the borders, and a frame around the headline figures would
+        // crowd them.
+        let tiles = div()
+            .flex()
+            .flex_row()
+            .px_4()
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "CPU",
+                    format!("{:.1}%", now.cpu),
+                    if now.cpu >= 50.0 {
+                        theme.alert
+                    } else {
+                        theme.accent
+                    },
+                    format!("peak {:.1}% · 100% is one core", page.peak_cpu),
+                )
+                .border_r_0(),
+            )
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "MEMORY",
+                    memory(usage.resident),
+                    theme.panel_fg,
+                    format!("peak {}", memory(page.peak_resident)),
+                )
+                .border_r_0(),
+            )
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "THREADS",
+                    usage.threads.to_string(),
+                    theme.panel_fg,
+                    format!("{running} running now"),
+                )
+                .border_r_0(),
+            )
+            .child(
+                style::stat_tile(
+                    theme,
+                    fonts,
+                    "CPU TIME",
+                    uptime(usage.cpu),
+                    theme.panel_fg,
+                    format!("of {} up", uptime(launched.elapsed())),
+                )
+                .border_r_0(),
+            )
             .child(
                 style::stat_tile(
                     theme,

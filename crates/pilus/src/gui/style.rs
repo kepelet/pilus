@@ -28,6 +28,12 @@ use super::toast::ToastKind;
 /// read as breathing rather than a blink, and it respects reduce motion
 /// through [`AnimationExt::with_animation`].
 const SKELETON_PULSE: Duration = Duration::from_millis(1400);
+/// How many pulses a skeleton makes before it rests dim; energy mode skips them. A placeholder whose
+/// data never arrives (a daemon whose feed is down) would otherwise repaint
+/// the window every frame for as long as it is open.
+const SKELETON_PULSES: u32 = 6;
+/// The most frames a second a skeleton asks for; a slow fade needs no more.
+const SKELETON_FPS: f32 = 30.0;
 /// How long a floating panel takes to fade in when it opens: quick enough
 /// that a menu never feels slow to answer, long enough to read as motion.
 const ENTER: Duration = Duration::from_millis(140);
@@ -1489,23 +1495,33 @@ fn button_colors(kind: ButtonKind, theme: Theme) -> (Rgba, Rgba, Rgba) {
 /// a fallback label: the shape reserves the space the text will take, so
 /// nothing jumps when it lands. `height` follows the text it stands in for,
 /// and the width is the caller's because only the caller knows how much of
-/// the line the content will fill.
+/// the line the content will fill. It pulses a few times and rests dim, so a
+/// feed that never answers cannot keep the window repainting; under energy mode
+/// it is solid and never moves.
 pub(super) fn skeleton(
     id: impl Into<ElementId>,
     theme: Theme,
     width: impl Into<Length> + Clone,
     height: f32,
-) -> impl IntoElement {
-    div()
+) -> AnyElement {
+    let bar = div()
         .w(width)
         .h(px(height))
         .radius_full()
-        .bg(theme.panel_dim)
-        .with_animation(
-            id,
-            Animation::new(SKELETON_PULSE).repeat(),
-            |this, phase| this.opacity(0.55 + 0.45 * phase),
-        )
+        .bg(theme.panel_dim);
+    // Energy mode rests the placeholder solid rather than pulsing it.
+    if energy() {
+        return bar.into_any_element();
+    }
+    bar.with_animation(
+        id,
+        Animation::new(SKELETON_PULSE * SKELETON_PULSES).with_max_fps(SKELETON_FPS),
+        |this, delta| {
+            let phase = (delta * SKELETON_PULSES as f32).fract();
+            this.opacity(0.55 + 0.45 * phase)
+        },
+    )
+    .into_any_element()
 }
 
 /// Width of a toast card: wide enough for a sentence on two lines, narrow

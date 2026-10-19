@@ -52,6 +52,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>${app_version}</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSLocalNetworkUsageDescription</key><string>pilus connects directly to your sipil daemons, contacts and paired devices on this network, so messages and agents do not go through a relay.</string>
 </dict>
 </plist>
 PLIST

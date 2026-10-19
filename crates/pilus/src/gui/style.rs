@@ -62,11 +62,11 @@ pub(super) enum Radius {
     /// A large floating panel.
     Lg,
     /// A pill, status dot, or round button: fully round whatever the
-    /// setting, since a square one stops reading as what it is. Only energy
-    /// mode squares it.
+    /// setting, since a square one stops reading as what it is. Energy mode
+    /// leaves it round too.
     Full,
-    /// A tab: never squarer than the default radius, so zero corners leave
-    /// the strip soft.
+    /// A tab: never squarer than the default radius, so zero corners and
+    /// energy mode leave the strip soft.
     Soft,
 }
 
@@ -81,7 +81,8 @@ static ENERGY: AtomicBool = AtomicBool::new(false);
 
 /// Publish the radius being drawn, and whether energy mode is in effect, for
 /// [`Radius`] and [`energy`] to resolve against. Energy mode squares the
-/// corners here, so every window follows without a check of its own.
+/// corners here, so every window follows without a check of its own; the
+/// pill and the tab keep their shape, as they do at a zero radius.
 pub(super) fn sync_corner_radius(settings: &Settings) {
     CORNER_RADIUS_PX.store(settings.drawn_radius().to_bits(), Ordering::Relaxed);
     ENERGY.store(settings.energy_saving(), Ordering::Relaxed);
@@ -97,15 +98,12 @@ impl Radius {
     /// This step's radius, scaled from the `Md` base the setting names.
     pub(super) fn pixels(self) -> Pixels {
         let base = f32::from_bits(CORNER_RADIUS_PX.load(Ordering::Relaxed));
-        self.resolve(base, energy())
+        self.resolve(base)
     }
 
-    /// The radius for a `base` setting. Energy mode squares every step, the
-    /// pill and the tab included, which the setting alone never does.
-    fn resolve(self, base: f32, energy: bool) -> Pixels {
-        if energy {
-            return px(0.0);
-        }
+    /// The radius for a `base` setting, which energy mode has already set to
+    /// zero.
+    fn resolve(self, base: f32) -> Pixels {
         match self {
             Self::None => px(0.0),
             Self::Sm => px(base * 2.0 / 3.0),
@@ -711,7 +709,11 @@ pub(super) fn tree_row(
             } else {
                 gpui::transparent_black()
             },
-            if selected { theme.panel } else { theme.panel_dim },
+            if selected {
+                theme.panel
+            } else {
+                theme.panel_dim
+            },
             RADIUS_MD,
         )
         .child(disclosure)
@@ -2893,21 +2895,19 @@ mod tests {
 
     #[test]
     fn a_zero_radius_leaves_the_pill_and_the_tab_soft() {
-        assert_eq!(Radius::Full.resolve(0.0, false), px(9999.0));
-        assert_eq!(Radius::Soft.resolve(0.0, false), px(CORNER_RADIUS));
+        assert_eq!(Radius::Full.resolve(0.0), px(9999.0));
+        assert_eq!(Radius::Soft.resolve(0.0), px(CORNER_RADIUS));
     }
 
     #[test]
-    fn energy_mode_squares_every_step() {
-        for step in [
-            Radius::None,
-            Radius::Sm,
-            Radius::Md,
-            Radius::Lg,
-            Radius::Full,
-            Radius::Soft,
-        ] {
-            assert_eq!(step.resolve(8.0, true), px(0.0), "{step:?}");
+    fn energy_mode_leaves_the_pill_and_the_tab_soft() {
+        let mut settings = Settings::default();
+        settings.energy_mode = true;
+        let base = settings.drawn_radius();
+        for step in [Radius::None, Radius::Sm, Radius::Md, Radius::Lg] {
+            assert_eq!(step.resolve(base), px(0.0), "{step:?}");
         }
+        assert_eq!(Radius::Full.resolve(base), px(9999.0));
+        assert_eq!(Radius::Soft.resolve(base), px(CORNER_RADIUS));
     }
 }

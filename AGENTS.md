@@ -385,8 +385,8 @@ is judged. The rules that keep it low:
 - Network polls use `Backoff`, not a constant: see the sipil notes above.
 - Energy mode (`Settings::energy_mode`, switched from the pilus menu, the menu bar
   item (`menubar::Pick::Energy`) or the command palette) draws over the person's
-  choices without changing them: `Settings::drawn_radius` (square, and `Radius::Full`
-  and `Soft` too, the pill and the tab, which the setting never squares) and
+  choices without changing them: `Settings::drawn_radius` (square, except `Radius::Full`
+  and `Soft`, the pill and the tab, which stay round as at a zero radius) and
   `drawn_opacity` (solid, so the blur view is dropped) replace `radius` and
   `glass_opacity` at every point of use, while the Appearances sliders keep
   reading the originals. Motion is GPUI's `reduce_motion`, set by

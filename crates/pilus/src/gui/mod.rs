@@ -11806,6 +11806,23 @@ impl PilusView {
         }
     }
 
+    /// Daemon columns the dock will hold once the toggle has landed. While
+    /// the snapshot is held `skipped_cols` still reads the pre-toggle dock,
+    /// so a size computed from it is off by the dock's width and the daemon
+    /// reflows to it, then again when the live frame releases the freeze.
+    fn settled_skip_cols(&self) -> u16 {
+        if self.sidebar_freeze.is_none() {
+            return self.skipped_cols();
+        }
+        if !self.sidebar_visible {
+            return 0;
+        }
+        match self.sidebar_dock() {
+            Some(dock) if dock.x == 0 => dock.width,
+            _ => self.skipped_cols(),
+        }
+    }
+
     /// The frame the card paints: the sidebar's snapshot while it slides,
     /// otherwise the live one. Pointer mapping reads the same frame, so a
     /// click lands on what is drawn.
@@ -14425,7 +14442,7 @@ impl PilusView {
         let layout = self.card_layout(window);
         // The daemon lays out its whole chrome (docks included); we only show
         // the pane area, so the skipped rows and columns ride along.
-        let cols = layout.cols.saturating_add(self.skipped_cols());
+        let cols = layout.cols.saturating_add(self.settled_skip_cols());
         let rows = layout
             .rows
             .saturating_add(self.skipped_rows())

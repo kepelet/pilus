@@ -316,10 +316,11 @@ fn window(name: &str) -> (Arc<Local>, Heard) {
     let heard: Heard = Arc::default();
     let sink = Arc::clone(&heard);
     let dir = scratch(name);
+    let db = pilus_db::Db::at(&dir);
     let local = Local::build(LocalOptions {
-        directory: Arc::new(pilus_client::sipil::Directory::open(&dir)),
-        chats: Arc::new(pilus_client::sipil::Chats::open(&dir)),
-        channels: Arc::new(pilus_client::sipil::Channels::open(&dir)),
+        directory: Arc::new(pilus_client::sipil::Directory::open(&db, &dir)),
+        chats: Arc::new(pilus_client::sipil::Chats::open(&db, &dir)),
+        channels: Arc::new(pilus_client::sipil::Channels::open(&db, &dir)),
         dir,
         relay: RelayChoice::Disabled,
         nickname: name.to_string(),

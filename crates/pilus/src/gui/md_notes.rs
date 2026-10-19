@@ -4,7 +4,9 @@
 //! source lines it came from, and what the reader wants done about it. Notes
 //! are the app's own (the daemon's review notes are anchored to a Git layer,
 //! which an unchanged file does not have), so they are kept per machine and
-//! file in `md-notes.json` beside the settings, and survive a restart.
+//! file in `pilus.db`'s `md_notes` table, and survive a restart. The first open
+//! reads the `md-notes.json` older versions kept beside the settings and sets it
+//! aside as `md-notes.json.migrated`.
 //!
 //! The reader collects several, then hands any of them to an agent as one
 //! prompt. A note remembers who it was sent to, so a second pass over a long
@@ -13,14 +15,21 @@
 
 use std::fmt::Write as _;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use pilus_db::rusqlite::{Transaction, params};
+use pilus_db::{Db, Error as DbError};
+use serde::Deserialize;
 
-const FILE: &str = "md-notes.json";
+/// The flat file notes were kept in before `pilus.db`.
+const LEGACY_FILE: &str = "md-notes.json";
+/// Marks that file as read into the database.
+const IMPORT: &str = "md_notes";
+/// The document holding the next id, which outlives the notes it was given to.
+const COUNTER: &str = "md_notes_next_id";
 
 /// One note: an excerpt of a file and the reader's words about it.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub(super) struct ExcerptNote {
     pub(super) id: u64,
     /// The machine the file lives on, as the window keys its endpoints.
@@ -44,28 +53,37 @@ pub(super) struct NewNote {
     pub(super) body: String,
 }
 
-/// Every note, in the order they were written.
-#[derive(Default, Deserialize, Serialize)]
-pub(super) struct NoteBook {
+/// What the old `md-notes.json` held.
+#[derive(Default, Deserialize)]
+struct LegacyBook {
     #[serde(default)]
     next_id: u64,
     #[serde(default)]
     notes: Vec<ExcerptNote>,
+}
+
+/// Every note, in the order they were written.
+#[derive(Default)]
+pub(super) struct NoteBook {
+    next_id: u64,
+    notes: Vec<ExcerptNote>,
     /// Where it saves; a book with none keeps its notes in memory.
-    #[serde(skip)]
-    file: Option<PathBuf>,
+    db: Option<Db>,
 }
 
 impl NoteBook {
-    /// The book stored in `root`. A missing or unreadable file is an empty
-    /// book: notes are a convenience, and a corrupt one must not stop the app.
+    /// The book stored in the database under `root`, first reading the old
+    /// `md-notes.json` there if it is still around. A book that cannot be read is
+    /// an empty one: notes are a convenience, and a corrupt one must not stop the
+    /// app.
     pub(super) fn load(root: &Path) -> Self {
-        let file = root.join(FILE);
-        let mut book: Self = std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
-        book.file = Some(file);
+        let db = Db::at(root);
+        import_legacy(&db, &root.join(LEGACY_FILE));
+        let mut book = read(&db).unwrap_or_else(|error| {
+            tracing::warn!("could not read the notes: {error}");
+            Self::default()
+        });
+        book.db = Some(db);
         // Ids are never reused, even if the stored counter fell behind.
         let highest = book.notes.iter().map(|note| note.id).max().unwrap_or(0);
         book.next_id = book.next_id.max(highest + 1);
@@ -78,16 +96,17 @@ impl NoteBook {
         Self::default()
     }
 
-    /// Write the book out, through a temporary file so a crash cannot leave
-    /// half of it.
+    /// Write the book out in one transaction, so a crash cannot leave half of it.
     pub(super) fn save(&self) -> io::Result<()> {
-        let Some(file) = &self.file else {
+        let Some(db) = &self.db else {
             return Ok(());
         };
-        let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        let staging = file.with_extension("json.tmp");
-        std::fs::write(&staging, text)?;
-        std::fs::rename(&staging, file)
+        db.transaction(|tx| {
+            tx.execute("DELETE FROM md_notes", [])?;
+            insert_all(tx, &self.notes)?;
+            pilus_db::put_doc_in(tx, COUNTER, &self.next_id)
+        })
+        .map_err(io::Error::from)
     }
 
     /// The notes on one file, oldest first.
@@ -139,6 +158,78 @@ impl NoteBook {
     }
 }
 
+fn insert_all(tx: &Transaction, notes: &[ExcerptNote]) -> Result<(), DbError> {
+    for note in notes {
+        tx.execute(
+            "INSERT OR REPLACE INTO md_notes
+                 (id, endpoint, path, first_line, last_line, quote, body, sent_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                note.id as i64,
+                note.endpoint,
+                note.path,
+                note.lines.map(|(first, _)| first),
+                note.lines.map(|(_, last)| last),
+                note.quote,
+                note.body,
+                note.sent_to,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn read(db: &Db) -> Result<NoteBook, DbError> {
+    let notes = db.with(|conn| {
+        let mut statement = conn.prepare(
+            "SELECT id, endpoint, path, first_line, last_line, quote, body, sent_to
+             FROM md_notes ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let first: Option<u32> = row.get(3)?;
+            let last: Option<u32> = row.get(4)?;
+            Ok(ExcerptNote {
+                id: row.get::<_, i64>(0)?.unsigned_abs(),
+                endpoint: row.get(1)?,
+                path: row.get(2)?,
+                lines: first.zip(last),
+                quote: row.get(5)?,
+                body: row.get(6)?,
+                sent_to: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })?;
+    Ok(NoteBook {
+        next_id: db.doc::<u64>(COUNTER)?.unwrap_or(0),
+        notes,
+        db: None,
+    })
+}
+
+/// Read the old file into the database once, then set it aside. A file that
+/// does not parse stays where it is.
+fn import_legacy(db: &Db, path: &Path) {
+    if !path.is_file() || db.imported(IMPORT) {
+        return;
+    }
+    let Some(old) = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<LegacyBook>(&bytes).ok())
+    else {
+        return;
+    };
+    let imported = db.import_once(IMPORT, |tx| {
+        insert_all(tx, &old.notes)?;
+        let highest = old.notes.iter().map(|note| note.id).max().unwrap_or(0);
+        pilus_db::put_doc_in(tx, COUNTER, &old.next_id.max(highest + 1))
+    });
+    match imported {
+        Ok(_) => pilus_db::retire(path),
+        Err(error) => tracing::warn!("could not import {}: {error}", path.display()),
+    }
+}
+
 /// The prompt that hands an agent `notes` on the file `path`. Each excerpt is
 /// quoted, so the agent can tell the reader's words from the document's.
 pub(super) fn notes_prompt(path: &str, notes: &[&ExcerptNote]) -> String {
@@ -171,6 +262,8 @@ pub(super) fn notes_prompt(path: &str, notes: &[&ExcerptNote]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn new(path: &str, body: &str) -> NewNote {
@@ -245,9 +338,39 @@ mod tests {
     #[test]
     fn a_corrupt_file_is_an_empty_book() {
         let dir = scratch_dir("corrupt");
-        std::fs::write(dir.join(FILE), "{ not json").expect("write");
+        std::fs::write(dir.join(LEGACY_FILE), "{ not json").expect("write");
         let book = NoteBook::load(&dir);
         assert_eq!(book.for_doc("local", "a.md").count(), 0);
+        assert!(
+            dir.join(LEGACY_FILE).is_file(),
+            "an unreadable file is left for the person to look at"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_old_file_is_imported_once_with_its_counter() {
+        let dir = scratch_dir("legacy");
+        std::fs::write(
+            dir.join(LEGACY_FILE),
+            r#"{"next_id":9,"notes":[
+                {"id":2,"endpoint":"local","path":"a.md","lines":[3,5],"quote":"q","body":"old","sent_to":"orca"},
+                {"id":4,"endpoint":"mini","path":"b.md","lines":null,"quote":"r","body":"two"}]}"#,
+        )
+        .expect("write");
+
+        let mut book = NoteBook::load(&dir);
+        let first = book.get(2).expect("imported");
+        assert_eq!(first.lines, Some((3, 5)));
+        assert_eq!(first.sent_to.as_deref(), Some("orca"));
+        assert_eq!(book.get(4).and_then(|note| note.lines), None);
+        assert!(!dir.join(LEGACY_FILE).exists());
+        assert!(dir.join("md-notes.json.migrated").is_file());
+        assert_eq!(book.add(new("a.md", "next")), 9, "the stored counter wins");
+        book.save().expect("save");
+
+        let again = NoteBook::load(&dir);
+        assert_eq!(again.for_doc("local", "a.md").count(), 2);
         std::fs::remove_dir_all(dir).ok();
     }
 

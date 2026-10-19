@@ -38,13 +38,36 @@ with only the command-line tools can build the app.
   stays `Transparent`; the blur slider drives the view's `alphaValue`. The view is pinned to the dark
   appearance, so a light-mode Mac still frosts dark under the chrome.
 
+- Durable state is `~/.pilus/pilus.db` (`crates/pilus-db`), not a pile of JSON
+  files. It holds the only copy of the sipil conversations, contacts, channels
+  and offline snapshots, the markdown notes, the GitHub cache and the window's
+  per-item state (`Settings::window`, `session_labels`, `session_icons`,
+  `github_pinned`, `sipil_order`, `last_session`, `last_endpoint` and the pane
+  sizes; the `ui_state` document, `settings::UiState`), so it is **migrated, never dropped**: a schema
+  change is a new entry at the end of `pilus-db/src/schema.rs`'s `MIGRATIONS`
+  and a released one is never edited, and a file from a newer pilus is refused
+  (`Error::Newer`) rather than written to. `index.db` is the opposite, a cache
+  that `SCHEMA` bumps rebuild and `wipe` deletes, so nothing durable goes there.
+  A store keeps its working copy in memory and writes each change through; take
+  the store's lock before the database's, never the reverse, and never call a
+  `Db` method inside `Db::transaction` (use the `tx`, as `put_doc_in` does). Open
+  it with `Db::at(dir)`, which shares one connection per folder. Small
+  always-whole state (contacts, channels, offline, `ui_state`) is one `docs`
+  row; anything that grows or changes a row at a time (chat lines, notes, the
+  GitHub cache) is a table. A store that used to be a flat file imports it once
+  on first open (`Db::import_once`, tagged in `imports`) and sets it aside as
+  `<name>.migrated` (`pilus_db::retire`); it never deletes it. `settings.json`
+  keeps the preferences, which `pilus-agent` (the `relay` block) and
+  `--check-updates` (`Settings::preferences`, which does not open the database)
+  also read.
+
 - The GitHub Repositories section reads the signed-in account through `gh` on
   the machine `pilus` runs on, never through a daemon or SSH. It shows three
   repositories: `Settings::github_pinned` first, then the most recently pushed
   to. Every list, and each repository's issues, pull requests and workflow
   runs, goes through `pilus_client::GhAccount`'s cache (fresh lists are free,
   REST lists revalidate by `ETag`, a rate limit is waited out and persisted in
-  `github-cache.json`); do not call `gh` for these from the GUI directly, or the
+  `pilus.db`); do not call `gh` for these from the GUI directly, or the
   cache and its limits are bypassed. `Settings::github` and
   `github_repositories` switch the feature off, which means no requests at
   all. The `visual-test` captures fill the feed with samples so a shot never
@@ -73,8 +96,10 @@ with only the command-line tools can build the app.
   directly. The identity key is `~/.pilus/sipil/identity.key`; losing it changes
   the device ID everywhere it was added.
 - A pilus is a sipil by `peer::Local`: the node, the contacts
-  (`contacts.json`), the conversations (`chats.jsonl`, an append-only log of
-  JSON records replayed at launch; both under `~/.pilus/sipil`) and the `PeerService` that answers inbound calls. It answers
+  (the `contacts` document), the conversations (the `chat_*` tables, read into
+  memory at launch and written through per change; the identity key stays under
+  `~/.pilus/sipil`, and the old `contacts.json` and `chats.jsonl` there are
+  imported once) and the `PeerService` that answers inbound calls. It answers
   `health` and `chat.send` only; a stranger's `chat.send` is refused unread and
   remembered as a *request* the person can accept, and a message is stored on the
   sender's side only once the receiver's pilus has taken it, so a refusal leaves
@@ -96,7 +121,7 @@ with only the command-line tools can build the app.
   `unknown_method`, and `health` lists no agents. It takes part only in a channel
   its person invited it into (see Mentions). Contacts are renamed in the Sipil tab
   (`Directory::rename`); the name is the user's, never the peer's.
-- Channels (`channels.json`, `pilus_client::sipil::Channels`) are named rooms of
+- Channels (the `channels` document, `pilus_client::sipil::Channels`) are named rooms of
   contacts with no server: the author's pilus fans `chan.send` out to every member
   that is a contact (in parallel, so one absent member holds nobody up), each
   member keeps its own copy under the thread `#<id>`, and a pilus learns a channel
@@ -112,7 +137,7 @@ with only the command-line tools can build the app.
   from someone who is not in its list (`not_member`), so a member taken out can
   neither read nor speak: it is told and forgets the channel, and one that was
   away finds out when every member refuses its next message. A removal is kept
-  per channel (`Channels::remove_members`, `removed` in `channels.json`) so an
+  per channel (`Channels::remove_members`, `removed` in the `channels` document) so an
   older list does not bring the person back; only an `added` does. The info
   button on a channel's page opens `channel_panel`: members with their device IDs
   and who owns it; the owner also sees Remove (two clicks), who can be invited,
@@ -124,7 +149,7 @@ with only the command-line tools can build the app.
   each, in one session per conversation (the cursor lives in the chat store), and
   its reply is said back under its name (`as`), to everyone. An agent answers
   only in a channel its person invited it into, on the channel panel's "Your
-  agents" list (`Channels::set_agent`, kept in `channels.json` on that device
+  agents" list (`Channels::set_agent`, kept in the `channels` document on that device
   only and never sent; the invite asks once because every member can then run a
   model with file and shell tools on that machine with its API keys, and joining
   or leaving is said to the channel as the agent). Naming an agent that was not
@@ -138,7 +163,7 @@ with only the command-line tools can build the app.
   (`bring_in_agents`, `answer_invited` and `answer_mention` all refuse a
   `Conversation::Direct`). Leaving a channel forgets its invitations.
 - A daemon being away does not close its agent. `pilus_client::sipil::Offline`
-  (`offline.json`, same directory) keeps each daemon's primary agent, the newest
+  (the `offline` document) keeps each daemon's primary agent, the newest
   200 lines of the 8 conversations last looked at, and an outbox. `sipil::begin`
   seeds the `Daemon` from it, so the sidebar row (muted dot instead of green)
   opens the chat before, and without, a connection; `sipil::watch` shows the
@@ -264,7 +289,7 @@ with only the command-line tools can build the app.
   turn arrives as `error` on the agent, the session and the transcript line.
 
 - Notes on excerpts of markdown files (`gui/md_notes.rs`) are the app's own,
-  kept per machine and file in `md-notes.json` beside the settings. They are not
+  kept per machine and file in the `md_notes` table of `pilus.db`. They are not
   the daemon's review notes: those are anchored to a Git layer, which an unchanged
   file has not. Sending ticked notes is one `agent.prompt` carrying every excerpt,
   so an agent never receives a note it cannot place.

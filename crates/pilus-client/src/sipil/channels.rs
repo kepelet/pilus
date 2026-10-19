@@ -24,9 +24,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pilus_db::Db;
 use serde::{Deserialize, Serialize};
 
 use super::store;
+
+/// The document the channels are kept in.
+const DOC: &str = "channels";
 
 /// The longest channel name kept.
 const NAME_LIMIT: usize = 40;
@@ -100,18 +104,21 @@ pub enum Learned {
 
 /// Every channel this pilus is in.
 pub struct Channels {
-    path: PathBuf,
+    db: Db,
+    /// Where the identity key lives, which names the owner of a new channel.
+    dir: PathBuf,
     inner: Mutex<File>,
     version: AtomicU64,
 }
 
 impl Channels {
-    /// Open the store under `dir` (`channels.json`).
-    pub fn open(dir: &Path) -> Self {
-        let path = dir.join("channels.json");
+    /// Open the channels in `db`, importing `dir`'s `channels.json` the first
+    /// time. `dir` also holds the identity key.
+    pub fn open(db: &Db, dir: &Path) -> Self {
         Self {
-            inner: Mutex::new(store::load(&path)),
-            path,
+            inner: Mutex::new(store::load(db, DOC, &dir.join("channels.json"))),
+            db: db.clone(),
+            dir: dir.to_path_buf(),
             version: AtomicU64::new(0),
         }
     }
@@ -138,8 +145,7 @@ impl Channels {
     /// Make a channel of `members` and return it, owned by this device. `name`
     /// is cleaned the way a channel name must be: lowercase, no spaces.
     pub fn create(&self, name: &str, members: Vec<String>) -> std::io::Result<Channel> {
-        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
-        let owner = super::node::device_id(dir)
+        let owner = super::node::device_id(&self.dir)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let channel = Channel {
             id: fresh_id(),
@@ -299,7 +305,7 @@ impl Channels {
         let mut file = self.lock();
         edit(&mut file);
         self.version.fetch_add(1, Ordering::Relaxed);
-        store::save(&self.path, &*file)
+        store::save(&self.db, DOC, &*file)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, File> {
@@ -361,6 +367,11 @@ mod tests {
         dir
     }
 
+    /// The store on the database that lives in `dir`, as a launch would open it.
+    fn open(dir: &Path) -> Channels {
+        Channels::open(&Db::at(dir), dir)
+    }
+
     fn id(seed: char) -> String {
         seed.to_string().repeat(64)
     }
@@ -375,7 +386,7 @@ mod tests {
     #[test]
     fn a_channel_survives_a_restart_and_never_lists_junk_or_repeats() {
         let dir = scratch("restart");
-        let channels = Channels::open(&dir);
+        let channels = open(&dir);
         let made = channels
             .create(
                 "Alerts",
@@ -384,7 +395,7 @@ mod tests {
             .unwrap();
         assert_eq!(made.members, [id('a'), id('b')]);
         assert_eq!(made.id.len(), 16);
-        assert_eq!(Channels::open(&dir).get(&made.id), Some(made.clone()));
+        assert_eq!(open(&dir).get(&made.id), Some(made.clone()));
         assert_eq!(made.thread(), format!("#{}", made.id));
         assert_eq!(channel_of(&made.thread()), Some(made.id.as_str()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -393,7 +404,7 @@ mod tests {
     #[test]
     fn learning_a_channel_creates_it_once_and_believes_only_its_owner() {
         let dir = scratch("learn");
-        let channels = Channels::open(&dir);
+        let channels = open(&dir);
         let me = id('m');
         let (owner, other) = (id('a'), id('c'));
         assert_eq!(
@@ -437,7 +448,7 @@ mod tests {
     #[test]
     fn a_channel_made_here_is_owned_by_this_device() {
         let dir = scratch("owner");
-        let channels = Channels::open(&dir);
+        let channels = open(&dir);
         let made = channels.create("x", vec![id('a')]).unwrap();
         assert_eq!(
             made.owner,
@@ -445,7 +456,7 @@ mod tests {
             "the identity of the directory it lives in"
         );
         assert_eq!(
-            Channels::open(&dir).get(&made.id).unwrap().owner,
+            open(&dir).get(&made.id).unwrap().owner,
             made.owner
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -454,7 +465,7 @@ mod tests {
     #[test]
     fn a_member_invited_is_listed_and_one_removed_stays_out_until_invited_again() {
         let dir = scratch("members");
-        let channels = Channels::open(&dir);
+        let channels = open(&dir);
         let me = id('m');
         let made = channels.create("x", vec![id('a')]).unwrap();
         assert!(channels.invite(&made.id, &id('b')));
@@ -487,7 +498,7 @@ mod tests {
 
         // It all survives a restart.
         channels.remove_members(&made.id, &[id('b')]);
-        let again = Channels::open(&dir);
+        let again = open(&dir);
         again.learn(&made.id, "x", &[id('b')], &me, &made.owner, &made.owner);
         assert!(!again.get(&made.id).unwrap().members.contains(&id('b')));
         let _ = std::fs::remove_dir_all(&dir);
@@ -496,7 +507,7 @@ mod tests {
     #[test]
     fn leaving_forgets_the_channel() {
         let dir = scratch("leave");
-        let channels = Channels::open(&dir);
+        let channels = open(&dir);
         let made = channels.create("x", vec![]).unwrap();
         channels.remove(&made.id).unwrap();
         assert!(channels.list().is_empty());
@@ -519,7 +530,7 @@ mod tests {
     #[test]
     fn an_agent_is_in_a_channel_only_once_invited_and_leaves_with_it() {
         let dir = scratch("agents");
-        let channels = Channels::open(&dir);
+        let channels = open(&dir);
         let made = channels.create("x", vec![id('a')]).unwrap();
         assert!(channels.agents(&made.id).is_empty());
         assert!(channels.set_agent(&made.id, "daemon-a", true));
@@ -529,7 +540,7 @@ mod tests {
             !channels.set_agent("nope", "daemon-a", true),
             "no such channel"
         );
-        assert_eq!(Channels::open(&dir).agents(&made.id), ["daemon-a"]);
+        assert_eq!(open(&dir).agents(&made.id), ["daemon-a"]);
         channels.remove(&made.id).unwrap();
         channels.rejoin(&made.id);
         assert!(

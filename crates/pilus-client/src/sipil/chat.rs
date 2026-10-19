@@ -5,19 +5,26 @@
 //! server to hold one for an absent peer, so a send to a pilus that is not
 //! running fails and stays in the composer to retry.
 //!
-//! They live in `chats.jsonl`, one JSON record per line, appended as things
-//! happen (a line said, a thread read, an agent's cursor moved, a thread
-//! forgotten) and replayed when the store opens. A send costs one small append
-//! instead of rewriting every thread, and a torn last record after a crash costs
-//! that record, not the file. Once the log holds well over twice what the threads
-//! still need it is rewritten from memory, which is also how a thread's 500-line
-//! limit reaches the disk.
+//! They live in `pilus.db` (`chat_threads`, `chat_lines`, `chat_requests`,
+//! `chat_cursors`) and are read into memory when the store opens, because the
+//! window asks for a thread's lines on every poll. Each change (a line said, a
+//! thread read, an agent's cursor moved, a thread forgotten) is applied to
+//! memory and written to the tables in one transaction, so what is in memory is
+//! always what a reopen gives, and a send costs a few small row writes instead of
+//! rewriting a log. A thread's 500-line limit is enforced in the same
+//! transaction.
+//!
+//! Before `pilus.db` they were `chats.jsonl`, one JSON record per line. The
+//! first open replays such a file into the tables ([`State::replay`]) and sets it
+//! aside as `chats.jsonl.migrated`.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pilus_db::rusqlite::{self, Transaction, params};
+use pilus_db::{Db, Error as DbError};
 use serde::{Deserialize, Serialize};
 
 use super::store;
@@ -27,11 +34,10 @@ use super::{Quote, Subagent};
 const THREAD_LIMIT: usize = 500;
 /// How many request ids a thread remembers to recognise a retried delivery.
 const SEEN_LIMIT: usize = 64;
-/// How many records beyond twice the live ones the log may hold before it is
-/// compacted, so a small store is not rewritten on every few lines.
-const COMPACT_SLACK: usize = 256;
 /// The longest message taken from a peer, in bytes.
 pub const MESSAGE_LIMIT: usize = 16 * 1024;
+/// Marks `chats.jsonl` as read into the database.
+const IMPORT: &str = "chats";
 
 /// One line of a conversation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -155,8 +161,8 @@ impl Thread {
     }
 }
 
-/// One line of `chats.jsonl`.
-#[derive(Deserialize, Serialize)]
+/// One record of the old `chats.jsonl`, and the unit of change today.
+#[derive(Deserialize)]
 struct Record {
     /// The peer's device ID, or `#<id>` for a channel.
     thread: String,
@@ -167,13 +173,13 @@ struct Record {
 // Each entry lives only long enough to be applied and written, so a boxed line
 // would cost an allocation to save nothing.
 #[allow(clippy::large_enum_variant)]
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Entry {
     /// A line was said. `request` is the id the peer sent it under.
     Line {
         line: Line,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         request: Option<String>,
     },
     /// Every line up to `through` was read.
@@ -191,8 +197,6 @@ enum Entry {
 #[derive(Default)]
 struct State {
     threads: BTreeMap<String, Thread>,
-    /// Records in the log, live or not.
-    records: usize,
 }
 
 impl State {
@@ -205,86 +209,235 @@ impl State {
         }
     }
 
-    /// Replay the log at `path`. A record that does not parse is skipped, so one
-    /// damaged line never takes the rest with it.
-    fn load(path: &Path) -> Self {
+    /// Replay the old log at `path`. A record that does not parse is skipped, so
+    /// one damaged line never takes the rest with it.
+    fn replay(path: &Path) -> Self {
         let bytes = std::fs::read(path).unwrap_or_default();
         let mut state = Self::default();
         for line in bytes.split(|byte| *byte == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
             if let Ok(record) = serde_json::from_slice::<Record>(line) {
                 state.apply(record);
             }
-            state.records += 1;
-        }
-        // A crash can leave the last record without its newline, which the next
-        // append would otherwise glue itself onto.
-        if bytes.last().is_some_and(|byte| *byte != b'\n') {
-            let _ = store::append_private(path, b"\n");
         }
         state
     }
 
-    /// What the threads need from the log: the smallest set of records that
-    /// replays to the same state.
-    fn snapshot(&self) -> Vec<Record> {
-        let mut out = Vec::new();
-        for (name, thread) in &self.threads {
-            let record = |entry| Record {
-                thread: name.clone(),
-                entry,
-            };
-            for (daemon, cursor) in &thread.agents {
-                out.push(record(Entry::Cursor {
-                    daemon: daemon.clone(),
-                    session: cursor.session.clone(),
-                    through: cursor.through,
-                }));
+    /// Everything in the tables.
+    fn read(db: &Db) -> Result<Self, DbError> {
+        db.with(|conn| {
+            let mut state = Self::default();
+            let mut threads = conn.prepare("SELECT thread, next, read_through FROM chat_threads")?;
+            for row in threads.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            })? {
+                let (name, next, read_through) = row?;
+                let thread = state.threads.entry(name).or_default();
+                thread.next = next.unsigned_abs();
+                thread.read_through = read_through.unsigned_abs();
             }
-            for line in &thread.lines {
-                let request = thread
-                    .requests
-                    .iter()
-                    .find(|(id, _)| *id == line.id)
-                    .map(|(_, request)| request.clone());
-                out.push(record(Entry::Line {
-                    line: line.clone(),
-                    request,
-                }));
+            let mut lines = conn.prepare(
+                "SELECT thread, id, mine, text, at, who, agent, reply, delegation
+                 FROM chat_lines ORDER BY thread, id",
+            )?;
+            for row in lines.query_map([], |row| {
+                let json = |index: usize| -> rusqlite::Result<Option<String>> { row.get(index) };
+                Ok((
+                    row.get::<_, String>(0)?,
+                    Line {
+                        id: row.get::<_, i64>(1)?.unsigned_abs(),
+                        mine: row.get(2)?,
+                        text: row.get(3)?,
+                        at: row.get::<_, i64>(4)?.unsigned_abs(),
+                        who: row.get(5)?,
+                        agent: row.get(6)?,
+                        reply: json(7)?.and_then(|text| serde_json::from_str(&text).ok()),
+                        delegation: json(8)?.and_then(|text| serde_json::from_str(&text).ok()),
+                    },
+                ))
+            })? {
+                let (name, line) = row?;
+                if let Some(thread) = state.threads.get_mut(&name) {
+                    thread.lines.push(line);
+                }
             }
-            if thread.read_through > 0 {
-                out.push(record(Entry::Read {
-                    through: thread.read_through,
-                }));
+            let mut requests =
+                conn.prepare("SELECT thread, line, request FROM chat_requests ORDER BY thread, line")?;
+            for row in requests.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+            })? {
+                let (name, line, request) = row?;
+                if let Some(thread) = state.threads.get_mut(&name) {
+                    thread.requests.push((line.unsigned_abs(), request));
+                }
             }
-        }
-        out
+            let mut cursors =
+                conn.prepare("SELECT thread, daemon, session, through FROM chat_cursors")?;
+            for row in cursors.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })? {
+                let (name, daemon, session, through) = row?;
+                if let Some(thread) = state.threads.get_mut(&name) {
+                    thread.agents.insert(
+                        daemon,
+                        Cursor {
+                            session,
+                            through: through.unsigned_abs(),
+                        },
+                    );
+                }
+            }
+            Ok(state)
+        })
     }
 
-    fn live(&self) -> usize {
-        self.threads
-            .values()
-            .map(|thread| thread.lines.len() + thread.agents.len() + 1)
-            .sum()
+    /// Write every thread, for the import. A row that is already there wins, so
+    /// an import never overwrites what the tables hold.
+    fn write_all(&self, tx: &Transaction) -> Result<(), DbError> {
+        for (name, thread) in &self.threads {
+            tx.execute(
+                "INSERT OR IGNORE INTO chat_threads (thread, next, read_through) VALUES (?1, ?2, ?3)",
+                params![name, thread.next as i64, thread.read_through as i64],
+            )?;
+            for line in &thread.lines {
+                insert_line(tx, name, line)?;
+            }
+            for (id, request) in &thread.requests {
+                tx.execute(
+                    "INSERT OR IGNORE INTO chat_requests (thread, line, request) VALUES (?1, ?2, ?3)",
+                    params![name, *id as i64, request],
+                )?;
+            }
+            for (daemon, cursor) in &thread.agents {
+                tx.execute(
+                    "INSERT OR IGNORE INTO chat_cursors (thread, daemon, session, through)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![name, daemon, cursor.session, cursor.through as i64],
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn insert_line(tx: &Transaction, thread: &str, line: &Line) -> Result<(), DbError> {
+    tx.execute(
+        "INSERT OR REPLACE INTO chat_lines
+             (thread, id, mine, text, at, who, agent, reply, delegation)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            thread,
+            line.id as i64,
+            line.mine,
+            line.text,
+            line.at as i64,
+            line.who,
+            line.agent,
+            line.reply.as_ref().and_then(|q| serde_json::to_string(q).ok()),
+            line.delegation.as_ref().and_then(|d| serde_json::to_string(d).ok()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Write one change to the tables, the same change `Thread::apply` makes in
+/// memory, including the limits on how much a thread keeps.
+fn write(tx: &Transaction, thread: &str, entry: &Entry) -> Result<(), DbError> {
+    if matches!(entry, Entry::Forget) {
+        for table in ["chat_lines", "chat_requests", "chat_cursors", "chat_threads"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE thread = ?1"), [thread])?;
+        }
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO chat_threads (thread) VALUES (?1)",
+        [thread],
+    )?;
+    match entry {
+        Entry::Line { line, request } => {
+            tx.execute(
+                "UPDATE chat_threads SET next = MAX(next, ?2) WHERE thread = ?1",
+                params![thread, line.id as i64],
+            )?;
+            insert_line(tx, thread, line)?;
+            // Keep the newest `THREAD_LIMIT` lines: everything older than the
+            // one that many from the end. With fewer there is no such row, the
+            // comparison is NULL, and nothing goes.
+            tx.execute(
+                "DELETE FROM chat_lines WHERE thread = ?1 AND id <
+                 (SELECT id FROM chat_lines WHERE thread = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+                params![thread, THREAD_LIMIT as i64 - 1],
+            )?;
+            if let Some(request) = request {
+                tx.execute(
+                    "INSERT OR REPLACE INTO chat_requests (thread, line, request) VALUES (?1, ?2, ?3)",
+                    params![thread, line.id as i64, request],
+                )?;
+                tx.execute(
+                    "DELETE FROM chat_requests WHERE thread = ?1 AND line <
+                     (SELECT line FROM chat_requests WHERE thread = ?1 ORDER BY line DESC LIMIT 1 OFFSET ?2)",
+                    params![thread, SEEN_LIMIT as i64 - 1],
+                )?;
+            }
+        }
+        Entry::Read { through } => {
+            tx.execute(
+                "UPDATE chat_threads SET read_through = MAX(read_through, ?2) WHERE thread = ?1",
+                params![thread, *through as i64],
+            )?;
+        }
+        Entry::Cursor {
+            daemon,
+            session,
+            through,
+        } => {
+            tx.execute(
+                "INSERT INTO chat_cursors (thread, daemon, session, through) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (thread, daemon) DO UPDATE
+                 SET session = excluded.session, through = excluded.through",
+                params![thread, daemon, session, *through as i64],
+            )?;
+        }
+        Entry::Forget => {}
+    }
+    Ok(())
+}
+
+/// Read `path`, the old log, into the tables the first time, then set it aside.
+fn import_legacy(db: &Db, path: &Path) {
+    if !path.is_file() || db.imported(IMPORT) {
+        return;
+    }
+    let old = State::replay(path);
+    match db.import_once(IMPORT, |tx| old.write_all(tx)) {
+        Ok(_) => pilus_db::retire(path),
+        Err(error) => tracing::warn!("could not import {}: {error}", path.display()),
     }
 }
 
 /// Every conversation, keyed by the peer's device ID (`#<id>` for a channel).
 pub struct Chats {
-    path: PathBuf,
+    db: Db,
     inner: Mutex<State>,
     version: AtomicU64,
 }
 
 impl Chats {
-    /// Open the store under `dir` (`chats.jsonl`).
-    pub fn open(dir: &Path) -> Self {
-        let path = dir.join("chats.jsonl");
+    /// Open the conversations in `db`, first importing `dir`'s `chats.jsonl` if
+    /// the old log is still there.
+    pub fn open(db: &Db, dir: &Path) -> Self {
+        import_legacy(db, &dir.join("chats.jsonl"));
+        let state = State::read(db).unwrap_or_else(|error| {
+            tracing::warn!("could not read the chats: {error}");
+            State::default()
+        });
         Self {
-            inner: Mutex::new(State::load(&path)),
-            path,
+            db: db.clone(),
+            inner: Mutex::new(state),
             version: AtomicU64::new(0),
         }
     }
@@ -480,43 +633,20 @@ impl Chats {
         }
     }
 
-    /// Apply `entry` to `thread` and append it to the log, so what is in memory
-    /// is always what a replay of the file gives.
+    /// Write `entry` to the tables and apply it to memory, so what is in memory
+    /// is always what a reopen gives.
     fn commit(&self, state: &mut State, thread: &str, entry: Entry) {
-        let record = Record {
+        let saved = self.db.transaction(|tx| write(tx, thread, &entry));
+        state.apply(Record {
             thread: thread.to_string(),
             entry,
-        };
-        let encoded = serde_json::to_vec(&record).map_err(std::io::Error::other);
-        state.apply(record);
-        state.records += 1;
+        });
         self.version.fetch_add(1, Ordering::Relaxed);
         // A chat that could not be saved is still in memory for this run; there
         // is nobody to tell that the window would not already show as lost data.
-        let saved = if state.records > 2 * state.live() + COMPACT_SLACK {
-            self.compact(state)
-        } else {
-            encoded.and_then(|mut line| {
-                line.push(b'\n');
-                store::append_private(&self.path, &line)
-            })
-        };
         if let Err(error) = saved {
             tracing::warn!("could not save chats: {error}");
         }
-    }
-
-    /// Rewrite the log as just what the threads hold now.
-    fn compact(&self, state: &mut State) -> std::io::Result<()> {
-        let records = state.snapshot();
-        let mut bytes = Vec::new();
-        for record in &records {
-            serde_json::to_writer(&mut bytes, record).map_err(std::io::Error::other)?;
-            bytes.push(b'\n');
-        }
-        store::replace(&self.path, &bytes)?;
-        state.records = records.len();
-        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -528,43 +658,50 @@ impl Chats {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pilus-chats-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The store on a database of its own, as a launch would open it.
+    fn reopen(dir: &Path) -> Chats {
+        Chats::open(&Db::open(&dir.join(pilus_db::FILE)).unwrap(), dir)
+    }
+
+    fn memory() -> Chats {
+        Chats::open(&Db::in_memory(), Path::new("/nonexistent"))
     }
 
     #[test]
     fn a_retried_delivery_is_one_message() {
-        let dir = scratch("retry");
-        let chats = Chats::open(&dir);
+        let chats = memory();
         assert!(chats.push_theirs("p", "hi", "r1", None, None));
         assert!(!chats.push_theirs("p", "hi", "r1", None, None));
         assert!(chats.push_theirs("p", "hi", "r2", None, None));
         assert_eq!(chats.lines("p").len(), 2);
         assert_eq!(chats.unread("p"), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn reading_clears_unread_and_my_own_lines_never_count() {
-        let dir = scratch("read");
-        let chats = Chats::open(&dir);
+        let chats = memory();
         chats.push_mine("p", "yo", None);
         assert_eq!(chats.unread_total(), 0);
         chats.push_theirs("p", "hey", "r", None, None);
         assert_eq!(chats.unread_total(), 1);
         chats.mark_read("p");
         assert_eq!(chats.unread_total(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_thread_keeps_only_its_newest_lines_and_ids_keep_growing() {
-        let dir = scratch("limit");
-        let chats = Chats::open(&dir);
+        let chats = memory();
         for n in 0..(THREAD_LIMIT + 3) {
             chats.push_mine("p", &n.to_string(), None);
         }
@@ -572,13 +709,11 @@ mod tests {
         assert_eq!(lines.len(), THREAD_LIMIT);
         assert_eq!(lines[0].text, "3");
         assert!(lines.windows(2).all(|pair| pair[0].id < pair[1].id));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_reply_keeps_its_quote_and_a_delegation_is_noted_once() {
-        let dir = scratch("reply");
-        let chats = Chats::open(&dir);
+        let chats = memory();
         let quote = Quote::of("Rina", "ship it\n  on   friday");
         assert_eq!(quote.text, "ship it on friday");
         chats.push_theirs_replying("p", "agreed", "r1", None, None, Some(&quote));
@@ -603,47 +738,40 @@ mod tests {
         assert!(line.mine && line.agent.as_deref() == Some("CoS"));
         assert_eq!(line.delegation.as_ref(), Some(&note));
         assert_eq!(chats.unread("p"), 1, "a note of ours is never unread");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn threads_survive_a_restart() {
+    fn threads_survive_a_restart_with_every_field() {
         let dir = scratch("restart");
-        Chats::open(&dir).push_theirs("p", "still here", "r", None, None);
-        let again = Chats::open(&dir);
-        assert_eq!(again.lines("p")[0].text, "still here");
+        let quote = Quote::of("Rina", "ship it");
+        let note = Delegation {
+            call: "c1".to_string(),
+            daemon: "d".to_string(),
+            conversation: "9".to_string(),
+            agent: "researcher".to_string(),
+            task: "How?".to_string(),
+        };
+        let first = reopen(&dir);
+        first.push_theirs_replying("#c", "still here", "r", Some("dev"), Some("Bot"), Some(&quote));
+        first.push_delegation("#c", "CoS", note.clone());
+        let before = first.lines("#c");
+        drop(first);
+
+        let again = reopen(&dir);
+        assert_eq!(again.lines("#c"), before);
+        assert_eq!(again.lines("#c")[0].reply.as_ref(), Some(&quote));
+        assert_eq!(again.lines("#c")[1].delegation.as_ref(), Some(&note));
         assert!(
-            !again.push_theirs("p", "still here", "r", None, None),
+            !again.push_theirs("#c", "still here", "r", None, None),
             "dedupe survives too"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn log(dir: &Path) -> String {
-        std::fs::read_to_string(dir.join("chats.jsonl")).unwrap()
-    }
-
-    #[test]
-    fn each_change_is_one_appended_record() {
-        let dir = scratch("append");
-        let chats = Chats::open(&dir);
-        chats.push_theirs("p", "hi", "r1", None, None);
-        chats.push_mine("p", "yo", None);
-        chats.mark_read("p");
-        let log = log(&dir);
-        let ops: Vec<_> = log
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["op"].clone())
-            .collect();
-        assert_eq!(ops, ["line", "line", "read"]);
-        assert!(log.lines().all(|line| line.contains("\"thread\":\"p\"")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn reading_cursors_and_forgetting_survive_a_restart() {
         let dir = scratch("replay");
-        let chats = Chats::open(&dir);
+        let chats = reopen(&dir);
         chats.push_theirs("p", "one", "r1", None, None);
         chats.push_theirs("p", "two", "r2", None, None);
         chats.mark_read("p");
@@ -656,13 +784,23 @@ mod tests {
                 through: 2,
             },
         );
+        chats.set_cursor(
+            "p",
+            "d",
+            Cursor {
+                session: "s2".to_string(),
+                through: 3,
+            },
+        );
         chats.push_mine("gone", "bye", None);
         chats.forget("gone");
+        drop(chats);
 
-        let again = Chats::open(&dir);
+        let again = reopen(&dir);
         assert_eq!(again.lines("p").len(), 3);
         assert_eq!(again.unread("p"), 1);
-        assert_eq!(again.cursor("p", "d").unwrap().session, "s");
+        let cursor = again.cursor("p", "d").unwrap();
+        assert_eq!((cursor.session.as_str(), cursor.through), ("s2", 3));
         assert!(again.lines("gone").is_empty());
         assert!(!again.push_theirs("p", "two", "r2", None, None));
         assert_eq!(again.lines("p").last().unwrap().id, 3);
@@ -670,46 +808,64 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_or_damaged_record_costs_only_itself() {
-        let dir = scratch("torn");
-        let chats = Chats::open(&dir);
-        chats.push_theirs("p", "kept", "r1", None, None);
-        let path = dir.join("chats.jsonl");
-        let mut log = std::fs::read(&path).unwrap();
-        log.extend_from_slice(b"not json\n{\"thread\":\"p\",\"op\":\"li");
-        std::fs::write(&path, log).unwrap();
-
-        let again = Chats::open(&dir);
-        assert_eq!(again.lines("p").len(), 1);
-        again.push_mine("p", "after", None);
-        let third = Chats::open(&dir);
-        assert_eq!(
-            third
-                .lines("p")
-                .iter()
-                .map(|l| l.text.as_str())
-                .collect::<Vec<_>>(),
-            ["kept", "after"],
-            "the next record is not glued onto the torn one"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_log_is_compacted_to_what_the_threads_keep() {
-        let dir = scratch("compact");
-        let chats = Chats::open(&dir);
-        let total = 2 * THREAD_LIMIT + COMPACT_SLACK + 50;
+    fn what_a_thread_trims_stays_trimmed_after_a_restart() {
+        let dir = scratch("trim");
+        let chats = reopen(&dir);
+        let total = THREAD_LIMIT + SEEN_LIMIT + 10;
         for n in 0..total {
             chats.push_theirs("p", &n.to_string(), &format!("r{n}"), None, None);
         }
-        assert!(log(&dir).lines().count() < total, "rewritten at least once");
-        let again = Chats::open(&dir);
+        drop(chats);
+
+        let again = reopen(&dir);
         let lines = again.lines("p");
         assert_eq!(lines.len(), THREAD_LIMIT);
         assert_eq!(lines.last().unwrap().text, (total - 1).to_string());
         assert_eq!(again.unread("p"), THREAD_LIMIT as u64);
         assert!(!again.push_theirs("p", "x", &format!("r{}", total - 1), None, None));
+        assert!(
+            again.push_theirs("p", "x", "r0", None, None),
+            "a request older than the last {SEEN_LIMIT} is forgotten"
+        );
+        assert_eq!(
+            again.lines("p").last().unwrap().id,
+            total as u64 + 1,
+            "ids keep growing past the trimmed ones"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_old_log_is_imported_once_and_set_aside() {
+        let dir = scratch("legacy");
+        let log = [
+            r#"{"thread":"p","op":"line","line":{"id":1,"mine":false,"text":"kept","at":5},"request":"r1"}"#,
+            "not json",
+            r#"{"thread":"p","op":"cursor","daemon":"d","session":"s","through":1}"#,
+            r#"{"thread":"gone","op":"line","line":{"id":1,"mine":true,"text":"x","at":6}}"#,
+            r#"{"thread":"gone","op":"forget"}"#,
+            r#"{"thread":"p","op":"line","line":{"id":2,"mine":true,"text":"after","at":7}}"#,
+            r#"{"thread":"p","op":"read","through":1}"#,
+            r#"{"thread":"p","op":"li"#,
+        ]
+        .join("\n");
+        std::fs::write(dir.join("chats.jsonl"), log).unwrap();
+
+        let chats = reopen(&dir);
+        let texts: Vec<_> = chats.lines("p").into_iter().map(|l| l.text).collect();
+        assert_eq!(texts, ["kept", "after"], "damaged records cost only themselves");
+        assert_eq!(chats.unread("p"), 0);
+        assert_eq!(chats.cursor("p", "d").unwrap().session, "s");
+        assert!(chats.lines("gone").is_empty());
+        assert!(!dir.join("chats.jsonl").exists());
+        assert!(dir.join("chats.jsonl.migrated").is_file());
+        drop(chats);
+
+        // A log put back is not read a second time over what has changed since.
+        std::fs::write(dir.join("chats.jsonl"), "").unwrap();
+        let again = reopen(&dir);
+        assert_eq!(again.lines("p").len(), 2);
+        assert!(!again.push_theirs("p", "kept", "r1", None, None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

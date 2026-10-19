@@ -17,13 +17,17 @@
 //! agreed to listen.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pilus_db::Db;
 use serde::{Deserialize, Serialize};
 
 use super::store;
+
+/// The document the list is kept in.
+const DOC: &str = "contacts";
 
 /// How many unanswered requests are remembered; the oldest go first, so a
 /// device that keeps knocking cannot grow the file.
@@ -90,7 +94,7 @@ struct File {
 /// The contact list and request inbox, shared between the window and the
 /// node's inbound handler.
 pub struct Directory {
-    path: PathBuf,
+    db: Db,
     inner: Mutex<File>,
     version: AtomicU64,
     /// Daemons that were refused and have not yet been told so.
@@ -98,12 +102,12 @@ pub struct Directory {
 }
 
 impl Directory {
-    /// Open the store under `dir` (`contacts.json`), starting empty if there is none.
-    pub fn open(dir: &Path) -> Self {
-        let path = dir.join("contacts.json");
+    /// Open the list in `db`, importing `dir`'s `contacts.json` the first time and
+    /// starting empty if there is neither.
+    pub fn open(db: &Db, dir: &Path) -> Self {
         Self {
-            inner: Mutex::new(store::load(&path)),
-            path,
+            inner: Mutex::new(store::load(db, DOC, &dir.join("contacts.json"))),
+            db: db.clone(),
             version: AtomicU64::new(0),
             declined: Mutex::new(BTreeSet::new()),
         }
@@ -323,7 +327,7 @@ impl Directory {
         let mut file = self.lock();
         edit(&mut file);
         self.version.fetch_add(1, Ordering::Relaxed);
-        store::save(&self.path, &*file)
+        store::save(&self.db, DOC, &*file)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, File> {
@@ -346,6 +350,8 @@ fn clean_name(name: &str, id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
@@ -355,13 +361,18 @@ mod tests {
         dir
     }
 
+    /// The store on the database that lives in `dir`, as a launch would open it.
+    fn open(dir: &Path) -> Directory {
+        Directory::open(&Db::at(dir), dir)
+    }
+
     #[test]
     fn contacts_survive_a_restart() {
         let dir = scratch("restart");
         let id = "a".repeat(64);
-        let directory = Directory::open(&dir);
+        let directory = open(&dir);
         directory.add(&id, "  Rina   P ", None).unwrap();
-        let again = Directory::open(&dir);
+        let again = open(&dir);
         assert_eq!(again.contact(&id).unwrap().name, "Rina P");
         assert!(again.is_contact(&id));
         let _ = std::fs::remove_dir_all(&dir);
@@ -371,7 +382,7 @@ mod tests {
     fn a_stranger_is_a_request_until_added_and_never_a_contact() {
         let dir = scratch("knock");
         let id = "b".repeat(64);
-        let directory = Directory::open(&dir);
+        let directory = open(&dir);
         assert!(directory.knock(&id), "the first knock is news");
         assert!(!directory.knock(&id), "the second is not");
         assert!(!directory.is_contact(&id));
@@ -386,13 +397,13 @@ mod tests {
     fn a_contact_can_be_renamed() {
         let dir = scratch("rename");
         let id = "e".repeat(64);
-        let directory = Directory::open(&dir);
+        let directory = open(&dir);
         directory
             .add(&id, "Rina", Some("ticket".to_string()))
             .unwrap();
         assert!(directory.rename(&id, "  Rina  P ").unwrap());
         assert!(!directory.rename(&"f".repeat(64), "x").unwrap());
-        let again = Directory::open(&dir).contact(&id).unwrap();
+        let again = open(&dir).contact(&id).unwrap();
         assert_eq!(again.name, "Rina P");
         assert_eq!(
             again.ticket.as_deref(),
@@ -406,7 +417,7 @@ mod tests {
     fn a_daemon_is_a_contact_only_after_the_person_accepts_and_is_never_a_person() {
         let dir = scratch("daemon");
         let id = "d".repeat(64);
-        let directory = Directory::open(&dir);
+        let directory = open(&dir);
         let (first, fresh) = directory.pair(&id, "  Researcher ", Some("ticket".to_string()));
         assert_eq!((first, fresh), (Pairing::Pending, true));
         assert_eq!(
@@ -421,7 +432,7 @@ mod tests {
         assert!(directory.requests().is_empty());
         assert!(directory.is_daemon(&id));
         assert_eq!(directory.pair(&id, "", None).0, Pairing::Accepted);
-        let kept = Directory::open(&dir).daemons();
+        let kept = open(&dir).daemons();
         assert_eq!(kept[0].name, "Researcher");
         assert_eq!(kept[0].ticket.as_deref(), Some("ticket"));
         // Nothing that admits a person admits a daemon.
@@ -434,11 +445,11 @@ mod tests {
     fn a_daemon_can_be_renamed_and_stays_a_daemon() {
         let dir = scratch("rename-daemon");
         let id = "c".repeat(64);
-        let directory = Directory::open(&dir);
+        let directory = open(&dir);
         directory.pair(&id, "Researcher", None);
         directory.accept(&id).unwrap();
         assert!(directory.rename(&id, "  Chief ").unwrap());
-        let again = Directory::open(&dir);
+        let again = open(&dir);
         assert!(again.is_daemon(&id));
         assert_eq!(again.daemons()[0].name, "Chief");
         let _ = std::fs::remove_dir_all(&dir);
@@ -448,7 +459,7 @@ mod tests {
     fn a_declined_daemon_is_told_once_and_may_ask_again() {
         let dir = scratch("decline");
         let id = "c".repeat(64);
-        let directory = Directory::open(&dir);
+        let directory = open(&dir);
         directory.pair(&id, "Researcher", None);
         directory.dismiss(&id).unwrap();
         assert!(directory.requests().is_empty());
@@ -465,7 +476,7 @@ mod tests {
     #[test]
     fn requests_are_bounded() {
         let dir = scratch("bound");
-        let directory = Directory::open(&dir);
+        let directory = open(&dir);
         for n in 0..(MAX_REQUESTS + 5) {
             directory.knock(&format!("{n:064}"));
         }
@@ -478,7 +489,7 @@ mod tests {
         let dir = scratch("broken");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("contacts.json"), "{ nope").unwrap();
-        assert!(Directory::open(&dir).contacts().is_empty());
+        assert!(open(&dir).contacts().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

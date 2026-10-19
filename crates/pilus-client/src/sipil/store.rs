@@ -1,61 +1,59 @@
-//! Small JSON files the sipil side keeps beside the settings.
+//! Small helpers the sipil stores share on top of `pilus.db`.
 //!
-//! Each store is read once and rewritten whole on every change, through a
-//! temporary file and a rename, so a crash mid-write leaves the old file rather
-//! than half of a new one. They are the app's own state, so a file that cannot
-//! be read starts the store empty instead of failing the window; the unreadable
-//! file is left where it is for the user to look at, and the next change
-//! replaces it. The conversations are the exception: `chat.rs` appends to a JSON
-//! Lines log with [`append_private`] and only rewrites it, with [`replace`], to
-//! compact it.
+//! Contacts, channels and what is remembered of the daemons are each one document
+//! in the `docs` table: read once at launch, held in memory, and replaced whole
+//! on every change inside a transaction, so a crash leaves the old document
+//! rather than half of a new one. They are the app's own state, so one that
+//! cannot be read starts the store empty instead of failing the window.
+//!
+//! Before `pilus.db` they were JSON files beside the identity key. The first
+//! open reads such a file into the database and sets it aside as
+//! `<name>.migrated` ([`pilus_db::retire`]). The conversations are not documents
+//! but tables, and `chat.rs` does its own import of `chats.jsonl`.
 
 use std::path::Path;
 
+use pilus_db::Db;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// Read `path` as `T`; a missing or unreadable file is `T::default()`.
-pub(super) fn load<T: DeserializeOwned + Default>(path: &Path) -> T {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// The document `name`, else the flat file `legacy` imported into it, else
+/// `T::default()`. A flat file that does not parse is left where it is for the
+/// person to look at, and the next change replaces nothing of it.
+pub(super) fn load<T: DeserializeOwned + Serialize + Default>(
+    db: &Db,
+    name: &str,
+    legacy: &Path,
+) -> T {
+    match db.doc::<T>(name) {
+        Ok(Some(value)) => return value,
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!("could not read {name} from the database: {error}");
+            return T::default();
+        }
+    }
+    let Some(value) = read_file::<T>(legacy) else {
+        return T::default();
+    };
+    match db.put_doc(name, &value) {
+        Ok(()) => pilus_db::retire(legacy),
+        Err(error) => tracing::warn!("could not import {}: {error}", legacy.display()),
+    }
+    value
 }
 
-/// Write `value` to `path` atomically and owner-only.
-pub(super) fn save<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
-    replace(path, &bytes)
+/// Replace the document `name` with `value`.
+pub(super) fn save<T: Serialize>(db: &Db, name: &str, value: &T) -> std::io::Result<()> {
+    db.put_doc(name, value).map_err(std::io::Error::from)
 }
 
-/// Put `bytes` at `path` atomically and owner-only, through a temporary file.
-pub(super) fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension("json.tmp");
-    write_private(&temp, bytes)?;
-    std::fs::rename(&temp, path)
-}
-
-/// Add `bytes` to the end of `path`, creating it owner-only. One `write` on an
-/// append-mode file, so a record is not interleaved with another writer's.
-pub(super) fn append_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.append(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)?.write_all(bytes)
+fn read_file<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
 /// Create `path` owner-only (`0600` on Unix) holding `bytes`, replacing any file.
+/// The identity key is written this way.
 pub(super) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();

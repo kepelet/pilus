@@ -411,7 +411,7 @@ fn run_feed(target: ConnectTarget) -> Result<()> {
 /// between the two. Uses the same engine the window drives, so a failing
 /// preview feed or a mismatched asset name shows up here first.
 fn run_check_updates(channel: Option<String>, feed_url: Option<String>) -> Result<()> {
-    let settings = crate::settings::Settings::load(&pilus_client::pilus_config_dir());
+    let settings = crate::settings::Settings::preferences(&pilus_client::pilus_config_dir());
     let mut request = crate::update::UpdateRequest::from_settings(
         &settings.update_channel,
         settings.update_feed_url.clone(),

@@ -18,8 +18,10 @@
 //!    only way to get stars and both open counts for fifty repositories in a
 //!    single request), which has no `304` but costs one point of the hourly
 //!    budget, once per lifetime.
-//! 3. **Disk survives a relaunch.** The cache lives in `github-cache.json`,
-//!    so opening the app re-shows the last lists at once and only revalidates.
+//! 3. **Disk survives a relaunch.** The cache lives in `pilus.db` (the
+//!    `github_cache` table and the rate-limit back-off), so opening the app
+//!    re-shows the last lists at once and only revalidates. The first open
+//!    reads the `github-cache.json` older versions kept and sets it aside.
 //! 4. **A limit is respected.** On a rate-limit answer the module stops
 //!    calling until GitHub says the window resets, and serves what it holds.
 //!
@@ -31,10 +33,12 @@
 //! without making a stale thread look current.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use pilus_db::Db;
+use pilus_db::rusqlite::params;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -158,7 +162,7 @@ pub struct Listing<T> {
     pub note: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Entry {
     fetched_at: u64,
     etag: String,
@@ -167,13 +171,86 @@ struct Entry {
     body: String,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+/// The cache in memory, read from `pilus.db` when the account opens. It is also
+/// the shape of the old `github-cache.json`, which is read once to import.
+#[derive(Default, Deserialize)]
 struct Store {
     #[serde(default)]
     entries: BTreeMap<String, Entry>,
     /// Unix seconds before which no call is made, after a rate-limit answer.
     #[serde(default)]
     backoff_until: u64,
+}
+
+/// The `docs` row holding [`Store::backoff_until`].
+const BACKOFF_DOC: &str = "github_backoff";
+/// Marks `github-cache.json` as read into the database.
+const IMPORT: &str = "github_cache";
+
+impl Store {
+    fn read(db: &Db) -> Self {
+        let read = || -> Result<Self, pilus_db::Error> {
+            let entries = db.with(|conn| {
+                let mut statement =
+                    conn.prepare("SELECT key, fetched_at, etag, body FROM github_cache")?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        Entry {
+                            fetched_at: row.get::<_, i64>(1)?.unsigned_abs(),
+                            etag: row.get(2)?,
+                            body: row.get(3)?,
+                        },
+                    ))
+                })?;
+                Ok(rows.collect::<Result<BTreeMap<_, _>, _>>()?)
+            })?;
+            Ok(Self {
+                entries,
+                backoff_until: db.doc(BACKOFF_DOC)?.unwrap_or(0),
+            })
+        };
+        read().unwrap_or_else(|error| {
+            tracing::warn!("could not read the GitHub cache: {error}");
+            Self::default()
+        })
+    }
+
+    /// Read `path`, the old cache file, into `db` the first time and set it
+    /// aside. It is only a cache, so one that does not parse is just skipped.
+    fn import_legacy(db: &Db, path: &Path) {
+        if !path.is_file() || db.imported(IMPORT) {
+            return;
+        }
+        let Some(old) = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
+        else {
+            return;
+        };
+        let imported = db.import_once(IMPORT, |tx| {
+            for (key, entry) in &old.entries {
+                write_entry(tx, key, entry)?;
+            }
+            pilus_db::put_doc_in(tx, BACKOFF_DOC, &old.backoff_until)
+        });
+        match imported {
+            Ok(_) => pilus_db::retire(path),
+            Err(error) => tracing::warn!("could not import {}: {error}", path.display()),
+        }
+    }
+}
+
+fn write_entry(
+    conn: &pilus_db::rusqlite::Connection,
+    key: &str,
+    entry: &Entry,
+) -> Result<(), pilus_db::Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO github_cache (key, fetched_at, etag, body) VALUES (?1, ?2, ?3, ?4)",
+        params![key, entry.fetched_at as i64, entry.etag, entry.body],
+    )?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -248,26 +325,25 @@ pub struct GhAccount {
     gh: GhRepo,
     program: String,
     store: Mutex<Store>,
-    /// Where the store persists; `None` keeps it in memory only.
-    path: Option<PathBuf>,
+    /// Where the store persists.
+    db: Db,
     ttl: Duration,
     details: Mutex<HashMap<String, (Instant, Detail)>>,
 }
 
 impl GhAccount {
-    /// An account whose cache lives in `<root>/github-cache.json`. A missing
-    /// or unreadable file starts empty.
+    /// An account whose cache lives in the `pilus.db` under `root`, importing the
+    /// `github-cache.json` there the first time. A cache that cannot be read
+    /// starts empty.
     pub fn new(root: &Path) -> Self {
-        let path = root.join("github-cache.json");
-        let store = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
+        let db = Db::at(root);
+        Store::import_legacy(&db, &root.join("github-cache.json"));
+        let store = Store::read(&db);
         Self {
             gh: GhRepo::new(None, ""),
             program: "gh".to_string(),
             store: Mutex::new(store),
-            path: Some(path),
+            db,
             ttl: TTL,
             details: Mutex::new(HashMap::new()),
         }
@@ -664,33 +740,23 @@ impl GhAccount {
 
     fn store_entry(&self, key: &str, entry: Entry) {
         if let Ok(mut store) = self.store.lock() {
+            self.persist(|conn| write_entry(conn, key, &entry));
             store.entries.insert(key.to_string(), entry);
-            self.persist(&store);
         }
     }
 
     fn stand_down(&self, until: u64) {
         if let Ok(mut store) = self.store.lock() {
             store.backoff_until = until;
-            self.persist(&store);
+            self.persist(|conn| pilus_db::put_doc_in(conn, BACKOFF_DOC, &until));
         }
     }
 
-    /// Write the store, best-effort like the app's other state. It names
-    /// private repositories, so only the owner reads it.
-    fn persist(&self, store: &Store) {
-        let Some(path) = &self.path else { return };
-        let Ok(json) = serde_json::to_string(store) else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(path, json);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    /// Write one change to the database, best-effort like the app's other state.
+    /// It names private repositories, and the database is owner-only.
+    fn persist(&self, write: impl FnOnce(&pilus_db::rusqlite::Connection) -> Result<(), pilus_db::Error>) {
+        if let Err(error) = self.db.with(write) {
+            tracing::warn!("could not save the GitHub cache: {error}");
         }
     }
 }
@@ -890,6 +956,7 @@ fn wait_words(seconds: u64) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pilus-acct-{name}-{}", std::process::id()));
@@ -1073,7 +1140,7 @@ esac"#;
         assert_eq!(saved.items[0].name, "me/app");
         reopened.repos("me", false).expect("fresh from disk");
         assert_eq!(calls(&dir).len(), 1);
-        let mode = std::fs::metadata(dir.join("github-cache.json"))
+        let mode = std::fs::metadata(dir.join(pilus_db::FILE))
             .expect("file")
             .permissions()
             .mode();

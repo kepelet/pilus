@@ -1,9 +1,9 @@
 //! The people half of the Sipil tab state: contacts, channels, the
 //! conversations in them, and the agents that join in when mentioned.
 //!
-//! Everything here is on this device's disk (`contacts.json`, `channels.json`,
-//! `chats.jsonl` under `~/.pilus/sipil`), so the lists are there before, and
-//! without, the network. The iroh node starts when something needs it: a message
+//! Everything here is on this device's disk (contacts, channels and chats in
+//! `~/.pilus/pilus.db`), so the lists are there before, and without, the
+//! network. The iroh node starts when something needs it: a message
 //! to send, a contact to add, a daemon to connect, or the person having left
 //! this pilus reachable. Like the daemon half, nothing here blocks the GUI
 //! thread: whatever touches the network runs on a worker thread and reports
@@ -101,7 +101,7 @@ pub enum Reach {
     Offline,
 }
 
-/// The files the people half reads and writes.
+/// The stores the people half reads and writes.
 pub(super) struct Stores {
     pub(super) directory: Arc<Directory>,
     pub(super) chats: Arc<Chats>,
@@ -114,16 +114,17 @@ static STORES: OnceLock<Stores> = OnceLock::new();
 static EVENTS: std::sync::Mutex<Vec<Event>> = std::sync::Mutex::new(Vec::new());
 static CHECKING: AtomicBool = AtomicBool::new(false);
 
-/// The contact list, channels and conversations. Opening them reads three small
-/// files and touches no network, so they are listed even while the node is down.
+/// The contact list, channels and conversations. Opening them reads `pilus.db`
+/// and touches no network, so they are listed even while the node is down.
 pub(super) fn stores() -> &'static Stores {
     STORES.get_or_init(|| {
         let dir = super::sipil::data_dir();
+        let db = pilus_db::Db::at(&pilus_client::pilus_config_dir());
         Stores {
-            directory: Arc::new(Directory::open(&dir)),
-            chats: Arc::new(Chats::open(&dir)),
-            channels: Arc::new(Channels::open(&dir)),
-            offline: Arc::new(Offline::open(&dir)),
+            directory: Arc::new(Directory::open(&db, &dir)),
+            chats: Arc::new(Chats::open(&db, &dir)),
+            channels: Arc::new(Channels::open(&db, &dir)),
+            offline: Arc::new(Offline::open(&db, &dir)),
         }
     })
 }
@@ -974,7 +975,7 @@ mod tests {
     fn a_reply_keeps_its_quote_and_a_handed_off_task_reads_as_the_call_it_was() {
         let dir = std::env::temp_dir().join(format!("pilus-social-note-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let directory = Directory::open(&dir);
+        let directory = Directory::open(&pilus_db::Db::in_memory(), &dir);
         let chat = Watch::Channel("0123456789abcdef".to_string());
 
         let mut answering = line(true, None, None);
@@ -1012,7 +1013,7 @@ mod tests {
     fn a_line_names_its_speaker_only_when_the_role_does_not() {
         let dir = std::env::temp_dir().join(format!("pilus-social-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let directory = Directory::open(&dir);
+        let directory = Directory::open(&pilus_db::Db::in_memory(), &dir);
         let rina = "a".repeat(64);
         directory.add(&rina, "Rina", None).unwrap();
 

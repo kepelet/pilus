@@ -6394,6 +6394,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-user-notifications",
  "pilus-client",
+ "pilus-db",
  "pilus-index",
  "pilus-protocol",
  "qrcode",
@@ -6431,11 +6432,23 @@ dependencies = [
  "iroh",
  "iroh-tickets",
  "libc",
+ "pilus-db",
  "pilus-protocol",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pilus-db"
+version = "0.3.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
  "tracing",
 ]
 

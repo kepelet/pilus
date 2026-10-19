@@ -4,11 +4,41 @@
 //! cell size in `Resize`, so pilus owns the family and size for both its chrome
 //! and the terminal grid. Update preferences live here too so both the window
 //! and `pilus --check-updates` read the same channel and feed URL.
+//!
+//! `settings.json` holds the preferences, which `pilus-agent` and
+//! `--check-updates` also read and a person may edit by hand. The state the
+//! window itself accumulates per item (where it sat, which label a session was
+//! given, which repositories are pinned, how the Sipil rows were dragged, which
+//! session it was last attached to, how wide its panes were left) is the
+//! one `ui_state` document of `pilus.db` instead (`UiState`). The fields stay
+//! on [`Settings`] so a reader does not care where they live; [`Settings::load`]
+//! fills them from the database and [`Settings::save`] writes them back there.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use pilus_db::Db;
 use serde::{Deserialize, Serialize};
+
+/// The `pilus.db` document the window state is kept in.
+const STATE_DOC: &str = "ui_state";
+
+/// The `Settings` fields that live in `pilus.db`, not in `settings.json`.
+const STATE_KEYS: [&str; 13] = [
+    "window",
+    "session_labels",
+    "session_icons",
+    "github_pinned",
+    "sipil_order",
+    "last_session",
+    "last_endpoint",
+    "right_sidebar_visible",
+    "right_sidebar_width",
+    "right_sidebar_tab",
+    "diff_list_height",
+    "diff_list_width",
+    "git_list_height",
+];
 
 /// The icons a session may take in the header, as `session_icons` values.
 pub const SESSION_ICONS: [&str; 7] = [
@@ -75,6 +105,78 @@ pub struct WindowGeometry {
     pub display: Option<String>,
 }
 
+/// The part of [`Settings`] that lives in `pilus.db` rather than `settings.json`.
+///
+/// Kept apart from the preferences because it is the window's own bookkeeping:
+/// it changes with use (a drag, a pin, a resize) and nothing else reads it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct UiState {
+    window: Option<WindowGeometry>,
+    session_labels: BTreeMap<String, String>,
+    session_icons: BTreeMap<String, String>,
+    github_pinned: Vec<String>,
+    sipil_order: Vec<String>,
+    /// Absent in a document written before these moved, which means the file
+    /// still holds them and they have not been taken yet.
+    layout: Option<Layout>,
+}
+
+/// Where the window was left: the session it was attached to and the size of its
+/// panes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct Layout {
+    last_session: Option<String>,
+    last_endpoint: Option<String>,
+    right_sidebar_visible: bool,
+    right_sidebar_width: f32,
+    right_sidebar_tab: String,
+    diff_list_height: f32,
+    diff_list_width: f32,
+    git_list_height: f32,
+}
+
+impl UiState {
+    fn of(settings: &Settings) -> Self {
+        Self {
+            window: settings.window.clone(),
+            session_labels: settings.session_labels.clone(),
+            session_icons: settings.session_icons.clone(),
+            github_pinned: settings.github_pinned.clone(),
+            sipil_order: settings.sipil_order.clone(),
+            layout: Some(Layout {
+                last_session: settings.last_session.clone(),
+                last_endpoint: settings.last_endpoint.clone(),
+                right_sidebar_visible: settings.right_sidebar_visible,
+                right_sidebar_width: settings.right_sidebar_width,
+                right_sidebar_tab: settings.right_sidebar_tab.clone(),
+                diff_list_height: settings.diff_list_height,
+                diff_list_width: settings.diff_list_width,
+                git_list_height: settings.git_list_height,
+            }),
+        }
+    }
+
+    fn put_in(self, settings: &mut Settings) {
+        settings.window = self.window;
+        settings.session_labels = self.session_labels;
+        settings.session_icons = self.session_icons;
+        settings.github_pinned = self.github_pinned;
+        settings.sipil_order = self.sipil_order;
+        if let Some(layout) = self.layout {
+            settings.last_session = layout.last_session;
+            settings.last_endpoint = layout.last_endpoint;
+            settings.right_sidebar_visible = layout.right_sidebar_visible;
+            settings.right_sidebar_width = layout.right_sidebar_width;
+            settings.right_sidebar_tab = layout.right_sidebar_tab;
+            settings.diff_list_height = layout.diff_list_height;
+            settings.diff_list_width = layout.diff_list_width;
+            settings.git_list_height = layout.git_list_height;
+        }
+    }
+}
+
 /// The font choices and update preferences a user can change.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -97,7 +199,8 @@ pub struct Settings {
     /// Show the agent list in the macOS menu bar. On by default; a no-op on
     /// other platforms.
     pub menu_bar: bool,
-    /// Frame of the main window, restored on the next launch.
+    /// Frame of the main window, restored on the next launch. Kept in
+    /// `pilus.db` (`UiState`).
     pub window: Option<WindowGeometry>,
     /// Run the host connector ("this node" remote access) while pilus is open.
     /// Off by default; the Remote Machines window toggles it.
@@ -151,7 +254,8 @@ pub struct Settings {
     /// Show the Repositories section while `github` is on.
     pub github_repositories: bool,
     /// Repositories (`owner/name`) kept in the sidebar's Repositories section
-    /// ahead of the most recent ones, in the order they were pinned.
+    /// ahead of the most recent ones, in the order they were pinned. Kept in
+    /// `pilus.db` (`UiState`).
     pub github_pinned: Vec<String>,
     /// Let other pilus windows reach this one by its device ID, and start the
     /// network side at launch. Off until the Sipil tab turns it on. Contacts
@@ -167,9 +271,11 @@ pub struct Settings {
     pub index_machines: Vec<String>,
     /// The SIPIL sidebar rows (`daemon:<id>`, `channel:<id>`, `person:<id>`) in
     /// the order the person dragged them into. A row not named here comes after
-    /// the ones that are, in the order the section would list it.
+    /// the ones that are, in the order the section would list it. Kept in
+    /// `pilus.db` (`UiState`).
     pub sipil_order: Vec<String>,
-    /// Whether the right sidebar (Changes and History tabs) is open.
+    /// Whether the right sidebar (Changes and History tabs) is open. This and the
+    /// other pane layout fields below are kept in `pilus.db` (`UiState`).
     pub right_sidebar_visible: bool,
     /// The right sidebar's width in logical pixels; 0 takes the default.
     pub right_sidebar_width: f32,
@@ -178,18 +284,20 @@ pub struct Settings {
     pub right_sidebar_tab: String,
     /// Display names for Luvus sessions, keyed by the real session name. The
     /// CLI and daemon cannot rename a session, so a label lives only here:
-    /// the session keeps its name on disk, in sockets, and in `--session`.
+    /// the session keeps its name on disk, in sockets, and in `--session`. Kept
+    /// in `pilus.db` (`UiState`).
     pub session_labels: BTreeMap<String, String>,
     /// Which of `SESSION_ICONS` stands for a session in the window's header,
-    /// keyed by the real session name. Hand-edited like `session_labels`; a
-    /// missing or unknown entry shows `DEFAULT_SESSION_ICON`.
+    /// keyed by the real session name, kept with `session_labels`; a missing or
+    /// unknown entry shows `DEFAULT_SESSION_ICON`.
     pub session_icons: BTreeMap<String, String>,
     /// The named session the window was attached to when it last closed;
-    /// `None` is the default session. The next plain launch reopens it.
+    /// `None` is the default session. The next plain launch reopens it. Kept in
+    /// `pilus.db` (`UiState`).
     pub last_session: Option<String>,
     /// The machine id that owned the surface in `last_session`; `None` is the
     /// local daemon. Machine profiles belong to a session, so a session switch
-    /// clears it.
+    /// clears it. Kept in `pilus.db` (`UiState`).
     pub last_endpoint: Option<String>,
     /// Height of the Diff's file list above the patch, in logical pixels; 0
     /// takes the default.
@@ -278,21 +386,63 @@ fn default_blur() -> f32 {
 }
 
 impl Settings {
-    /// Load `<root>/settings.json`, falling back to the defaults.
-    pub fn load(root: &Path) -> Self {
+    /// The preferences in `<root>/settings.json`, falling back to the defaults,
+    /// without the window state in `pilus.db`. For a reader that has no use for
+    /// it, such as `--check-updates`, which should not open the database.
+    pub fn preferences(root: &Path) -> Self {
         std::fs::read_to_string(path(root))
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default()
     }
 
-    /// Persist to `<root>/settings.json`, best-effort like the daemon's own
-    /// state writes.
+    /// [`Self::preferences`] with the window state from `pilus.db`. The first
+    /// time, there is none there and an older `settings.json` may still carry
+    /// it, so what the file held becomes the state.
+    pub fn load(root: &Path) -> Self {
+        let mut settings = Self::preferences(root);
+        let db = Db::at(root);
+        match db.doc::<UiState>(STATE_DOC) {
+            Ok(Some(state)) => {
+                let complete = state.layout.is_some();
+                state.put_in(&mut settings);
+                if !complete && let Err(error) = db.put_doc(STATE_DOC, &UiState::of(&settings)) {
+                    tracing::warn!("could not move the pane layout into pilus.db: {error}");
+                }
+            }
+            Ok(None) => {
+                if let Err(error) = db.put_doc(STATE_DOC, &UiState::of(&settings)) {
+                    tracing::warn!("could not move the window state into pilus.db: {error}");
+                }
+            }
+            Err(error) => tracing::warn!("could not read the window state: {error}"),
+        }
+        settings
+    }
+
+    /// Persist the preferences to `<root>/settings.json` and the window state to
+    /// `pilus.db`, best-effort like the daemon's own state writes. The state
+    /// leaves the file only once the database has it, so a database that cannot
+    /// be written never costs the person their labels and pins.
     /// Only the window writes settings; `--check-updates` reads them without
     /// the GUI feature, where this method is unused.
     #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn save(&self, root: &Path) {
-        if let Ok(text) = serde_json::to_string_pretty(self) {
+        let db = Db::at(root);
+        let kept = db.durable()
+            && db
+                .put_doc(STATE_DOC, &UiState::of(self))
+                .map_err(|error| tracing::warn!("could not save the window state: {error}"))
+                .is_ok();
+        let Ok(mut value) = serde_json::to_value(self) else {
+            return;
+        };
+        if kept && let Some(object) = value.as_object_mut() {
+            for key in STATE_KEYS {
+                object.remove(key);
+            }
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&value) {
             let _ = std::fs::create_dir_all(root);
             let path = path(root);
             let _ = std::fs::write(&path, text);
@@ -858,6 +1008,87 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_window_state_moves_into_the_database_and_out_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("pilus-ui-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        // What an older pilus wrote: preferences and state together.
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"opacity":0.5,"github_pinned":["o/a","o/b"],"session_labels":{"s":"Work"},
+                "sipil_order":["daemon:1"],"last_session":"work","right_sidebar_width":320.0,
+                "relay":{"secret":"abc"}}"#,
+        )
+        .expect("write");
+
+        let mut settings = Settings::load(&dir);
+        assert_eq!(settings.github_pinned, ["o/a", "o/b"]);
+        assert_eq!(settings.session_label("s"), "Work");
+        assert_eq!(settings.last_session.as_deref(), Some("work"));
+
+        settings.right_sidebar_visible = true;
+        settings.set_pinned("o/c", true);
+        settings.window = Some(WindowGeometry {
+            x: 1.0,
+            y: 2.0,
+            width: 800.0,
+            height: 600.0,
+            maximized: false,
+            display: None,
+        });
+        settings.save(&dir);
+
+        let text = std::fs::read_to_string(dir.join("settings.json")).expect("read");
+        let file: serde_json::Value = serde_json::from_str(&text).expect("json");
+        for key in STATE_KEYS {
+            assert!(file.get(key).is_none(), "{key} left the file");
+        }
+        assert_eq!(file["opacity"], 0.5);
+        assert_eq!(file["relay"]["secret"], "abc", "the agent's block stays");
+
+        // A hand edit that puts the old keys back does not beat the database.
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"opacity":0.75,"github_pinned":["stale/repo"]}"#,
+        )
+        .expect("write");
+        let again = Settings::load(&dir);
+        assert_eq!(again.opacity, 0.75);
+        assert_eq!(again.github_pinned, ["o/a", "o/b", "o/c"]);
+        assert_eq!(again.window.map(|w| w.width), Some(800.0));
+        assert_eq!(again.last_session.as_deref(), Some("work"));
+        assert_eq!(again.right_sidebar_width, 320.0);
+        assert!(again.right_sidebar_visible);
+        assert_eq!(Settings::preferences(&dir).github_pinned, ["stale/repo"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_state_document_from_before_the_layout_moved_takes_it_from_the_file() {
+        let dir = std::env::temp_dir().join(format!("pilus-ui-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        Db::at(&dir)
+            .put_doc(STATE_DOC, &serde_json::json!({"github_pinned": ["o/a"]}))
+            .expect("old document");
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"last_session":"work","diff_list_height":210.0}"#,
+        )
+        .expect("write");
+
+        let settings = Settings::load(&dir);
+        assert_eq!(settings.github_pinned, ["o/a"]);
+        assert_eq!(settings.last_session.as_deref(), Some("work"));
+        assert_eq!(settings.diff_list_height, 210.0);
+
+        // Now the database has them, so the file no longer decides.
+        std::fs::write(dir.join("settings.json"), r#"{"last_session":"other"}"#).expect("write");
+        assert_eq!(Settings::load(&dir).last_session.as_deref(), Some("work"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

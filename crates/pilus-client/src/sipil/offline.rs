@@ -11,22 +11,25 @@
 //!
 //! The copy is a snapshot, never a source of truth: the daemon's own transcript
 //! replaces it the moment one arrives, and nothing here is sent anywhere.
-//! Everything is held in memory and written to `offline.json` by [`flush`]
+//! Everything is held in memory and written to the `offline` document by [`flush`]
 //! (called on a timer), because a streaming answer changes the snapshot many
 //! times a second and a rewrite per change would be wasted.
 //!
 //! [`flush`]: Offline::flush
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use pilus_db::Db;
 use serde::{Deserialize, Serialize};
 
 use super::TranscriptItem;
 use super::store;
 
+/// The document the snapshots and outboxes are kept in.
+const DOC: &str = "offline";
 /// The most lines of one conversation kept.
 const LINE_LIMIT: usize = 200;
 /// The most conversations kept per daemon; the least recently seen go first.
@@ -98,17 +101,17 @@ struct State {
 
 /// The snapshots and outboxes of every daemon.
 pub struct Offline {
-    path: PathBuf,
+    db: Db,
     state: Mutex<State>,
 }
 
 impl Offline {
-    /// Read `offline.json` in `dir`; a missing or unreadable one starts empty.
-    pub fn open(dir: &Path) -> Self {
-        let path = dir.join("offline.json");
-        let file = store::load(&path);
+    /// Read what `db` holds, importing `dir`'s `offline.json` the first time; with
+    /// neither it starts empty.
+    pub fn open(db: &Db, dir: &Path) -> Self {
+        let file = store::load(db, DOC, &dir.join("offline.json"));
         Self {
-            path,
+            db: db.clone(),
             state: Mutex::new(State {
                 file,
                 dirty: false,
@@ -299,7 +302,7 @@ impl Offline {
         if !state.dirty || state.written.is_some_and(|at| at.elapsed() < WRITE_EVERY) {
             return;
         }
-        if store::save(&self.path, &state.file).is_ok() {
+        if store::save(&self.db, DOC, &state.file).is_ok() {
             state.dirty = false;
             state.written = Some(Instant::now());
         }
@@ -311,7 +314,7 @@ impl Offline {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if store::save(&self.path, &state.file).is_ok() {
+        if store::save(&self.db, DOC, &state.file).is_ok() {
             state.dirty = false;
             state.written = Some(Instant::now());
         }
@@ -320,6 +323,8 @@ impl Offline {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::sipil::ItemRole;
 
@@ -349,6 +354,11 @@ mod tests {
         dir
     }
 
+    /// The store on the database that lives in `dir`, as a launch would open it.
+    fn open(dir: &Path) -> Offline {
+        Offline::open(&Db::at(dir), dir)
+    }
+
     fn agent() -> RememberedAgent {
         RememberedAgent {
             id: "c1".to_string(),
@@ -359,13 +369,13 @@ mod tests {
     #[test]
     fn what_a_daemon_was_survives_a_restart() {
         let dir = scratch("restart");
-        let offline = Offline::open(&dir);
+        let offline = open(&dir);
         offline.remember_agent("d", "Researcher", agent());
         offline.remember_transcript("d", "c1", &lines(1..=3), true);
         offline.queue("d", "c1", "hello", "r1");
         offline.flush();
 
-        let again = Offline::open(&dir);
+        let again = open(&dir);
         assert_eq!(again.agent("d"), Some(("Researcher".to_string(), agent())));
         assert_eq!(again.transcript("d", "c1"), Some((lines(1..=3), true)));
         assert_eq!(again.queued("d", "c1").len(), 1);
@@ -375,7 +385,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_keeps_the_newest_lines_and_says_older_ones_exist() {
-        let offline = Offline::open(&scratch("limit"));
+        let offline = open(&scratch("limit"));
         offline.remember_transcript("d", "c1", &lines(1..=250), false);
         let (held, more) = offline.transcript("d", "c1").expect("kept");
         assert_eq!(held.len(), LINE_LIMIT);
@@ -385,7 +395,7 @@ mod tests {
 
     #[test]
     fn the_least_recently_seen_conversations_are_dropped() {
-        let offline = Offline::open(&scratch("prune"));
+        let offline = open(&scratch("prune"));
         for n in 0..=CONVERSATION_LIMIT {
             offline.remember_transcript("d", &format!("c{n}"), &lines(1..=1), false);
             // `seen` is in seconds; make each later than the one before.
@@ -405,7 +415,7 @@ mod tests {
 
     #[test]
     fn messages_wait_in_order_and_leave_one_by_one() {
-        let offline = Offline::open(&scratch("outbox"));
+        let offline = open(&scratch("outbox"));
         offline.queue("d", "c1", "first", "r1");
         offline.queue("d", "c2", "elsewhere", "r2");
         offline.queue("d", "c1", "second", "r3");
@@ -424,7 +434,7 @@ mod tests {
 
     #[test]
     fn a_full_outbox_refuses_rather_than_growing() {
-        let offline = Offline::open(&scratch("full"));
+        let offline = open(&scratch("full"));
         for n in 0..OUTBOX_LIMIT {
             assert!(offline.queue("d", "c1", "x", &format!("r{n}")).is_some());
         }
@@ -434,20 +444,20 @@ mod tests {
     #[test]
     fn a_forgotten_daemon_leaves_nothing_behind() {
         let dir = scratch("forget");
-        let offline = Offline::open(&dir);
+        let offline = open(&dir);
         offline.remember_agent("d", "Researcher", agent());
         offline.queue("d", "c1", "hello", "r1");
         offline.forget("d");
         assert!(offline.agent("d").is_none());
         assert!(offline.outbox("d").is_empty());
-        assert!(Offline::open(&dir).agent("d").is_none(), "and on disk");
+        assert!(open(&dir).agent("d").is_none(), "and on disk");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn writes_wait_for_the_timer_and_an_unchanged_snapshot_is_not_a_change() {
         let dir = scratch("timer");
-        let offline = Offline::open(&dir);
+        let offline = open(&dir);
         offline.remember_transcript("d", "c1", &lines(1..=2), false);
         offline.flush();
         assert!(!offline.state.lock().expect("lock").dirty);

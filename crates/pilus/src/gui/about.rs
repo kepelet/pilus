@@ -99,6 +99,20 @@ impl AboutView {
     }
 }
 
+/// How an SVG from another device is read. usvg resolves an `<image>` href that
+/// is a path by reading that file from this disk, so a logo could make the
+/// window read `/dev/zero` until it runs out of memory, or draw a private file.
+/// Only images embedded in the SVG itself (`data:` URLs) are taken.
+fn untrusted_svg_options() -> resvg::usvg::Options<'static> {
+    resvg::usvg::Options {
+        image_href_resolver: resvg::usvg::ImageHrefResolver {
+            resolve_data: resvg::usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..resvg::usvg::Options::default()
+    }
+}
+
 /// The in-app mark, rasterized once from the embedded SVG so its two-tone
 /// face survives: GPUI's `svg()` element repaints as a single-color alpha
 /// mask, which would flatten the mark into a silhouette. GPUI's image
@@ -115,7 +129,7 @@ pub(super) fn app_icon() -> Option<Arc<RenderImage>> {
 /// not an SVG or draws nothing. A sipil's logo comes from the network, so it
 /// is only ever parsed and drawn here, never fetched from or run.
 pub(super) fn rasterize(svg: &[u8], extent: u32) -> Option<Arc<RenderImage>> {
-    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default()).ok()?;
+    let tree = resvg::usvg::Tree::from_data(svg, &untrusted_svg_options()).ok()?;
     let size = tree.size();
     let scale = extent as f32 / size.width().max(size.height());
     let mut pixmap = resvg::tiny_skia::Pixmap::new(extent, extent)?;
@@ -275,5 +289,22 @@ mod tests {
             rasterize(empty.as_bytes(), 32).is_none(),
             "nothing drawn is no logo"
         );
+    }
+
+    #[test]
+    fn a_logo_cannot_reach_a_file_on_this_disk() {
+        let dir = std::env::temp_dir().join(format!("pilus-logo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let png = dir.join("private.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]))
+            .save(&png)
+            .expect("write png");
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 10 10"><image width="10" height="10" xlink:href="{}"/></svg>"#,
+            png.display()
+        );
+        let drawn = rasterize(svg.as_bytes(), 16);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(drawn.is_none(), "the file was read and drawn");
     }
 }

@@ -162,6 +162,12 @@ with only the command-line tools can build the app.
   speaks in it, and naming one there does nothing, from either side
   (`bring_in_agents`, `answer_invited` and `answer_mention` all refuse a
   `Conversation::Direct`). Leaving a channel forgets its invitations.
+- One sipil install can run several primary agents (its `role: primary`
+  blueprints, see `../sipil/src/host.ts`). Each is a daemon of its own to pilus:
+  its own device ID, contact and sidebar row, so nothing here changes for them. A
+  daemon's transcript marks a line an agent said to a primary (a coding agent's
+  report, a finished subagent, `sipil tell`, another primary's question) with
+  `speaker`, which the log draws as that agent's nick, never the person's.
 - A daemon being away does not close its agent. `pilus_client::sipil::Offline`
   (the `offline` document) keeps each daemon's primary agent, the newest
   200 lines of the 8 conversations last looked at, and an outbox. `sipil::begin`
@@ -358,6 +364,31 @@ with only the command-line tools can build the app.
   offset (`date +%z`) when the page opens. Bump `store::SCHEMA` when a table
   changes, which rebuilds the cache. The heatmap cell and ranking row are
   `style::heat_cell` and `style::rank_row`, shown in the playground.
+
+## Untrusted input and local files
+
+pilus runs outside the sandbox, so the rules below are what keep a pane, a
+daemon or a contact from reaching past what it was given.
+
+- What the daemon asks to open (`ServerMessage::OpenUrl`, from whatever runs in a
+  pane, on a remote host too) reaches the system opener only when
+  `surface::openable_url` passes it: http, https and mailto. `open` launches any
+  registered scheme, and a `file:` URL starts an application.
+- An SVG from another device (a sipil's logo) is parsed with
+  `about::untrusted_svg_options`, which resolves only `data:` images: usvg would
+  otherwise read any path an `<image>` names.
+- A remote command reaches the host's login shell, which may be fish. Quote for it
+  with `transport::quote_for_login_shell` (backslashes and quotes outside the
+  quoted runs, which `sh` and fish read alike) and quote the script's own words
+  with `git::sh_quote`; never build a remote command from unquoted input.
+- Files under `~/.pilus` are owner-only. Create one with `pilus_db::create_private`
+  and replace one with `pilus_db::write_private` (staged, synced, renamed), so a
+  crash never leaves half a file; `pilus_db::private_dir` keeps the folder `0700`.
+  A remote save is staged beside the file and copied over it only when every
+  byte arrived (`write::remote_save_script`).
+- Warnings and panics go to `~/.pilus/logs/pilus.log` (`logging.rs`, owner-only,
+  cut over at 4 MB; `PILUS_LOG=info|debug|trace`). Report trouble with `tracing`,
+  not `eprintln!`, or a bundle launched from Finder loses it.
 
 ## Idle cost
 

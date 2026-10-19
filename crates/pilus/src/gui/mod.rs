@@ -119,10 +119,10 @@ use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
 use pilus_client::{
     Agent, AgentConfig, AgentFeed, Appearance, AutomationSummary, BarWidget, ClientEvent,
     ConnectTarget, Connection, ControlClient, ControlTransport, HOME_ENV, MachineInfo, SessionInfo,
-    SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary,
-    common_git_dirs_remote, config_dir, connect_machine, expand_local, expand_remote,
-    generate_session_name, is_behind, list_machines, list_session_infos, luvus_binary,
-    pilus_config_dir, refresh_machines, split_client_socket,
+    SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary, config_dir,
+    connect_machine, expand_local, expand_remote, generate_session_name, is_behind, list_machines,
+    list_session_infos, luvus_binary, pilus_config_dir, refresh_machines, remote_home,
+    split_client_socket,
 };
 use pilus_protocol::{
     CellData, ClientMessage, FrameData, ShellDockRect, ShellSidebars, ShellWorkspace,
@@ -13935,8 +13935,9 @@ impl PilusView {
         let tx = self.home_resolve_tx.clone();
         std::thread::spawn(move || {
             let mut homes = Vec::new();
-            for (endpoint_key, target, cwds) in probes {
-                let home = common_git_dirs_remote(&target, &cwds).home;
+            // Only the home is wanted here, so no git runs in each workspace.
+            for (endpoint_key, target, _) in probes {
+                let home = remote_home(&target);
                 if !home.is_empty() {
                     homes.push((endpoint_key, home));
                 }

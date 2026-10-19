@@ -102,6 +102,20 @@ pub fn discard_worktree_changes(
     Ok(())
 }
 
+/// The remote machine's `$HOME`, empty when it cannot be read.
+///
+/// One `printf` over the shared SSH master: the daemon's workspace dirs use `~`
+/// shorthand, and only the host knows what it expands to.
+pub fn remote_home(target: &crate::transport::SshTarget) -> String {
+    let Ok(output) = target.shell_multiplexed("printf '%s' \"$HOME\"").output() else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 /// One remote batch's answers: the machine's `$HOME` plus the git common dir
 /// of each requested directory.
 ///

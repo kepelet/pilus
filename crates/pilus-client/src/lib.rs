@@ -75,7 +75,7 @@ pub use error::{Error, Result};
 pub use files::{FileChange, FileChanges, FileRow, FileTree, OpenTarget, visible_rows};
 pub use git::{
     RemoteRepos, common_git_dirs_remote, discard_worktree_changes, expand_local, expand_remote,
-    init_repository, worktree_is_dirty,
+    init_repository, remote_home, worktree_is_dirty,
 };
 pub use git_status::{CommitRef, CommitRefKind, GitCommit, GitStatus};
 pub use github::{

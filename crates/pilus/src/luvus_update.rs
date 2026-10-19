@@ -61,11 +61,13 @@ impl UpdateSource for LuvusSource {
         let stem = format!("luvus-v{version}-{triple}");
         let asset_name = format!("{stem}.tar.gz");
         let url = format!("{base}/v{version}/{asset_name}");
-        // The sidecar is `shasum -a 256` output: `<hex>  <archive name>`.
+        // The sidecar is `shasum -a 256` output: `<hex>  <archive name>`. One
+        // that is not a SHA-256 is no checksum, and the install refuses.
         let sha256 = get_string(&format!("{base}/v{version}/{stem}.sha256"))?
             .split_whitespace()
             .next()
-            .map(str::to_string);
+            .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase);
         Ok(Release {
             version,
             notes,
@@ -98,16 +100,15 @@ pub fn installed_version() -> Option<Version> {
 
 /// Build the blocking engine for a check or update.
 ///
-/// `BestEffort` is enough: the download is checked against the published
-/// sidecar whenever one exists, and the archive is served over HTTPS.
+/// It fails closed: an archive is installed only when it matches the published
+/// `.sha256`. The daemon runs every pane's shell, so a release without its
+/// checksum is not one to swap in on the strength of HTTPS alone.
 pub fn engine() -> LuvusEngine {
-    engine_with(Verification::BestEffort)
+    engine_with(Verification::Checksum)
 }
 
-/// The engine for a first install, which fails closed on a checksum mismatch.
-///
-/// An update replaces a binary the user already runs; a first install has
-/// nothing else vouching for what lands in `~/.local/bin`.
+/// The engine for a first install, which fails closed on a checksum mismatch
+/// like an update does.
 pub fn first_install_engine() -> LuvusEngine {
     engine_with(Verification::Checksum)
 }

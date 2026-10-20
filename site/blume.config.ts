@@ -39,6 +39,7 @@ export default defineConfig({
       {
         label: "Fitur utama",
         items: [
+          "/features/lightweight",
           "/features/ui",
           "/features/in-app-browser",
           "/features/port-forwarder",

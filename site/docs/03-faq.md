@@ -26,7 +26,10 @@ macOS di Apple Silicon adalah platform utama. iOS dan iPadOS lewat TestFlight. G
 
 ## Seberapa berat pilus?
 
-Targetnya sekitar 60MB RSS, dengan Metal di macOS lewat GPUI.
+Target:
+
+- 350 mCPU (150 mCPU idle)
+- ~60MB RSS
 
 ## Apakah pilus mengirim data ke GitHub atau server lain?
 

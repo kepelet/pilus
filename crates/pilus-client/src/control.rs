@@ -467,6 +467,33 @@ pub struct Agent {
     pub session_title: Option<String>,
 }
 
+/// One pane as `pane.list` reports it: where it sits and its working directory.
+///
+/// Unlike [`Agent`] this covers every pane, a plain shell included, which is
+/// how a launch checks the directory of a `terminal` it just opened.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PaneInfo {
+    pub pane: String,
+    /// 1-based tab position inside the pane's workspace.
+    pub tab: u16,
+    /// Stable workspace id; tab positions repeat across workspaces.
+    pub workspace_id: String,
+    /// The pane's working directory.
+    pub cwd: String,
+}
+
+impl PaneInfo {
+    fn from_json(value: &Value) -> Option<Self> {
+        let text = |key: &str| value.get(key).and_then(Value::as_str);
+        Some(Self {
+            pane: text("pane")?.to_string(),
+            tab: text("tab")?.parse().ok()?,
+            workspace_id: text("workspace_id").unwrap_or_default().to_string(),
+            cwd: text("cwd")?.to_string(),
+        })
+    }
+}
+
 impl Agent {
     fn from_json(value: &Value) -> Option<Self> {
         Some(Self {
@@ -725,6 +752,17 @@ impl ControlClient {
             return Err(Error::Control(format!("{code}: {message}")));
         }
         Ok(value.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Every pane of every workspace and tab, with its working directory.
+    pub fn panes(&mut self) -> Result<Vec<PaneInfo>> {
+        let result = self.request("pane.list", json!({}))?;
+        let panes = result
+            .get("panes")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        Ok(panes.iter().filter_map(PaneInfo::from_json).collect())
     }
 
     /// The current live agent sessions.

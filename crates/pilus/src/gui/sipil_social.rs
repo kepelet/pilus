@@ -27,7 +27,7 @@ use pilus_client::sipil::peer::local;
 use pilus_client::sipil::{Backoff, Policy};
 use pilus_client::sipil::{
     Channels, Chats, Contact, Conversation, Delivery, Directory, Event, ItemRole, Line, Local,
-    LocalOptions, Offline, Quote, SipilError, ToolCall, TranscriptItem, parse_target,
+    LocalOptions, Offline, Quote, SipilError, TranscriptItem, parse_target,
 };
 
 use super::sipil::{
@@ -693,28 +693,6 @@ fn item_of(directory: &Directory, watching: &Watch, line: Line) -> TranscriptIte
         (None, false) if channel => person,
         (None, _) => None,
     };
-    // A note that an agent of ours handed work off reads as the call it was.
-    if let Some(delegation) = &line.delegation {
-        return TranscriptItem {
-            id: line.id,
-            role: ItemRole::Assistant,
-            text: String::new(),
-            tools: vec!["subagent".to_string()],
-            calls: vec![ToolCall {
-                id: delegation.call.clone(),
-                name: "subagent".to_string(),
-                summary: delegation.task.clone(),
-                args: String::new(),
-                subagent: Some(delegation.subagent()),
-            }],
-            call_id: None,
-            is_error: false,
-            reply: None,
-            error: None,
-            at: Some(line.at),
-            speaker,
-        };
-    }
     TranscriptItem {
         id: line.id,
         role: if line.mine {
@@ -967,12 +945,11 @@ mod tests {
             who: who.map(str::to_string),
             agent: agent.map(str::to_string),
             reply: None,
-            delegation: None,
         }
     }
 
     #[test]
-    fn a_reply_keeps_its_quote_and_a_handed_off_task_reads_as_the_call_it_was() {
+    fn a_reply_keeps_its_quote() {
         let dir = std::env::temp_dir().join(format!("pilus-social-note-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let directory = Directory::open(&pilus_db::Db::in_memory(), &dir);
@@ -983,28 +960,6 @@ mod tests {
         assert_eq!(
             item_of(&directory, &chat, answering).reply,
             Some(Quote::of("Rina", "ship it"))
-        );
-
-        let mut note = line(true, Some("CoS"), None);
-        note.delegation = Some(pilus_client::sipil::Delegation {
-            call: "c1".to_string(),
-            daemon: "d".to_string(),
-            conversation: "9".to_string(),
-            agent: "researcher".to_string(),
-            task: "How does X work?".to_string(),
-        });
-        let item = item_of(&directory, &chat, note);
-        assert_eq!(item.role, ItemRole::Assistant);
-        assert_eq!(item.speaker.as_deref(), Some("CoS"));
-        assert!(
-            item.text.is_empty(),
-            "it is drawn as the call, not as words"
-        );
-        let subagent = item.calls[0].subagent.as_ref().unwrap();
-        assert_eq!(
-            (subagent.conversation.as_deref(), subagent.daemon.as_deref()),
-            (Some("9"), Some("d")),
-            "it names the daemon, since the open conversation is a channel"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

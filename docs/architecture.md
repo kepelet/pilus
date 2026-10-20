@@ -738,16 +738,29 @@ running a POSIX script). Opening focuses the new workspace on the Mac: `workspac
 has no no-focus option, unlike `task.start`.
 
 `hub.run` (operate only) starts an agent in a workspace and gives it a prompt, in one
-request: the same steps as the window's launcher (`workspace.open` to focus it, reuse
-the idle pane, `agent.start`, `agent.prompt`) on a single control connection, with one
-audit line (`hub.run`; the prompt is never logged). The agent gets an alias of its own
-(`phone-<kind>-<workspace tail>`), and a later `hub.run` for the same kind and workspace
-prompts that agent instead of starting another. The alias is what finds it, because
-Luvus can label a process as a different kind (a Pi pane reads as `opencode`). It
-focuses the workspace on the Mac, since an agent spawns beside the focused pane.
+request: the same steps as the window's launcher (`workspace.open` to focus it, then a
+new tab, its idle pane, `agent.start`, `agent.prompt`) on a single control connection,
+with one audit line (`hub.run`; the prompt is never logged). Every call starts a new
+agent in a new tab (since `8cba086`, "hub.run opens a new tab per session"); it does not
+find an earlier one. The agent gets an alias of its own, `phone-<kind>-<workspace tail>`,
+with `-2`, `-3` added when that name is already taken, so the name finds it later where
+the kind cannot: Luvus can label a process as a different kind (a Pi pane reads as
+`opencode`). It focuses the workspace on the Mac, since an agent spawns beside the focused
+pane. Launches on one machine take turns: Luvus has one focus, so two at once would pick
+the same name and the same pane. Luvus takes no directory for `tab.new` or `agent.start`,
+and starts a new tab in the focused pane's directory, not the workspace's, so the hub
+reads the pane's directory back before it prompts anything. If it is not `path`, the call
+fails with `wrong_directory`, nothing is typed, and the tab it opened is closed (a tab
+that holds anything else is left alone). The same check covers `terminal`. `path` is
+compared as given (and resolved first on the local machine), so it should be absolute.
 `model` and `effort` params resolve to launch flags on the machine that owns the
 catalog (`AgentConfig::launch_args`), so a kind without one launches on its
-defaults. `terminal` is the one **pseudo-kind**: instead of `agent.start` it
+defaults. `args` adds verbatim launch flags after those (at most 32 single lines of
+500 bytes, passed as an argument list, never through a shell); an operate device
+can already start any agent, so they grant nothing new. `hub.run` may take two
+minutes, not the usual 25 seconds, because `agent.start` answers only once the
+agent is up: timing out sooner would drop the reply of a launch that carries on,
+and a retry under the same key would start the agent twice. `terminal` is the one **pseudo-kind**: instead of `agent.start` it
 opens a fresh shell tab in the workspace and types the prompt through
 `pane.send_input`, so a device can run plain commands without pretending a kind
 exists the daemon does not know.
@@ -787,7 +800,7 @@ sentence, rather than failing; the host needs nothing but a signed-in `gh`.
 `hub.agents` (operate only) lists the agents **installed** on a machine, for a
 picker: the same probe the window's launch composer uses (`agents::local`, or
 `agents::remote` in one SSH round trip), cached for a minute. Each entry carries
-its model catalog (`models` with names, efforts, and defaults, plus
+its model catalog (`models` with provider, id, name, efforts, and defaults, plus
 `default_model`) so a remote picker can offer models without probing the
 machine itself; kinds that report none simply hide the picker. A separate
 `pseudo_kinds` list advertises the kinds `hub.run` accepts beyond real adapters
@@ -909,7 +922,7 @@ replaced the daemon's HTTP API (revision 1), which is gone.
 - **Watching.** `watch {id}` is the one call that answers many times: the daemon
   keeps the stream open and writes one JSON object per line, `{"event": ...}` for
   each thing that happens in the conversation, then `{"result": {}}` when it ends.
-  The first event is a `snapshot`; `item`, `delta`, `live`, `status` and `subagent`
+  The first event is a `snapshot`; `item`, `delta`, `live` and `status`
   apply on top of it, and `pilus_client::sipil::Watched` is the reducer that holds
   the result. The window opens one stream for the conversation it is on
   (`gui/sipil.rs`, `stream_conversation`), reopens it when it breaks or goes silent

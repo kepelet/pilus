@@ -27,8 +27,8 @@ use pilus_db::rusqlite::{self, Transaction, params};
 use pilus_db::{Db, Error as DbError};
 use serde::{Deserialize, Serialize};
 
+use super::Quote;
 use super::store;
-use super::{Quote, Subagent};
 
 /// The most lines a thread keeps; older ones are dropped as new ones arrive.
 const THREAD_LIMIT: usize = 500;
@@ -61,44 +61,6 @@ pub struct Line {
     /// The line this one answers, quoted by whoever answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<Quote>,
-    /// For a note that one of this pilus's agents handed work to another: where
-    /// that conversation is. Kept here only. It is not said to anyone else,
-    /// since no one else could open it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delegation: Option<Delegation>,
-}
-
-/// An agent of this pilus handing work to a subagent while it answers in a
-/// conversation.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Delegation {
-    /// The tool call, which keeps one call from being noted twice.
-    pub call: String,
-    /// The daemon the subagent runs on.
-    pub daemon: String,
-    /// The subagent's conversation, to open.
-    pub conversation: String,
-    /// Who was asked: `researcher`, or `subagent`.
-    pub agent: String,
-    /// What it was asked.
-    pub task: String,
-}
-
-impl Delegation {
-    /// The note as plain text, for anything that cannot draw it as a link.
-    pub fn text(&self) -> String {
-        format!("talking with {} about “{}”", self.agent, self.task)
-    }
-
-    /// This as the subagent a transcript line carries.
-    pub fn subagent(&self) -> Subagent {
-        Subagent {
-            conversation: Some(self.conversation.clone()),
-            daemon: Some(self.daemon.clone()),
-            agent: self.agent.clone(),
-            task: self.task.clone(),
-        }
-    }
 }
 
 /// How far a sipil agent has read a conversation, and the daemon session it
@@ -241,7 +203,7 @@ impl State {
                 thread.read_through = read_through.unsigned_abs();
             }
             let mut lines = conn.prepare(
-                "SELECT thread, id, mine, text, at, who, agent, reply, delegation
+                "SELECT thread, id, mine, text, at, who, agent, reply
                  FROM chat_lines ORDER BY thread, id",
             )?;
             for row in lines.query_map([], |row| {
@@ -256,7 +218,6 @@ impl State {
                         who: row.get(5)?,
                         agent: row.get(6)?,
                         reply: json(7)?.and_then(|text| serde_json::from_str(&text).ok()),
-                        delegation: json(8)?.and_then(|text| serde_json::from_str(&text).ok()),
                     },
                 ))
             })? {
@@ -336,8 +297,8 @@ impl State {
 fn insert_line(tx: &Transaction, thread: &str, line: &Line) -> Result<(), DbError> {
     tx.execute(
         "INSERT OR REPLACE INTO chat_lines
-             (thread, id, mine, text, at, who, agent, reply, delegation)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (thread, id, mine, text, at, who, agent, reply)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             thread,
             line.id as i64,
@@ -349,9 +310,6 @@ fn insert_line(tx: &Transaction, thread: &str, line: &Line) -> Result<(), DbErro
             line.reply
                 .as_ref()
                 .and_then(|q| serde_json::to_string(q).ok()),
-            line.delegation
-                .as_ref()
-                .and_then(|d| serde_json::to_string(d).ok()),
         ],
     )?;
     Ok(())
@@ -518,36 +476,7 @@ impl Chats {
         agent: Option<&str>,
         reply: Option<&Quote>,
     ) {
-        self.push(thread, text, true, None, None, agent, reply, None);
-    }
-
-    /// Note that `agent`, one of ours, has handed work to a subagent while it
-    /// answers in `thread`. Once per call: noting it again changes nothing.
-    pub fn push_delegation(&self, thread: &str, agent: &str, delegation: Delegation) {
-        {
-            let state = self.lock();
-            let noted = state.threads.get(thread).is_some_and(|thread| {
-                thread.lines.iter().any(|line| {
-                    line.delegation
-                        .as_ref()
-                        .is_some_and(|d| d.call == delegation.call)
-                })
-            });
-            if noted {
-                return;
-            }
-        }
-        let text = delegation.text();
-        self.push(
-            thread,
-            &text,
-            true,
-            None,
-            None,
-            Some(agent),
-            None,
-            Some(delegation),
-        );
+        self.push(thread, text, true, None, None, agent, reply);
     }
 
     /// Record a line from someone else. In a channel `who` is the device that
@@ -574,16 +503,7 @@ impl Chats {
         agent: Option<&str>,
         reply: Option<&Quote>,
     ) -> bool {
-        self.push(
-            thread,
-            text,
-            false,
-            Some(request_id),
-            who,
-            agent,
-            reply,
-            None,
-        )
+        self.push(thread, text, false, Some(request_id), who, agent, reply)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -596,7 +516,6 @@ impl Chats {
         who: Option<&str>,
         agent: Option<&str>,
         reply: Option<&Quote>,
-        delegation: Option<Delegation>,
     ) -> bool {
         let mut state = self.lock();
         let current = state.threads.get(thread);
@@ -616,7 +535,6 @@ impl Chats {
                 who: who.map(str::to_string),
                 agent: agent.map(str::to_string),
                 reply: reply.cloned(),
-                delegation,
             },
             request: request.map(str::to_string),
         };
@@ -730,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_keeps_its_quote_and_a_delegation_is_noted_once() {
+    fn a_reply_keeps_its_quote() {
         let chats = memory();
         let quote = Quote::of("Rina", "ship it\n  on   friday");
         assert_eq!(quote.text, "ship it on friday");
@@ -739,36 +657,12 @@ mod tests {
         let lines = chats.lines("p");
         assert_eq!(lines[0].reply.as_ref(), Some(&quote));
         assert_eq!(lines[1].reply.as_ref(), Some(&quote));
-        assert_eq!(chats.lines("p")[0].delegation, None);
-
-        let note = Delegation {
-            call: "c1".to_string(),
-            daemon: "d".to_string(),
-            conversation: "9".to_string(),
-            agent: "researcher".to_string(),
-            task: "How does X work?".to_string(),
-        };
-        chats.push_delegation("p", "CoS", note.clone());
-        chats.push_delegation("p", "CoS", note.clone());
-        let lines = chats.lines("p");
-        assert_eq!(lines.len(), 3, "the same call is not noted twice");
-        let line = lines.last().unwrap();
-        assert!(line.mine && line.agent.as_deref() == Some("CoS"));
-        assert_eq!(line.delegation.as_ref(), Some(&note));
-        assert_eq!(chats.unread("p"), 1, "a note of ours is never unread");
     }
 
     #[test]
     fn threads_survive_a_restart_with_every_field() {
         let dir = scratch("restart");
         let quote = Quote::of("Rina", "ship it");
-        let note = Delegation {
-            call: "c1".to_string(),
-            daemon: "d".to_string(),
-            conversation: "9".to_string(),
-            agent: "researcher".to_string(),
-            task: "How?".to_string(),
-        };
         let first = reopen(&dir);
         first.push_theirs_replying(
             "#c",
@@ -778,14 +672,12 @@ mod tests {
             Some("Bot"),
             Some(&quote),
         );
-        first.push_delegation("#c", "CoS", note.clone());
         let before = first.lines("#c");
         drop(first);
 
         let again = reopen(&dir);
         assert_eq!(again.lines("#c"), before);
         assert_eq!(again.lines("#c")[0].reply.as_ref(), Some(&quote));
-        assert_eq!(again.lines("#c")[1].delegation.as_ref(), Some(&note));
         assert!(
             !again.push_theirs("#c", "still here", "r", None, None),
             "dedupe survives too"

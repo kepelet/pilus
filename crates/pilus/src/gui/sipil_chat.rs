@@ -12,11 +12,8 @@
 //! that was refused (no API key yet, say) stays there to fix and retry.
 //!
 //! Agents and sessions open here from the sidebar. A call an agent made is a
-//! line that folds open to show what it was given and what came back; one that
-//! handed work to a subagent says so ("sipil talking with researcher about …")
-//! and opens that subagent's own page, where the person can carry on with it
-//! and from which they step back. Any line of a conversation can be replied to,
-//! which quotes it above what is sent.
+//! line that folds open to show what it was given and what came back. Any line
+//! of a conversation can be replied to, which quotes it above what is sent.
 
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
@@ -29,9 +26,7 @@ use gpui::{
     AnyElement, Context, Div, Entity, Focusable, FollowMode, FontWeight, KeyDownEvent,
     ListAlignment, ListState, MouseButton, ScrollHandle, Stateful, div, img, list, prelude::*, px,
 };
-use pilus_client::sipil::{
-    Activity, ConversationRole, ItemRole, Quote, Role, RunningTool, ToolCall, TranscriptItem,
-};
+use pilus_client::sipil::{Activity, ItemRole, Quote, RunningTool, ToolCall, TranscriptItem};
 
 use super::markdown::{self, Document};
 use super::md_select::Leaves;
@@ -48,12 +43,10 @@ const OVERDRAW: f32 = 1200.0;
 /// How near the top, in rows, the first visible line must be for the older
 /// lines to be fetched, so they are in before the reader runs out.
 const OLDER_PREFETCH_ROWS: usize = 3;
-/// Width of the panel beside the log, for the subthreads and for a thread.
+/// Width of the panel beside the log, for a thread.
 const SIDE_PANEL: f32 = 340.0;
 /// Lines of a tool's result shown when its call is folded open; the rest is cut.
 const TOOL_LINES: usize = 40;
-/// Characters of a subagent's task the folded line shows.
-const TASK_PREVIEW: usize = 80;
 
 /// The page's own state: whether it is open, and what it last scrolled for.
 pub(super) struct SipilChat {
@@ -85,8 +78,6 @@ pub(super) struct SipilChat {
     open_calls: HashSet<String>,
     /// The line the next message answers.
     reply: Option<Quote>,
-    /// The subthread panel is open beside the log.
-    pub(super) subthreads_open: bool,
     /// The daemon's description of itself is open beside the log.
     pub(super) about_open: bool,
     /// The agents whose instructions are folded open in it, by profile id.
@@ -103,8 +94,6 @@ pub(super) struct SipilChat {
     /// Lines in the open thread when the panel last scrolled, so it follows a
     /// reply arriving.
     thread_len: usize,
-    /// The conversations the person stepped out of to get here, nearest last.
-    trail: Vec<Watch>,
     /// The settings the log is set in, handed to its lines.
     log_settings: RefCell<Option<Rc<RefCell<crate::settings::Settings>>>>,
 }
@@ -143,8 +132,6 @@ struct Built {
     threads: HashMap<usize, Vec<usize>>,
     /// The line whose thread each reply belongs to.
     root_of: HashMap<usize, usize>,
-    /// The conversations this one handed work to, oldest first.
-    subthreads: Vec<Subthread>,
     me: String,
     speaker: String,
     /// Columns of the nick column: the longest nick in view.
@@ -154,18 +141,6 @@ struct Built {
     /// The id of the first line that has a row, to tell when older lines were
     /// loaded in front of it.
     first_id: Option<u64>,
-}
-
-/// A conversation the open one handed work to.
-struct Subthread {
-    call: String,
-    agent: String,
-    task: String,
-    /// Where it opens, when this pilus can reach it.
-    watch: Option<Watch>,
-    /// It has not answered yet.
-    running: bool,
-    failed: bool,
 }
 
 impl SipilChat {
@@ -227,7 +202,6 @@ impl SipilChat {
             docs: RefCell::default(),
             open_calls: HashSet::new(),
             reply: None,
-            subthreads_open: false,
             about_open: false,
             open_agents: HashSet::new(),
             confirm_remove: None,
@@ -235,7 +209,6 @@ impl SipilChat {
             thread: None,
             thread_scroll: ScrollHandle::new(),
             thread_len: 0,
-            trail: Vec::new(),
             log_settings: RefCell::default(),
         }
     }
@@ -344,7 +317,6 @@ impl SipilChat {
             results,
             threads,
             root_of,
-            subthreads: subthreads(state),
             me,
             speaker: subject.speaker,
             nick_columns,
@@ -413,8 +385,6 @@ struct Subject {
     /// Who the other side's lines are from, when a line does not say.
     speaker: String,
     activity: Activity,
-    /// Started by a tool call of another conversation.
-    subagent: bool,
     /// The page is a chat with people or their agent, not a conversation on
     /// this pilus's own daemon: there is no model to show.
     peer: bool,
@@ -432,7 +402,6 @@ impl Subject {
                     title: name.clone(),
                     speaker: name,
                     activity: Activity::Idle,
-                    subagent: false,
                     peer: true,
                 };
             }
@@ -443,7 +412,6 @@ impl Subject {
                     title: format!("#{name}"),
                     speaker: String::new(),
                     activity: Activity::Idle,
-                    subagent: false,
                     peer: true,
                 };
             }
@@ -455,17 +423,11 @@ impl Subject {
             Watch::On(_, id) => Some(id.as_str()),
             _ => None,
         };
-        // What the daemon says this conversation is, which the lists may not:
-        // a subagent of a session is in neither.
+        // What the daemon says this conversation is, which the lists may not.
         let info = state
             .watched
             .as_ref()
             .filter(|info| Some(info.id.as_str()) == id);
-        // A subagent answers under the agent it was asked to be.
-        let subagent_speaker = || {
-            info.and_then(|info| info.profile.clone())
-                .unwrap_or_else(|| "subagent".to_string())
-        };
         if let Some(agent) = daemon.and_then(|daemon| {
             daemon
                 .agents
@@ -474,13 +436,8 @@ impl Subject {
         }) {
             return Self {
                 title: agent.name.clone(),
-                speaker: if agent.role == Role::Primary {
-                    agent.name.clone()
-                } else {
-                    subagent_speaker()
-                },
+                speaker: agent.name.clone(),
                 activity: agent.status,
-                subagent: agent.role == Role::Subagent,
                 peer: false,
             };
         }
@@ -494,21 +451,14 @@ impl Subject {
                 title: session.title.clone(),
                 speaker: daemon_name,
                 activity: session.status,
-                subagent: false,
                 peer: false,
             };
         }
         if let Some(info) = info {
-            let subagent = info.role == ConversationRole::Subagent;
             return Self {
                 title: info.name.clone(),
-                speaker: if subagent {
-                    subagent_speaker()
-                } else {
-                    daemon_name
-                },
+                speaker: daemon_name,
                 activity: info.status,
-                subagent,
                 peer: false,
             };
         }
@@ -516,7 +466,6 @@ impl Subject {
             title: "New session".to_string(),
             speaker: daemon_name,
             activity: Activity::Idle,
-            subagent: false,
             peer: false,
         }
     }
@@ -537,7 +486,6 @@ impl PilusView {
             // conversation they were made in.
             self.sipil_chat.open_calls.clear();
             self.sipil_chat.reply = None;
-            self.sipil_chat.subthreads_open = false;
             self.sipil_chat.about_open = false;
             self.sipil_chat.open_agents.clear();
             self.sipil_chat.confirm_remove = None;
@@ -549,32 +497,12 @@ impl PilusView {
                 .thread_input
                 .update(cx, |input, cx| input.clear(cx));
             self.sipil_chat.thread_len = 0;
-            self.sipil_chat.trail.clear();
             // The list starts over at the end of the conversation it opens on.
             self.sipil_chat.synced = None;
             self.sipil_chat.built.watch = Watch::Off;
             sipil::watch(watch);
         }
         cx.notify();
-    }
-
-    /// Open `watch`, a conversation the open one handed work to, remembering the
-    /// way back.
-    fn step_into_sipil(&mut self, watch: Watch, cx: &mut Context<Self>) {
-        let from = self.sipil.watch.clone();
-        let mut trail = std::mem::take(&mut self.sipil_chat.trail);
-        trail.push(from);
-        self.open_sipil_chat(watch, cx);
-        self.sipil_chat.trail = trail;
-    }
-
-    /// Go back to the conversation the open one was stepped into from.
-    fn step_back_sipil(&mut self, cx: &mut Context<Self>) {
-        let mut trail = std::mem::take(&mut self.sipil_chat.trail);
-        if let Some(watch) = trail.pop() {
-            self.open_sipil_chat(watch, cx);
-            self.sipil_chat.trail = trail;
-        }
     }
 
     /// Start a reply to the line `id`, quoting `quote`: the reply goes in that
@@ -592,7 +520,6 @@ impl PilusView {
         self.sipil_chat.in_thread = true;
         self.sipil_chat.reply = Some(quote);
         self.sipil_chat.thread_len = usize::MAX;
-        self.sipil_chat.subthreads_open = false;
         cx.notify();
     }
 
@@ -714,14 +641,12 @@ impl PilusView {
             return;
         }
         match key {
-            // Escape undoes the nearest thing: a reply being made, a step into
-            // a subagent, and last the page.
+            // Escape undoes the nearest thing: a reply being made, and last the page.
             "escape" if self.sipil_chat.thread.is_some() => self.close_thread(cx),
             "escape" if self.sipil_chat.reply.is_some() => {
                 self.sipil_chat.reply = None;
                 cx.notify();
             }
-            "escape" if !self.sipil_chat.trail.is_empty() => self.step_back_sipil(cx),
             "escape" => {
                 self.close_sipil_chat();
                 cx.notify();
@@ -830,22 +755,6 @@ impl PilusView {
                     .flex()
                     .flex_row()
                     .gap_3()
-                    .children((!self.sipil_chat.trail.is_empty()).then(|| {
-                        style::icon_button(
-                            "pilus-sipil-chat-back",
-                            include_bytes!("../../assets/icons/chevron-left.svg"),
-                            ButtonKind::Ghost,
-                            theme,
-                            18.0,
-                        )
-                        .tooltip(row_tooltip(
-                            "Back".to_string(),
-                            theme.panel_fg,
-                            Vec::new(),
-                            theme,
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| this.step_back_sipil(cx)))
-                    }))
                     .children(logo)
                     .child(
                         div()
@@ -863,7 +772,6 @@ impl PilusView {
                     .flex_shrink_0()
                     .gap_2()
                     .child(status)
-                    .children(self.subthreads_toggle(cx))
                     .children(self.about_toggle(cx)),
             );
 
@@ -877,8 +785,6 @@ impl PilusView {
                 "-- Nothing here yet. Say something, or mention an agent with @name."
             } else if subject.peer {
                 "-- No messages yet. Say hello."
-            } else if subject.subagent {
-                "-- This subagent has not said anything yet. Write to it to carry on."
             } else {
                 "-- Say something to start."
             }
@@ -1043,8 +949,6 @@ impl PilusView {
             body = body.child(self.contact_panel(fonts, cx));
         } else if self.sipil_chat.about_open && self.about_of_watched().is_some() {
             body = body.child(self.about_panel(fonts, cx));
-        } else if self.sipil_chat.subthreads_open && !self.sipil_chat.built.subthreads.is_empty() {
-            body = body.child(self.subthread_panel(fonts, cx));
         }
         div()
             .flex()
@@ -1101,8 +1005,7 @@ impl PilusView {
             ))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.sipil_chat.about_open = !this.sipil_chat.about_open;
-                // It shares the side with the subthreads and a thread.
-                this.sipil_chat.subthreads_open = false;
+                // It shares the side with a thread.
                 if this.sipil_chat.thread.take().is_some() {
                     this.sipil_chat.reply = None;
                 }
@@ -1857,26 +1760,12 @@ impl PilusView {
                 .border_color(theme.border)
                 .radius_md()
                 .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(nick_color(theme, &agent.name))
-                                .child(agent.name.clone()),
-                        )
-                        .child(style::chip(
-                            theme,
-                            if agent.role == Role::Primary {
-                                "primary"
-                            } else {
-                                "subagent"
-                            },
-                            fonts.label,
-                        )),
+                    div().flex().flex_row().items_center().gap_2().child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(nick_color(theme, &agent.name))
+                            .child(agent.name.clone()),
+                    ),
                 );
             if !agent.summary.is_empty() {
                 card = card.child(div().text_color(theme.muted).child(agent.summary.clone()));
@@ -1968,64 +1857,6 @@ impl PilusView {
             .child(panel)
     }
 
-    /// The header's button for the subthreads, with how many there are: none
-    /// when the conversation handed no work off.
-    fn subthreads_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let theme = self.theme;
-        let count = self.sipil_chat.built.subthreads.len();
-        if count == 0 {
-            return None;
-        }
-        let open = self.sipil_chat.subthreads_open;
-        let running = self.sipil_chat.built.subthreads.iter().any(|t| t.running);
-        let button = style::icon_button(
-            "pilus-sipil-subthreads-toggle",
-            include_bytes!("../../assets/icons/list-tree.svg"),
-            if open {
-                ButtonKind::Secondary
-            } else {
-                ButtonKind::Ghost
-            },
-            theme,
-            18.0,
-        )
-        .tooltip(row_tooltip(
-            if open {
-                "Hide subthreads".to_string()
-            } else {
-                "Show subthreads".to_string()
-            },
-            theme.panel_fg,
-            Vec::new(),
-            theme,
-        ))
-        .on_click(cx.listener(|this, _, _, cx| {
-            // The list replaces a thread that is open.
-            if this.sipil_chat.thread.take().is_some() {
-                this.sipil_chat.reply = None;
-                this.sipil_chat.subthreads_open = true;
-            } else {
-                this.sipil_chat.subthreads_open = !this.sipil_chat.subthreads_open;
-            }
-            this.sipil_chat.about_open = false;
-            cx.notify();
-        }));
-        Some(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .child(button)
-                .child(
-                    div()
-                        .text_size(px(self.chrome_font()))
-                        .text_color(if running { theme.accent } else { theme.muted })
-                        .child(count.to_string()),
-                )
-                .into_any_element(),
-        )
-    }
     /// A thread, beside the log: the line, and the replies to it, which are
     /// drawn here and not in the log. A message sent while it is open is one
     /// more reply.
@@ -2168,111 +1999,6 @@ impl PilusView {
                 }),
             )
             .child(input)
-    }
-
-    /// The conversations this one handed work to, beside the log: what each was
-    /// asked and how it is going, a click away from its own page.
-    fn subthread_panel(&self, fonts: style::Fonts, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let mono = style::mono_family(&self.shared_settings);
-        let threads = &self.sipil_chat.built.subthreads;
-        let daemon = self.sipil.watched_daemon();
-        let mut rows = div()
-            .id("pilus-sipil-subthreads-scroll")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_y_scroll();
-        for thread in threads {
-            // What the daemon says the child is doing, when it lists it; else
-            // it is running until it has answered.
-            let working = thread.running
-                || thread.watch.as_ref().is_some_and(|watch| {
-                    daemon.is_some_and(|daemon| {
-                        daemon.agents.iter().any(|agent| {
-                            matches!(watch, Watch::On(_, id) if *id == agent.id)
-                                && agent.status == Activity::Working
-                        })
-                    })
-                });
-            let lead = if working {
-                style::spinner(
-                    format!("pilus-sipil-subthread-{}-spinner", thread.call),
-                    14.0,
-                    theme.muted,
-                )
-                .into_any_element()
-            } else if thread.failed {
-                icon(
-                    include_bytes!("../../assets/icons/circle-alert.svg"),
-                    14.0,
-                    theme.alert,
-                )
-                .into_any_element()
-            } else {
-                icon(
-                    include_bytes!("../../assets/icons/circle-check.svg"),
-                    14.0,
-                    theme.muted,
-                )
-                .into_any_element()
-            };
-            let mut row = div()
-                .id(format!("pilus-sipil-subthread-{}", thread.call))
-                .flex()
-                .flex_row()
-                .items_start()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .text_color(theme.muted)
-                .child(div().w(px(14.0)).flex_shrink_0().pt(px(2.0)).child(lead))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(nick_color(theme, &thread.agent))
-                                .child(thread.agent.clone()),
-                        )
-                        .child(div().child(preview(&thread.task, TASK_PREVIEW))),
-                );
-            if let Some(watch) = thread.watch.clone() {
-                row = row
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme.panel_dim).text_color(theme.fg))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.step_into_sipil(watch.clone(), cx);
-                    }));
-            }
-            rows = rows.child(row);
-        }
-        div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .w(px(SIDE_PANEL))
-            .h_full()
-            .border_l_1()
-            .border_color(theme.border)
-            .font_family(mono)
-            .text_size(px(fonts.secondary))
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .text_size(px(fonts.label))
-                    .text_color(theme.muted)
-                    .child("SUBTHREADS"),
-            )
-            .child(rows)
     }
 
     /// One row of the log, set in the terminal's font at the width the
@@ -2530,10 +2256,9 @@ impl PilusView {
                         .and_then(|&at| self.sipil.transcript.get(at));
                     block = block.child(self.call_block(
                         call,
-                        (name, result, working && result.is_none()),
+                        (result, working && result.is_none()),
                         output_of(&self.sipil.running, &call.id),
                         fonts,
-                        settings,
                         cx,
                     ));
                 }
@@ -2553,22 +2278,19 @@ impl PilusView {
     }
 
     /// A call, folded to one line. Opened, it shows what it was given and what
-    /// came back. A call that handed work to a subagent reads "sipil talking with
-    /// researcher about “…”", and that sentence opens the subagent's page.
+    /// came back.
     fn call_block(
         &self,
         call: &ToolCall,
-        who: (&str, Option<&TranscriptItem>, bool),
+        who: (Option<&TranscriptItem>, bool),
         printed: Option<&str>,
         fonts: style::Fonts,
-        settings: &Rc<RefCell<crate::settings::Settings>>,
         cx: &mut Context<Self>,
     ) -> Div {
-        let (asker, result, running) = who;
+        let (result, running) = who;
         let theme = self.theme;
         let open = self.sipil_chat.open_calls.contains(&call.id);
         let failed = result.is_some_and(|result| result.is_error);
-        let target = self.subagent_target(call);
         let toggle = {
             let id = call.id.clone();
             cx.listener(move |this, _, _, cx| this.toggle_sipil_call(&id, cx))
@@ -2592,43 +2314,16 @@ impl PilusView {
             .cursor_pointer()
             .on_click(toggle)
             .child(div().pt(px(2.0)).child(chevron));
-        match &call.subagent {
-            Some(subagent) => {
-                let sentence = format!(
-                    "{asker} talking with {} about “{}”",
-                    subagent_label(&subagent.agent),
-                    preview(&subagent.task, TASK_PREVIEW)
-                );
-                let mut label = div()
-                    .id(format!("pilus-sipil-subagent-{}", call.id))
-                    .min_w_0()
-                    .text_color(theme.muted)
-                    .child(sentence);
-                if let Some(watch) = target.clone() {
-                    label = label
-                        .text_color(theme.accent)
-                        .cursor_pointer()
-                        .hover(|style| style.text_color(theme.fg))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.step_into_sipil(watch.clone(), cx);
-                        }));
-                }
-                head = head.child(label);
-            }
-            None => {
-                head = head.child(
-                    div()
-                        .min_w_0()
-                        .flex()
-                        .flex_row()
-                        .gap_2()
-                        .text_color(theme.muted)
-                        .child(div().flex_shrink_0().child(call.name.clone()))
-                        .child(div().min_w_0().truncate().child(call.summary.clone())),
-                );
-            }
-        }
+        head = head.child(
+            div()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .text_color(theme.muted)
+                .child(div().flex_shrink_0().child(call.name.clone()))
+                .child(div().min_w_0().truncate().child(call.summary.clone())),
+        );
         if failed {
             head = head.child(div().text_color(theme.alert).child("failed"));
         } else if running {
@@ -2672,26 +2367,16 @@ impl PilusView {
             .pl_3()
             .border_l_1()
             .border_color(theme.border);
-        let given = match &call.subagent {
-            Some(subagent) => ("task", subagent.task.clone()),
-            None => ("arguments", call.args.clone()),
-        };
-        if !given.1.is_empty() {
+        if !call.args.is_empty() {
             body = body.child(section(
-                given.0,
+                "arguments",
                 div()
                     .text_color(theme.muted)
-                    .child(clip_lines(&given.1, TOOL_LINES))
+                    .child(clip_lines(&call.args, TOOL_LINES))
                     .into_any_element(),
             ));
         }
         match result {
-            Some(result) if call.subagent.is_some() && !failed => {
-                body = body.child(section(
-                    "answer",
-                    self.chat_text(&result.text, theme.fg, fonts, settings),
-                ));
-            }
             Some(result) => {
                 body = body.child(section(
                     if failed { "error" } else { "result" },
@@ -2715,27 +2400,8 @@ impl PilusView {
             }
             None => {}
         }
-        if let Some(watch) = target {
-            body = body.child(
-                div()
-                    .id(format!("pilus-sipil-open-{}", call.id))
-                    .cursor_pointer()
-                    .text_color(theme.accent)
-                    .hover(|style| style.text_color(theme.fg))
-                    .child("Open the conversation →")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.step_into_sipil(watch.clone(), cx);
-                    })),
-            );
-        }
         block = block.child(body);
         block
-    }
-
-    /// The conversation a `subagent` call can be followed into, when this pilus
-    /// can reach it: the daemon it ran on is connected, and the call says where.
-    fn subagent_target(&self, call: &ToolCall) -> Option<Watch> {
-        follow(&self.sipil, call)
     }
 
     /// The line a reply answers, above what was said: who said it and the start of it.
@@ -2882,20 +2548,6 @@ fn known_calls(items: &[TranscriptItem]) -> HashSet<&str> {
         .collect()
 }
 
-/// The conversation a `subagent` call can be followed into from the state `state`
-/// is in, if it can: the call names the conversation, and the daemon it ran on is
-/// connected. A call read from a contact's agent names none, so it is never a link.
-fn follow(state: &SipilState, call: &ToolCall) -> Option<Watch> {
-    let subagent = call.subagent.as_ref()?;
-    let conversation = subagent.conversation.clone()?;
-    let daemon = subagent
-        .daemon
-        .as_deref()
-        .or_else(|| state.watch.daemon())?;
-    state.daemon(daemon).filter(|found| found.connected())?;
-    Some(Watch::On(daemon.to_string(), conversation))
-}
-
 /// A digest of what a row shows, so the list re-measures the lines whose
 /// content changed and keeps the measure of the rest: the line itself, and
 /// for each call it made, the result drawn under it.
@@ -3008,56 +2660,6 @@ fn group_threads(
     (threads, root_of)
 }
 
-/// The conversations the open one handed work to, in the order it did, as
-/// the page lists them.
-fn subthreads(state: &SipilState) -> Vec<Subthread> {
-    let items = &state.transcript;
-    let answers: HashMap<&str, &TranscriptItem> = items
-        .iter()
-        .filter(|item| item.role == ItemRole::Tool)
-        .filter_map(|item| Some((item.call_id.as_deref()?, item)))
-        .collect();
-    items
-        .iter()
-        .flat_map(|item| item.calls.iter())
-        .filter_map(|call| {
-            let subagent = call.subagent.as_ref()?;
-            let answer = answers.get(call.id.as_str());
-            Some(Subthread {
-                call: call.id.clone(),
-                agent: if subagent.agent == "subagent" {
-                    "subagent".to_string()
-                } else {
-                    subagent.agent.clone()
-                },
-                task: subagent.task.clone(),
-                watch: follow(state, call),
-                running: answer.is_none(),
-                failed: answer.is_some_and(|answer| answer.is_error),
-            })
-        })
-        .collect()
-}
-
-/// Who a subagent call asked, as a sentence names them.
-fn subagent_label(agent: &str) -> String {
-    if agent == "subagent" {
-        "a subagent".to_string()
-    } else {
-        agent.to_string()
-    }
-}
-
-/// `text` as one line of at most `limit` characters, cut with a mark.
-fn preview(text: &str, limit: usize) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= limit {
-        return flat;
-    }
-    let cut: String = flat.chars().take(limit).collect();
-    format!("{}…", cut.trim_end())
-}
-
 /// The first `limit` lines of `text`, with a mark where the rest was cut.
 /// What a running call has printed, by the call's id.
 fn output_of<'a>(running: &'a [RunningTool], call: &str) -> Option<&'a str> {
@@ -3149,18 +2751,17 @@ fn nick_color(theme: Theme, name: &str) -> gpui::Rgba {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pilus_client::sipil::{Agent, ConversationInfo, ConversationRole, Session, ToolCall};
+    use pilus_client::sipil::{Agent, ConversationInfo, ConversationRole, Role, Session, ToolCall};
 
     use super::super::sipil::{ChannelRow, Daemon, Me, Phase};
 
-    fn agent(id: &str, name: &str, role: Role) -> Agent {
+    fn agent(id: &str, name: &str) -> Agent {
         Agent {
             id: id.to_string(),
             name: name.to_string(),
-            role,
+            role: Role::Primary,
             status: Activity::Idle,
             model: None,
-            parent_id: None,
             error: None,
         }
     }
@@ -3186,57 +2787,40 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_is_told_apart_from_the_primary_and_goes_by_the_agent_it_was_asked_to_be() {
+    fn an_agent_goes_by_its_own_name() {
         let daemon = Daemon {
-            agents: vec![
-                agent("1", "Researcher", Role::Primary),
-                agent("9", "subagent Count", Role::Subagent),
-            ],
+            agents: vec![agent("1", "Researcher"), agent("2", "Chief")],
             ..Daemon::default()
         };
-        let state = on(daemon, Watch::On("d".to_string(), "9".to_string()));
-        let child = Subject::of(&state);
-        assert!(child.subagent);
-        assert_eq!(child.speaker, "subagent");
-        let state = SipilState {
-            watch: Watch::On("d".to_string(), "1".to_string()),
-            ..state
-        };
-        let primary = Subject::of(&state);
-        assert!(!primary.subagent);
-        assert_eq!(
-            primary.speaker, "Researcher",
-            "the agent goes by its own name"
-        );
+        let state = on(daemon, Watch::On("d".to_string(), "2".to_string()));
+        let subject = Subject::of(&state);
+        assert_eq!(subject.title, "Chief");
+        assert_eq!(subject.speaker, "Chief");
     }
 
-    fn info(id: &str, role: ConversationRole, profile: Option<&str>) -> ConversationInfo {
+    fn info(id: &str) -> ConversationInfo {
         ConversationInfo {
             id: id.to_string(),
-            name: format!("subagent {id}"),
-            role,
+            name: format!("conversation {id}"),
+            role: ConversationRole::Session,
             status: Activity::Working,
             model: None,
-            parent_id: Some("7".to_string()),
-            profile: profile.map(str::to_string),
+            profile: None,
             error: None,
         }
     }
 
     #[test]
-    fn a_subagent_of_a_session_is_named_by_what_the_daemon_says_it_is() {
-        // Neither list carries it: a session's subagents are not the sidebar's business.
+    fn a_conversation_neither_list_carries_is_named_by_what_the_daemon_says_it_is() {
         let state = SipilState {
-            watched: Some(info("12", ConversationRole::Subagent, Some("researcher"))),
+            watched: Some(info("12")),
             ..on(
                 Daemon::default(),
                 Watch::On("d".to_string(), "12".to_string()),
             )
         };
         let subject = Subject::of(&state);
-        assert!(subject.subagent);
-        assert_eq!(subject.title, "subagent 12");
-        assert_eq!(subject.speaker, "researcher");
+        assert_eq!(subject.title, "conversation 12");
         assert_eq!(subject.activity, Activity::Working);
 
         // One for another conversation (the page has since moved on) is not used.
@@ -3247,53 +2831,8 @@ mod tests {
         assert_eq!(Subject::of(&stale).title, "New session");
     }
 
-    fn handed_off(conversation: Option<&str>, daemon: Option<&str>) -> ToolCall {
-        ToolCall {
-            id: "c".to_string(),
-            name: "subagent".to_string(),
-            subagent: Some(pilus_client::sipil::Subagent {
-                conversation: conversation.map(str::to_string),
-                daemon: daemon.map(str::to_string),
-                agent: "researcher".to_string(),
-                task: "How does X work?".to_string(),
-            }),
-            ..ToolCall::default()
-        }
-    }
-
     #[test]
-    fn a_handed_off_task_opens_only_where_this_pilus_can_reach_it() {
-        let state = on(
-            Daemon::default(),
-            Watch::On("d".to_string(), "7".to_string()),
-        );
-        let here = Some(Watch::On("d".to_string(), "9".to_string()));
-        // On the open conversation's daemon, or on the one the line names.
-        assert_eq!(follow(&state, &handed_off(Some("9"), None)), here);
-        let in_a_channel = SipilState {
-            watch: Watch::Channel("0123456789abcdef".to_string()),
-            ..state.clone()
-        };
-        assert_eq!(follow(&in_a_channel, &handed_off(Some("9"), None)), None);
-        assert_eq!(
-            follow(&in_a_channel, &handed_off(Some("9"), Some("d"))),
-            here
-        );
-        // A daemon that is not connected, a child not yet made, a contact's agent
-        // (which names none) and a call that handed nothing off are not links.
-        assert_eq!(
-            follow(&in_a_channel, &handed_off(Some("9"), Some("gone"))),
-            None
-        );
-        assert_eq!(follow(&state, &handed_off(None, None)), None);
-        assert_eq!(follow(&state, &ToolCall::default()), None);
-        let mut away = state;
-        away.daemons[0].phase = Phase::Off;
-        assert_eq!(follow(&away, &handed_off(Some("9"), None)), None);
-    }
-
-    #[test]
-    fn a_result_belongs_under_its_call_and_a_task_is_previewed_on_one_line() {
+    fn a_result_belongs_under_its_call() {
         let item = |id, role, call: Option<&str>, calls: &[&str]| TranscriptItem {
             id,
             role,
@@ -3324,12 +2863,6 @@ mod tests {
             !known.contains("cut-off"),
             "a result whose call is out of view keeps its own line"
         );
-
-        assert_eq!(preview("short  task", 80), "short task");
-        assert_eq!(preview("one\n  two\tthree", 80), "one two three");
-        assert_eq!(preview("abcdefghij", 5), "abcde…");
-        assert_eq!(subagent_label("subagent"), "a subagent");
-        assert_eq!(subagent_label("researcher"), "researcher");
     }
 
     fn line(id: u64, role: ItemRole, text: &str) -> TranscriptItem {
@@ -3348,11 +2881,12 @@ mod tests {
         }
     }
 
-    fn asking(id: u64, call: &str, conversation: Option<&str>) -> TranscriptItem {
+    fn asking(id: u64, call: &str) -> TranscriptItem {
         TranscriptItem {
             calls: vec![ToolCall {
                 id: call.to_string(),
-                ..handed_off(conversation, None)
+                name: "bash".to_string(),
+                ..ToolCall::default()
             }],
             ..line(id, ItemRole::Assistant, "")
         }
@@ -3367,52 +2901,8 @@ mod tests {
     }
 
     #[test]
-    fn the_subthreads_are_the_handed_off_calls_in_order_with_what_became_of_each() {
-        let mut state = on(
-            Daemon::default(),
-            Watch::On("d".to_string(), "7".to_string()),
-        );
-        assert!(
-            subthreads(&state).is_empty(),
-            "none until work is handed off"
-        );
-
-        state.transcript = vec![
-            line(1, ItemRole::User, "look into it"),
-            asking(2, "a", Some("9")),
-            answer(3, "a", false),
-            asking(4, "b", Some("10")),
-            answer(5, "b", true),
-            asking(6, "c", None),
-            TranscriptItem {
-                calls: vec![ToolCall {
-                    id: "bash".to_string(),
-                    ..ToolCall::default()
-                }],
-                ..line(7, ItemRole::Assistant, "")
-            },
-        ];
-        let found = subthreads(&state);
-        assert_eq!(
-            found.iter().map(|t| t.call.as_str()).collect::<Vec<_>>(),
-            ["a", "b", "c"],
-            "a call that handed nothing off is not one"
-        );
-        assert!(!found[0].running && !found[0].failed);
-        assert_eq!(
-            found[0].watch,
-            Some(Watch::On("d".to_string(), "9".to_string()))
-        );
-        assert!(found[1].failed);
-        assert!(
-            found[2].running && found[2].watch.is_none(),
-            "one still starting has no page to open yet"
-        );
-    }
-
-    #[test]
     fn a_row_is_re_measured_only_when_what_it_shows_changed() {
-        let items = vec![asking(1, "a", Some("9")), answer(2, "a", false)];
+        let items = vec![asking(1, "a"), answer(2, "a", false)];
         let none = HashMap::new();
         let results: HashMap<String, usize> = [("a".to_string(), 1)].into();
         let call = &items[0];
@@ -3438,7 +2928,7 @@ mod tests {
 
     #[test]
     fn a_running_call_is_re_measured_as_it_prints_and_not_for_other_calls_output() {
-        let items = vec![asking(1, "a", Some("9"))];
+        let items = vec![asking(1, "a")];
         let none = HashMap::new();
         let printing = |call: &str, text: &str| {
             vec![RunningTool {
@@ -3460,7 +2950,7 @@ mod tests {
         );
         // Once the result is in, what it printed no longer matters to the row.
         let results: HashMap<String, usize> = [("a".to_string(), 1)].into();
-        let with_result = vec![asking(1, "a", Some("9")), answer(2, "a", false)];
+        let with_result = vec![asking(1, "a"), answer(2, "a", false)];
         assert_eq!(
             signature(&with_result[0], &with_result, &results, true, 0, &[]),
             signature(
@@ -3597,7 +3087,7 @@ mod tests {
         };
         let channel = Subject::of(&state);
         assert_eq!(channel.title, "#project-x");
-        assert!(channel.peer && !channel.subagent);
+        assert!(channel.peer);
     }
 
     #[test]

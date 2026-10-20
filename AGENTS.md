@@ -166,7 +166,7 @@ with only the command-line tools can build the app.
   blueprints, see `../sipil/src/host.ts`). Each is a daemon of its own to pilus:
   its own device ID, contact and sidebar row, so nothing here changes for them. A
   daemon's transcript marks a line an agent said to a primary (a coding agent's
-  report, a finished subagent, `sipil tell`, another primary's question) with
+  report, `sipil tell`, another primary's question) with
   `speaker`, which the log draws as that agent's nick, never the person's.
 - A daemon being away does not close its agent. `pilus_client::sipil::Offline`
   (the `offline` document) keeps each daemon's primary agent, the newest
@@ -209,9 +209,10 @@ with only the command-line tools can build the app.
   `channel:<id>`, `person:<id>`); rows not named there follow in the default
   order (`move_sipil_row`, `sipil_rank`).
 - `gui/sipil.rs` owns the one shared `SipilState` and its poller; the sidebar's
-  SIPIL section draws its primary agents from the daemons' half of that snapshot
-  (a subagent has no row: it is listed in the subthread panel of the conversation
-  that handed it work), and its people and channels from `SipilState::me`. There
+  SIPIL section draws its primary agents from the daemons' half of that snapshot,
+  and its people and channels from `SipilState::me`. There is no subagent: every
+  agent of a daemon is a primary with a row of its own, and `Role` has no other
+  value. There
   is no sessions list: a daemon is talked to through its agents. `gui/sipil_social.rs` holds the people half (contacts,
   channels, mentions, presence); `gui/sipil.rs` holds the daemons and the poller. A first
   connect that fails stops and reports; a launch or a dropped connection keeps
@@ -242,16 +243,9 @@ with only the command-line tools can build the app.
   contact's thread from the chat store, and a send goes through `sipil::send`,
   A tool call is a folding line (`call_block`): closed it shows the tool and its
   summary, open the arguments and the result, which is drawn under its call by
-  `call_id` and has no line of its own while that call is in view. A `subagent`
-  call reads "<agent> talking with <researcher> about “<task>”" and that sentence
-  opens the child's page (`step_into_sipil`, with a way back: the header's back
-  button and Escape), by `Watch::On` on the daemon it ran on; a daemon not
-  connected, or a contact's agent (the relay strips the conversation id), leaves
-  it plain text. The daemon's `transcript` answers `conversation` too, which
-  names a subagent of a session that neither list carries (`SipilState::watched`).
-  In a channel or chat, `mention::answer` notes each hand-off as a `Line` with a
-  `Delegation` as it happens; that note is kept on the owner's pilus only and is
-  never sent, since nobody else could open it. A line can be replied to (the
+  `call_id` and has no line of its own while that call is in view. The daemon's
+  `transcript` answers `conversation` too, which names a conversation neither list
+  carries (`SipilState::watched`). A line can be replied to (the
   hover button): the `Quote` (who, and the start of the text) travels as `reply`
   in `chat.send` and `chan.send` and is stored with the line on both sides; to a
   daemon or a contact's agent, which have no field for one, it goes as a Markdown
@@ -287,9 +281,7 @@ with only the command-line tools can build the app.
   also opens `contact_panel` on a contact's page (name with rename, device ID,
   channels in common, remove); while the name is
   edited `SipilChat::active_input` gives the keyboard to the rename field. A header button
-  (`subthreads_toggle`, with the count) opens `subthread_panel`
-  beside the log, listing every `subagent` call of the open conversation, each
-  opening that child's page. The composer has
+  The composer has
   no status bar or `[nick]` prefix. The composer is cleared only when
   `SipilState::sent` grows, so a refused message stays to retry. A contact's page has no Stop. Never show an error as an empty line: a failed
   turn arrives as `error` on the agent, the session and the transcript line.

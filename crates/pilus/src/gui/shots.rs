@@ -746,7 +746,7 @@ pub fn run_main() -> Result<()> {
     settle(&mut cx, 8);
     capture(&mut cx, window.into(), "main-sipil")?;
     // The chat page: a conversation with every kind of line, then a refused
-    // send, a draft, and a subagent's read-only page.
+    // send and a draft.
     for (name, watch, banner) in [
         (
             "main-sipil-chat",
@@ -766,11 +766,6 @@ pub fn run_main() -> Result<()> {
         (
             "main-sipil-chat-channel",
             super::sipil::Watch::Channel("0123456789abcdef".to_string()),
-            None,
-        ),
-        (
-            "main-sipil-chat-subagent",
-            super::sipil::Watch::On(RESEARCHER.to_string(), "9".to_string()),
             None,
         ),
     ] {
@@ -907,19 +902,8 @@ pub fn run_main() -> Result<()> {
             cx.notify();
         });
     });
-    // The subthreads panel, opened from the header.
     cx.update(|app| {
         view.update(app, |view, cx| {
-            view.sipil_chat.fold_open_for_shot(&[], "", "");
-            view.sipil_chat.subthreads_open = true;
-            cx.notify();
-        });
-    });
-    settle(&mut cx, 8);
-    capture(&mut cx, window.into(), "main-sipil-chat-subthreads")?;
-    cx.update(|app| {
-        view.update(app, |view, cx| {
-            view.sipil_chat.subthreads_open = false;
             view.sipil_chat.open = false;
             view.sipil_chat.fold_open_for_shot(&[], "", "");
             cx.notify();
@@ -2400,8 +2384,8 @@ fn sipil_me_fixture() -> super::sipil::Me {
     }
 }
 
-/// sipil as the daemon would report it, for the shots: a primary agent with
-/// two subagents (one working) and three sessions.
+/// sipil as the daemon would report it, for the shots: a primary agent and
+/// three sessions.
 fn sipil_fixture(connected: bool) -> super::sipil::SipilState {
     use pilus_client::sipil::{self as client, Activity, Agent, Role, Session};
 
@@ -2425,13 +2409,12 @@ fn sipil_fixture(connected: bool) -> super::sipil::SipilState {
         provider: "opencode-go".to_string(),
         model_id: "qwen3.8-max".to_string(),
     });
-    let agent = |id: &str, name: &str, role, status, parent: Option<&str>| Agent {
+    let agent = |id: &str, name: &str, status| Agent {
         id: id.to_string(),
         name: name.to_string(),
-        role,
+        role: Role::Primary,
         status,
         model: model.clone(),
-        parent_id: parent.map(str::to_string),
         error: None,
     };
     let session = |id: &str, title: &str, status| Session {
@@ -2447,23 +2430,7 @@ fn sipil_fixture(connected: bool) -> super::sipil::SipilState {
         label: "Researcher".to_string(),
         phase: super::sipil::Phase::Connected,
         version: Some("0.1.0".to_string()),
-        agents: vec![
-            agent("1", "Researcher", Role::Primary, Activity::Working, None),
-            agent(
-                "9",
-                "subagent Count the files in src",
-                Role::Subagent,
-                Activity::Working,
-                Some("1"),
-            ),
-            agent(
-                "12",
-                "subagent Summarize the failing test",
-                Role::Subagent,
-                Activity::Idle,
-                Some("1"),
-            ),
-        ],
+        agents: vec![agent("1", "Researcher", Activity::Working)],
         sessions: vec![
             session(
                 "7",
@@ -2490,7 +2457,7 @@ fn sipil_fixture(connected: bool) -> super::sipil::SipilState {
         label: "CoS".to_string(),
         phase: super::sipil::Phase::Connected,
         version: Some("0.1.0".to_string()),
-        agents: vec![agent("1", "CoS", Role::Primary, Activity::Idle, None)],
+        agents: vec![agent("1", "CoS", Activity::Idle)],
         sessions: vec![session("3", "Plan the week", Activity::Idle)],
         ..super::sipil::Daemon::default()
     };
@@ -2506,7 +2473,7 @@ fn sipil_chat_fixture(
     watch: super::sipil::Watch,
     send_error: Option<&str>,
 ) -> super::sipil::SipilState {
-    use pilus_client::sipil::{ItemRole, Quote, Subagent, ToolCall, TranscriptItem};
+    use pilus_client::sipil::{ItemRole, Quote, ToolCall, TranscriptItem};
 
     let line = |id, role, text: &str, tools: &[&str], error: Option<&str>| TranscriptItem {
         // Mornings apart from the minute, so the log reads as a day's talk.
@@ -2528,16 +2495,6 @@ fn sipil_chat_fixture(
         name: name.to_string(),
         summary: summary.to_string(),
         args: args.to_string(),
-        subagent: None,
-    };
-    let handed_off = |id: &str, agent: &str, task: &str| ToolCall {
-        subagent: Some(Subagent {
-            conversation: Some("9".to_string()),
-            daemon: None,
-            agent: agent.to_string(),
-            task: task.to_string(),
-        }),
-        ..call(id, "subagent", task, "")
     };
     let answer = |item: TranscriptItem, call_id: &str| TranscriptItem {
         call_id: Some(call_id.to_string()),
@@ -2611,26 +2568,6 @@ fn sipil_chat_fixture(
                 )
             },
         ],
-        super::sipil::Watch::On(_, id) if id == "9" => vec![
-            line(20, ItemRole::User, "Count the files in src", &[], None),
-            TranscriptItem {
-                calls: vec![call(
-                    "c-wc",
-                    "bash",
-                    "ls src | wc -l",
-                    "{\n  \"command\": \"ls src | wc -l\"\n}",
-                )],
-                ..line(21, ItemRole::Assistant, "", &["bash"], None)
-            },
-            answer(line(22, ItemRole::Tool, "43", &[], None), "c-wc"),
-            line(
-                23,
-                ItemRole::Assistant,
-                "There are 43 files in src.",
-                &[],
-                None,
-            ),
-        ],
         _ => vec![
             line(
                 13,
@@ -2641,10 +2578,11 @@ fn sipil_chat_fixture(
             ),
             TranscriptItem {
                 calls: vec![
-                    handed_off(
+                    call(
                         "c-count",
-                        "researcher",
-                        "Count the files in src and say which one is the biggest",
+                        "bash",
+                        "ls src | wc -l",
+                        "{\n  \"command\": \"ls src | wc -l\"\n}",
                     ),
                     call(
                         "c-sizes",
@@ -2656,8 +2594,8 @@ fn sipil_chat_fixture(
                 ..line(
                     14,
                     ItemRole::Assistant,
-                    "I'll ask a subagent to count them while I look at sizes.",
-                    &["subagent", "bash"],
+                    "I'll count them while I look at sizes.",
+                    &["bash", "bash"],
                     None,
                 )
             },
@@ -2675,7 +2613,7 @@ fn sipil_chat_fixture(
                 line(
                     19,
                     ItemRole::Tool,
-                    "43 files; mod.rs is the biggest at 91244 bytes.",
+                    "43",
                     &[],
                     None,
                 ),
@@ -2812,23 +2750,12 @@ fn about_fixture() -> pilus_client::sipil::About {
                 id: "sipil".to_string(),
                 name: "Researcher".to_string(),
                 role: Role::Primary,
-                summary: "Takes a request, does the concrete work, and sends investigation to the researcher.".to_string(),
+                summary: "Takes a request, does the concrete work, and starts coding agents.".to_string(),
                 instructions: "You are Researcher, the chief of staff of a durable agent daemon.\nYou own the outcome of whatever you are asked.".to_string(),
-                tools: ["read", "write", "edit", "bash", "subagent", "create_artifacts"]
+                tools: ["read", "write", "edit", "bash", "create_artifacts"]
                     .map(str::to_string)
                     .to_vec(),
                 extensions: vec!["coding".to_string(), "artifacts".to_string()],
-            },
-            AgentDetail {
-                id: "researcher".to_string(),
-                name: "Researcher".to_string(),
-                role: Role::Subagent,
-                summary: "Finds things out and answers with cited evidence.".to_string(),
-                instructions: "You are a researcher. Report what you verified apart from what you infer.".to_string(),
-                tools: ["read", "bash", "web_fetch", "create_artifacts"]
-                    .map(str::to_string)
-                    .to_vec(),
-                extensions: vec!["coding".to_string()],
             },
         ],
         logo: Some(DAEMON_LOGO.to_string()),

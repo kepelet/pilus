@@ -177,8 +177,7 @@ fn a_device_nobody_can_find_is_unreachable() {
 fn agents_and_sessions_are_read_as_listed() {
     let script = Script::daemon(vec![
         ok(json!({"agents": [
-            {"id":"1","name":"sipil","role":"primary","status":"working","model":{"provider":"opencode-go","modelId":"kimi-k2"}},
-            {"id":"9","name":"subagent Count the files","role":"subagent","status":"idle","parentId":"1"}
+            {"id":"1","name":"sipil","role":"primary","status":"working","model":{"provider":"opencode-go","modelId":"kimi-k2"}}
         ]})),
         ok(json!({"sessions": [
             {"id":"7","title":"Say hello","status":"idle","error":"401 Unauthorized: invalid API key"}
@@ -189,7 +188,6 @@ fn agents_and_sessions_are_read_as_listed() {
     assert_eq!(agents[0].role, Role::Primary);
     assert_eq!(agents[0].status, Activity::Working);
     assert_eq!(agents[0].model.as_ref().unwrap().model_id, "kimi-k2");
-    assert_eq!(agents[1].parent_id.as_deref(), Some("1"));
     // `error` is only sent for a conversation whose latest turn failed.
     assert_eq!(agents[0].error, None);
     let sessions = sipil.sessions().unwrap();
@@ -536,7 +534,7 @@ fn the_real_daemon_asks_a_stranger_to_be_allowed_and_then_serves_it() {
                 .iter()
                 .map(|agent| (agent.id.as_str(), agent.role))
                 .collect::<Vec<_>>(),
-            [("sipil", Role::Primary), ("researcher", Role::Subagent)]
+            [("sipil", Role::Primary)]
         );
         assert!(
             about
@@ -544,7 +542,12 @@ fn the_real_daemon_asks_a_stranger_to_be_allowed_and_then_serves_it() {
                 .iter()
                 .all(|agent| !agent.instructions.is_empty())
         );
-        assert!(about.agents[1].tools.iter().any(|tool| tool == "web_fetch"));
+        assert!(
+            about.agents[0]
+                .tools
+                .iter()
+                .any(|tool| tool == "pilus_start_agent")
+        );
         assert!(
             about
                 .logo
@@ -1342,102 +1345,4 @@ fn a_reply_carries_the_line_it_answers_to_a_chat_and_to_every_member_of_a_channe
         )
         .unwrap();
     assert_eq!(b.chats().lines(a.id()).last().unwrap().reply, None);
-}
-
-/// A daemon whose agent hands work to a subagent before it answers.
-#[derive(Debug, Default)]
-struct Delegating {
-    items: Mutex<Vec<Value>>,
-}
-
-impl Service for Delegating {
-    fn handle(&self, _from: &str, method: &str, _params: Value) -> Result<Value, Failure> {
-        let mut items = self.items.lock().unwrap();
-        match method {
-            "health" => Ok(
-                json!({"name": "sipil", "kind": "daemon", "label": "CoS", "version": "0", "api": 3, "allowed": true}),
-            ),
-            "sessions.create" => Ok(json!({"id": "4", "title": "New session", "status": "idle"})),
-            "sessions" => Ok(json!({"sessions": [{"id": "4", "title": "t", "status": "idle"}]})),
-            "transcript" => Ok(json!({ "items": *items })),
-            "message" => {
-                let next = items.len() as u64 + 1;
-                items.push(json!({"id": next, "role": "user", "text": "(prompt)", "tools": []}));
-                items.push(json!({"id": next + 1, "role": "assistant", "text": "", "tools": ["subagent"],
-                    "calls": [{"id": "call-1", "name": "subagent", "summary": "How does X work?", "args": "{}",
-                        "subagent": {"conversationId": "9", "agent": "researcher", "task": "How does X work?"}}]}));
-                items.push(
-                    json!({"id": next + 2, "role": "tool", "text": "X works by Y.", "tools": [],
-                    "callId": "call-1", "name": "subagent"}),
-                );
-                items.push(json!({"id": next + 3, "role": "assistant", "text": "It works by Y.", "tools": []}));
-                Ok(json!({"submissionId": "1"}))
-            }
-            _ => Err(Failure::new("unknown_method", "no")),
-        }
-    }
-}
-
-#[test]
-fn an_agent_handing_work_off_while_answering_leaves_a_note_only_its_owner_keeps() {
-    use pilus_client::sipil::mention;
-
-    let (a, b, _c, _hb, _hc) = trio("handoff");
-    let server = node("handoff-daemon", Arc::new(Delegating::default()));
-    let cos = Sipil::with_node(a.node(), &loopback(&server.addr())).unwrap();
-    let daemon_id = cos.target().id();
-    let channel = a
-        .channels()
-        .create("team", vec![b.id().to_string()])
-        .unwrap();
-    let conversation = Conversation::Channel(channel.clone());
-    let thread = conversation.thread();
-    a.say(&conversation, "@CoS look into X", "r1", None)
-        .unwrap();
-
-    let reply = mention::answer(
-        &mention::Mention {
-            chats: a.chats(),
-            daemon: &cos,
-            daemon_id: &daemon_id,
-            agent: "CoS",
-            thread: &thread,
-            conversation: "the channel #team",
-            request_id: "m1",
-        },
-        &|_| "A".to_string(),
-    )
-    .unwrap();
-    assert_eq!(reply, "It works by Y.");
-    a.say(&conversation, &reply, "m1-reply", Some("CoS"))
-        .unwrap();
-
-    let lines = a.chats().lines(&thread);
-    let note = lines
-        .iter()
-        .find_map(|line| line.delegation.clone())
-        .expect("the hand-off is noted in the thread");
-    assert_eq!(
-        (
-            note.conversation.as_str(),
-            note.agent.as_str(),
-            note.task.as_str()
-        ),
-        ("9", "researcher", "How does X work?")
-    );
-    assert_eq!(note.daemon, daemon_id);
-    let at = |text: &str| lines.iter().position(|line| line.text == text).unwrap();
-    assert!(
-        at("@CoS look into X") < at(&note.text()) && at(&note.text()) < at("It works by Y."),
-        "the note comes between the question and the answer"
-    );
-
-    // B sees the answer but never the note: it is a link into A's daemon.
-    let theirs = b.chats().lines(&channel.thread());
-    assert!(theirs.iter().any(|line| line.text == "It works by Y."));
-    assert!(
-        theirs
-            .iter()
-            .all(|line| line.delegation.is_none() && !line.text.contains("talking with"))
-    );
 }

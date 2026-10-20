@@ -13379,7 +13379,7 @@ impl PilusView {
         self.open_sipil_chat(sipil::thread_watch(thread), cx);
     }
 
-    /// SIPIL: the primary agents (and their subagents) of every connected daemon,
+    /// SIPIL: the primary agents of every connected daemon,
     /// then the people this pilus talks to, the channels, and any agents the
     /// people share. People and
     /// channels are listed whether or not a daemon is connected, since they never
@@ -13451,13 +13451,7 @@ impl PilusView {
         // by the order the person dragged them into.
         let mut placed: Vec<(String, AnyElement)> = Vec::new();
         for daemon in &self.sipil.daemons {
-            // A subagent is not listed: it is reached from the conversation that
-            // handed it work, and listed at the top of that page.
-            let primaries: Vec<_> = daemon
-                .agents
-                .iter()
-                .filter(|agent| agent.role != pilus_client::sipil::Role::Subagent)
-                .collect();
+            let primaries: Vec<_> = daemon.agents.iter().collect();
             let key = format!("daemon:{}", daemon.id);
             if !primaries.is_empty() {
                 // Its agent, up or not: a daemon that is away still has the

@@ -14,9 +14,7 @@
 
 use std::time::{Duration, Instant};
 
-use std::collections::HashSet;
-
-use super::chat::{Chats, Cursor, Delegation, Line};
+use super::chat::{Chats, Cursor, Line};
 use super::{Activity, ItemRole, Sipil, SipilError};
 
 /// The most earlier lines an agent is shown when first mentioned.
@@ -77,8 +75,7 @@ pub fn prompt(
          Everything below was said there since you last looked. Reply to what was asked of you; \
          your reply is posted in the conversation for everyone in it, so write it to them, briefly.\n\n"
     );
-    // A note that an agent handed work off is for the person reading, not for the agent.
-    for line in lines.iter().filter(|line| line.delegation.is_none()) {
+    for line in lines {
         match &line.reply {
             Some(quote) => text.push_str(&format!(
                 "{} (replying to {}: \"{}\"): {}\n",
@@ -164,34 +161,10 @@ pub fn answer(
     );
 
     let started = Instant::now();
-    // Calls already noted in the conversation, so each is announced once.
-    let mut noted: HashSet<String> = HashSet::new();
     loop {
         std::thread::sleep(POLL);
         let items = daemon.transcript(&session)?;
         let new: Vec<_> = items.iter().filter(|item| item.id > before).collect();
-        // Said as they happen, so the person can open the subagent while it works.
-        for call in new.iter().flat_map(|item| item.calls.iter()) {
-            let Some(subagent) = &call.subagent else {
-                continue;
-            };
-            let Some(conversation) = &subagent.conversation else {
-                continue;
-            };
-            if noted.insert(call.id.clone()) {
-                chats.push_delegation(
-                    thread,
-                    agent,
-                    Delegation {
-                        call: format!("{session}/{}", call.id),
-                        daemon: daemon_id.to_string(),
-                        conversation: conversation.clone(),
-                        agent: subagent.agent.clone(),
-                        task: subagent.task.clone(),
-                    },
-                );
-            }
-        }
         let working = daemon
             .sessions()?
             .iter()
@@ -276,7 +249,6 @@ mod tests {
             who: None,
             agent: None,
             reply: None,
-            delegation: None,
         };
         let text = prompt(
             "Researcher",
@@ -293,21 +265,10 @@ mod tests {
         assert!(text.contains("You are Researcher, taking part in a chat with Rina"));
         assert!(text.contains("Rina: hi\nrizaldy: @Researcher summarise\n"));
 
-        // A reply says what it answers; a note about a handed-off task is not for the agent.
+        // A reply says what it answers.
         let mut answering = line(3, "yes");
         answering.reply = Some(Quote::of("Rina", "ship it?"));
-        let mut note = line(4, "talking with researcher about “x”");
-        note.delegation = Some(Delegation {
-            call: "c".to_string(),
-            daemon: "d".to_string(),
-            conversation: "9".to_string(),
-            agent: "researcher".to_string(),
-            task: "x".to_string(),
-        });
-        let text = prompt("CoS", "a chat", &[answering, note], &|_| {
-            "rizaldy".to_string()
-        });
+        let text = prompt("CoS", "a chat", &[answering], &|_| "rizaldy".to_string());
         assert!(text.contains("rizaldy (replying to Rina: \"ship it?\"): yes\n"));
-        assert!(!text.contains("talking with"));
     }
 }

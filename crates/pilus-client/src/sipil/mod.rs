@@ -36,7 +36,7 @@ pub mod wire;
 
 pub use backoff::{Backoff, Policy};
 pub use channels::{Channel, Channels, Learned};
-pub use chat::{Chats, Cursor, Delegation, Line};
+pub use chat::{Chats, Cursor, Line};
 pub use contacts::{Contact, Directory, Pairing, Request};
 pub use node::{CallError, Node, NodeConfig, RelayChoice, device_id};
 pub use offline::{Offline, Queued, RememberedAgent};
@@ -245,14 +245,13 @@ pub enum Activity {
     Working,
 }
 
-/// Whether an agent is the one the user talks to or one it started.
+/// What an agent is to the user. Every agent of a daemon is one the person talks
+/// to; the field stays because the daemon still sends it.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
-    /// The primary agent.
+    /// An agent the person talks to.
     Primary,
-    /// A child of another agent.
-    Subagent,
 }
 
 /// A model, as sipil names it.
@@ -265,7 +264,7 @@ pub struct ModelRef {
     pub model_id: String,
 }
 
-/// The primary agent or one of its subagents.
+/// A primary agent of a daemon.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Agent {
@@ -273,14 +272,12 @@ pub struct Agent {
     pub id: String,
     /// What to call it.
     pub name: String,
-    /// Primary or subagent.
+    /// What it is to the user.
     pub role: Role,
     /// Whether it is working.
     pub status: Activity,
     /// The model it runs, once one is chosen.
     pub model: Option<ModelRef>,
-    /// The agent that started it, for a subagent.
-    pub parent_id: Option<String>,
     /// Why its latest turn failed, until a later turn succeeds.
     #[serde(default)]
     pub error: Option<String>,
@@ -408,30 +405,6 @@ pub struct ToolCall {
     /// The arguments as JSON, cut to a readable length.
     #[serde(default)]
     pub args: String,
-    /// For the `subagent` tool: who it handed the work to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subagent: Option<Subagent>,
-}
-
-/// Work one agent handed to another.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct Subagent {
-    /// The conversation it runs in, which can be opened and talked to. Unknown
-    /// for the moment between the call starting and the child existing.
-    #[serde(
-        default,
-        rename = "conversationId",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub conversation: Option<String>,
-    /// The daemon that conversation is on, when the line does not already say:
-    /// a call told to a channel is read where its daemon is not the open one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub daemon: Option<String>,
-    /// Who was asked: `researcher`, or `subagent` for the general one.
-    pub agent: String,
-    /// What it was asked to do.
-    pub task: String,
 }
 
 /// One line of a conversation.
@@ -520,9 +493,8 @@ impl Quote {
     }
 }
 
-/// A conversation on a daemon, whichever list carries it. A subagent of a
-/// session is in neither the agents nor the sessions, so the page that opened it
-/// learns what it is from this.
+/// A conversation on a daemon, whichever list carries it, so a page learns what
+/// it opened from this.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationInfo {
@@ -537,9 +509,6 @@ pub struct ConversationInfo {
     /// The model it runs, once one is chosen.
     #[serde(default)]
     pub model: Option<ModelRef>,
-    /// The conversation that started it, for a subagent.
-    #[serde(default)]
-    pub parent_id: Option<String>,
     /// The agent it runs as, when it was started as one.
     #[serde(default)]
     pub profile: Option<String>,
@@ -556,8 +525,6 @@ pub enum ConversationRole {
     Primary,
     /// A session.
     Session,
-    /// Started by a tool call of another conversation.
-    Subagent,
 }
 
 /// A handle on one sipil daemon.
@@ -612,7 +579,7 @@ impl Sipil {
         Ok(health)
     }
 
-    /// The primary agent first, then its subagents.
+    /// The daemon's agents.
     pub fn agents(&self) -> Result<Vec<Agent>, SipilError> {
         Ok(self.call::<Agents>("agents", &json!({}))?.agents)
     }

@@ -162,7 +162,7 @@ pub struct Daemon {
     pub version: Option<String>,
     /// The last failure, for the user to read.
     pub error: Option<String>,
-    /// The primary agent, then its subagents.
+    /// The daemon's agents.
     pub agents: Vec<Agent>,
     /// The top-level conversations.
     pub sessions: Vec<Session>,
@@ -298,8 +298,7 @@ pub struct SipilState {
     /// The calls running in the watched conversation, with what each has
     /// printed. Only a daemon that streams fills it.
     pub running: Vec<RunningTool>,
-    /// What the daemon says the watched conversation is: how a subagent of a
-    /// session, which neither list carries, gets its name and its status.
+    /// What the daemon says the watched conversation is: its name and status.
     pub watched: Option<ConversationInfo>,
     /// Agents of ours that are answering a mention: the thread, then the agent.
     pub thinking: Vec<(String, String)>,
@@ -501,7 +500,6 @@ fn remembered_agent(agent: RememberedAgent) -> Agent {
         role: Role::Primary,
         status: Activity::Idle,
         model: None,
-        parent_id: None,
         error: None,
     }
 }
@@ -1995,7 +1993,6 @@ mod tests {
                 role: Role::Primary,
                 status: Activity::Idle,
                 model: None,
-                parent_id: None,
                 error: None,
             }]),
             sessions: Err(SipilError::Malformed),

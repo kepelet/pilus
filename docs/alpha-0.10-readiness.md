@@ -66,8 +66,10 @@ could not measure it: SSH to localhost needs a host-key prompt, and I left
 | `1d0fb47` | Dashboard shows unusable blueprints, each agent's blueprint and model, and the other primaries. |
 
 Try it: copy `../sipil/examples/agents/*.md` into `~/.sipil/agents/`, start sipil,
-and edit a file while it runs. `reviewer.md` is a subagent; `ops.md` is a second
-primary that will ask your pilus to add it.
+and edit a file while it runs. Every blueprint is a primary agent (there are no
+subagents any more: `role: subagent`, the `subagent` tool and the researcher are
+gone, and pilus has no subthreads panel). `ops.md` and `reviewer.md` each ask your
+pilus to add them.
 
 ## SSH and UHP
 
@@ -97,7 +99,7 @@ My recommendation: ask Luvus for the `files.*` and `git.stage/unstage/discard`
 methods first. They cover the Files and Git tabs, which are most of the remaining
 shell traffic and most of the quoting surface. Ports and transfers can stay on SSH.
 
-sipil already uses UHP only (the owner socket), never SSH.
+sipil uses UHP only, never SSH, and now only through pilus-agent's hub (below).
 
 ## Safety: what is left
 
@@ -124,10 +126,13 @@ sipil already uses UHP only (the owner socket), never SSH.
 
 ## sipil as chief of staff: what is left
 
-1. **Other machines.** sipil reaches only the Luvus on its own machine. Your CoS
-   prototype went through pilus-agent's hub and could place work on `mac-mini`.
-   Next step: a `machine` parameter on the pilus tools, through the hub as an
-   enrolled device.
+1. **Other machines: done.** sipil now reaches pilus only through pilus-agent's
+   hub, as an enrolled device (`sipil hub pair '<link from Add device>'`, at the
+   operate level), so it can run on another machine than pilus. Every pilus tool
+   takes a `machine` from `pilus_machines`. pilus-agent gained `args` on
+   `hub.run`, `provider`/`id` per model in `hub.agents`, and a two-minute limit on
+   `hub.run`. What does not follow sipil off the pilus machine: `sipil tell` (a
+   local file drop) and the chief checking `git diff` itself.
 2. **Approval gate.** The CoS prototype asked before every external write; sipil
    acts directly (you said sipil should coordinate, so I kept that). If you want a
    gate, the place is `pilus_start_agent` / `pilus_agent_send`: queue, then a

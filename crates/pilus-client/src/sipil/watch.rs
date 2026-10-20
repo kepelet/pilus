@@ -85,15 +85,6 @@ pub enum WatchEvent {
         /// Its output so far, which replaces what is held for it.
         text: String,
     },
-    /// A `subagent` call's conversation now exists.
-    Subagent {
-        /// The call.
-        #[serde(rename = "callId")]
-        call_id: String,
-        /// The conversation it started.
-        #[serde(rename = "conversationId")]
-        conversation_id: String,
-    },
     /// The daemon is still there.
     Ping,
     /// An event from a newer daemon than this pilus.
@@ -168,22 +159,6 @@ impl Watched {
                     output: text,
                 }),
             },
-            WatchEvent::Subagent {
-                call_id,
-                conversation_id,
-            } => {
-                let started = self
-                    .items
-                    .iter_mut()
-                    .flat_map(|item| item.calls.iter_mut())
-                    .find(|call| call.id == call_id)
-                    .and_then(|call| call.subagent.as_mut());
-                if let Some(subagent) = started
-                    && subagent.conversation.is_none()
-                {
-                    subagent.conversation = Some(conversation_id);
-                }
-            }
             WatchEvent::Ping | WatchEvent::Unknown => {}
         }
     }
@@ -338,29 +313,6 @@ mod tests {
             json!({"type": "status", "conversation": info("idle")}),
         ));
         assert_eq!(watched.live, "");
-    }
-
-    #[test]
-    fn a_subagent_event_fills_in_the_call_it_names() {
-        let mut watched = Watched::default();
-        watched.apply(event(json!({"type": "item", "item": {
-            "id": 5, "role": "assistant", "text": "", "tools": ["subagent"],
-            "calls": [{"id": "c1", "name": "subagent", "subagent": {"agent": "researcher", "task": "look"}}]
-        }})));
-        watched.apply(event(
-            json!({"type": "subagent", "callId": "c1", "conversationId": "12"}),
-        ));
-        let call = &watched.items[0].calls[0];
-        assert_eq!(
-            call.subagent.as_ref().unwrap().conversation.as_deref(),
-            Some("12")
-        );
-        // An event for a call that is not held changes nothing.
-        let before = watched.clone();
-        watched.apply(event(
-            json!({"type": "subagent", "callId": "nope", "conversationId": "9"}),
-        ));
-        assert_eq!(watched, before);
     }
 
     #[test]

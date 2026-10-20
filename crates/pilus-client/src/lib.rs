@@ -55,7 +55,7 @@ pub use connection::{ClientEvent, Connection, EndpointIdentity};
 pub use connector::agent_binary;
 pub use control::{
     Agent, AgentFeed, AgentSession, Appearance, AutomationSummary, BarSegment, BarWidget,
-    ControlClient, ControlTransport, FeedScope, FeedUpdate, PaneFrame, Tab, TaskAction,
+    ControlClient, ControlTransport, FeedScope, FeedUpdate, PaneFrame, PaneInfo, Tab, TaskAction,
     TaskSummary, ThemeInfo, WorktreeInfo, set_feed_slowdown, worktree_blockers,
 };
 pub use diff::{

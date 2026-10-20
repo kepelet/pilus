@@ -47,7 +47,7 @@ use pilus_client::{
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{OnceCell, Semaphore, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, OnceCell, OwnedMutexGuard, Semaphore, mpsc};
 
 use crate::enroll::{AuthState, Level};
 use crate::supervisor::GatewayLink;
@@ -98,6 +98,11 @@ const GH_WRITES: &[&str] = &[
     "hub.gh.pull_create",
 ];
 
+/// How long `hub.run` may take. `agent.start` answers once the agent is up,
+/// and a cold one can take well past [`CALL_TIMEOUT`]; timing out sooner would
+/// drop the reply of a launch that carries on, and a retry under the same
+/// `idempotency_key` would then start the agent twice.
+const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a pull request creation may take: a push, then `gh pr create`.
 const GH_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Most items a list call returns.
@@ -263,6 +268,8 @@ pub struct Hub {
     ssh: Arc<Semaphore>,
     watchers: Arc<Slots>,
     replays: Arc<Replays>,
+    /// One launch at a time per machine (see [`Hub::launch_turn`]).
+    launches: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl std::fmt::Debug for Hub {
@@ -294,6 +301,7 @@ impl Hub {
             ssh: Arc::new(Semaphore::new(SSH_PARALLELISM)),
             watchers: Arc::default(),
             replays: Arc::default(),
+            launches: Arc::default(),
         }
     }
 
@@ -335,11 +343,14 @@ impl Hub {
                         _ => self.run_once(device, machine, &params).await,
                     }
                 };
-                tokio::time::timeout(CALL_TIMEOUT, work)
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(failure("timeout", "the machine did not answer in time"))
-                    })
+                let limit = if method == "hub.run" {
+                    RUN_TIMEOUT
+                } else {
+                    CALL_TIMEOUT
+                };
+                tokio::time::timeout(limit, work).await.unwrap_or_else(|_| {
+                    Err(failure("timeout", "the machine did not answer in time"))
+                })
             };
             // `hub.run` starts work, so it is audited like every other write (the
             // prompt it carries is never logged).
@@ -747,9 +758,13 @@ impl Hub {
         if path.is_empty() {
             return Err(bad("`path` must be the workspace's directory"));
         }
+        let extra = extra_args(params.get("args")).map_err(|message| bad(&message))?;
+        if kind == "terminal" && !extra.is_empty() {
+            return Err(bad("`args` are launch flags; a terminal has none"));
+        }
         // Display names become the agent's launch flags here, on the machine
         // that knows the catalog; a kind without one launches on its defaults.
-        let args = if model.is_empty() {
+        let mut args = if model.is_empty() {
             Vec::new()
         } else {
             self.installed_agents(machine)
@@ -760,8 +775,12 @@ impl Hub {
                 .map(|config| config.launch_args(&model, &effort))
                 .unwrap_or_default()
         };
+        args.extend(extra);
         let launch_params = (kind, path, workspace_id, prompt, args);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        // Waited for here, inside the call's own deadline: a launch that gives
+        // up waiting never starts, so a retry cannot start a second one.
+        let turn = self.launch_turn(machine).await;
         if machine == LOCAL {
             let socket = api_socket_path_for(self.session.as_deref());
             let (kind, path, workspace_id, prompt, args) = launch_params;
@@ -769,11 +788,15 @@ impl Hub {
                 move || match ControlClient::connect(&socket) {
                     Ok(client) => launch_for_hub(
                         client,
-                        &kind,
-                        &path,
-                        &workspace_id,
-                        &prompt,
-                        &args,
+                        Launch {
+                            kind: &kind,
+                            path: &path,
+                            workspace_id: &workspace_id,
+                            prompt: &prompt,
+                            args: &args,
+                            local: true,
+                        },
+                        turn,
                         ready_tx,
                     ),
                     Err(error) => {
@@ -805,11 +828,15 @@ impl Hub {
             match ControlClient::connect_ssh(target) {
                 Ok(client) => launch_for_hub(
                     client,
-                    &kind,
-                    &path,
-                    &workspace_id,
-                    &prompt,
-                    &args,
+                    Launch {
+                        kind: &kind,
+                        path: &path,
+                        workspace_id: &workspace_id,
+                        prompt: &prompt,
+                        args: &args,
+                        local: false,
+                    },
+                    turn,
                     ready_tx,
                 ),
                 Err(error) => {
@@ -820,6 +847,17 @@ impl Hub {
         ready_rx
             .await
             .map_err(|_| failure("internal", "hub.run launch task ended early"))?
+    }
+
+    /// Wait for this machine's turn to launch an agent.
+    ///
+    /// A launch reads the agent names, opens a tab, takes whichever pane is
+    /// focused and starts an agent in it, and the daemon has one focus, so two
+    /// launches at once pick the same name and the same pane. Held until the
+    /// launch has either started or failed, not through the prompt retries.
+    async fn launch_turn(&self, machine: &str) -> OwnedMutexGuard<()> {
+        let gate = Arc::clone(lock(&self.launches).entry(machine.to_string()).or_default());
+        gate.lock_owned().await
     }
 
     /// The child folders of `params.path` (default `~`) on `machine`, for choosing
@@ -965,6 +1003,8 @@ impl Hub {
                         .models
                         .iter()
                         .map(|model| json!({
+                            "provider": model.provider,
+                            "id": model.id,
                             "name": model.name,
                             "efforts": model.efforts,
                             "default_effort": model.default_effort,
@@ -1280,27 +1320,168 @@ fn unique_alias(base: &str, taken: &[String]) -> String {
     unreachable!("the alias suffix search has an unbounded counter")
 }
 
+/// What one `hub.run` asks to start.
+struct Launch<'a> {
+    kind: &'a str,
+    path: &'a str,
+    workspace_id: &'a str,
+    prompt: &'a str,
+    args: &'a [String],
+    /// Whether the daemon is on this machine, so both paths can be resolved here.
+    local: bool,
+}
+
+/// Why a launch stopped.
+enum LaunchError {
+    /// The daemon refused or did not answer.
+    Client(ClientError),
+    /// The pane did not come up in the workspace's directory.
+    Directory(String),
+}
+
+impl From<ClientError> for LaunchError {
+    fn from(error: ClientError) -> Self {
+        Self::Client(error)
+    }
+}
+
+impl LaunchError {
+    fn into_failure(self, method: &str) -> Value {
+        match self {
+            Self::Client(error) => client_failure(&error, method),
+            Self::Directory(message) => failure("wrong_directory", &message),
+        }
+    }
+}
+
+/// Whether the directory a pane is in is the directory that was asked for.
+///
+/// Luvus starts a new tab in the focused pane's directory, not the workspace's,
+/// so the pane has to be checked rather than assumed. On this machine both
+/// sides are resolved first, so a symlink or a trailing slash is not a
+/// difference; on another machine only the text can be compared.
+fn same_directory(requested: &str, actual: &str, local: bool) -> bool {
+    let plain = |path: &str| match path.trim_end_matches('/') {
+        "" => "/".to_string(),
+        trimmed => trimmed.to_string(),
+    };
+    if plain(requested) == plain(actual) {
+        return true;
+    }
+    let requested = if local {
+        pilus_client::folders::expand_path(requested)
+    } else {
+        requested.to_string()
+    };
+    local
+        && std::path::Path::new(&requested).is_absolute()
+        && matches!(
+            (
+                std::fs::canonicalize(&requested),
+                std::fs::canonicalize(actual)
+            ),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// Where `pane` is now, or why that cannot be told.
+fn pane_directory(client: &mut ControlClient, pane: &str) -> Result<String, LaunchError> {
+    client
+        .panes()?
+        .into_iter()
+        .find(|info| info.pane == pane)
+        .map(|info| info.cwd)
+        .ok_or_else(|| {
+            LaunchError::Directory(format!(
+                "could not tell which directory pane {pane} started in"
+            ))
+        })
+}
+
+/// Fail unless `pane` is in the workspace's directory `path`.
+fn require_directory(
+    client: &mut ControlClient,
+    pane: &str,
+    path: &str,
+    local: bool,
+) -> Result<(), LaunchError> {
+    let actual = pane_directory(client, pane)?;
+    if same_directory(path, &actual, local) {
+        return Ok(());
+    }
+    Err(LaunchError::Directory(format!(
+        "pane {pane} started in {actual}, not in the workspace {path}; nothing was typed into it"
+    )))
+}
+
+/// Close the tab a failed launch opened, if it is still only that launch's pane.
+///
+/// Tab positions shift when anyone closes a tab, so the pane is looked up again
+/// first, and a tab that holds anything else is left alone. Focusing the pane
+/// makes `tab.close` act on its workspace, whichever one the person has since
+/// switched to.
+fn discard_tab(client: &mut ControlClient, pane: Option<&str>) {
+    let Some(pane) = pane else {
+        return;
+    };
+    let Ok(panes) = client.panes() else {
+        return;
+    };
+    let Some(mine) = panes.iter().find(|info| info.pane == pane) else {
+        return;
+    };
+    let alone = panes
+        .iter()
+        .filter(|info| info.workspace_id == mine.workspace_id && info.tab == mine.tab)
+        .count()
+        == 1;
+    if alone && client.focus_pane(pane).is_ok() {
+        let _ = client.close_tab(mine.tab);
+    }
+}
+
 /// The blocking half of [`Hub::run`], on one control connection.
 ///
 /// It always opens a new tab and returns before the separate prompt retry
-/// begins, so the phone can navigate to the started pane immediately.
-fn launch_agent(
-    client: &mut ControlClient,
-    kind: &str,
-    path: &str,
-    workspace_id: &str,
-    args: &[String],
-) -> Result<Value, ClientError> {
+/// begins, so the phone can navigate to the started pane immediately. The
+/// agent is started only in the tab it opened, and the call fails, with that tab
+/// closed, when the pane is not in the workspace's directory: Luvus takes no
+/// directory for `tab.new` or `agent.start`, and an agent in the wrong one
+/// reads and writes the wrong files.
+fn launch_agent(client: &mut ControlClient, launch: &Launch<'_>) -> Result<Value, LaunchError> {
     let taken = client
         .agents()?
         .into_iter()
         .map(|agent| agent.name)
         .collect::<Vec<_>>();
-    let alias = unique_alias(&phone_alias(kind, workspace_id, path), &taken);
-    client.open_workspace(path)?;
+    let alias = unique_alias(
+        &phone_alias(launch.kind, launch.workspace_id, launch.path),
+        &taken,
+    );
+    client.open_workspace(launch.path)?;
     client.new_tab()?;
     let pane = client.idle_pane()?;
-    client.start_agent(&alias, kind, pane.as_deref(), args)?;
+    let started = (|| {
+        client.start_agent(&alias, launch.kind, pane.as_deref(), launch.args)?;
+        match pane.as_deref() {
+            Some(pane) => require_directory(client, pane, launch.path, launch.local),
+            // No pane to read it from: find the agent by the alias it was given.
+            None => {
+                let agent = client.agents()?.into_iter().find(|a| a.name == alias);
+                match agent {
+                    Some(agent) if same_directory(launch.path, &agent.cwd, launch.local) => Ok(()),
+                    _ => Err(LaunchError::Directory(format!(
+                        "could not confirm that {alias} started in the workspace {}",
+                        launch.path
+                    ))),
+                }
+            }
+        }
+    })();
+    if let Err(error) = started {
+        discard_tab(client, pane.as_deref());
+        return Err(error);
+    }
     if let Some(pane) = pane.as_deref() {
         client.focus_pane(pane)?;
     }
@@ -1310,24 +1491,26 @@ fn launch_agent(
 
 /// Launch an agent, report its pane, then keep the connection for readiness
 /// retries without delaying the response that tells the phone it started.
+///
+/// `turn` is this machine's launch turn (see [`Hub::launch_turn`]); it ends as
+/// soon as the launch has an outcome.
 fn launch_for_hub(
     mut client: ControlClient,
-    kind: &str,
-    path: &str,
-    workspace_id: &str,
-    prompt: &str,
-    args: &[String],
+    launch: Launch<'_>,
+    turn: OwnedMutexGuard<()>,
     ready_tx: tokio::sync::oneshot::Sender<Result<Value, Value>>,
 ) {
-    let launch = if kind == "terminal" {
-        launch_terminal(&mut client, path, workspace_id)
+    let (kind, prompt) = (launch.kind, launch.prompt);
+    let outcome = if kind == "terminal" {
+        launch_terminal(&mut client, &launch)
     } else {
-        launch_agent(&mut client, kind, path, workspace_id, args)
+        launch_agent(&mut client, &launch)
     };
-    let mut result = match launch {
+    drop(turn);
+    let mut result = match outcome {
         Ok(result) => result,
         Err(error) => {
-            let _ = ready_tx.send(Err(client_failure(&error, "agent.start")));
+            let _ = ready_tx.send(Err(error.into_failure("agent.start")));
             return;
         }
     };
@@ -1396,20 +1579,58 @@ where
 }
 
 /// The `terminal` pseudo-kind: a fresh shell tab in the workspace, with the
-/// prompt typed as its first command when one was given.
-fn launch_terminal(
-    client: &mut ControlClient,
-    path: &str,
-    _workspace_id: &str,
-) -> Result<Value, ClientError> {
-    client.open_workspace(path)?;
+/// prompt typed as its first command when one was given. The shell is checked
+/// like an agent's pane: a prompt is never typed into a shell in another directory.
+fn launch_terminal(client: &mut ControlClient, launch: &Launch<'_>) -> Result<Value, LaunchError> {
+    client.open_workspace(launch.path)?;
     client.new_tab()?;
     // The new tab takes focus, so the current idle pane is its fresh shell.
     let pane = client.idle_pane()?;
+    let checked = match pane.as_deref() {
+        Some(pane) => require_directory(client, pane, launch.path, launch.local),
+        None => Err(LaunchError::Directory(
+            "could not find the shell of the new tab".to_string(),
+        )),
+    };
+    if let Err(error) = checked {
+        discard_tab(client, pane.as_deref());
+        return Err(error);
+    }
     if let Some(pane) = pane.as_deref() {
         client.focus_pane(pane)?;
     }
     Ok(json!({ "started": true, "name": "terminal", "pane": pane }))
+}
+
+/// Most extra launch flags `hub.run` takes, and the longest one.
+const EXTRA_ARGS_MAX: usize = 32;
+const EXTRA_ARG_LEN: usize = 500;
+
+/// The verbatim launch flags a `hub.run` carries in `args`, after any made
+/// from `model` and `effort`. They are passed to `agent.start` as an argument
+/// list, never through a shell, and an `Operate` device can already start any
+/// agent it likes, so they grant nothing new; they are only kept to single,
+/// bounded lines.
+fn extra_args(value: Option<&Value>) -> Result<Vec<String>, String> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let list = value
+        .as_array()
+        .ok_or_else(|| "`args` must be a list of launch flags".to_string())?;
+    if list.len() > EXTRA_ARGS_MAX {
+        return Err(format!("`args` takes at most {EXTRA_ARGS_MAX} flags"));
+    }
+    list.iter()
+        .map(|arg| match arg.as_str() {
+            Some(text) if text.len() <= EXTRA_ARG_LEN && !text.contains(['\n', '\r', '\0']) => {
+                Ok(text.to_string())
+            }
+            _ => Err(format!(
+                "each of `args` must be one line of at most {EXTRA_ARG_LEN} bytes"
+            )),
+        })
+        .collect()
 }
 
 /// `{"id","result"}` or `{"id","error"}`.
@@ -1832,6 +2053,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extra_launch_flags_are_bounded_single_lines() {
+        assert_eq!(extra_args(None), Ok(Vec::new()));
+        assert_eq!(extra_args(Some(&Value::Null)), Ok(Vec::new()));
+        assert_eq!(
+            extra_args(Some(&json!(["--yolo", "--name", "a b"]))),
+            Ok(vec![
+                "--yolo".to_string(),
+                "--name".to_string(),
+                "a b".to_string()
+            ])
+        );
+        for bad in [
+            json!("--yolo"),
+            json!([1]),
+            json!(["a\nb"]),
+            json!(["x".repeat(EXTRA_ARG_LEN + 1)]),
+            json!(vec!["-v"; EXTRA_ARGS_MAX + 1]),
+        ] {
+            assert!(extra_args(Some(&bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_launch_flags_are_refused_before_anything_starts() {
+        let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
+        for params in [
+            json!({ "agent": "pi", "path": "/tmp", "args": "--yolo" }),
+            json!({ "agent": "pi", "path": "/tmp", "args": ["a\nb"] }),
+            json!({ "agent": "terminal", "path": "/tmp", "args": ["--yolo"] }),
+        ] {
+            let refused = hub
+                .handle(
+                    &json!({ "id": "r", "method": "hub.run", "params": params }),
+                    Level::Operate,
+                    "t",
+                )
+                .await;
+            assert_eq!(refused["error"]["code"], "bad_request", "{params}");
+        }
+    }
+
     #[tokio::test]
     async fn an_overlong_idempotency_key_is_refused() {
         let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
@@ -2085,5 +2348,314 @@ mod tests {
         assert!(result.is_err());
         assert!(attempts >= 3);
         assert!(elapsed.get() >= PROMPT_RETRY_DEADLINE);
+    }
+
+    /// A scripted Luvus control socket that keeps panes the way the real one
+    /// does where it matters here: `tab.new` puts the new shell in the focused
+    /// pane's directory (Luvus's changelog, 9385ea6) unless told to use the
+    /// workspace root, and `agent.start` refuses a name that is in use.
+    #[cfg(unix)]
+    mod launching {
+        use super::*;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        const ROOT: &str = "/work/sipil";
+        const DRIFTED: &str = "/home/me/.sipil";
+        const WORKSPACE_ID: &str = "workspace_c8275bffbd9cc83597da73d0912b7028";
+
+        struct Pane {
+            id: u32,
+            tab: u16,
+            cwd: String,
+            agent: String,
+            name: String,
+        }
+
+        struct Daemon {
+            panes: Vec<Pane>,
+            focused: u32,
+            next: u32,
+            /// Whether a new tab starts where the focused pane is, not at the workspace root.
+            inherit: bool,
+            refuse_kind: &'static str,
+            prompts: Vec<(String, String)>,
+            inputs: Vec<(String, String)>,
+        }
+
+        struct FakeLuvus {
+            socket: std::path::PathBuf,
+            state: Arc<Mutex<Daemon>>,
+        }
+
+        impl FakeLuvus {
+            /// A workspace with its shell at the root and the person's focus on a shell that has `cd`ed away.
+            fn new(name: &str, inherit: bool) -> Self {
+                let dir =
+                    std::env::temp_dir().join(format!("pilus-hub-{name}-{}", std::process::id()));
+                std::fs::create_dir_all(&dir).expect("temp dir");
+                let socket = dir.join("luvus.sock");
+                let _ = std::fs::remove_file(&socket);
+                let pane = |id, tab, cwd: &str| Pane {
+                    id,
+                    tab,
+                    cwd: cwd.to_string(),
+                    agent: "fish".to_string(),
+                    name: String::new(),
+                };
+                let state = Arc::new(Mutex::new(Daemon {
+                    panes: vec![pane(717, 1, ROOT), pane(719, 2, DRIFTED)],
+                    focused: 719,
+                    next: 720,
+                    inherit,
+                    refuse_kind: "boom",
+                    prompts: Vec::new(),
+                    inputs: Vec::new(),
+                }));
+                let listener = UnixListener::bind(&socket).expect("bind");
+                let served = Arc::clone(&state);
+                std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        let Ok(stream) = stream else { return };
+                        let served = Arc::clone(&served);
+                        std::thread::spawn(move || {
+                            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                            let mut writer = stream;
+                            let mut line = String::new();
+                            reader.read_line(&mut line).expect("read request");
+                            let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                                return;
+                            };
+                            let answer = Self::answer(&served, &request);
+                            let _ = writeln!(writer, "{answer}");
+                        });
+                    }
+                });
+                Self { socket, state }
+            }
+
+            fn client(&self) -> ControlClient {
+                ControlClient::connect(&self.socket).expect("client")
+            }
+
+            fn answer(state: &Mutex<Daemon>, request: &Value) -> Value {
+                let id = request["id"].clone();
+                let params = &request["params"];
+                // Slow enough that two unserialised launches interleave.
+                std::thread::sleep(Duration::from_millis(30));
+                let mut daemon = lock(state);
+                let refuse = |code: &str, message: &str| json!({ "id": id, "error": { "code": code, "message": message } });
+                let ok = |result: Value| json!({ "id": id, "result": result });
+                let text = |key: &str| params[key].as_str().unwrap_or_default().to_string();
+                match request["method"].as_str().unwrap_or_default() {
+                    "agent.list" => ok(json!({ "agents": daemon.panes.iter()
+                        .filter(|pane| pane.agent != "fish")
+                        .map(|pane| json!({
+                            "pane": pane.id.to_string(), "tab": pane.tab.to_string(),
+                            "agent": pane.agent, "name": pane.name, "cwd": pane.cwd,
+                            "workspace_id": WORKSPACE_ID, "status": "idle",
+                        }))
+                        .collect::<Vec<_>>() })),
+                    "pane.list" => ok(json!({ "panes": daemon.panes.iter()
+                        .map(|pane| json!({
+                            "pane": pane.id.to_string(), "tab": pane.tab.to_string(),
+                            "workspace_id": WORKSPACE_ID, "cwd": pane.cwd,
+                        }))
+                        .collect::<Vec<_>>() })),
+                    "pane.current" => ok(json!({ "pane": daemon.focused.to_string() })),
+                    "workspace.open" => ok(json!({})),
+                    "tab.new" => {
+                        let cwd = if daemon.inherit {
+                            daemon
+                                .panes
+                                .iter()
+                                .find(|p| p.id == daemon.focused)
+                                .map(|p| p.cwd.clone())
+                                .unwrap_or_default()
+                        } else {
+                            ROOT.to_string()
+                        };
+                        let tab = daemon.panes.iter().map(|p| p.tab).max().unwrap_or(0) + 1;
+                        let new = daemon.next;
+                        daemon.next += 1;
+                        daemon.focused = new;
+                        daemon.panes.push(Pane {
+                            id: new,
+                            tab,
+                            cwd,
+                            agent: "fish".to_string(),
+                            name: String::new(),
+                        });
+                        ok(json!({}))
+                    }
+                    "agent.start" => {
+                        let (name, kind) = (text("name"), text("kind"));
+                        if daemon.panes.iter().any(|p| p.name == name) {
+                            return refuse(
+                                "name_in_use",
+                                &format!("agent name already exists: {name}"),
+                            );
+                        }
+                        if kind == daemon.refuse_kind {
+                            return refuse("spawn_failed", "the agent did not come up");
+                        }
+                        let target = text("pane");
+                        match daemon.panes.iter_mut().find(|p| p.id.to_string() == target) {
+                            Some(pane) => {
+                                pane.agent = kind;
+                                pane.name = name;
+                                ok(json!({}))
+                            }
+                            None => refuse("not_found", "no such pane"),
+                        }
+                    }
+                    "pane.focus" => {
+                        daemon.focused = text("pane").parse().unwrap_or(daemon.focused);
+                        ok(json!({}))
+                    }
+                    "tab.close" => {
+                        let tab: u16 = text("tab").parse().unwrap_or(0);
+                        daemon.panes.retain(|p| p.tab != tab);
+                        // Focus falls to the last shell left, which is where the person was.
+                        if !daemon.panes.iter().any(|p| p.id == daemon.focused) {
+                            daemon.focused = daemon.panes.last().map_or(0, |p| p.id);
+                        }
+                        ok(json!({}))
+                    }
+                    "agent.prompt" => {
+                        let entry = (text("target"), text("text"));
+                        daemon.prompts.push(entry);
+                        ok(json!({}))
+                    }
+                    "pane.send_input" => {
+                        let entry = (text("pane"), text("text"));
+                        daemon.inputs.push(entry);
+                        ok(json!({}))
+                    }
+                    other => refuse("unknown_method", other),
+                }
+            }
+
+            fn panes(&self) -> usize {
+                lock(&self.state).panes.len()
+            }
+        }
+
+        impl Drop for FakeLuvus {
+            fn drop(&mut self) {
+                // Nothing is waiting on it; the listener thread ends with the test process.
+                let _ = UnixStream::connect(&self.socket);
+                let _ = std::fs::remove_dir_all(self.socket.parent().expect("dir"));
+            }
+        }
+
+        /// What one `hub.run` of `kind` in the workspace came to, with its prompt `say`.
+        async fn start(
+            hub: &Hub,
+            luvus: &FakeLuvus,
+            kind: &str,
+            say: &str,
+        ) -> Result<Value, Value> {
+            let turn = hub.launch_turn(LOCAL).await;
+            let client = luvus.client();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (kind, say) = (kind.to_string(), say.to_string());
+            let launched = tokio::task::spawn_blocking(move || {
+                launch_for_hub(
+                    client,
+                    Launch {
+                        kind: &kind,
+                        path: ROOT,
+                        workspace_id: WORKSPACE_ID,
+                        prompt: &say,
+                        args: &[],
+                        local: true,
+                    },
+                    turn,
+                    ready_tx,
+                );
+            });
+            let outcome = ready_rx.await.expect("an outcome");
+            launched.await.expect("the launch ends");
+            outcome
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_start_in_the_wrong_directory_fails_closed_and_types_nothing() {
+            let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
+            // Luvus puts the new tab where the focused pane is, which is not the workspace.
+            let luvus = FakeLuvus::new("wrong-directory", true);
+            let before = luvus.panes();
+            for kind in ["pi", "terminal"] {
+                let refused = start(&hub, &luvus, kind, "edit the config")
+                    .await
+                    .expect_err(kind);
+                assert_eq!(refused["code"], "wrong_directory", "{kind}");
+                let message = refused["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains(DRIFTED) && message.contains(ROOT),
+                    "{message}"
+                );
+                assert_eq!(luvus.panes(), before, "{kind}: the tab it opened is closed");
+            }
+            let daemon = lock(&luvus.state);
+            assert!(
+                daemon.prompts.is_empty() && daemon.inputs.is_empty(),
+                "no prompt reached any pane"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_start_in_the_workspace_directory_goes_ahead_and_is_prompted() {
+            let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
+            let luvus = FakeLuvus::new("right-directory", false);
+            let started = start(&hub, &luvus, "pi", "edit the config")
+                .await
+                .expect("started");
+            assert_eq!(started["name"], "phone-pi-2b7028");
+            assert_eq!(started["prompt"], "queued");
+            let daemon = lock(&luvus.state);
+            assert_eq!(
+                daemon.prompts,
+                vec![(
+                    started["pane"].as_str().unwrap().to_string(),
+                    "edit the config".to_string()
+                )]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn overlapping_starts_take_turns_so_names_differ_and_a_failure_leaves_no_tab() {
+            let hub = hub_allowing("127.0.0.1:1", &["workspace.list"]);
+            let luvus = FakeLuvus::new("overlap", false);
+            let before = luvus.panes();
+            let (a, b, c, d) = tokio::join!(
+                start(&hub, &luvus, "pi", ""),
+                start(&hub, &luvus, "pi", ""),
+                start(&hub, &luvus, "boom", ""),
+                start(&hub, &luvus, "pi", ""),
+            );
+            let mut names: Vec<String> = [a, b, d]
+                .into_iter()
+                .map(|r| {
+                    r.expect("the pi starts")["name"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            names.sort();
+            assert_eq!(
+                names,
+                ["phone-pi-2b7028", "phone-pi-2b7028-2", "phone-pi-2b7028-3"]
+            );
+            let refused = c.expect_err("the agent that cannot start");
+            assert_eq!(refused["code"], "spawn_failed");
+            assert_eq!(
+                luvus.panes(),
+                before + 3,
+                "one tab per agent that started, none left by the one that did not"
+            );
+        }
     }
 }

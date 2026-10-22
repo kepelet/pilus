@@ -897,6 +897,119 @@ impl super::sipil::SipilState {
     }
 }
 
+/// The newest thing anyone said in any conversation this pilus has, for the
+/// Home page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct Latest {
+    /// The conversation it was said in, which is what a click opens.
+    pub(super) watch: Watch,
+    /// What the conversation is called: a contact, `#channel`, or an agent.
+    pub(super) place: String,
+    /// Who said it.
+    pub(super) who: String,
+    pub(super) text: String,
+    /// Unix seconds; 0 for a remembered line the daemon never dated.
+    pub(super) at: u64,
+    /// Lines in that conversation nobody has read.
+    pub(super) unread: u64,
+}
+
+/// What the agent of `daemon`'s conversation `conversation` last said, from the
+/// remembered copy of it, with when (0 when the daemon never dated it). `None`
+/// until that conversation has been opened once.
+pub(super) fn last_said(daemon: &str, conversation: &str) -> Option<(String, u64)> {
+    let (items, _) = stores().offline.transcript(daemon, conversation)?;
+    items
+        .into_iter()
+        .rev()
+        .find(|item| {
+            item.role == ItemRole::Assistant && item.error.is_none() && !item.text.trim().is_empty()
+        })
+        .map(|item| (item.text, item.at.unwrap_or(0)))
+}
+
+/// The newest line across the contacts' and channels' threads and the primary
+/// agents' remembered conversations. All of it is read from this device's own
+/// store, so it works with the network down and never dials anyone.
+pub(super) fn latest(state: &super::sipil::SipilState) -> Option<Latest> {
+    let stores = stores();
+    let mut found: Vec<Latest> = Vec::new();
+    let named = |id: &str| {
+        state
+            .me
+            .people
+            .iter()
+            .find(|person| person.contact.id == id)
+            .map(|person| person.contact.name.clone())
+    };
+    for person in &state.me.people {
+        let Some(line) = stores.chats.last(&person.contact.id) else {
+            continue;
+        };
+        let who = if line.mine {
+            "you".to_string()
+        } else {
+            line.agent
+                .clone()
+                .unwrap_or_else(|| person.contact.name.clone())
+        };
+        found.push(Latest {
+            watch: Watch::Peer(person.contact.id.clone()),
+            place: person.contact.name.clone(),
+            who,
+            text: line.text,
+            at: line.at,
+            unread: person.unread,
+        });
+    }
+    for row in &state.me.channels {
+        let Some(line) = stores.chats.last(&row.channel.thread()) else {
+            continue;
+        };
+        let who = if line.mine {
+            "you".to_string()
+        } else if let Some(agent) = line.agent.clone() {
+            agent
+        } else {
+            line.who
+                .as_deref()
+                .map(|id| named(id).unwrap_or_else(|| id.chars().take(8).collect()))
+                .unwrap_or_default()
+        };
+        found.push(Latest {
+            watch: Watch::Channel(row.channel.id.clone()),
+            place: format!("#{}", row.channel.name),
+            who,
+            text: line.text,
+            at: line.at,
+            unread: row.unread,
+        });
+    }
+    for daemon in &state.daemons {
+        for agent in &daemon.agents {
+            let Some((items, _)) = stores.offline.transcript(&daemon.id, &agent.id) else {
+                continue;
+            };
+            let said = items.into_iter().rev().find(|item| {
+                item.role == ItemRole::Assistant
+                    && item.error.is_none()
+                    && !item.text.trim().is_empty()
+            });
+            if let Some(item) = said {
+                found.push(Latest {
+                    watch: Watch::On(daemon.id.clone(), agent.id.clone()),
+                    place: daemon.name(),
+                    who: agent.name.clone(),
+                    text: item.text,
+                    at: item.at.unwrap_or(0),
+                    unread: 0,
+                });
+            }
+        }
+    }
+    found.into_iter().max_by_key(|latest| latest.at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

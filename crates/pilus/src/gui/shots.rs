@@ -19,6 +19,7 @@ use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, HeadlessAppContext, Render, Window, point, px, size};
 
 use super::machines::AddMachineView;
+use super::session_view::Origin;
 use super::theme::Theme;
 use super::update_window::UpdateWindow;
 use super::updater::Updater;
@@ -902,6 +903,21 @@ pub fn run_main() -> Result<()> {
             cx.notify();
         });
     });
+    // The agent's board and routines, opened from the header.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil_chat.work_open = true;
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-sipil-chat-work")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.sipil_chat.work_open = false;
+            cx.notify();
+        });
+    });
     cx.update(|app| {
         view.update(app, |view, cx| {
             view.sipil_chat.open = false;
@@ -1068,6 +1084,37 @@ pub fn run_main() -> Result<()> {
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), &format!("main-stats-{name}"))?;
     }
+    cx.update(|app| {
+        view.update(app, |view, cx| view.overview_show_sample(true, true, cx));
+    });
+    settle(&mut cx, 12);
+    capture(&mut cx, window.into(), "main-overview")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| view.overview_scroll_to(560.0, cx));
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-overview-agent")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| view.overview_scroll_to_end(cx));
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-overview-bottom")?;
+    // GitHub off and sipil not set up: neither block is drawn.
+    cx.update(|app| {
+        view.update(app, |view, cx| view.overview_show_sample(false, false, cx));
+    });
+    settle(&mut cx, 12);
+    capture(&mut cx, window.into(), "main-overview-bare")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| view.session_show_sample(Origin::Home, cx));
+    });
+    settle(&mut cx, 12);
+    capture(&mut cx, window.into(), "main-overview-session")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| view.session_show_sample(Origin::Search, cx));
+    });
+    settle(&mut cx, 12);
+    capture(&mut cx, window.into(), "main-search-session")?;
     cx.update(|app| {
         view.update(app, |view, cx| view.process_show_sample(cx));
     });
@@ -2449,6 +2496,8 @@ fn sipil_fixture(connected: bool) -> super::sipil::SipilState {
         ],
         about: Some(about_fixture()),
         logo: super::about::rasterize(DAEMON_LOGO.as_bytes(), 128).map(super::sipil::Logo),
+        work: Some(work_fixture()),
+        routines: routines_fixture(),
         ..super::sipil::Daemon::default()
     };
     let cos = super::sipil::Daemon {
@@ -2466,6 +2515,104 @@ fn sipil_fixture(connected: bool) -> super::sipil::SipilState {
         daemons: vec![researcher, cos],
         ..super::sipil::SipilState::default()
     }
+}
+
+/// A board as the agent keeps it: one item waiting on the person, one blocked,
+/// one moving and one queued, and what it closed lately.
+fn work_fixture() -> pilus_client::sipil::WorkBoard {
+    use pilus_client::sipil::{ClosedWork, WorkBoard, WorkItem};
+
+    // A fixed clock would read as "20,000d ago"; these are near now.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(0));
+    let item =
+        |id, state: &str, title: &str, owner: &str, next: &str, waiting: &str, ago| WorkItem {
+            id,
+            title: title.to_string(),
+            state: state.to_string(),
+            owner: owner.to_string(),
+            next: next.to_string(),
+            waiting_on: waiting.to_string(),
+            updated_at: now - ago,
+        };
+    WorkBoard {
+        open: vec![
+            item(
+                4,
+                "blocked",
+                "Rotate the staging keys",
+                "me",
+                "Rotate once the vault opens",
+                "vault access for this device",
+                2 * 86_400_000,
+            ),
+            item(
+                2,
+                "waiting",
+                "Name the teams feature",
+                "the person",
+                "",
+                "your pick: crews or squads",
+                3 * 3_600_000,
+            ),
+            item(
+                1,
+                "doing",
+                "Add basic auth to the dashboard",
+                "pi phone-pi-2b7028 in sipil",
+                "Review its diff",
+                "",
+                20 * 60_000,
+            ),
+            item(
+                5,
+                "todo",
+                "Draft the 0.10 release notes",
+                "me",
+                "Start after the auth change lands",
+                "",
+                60 * 60_000,
+            ),
+        ],
+        closed: vec![ClosedWork {
+            id: 3,
+            title: "Remove the subagent concept".to_string(),
+            outcome: "Merged as 41ab2c3".to_string(),
+            closed_at: now - 5 * 3_600_000,
+        }],
+    }
+}
+
+/// Routines as the daemon reports them: one quiet, one that reported.
+fn routines_fixture() -> Vec<pilus_client::sipil::Routine> {
+    use pilus_client::sipil::Routine;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(0));
+    vec![
+        Routine {
+            id: 1,
+            name: "Morning PR check".to_string(),
+            schedule: "0 9 * * 1-5".to_string(),
+            timezone: "Asia/Jakarta".to_string(),
+            next_run_at: Some(now + 14 * 3_600_000),
+            last_run_at: Some(now - 10 * 3_600_000),
+            last_outcome: Some("reported".to_string()),
+            ..Routine::default()
+        },
+        Routine {
+            id: 2,
+            name: "Backup check".to_string(),
+            schedule: "@daily".to_string(),
+            timezone: "UTC".to_string(),
+            next_run_at: Some(now + 3 * 3_600_000),
+            last_run_at: Some(now - 21 * 3_600_000),
+            last_outcome: Some("quiet".to_string()),
+            ..Routine::default()
+        },
+    ]
 }
 
 /// sipil with a conversation open in the chat page, for the shots.

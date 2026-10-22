@@ -564,9 +564,33 @@ impl GhRepo {
         }
         let output = self.run(&self.program, &args, None)?;
         if output.code != Some(0) {
+            // A checkout with several remotes (a fork and its upstream) has no
+            // default repository until someone runs `gh repo set-default`, so
+            // `gh` refuses to guess. `origin` is the one the person pushes to.
+            if self.slug.is_none()
+                && needs_default_repo(&output.stderr)
+                && let Ok(slug) = self.origin_slug()
+            {
+                args.extend(["-R", slug.as_str()]);
+                let retry = self.run(&self.program, &args, None)?;
+                if retry.code == Some(0) {
+                    return parse_json(&retry.stdout);
+                }
+                return Err(self.explain(&retry));
+            }
             return Err(self.explain(&output));
         }
         parse_json(&output.stdout)
+    }
+
+    /// `owner/name` of the checkout's `origin` remote when that is on
+    /// github.com, whichever machine the checkout is on. With it the repository
+    /// can be read through *this* Mac's `gh` login (`-R`), so a checkout on a
+    /// machine where `gh` is not signed in still lists its issues.
+    pub fn origin_slug(&self) -> Result<String, String> {
+        let url = self.git_line(&["remote", "get-url", "origin"])?;
+        slug_of_github_remote(&url)
+            .ok_or_else(|| format!("This checkout's remote is not on github.com: {url}"))
     }
 
     fn git(&self, args: &[&str]) -> Result<String, String> {
@@ -706,6 +730,37 @@ fn script(dir: &str, program: &str, args: &[&str]) -> String {
 ///
 /// The order matters: the "no GitHub remote" message also tells the reader to
 /// run `gh auth login`, and it must not read as signed out.
+/// Whether `gh` stopped for want of a default repository, which an explicit
+/// `-R` answers.
+fn needs_default_repo(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("set-default") || lower.contains("multiple remotes")
+}
+
+/// The host and `owner/name` of a remote URL: `git@github.com:o/r.git`,
+/// `https://github.com/o/r`, or `ssh://git@github.com/o/r.git`.
+fn remote_parts(url: &str) -> Option<(String, String)> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let (host, path) = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?,
+        None => url.split_once(':')?,
+    };
+    // `git@` and `user:password@` are not part of the host.
+    let host = host.rsplit('@').next()?;
+    let mut parts = path.trim_start_matches('/').split('/');
+    let (owner, name) = (parts.next()?, parts.next()?);
+    (!host.is_empty() && !owner.is_empty() && !name.is_empty() && parts.next().is_none())
+        .then(|| (host.to_lowercase(), format!("{owner}/{name}")))
+}
+
+/// `owner/name` from a remote URL on github.com, the host `-R` addresses.
+fn slug_of_github_remote(url: &str) -> Option<String> {
+    remote_parts(url)
+        .filter(|(host, _)| host == "github.com")
+        .map(|(_, slug)| slug)
+}
+
 pub(crate) fn classify(code: Option<i32>, stderr: &str) -> GhState {
     let message = stderr.trim();
     let lower = message.to_lowercase();
@@ -982,6 +1037,43 @@ impl Issue {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_remote_url_names_its_repository() {
+        for url in [
+            "git@github.com:kepelet/pilus.git",
+            "https://github.com/kepelet/pilus",
+            "https://github.com/kepelet/pilus.git/",
+            "ssh://git@github.com/kepelet/pilus.git",
+        ] {
+            assert_eq!(
+                slug_of_github_remote(url).as_deref(),
+                Some("kepelet/pilus"),
+                "{url}"
+            );
+        }
+        assert_eq!(slug_of_github_remote("/srv/git/pilus.git"), None);
+        assert_eq!(
+            slug_of_github_remote("git@github.com:kepelet/pilus.git").as_deref(),
+            Some("kepelet/pilus")
+        );
+        // Another host, or an alias for one, is not something `-R` can address.
+        assert_eq!(
+            slug_of_github_remote("https://seed.radicle.dev/z4V1/x.git"),
+            None
+        );
+        assert_eq!(slug_of_github_remote("git@github.com-work:o/r.git"), None);
+        assert_eq!(slug_of_github_remote("https://github.com/only"), None);
+    }
+
+    #[test]
+    fn only_a_missing_default_repository_is_retried() {
+        assert!(needs_default_repo(
+            "X No default remote repository has been set. To learn more about the default repository, run: gh repo set-default --help"
+        ));
+        assert!(needs_default_repo("Multiple remotes detected."));
+        assert!(!needs_default_repo("HTTP 401: Bad credentials"));
+    }
+
     use super::*;
     use serde_json::json;
 

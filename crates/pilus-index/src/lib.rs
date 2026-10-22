@@ -6,7 +6,9 @@
 //! directly, on a remote one in two `ssh` round trips), [`parse`] turns that
 //! evidence into a title and metadata, and [`Index`] keeps the result in a
 //! SQLite file. The index is a cache of what the agents wrote, not a source of
-//! truth: it holds no message text, a schema change drops and rebuilds it, and
+//! truth: it holds no message text (a window may ask [`last_reply_local`] for
+//! one agent's newest reply or [`read_transcript_local`] for the end of its
+//! conversation, both read from the end of the transcript and kept nowhere), a schema change drops and rebuilds it, and
 //! [`wipe`] removes it entirely when the person withdraws consent.
 //!
 //! Nothing here asks whether it may run. The caller owns that decision
@@ -22,12 +24,18 @@ mod refresh;
 mod scan;
 mod stats;
 mod store;
+mod transcript;
 mod usage;
 
 pub use error::{Error, Result};
 pub use model::{Agent, Session};
+pub use parse::Reply;
 pub use pricing::{Price, estimate as estimate_cost, lookup as price_of};
 pub use refresh::{Report, Source, refresh};
+pub use scan::last_reply_local;
 pub use stats::{Cost, Hourly, Overview, Ranked, Scope, Tokens};
 pub use store::{Filter, Index, wipe};
+pub use transcript::{
+    Entry, MAX_WINDOW, Transcript, WINDOW, read_transcript_local, read_transcript_remote,
+};
 pub use usage::{Bucket, Turn};

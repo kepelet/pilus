@@ -168,6 +168,16 @@ with only the command-line tools can build the app.
   daemon's transcript marks a line an agent said to a primary (a coding agent's
   report, `sipil tell`, another primary's question) with
   `speaker`, which the log draws as that agent's nick, never the person's.
+- A daemon's primary agent keeps a board of its open work and a list of
+  routines (`../sipil/src/work.ts`, `routines.ts`), read with the `work` and
+  `routines` calls (`Sipil::work`, `Sipil::routines`) in the same poll as its
+  agents and sessions. A failed read keeps the last good one and never calls the
+  daemon down; a daemon that answers `unknown_method` is from before them
+  (`Daemon::board_unsupported`) and is not asked again until it reconnects. The
+  chat page's header has a Work button for a daemon that has a board, with a count
+  of the items waiting on someone (`waiting` or `blocked`); it opens
+  `work_panel` beside the log, which shares the side with the about panel and a
+  thread. The agent keeps the board; pilus only shows it.
 - A daemon being away does not close its agent. `pilus_client::sipil::Offline`
   (the `offline` document) keeps each daemon's primary agent, the newest
   200 lines of the 8 conversations last looked at, and an outbox. `sipil::begin`
@@ -356,6 +366,47 @@ with only the command-line tools can build the app.
   offset (`date +%z`) when the page opens. Bump `store::SCHEMA` when a table
   changes, which rebuilds the cache. The heatmap cell and ranking row are
   `style::heat_cell` and `style::rank_row`, shown in the playground.
+
+- A session row (Home's Recent Sessions, Search's results) opens
+  `gui/session_view.rs`, a page of the conversation with Continue and Fork
+  (`Reopen`; Fork is the agent's own flag, `Agent::fork_args`, never the daemon's
+  resume). The conversation is `pilus_index::read_transcript_local`, or
+  `read_transcript_remote` for a saved machine (the end of the file, cut by
+  `tail` on the host, the path sent on stdin), read on a worker thread, shown and
+  kept nowhere, and only with `Settings::index_agents` and that session's machine
+  in `index_machines`, as Search reads it. The page is a virtualized `list`; the
+  first read is the last `WINDOW` (4 MB) of the file, and scrolling near the top
+  reads a window twice as large (up to `MAX_WINDOW`) and puts the older entries in
+  front (`SessionView::extend`), so a long session is never read whole unasked.
+- Home (`gui/overview.rs`, the row below Open Workspace; the new-agent composer
+  is `home.rs` and is called "New Agent") is read-only and owns no data: the
+  every agent, in a Working now card and an Idle agents card (blocked, done, idle; a sipil daemon that is away lists its agent as away, never working), each with its workspace, folder and branch, the
+  newest ten rows of Search's index (same `Settings::index_agents` gate and
+  consent hint; the file is opened per read, never held), open pull requests of
+  the sidebar's repositories read through `GhAccount` on a worker thread (none
+  at all with GitHub off), and the newest line in any chat thread or remembered
+  daemon conversation (`sipil_social::latest`, local stores only, never dials).
+  An idle agent's row opens a panel (`gui/overview_peek.rs`): its newest reply as
+  Markdown, a reply field (`agent.prompt`, or `sipil::send_in`, which queues for an
+  away daemon) and Stop, which closes a terminal agent's pane after a second press
+  (`pane.close`; a sipil agent has none, so no Stop). A terminal agent's reply is
+  the end of its transcript (`pilus_index::last_reply_local`, found through
+  `Index::session_for`), read on demand, shown and kept nowhere, and only with
+  `Settings::index_agents` and this Mac ticked; otherwise, over SSH, or for an
+  agent waiting on a question, the panel shows the tail of its screen
+  (`agent.read`). A sipil agent's is its newest remembered line. The latest sipil
+  message is drawn by the chat page's own Markdown path (`chat_text`). The
+  composer's Issue picker reads the workspace's `origin` (on its own machine, over
+  SSH if need be) and lists the issues with *this* Mac's `gh` login (`-R`), so a
+  workspace on a machine where `gh` is not signed in works; it keeps the committed
+  issue by number (Escape restores it), keeps its list across a failed re-read, and
+  retries a failed read when reopened.
+  The hero is `assets/hero-factory.png`, cropped from the site's image. The page
+  embeds the Cmd+Shift+N composer (`home_composer`, the same `PilusView::home`
+  state): opening Home starts it (`home_begin`) and leaving either one closes
+  both (`close_home_page`), so the page has no key layer of its own. GitHub's
+  blocks (pull requests, issues) are hidden with GitHub off or `gh` missing, and
+  the sipil message while sipil is not set up and switched on (`sipil_listed`).
 
 ## Untrusted input and local files
 

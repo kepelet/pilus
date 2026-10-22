@@ -6,7 +6,7 @@
 //! cannot tell which one fed it.
 
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::Stdio;
 
@@ -14,7 +14,7 @@ use pilus_client::SshTarget;
 
 use crate::error::{Error, Result};
 use crate::model::Agent;
-use crate::parse::Evidence;
+use crate::parse::{Evidence, Reply, reply_in_line};
 use crate::usage;
 
 /// A transcript as a listing shows it.
@@ -137,8 +137,34 @@ pub fn read_local(path: &str, agent: Agent) -> Result<Evidence> {
     Ok(evidence)
 }
 
+/// How much of the end of a transcript is looked through for a reply.
+const TAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The newest reply in a local transcript, found by reading only its end: a
+/// transcript of many megabytes costs one seek. `None` when the end holds no
+/// reply (one very long line can be larger than the window).
+pub fn last_reply_local(path: &str, agent: Agent) -> Result<Option<Reply>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines();
+    // A window that starts mid-file starts mid-line.
+    if start > 0 {
+        lines.next();
+    }
+    Ok(lines
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .find_map(|line| reply_in_line(agent, line)))
+}
+
 /// Run `script` on the host with `input` on its standard input.
-fn run_remote(target: &SshTarget, script: &str, input: &str) -> Result<Vec<u8>> {
+pub(crate) fn run_remote(target: &SshTarget, script: &str, input: &str) -> Result<Vec<u8>> {
     let mut child = target
         .shell_multiplexed(script)
         .stdin(Stdio::piped())
@@ -302,6 +328,28 @@ fn parse_evidence(text: &str) -> Vec<(String, Evidence)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_newest_reply_is_found_from_the_end_of_a_transcript() {
+        let dir = std::env::temp_dir().join(format!("pilus-reply-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("t.jsonl");
+        let line = |text: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            )
+        };
+        let tool = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]}}"#;
+        let body = [line("first"), line("second"), tool.to_string()].join("\n");
+        fs::write(&path, body + "\n").expect("write");
+        let reply = last_reply_local(&path.to_string_lossy(), Agent::Claude)
+            .expect("read")
+            .expect("a reply");
+        // The tool-only line after it says nothing, so the answer is the one before.
+        assert_eq!(reply.text, "second");
+        assert!(last_reply_local("/no/such/file.jsonl", Agent::Pi).is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
 
     fn scratch(tag: &str) -> std::path::PathBuf {

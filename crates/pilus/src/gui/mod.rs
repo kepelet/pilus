@@ -42,6 +42,9 @@ mod menubar;
 mod mission;
 mod notify;
 mod orchestration;
+mod overview;
+mod overview_peek;
+mod session_view;
 mod page_split;
 mod palette;
 mod pane_chrome;
@@ -113,6 +116,7 @@ use home_issues::HomeIssues;
 use machines::MachineOp;
 use menubar::MenuBar;
 use mission::MissionPanel;
+use overview::OverviewPage;
 use page_split::{PageSplit, SplitAxis, page_extent};
 use palette::{Command, Entry, Palette};
 use picker::{DirSource, MenuChoice, PickerEvent, WorkspacePicker};
@@ -2112,6 +2116,7 @@ struct PilusView {
     /// The Search page's query field, over `search`'s buffer.
     search_input: Entity<TextInput>,
     /// The page that totals the agents' token use.
+    overview: OverviewPage,
     stats: StatsPage,
     process: ProcessPage,
     database: DatabasePage,
@@ -2132,6 +2137,8 @@ struct PilusView {
     mission: MissionPanel,
     /// Mission Control's reply field for a blocked agent.
     mission_answer: Entity<TextInput>,
+    /// The reply field under an agent opened on the Home page.
+    overview_reply: Entity<TextInput>,
     /// The native Automations page: its state and the daemon's last read of
     /// the definitions.
     automations_page: AutomationsPanel,
@@ -2266,6 +2273,12 @@ impl PilusView {
             cx,
         );
         let mission_answer = mission::answer_input(
+            style::chrome_font(&shared_settings),
+            initial_fonts.body,
+            initial_theme,
+            cx,
+        );
+        let overview_reply = mission::answer_input(
             style::chrome_font(&shared_settings),
             initial_fonts.body,
             initial_theme,
@@ -2641,6 +2654,7 @@ impl PilusView {
             github_page: GithubPage::default(),
             search,
             search_input,
+            overview: OverviewPage::default(),
             stats: StatsPage::default(),
             process: ProcessPage::default(),
             database: DatabasePage::default(),
@@ -2654,6 +2668,7 @@ impl PilusView {
             right,
             mission: MissionPanel::default(),
             mission_answer,
+            overview_reply,
             automations_page: AutomationsPanel::default(),
             page_split: None,
             agent_configs: Vec::new(),
@@ -3148,6 +3163,7 @@ impl PilusView {
         changed |= self.mission_tick();
         changed |= self.automations_tick();
         changed |= self.search_tick(cx);
+        changed |= self.overview_tick();
         changed |= self.process_tick();
         while let Ok(resolved) = self.home_resolve_rx.try_recv() {
             self.home_resolve_pending = false;
@@ -3307,7 +3323,7 @@ impl PilusView {
                             // composer, so no empty terminal flashes first.
                             self.home_launching = false;
                             self.home_issue_clear();
-                            self.home.close();
+                            self.close_home_page();
                             self.toast(ToastKind::Success, message);
                             self.activate_opened_endpoint(machine, pane, cx);
                         }
@@ -5022,6 +5038,7 @@ impl PilusView {
             ),
             entry(Command::OpenHome, "New Agent", "Application", Some("⌘⇧N")),
             entry(Command::OpenSearch, "Search Sessions", "Workspace", None),
+            entry(Command::OpenOverview, "Home", "Workspace", None),
             entry(Command::OpenStats, "Insights", "Workspace", None),
             entry(
                 Command::OpenSettings,
@@ -5115,6 +5132,7 @@ impl PilusView {
             Command::OpenSettings => self.open_settings(cx),
             Command::OpenHome => self.open_home(cx),
             Command::OpenSearch => self.open_search(cx),
+            Command::OpenOverview => self.open_overview(cx),
             Command::OpenStats => self.open_stats(cx),
             Command::OpenProcess => self.open_process(cx),
             Command::OpenDatabase => self.open_database(cx),
@@ -5245,6 +5263,7 @@ impl PilusView {
         self.automations_page.close();
         self.github_page.close();
         self.search.close();
+        self.overview.close();
         self.stats.close();
         self.process.close();
         self.database.close();
@@ -5475,6 +5494,14 @@ impl PilusView {
             return style::enter("pilus-page-install-luvus", self.install_luvus_prompt(cx))
                 .into_any_element();
         }
+        if self.overview.is_open() {
+            let page = div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(self.overview_page(cx));
+            return self.page_card("pilus-page-overview", page, grid, layout, terminal_fill, cx);
+        }
         if self.home.is_open() {
             return style::enter(
                 "pilus-page-home",
@@ -5552,11 +5579,12 @@ impl PilusView {
             return self.page_card("pilus-page-github", page, grid, layout, terminal_fill, cx);
         }
         if self.search.is_open() {
-            let page = div()
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_hidden()
-                .child(self.search_page(cx));
+            let page = div().flex_1().min_h(px(0.0)).overflow_hidden();
+            let page = if self.overview.session.is_open_from(session_view::Origin::Search) {
+                page.child(self.session_page(cx))
+            } else {
+                page.child(self.search_page(cx))
+            };
             return self.page_card("pilus-page-search", page, grid, layout, terminal_fill, cx);
         }
         if self.stats.is_open() {
@@ -5760,7 +5788,7 @@ impl PilusView {
 
     /// Show the Settings page.
     fn open_settings(&mut self, cx: &mut Context<Self>) {
-        self.home.close();
+        self.close_home_page();
         self.settings_open = true;
         self.settings_status.clear();
         self.probe_machines();
@@ -5779,6 +5807,13 @@ impl PilusView {
     /// probes the machine catalog and resolves the local agent list first.
     fn open_home(&mut self, cx: &mut Context<Self>) {
         self.leave_settings_page();
+        self.home_begin();
+        cx.notify();
+    }
+
+    /// Bring the composer's state up to date and live. The Home page embeds the
+    /// same composer, so both entrances start it here.
+    fn home_begin(&mut self) {
         self.picker.close();
         self.home.open();
         self.home_sync_key.clear();
@@ -5786,7 +5821,12 @@ impl PilusView {
         self.ensure_home_agent_configs();
         self.sync_home();
         self.home_focus_active_workspace();
-        cx.notify();
+    }
+
+    /// Leave the composer, and the Home page when the composer is embedded in it.
+    fn close_home_page(&mut self) {
+        self.home.close();
+        self.overview.close();
     }
 
     /// Point the composer's Workspace picker at the active workspace, so a
@@ -6061,10 +6101,30 @@ impl PilusView {
         let key = event.keystroke.key.as_str();
         let mods = event.keystroke.modifiers;
 
+        // A session open on the Home page covers the composer, so its keys are
+        // not the composer's: Escape goes back to the list.
+        if self.overview.session.is_open_from(session_view::Origin::Home) {
+            if key == "escape" {
+                self.overview.session.close();
+                cx.notify();
+            }
+            return;
+        }
+
+        // The reply under an agent on the Home page holds the keyboard while
+        // it is focused, ahead of the composer around it.
+        if self.overview.reply_focused() {
+            self.overview_reply_key(event, cx);
+            return;
+        }
+
         // An open dropdown owns the keyboard: arrows move, Enter commits.
         if self.home.dropdown().is_some() {
             match key {
-                "escape" => self.home.close_dropdown(),
+                "escape" => {
+                    self.home.close_dropdown();
+                    self.home_issues_cancel();
+                }
                 "up" => self.home.move_dropdown(-1),
                 "down" => self.home.move_dropdown(1),
                 "enter" | "tab" => self.home.close_dropdown(),
@@ -6091,7 +6151,7 @@ impl PilusView {
         }
 
         if key == "escape" {
-            self.home.close();
+            self.close_home_page();
             cx.notify();
             return;
         }
@@ -6308,7 +6368,9 @@ impl PilusView {
             }
             InputLayer::Palette => Some(self.palette_input.focus_handle(cx)),
             InputLayer::Home => {
-                if self.home.focus() == HomeFocus::Prompt {
+                if self.overview.reply_focused() {
+                    Some(self.overview_reply.focus_handle(cx))
+                } else if self.home.focus() == HomeFocus::Prompt {
                     Some(self.home_prompt.focus_handle(cx))
                 } else {
                     None
@@ -6351,7 +6413,10 @@ impl PilusView {
             InputLayer::Automations => None,
             // The query field holds the keyboard, except over the permission
             // card, which has none.
-            InputLayer::Search if self.search.typing(self.settings.index_agents) => {
+            InputLayer::Search
+                if self.search.typing(self.settings.index_agents)
+                    && !self.overview.session.is_open() =>
+            {
                 Some(self.search_input.focus_handle(cx))
             }
             InputLayer::Search => None,
@@ -6468,6 +6533,7 @@ impl PilusView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    this.overview.blur_reply();
                     this.home.set_focus(HomeFocus::Prompt);
                     this.home.close_dropdown();
                     cx.notify();
@@ -6617,6 +6683,7 @@ impl PilusView {
     /// A press outside the dropdown already closed it in the capture phase;
     /// in that case this click is a toggle-off and must not reopen the picker.
     fn toggle_home_dropdown(&mut self, field: HomeField, cx: &mut Context<Self>) {
+        self.overview.blur_reply();
         self.home.set_focus(HomeFocus::Picker(field));
         if self.home.take_dismissed() == Some(field) {
             // Already closed by the outside press; stay closed.
@@ -6669,6 +6736,7 @@ impl PilusView {
             .max_h(px(PICKER_MENU_MAX_H))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.home.dismiss_dropdown();
+                this.home_issues_cancel();
                 cx.notify();
             }));
         if !filter.is_empty() {
@@ -11105,6 +11173,7 @@ impl PilusView {
             SIDEBAR_ROW_EDGE,
         ));
         content = content.child(self.open_workspace_row(cx));
+        content = content.child(self.overview_nav_row(cx));
         content = content.child(self.search_nav_row(cx));
         content = content.child(self.stats_nav_row(cx));
         // sipil's own section leads the lists: the user's agents, people and
@@ -13274,6 +13343,32 @@ impl PilusView {
             .on_click(cx.listener(|this, _, _, cx| this.open_picker(cx)))
     }
 
+    /// The Home row below Open Workspace: what is working, waiting and new.
+    fn overview_nav_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .id("pilus-overview")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(SIDEBAR_GLYPH_GAP))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .pl(px(SIDEBAR_ROW_PAD))
+            .pr(px(SIDEBAR_ROW_PAD))
+            .radius_md()
+            .cursor_pointer()
+            .text_size(px(self.chrome_font()))
+            .text_color(theme.panel_fg)
+            .child(style::hover_target(&self.sidebar_hover))
+            .child(icon(
+                include_bytes!("../../assets/icons/house.svg"),
+                SIDEBAR_GLYPH,
+                theme.muted,
+            ))
+            .child(div().flex_1().child("Home"))
+            .on_click(cx.listener(|this, _, _, cx| this.open_overview(cx)))
+    }
+
     /// The Search row below Open Workspace: it opens the page that finds a
     /// saved agent session and resumes it.
     fn search_nav_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -13408,15 +13503,21 @@ impl PilusView {
         // Shown only for a pilus that is switched on and has something to list;
         // the Sipil tab, where a first agent or contact is added, opens from
         // the pilus mark in the right toolbar.
+        if !self.sipil_listed() {
+            return Vec::new();
+        }
+        vec![self.sipil_agents_section(cx)]
+    }
+
+    /// Whether sipil is set up and switched on: reachable, with something to
+    /// list. The sidebar's section and the Home page's message both wait for it.
+    fn sipil_listed(&self) -> bool {
         let me = &self.sipil.me;
         let listed = !self.sipil.daemons.is_empty()
             || !me.people.is_empty()
             || !me.channels.is_empty()
             || !me.requests.is_empty();
-        if !me.reachable || !listed {
-            return Vec::new();
-        }
-        vec![self.sipil_agents_section(cx)]
+        me.reachable && listed
     }
 
     fn sipil_agents_section(&self, cx: &mut Context<Self>) -> Div {

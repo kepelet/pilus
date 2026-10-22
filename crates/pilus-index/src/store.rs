@@ -237,6 +237,45 @@ impl Index {
         Ok(found)
     }
 
+    /// The session an agent running in `cwd` on `machine` is most likely on:
+    /// the one with `session` as its id when that is known, else the most
+    /// recently written one of that agent in that folder.
+    pub fn session_for(
+        &self,
+        machine: &str,
+        agent: Agent,
+        cwd: &str,
+        session: Option<&str>,
+    ) -> Result<Option<Session>> {
+        let session = session.unwrap_or_default();
+        let found = self
+            .conn
+            .query_row(
+                "SELECT machine, path, session_id, cwd, title, branch, started, updated, size
+                 FROM sessions
+                 WHERE machine = ?1 AND agent = ?2 AND title <> ''
+                   AND ((?3 <> '' AND session_id = ?3) OR cwd = ?4)
+                 ORDER BY (session_id = ?3) DESC, updated DESC LIMIT 1",
+                (machine, agent.kind(), session, cwd),
+                |row| {
+                    Ok(Session {
+                        machine: row.get(0)?,
+                        agent,
+                        session_id: row.get(2)?,
+                        cwd: row.get(3)?,
+                        title: row.get(4)?,
+                        branch: row.get(5)?,
+                        started: row.get(6)?,
+                        updated: row.get(7)?,
+                        path: row.get(1)?,
+                        size: row.get::<_, i64>(8)?.unsigned_abs(),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(found)
+    }
+
     /// How many listed sessions `machine` has, or all machines together.
     pub fn count(&self, machine: Option<&str>) -> Result<u64> {
         let count: Option<i64> = match machine {
@@ -340,6 +379,44 @@ mod tests {
             ])
             .expect("upsert");
         index
+    }
+
+    #[test]
+    fn an_agent_in_a_folder_gets_its_own_session_by_id_else_the_newest_there() {
+        let mut index = seeded();
+        index
+            .upsert(&[session(
+                "local",
+                Agent::Claude,
+                "e",
+                "Newer in the folder",
+                90,
+            )])
+            .expect("upsert");
+        let newest = index
+            .session_for("local", Agent::Claude, "/work/app", None)
+            .expect("lookup")
+            .expect("a session");
+        assert_eq!(newest.session_id, "e");
+        // The id the agent reported wins over a newer session in the folder.
+        let exact = index
+            .session_for("local", Agent::Claude, "/work/app", Some("a"))
+            .expect("lookup")
+            .expect("a session");
+        assert_eq!(exact.session_id, "a");
+        // Another agent's, another machine's and another folder's do not count.
+        assert!(
+            index
+                .session_for("local", Agent::Claude, "/elsewhere", None)
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(
+            index
+                .session_for("box", Agent::Pi, "/work/app", None)
+                .expect("lookup")
+                .is_none()
+        );
     }
 
     #[test]

@@ -86,7 +86,7 @@ fn weekday(day: i64) -> usize {
 
 /// The calendar date of a day number, by the civil-calendar algorithm, so the
 /// page needs no date crate for a label.
-fn civil(day: i64) -> (i64, usize, i64) {
+pub(super) fn civil(day: i64) -> (i64, usize, i64) {
     let shifted = day + 719_468;
     let era = shifted.div_euclid(146_097);
     let day_of_era = shifted.rem_euclid(146_097);

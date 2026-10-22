@@ -378,6 +378,97 @@ pub struct Session {
     pub error: Option<String>,
 }
 
+/// An open piece of work on a daemon's board: what its primary agent is
+/// carrying for the person (`../sipil/src/work.ts`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkItem {
+    /// Its number on the board.
+    pub id: u64,
+    /// What the work is.
+    pub title: String,
+    /// `todo`, `doing`, `waiting` or `blocked`.
+    pub state: String,
+    /// Who is on it: the person, the agent, or a coding agent and where.
+    #[serde(default)]
+    pub owner: String,
+    /// The next step.
+    #[serde(default)]
+    pub next: String,
+    /// What it waits on, when waiting or blocked.
+    #[serde(default)]
+    pub waiting_on: String,
+    /// When it last changed, in Unix milliseconds.
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+impl WorkItem {
+    /// Whether it needs someone before it can go on.
+    pub fn stuck(&self) -> bool {
+        self.state == "waiting" || self.state == "blocked"
+    }
+}
+
+/// A piece of work the agent took off its board, with how it ended.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedWork {
+    /// Its number on the board.
+    pub id: u64,
+    /// What the work was.
+    pub title: String,
+    /// How it ended.
+    #[serde(default)]
+    pub outcome: String,
+    /// When it was closed, in Unix milliseconds.
+    #[serde(default)]
+    pub closed_at: u64,
+}
+
+/// A daemon's board: the open work in the order the agent keeps it (what waits
+/// on someone first), and what it closed lately.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct WorkBoard {
+    /// Open items, blocked and waiting first.
+    #[serde(default)]
+    pub open: Vec<WorkItem>,
+    /// Recently closed items, newest first.
+    #[serde(default)]
+    pub closed: Vec<ClosedWork>,
+}
+
+/// Recurring work a daemon's primary agent does on a schedule
+/// (`../sipil/src/routines.ts`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Routine {
+    /// Its number.
+    pub id: u64,
+    /// What it is called.
+    pub name: String,
+    /// Its cron schedule.
+    pub schedule: String,
+    /// The time zone the schedule is read in.
+    #[serde(default)]
+    pub timezone: String,
+    /// What each run does.
+    #[serde(default)]
+    pub prompt: String,
+    /// Whether its runs are stopped.
+    #[serde(default)]
+    pub paused: bool,
+    /// When it runs next, in Unix milliseconds.
+    #[serde(default)]
+    pub next_run_at: Option<u64>,
+    /// When it last ran, in Unix milliseconds.
+    #[serde(default)]
+    pub last_run_at: Option<u64>,
+    /// How the last run went: `reported`, `quiet` or `failed`.
+    #[serde(default)]
+    pub last_outcome: Option<String>,
+}
+
 /// Who said a transcript line.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -589,6 +680,18 @@ impl Sipil {
         self.call("about", &json!({}))
     }
 
+    /// The primary agent's board of open work. A daemon from before the board
+    /// refuses it with `unknown_method`.
+    pub fn work(&self) -> Result<WorkBoard, SipilError> {
+        self.call("work", &json!({}))
+    }
+
+    /// The primary agent's routines, each with when it runs next. A daemon
+    /// from before routines refuses it with `unknown_method`.
+    pub fn routines(&self) -> Result<Vec<Routine>, SipilError> {
+        Ok(self.call::<Routines>("routines", &json!({}))?.routines)
+    }
+
     /// The top-level conversations.
     pub fn sessions(&self) -> Result<Vec<Session>, SipilError> {
         Ok(self.call::<Sessions>("sessions", &json!({}))?.sessions)
@@ -744,6 +847,11 @@ struct Agents {
 #[derive(Deserialize)]
 struct Sessions {
     sessions: Vec<Session>,
+}
+
+#[derive(Deserialize)]
+struct Routines {
+    routines: Vec<Routine>,
 }
 
 #[derive(Deserialize)]

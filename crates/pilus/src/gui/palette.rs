@@ -40,6 +40,7 @@ pub enum Command {
     OpenSettings,
     OpenHome,
     OpenSearch,
+    OpenOverview,
     OpenStats,
     OpenProcess,
     OpenDatabase,

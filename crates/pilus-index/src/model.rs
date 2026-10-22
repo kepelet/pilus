@@ -30,7 +30,17 @@ impl Agent {
     pub const fn resume_flag(self) -> Option<&'static str> {
         match self {
             Self::Claude => Some("--resume"),
-            Self::Pi => None,
+            Self::Pi => Some("--session"),
+        }
+    }
+
+    /// The arguments that start a new session from session `id`'s history,
+    /// leaving the original untouched.
+    #[must_use]
+    pub fn fork_args(self, id: &str) -> Vec<String> {
+        match self {
+            Self::Claude => vec!["--resume".into(), id.into(), "--fork-session".into()],
+            Self::Pi => vec!["--fork".into(), id.into()],
         }
     }
 
@@ -87,4 +97,19 @@ pub struct Session {
     /// The transcript file, which is also the row's identity on its machine.
     pub path: String,
     pub size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fork_starts_a_new_session_from_the_old_one() {
+        assert_eq!(
+            Agent::Claude.fork_args("abc"),
+            ["--resume", "abc", "--fork-session"]
+        );
+        assert_eq!(Agent::Pi.fork_args("abc"), ["--fork", "abc"]);
+        assert_eq!(Agent::Pi.resume_flag(), Some("--session"));
+    }
 }

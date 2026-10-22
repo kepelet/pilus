@@ -33,6 +33,55 @@ pub struct Parsed {
     pub started: i64,
 }
 
+/// What an agent last said: the text of its newest reply, without its tool
+/// calls and its reasoning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Reply {
+    pub text: String,
+    /// Unix seconds, `0` when the line carries no readable time.
+    pub at: i64,
+}
+
+/// The reply a transcript `line` holds, or `None` for a line that is not an
+/// assistant message with some text in it. A reply that only called tools has
+/// no text, so it is skipped rather than shown empty.
+pub fn reply_in_line(agent: Agent, line: &str) -> Option<Reply> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let message = match agent {
+        Agent::Claude => {
+            if value.get("type")?.as_str()? != "assistant" || flag(&value, "isSidechain") {
+                return None;
+            }
+            value.get("message")?
+        }
+        Agent::Pi => value.get("message")?,
+    };
+    if message.get("role")?.as_str()? != "assistant" {
+        return None;
+    }
+    let text: Vec<&str> = message
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect();
+    if text.is_empty() {
+        return None;
+    }
+    let at = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(iso_seconds)
+        .unwrap_or(0);
+    Some(Reply {
+        text: text.join("\n\n"),
+        at,
+    })
+}
+
 /// Longest title kept, in characters.
 const TITLE_CHARS: usize = 140;
 
@@ -219,6 +268,31 @@ pub(crate) fn iso_seconds(text: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reply_is_the_text_of_an_assistant_line_and_nothing_else() {
+        let claude = r#"{"type":"assistant","timestamp":"2026-10-21T02:05:22.223Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hm"},{"type":"text","text":" Done. "},{"type":"tool_use","name":"Bash"},{"type":"text","text":"Tests pass."}]}}"#;
+        let reply = reply_in_line(Agent::Claude, claude).expect("a reply");
+        assert_eq!(reply.text, "Done.\n\nTests pass.");
+        assert_eq!(reply.at, 1_792_548_322);
+
+        let pi = r#"{"type":"message","timestamp":"2026-10-21T02:05:22.223Z","message":{"role":"assistant","content":[{"type":"text","text":"Fixed."},{"type":"toolCall","name":"bash"}]}}"#;
+        assert_eq!(
+            reply_in_line(Agent::Pi, pi).expect("a reply").text,
+            "Fixed."
+        );
+
+        // A reply that only called a tool, a user line, a tool result and a
+        // sidechain say nothing.
+        let only_tool = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]}}"#;
+        let user =
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
+        let side = r#"{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"x"}]}}"#;
+        assert_eq!(reply_in_line(Agent::Claude, only_tool), None);
+        assert_eq!(reply_in_line(Agent::Claude, user), None);
+        assert_eq!(reply_in_line(Agent::Claude, side), None);
+        assert_eq!(reply_in_line(Agent::Pi, "not json"), None);
+    }
+
     use super::*;
 
     fn evidence(head: &[&str], titles: &[&str]) -> Evidence {

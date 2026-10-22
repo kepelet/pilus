@@ -49,8 +49,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pilus_client::sipil::history;
 use pilus_client::sipil::{
     About, Activity, Agent, Backoff, Channel, ConversationInfo, Next, Policy, Queued, Quote,
-    RememberedAgent, Request, Role, RunningTool, Session, Sipil, SipilError, TranscriptItem,
-    Watched, Watching, parse_target,
+    RememberedAgent, Request, Role, Routine, RunningTool, Session, Sipil, SipilError,
+    TranscriptItem, Watched, Watching, WorkBoard, parse_target,
 };
 use pilus_client::{RelaySettings, pilus_config_dir};
 
@@ -172,6 +172,13 @@ pub struct Daemon {
     pub about_unsupported: bool,
     /// Its logo, drawn once from the SVG it advertises.
     pub logo: Option<Logo>,
+    /// Its primary agent's board of open work, once it has said
+    /// (`../sipil/src/work.ts`).
+    pub work: Option<WorkBoard>,
+    /// Its primary agent's routines, with when each runs next.
+    pub routines: Vec<Routine>,
+    /// It is from before the board and routines, so asking again is no use.
+    pub board_unsupported: bool,
 }
 
 /// A daemon's logo, already drawn. Two are the same when they are the same
@@ -805,6 +812,12 @@ pub fn send(text: String, reply: Option<Quote>) {
         }
         shared.state.watch.clone()
     };
+    send_in(watching, text, reply);
+}
+
+/// Say `text` in `watching`, which need not be the open conversation: the Home
+/// page answers an agent without opening its chat.
+pub fn send_in(watching: Watch, text: String, reply: Option<Quote>) {
     match watching {
         Watch::Peer(_) | Watch::Channel(_) => {
             return social::send_to_conversation(&watching, text, reply);
@@ -969,7 +982,11 @@ fn deliver_queued(daemon: &str, target: &Sipil, epoch: u64) {
 
 /// Stop the open conversation's current work.
 pub fn abort() {
-    let watching = snapshot().watch.clone();
+    abort_in(snapshot().watch.clone());
+}
+
+/// Stop the current work of `watching`, which need not be the open conversation.
+pub fn abort_in(watching: Watch) {
     let Watch::On(daemon, id) = watching else {
         return;
     };
@@ -1206,7 +1223,7 @@ pub(super) fn request_id() -> String {
 
 /// Take a daemon that answered: load its lists and fold them in.
 fn adopt(id: &str, target: &Sipil, epoch: u64, health: &pilus_client::sipil::Health) {
-    let lists = Lists::fetch(target, true);
+    let lists = Lists::fetch(target, true, true);
     let mut shared = lock();
     if !shared.current(id, epoch) {
         return;
@@ -1262,6 +1279,7 @@ fn settle(shared: &mut Shared, id: &str, health: &pilus_client::sipil::Health, l
                 // another model, so it is asked again.
                 daemon.about = None;
                 daemon.about_unsupported = false;
+                daemon.board_unsupported = false;
             }
         }
     });
@@ -1275,6 +1293,12 @@ fn settle(shared: &mut Shared, id: &str, health: &pilus_client::sipil::Health, l
     }
 }
 
+/// The agent's board and its routines, as the daemon answered each.
+type Board = (
+    Result<WorkBoard, SipilError>,
+    Result<Vec<Routine>, SipilError>,
+);
+
 /// Everything the sidebar and the window list, fetched together.
 struct Lists {
     agents: Result<Vec<Agent>, SipilError>,
@@ -1282,14 +1306,18 @@ struct Lists {
     /// What the daemon says about itself, asked for when it has not yet. It is
     /// not a reason to call the daemon down: an older one has no such call.
     about: Option<Result<About, SipilError>>,
+    /// The agent's board and routines, asked for unless the daemon is too old
+    /// to have them. Like `about`, a failure here never calls the daemon down.
+    board: Option<Board>,
 }
 
 impl Lists {
-    fn fetch(target: &Sipil, with_about: bool) -> Self {
+    fn fetch(target: &Sipil, with_about: bool, with_board: bool) -> Self {
         Self {
             agents: target.agents(),
             sessions: target.sessions(),
             about: with_about.then(|| target.about()),
+            board: with_board.then(|| (target.work(), target.routines())),
         }
     }
 
@@ -1324,6 +1352,20 @@ impl Lists {
                 daemon.about_unsupported = true;
             }
             Some(Err(_)) | None => {}
+        }
+        match self.board {
+            Some((Err(SipilError::Refused { code, .. }), _)) if code == "unknown_method" => {
+                daemon.board_unsupported = true;
+            }
+            Some((work, routines)) => {
+                if let Ok(work) = work {
+                    daemon.work = Some(work);
+                }
+                if let Ok(routines) = routines {
+                    daemon.routines = routines;
+                }
+            }
+            None => {}
         }
     }
 }
@@ -1495,13 +1537,15 @@ fn poll_daemons(now: Instant, front: bool) {
 fn poll_daemon(id: &str, target: &Sipil, epoch: u64, open: Option<String>) {
     // A reconnect starts from the health check, so a daemon that came back as
     // something else is caught rather than trusted.
-    let with_about = lock()
-        .state
-        .daemon(id)
-        .is_some_and(|daemon| daemon.about.is_none() && !daemon.about_unsupported);
+    let (with_about, with_board) = lock().state.daemon(id).map_or((false, false), |daemon| {
+        (
+            daemon.about.is_none() && !daemon.about_unsupported,
+            !daemon.board_unsupported,
+        )
+    });
     let outcome = target
         .connect()
-        .map(|health| (health, Lists::fetch(target, with_about)));
+        .map(|health| (health, Lists::fetch(target, with_about, with_board)));
     let connected = {
         let mut shared = lock();
         if !shared.current(id, epoch) {
@@ -1672,6 +1716,7 @@ mod tests {
             agents: Ok(Vec::new()),
             sessions: Ok(Vec::new()),
             about,
+            board: None,
         };
         let mut daemon = Daemon::default();
         lists(Some(Ok(about))).apply(&mut daemon);
@@ -1689,6 +1734,55 @@ mod tests {
         let mut flaky = Daemon::default();
         lists(Some(Err(SipilError::Malformed))).apply(&mut flaky);
         assert!(flaky.about.is_none() && !flaky.about_unsupported);
+    }
+
+    #[test]
+    fn the_board_is_kept_from_a_daemon_that_has_one_and_not_asked_of_one_that_does_not() {
+        let lists = |board| Lists {
+            agents: Ok(Vec::new()),
+            sessions: Ok(Vec::new()),
+            about: None,
+            board: Some(board),
+        };
+        let item = pilus_client::sipil::WorkItem {
+            id: 1,
+            title: "Rotate the keys".to_string(),
+            state: "blocked".to_string(),
+            ..Default::default()
+        };
+        let mut daemon = Daemon::default();
+        lists((
+            Ok(WorkBoard {
+                open: vec![item.clone()],
+                closed: Vec::new(),
+            }),
+            Ok(vec![Routine {
+                id: 1,
+                name: "PR check".to_string(),
+                ..Default::default()
+            }]),
+        ))
+        .apply(&mut daemon);
+        assert_eq!(
+            daemon.work.as_ref().map(|w| w.open.clone()),
+            Some(vec![item])
+        );
+        assert_eq!(daemon.routines.len(), 1);
+
+        // A failed read keeps the last good board.
+        lists((Err(SipilError::Malformed), Err(SipilError::Malformed))).apply(&mut daemon);
+        assert_eq!(daemon.work.as_ref().map(|w| w.open.len()), Some(1));
+        assert_eq!(daemon.routines.len(), 1);
+        assert!(!daemon.board_unsupported);
+
+        // A daemon from before the board says so once, and is not asked again.
+        let mut old = Daemon::default();
+        let unknown = || SipilError::Refused {
+            code: "unknown_method".to_string(),
+            message: String::new(),
+        };
+        lists((Err(unknown()), Err(unknown()))).apply(&mut old);
+        assert!(old.board_unsupported && old.work.is_none());
     }
 
     #[test]
@@ -1886,6 +1980,7 @@ mod tests {
             agents: Ok(Vec::new()),
             sessions: Ok(Vec::new()),
             about: None,
+            board: None,
         };
         settle(&mut shared, "flaky", &health, lists);
         assert_eq!(failures(&shared), Some(0));
@@ -1987,6 +2082,7 @@ mod tests {
         };
         let lists = Lists {
             about: None,
+            board: None,
             agents: Ok(vec![Agent {
                 id: "1".to_string(),
                 name: "sipil".to_string(),

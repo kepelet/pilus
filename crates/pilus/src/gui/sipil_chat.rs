@@ -26,7 +26,9 @@ use gpui::{
     AnyElement, Context, Div, Entity, Focusable, FollowMode, FontWeight, KeyDownEvent,
     ListAlignment, ListState, MouseButton, ScrollHandle, Stateful, div, img, list, prelude::*, px,
 };
-use pilus_client::sipil::{Activity, ItemRole, Quote, RunningTool, ToolCall, TranscriptItem};
+use pilus_client::sipil::{
+    Activity, ItemRole, Quote, Routine, RunningTool, ToolCall, TranscriptItem, WorkBoard,
+};
 
 use super::markdown::{self, Document};
 use super::md_select::Leaves;
@@ -80,6 +82,9 @@ pub(super) struct SipilChat {
     reply: Option<Quote>,
     /// The daemon's description of itself is open beside the log.
     pub(super) about_open: bool,
+    /// The daemon's board of open work and its routines are open beside the
+    /// log.
+    pub(super) work_open: bool,
     /// The agents whose instructions are folded open in it, by profile id.
     open_agents: HashSet<String>,
     /// The channel member whose removal is waiting for a second click.
@@ -203,6 +208,7 @@ impl SipilChat {
             open_calls: HashSet::new(),
             reply: None,
             about_open: false,
+            work_open: false,
             open_agents: HashSet::new(),
             confirm_remove: None,
             confirm_agent: None,
@@ -487,6 +493,7 @@ impl PilusView {
             self.sipil_chat.open_calls.clear();
             self.sipil_chat.reply = None;
             self.sipil_chat.about_open = false;
+            self.sipil_chat.work_open = false;
             self.sipil_chat.open_agents.clear();
             self.sipil_chat.confirm_remove = None;
             self.sipil_chat.confirm_agent = None;
@@ -772,6 +779,7 @@ impl PilusView {
                     .flex_shrink_0()
                     .gap_2()
                     .child(status)
+                    .children(self.work_toggle(cx))
                     .children(self.about_toggle(cx)),
             );
 
@@ -940,6 +948,8 @@ impl PilusView {
             .and_then(|id| self.sipil.transcript.iter().position(|item| item.id == id));
         if let Some(root) = thread {
             body = body.child(self.thread_panel(root, fonts, &log_settings, cx));
+        } else if self.sipil_chat.work_open && self.watched_board().is_some() {
+            body = body.child(self.work_panel(fonts, cx));
         } else if self.sipil_chat.about_open && self.sipil.watched_channel().is_some() {
             body = body.child(self.channel_panel(fonts, cx));
         } else if self.sipil_chat.about_open
@@ -965,6 +975,275 @@ impl PilusView {
             return None;
         }
         self.sipil.watched_daemon()?.about.as_ref()
+    }
+
+    /// The board and routines of the daemon of the open conversation, when it
+    /// is a conversation with a daemon that keeps them.
+    fn watched_board(&self) -> Option<(&WorkBoard, &[Routine])> {
+        if !matches!(self.sipil.watch, Watch::On(..)) {
+            return None;
+        }
+        let daemon = self.sipil.watched_daemon()?;
+        if daemon.board_unsupported {
+            return None;
+        }
+        Some((daemon.work.as_ref()?, daemon.routines.as_slice()))
+    }
+
+    /// The header's button for the daemon's board of open work: none for a
+    /// person, a channel, or a daemon from before the board. It reads how many
+    /// items wait on someone, since those are the ones to look at.
+    fn work_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (board, routines) = self.watched_board()?;
+        let theme = self.theme;
+        let open = self.sipil_chat.work_open;
+        let stuck = board.open.iter().filter(|item| item.stuck()).count();
+        let tip = if open {
+            "Hide open work".to_string()
+        } else {
+            work_summary(board, routines.len())
+        };
+        let button = style::icon_button(
+            "pilus-sipil-work-toggle",
+            include_bytes!("../../assets/icons/list-checks.svg"),
+            if open {
+                ButtonKind::Secondary
+            } else {
+                ButtonKind::Ghost
+            },
+            theme,
+            18.0,
+        )
+        .tooltip(row_tooltip(tip, theme.panel_fg, Vec::new(), theme))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.sipil_chat.work_open = !this.sipil_chat.work_open;
+            this.sipil_chat.about_open = false;
+            // It shares the side with a thread.
+            if this.sipil_chat.thread.take().is_some() {
+                this.sipil_chat.reply = None;
+            }
+            cx.notify();
+        }));
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(button)
+                .when(stuck > 0, |row| {
+                    row.child(
+                        div()
+                            .text_color(theme.alert)
+                            .font_weight(FontWeight::BOLD)
+                            .child(stuck.to_string()),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The daemon's board beside the log: what waits on someone first, then
+    /// what is moving and what is queued; its routines with when each runs
+    /// next; and what it closed lately. The agent keeps it; this only shows it.
+    fn work_panel(&self, fonts: style::Fonts, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let mono = style::mono_family(&self.shared_settings);
+        let Some((board, routines)) = self.watched_board() else {
+            return div();
+        };
+        let now = now_ms();
+        let heading = |text: String| {
+            div()
+                .pt_2()
+                .text_size(px(fonts.label))
+                .text_color(theme.muted)
+                .child(text.to_uppercase())
+        };
+        let mut panel = div()
+            .id("pilus-sipil-work-scroll")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_2()
+            .px_3()
+            .py_3()
+            .overflow_y_scroll();
+
+        panel = panel.child(heading(format!("Open · {}", board.open.len())));
+        if board.open.is_empty() {
+            panel = panel.child(div().text_color(theme.muted).child(
+                "Nothing open. The agent adds an item when it takes on work that outlasts a turn.",
+            ));
+        }
+        for item in &board.open {
+            let color = match item.state.as_str() {
+                "blocked" => theme.alert,
+                // The theme's own yellow: waiting is not an error, but it is not fine either.
+                "waiting" => theme.ansi[3],
+                "doing" => theme.accent,
+                _ => theme.muted,
+            };
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .border_1()
+                .border_color(if item.stuck() { color } else { theme.border })
+                .radius_md()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(fonts.label))
+                                .text_color(color)
+                                .child(item.state.to_uppercase()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme.fg)
+                                .child(item.title.clone()),
+                        ),
+                );
+            for (label, value) in [
+                ("Waiting on", &item.waiting_on),
+                ("Next", &item.next),
+                ("On it", &item.owner),
+            ] {
+                if !value.is_empty() {
+                    card = card.child(
+                        div()
+                            .text_color(theme.muted)
+                            .child(format!("{label}: {value}")),
+                    );
+                }
+            }
+            if item.updated_at > 0 {
+                card = card.child(
+                    div()
+                        .text_size(px(fonts.label))
+                        .text_color(theme.muted)
+                        .child(format!(
+                            "#{} · changed {}",
+                            item.id,
+                            ago(item.updated_at, now)
+                        )),
+                );
+            }
+            panel = panel.child(card);
+        }
+
+        panel = panel.child(heading(format!("Routines · {}", routines.len())));
+        if routines.is_empty() {
+            panel = panel.child(
+                div()
+                    .text_color(theme.muted)
+                    .child("No routines. Ask the agent to do something on a schedule."),
+            );
+        }
+        for routine in routines {
+            let next = if routine.paused {
+                "paused".to_string()
+            } else {
+                routine.next_run_at.map_or_else(
+                    || "not again".to_string(),
+                    |at| format!("next {}", until(at, now)),
+                )
+            };
+            let last = match (routine.last_run_at, routine.last_outcome.as_deref()) {
+                (Some(at), Some(outcome)) => format!("last {} ({outcome})", ago(at, now)),
+                _ => "never run".to_string(),
+            };
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .border_1()
+                    .border_color(if routine.last_outcome.as_deref() == Some("failed") {
+                        theme.alert
+                    } else {
+                        theme.border
+                    })
+                    .radius_md()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme.fg)
+                            .child(routine.name.clone()),
+                    )
+                    .child(div().text_color(theme.muted).child(format!(
+                        "{} {} · {next} · {last}",
+                        routine.schedule, routine.timezone
+                    ))),
+            );
+        }
+
+        if !board.closed.is_empty() {
+            panel = panel.child(heading("Recently closed".to_string()));
+            for closed in board.closed.iter().take(CLOSED_SHOWN) {
+                panel = panel.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_color(theme.fg).child(closed.title.clone()))
+                        .child(div().text_color(theme.muted).child(format!(
+                            "{} · {}",
+                            closed.outcome,
+                            ago(closed.closed_at, now)
+                        ))),
+                );
+            }
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w(px(SIDE_PANEL))
+            .h_full()
+            .border_l_1()
+            .border_color(theme.border)
+            .font_family(mono)
+            .text_size(px(fonts.secondary))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .text_size(px(fonts.label))
+                    .text_color(theme.muted)
+                    .child("WORK")
+                    .child(
+                        style::icon_button(
+                            "pilus-sipil-work-close",
+                            include_bytes!("../../assets/icons/x.svg"),
+                            ButtonKind::Ghost,
+                            theme,
+                            18.0,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sipil_chat.work_open = false;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .child(panel)
     }
 
     /// The header's button for the daemon's own page: none for a conversation
@@ -1005,6 +1284,7 @@ impl PilusView {
             ))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.sipil_chat.about_open = !this.sipil_chat.about_open;
+                this.sipil_chat.work_open = false;
                 // It shares the side with a thread.
                 if this.sipil_chat.thread.take().is_some() {
                     this.sipil_chat.reply = None;
@@ -2430,7 +2710,7 @@ impl PilusView {
     /// A message's text. Plain talk is set plain; anything that reads as
     /// Markdown (emphasis, code, lists, headings, links, quotes, tables, more
     /// than one paragraph) is parsed and drawn as a document, once per text.
-    fn chat_text(
+    pub(super) fn chat_text(
         &self,
         text: &str,
         color: gpui::Rgba,
@@ -2540,6 +2820,56 @@ fn daemon_mark(daemon: &sipil::Daemon, size: f32, theme: Theme) -> AnyElement {
 
 /// The ids of the calls in view. A result whose call is among them is drawn
 /// under it and has no row of its own.
+/// How many recently closed items the work panel lists.
+const CLOSED_SHOWN: usize = 5;
+
+/// The time now, in Unix milliseconds, as the daemon writes times.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// How long ago `at` was, shortly: "just now", "5m ago", "3h ago", "2d ago".
+fn ago(at: u64, now: u64) -> String {
+    let minutes = now.saturating_sub(at) / 60_000;
+    match minutes {
+        0 => "just now".to_string(),
+        1..60 => format!("{minutes}m ago"),
+        60..1440 => format!("{}h ago", minutes / 60),
+        _ => format!("{}d ago", minutes / 1440),
+    }
+}
+
+/// How far off `at` is, shortly: "in 5m", "in 3h", "in 2d"; "now" once due.
+fn until(at: u64, now: u64) -> String {
+    let minutes = at.saturating_sub(now).div_ceil(60_000);
+    match minutes {
+        0 => "now".to_string(),
+        1..60 => format!("in {minutes}m"),
+        60..1440 => format!("in {}h", minutes / 60),
+        _ => format!("in {}d", minutes / 1440),
+    }
+}
+
+/// The work button's tooltip: how much is open, and how much of it waits on
+/// someone.
+fn work_summary(board: &WorkBoard, routines: usize) -> String {
+    let stuck = board.open.iter().filter(|item| item.stuck()).count();
+    let open = match (board.open.len(), stuck) {
+        (0, _) => "No open work".to_string(),
+        (n, 0) => format!("Open work: {n}"),
+        (n, stuck) => format!("Open work: {n}, {stuck} waiting on someone"),
+    };
+    match routines {
+        0 => open,
+        1 => format!("{open} · 1 routine"),
+        n => format!("{open} · {n} routines"),
+    }
+}
+
 fn known_calls(items: &[TranscriptItem]) -> HashSet<&str> {
     items
         .iter()
@@ -2777,6 +3107,40 @@ mod tests {
             watch,
             ..SipilState::default()
         }
+    }
+
+    #[test]
+    fn times_on_the_board_read_shortly_both_ways() {
+        let now = 10 * 86_400_000;
+        assert_eq!(ago(now, now), "just now");
+        assert_eq!(ago(now - 5 * 60_000, now), "5m ago");
+        assert_eq!(ago(now - 3 * 3_600_000, now), "3h ago");
+        assert_eq!(ago(now - 2 * 86_400_000, now), "2d ago");
+        assert_eq!(until(now, now), "now");
+        assert_eq!(until(now + 90_000, now), "in 2m");
+        assert_eq!(until(now + 3 * 3_600_000, now), "in 3h");
+        assert_eq!(until(now + 2 * 86_400_000, now), "in 2d");
+    }
+
+    #[test]
+    fn the_work_button_says_what_waits_on_someone() {
+        let item = |state: &str| pilus_client::sipil::WorkItem {
+            state: state.to_string(),
+            ..Default::default()
+        };
+        let board = |states: &[&str]| WorkBoard {
+            open: states.iter().map(|s| item(s)).collect(),
+            closed: Vec::new(),
+        };
+        assert_eq!(work_summary(&board(&[]), 0), "No open work");
+        assert_eq!(
+            work_summary(&board(&["doing", "todo"]), 1),
+            "Open work: 2 · 1 routine"
+        );
+        assert_eq!(
+            work_summary(&board(&["blocked", "waiting", "doing"]), 3),
+            "Open work: 3, 2 waiting on someone · 3 routines"
+        );
     }
 
     #[test]

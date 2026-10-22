@@ -21,6 +21,7 @@ use pilus_client::{ControlClient, SshTarget};
 use pilus_index::{Agent, Filter, Index, Report, Session, Source};
 
 use super::mission::row_fills;
+use super::session_view::Origin;
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::tasks::{age_label, unix_now};
 use super::text_input::TextField;
@@ -44,7 +45,7 @@ pub(super) struct Choice {
     pub(super) key: String,
     pub(super) label: String,
     /// How to reach it; `None` is this Mac.
-    target: Option<SshTarget>,
+    pub(super) target: Option<SshTarget>,
 }
 
 /// What a background thread reports back.
@@ -56,12 +57,22 @@ enum Msg {
     },
     /// Every machine has been tried.
     Finished,
-    /// A resume reached the daemon, or did not.
+    /// A resume or fork reached the daemon, or did not.
     Resumed {
         endpoint: EndpointId,
         title: String,
+        how: Reopen,
         result: Result<(), String>,
     },
+}
+
+/// What is done with a session that is opened again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Reopen {
+    /// Carry on in the same session.
+    Continue,
+    /// Start a new session from its history and leave the original as it is.
+    Fork,
 }
 
 /// The page's state.
@@ -85,7 +96,7 @@ pub(super) struct SearchPage {
     pub(super) synced_at: Option<Instant>,
     /// The last failure per machine key, cleared by its next good read.
     errors: BTreeMap<String, String>,
-    resuming: bool,
+    pub(super) resuming: bool,
     scroll: ScrollHandle,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -366,6 +377,7 @@ impl PilusView {
                         if report.indexed + report.removed > 0 {
                             self.search_requery();
                             self.stats_reload();
+                            self.overview_reload_sessions();
                         }
                     }
                     Err(error) => {
@@ -377,21 +389,32 @@ impl PilusView {
                     self.search.synced_at = Some(Instant::now());
                     self.search_requery();
                     self.stats_reload();
+                    self.overview_reload_sessions();
                 }
                 Msg::Resumed {
                     endpoint,
                     title,
+                    how,
                     result,
                 } => {
                     self.search.resuming = false;
                     match result {
                         Ok(()) => {
-                            self.toast(ToastKind::Info, format!("Resumed {title}"));
+                            let said = match how {
+                                Reopen::Continue => "Resumed",
+                                Reopen::Fork => "Forked",
+                            };
+                            self.toast(ToastKind::Info, format!("{said} {title}"));
                             self.search.close();
+                            self.close_home_page();
                             self.activate_endpoint(endpoint, None, None, cx);
                         }
                         Err(error) => {
-                            self.toast(ToastKind::Error, format!("Couldn't resume: {error}"));
+                            let did = match how {
+                                Reopen::Continue => "resume",
+                                Reopen::Fork => "fork",
+                            };
+                            self.toast(ToastKind::Error, format!("Couldn't {did}: {error}"));
                         }
                     }
                 }
@@ -401,7 +424,7 @@ impl PilusView {
             .search
             .synced_at
             .is_none_or(|at| at.elapsed() >= RESYNC);
-        let watched = self.search.open || self.stats.is_open();
+        let watched = self.search.open || self.stats.is_open() || self.overview.is_open();
         if watched && self.settings.index_agents && !self.search.syncing && due {
             self.search_sync();
         }
@@ -409,8 +432,9 @@ impl PilusView {
     }
 
     /// Reopen `session` in a pane: its folder as a workspace on its machine
-    /// (or the one already open), then the agent's own resume.
-    fn search_resume(&mut self, session: &Session, cx: &mut Context<Self>) {
+    /// (or the one already open), then the agent's own resume, or, for a fork,
+    /// a new session that starts from `session`'s history.
+    pub(super) fn search_reopen(&mut self, session: &Session, how: Reopen, cx: &mut Context<Self>) {
         if self.search.resuming {
             return;
         }
@@ -426,10 +450,12 @@ impl PilusView {
         let title = session.title.clone();
         let agent = session.agent;
         std::thread::spawn(move || {
-            let result = resume(&mut client, agent, &cwd, &id).map_err(|error| error.to_string());
+            let result =
+                resume(&mut client, agent, &cwd, &id, how).map_err(|error| error.to_string());
             tx.send(Msg::Resumed {
                 endpoint,
                 title,
+                how,
                 result,
             })
             .ok();
@@ -441,6 +467,14 @@ impl PilusView {
     pub(super) fn search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         if event.keystroke.modifiers.platform {
+            return;
+        }
+        // An open session covers the results: Escape goes back to them.
+        if self.overview.session.is_open_from(Origin::Search) {
+            if key == "escape" {
+                self.overview.session.close();
+                cx.notify();
+            }
             return;
         }
         match key {
@@ -458,7 +492,7 @@ impl PilusView {
             }
             "enter" if self.settings.index_agents && !self.search.sources => {
                 if let Some(session) = self.search.results.get(self.search.selected).cloned() {
-                    self.search_resume(&session, cx);
+                    self.open_session_view(session, Origin::Search, cx);
                 }
             }
             _ => return,
@@ -477,31 +511,56 @@ fn resume(
     agent: Agent,
     cwd: &str,
     id: &str,
+    how: Reopen,
 ) -> pilus_client::Result<()> {
     if !cwd.is_empty() {
         client.open_workspace(cwd)?;
+    }
+    if how == Reopen::Fork {
+        // The daemon's own resume carries on in the session; only the agent's
+        // fork flag starts a new one.
+        return launch(client, agent, &fork_name(agent), agent.fork_args(id));
     }
     match client.resume_agent(id) {
         Err(error) if error.to_string().contains("no resumable session") => {
             let Some(flag) = agent.resume_flag() else {
                 return Err(error);
             };
-            // A fresh workspace opens with one shell pane; reuse it rather than
-            // splitting a second, empty terminal beside the agent.
-            let pane = client.idle_pane().ok().flatten();
-            client.start_agent(
+            launch(
+                client,
+                agent,
                 &launch_name(agent, id),
-                agent.kind(),
-                pane.as_deref(),
-                &[flag.to_string(), id.to_string()],
-            )?;
-            if let Some(pane) = pane.as_deref() {
-                client.focus_pane(pane).ok();
-            }
-            Ok(())
+                vec![flag.to_string(), id.to_string()],
+            )
         }
         other => other,
     }
+}
+
+/// Start `agent` with `args` in the workspace just opened.
+fn launch(
+    client: &mut ControlClient,
+    agent: Agent,
+    name: &str,
+    args: Vec<String>,
+) -> pilus_client::Result<()> {
+    // A fresh workspace opens with one shell pane; reuse it rather than
+    // splitting a second, empty terminal beside the agent.
+    let pane = client.idle_pane().ok().flatten();
+    client.start_agent(name, agent.kind(), pane.as_deref(), &args)?;
+    if let Some(pane) = pane.as_deref() {
+        client.focus_pane(pane).ok();
+    }
+    Ok(())
+}
+
+/// The pane alias for a fork. A fork has no id of its own to name it by, and a
+/// session can be forked more than once, so the clock tells them apart.
+fn fork_name(agent: Agent) -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    format!("{}-fork-{}", agent.kind(), seconds % 100_000)
 }
 
 /// The pane alias for a resumed session. The daemon accepts only
@@ -929,7 +988,7 @@ impl PilusView {
             .flex_shrink_0()
             .text_size(px(fonts.label))
             .text_color(theme.muted)
-            .child("↑↓ to move · Enter to resume · Esc to close");
+            .child("↑↓ to move · Enter to open · Esc to close");
 
         div().flex().flex_1().min_h(px(0.0)).justify_center().child(
             div()
@@ -1029,7 +1088,7 @@ impl PilusView {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.search.selected = index;
-                this.search_resume(&picked, cx);
+                this.open_session_view(picked.clone(), Origin::Search, cx);
             }))
     }
 }

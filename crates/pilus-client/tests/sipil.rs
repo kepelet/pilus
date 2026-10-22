@@ -554,6 +554,17 @@ fn the_real_daemon_asks_a_stranger_to_be_allowed_and_then_serves_it() {
                 .as_deref()
                 .is_some_and(|svg| svg.starts_with("<svg"))
         );
+        // The agent's board and routines: empty on a new daemon, and served.
+        let board = sipil.work().unwrap();
+        assert!(board.open.is_empty() && board.closed.is_empty());
+        assert!(sipil.routines().unwrap().is_empty());
+        assert!(
+            about.agents[0]
+                .tools
+                .iter()
+                .any(|tool| tool == "add_work" || tool == "create_routine")
+        );
+
         let session = sipil.create_session().unwrap();
         assert!(sipil.sessions().unwrap().iter().any(|s| s.id == session.id));
         let refused = sipil.send_message(&session.id, "hi", "r1").unwrap_err();

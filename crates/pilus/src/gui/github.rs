@@ -203,6 +203,27 @@ impl GithubFeed {
         self.login.as_deref()
     }
 
+    /// Whether `gh` has found the account, which is when its lists can be read.
+    pub(super) fn ready(&self) -> bool {
+        matches!(self.reach, Reach::Ready { .. })
+    }
+
+    /// `gh` is not installed, which the sidebar answers by drawing nothing.
+    pub(super) fn missing(&self) -> bool {
+        matches!(self.reach, Reach::Down { missing: true, .. })
+    }
+
+    /// Why GitHub can't be read, in words for the person, once `gh` has said.
+    pub(super) fn unreachable_note(&self) -> Option<String> {
+        match &self.reach {
+            Reach::Down { missing: true, .. } => {
+                Some("The GitHub CLI (gh) isn't installed on this Mac.".to_string())
+            }
+            Reach::Down { advice, .. } => Some(advice.clone()),
+            _ => None,
+        }
+    }
+
     fn running(&self) -> bool {
         self.reach != Reach::Idle
     }

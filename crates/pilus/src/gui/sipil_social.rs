@@ -914,20 +914,6 @@ pub(super) struct Latest {
     pub(super) unread: u64,
 }
 
-/// What the agent of `daemon`'s conversation `conversation` last said, from the
-/// remembered copy of it, with when (0 when the daemon never dated it). `None`
-/// until that conversation has been opened once.
-pub(super) fn last_said(daemon: &str, conversation: &str) -> Option<(String, u64)> {
-    let (items, _) = stores().offline.transcript(daemon, conversation)?;
-    items
-        .into_iter()
-        .rev()
-        .find(|item| {
-            item.role == ItemRole::Assistant && item.error.is_none() && !item.text.trim().is_empty()
-        })
-        .map(|item| (item.text, item.at.unwrap_or(0)))
-}
-
 /// The newest line across the contacts' and channels' threads and the primary
 /// agents' remembered conversations. All of it is read from this device's own
 /// store, so it works with the network down and never dials anyone.

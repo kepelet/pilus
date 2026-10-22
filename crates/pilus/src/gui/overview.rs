@@ -6,9 +6,9 @@
 //! daemons' boards. It owns no data of its own:
 //! every block is another feature's, read through that feature's own gate.
 //!
-//! - Agents are the daemons' agents (any endpoint) and the sipil daemons'
-//!   agents, ordered working, blocked, done, idle. A sipil daemon that is away
-//!   lists its agent as away and never as working.
+//! - Agents are the daemons' agents (any endpoint), ordered working, blocked,
+//!   done, idle. A sipil daemon's agents are not listed: they have their own
+//!   rows in the sidebar, and their talk and work show in the blocks below.
 //! - Sessions are `pilus-index`'s newest rows, so they need the same
 //!   `Settings::index_agents` permission as Search and show its consent hint
 //!   until it is given. Nothing is read from a transcript here.
@@ -33,7 +33,6 @@ use gpui::{
     AnyElement, Context, Div, FontWeight, ObjectFit, RenderImage, ScrollHandle, Stateful,
     StyledImage, div, img, linear_color_stop, linear_gradient, prelude::*, px,
 };
-use pilus_client::sipil::Activity;
 use pilus_client::{ItemSummary, unix_seconds};
 use pilus_index::{Filter, Index, Session, Transcript};
 
@@ -82,15 +81,12 @@ const MESSAGE_HEIGHT: f32 = 200.0;
 pub(super) enum Target {
     /// A pane of a daemon's endpoint.
     Pane { endpoint: EndpointId, pane: String },
-    /// A sipil conversation.
-    Chat(Watch),
 }
 
 /// An agent the page lists.
 #[derive(Clone)]
 pub(super) struct Listed {
-    /// `working`, `blocked`, `done`, `idle`, or `away` for a sipil agent whose
-    /// daemon is not connected.
+    /// `working`, `blocked`, `done` or `idle`.
     pub(super) status: String,
     pub(super) glyph: &'static [u8],
     pub(super) name: String,
@@ -424,8 +420,7 @@ impl PilusView {
         changed
     }
 
-    /// Every agent, the working ones first, then blocked, done, idle and away.
-    /// Daemons' panes come before sipil's within a status.
+    /// Every daemon's agent, the working ones first, then blocked, done and idle.
     pub(super) fn overview_agents(&self) -> Vec<Listed> {
         if let Some(sample) = &self.overview.sample {
             return sample.agents.clone();
@@ -462,40 +457,6 @@ impl PilusView {
                         cwd: self.expand_cwd(&id.key(), &agent.cwd),
                         session: agent.session.clone(),
                     }),
-                });
-            }
-        }
-        for daemon in &self.sipil.daemons {
-            let single = daemon.agents.len() == 1;
-            for agent in &daemon.agents {
-                // A daemon that is away is never shown as working.
-                let (status, place) = if !daemon.connected() {
-                    ("away", "sipil · away")
-                } else if agent.status == Activity::Working {
-                    ("working", "sipil")
-                } else {
-                    ("idle", "sipil")
-                };
-                let mut detail = place.to_string();
-                if let Some(about) = daemon
-                    .about
-                    .as_ref()
-                    .filter(|about| !about.workspace.is_empty())
-                {
-                    detail.push_str(" · ");
-                    detail.push_str(&about.workspace);
-                }
-                agents.push(Listed {
-                    status: status.to_string(),
-                    glyph: include_bytes!("../../assets/icons/pilus-mark.svg"),
-                    name: if single {
-                        daemon.name()
-                    } else {
-                        agent.name.clone()
-                    },
-                    detail,
-                    target: Target::Chat(Watch::On(daemon.id.clone(), agent.id.clone())),
-                    lookup: None,
                 });
             }
         }
@@ -935,7 +896,7 @@ impl PilusView {
                     .into_any_element()
             };
             // Working says so with its spinner; the others spell it out.
-            let detail = if agent.status == "working" || agent.status == "away" {
+            let detail = if agent.status == "working" {
                 agent.detail.clone()
             } else if agent.detail.is_empty() {
                 super::status_label(&agent.status)
@@ -1506,17 +1467,6 @@ impl PilusView {
                     target: Target::Pane {
                         endpoint: EndpointId::Local,
                         pane: "%5".to_string(),
-                    },
-                    lookup: None,
-                },
-                Listed {
-                    status: "idle".to_string(),
-                    glyph: include_bytes!("../../assets/icons/pilus-mark.svg"),
-                    name: "Chief of staff".to_string(),
-                    detail: "sipil".to_string(),
-                    target: Target::Pane {
-                        endpoint: EndpointId::Local,
-                        pane: "%6".to_string(),
                     },
                     lookup: None,
                 },

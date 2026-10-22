@@ -11,14 +11,9 @@
 //!   permission, for a machine over SSH, or for an agent that is waiting on a
 //!   question (which is on its screen, not in its transcript), the panel shows
 //!   the tail of the screen (`agent.read`) instead.
-//! - A sipil agent's is its newest line in the copy this pilus keeps of the
-//!   conversation, which is there once the conversation has been opened.
 //!
-//! A reply goes where the sidebar's rows would take you: `agent.prompt` for a
-//! terminal agent, the conversation's own `send` for a sipil agent, which queues
-//! it when the daemon is away. Stop closes the agent's pane (the daemon's
-//! `pane.close`), after a second press; a sipil agent has no pane of this
-//! window's to close, so it has no Stop.
+//! A reply is `agent.prompt`. Stop closes the agent's pane (the daemon's
+//! `pane.close`), after a second press.
 //!
 //! Every call runs on a worker thread and answers through the page's channel;
 //! the GUI thread only builds the request.
@@ -30,8 +25,6 @@ use gpui::{Context, Div, KeyDownEvent, MouseButton, div, prelude::*, px};
 use pilus_index::{Agent, Index, last_reply_local};
 
 use super::overview::{Listed, Msg, Target};
-use super::sipil::{self, Watch};
-use super::sipil_social;
 use super::style::{self, ButtonKind, Fonts, RadiusExt};
 use super::tasks::{age_label, unix_now};
 use super::{PilusView, activity};
@@ -210,16 +203,6 @@ impl PilusView {
                     tx.send(Msg::Peek(target, found)).ok();
                 });
             }
-            Target::Chat(Watch::On(daemon, conversation)) => {
-                self.overview.agent.peek = match sipil_social::last_said(daemon, conversation) {
-                    Some((text, at)) => Peek::Said { text, at },
-                    None => Peek::Failed(
-                        "Nothing remembered of this conversation yet. Open it once to load it."
-                            .to_string(),
-                    ),
-                };
-            }
-            Target::Chat(_) => {}
         }
     }
 
@@ -284,7 +267,6 @@ impl PilusView {
                 self.leave_settings_page();
                 self.activate_endpoint(endpoint.clone(), None, Some(pane.clone()), cx);
             }
-            Target::Chat(watch) => self.open_sipil_chat(watch.clone(), cx),
         }
     }
 
@@ -313,10 +295,6 @@ impl PilusView {
                         .map_err(|error| format!("Couldn't send the reply: {error}"));
                     tx.send(Msg::Done(result)).ok();
                 });
-            }
-            Target::Chat(watch) => {
-                sipil::send_in(watch, text, None);
-                self.toast(super::toast::ToastKind::Info, "Reply sent");
             }
         }
         // It is working on it now, so the panel has done its job.

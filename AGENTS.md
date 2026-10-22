@@ -380,21 +380,20 @@ with only the command-line tools can build the app.
   front (`SessionView::extend`), so a long session is never read whole unasked.
 - Home (`gui/overview.rs`, the row below Open Workspace; the new-agent composer
   is `home.rs` and is called "New Agent") is read-only and owns no data: the
-  every agent, in a Working now card and an Idle agents card (blocked, done, idle; a sipil daemon that is away lists its agent as away, never working), each with its workspace, folder and branch, the
+  every agent, in a Working now card and an Idle agents card (blocked, done, idle; the sipil daemons' agents are not listed, they have their own sidebar rows), each with its workspace, folder and branch, the
   newest ten rows of Search's index (same `Settings::index_agents` gate and
   consent hint; the file is opened per read, never held), open pull requests of
   the sidebar's repositories read through `GhAccount` on a worker thread (none
   at all with GitHub off), and the newest line in any chat thread or remembered
   daemon conversation (`sipil_social::latest`, local stores only, never dials).
   An idle agent's row opens a panel (`gui/overview_peek.rs`): its newest reply as
-  Markdown, a reply field (`agent.prompt`, or `sipil::send_in`, which queues for an
-  away daemon) and Stop, which closes a terminal agent's pane after a second press
-  (`pane.close`; a sipil agent has none, so no Stop). A terminal agent's reply is
+  Markdown, a reply field (`agent.prompt`) and Stop, which closes the agent's pane
+  after a second press (`pane.close`). A terminal agent's reply is
   the end of its transcript (`pilus_index::last_reply_local`, found through
   `Index::session_for`), read on demand, shown and kept nowhere, and only with
   `Settings::index_agents` and this Mac ticked; otherwise, over SSH, or for an
   agent waiting on a question, the panel shows the tail of its screen
-  (`agent.read`). A sipil agent's is its newest remembered line. The latest sipil
+  (`agent.read`). The latest sipil
   message is drawn by the chat page's own Markdown path (`chat_text`). The
   composer has no Issue picker; the page's Issues block lists them.
   Between the composer and the columns sit the latest sipil message and, when a connected daemon

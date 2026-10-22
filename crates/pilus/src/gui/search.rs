@@ -21,6 +21,7 @@ use pilus_client::{ControlClient, SshTarget};
 use pilus_index::{Agent, Filter, Index, Report, Session, Source};
 
 use super::mission::row_fills;
+use super::page_menu::PageAction;
 use super::session_view::Origin;
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::tasks::{age_label, unix_now};
@@ -82,6 +83,8 @@ pub(super) struct SearchPage {
     pub(super) sources: bool,
     /// Whether "Turn off" has been pressed once and awaits its second press.
     pub(super) confirm_off: bool,
+    /// Whether the page menu (Refresh, Sources, Close) is dropped.
+    menu: bool,
     pub(super) field: TextField,
     /// The text the results were last drawn for.
     query: String,
@@ -109,6 +112,7 @@ impl Default for SearchPage {
             open: false,
             sources: false,
             confirm_off: false,
+            menu: false,
             field: TextField::default(),
             query: String::new(),
             results: Vec::new(),
@@ -136,6 +140,7 @@ impl SearchPage {
         self.open = false;
         self.sources = false;
         self.confirm_off = false;
+        self.menu = false;
     }
 
     /// Whether the query field takes the keyboard: not while the permission
@@ -581,65 +586,33 @@ fn launch_name(agent: Agent, id: &str) -> String {
 impl PilusView {
     /// The page, drawn in place of the terminal card.
     pub(super) fn search_page(&mut self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme;
-        let fonts = style::Fonts::resolve(&self.shared_settings);
         let allowed = self.settings.index_agents;
 
-        let status = if !allowed {
-            "Off".to_string()
-        } else if self.search.syncing {
-            format!("{} sessions · indexing…", self.search.total)
-        } else {
-            format!("{} sessions", self.search.total)
-        };
-        let mut actions = div().flex().flex_row().items_center().gap_2();
+        let mut actions = Vec::new();
         if allowed {
-            actions = actions
-                .child(
-                    style::small_button(
-                        "pilus-search-refresh",
-                        "Refresh",
-                        ButtonKind::Secondary,
-                        theme,
-                        fonts.label,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.search_sync();
-                        cx.notify();
-                    })),
-                )
-                .child(
-                    style::small_button(
-                        "pilus-search-sources",
-                        "Sources",
-                        ButtonKind::Secondary,
-                        theme,
-                        fonts.label,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.search.sources = !this.search.sources;
-                        this.search.confirm_off = false;
-                        cx.notify();
-                    })),
-                );
+            actions.push(PageAction {
+                label: "Refresh",
+                run: |this, _| this.search_sync(),
+            });
+            actions.push(PageAction {
+                label: "Sources",
+                run: |this, _| {
+                    this.search.sources = !this.search.sources;
+                    this.search.confirm_off = false;
+                },
+            });
         }
-        let close = style::icon_button(
-            "pilus-search-close",
-            include_bytes!("../../assets/icons/x.svg"),
-            ButtonKind::Ghost,
-            theme,
-            style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL),
-        )
-        .tooltip(super::row_tooltip(
-            "Close".to_string(),
-            theme.panel_fg,
-            Vec::new(),
-            theme,
-        ))
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.search.close();
-            cx.notify();
-        }));
+        actions.push(PageAction {
+            label: "Close",
+            run: |this, _| this.search.close(),
+        });
+        let menu = self.page_menu(
+            "search",
+            self.search.menu,
+            actions,
+            |this| &mut this.search.menu,
+            cx,
+        );
 
         let bar = div()
             .flex()
@@ -647,9 +620,10 @@ impl PilusView {
             .items_center()
             .justify_end()
             .flex_shrink_0()
+            .gap_3()
             .px_4()
             .pt_3()
-            .child(close);
+            .child(menu);
         if !allowed || self.search.sources {
             return div()
                 .flex()
@@ -659,26 +633,13 @@ impl PilusView {
                 .child(bar)
                 .child(self.search_consent(cx));
         }
-        let trailing = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .flex_shrink_0()
-            .gap_3()
-            .child(
-                div()
-                    .text_size(px(fonts.label))
-                    .text_color(theme.muted)
-                    .child(status),
-            )
-            .child(actions);
         div()
             .flex()
             .flex_col()
             .size_full()
             .min_h(px(0.0))
             .child(bar)
-            .child(self.search_results(trailing, cx))
+            .child(self.search_results(cx))
     }
 
     /// The permission card, and the sources panel once it has been given.
@@ -817,7 +778,7 @@ impl PilusView {
     }
 
     /// The query, its filters and the matching sessions.
-    fn search_results(&self, trailing: Div, cx: &mut Context<Self>) -> Div {
+    fn search_results(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let height = style::scaled(&self.shared_settings, style::CONTROL_HEIGHT);
@@ -842,7 +803,13 @@ impl PilusView {
         .text_size(px(fonts.body));
 
         let allowed = self.search_allowed();
-        let mut filters = div().flex().flex_row().flex_wrap().items_center().gap_2();
+        let mut filters = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .justify_center()
+            .gap_2();
         if allowed.len() > 1 {
             let mut machines = style::segmented(theme).child(
                 style::segment(
@@ -912,15 +879,6 @@ impl PilusView {
             );
         }
         filters = filters.child(agents);
-        let filters = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .child(filters.flex_1().min_w(px(0.0)))
-            .child(trailing);
-
         let mut problems = div().flex().flex_col().gap_1();
         for (key, error) in &self.search.errors {
             let who = self
@@ -999,8 +957,8 @@ impl PilusView {
                 .max_w(px(style::scaled(&self.shared_settings, 880.0)))
                 .px_4()
                 .pb_3()
-                .child(div().flex().flex_row().child(field))
                 .child(filters)
+                .child(div().flex().flex_row().child(field))
                 .child(problems)
                 .child(list)
                 .child(hint),

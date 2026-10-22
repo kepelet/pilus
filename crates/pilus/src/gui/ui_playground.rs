@@ -2217,6 +2217,39 @@ impl Render for UiPlaygroundView {
             )
             .child(
                 self.section(
+                    "PAGE MENU",
+                    self.tray(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .gap_3()
+                            .child(style::icon_button(
+                                "pg-page-menu",
+                                include_bytes!("../../assets/icons/ellipsis-vertical.svg"),
+                                ButtonKind::Ghost,
+                                theme,
+                                style::scaled(&self.settings, style::CONTROL_HEIGHT_SMALL),
+                            ))
+                            .child(
+                                super::picker_menu("pg-page-menu-list", theme)
+                                    .w(px(style::scaled(&self.settings, 150.0)))
+                                    .children(["Refresh", "Sources", "Close"].map(|label| {
+                                        super::picker_row(
+                                            format!("pg-page-menu-{label}"),
+                                            label.to_string(),
+                                            false,
+                                            theme,
+                                            self.fonts().body,
+                                            |_, _, _| {},
+                                        )
+                                    })),
+                            ),
+                    ),
+                ),
+            )
+            .child(
+                self.section(
                     "TABS",
                     self.tray(
                         div()

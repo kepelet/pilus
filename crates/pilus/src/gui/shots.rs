@@ -1085,6 +1085,14 @@ pub fn run_main() -> Result<()> {
         capture(&mut cx, window.into(), &format!("main-stats-{name}"))?;
     }
     cx.update(|app| {
+        view.update(app, |view, cx| view.stats_show_menus(cx));
+    });
+    settle(&mut cx, 12);
+    capture(&mut cx, window.into(), "main-stats-menus")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| view.stats_show_sample(true, cx));
+    });
+    cx.update(|app| {
         view.update(app, |view, cx| view.overview_show_sample(true, true, cx));
     });
     settle(&mut cx, 12);

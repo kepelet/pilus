@@ -15,6 +15,7 @@ use gpui::{Context, Div, FontWeight, KeyDownEvent, ScrollHandle, div, prelude::*
 use pilus_db::Db;
 use pilus_db::browse::{Cell, Rows, Summary};
 
+use super::page_menu::PageAction;
 use super::style::{self, ButtonKind, RadiusExt};
 use super::{PilusView, icon};
 
@@ -127,6 +128,8 @@ pub(super) struct DatabasePage {
     scroll: ScrollHandle,
     /// The rows are made up for a screenshot, not read from the real file.
     sample: bool,
+    /// Whether the page menu (Refresh, Close) is dropped.
+    menu: bool,
 }
 
 impl Default for DatabasePage {
@@ -142,6 +145,7 @@ impl Default for DatabasePage {
             rows: None,
             scroll: ScrollHandle::new(),
             sample: false,
+            menu: false,
         }
     }
 }
@@ -153,6 +157,7 @@ impl DatabasePage {
 
     pub(super) fn close(&mut self) {
         self.open = false;
+        self.menu = false;
         // What was on screen can name private conversations; keep none of it
         // while the page is shut.
         self.summary = None;
@@ -279,6 +284,22 @@ impl PilusView {
         } else {
             "pilus.db could not be opened, so this run keeps its state in memory only".to_string()
         };
+        let menu = self.page_menu(
+            "database",
+            self.database.menu,
+            vec![
+                PageAction {
+                    label: "Refresh",
+                    run: |this, _| this.database.read(),
+                },
+                PageAction {
+                    label: "Close",
+                    run: |this, _| this.database.close(),
+                },
+            ],
+            |this| &mut this.database.menu,
+            cx,
+        );
         let bar = div()
             .flex()
             .flex_row()
@@ -308,35 +329,7 @@ impl PilusView {
                             .child(subtitle),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(
-                        style::small_button(
-                            "pilus-database-refresh",
-                            "Refresh",
-                            ButtonKind::Secondary,
-                            theme,
-                            fonts.label,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.database.read();
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        style::small_button(
-                            "pilus-database-close",
-                            "Close",
-                            ButtonKind::Ghost,
-                            theme,
-                            fonts.label,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.close_database(cx))),
-                    ),
-            );
+            .child(menu);
         let body = match (&self.database.summary, &self.database.error) {
             (Some(_), _) => self.database_body(cx),
             (None, error) => div()
@@ -429,7 +422,13 @@ impl PilusView {
                 .border_r_0(),
             );
 
-        let mut chooser = div().flex().flex_row().flex_wrap().gap_1().px_4();
+        let mut chooser = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .justify_center()
+            .gap_1()
+            .px_4();
         for (index, table) in summary.tables.iter().enumerate() {
             chooser = chooser.child(
                 style::tab(

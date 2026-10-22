@@ -16,12 +16,16 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
-use gpui::{Context, Div, KeyDownEvent, ScrollHandle, div, prelude::*, px};
+use gpui::{
+    Anchor, AnyElement, Context, Div, KeyDownEvent, ScrollHandle, anchored, deferred, div, point,
+    prelude::*, px,
+};
 use pilus_index::{Cost, Hourly, Index, Overview, Ranked, Scope, Tokens};
 
-use super::style::{self, ButtonKind, RadiusExt};
+use super::page_menu::PageAction;
+use super::style::{self, RadiusExt};
 use super::tasks::unix_now;
-use super::{PilusView, icon};
+use super::{PICKER_CHIP_H, PICKER_MENU_MAX_H, PilusView, icon, picker_face, picker_menu};
 
 /// Weeks of history the heatmap shows.
 const HEAT_WEEKS: i64 = 52;
@@ -308,6 +312,10 @@ pub(super) struct StatsPage {
     open: bool,
     range: Range,
     machine: Option<String>,
+    /// Whether the machine picker's list is dropped.
+    machine_menu: bool,
+    /// Whether the page menu (Refresh, Sources, Close) is dropped.
+    actions_menu: bool,
     data: Option<Data>,
     reader: Option<Index>,
     /// Seconds east of UTC, read when the page opens.
@@ -323,6 +331,8 @@ impl Default for StatsPage {
             open: false,
             range: Range::Month,
             machine: None,
+            machine_menu: false,
+            actions_menu: false,
             data: None,
             reader: None,
             offset: 0,
@@ -339,6 +349,8 @@ impl StatsPage {
 
     pub(super) fn close(&mut self) {
         self.open = false;
+        self.machine_menu = false;
+        self.actions_menu = false;
     }
 }
 
@@ -398,6 +410,7 @@ impl PilusView {
 
     fn stats_set_machine(&mut self, machine: Option<String>, cx: &mut Context<Self>) {
         self.stats.machine = machine;
+        self.stats.machine_menu = false;
         self.stats_reload();
         cx.notify();
     }
@@ -504,11 +517,13 @@ impl PilusView {
         let allowed = self.settings.index_agents;
         let reading = allowed && !self.search.sources;
 
-        let mut actions = div().flex().flex_row().items_center().gap_2();
+        let mut range = None;
+        let mut machine = None;
+        let mut actions = Vec::new();
         if reading {
-            let mut range = style::segmented(theme);
+            let mut segments = style::segmented(theme);
             for choice in Range::ALL {
-                range = range.child(
+                segments = segments.child(
                     style::segment(
                         format!("pilus-stats-range-{}", choice.label()),
                         choice.label(),
@@ -520,63 +535,50 @@ impl PilusView {
                     .on_click(cx.listener(move |this, _, _, cx| this.stats_set_range(choice, cx))),
                 );
             }
-            actions = actions.child(range);
-            actions = actions
-                .child(
-                    style::small_button(
-                        "pilus-stats-refresh",
-                        "Refresh",
-                        ButtonKind::Secondary,
-                        theme,
-                        fonts.label,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.search_sync();
-                        cx.notify();
-                    })),
-                )
-                .child(
-                    style::small_button(
-                        "pilus-stats-sources",
-                        "Sources",
-                        ButtonKind::Secondary,
-                        theme,
-                        fonts.label,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.search.sources = true;
-                        cx.notify();
-                    })),
-                );
+            range = Some(segments);
+            machine = self.stats_machine_picker(cx);
+            actions.push(PageAction {
+                label: "Refresh",
+                run: |this, _| this.search_sync(),
+            });
+            actions.push(PageAction {
+                label: "Sources",
+                run: |this, _| this.search.sources = true,
+            });
         }
-        actions = actions.child(
-            style::icon_button(
-                "pilus-stats-close",
-                include_bytes!("../../assets/icons/x.svg"),
-                ButtonKind::Ghost,
-                theme,
-                style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL),
-            )
-            .tooltip(super::row_tooltip(
-                "Close".to_string(),
-                theme.panel_fg,
-                Vec::new(),
-                theme,
-            ))
-            .on_click(cx.listener(|this, _, _, cx| this.close_stats(cx))),
+        actions.push(PageAction {
+            label: "Close",
+            run: |this, cx| this.close_stats(cx),
+        });
+        let menu = self.page_menu(
+            "stats",
+            self.stats.actions_menu,
+            actions,
+            |this| &mut this.stats.actions_menu,
+            cx,
         );
 
+        // The range sits in the middle of the page; an equal flexible column
+        // on each side keeps it there whatever the sides hold.
+        let side = || {
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_w(px(0.0))
+                .items_center()
+        };
         let bar = div()
             .flex()
             .flex_row()
             .items_center()
-            .justify_end()
             .flex_shrink_0()
-            .flex_wrap()
             .gap_3()
             .px_4()
             .py_3()
-            .child(actions);
+            .child(side().justify_start().children(machine))
+            .children(range)
+            .child(side().justify_end().child(menu));
 
         let body = if !reading {
             self.search_consent(cx).into_any_element()
@@ -592,7 +594,79 @@ impl PilusView {
             .child(body)
     }
 
-    fn stats_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// Which machine the figures cover, as a dropdown. `None` when only one
+    /// machine is indexed, since there is nothing to choose.
+    fn stats_machine_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let allowed = self.search_allowed();
+        if allowed.len() < 2 {
+            return None;
+        }
+        let current = self.stats.machine.as_deref();
+        let label = allowed
+            .iter()
+            .find(|choice| Some(choice.key.as_str()) == current)
+            .map_or_else(|| "All machines".to_string(), |choice| choice.label.clone());
+        let open = self.stats.machine_menu;
+        let mut face = picker_face(
+            "pilus-stats-machine-picker",
+            icon(
+                include_bytes!("../../assets/icons/server.svg"),
+                14.0,
+                theme.muted,
+            )
+            .into_any_element(),
+            label,
+            150.0,
+            open,
+            theme.panel,
+            theme,
+            fonts.secondary,
+            cx.listener(|this, _, _, cx| {
+                this.stats.machine_menu = !this.stats.machine_menu;
+                cx.notify();
+            }),
+        );
+        if open {
+            let mut list = picker_menu("pilus-stats-machine-menu", theme)
+                .max_h(px(PICKER_MENU_MAX_H))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.stats.machine_menu = false;
+                    cx.notify();
+                }));
+            let rows = std::iter::once(("All machines".to_string(), None)).chain(
+                allowed
+                    .iter()
+                    .map(|choice| (choice.label.clone(), Some(choice.key.clone()))),
+            );
+            for (index, (label, key)) in rows.enumerate() {
+                list = list.child(super::picker_row(
+                    ("pilus-stats-machine-option", index),
+                    label,
+                    key.as_deref() == current,
+                    theme,
+                    fonts.body,
+                    cx.listener(move |this, _, _, cx| this.stats_set_machine(key.clone(), cx)),
+                ));
+            }
+            face = face.relative().child(
+                div().absolute().top(px(0.0)).left(px(0.0)).child(
+                    deferred(
+                        anchored()
+                            .anchor(Anchor::TopLeft)
+                            .offset(point(px(0.0), px(PICKER_CHIP_H + 4.0)))
+                            .snap_to_window_with_margin(px(8.0))
+                            .child(style::enter("pilus-stats-machine-enter", list)),
+                    )
+                    .with_priority(2),
+                ),
+            );
+        }
+        Some(face.into_any_element())
+    }
+
+    fn stats_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let Some(data) = self
@@ -697,37 +771,6 @@ impl PilusView {
             );
 
         let allowed = self.search_allowed();
-        let mut machines = div().flex().flex_row().items_center();
-        if allowed.len() > 1 {
-            let mut choices = style::segmented(theme).child(
-                style::segment(
-                    "pilus-stats-machine-all",
-                    "All machines",
-                    self.stats.machine.is_none(),
-                    true,
-                    theme,
-                    fonts.label,
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.stats_set_machine(None, cx))),
-            );
-            for choice in &allowed {
-                let key = choice.key.clone();
-                choices = choices.child(
-                    style::segment(
-                        format!("pilus-stats-machine-{}", choice.key),
-                        choice.label.clone(),
-                        self.stats.machine.as_deref() == Some(choice.key.as_str()),
-                        true,
-                        theme,
-                        fonts.label,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.stats_set_machine(Some(key.clone()), cx);
-                    })),
-                );
-            }
-            machines = machines.child(choices);
-        }
 
         // Only a page that spans machines needs to say which one a row is on.
         let spans_machines = self.stats.machine.is_none() && data.machines.len() > 1;
@@ -813,7 +856,6 @@ impl PilusView {
             .max_w(px(style::scaled(&self.shared_settings, 1040.0)))
             .pb_6()
             .child(tiles)
-            .child(machines.px_4())
             .child(div().px_4().child(self.stats_block("ACTIVITY", heat)))
             .child(
                 div()
@@ -1167,9 +1209,20 @@ impl PilusView {
 impl PilusView {
     /// Scroll the page to its end, as a long page is read.
     pub(super) fn stats_scroll_to_end(&mut self, cx: &mut Context<Self>) {
-        self.stats
-            .scroll
-            .set_offset(gpui::point(px(0.0), px(-100_000.0)));
+        self.stats.scroll.set_offset(point(px(0.0), px(-100_000.0)));
+        cx.notify();
+    }
+
+    /// The sample page with every machine ticked and both menus dropped.
+    pub(super) fn stats_show_menus(&mut self, cx: &mut Context<Self>) {
+        self.settings.index_machines = self
+            .search_choices()
+            .into_iter()
+            .map(|choice| choice.key)
+            .collect();
+        *self.shared_settings.borrow_mut() = self.settings.clone();
+        self.stats.machine_menu = true;
+        self.stats.actions_menu = true;
         cx.notify();
     }
 

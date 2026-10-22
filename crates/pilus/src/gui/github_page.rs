@@ -875,7 +875,7 @@ impl PilusView {
 
         let inside = &self.github_page.inside;
         let counts = summary.map(|repo| (repo.open_issues, repo.open_pulls));
-        let mut tabs = div().flex().flex_row().gap_1().px_3();
+        let mut tabs = div().flex().flex_row().justify_center().gap_1().px_3();
         for each in RepoTab::ALL {
             let count = match (each, counts) {
                 (RepoTab::Issues, Some((issues, _))) => Some(issues),

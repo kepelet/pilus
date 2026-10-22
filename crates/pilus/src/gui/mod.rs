@@ -45,6 +45,7 @@ mod orchestration;
 mod overview;
 mod overview_peek;
 mod session_view;
+mod page_menu;
 mod page_split;
 mod palette;
 mod pane_chrome;

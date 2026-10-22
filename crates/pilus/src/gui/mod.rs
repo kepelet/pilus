@@ -1970,6 +1970,10 @@ struct PilusView {
     sidebar_visible: bool,
     /// Whether the WORKSPACES section is collapsed to its header.
     workspaces_collapsed: bool,
+    /// Keys of the machines whose workspaces are folded under their row.
+    machines_collapsed: HashSet<String>,
+    /// The machine row toggled last and when, so only its chevron turns.
+    machine_toggled: Option<(String, Instant)>,
     /// Whether the AGENTS section is collapsed to its header.
     agents_collapsed: bool,
     /// Whether the SIPIL section is collapsed to its header.
@@ -2567,6 +2571,8 @@ impl PilusView {
             sidebar_revision: 0,
             sidebar_visible: true,
             workspaces_collapsed: false,
+            machines_collapsed: HashSet::new(),
+            machine_toggled: None,
             agents_collapsed: false,
             sipil_collapsed: false,
             sipil_badged: false,
@@ -13026,19 +13032,30 @@ impl PilusView {
     /// the second. The active workspace gets the pill.
     ///
     /// `host` is the machine name for a remote row, kept for the tooltip and
-    /// the leading server glyph; the row itself stays unlabelled. `compact`
-    /// drops the leading icon for rows nested under another row, which
-    /// already carries one.
+    /// the leading server glyph; the row itself stays unlabelled. `depth` is
+    /// how far the row hangs below its machine: 0 is the machine's own row, 1 a
+    /// workspace under it and 2 a worktree under that workspace. Anything
+    /// deeper than the machine row swaps its icon for the elbow. `foldable`
+    /// gives a machine's row the chevron that folds the workspaces below it.
     fn workspace_row(
         &self,
         endpoint: &EndpointId,
         workspace: &ShellWorkspace,
         host: Option<&str>,
-        compact: bool,
+        depth: usize,
+        foldable: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
-        let active = self.endpoint_selected(endpoint) && workspace.active;
+        // A folded machine keeps the pill when the workspace hidden below it
+        // is the active one, so the selection never disappears.
+        let hidden_active = foldable
+            && self.machine_folded(endpoint)
+            && self
+                .endpoint_workspaces(endpoint)
+                .iter()
+                .any(|other| other.active);
+        let active = self.endpoint_selected(endpoint) && (workspace.active || hidden_active);
         let remote = endpoint.machine_id().is_some();
         let selected = active;
         let cwd = self.shorten_cwd(&endpoint.key(), &workspace.cwd);
@@ -13065,7 +13082,7 @@ impl PilusView {
             .gap_2()
             .min_w_0()
             .text_size(px(self.chrome_font()));
-        if !compact {
+        {
             // Every leading glyph wears the shared box, so the workspace name
             // lands on the same column as the nav and agent labels.
             let glyph = |bytes: &'static [u8], size: f32, color: gpui::Rgba| {
@@ -13074,9 +13091,10 @@ impl PilusView {
                     .flex_shrink_0()
                     .child(icon(bytes, size, color))
             };
-            head = head.child(if workspace.nested {
-                // A worktree hangs off the workspace above it: an elbow
-                // ("|_") says so in place of the indent a deeper row needs.
+            head = head.child(if depth > 0 {
+                // A row below its machine (or a worktree below its workspace)
+                // hangs off the row above it: an elbow ("|_") says so in place
+                // of the indent a deeper row needs.
                 div()
                     .w(px(SIDEBAR_GLYPH))
                     .h(px(SIDEBAR_GLYPH))
@@ -13117,6 +13135,9 @@ impl PilusView {
             .truncate()
             .text_color(theme.panel_fg);
         head = head.child(name.child(title));
+        if foldable {
+            head = head.child(self.machine_fold_toggle(endpoint, cx));
+        }
 
         // Second line: the path grows and truncates; the branch rides at the
         // far right, where it competes with the path instead of the name.
@@ -13134,8 +13155,7 @@ impl PilusView {
                 .text_color(theme.muted)
                 .child(cwd),
         );
-        if !compact
-            && !workspace.nested
+        if !workspace.nested
             && let Some(branch) = workspace.branch.clone()
             && branch != workspace.name
         {
@@ -13172,8 +13192,8 @@ impl PilusView {
         if self.sidebar_workspace_paths {
             row = row.child(sub);
         }
-        if workspace.nested {
-            row = row.pl(px(SIDEBAR_ROW_PAD + SIDEBAR_NEST_INDENT));
+        if depth > 0 {
+            row = row.pl(px(SIDEBAR_ROW_PAD + SIDEBAR_NEST_INDENT * depth as f32));
         }
         let workspace_id = workspace.id.clone();
         let workspace_name = workspace.name.clone();
@@ -13940,7 +13960,8 @@ impl PilusView {
         });
     }
 
-    /// WORKSPACES: every open workspace on every connected endpoint.
+    /// WORKSPACES: every connected endpoint as a machine row, with the
+    /// workspaces opened on it hanging below.
     fn workspaces_section(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let section = div()
@@ -13968,10 +13989,45 @@ impl PilusView {
         let mut any = false;
         for id in self.connected_endpoints() {
             let host = id.machine_id().map(|_| self.endpoint_label(&id));
-            for workspace in self.endpoint_workspaces(&id) {
-                any = true;
-                children =
-                    children.child(self.workspace_row(&id, workspace, host.as_deref(), false, cx));
+            let workspaces = self.endpoint_workspaces(&id);
+            if workspaces.is_empty() {
+                continue;
+            }
+            any = true;
+            // The machine's home workspace is its row. Once a folder is opened
+            // the daemon may no longer list one, so the row is drawn anyway:
+            // the folder belongs under the machine, never in its place.
+            let home = workspaces
+                .iter()
+                .position(|workspace| self.is_home_workspace(&id, workspace));
+            let foldable = workspaces.len() > usize::from(home.is_some());
+            children = match home {
+                Some(index) => children.child(self.workspace_row(
+                    &id,
+                    &workspaces[index],
+                    host.as_deref(),
+                    0,
+                    foldable,
+                    cx,
+                )),
+                None => children.child(self.machine_row(&id, host.as_deref(), cx)),
+            };
+            if self.machine_folded(&id) {
+                continue;
+            }
+            for (index, workspace) in workspaces.iter().enumerate() {
+                if Some(index) == home {
+                    continue;
+                }
+                let depth = if workspace.nested { 2 } else { 1 };
+                children = children.child(self.workspace_row(
+                    &id,
+                    workspace,
+                    host.as_deref(),
+                    depth,
+                    false,
+                    cx,
+                ));
             }
         }
         if !any {
@@ -13995,6 +14051,123 @@ impl PilusView {
         // Collapsed sections drop their rows, so the fade replays each time
         // the section opens.
         section.child(style::enter("pilus-workspaces-rows", children))
+    }
+
+    /// Whether `workspace` is the machine's home directory, which the sidebar
+    /// names for the machine rather than for the user's folder.
+    fn is_home_workspace(&self, endpoint: &EndpointId, workspace: &ShellWorkspace) -> bool {
+        !workspace.nested && self.shorten_cwd(&endpoint.key(), &workspace.cwd) == "~"
+    }
+
+    /// Whether the machine's workspaces are folded under its row.
+    fn machine_folded(&self, endpoint: &EndpointId) -> bool {
+        self.machines_collapsed.contains(&endpoint.key())
+    }
+
+    /// The chevron at the end of a machine's row. It folds and unfolds the
+    /// workspaces below without selecting the machine, so the row's own click
+    /// stays "go there".
+    fn machine_fold_toggle(
+        &self,
+        endpoint: &EndpointId,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let key = endpoint.key();
+        let folded = self.machine_folded(endpoint);
+        let turning = self
+            .machine_toggled
+            .as_ref()
+            .is_some_and(|(last, at)| *last == key && at.elapsed() < SECTION_TURN_WINDOW);
+        let chevron_id = format!("pilus-machine-fold-{key}");
+        div()
+            .id(chevron_id.clone())
+            .w(px(SIDEBAR_GLYPH))
+            .flex_shrink_0()
+            .cursor_pointer()
+            .child(style::chevron(
+                chevron_id,
+                !folded,
+                turning,
+                12.0,
+                self.theme.muted,
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if !this.machines_collapsed.remove(&key) {
+                        this.machines_collapsed.insert(key.clone());
+                    }
+                    this.machine_toggled = Some((key.clone(), Instant::now()));
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// A machine's row when it has no home workspace to stand for it. It takes
+    /// the selection only while none of the machine's workspaces is active, so
+    /// one row lights per endpoint.
+    fn machine_row(
+        &self,
+        endpoint: &EndpointId,
+        host: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let title = self.endpoint_label(endpoint);
+        let selected = self.endpoint_selected(endpoint)
+            && (self.machine_folded(endpoint)
+                || !self
+                    .endpoint_workspaces(endpoint)
+                    .iter()
+                    .any(|workspace| workspace.active));
+        let icon_bytes: &'static [u8] = if endpoint.machine_id().is_some() {
+            include_bytes!("../../assets/icons/server.svg")
+        } else {
+            include_bytes!("../../assets/icons/folder.svg")
+        };
+        let mut lines = Vec::new();
+        if let Some(host) = host {
+            lines.push((format!("Host: {host}"), theme.muted));
+        }
+        let tip = row_tooltip(title.clone(), theme.panel_fg, lines, theme);
+        let target = endpoint.clone();
+        div()
+            .id(format!("pilus-machine-{}", endpoint.key()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .px(px(SIDEBAR_ROW_PAD))
+            .radius_md()
+            .cursor_pointer()
+            .text_size(px(self.chrome_font()))
+            .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
+            .child(style::hover_target(&self.sidebar_hover))
+            .tooltip(tip)
+            .child(div().w(px(SIDEBAR_GLYPH)).flex_shrink_0().child(icon(
+                icon_bytes,
+                SIDEBAR_GLYPH,
+                theme.muted,
+            )))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme.panel_fg)
+                    .child(title),
+            )
+            .child(self.machine_fold_toggle(endpoint, cx))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.leave_settings_page();
+                    this.activate_endpoint(target.clone(), None, None, cx);
+                }),
+            )
     }
 
     /// Placeholder rows for a sidebar list still in flight: a glyph dot and a

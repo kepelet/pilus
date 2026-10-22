@@ -22,6 +22,7 @@
 //!   this one's history, so the original is left as it was.
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -51,6 +52,11 @@ const OVERDRAW: f32 = 1200.0;
 const EARLIER_PREFETCH_ROWS: usize = 20;
 /// The machine key of this Mac in the index.
 const LOCAL: &str = "local";
+/// A message longer than this is set as several rows, cut at a blank line. A
+/// row is built whole on every frame it is in view, and a paragraph full of
+/// inline code is one element per word, so one long reply as one row made
+/// every scroll step lay out all of it.
+const CHUNK_BYTES: usize = 1_500;
 
 /// What the page knows of the conversation.
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -70,6 +76,78 @@ pub(super) enum Origin {
     Search,
 }
 
+/// Where a row sits in the card its entry is drawn as.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Place {
+    Only,
+    First,
+    Middle,
+    Last,
+}
+
+impl Place {
+    fn starts(self) -> bool {
+        matches!(self, Self::Only | Self::First)
+    }
+
+    fn ends(self) -> bool {
+        matches!(self, Self::Only | Self::Last)
+    }
+}
+
+/// One list row: the whole of an entry, or one stretch of a long message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Row {
+    entry: usize,
+    /// The bytes of the entry's text this row sets.
+    text: Range<usize>,
+    place: Place,
+}
+
+/// `text` cut into stretches of about [`CHUNK_BYTES`] at blank lines, never
+/// inside a fenced block, so each parses as Markdown on its own. Never empty.
+fn chunks(text: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let (mut start, mut at, mut fenced) = (0, 0, false);
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+        }
+        if !fenced && trimmed.is_empty() && at - start >= CHUNK_BYTES {
+            out.push(start..at);
+            start = at + line.len();
+        }
+        at += line.len();
+    }
+    if start < text.len() || out.is_empty() {
+        out.push(start..text.len());
+    }
+    out
+}
+
+/// The rows of `entries`, in order.
+fn rows_of(entries: &[Entry]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (entry, item) in entries.iter().enumerate() {
+        let spans = match item {
+            Entry::User { text, .. } | Entry::Assistant { text, .. } => chunks(text),
+            Entry::Tool { .. } => std::iter::once(0..0).collect(),
+        };
+        let last = spans.len() - 1;
+        for (at, text) in spans.into_iter().enumerate() {
+            let place = match (at, last) {
+                (0, 0) => Place::Only,
+                (0, _) => Place::First,
+                (at, last) if at == last => Place::Last,
+                _ => Place::Middle,
+            };
+            rows.push(Row { entry, text, place });
+        }
+    }
+    rows
+}
+
 /// The session on the page.
 pub(super) struct SessionView {
     open: Option<Session>,
@@ -77,8 +155,10 @@ pub(super) struct SessionView {
     load: Load,
     /// Where its transcript is read: `None` is this Mac.
     target: Option<SshTarget>,
-    /// The conversation so far, one list row each.
+    /// The conversation so far.
     entries: Vec<Entry>,
+    /// What the list draws: a row for each entry, or several for a long one.
+    rows: Vec<Row>,
     /// The file goes on before what has been read.
     earlier: bool,
     /// How much of the end of the file `entries` came from.
@@ -112,6 +192,7 @@ impl Default for SessionView {
             load: Load::Reading,
             target: None,
             entries: Vec::new(),
+            rows: Vec::new(),
             earlier: false,
             window: WINDOW,
             fetching: false,
@@ -139,7 +220,8 @@ impl SessionView {
     /// Show `transcript` from its end, as a conversation just opened.
     fn start(&mut self, transcript: Transcript) {
         self.load = Load::Ready;
-        self.list.reset(transcript.entries.len());
+        self.rows = rows_of(&transcript.entries);
+        self.list.reset(self.rows.len());
         self.list.set_follow_mode(FollowMode::Tail);
         self.list.scroll_to_end();
         self.entries = transcript.entries;
@@ -166,16 +248,19 @@ impl SessionView {
         let Some(lead) = lead.filter(|lead| lead + old.len() <= transcript.entries.len()) else {
             return self.start(transcript);
         };
+        let rows = rows_of(&transcript.entries);
+        let lead_rows = rows_of(&transcript.entries[..lead]).len();
         if lead > 0 {
-            self.list.splice(0..0, lead);
+            self.list.splice(0..0, lead_rows);
             self.expanded = self.expanded.iter().map(|index| index + lead).collect();
         }
         // What the session said meanwhile comes after.
-        let end = lead + old.len();
-        let added = transcript.entries.len().saturating_sub(end);
+        let end = lead_rows + self.rows.len();
+        let added = rows.len().saturating_sub(end);
         if added > 0 {
             self.list.splice(end..end, added);
         }
+        self.rows = rows;
         self.entries = transcript.entries;
         self.earlier = transcript.earlier;
     }
@@ -338,8 +423,10 @@ impl PilusView {
         if !view.expanded.remove(&index) {
             view.expanded.insert(index);
         }
-        // The row is taller or shorter now.
-        view.list.remeasure_items(index..index + 1);
+        // The row is taller or shorter now. A tool call is one row.
+        if let Some(row) = view.rows.iter().position(|row| row.entry == index) {
+            view.list.remeasure_items(row..row + 1);
+        }
         cx.notify();
     }
 
@@ -586,7 +673,10 @@ impl PilusView {
     /// One row of the list: the entry, in the page's column.
     fn session_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let view = &self.overview.session;
-        let (Some(entry), Some(session)) = (view.entries.get(ix), view.open.as_ref()) else {
+        let (Some(row), Some(session)) = (view.rows.get(ix), view.open.as_ref()) else {
+            return div().into_any_element();
+        };
+        let Some(entry) = view.entries.get(row.entry) else {
             return div().into_any_element();
         };
         div()
@@ -599,8 +689,8 @@ impl PilusView {
                     .w_full()
                     .max_w(px(style::scaled(&self.shared_settings, WIDTH)))
                     .px_4()
-                    .pb_3()
-                    .child(self.session_entry(session.agent, ix, entry, cx)),
+                    .when(row.place.ends(), |gap| gap.pb_3())
+                    .child(self.session_entry(session.agent, row, entry, cx)),
             )
             .into_any_element()
     }
@@ -608,13 +698,15 @@ impl PilusView {
     fn session_entry(
         &self,
         agent: Agent,
-        index: usize,
+        row: &Row,
         entry: &Entry,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let index = row.entry;
         let theme = self.theme;
         let fonts = Fonts::resolve(&self.shared_settings);
         let said = |who: String, at: i64, text: &str, fill: gpui::Rgba| {
+            let text = text.get(row.text.clone()).unwrap_or_default();
             let when = if at > 0 {
                 format!(
                     " · {} ago",
@@ -623,27 +715,37 @@ impl PilusView {
             } else {
                 String::new()
             };
-            div()
+            // A long message is several rows; the card's edges are drawn on
+            // the first and last, and its sides on all.
+            let card = div()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .p_3()
-                .radius_md()
-                .border_1()
+                .px_3()
                 .border_color(theme.border)
                 .bg(fill)
-                .child(style::section_label(
+                .border_l_1()
+                .border_r_1();
+            let card = match row.place {
+                Place::Only => card.py_3().border_t_1().border_b_1().radius_md(),
+                Place::First => card.pt_3().pb_1().border_t_1().radius_t_md(),
+                Place::Middle => card.py_1(),
+                Place::Last => card.pt_1().pb_3().border_b_1().radius_b_md(),
+            };
+            card.when(row.place.starts(), |card| {
+                card.child(style::section_label(
                     theme,
                     format!("{who}{when}").to_uppercase(),
                     fonts.label,
                 ))
-                .child(div().text_size(px(fonts.body)).child(self.chat_text(
-                    text,
-                    theme.panel_fg,
-                    fonts,
-                    &self.shared_settings,
-                )))
-                .into_any_element()
+            })
+            .child(div().text_size(px(fonts.body)).child(self.chat_text(
+                text,
+                theme.panel_fg,
+                fonts,
+                &self.shared_settings,
+            )))
+            .into_any_element()
         };
         match entry {
             Entry::User { text, at } => said("You".to_string(), *at, text, theme.panel),
@@ -787,5 +889,41 @@ mod tests {
         assert_eq!(view.entries.len(), 3);
         assert_eq!(view.list.item_count(), 3);
         assert!(view.expanded.is_empty());
+    }
+
+    #[test]
+    fn a_long_message_is_cut_at_blank_lines_and_never_inside_a_fence() {
+        let paragraph = "word ".repeat(400);
+        let fence = format!("```\n{paragraph}\n\n{paragraph}\n```");
+        let text = format!("{paragraph}\n\n{fence}\n\n{paragraph}");
+        let cuts = chunks(&text);
+        assert_eq!(cuts.len(), 3);
+        assert!(text[cuts[1].clone()].starts_with("```"));
+        assert!(text[cuts[1].clone()].trim_end().ends_with("```"));
+        let rejoined: String = cuts.iter().map(|cut| &text[cut.clone()]).collect();
+        assert_eq!(rejoined.replace('\n', ""), text.replace('\n', ""));
+    }
+
+    #[test]
+    fn a_short_message_is_one_row() {
+        assert_eq!(chunks("hello\n\nthere"), vec![0..12]);
+        assert_eq!(chunks(""), vec![0..0]);
+    }
+
+    #[test]
+    fn rows_say_where_a_long_message_begins_and_ends() {
+        let paragraph = "word ".repeat(400);
+        let long = format!("{paragraph}\n\n{paragraph}\n\n{paragraph}");
+        let mut view = SessionView::default();
+        view.start(Transcript {
+            entries: vec![said("short"), said(&long)],
+            earlier: false,
+        });
+        let places: Vec<Place> = view.rows.iter().map(|row| row.place).collect();
+        assert_eq!(
+            places,
+            [Place::Only, Place::First, Place::Middle, Place::Last]
+        );
+        assert_eq!(view.list.item_count(), 4);
     }
 }

@@ -156,6 +156,10 @@ pub(super) trait RadiusExt: Styled + Sized {
         self.rounded_t(Radius::Lg.pixels())
     }
 
+    fn radius_b_md(self) -> Self {
+        self.rounded_b(Radius::Md.pixels())
+    }
+
     fn radius_b_lg(self) -> Self {
         self.rounded_b(Radius::Lg.pixels())
     }

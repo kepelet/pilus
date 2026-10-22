@@ -1690,6 +1690,12 @@ impl PilusView {
                     "error[E0425]: cannot find value `calls` in this scope",
                     true,
                 ),
+                // Long enough to be several rows, which must read as one card.
+                say(
+                    &"A paragraph that names `read_transcript_local`, `chunks` and `Place` keeps every word of it a separate element, which is what made a long reply slow to scroll.\n\n"
+                        .repeat(10),
+                    4_000,
+                ),
                 say(
                     "The page reads the end of the transcript, so a long session costs one seek:\n\n- **Continue** resumes it in its folder\n- **Fork** starts a new session from its history\n\n```rust\nlet transcript = read_transcript_local(&path, agent)?;\n```",
                     3_700,

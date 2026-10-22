@@ -2171,9 +2171,9 @@ struct PilusView {
     /// A Home launch is in flight; the composer ignores a second send until it
     /// settles, since Home stays open until the agent is ready.
     home_launching: bool,
-    /// A workspace opened from the composer's picker, awaiting its catalog row
-    /// so the Workspace picker can select it.
-    home_pending_open: Option<String>,
+    /// A workspace opened from the composer's picker (its endpoint and absolute
+    /// path), awaiting its catalog row so the Workspace picker can select it.
+    home_pending_open: Option<(EndpointId, String)>,
     /// Whether the Settings page covers the terminal card.
     settings_open: bool,
     /// The Settings page's one-line status, above the page footer.
@@ -5355,7 +5355,10 @@ impl PilusView {
         // Opening from the Home composer's picker should leave the composer
         // targeting the workspace it just opened, once the catalog catches up.
         if self.home.is_open() {
-            self.home_pending_open = Some(path.clone());
+            self.home_pending_open = self.endpoint_for_source(&source).map(|endpoint| {
+                let path = self.expand_cwd(&endpoint.key(), &path);
+                (endpoint, path)
+            });
         }
         self.status = format!("opening {path}…");
         let tx = self.picker_tx.clone();
@@ -5924,10 +5927,16 @@ impl PilusView {
 
     /// Every open workspace the Home composer can launch into, across the
     /// connected endpoints, in picker order.
+    ///
+    /// A machine's home directory is its default, not a project, so it is not
+    /// offered: a launch with nothing picked is a fresh personal session.
     fn home_workspaces(&self) -> Vec<(EndpointId, &ShellWorkspace)> {
         let mut rows = Vec::new();
         for id in self.connected_endpoints() {
             for workspace in self.endpoint_workspaces(&id) {
+                if self.is_home_workspace(&id, workspace) {
+                    continue;
+                }
                 rows.push((id.clone(), workspace));
             }
         }
@@ -6039,6 +6048,9 @@ impl PilusView {
             workspace_labels.join("\u{1f}"),
         );
         if signature == self.home_sync_key {
+            // Opening a folder that is already open changes no label, so the
+            // pending pick is settled here too.
+            self.home_select_pending_open();
             return;
         }
         self.home_sync_key = signature;
@@ -6063,19 +6075,7 @@ impl PilusView {
             .choice_mut(HomeField::Workspace)
             .set(workspace_labels);
 
-        // A workspace opened from the composer's own picker lands in the
-        // catalog a tick later; select it then so Send targets it.
-        let pending = self.home_pending_open.clone();
-        let pending_index = pending.as_deref().and_then(|pending| {
-            self.home_workspaces().iter().position(|(id, workspace)| {
-                let cwd = self.expand_cwd(&id.key(), &workspace.cwd);
-                cwd == pending || canonical(&cwd) == canonical(pending)
-            })
-        });
-        if let Some(index) = pending_index {
-            self.home.choice_mut(HomeField::Workspace).choose(index);
-            self.home_pending_open = None;
-        }
+        self.home_select_pending_open();
 
         let models = self
             .home_agent()
@@ -6128,6 +6128,37 @@ impl PilusView {
             {
                 self.home.choice_mut(HomeField::Effort).choose(index);
             }
+        }
+    }
+
+    /// Select the workspace the composer's own picker just opened, once the
+    /// catalog lists it, so Send targets it rather than the previous pick.
+    ///
+    /// The folder is matched on its endpoint as well as its path: the same
+    /// path is usually open on this Mac and on a saved machine.
+    fn home_select_pending_open(&mut self) {
+        let Some((endpoint, path)) = self.home_pending_open.as_ref() else {
+            return;
+        };
+        let index = self.home_workspaces().iter().position(|(id, workspace)| {
+            let cwd = self.expand_cwd(&id.key(), &workspace.cwd);
+            id == endpoint && (cwd == *path || canonical(&cwd) == canonical(path))
+        });
+        if let Some(index) = index {
+            self.home.choice_mut(HomeField::Workspace).choose(index);
+            self.home_pending_open = None;
+        }
+    }
+
+    /// The endpoint a folder picker source belongs to.
+    fn endpoint_for_source(&self, source: &DirSource) -> Option<EndpointId> {
+        match source {
+            DirSource::Local => Some(EndpointId::Local),
+            DirSource::Remote(target) => self
+                .machines
+                .iter()
+                .find(|machine| machine.ssh_target().as_ref() == Some(target))
+                .map(|machine| EndpointId::Machine(machine.id.clone())),
         }
     }
 
@@ -6291,7 +6322,9 @@ impl PilusView {
             return;
         };
         let machine = endpoint.machine_id().map(str::to_string);
-        let location = workspace.cwd.clone();
+        // The daemon is handed the same absolute spelling the picker opens
+        // folders with, not the sidebar's `~` shorthand.
+        let location = self.expand_cwd(&endpoint.key(), &workspace.cwd);
         let args = self.home_launch_args();
         self.home_launching = true;
         self.home.set_status(format!("starting {agent}…"));

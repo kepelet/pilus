@@ -201,6 +201,9 @@ const SIDEBAR_NEST_INDENT: f32 = 4.0;
 /// Share of the selected pill's strength a hover fill carries, so hovering a
 /// row hints at the selection without matching it.
 const SIDEBAR_HOVER_WEIGHT: f32 = 0.6;
+/// How much of the selection pill the active workspace keeps while an agent
+/// is the focused row: enough to read as "still here", less than the agent.
+const SIDEBAR_CONTEXT_WEIGHT: f32 = 0.4;
 /// Box every leading sidebar glyph sits in, so labels share one column
 /// whatever the glyph is: chevron, folder, brand mark, or status dot.
 const SIDEBAR_GLYPH: f32 = 14.0;
@@ -1935,6 +1938,9 @@ struct PilusView {
     sidebar_hover: style::HoverSlot,
     /// The row the sidebar's selection pill is gliding to.
     sidebar_selection: style::GlideSlot,
+    /// The active workspace's quieter pill while a focused agent holds the
+    /// main selection, so the workspace the agent lives in stays marked.
+    sidebar_context: style::GlideSlot,
     /// The tab index the strip last scrolled to, so it only follows changes.
     tab_scrolled: std::cell::Cell<Option<u16>>,
     /// Where each tab was drawn last frame, so a reorder slides from there.
@@ -2565,6 +2571,7 @@ impl PilusView {
             tab_scroll: ScrollHandle::new(),
             sidebar_hover: style::HoverSlot::default(),
             sidebar_selection: style::GlideSlot::default(),
+            sidebar_context: style::GlideSlot::default(),
             tab_scrolled: std::cell::Cell::new(None),
             tab_bounds: style::BoundsLedger::default(),
             tab_slide: None,
@@ -5189,6 +5196,29 @@ impl PilusView {
             return selected == endpoint && *pane == agent.pane;
         }
         self.endpoint_selected(endpoint) && agent.focused
+    }
+
+    /// Whether an agent row in the sidebar is drawn as the selected one.
+    fn agent_pill_shown(&self) -> bool {
+        if self.agents_collapsed {
+            return false;
+        }
+        let scoped_workspace = if self.agents_this_workspace {
+            self.endpoint_workspaces(&self.active)
+                .iter()
+                .find(|workspace| workspace.active)
+                .map(|workspace| workspace.id.clone())
+        } else {
+            None
+        };
+        self.connected_endpoints().iter().any(|id| {
+            self.endpoint_agents(id).iter().any(|agent| {
+                scoped_workspace
+                    .as_ref()
+                    .is_none_or(|workspace| agent.workspace_id == *workspace)
+                    && self.agent_focused(id, agent)
+            })
+        })
     }
 
     /// Focus a workspace by id, switching the daemon's active workspace.
@@ -11165,6 +11195,16 @@ impl PilusView {
         ));
         // The selected row's raised fill is a second pill under the rows, so
         // changing the selection reads as motion, like the tab strip's.
+        // Beneath the main pill: the active workspace's softer mark while an
+        // agent row owns the selection.
+        content = content.child(style::glide(
+            "pilus-sidebar-context",
+            &self.sidebar_context,
+            self.theme
+                .sidebar_raise(self.glass_opacity(), SIDEBAR_CONTEXT_WEIGHT),
+            style::RADIUS_MD,
+            SIDEBAR_ROW_EDGE,
+        ));
         content = content.child(style::glide(
             "pilus-sidebar-selection",
             &self.sidebar_selection,
@@ -13127,6 +13167,13 @@ impl PilusView {
         let active = self.endpoint_selected(endpoint) && (workspace.active || hidden_active);
         let remote = endpoint.machine_id().is_some();
         let selected = active;
+        // A focused agent row takes the full pill; the workspace keeps a
+        // subtler one rather than going unmarked.
+        let pill = if self.agent_pill_shown() {
+            &self.sidebar_context
+        } else {
+            &self.sidebar_selection
+        };
         let cwd = self.shorten_cwd(&endpoint.key(), &workspace.cwd);
         // The home workspace is named for the machine it lives on, since its
         // own name is just the user's directory.
@@ -13253,7 +13300,7 @@ impl PilusView {
             .py_1()
             .radius_md()
             .cursor_pointer()
-            .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
+            .children(selected.then(|| style::glide_target(pill)))
             .child(style::hover_target(&self.sidebar_hover))
             .tooltip(tip)
             .child(head);
@@ -14222,6 +14269,11 @@ impl PilusView {
                     .endpoint_workspaces(endpoint)
                     .iter()
                     .any(|workspace| workspace.active));
+        let pill = if self.agent_pill_shown() {
+            &self.sidebar_context
+        } else {
+            &self.sidebar_selection
+        };
         let icon_bytes: &'static [u8] = if endpoint.machine_id().is_some() {
             include_bytes!("../../assets/icons/server.svg")
         } else {
@@ -14245,7 +14297,7 @@ impl PilusView {
             .radius_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
+            .children(selected.then(|| style::glide_target(pill)))
             .child(style::hover_target(&self.sidebar_hover))
             .tooltip(tip)
             .child(div().w(px(SIDEBAR_GLYPH)).flex_shrink_0().child(icon(

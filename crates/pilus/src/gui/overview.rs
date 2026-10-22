@@ -2,7 +2,8 @@
 //!
 //! Under a hero it lists the agents (working first, then the idle ones), the
 //! last ten agent sessions, the open pull requests of the repositories the sidebar shows, and
-//! the newest message in any sipil conversation. It owns no data of its own:
+//! the newest message in any sipil conversation and the open work on the sipil
+//! daemons' boards. It owns no data of its own:
 //! every block is another feature's, read through that feature's own gate.
 //!
 //! - Agents are the daemons' agents (any endpoint) and the sipil daemons'
@@ -16,6 +17,8 @@
 //!   limit is waited out. With GitHub off nothing is asked at all.
 //! - The newest sipil message is read from this device's own stores (the chat
 //!   threads and the daemons' remembered conversations) and never dials anyone.
+//! - Open work is each connected daemon's board as the sipil poller last read
+//!   it (`Daemon::work`), what waits on someone first. Nothing is asked here.
 //!
 //! A row opens the thing it names (the working agent's pane, the resumed
 //! session, the pull request, the conversation). An idle agent's row opens a
@@ -56,6 +59,8 @@ const PULL_REPOS: usize = 5;
 const PULLS: usize = 10;
 /// Issues the page lists, below the pull requests.
 const ISSUES: usize = 5;
+/// Items of open work the page lists before "more in the chat".
+const WORK_ROWS: usize = 6;
 /// How often an open page asks the account's cache about pull requests. The
 /// cache owns freshness, so this only has to be shorter than its lifetime.
 const PULLS_EVERY: Duration = Duration::from_secs(120);
@@ -101,6 +106,23 @@ pub(super) struct Sample {
     /// Whether the capture shows GitHub's blocks and the sipil message.
     github: bool,
     sipil: bool,
+    work: Vec<OpenWork>,
+}
+
+/// One item of open work on a daemon's board, with where it is kept.
+#[derive(Clone)]
+pub(super) struct OpenWork {
+    /// The daemon's name.
+    who: String,
+    title: String,
+    /// `todo`, `doing`, `waiting` or `blocked`.
+    state: String,
+    /// What it waits on, else its next step, else who is on it.
+    detail: String,
+    /// When it last changed, in Unix milliseconds.
+    updated_at: u64,
+    /// The daemon's primary agent, whose chat the row opens.
+    watch: Watch,
 }
 
 /// One finished GitHub read: the pull requests and the issues of the repositories.
@@ -480,6 +502,40 @@ impl PilusView {
         agents.sort_by_key(|agent| status_rank(&agent.status));
         agents
     }
+
+    /// The open work of every daemon that has a board, what waits on someone
+    /// first. `None` when no daemon has one, so the page has no block for it.
+    fn overview_work(&self) -> Option<Vec<OpenWork>> {
+        if let Some(sample) = &self.overview.sample {
+            return (!sample.work.is_empty()).then(|| sample.work.clone());
+        }
+        let mut boards = false;
+        let mut work = Vec::new();
+        for daemon in &self.sipil.daemons {
+            let (Some(board), Some(agent)) = (daemon.work.as_ref(), daemon.agents.first()) else {
+                continue;
+            };
+            boards = true;
+            for item in &board.open {
+                let detail = [&item.waiting_on, &item.next, &item.owner]
+                    .into_iter()
+                    .find(|text| !text.is_empty())
+                    .cloned()
+                    .unwrap_or_default();
+                work.push(OpenWork {
+                    who: daemon.name(),
+                    title: item.title.clone(),
+                    state: item.state.clone(),
+                    detail,
+                    updated_at: item.updated_at,
+                    watch: Watch::On(daemon.id.clone(), agent.id.clone()),
+                });
+            }
+        }
+        // Each board already keeps what waits first; across boards, keep that.
+        work.sort_by_key(|item| !matches!(item.state.as_str(), "waiting" | "blocked"));
+        boards.then_some(work)
+    }
 }
 
 /// Where a status sits in the list: what needs looking at first.
@@ -597,7 +653,24 @@ impl PilusView {
             }
             columns = columns.child(right);
         }
-        let mut content = div()
+        // Without sipil set up and switched on there is nothing to hear from;
+        // what it has to say sits right under the composer.
+        let sipil = match &self.overview.sample {
+            Some(sample) => sample.sipil,
+            None => self.sipil_listed(),
+        };
+        let heard = sipil.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(self.overview_latest_card(cx))
+                .children(
+                    self.overview_work()
+                        .map(|work| self.overview_work_card(&work, cx)),
+                )
+        });
+        let content = div()
             .flex()
             .flex_col()
             .gap_4()
@@ -606,15 +679,8 @@ impl PilusView {
             .px_4()
             .py_4()
             .child(self.overview_composer(cx))
+            .children(heard)
             .child(columns);
-        // Without sipil set up and switched on there is nothing to hear from.
-        let sipil = match &self.overview.sample {
-            Some(sample) => sample.sipil,
-            None => self.sipil_listed(),
-        };
-        if sipil {
-            content = content.child(self.overview_latest_card(cx));
-        }
 
         div()
             .id("pilus-overview-scroll")
@@ -696,9 +762,6 @@ impl PilusView {
             .flex_row()
             .items_center()
             .gap_1()
-            .p_1()
-            .radius_md()
-            .bg(theme.bg.opacity(0.7))
             .child(
                 style::icon_button(
                     "pilus-overview-close",
@@ -912,7 +975,7 @@ impl PilusView {
                     .child(format!("{} more in the sidebar", agents.len() - shown)),
             );
         }
-        card(theme, fonts, label, Some(agents.len()), body)
+        card(theme, fonts, label, None, body)
     }
 
     fn overview_sessions_card(&self, cx: &mut Context<Self>) -> Div {
@@ -984,7 +1047,7 @@ impl PilusView {
                 })),
             );
         }
-        card(theme, fonts, "RECENT SESSIONS", Some(shown.len()), body)
+        card(theme, fonts, "RECENT SESSIONS", None, body)
     }
 
     fn overview_pulls_card(&self, cx: &mut Context<Self>) -> Div {
@@ -1157,6 +1220,62 @@ impl PilusView {
             )
     }
 
+    /// The open work of the daemons' boards, what waits on someone first. A row
+    /// opens the daemon's primary agent, whose chat has the full board.
+    fn overview_work_card(&self, work: &[OpenWork], cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let fonts = Fonts::resolve(&self.shared_settings);
+        let mut body = div().flex().flex_col().gap_1();
+        if work.is_empty() {
+            body = body.child(quiet(
+                theme,
+                fonts,
+                "Nothing open",
+                "Your agents add an item when they take on work that outlasts a turn.",
+            ));
+        }
+        let shown = work.len().min(WORK_ROWS);
+        for (index, item) in work.iter().take(shown).enumerate() {
+            let tint = match item.state.as_str() {
+                "blocked" => theme.alert,
+                // The theme's own yellow: waiting is not an error, but it is not fine either.
+                "waiting" => theme.ansi[3],
+                "doing" => theme.accent,
+                _ => theme.muted,
+            };
+            let mut detail = vec![item.who.clone(), item.state.clone()];
+            if !item.detail.is_empty() {
+                detail.push(item.detail.clone());
+            }
+            let when = (item.updated_at > 0)
+                .then(|| self.overview_trail(age_label(unix_now(), item.updated_at / 1000)));
+            let watch = item.watch.clone();
+            body = body.child(
+                self.overview_row(
+                    format!("pilus-overview-work-{index}"),
+                    div().w(px(8.0)).h(px(8.0)).radius_full().bg(tint),
+                    item.title.clone(),
+                    detail.join(" · "),
+                    when,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_sipil_chat(watch.clone(), cx);
+                })),
+            );
+        }
+        if shown < work.len() {
+            body = body.child(
+                div()
+                    .px_2()
+                    .pt_1()
+                    .text_size(px(fonts.label))
+                    .text_color(theme.muted)
+                    .child(format!("{} more on the boards", work.len() - shown)),
+            );
+        }
+        card(theme, fonts, "OPEN WORK", None, body)
+    }
+
     fn overview_latest_card(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = Fonts::resolve(&self.shared_settings);
@@ -1300,9 +1419,40 @@ impl PilusView {
         *self.shared_settings.borrow_mut() = self.settings.clone();
         let page = &mut self.overview;
         page.open = true;
+        let item = |who: &str, title: &str, state: &str, detail: &str, ago: i64| OpenWork {
+            who: who.to_string(),
+            title: title.to_string(),
+            state: state.to_string(),
+            detail: detail.to_string(),
+            updated_at: u64::try_from(now - ago).unwrap_or(0) * 1000,
+            watch: Watch::Peer("sample".to_string()),
+        };
         page.sample = Some(Sample {
             github,
             sipil,
+            work: vec![
+                item(
+                    "Researcher",
+                    "Sign the 0.10 release build",
+                    "blocked",
+                    "waiting on the Developer ID certificate",
+                    5_400,
+                ),
+                item(
+                    "CoS",
+                    "Draft the alpha announcement",
+                    "waiting",
+                    "Rina's review",
+                    900,
+                ),
+                item(
+                    "Researcher",
+                    "Compare relay costs",
+                    "doing",
+                    "read the iroh pricing page",
+                    120,
+                ),
+            ],
             agents: vec![
                 Listed {
                     status: "working".to_string(),

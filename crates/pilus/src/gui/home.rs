@@ -15,8 +15,6 @@ use super::text_input::TextField;
 pub enum HomeField {
     Agent,
     Workspace,
-    /// The GitHub issue of the target workspace to attach to the prompt.
-    Issue,
     Model,
     Effort,
 }
@@ -26,19 +24,13 @@ impl HomeField {
     ///
     /// `Agent` is state-only: the composer derives it from the installed
     /// agents, so it has no chip or stop in the focus cycle.
-    pub const ALL: [HomeField; 4] = [
-        HomeField::Workspace,
-        HomeField::Issue,
-        HomeField::Model,
-        HomeField::Effort,
-    ];
+    pub const ALL: [HomeField; 3] = [HomeField::Workspace, HomeField::Model, HomeField::Effort];
 
     /// The chip label.
     pub fn label(self) -> &'static str {
         match self {
             HomeField::Agent => "Agent",
             HomeField::Workspace => "Workspace",
-            HomeField::Issue => "Issue",
             HomeField::Model => "Model",
             HomeField::Effort => "Effort",
         }
@@ -132,7 +124,6 @@ pub struct HomePanel {
     focus: HomeFocus,
     agent: Choice,
     workspace: Choice,
-    issue: Choice,
     model: Choice,
     effort: Choice,
     /// Which picker's dropdown is showing, if any.
@@ -153,7 +144,6 @@ impl Default for HomePanel {
             focus: HomeFocus::Prompt,
             agent: Choice::default(),
             workspace: Choice::default(),
-            issue: Choice::default(),
             model: Choice::default(),
             effort: Choice::default(),
             dropdown: None,
@@ -227,7 +217,6 @@ impl HomePanel {
         match field {
             HomeField::Agent => &self.agent,
             HomeField::Workspace => &self.workspace,
-            HomeField::Issue => &self.issue,
             HomeField::Model => &self.model,
             HomeField::Effort => &self.effort,
         }
@@ -238,7 +227,6 @@ impl HomePanel {
         match field {
             HomeField::Agent => &mut self.agent,
             HomeField::Workspace => &mut self.workspace,
-            HomeField::Issue => &mut self.issue,
             HomeField::Model => &mut self.model,
             HomeField::Effort => &mut self.effort,
         }
@@ -411,7 +399,7 @@ mod tests {
         home.focus_next();
         assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Workspace));
         home.focus_next();
-        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Issue));
+        assert_eq!(home.focus(), HomeFocus::Picker(HomeField::Model));
     }
 
     #[test]

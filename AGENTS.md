@@ -396,11 +396,12 @@ with only the command-line tools can build the app.
   agent waiting on a question, the panel shows the tail of its screen
   (`agent.read`). A sipil agent's is its newest remembered line. The latest sipil
   message is drawn by the chat page's own Markdown path (`chat_text`). The
-  composer's Issue picker reads the workspace's `origin` (on its own machine, over
-  SSH if need be) and lists the issues with *this* Mac's `gh` login (`-R`), so a
-  workspace on a machine where `gh` is not signed in works; it keeps the committed
-  issue by number (Escape restores it), keeps its list across a failed re-read, and
-  retries a failed read when reopened.
+  composer has no Issue picker; the page's Issues block lists them.
+  Between the composer and the columns sit the latest sipil message and, when a connected daemon
+  has a board, an Open work block (`overview_work`: each board's open items, what
+  waits on someone first, read from `Daemon::work` and never asked for here); a
+  row opens that daemon's primary agent. The page is a flush card, so the hero
+  runs to the window's edges.
   The hero is `assets/hero-factory.png`, cropped from the site's image. The page
   embeds the Cmd+Shift+N composer (`home_composer`, the same `PilusView::home`
   state): opening Home starts it (`home_begin`) and leaving either one closes

@@ -116,10 +116,6 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../../assets/icons/agents/cursor.svg"),
     ),
     (
-        "agent: amp",
-        include_bytes!("../../assets/icons/agents/amp.svg"),
-    ),
-    (
         "agent: bot",
         include_bytes!("../../assets/icons/agents/bot.svg"),
     ),
@@ -538,7 +534,8 @@ impl UiPlaygroundView {
         });
         let focused = entity.read(cx).is_focused(window);
         let multiline = id == InputId::Multi;
-        style::field(
+        let build = if multiline { style::textarea } else { style::field };
+        build(
             match id {
                 InputId::Single => "pg-input-single",
                 InputId::Multi => "pg-input-multi",
@@ -1941,8 +1938,6 @@ impl UiPlaygroundView {
             .py_2()
             .radius_md()
             .bg(theme.sidebar_bg)
-            .border_1()
-            .border_color(theme.border)
             .child(
                 div()
                     .text_size(px(self.fonts().secondary))

@@ -21,8 +21,7 @@ const ICONS: [&str; 14] = [
 ];
 
 /// The vendored agent brand marks, mirrored from `agent_icon` in the GUI.
-const AGENT_ICONS: [&str; 17] = [
-    "amp",
+const AGENT_ICONS: [&str; 16] = [
     "antigravity",
     "arc",
     "bot",

@@ -329,10 +329,6 @@ const STACK_PAD: f32 = 2.0;
 /// They alternate so the deck looks handled rather than machined.
 const STACK_TILT: [f32; STACK_MAX as usize - 1] = [7.0, -6.0];
 
-/// How much of a status color the front card's fill takes: enough to read at a
-/// glance across the strip, little enough that the glyph keeps its contrast.
-const STATUS_WASH: f32 = 0.45;
-
 /// How much of the foreground a tile's glyph keeps: dimmed so the mark sits
 /// quietly in the strip, yet clear of the fill on a light theme, where the
 /// border role is too faint to read as a glyph.
@@ -341,9 +337,8 @@ const GLYPH_DIM: f32 = 0.6;
 /// A bordered tile holding a glyph on the theme's panel fill, so the glyph
 /// reads on a surface rather than on the bare strip: a tab's terminal or agent
 /// mark. With `panes` above one it becomes a deck, one card more behind it per
-/// pane up to [`STACK_MAX`], each turned a little. `status` washes the front
-/// card's fill with that color ([`STATUS_WASH`]); the cards behind stay neutral,
-/// so the deck still counts.
+/// pane up to [`STACK_MAX`], each turned a little. `status` colors the glyph
+/// itself, so the fills stay neutral and the deck still counts.
 ///
 /// The cards are opaque, since a translucent one would show the edge of the
 /// card behind it through the front. GPUI turns SVGs but not divs, so the cards
@@ -358,7 +353,6 @@ pub(super) fn glyph_tile(
     let cards = panes.clamp(1, STACK_MAX);
     let behind = f32::from(cards - 1);
     let face = theme.panel;
-    let front_face = status.map_or(face, |status| mix(face, status, STATUS_WASH));
     // Each card needs an edge that stands clear of its neighbor, or the deck
     // cannot be counted; the border role is too faint for that, the full
     // foreground too loud.
@@ -423,14 +417,14 @@ pub(super) fn glyph_tile(
         .h(px(GLYPH_TILE))
         .radius_sm()
         .when(outlined, |front| front.border_1().border_color(edge))
-        .bg(front_face)
+        .bg(face)
         .child(
             svg()
                 .data(glyph)
                 .w(px(GLYPH_TILE * 0.6))
                 .h(px(GLYPH_TILE * 0.6))
                 .flex_shrink_0()
-                .text_color(tint(theme.panel_fg, GLYPH_DIM)),
+                .text_color(status.unwrap_or_else(|| tint(theme.panel_fg, GLYPH_DIM))),
         );
     deck.child(front)
 }
@@ -1696,6 +1690,11 @@ pub(super) fn skeleton(
 /// enough to leave the terminal readable beside it.
 pub(super) const TOAST_WIDTH: f32 = 320.0;
 
+/// Line height of a toast's text, as a multiple of its size. Fixed so the
+/// glyphs can be centered on the first line instead of guessing at the
+/// inherited leading.
+const TOAST_LEADING: f32 = 1.4;
+
 /// An in-app notice: a glyph for what happened, an optional bold title, and
 /// the message, clamped to four lines.
 ///
@@ -1727,7 +1726,25 @@ pub(super) fn toast(
             .flex_shrink_0()
             .text_color(color)
     };
-    let mut text = div().flex().flex_col().gap_1().flex_1().min_w_0();
+    // A cell as tall as the first line of text, so a glyph sits on that line's
+    // middle whatever its own size.
+    let first_line = px(fonts.secondary * TOAST_LEADING);
+    let cell = |glyph: gpui::Svg| {
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .h(first_line)
+            .child(glyph)
+    };
+    let mut text = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .flex_1()
+        .min_w_0()
+        .line_height(first_line);
     if let Some(title) = title {
         text = text.child(
             div()
@@ -1763,13 +1780,13 @@ pub(super) fn toast(
         .border_color(theme.border)
         .cursor_pointer()
         .hover_fill(theme.panel, RADIUS_MD)
-        .child(glyph(icon, fonts.body, tone))
+        .child(cell(glyph(icon, fonts.body, tone)))
         .child(text)
-        .child(glyph(
+        .child(cell(glyph(
             include_bytes!("../../assets/icons/x.svg"),
             fonts.label,
             theme.muted,
-        ))
+        )))
 }
 
 /// Fade a floating panel in as it opens: menus, pickers, the palette,
@@ -2725,6 +2742,48 @@ pub(super) fn field(
     label_size: f32,
     body: impl IntoElement,
 ) -> Stateful<Div> {
+    labelled(
+        id,
+        label,
+        label_size,
+        theme,
+        field_box(focused, theme, height).items_center().child(body),
+    )
+}
+
+/// A [`field`] for a multi-line body: the text starts at the top edge, under
+/// the same padding the sides have, instead of floating in the middle of a box
+/// taller than the text.
+pub(super) fn textarea(
+    id: impl Into<ElementId>,
+    label: &str,
+    focused: bool,
+    theme: Theme,
+    height: f32,
+    label_size: f32,
+    body: impl IntoElement,
+) -> Stateful<Div> {
+    labelled(
+        id,
+        label,
+        label_size,
+        theme,
+        field_box(focused, theme, height)
+            .items_start()
+            .py_2()
+            .child(body),
+    )
+}
+
+/// A small muted label above `control`, the frame of [`field`] and
+/// [`textarea`].
+fn labelled(
+    id: impl Into<ElementId>,
+    label: &str,
+    label_size: f32,
+    theme: Theme,
+    control: Div,
+) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
@@ -2736,14 +2795,13 @@ pub(super) fn field(
                 .text_color(theme.muted)
                 .child(label.to_string()),
         )
-        .child(field_box(focused, theme, height).child(body))
+        .child(control)
 }
 
 /// The boxed control a [`field`] and a [`search_field`] share.
 fn field_box(focused: bool, theme: Theme, height: f32) -> Div {
     div()
         .flex()
-        .items_center()
         .min_h(px(height))
         .px_2()
         .radius_md()
@@ -2770,6 +2828,7 @@ pub(super) fn search_field(
 ) -> Stateful<Div> {
     div().id(id).child(
         field_box(focused, theme, height)
+            .items_center()
             .gap_2()
             .child(super::icon(
                 include_bytes!("../../assets/icons/search.svg"),

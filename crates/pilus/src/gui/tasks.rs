@@ -1293,8 +1293,13 @@ impl PilusView {
                         px(fonts.body),
                     );
                 });
+                let build = if field == ComposeField::Prompt {
+                    style::textarea
+                } else {
+                    style::field
+                };
                 Some(
-                    style::field(
+                    build(
                         format!("pilus-task-field-{label}"),
                         label,
                         focus == field,

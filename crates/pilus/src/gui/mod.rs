@@ -16774,7 +16774,6 @@ fn agent_icon(kind: &str) -> &'static [u8] {
             "devin",
             include_bytes!("../../assets/icons/agents/devin.svg"),
         ),
-        ("amp", include_bytes!("../../assets/icons/agents/amp.svg")),
         ("arc", include_bytes!("../../assets/icons/agents/arc.svg")),
         ("omp", include_bytes!("../../assets/icons/agents/pi.svg")),
         ("pi", include_bytes!("../../assets/icons/agents/pi.svg")),
@@ -16807,8 +16806,6 @@ impl Render for SidebarTip {
             .px_3()
             .py_2()
             .radius_md()
-            .border_1()
-            .border_color(theme.border)
             .bg(theme.panel)
             .text_size(px(SECTION_FONT))
             .child(

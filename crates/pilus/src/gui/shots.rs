@@ -546,6 +546,13 @@ pub fn run() -> Result<()> {
         std::thread::sleep(Duration::from_secs(3));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "files-tab-doc-diagrams")?;
+        // Pictures: an SVG fitted to the view, and a small PNG at its own size.
+        cx.update(|app| view.update(app, |view, cx| view.files_show_svg_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-picture-svg")?;
+        cx.update(|app| view.update(app, |view, cx| view.files_show_png_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-picture-png")?;
         // ⌘P over the tree: the file name outranks a scattered path.
         cx.update(|app| view.update(app, |view, cx| view.quick_open_show_sample("mod", cx)));
         settle(&mut cx, 12);

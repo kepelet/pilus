@@ -94,7 +94,7 @@ pub use mission::{
 };
 pub use pilus_protocol as protocol;
 pub use ports::{ListeningPort, PortForward, free_local_port, kill_process, list_ports};
-pub use read::{MAX_TEXT_BYTES, TextFile, Version, read_text};
+pub use read::{MAX_IMAGE_BYTES, MAX_TEXT_BYTES, TextFile, Version, read_bytes, read_text};
 pub use relay::RelaySettings;
 pub use stage::{Discard, StageAction, discard, set_staged};
 pub use surface::{Surface, SurfaceChange};

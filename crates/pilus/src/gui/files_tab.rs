@@ -9,7 +9,9 @@
 //! the daemon. Clicking a file hands it to the daemon (`files.open`), which
 //! shows it in the terminal card. The exception is a text file: the tab reads it
 //! itself and opens it in place of the tree, in an editor (a markdown file is
-//! drawn as a document and edited beside its preview, see `md_view`). The rows
+//! drawn as a document and edited beside its preview, see `md_view`). An image
+//! or an SVG is read as bytes and drawn as a picture instead (see
+//! `image_view`), the SVG with a way back to its source. The rows
 //! carry no Git state, so each read also asks for the Diff's change list and
 //! marks changed files and the folders above them; a click on any other changed
 //! file opens it in the Diff instead.
@@ -49,6 +51,7 @@ use pilus_client::{
 
 use super::diff::status_glyph;
 use super::highlight;
+use super::image_view::{self, Picture};
 use super::md_view::{self, MdDoc, Page};
 use super::right_sidebar::SidebarTab;
 use super::sidebar_menu::{Item, MenuTarget};
@@ -143,6 +146,12 @@ pub(super) enum FilesMsg {
         endpoint: EndpointId,
         seq: u32,
         result: Result<TextFile, String>,
+    },
+    /// A picture was read and drawn, or why it could not be.
+    Picture {
+        endpoint: EndpointId,
+        seq: u32,
+        result: Result<Picture, String>,
     },
     Uploaded {
         endpoint: EndpointId,
@@ -242,9 +251,11 @@ impl Upload {
     }
 }
 
-/// A markdown file open in the tab, in place of the tree.
+/// A file open in the tab, in place of the tree.
 struct FileDoc {
     path: String,
+    /// Opened as text though its name says picture: an SVG's source.
+    as_text: bool,
     /// The read this document waits on or came from: only its answer lands.
     seq: u32,
     state: DocState,
@@ -287,6 +298,7 @@ pub(super) struct DocEdit {
 enum DocState {
     Loading,
     Ready(MdDoc),
+    Picture(Picture),
     Failed(String),
 }
 
@@ -488,6 +500,18 @@ impl FilesPanel {
         };
         doc.state = match result {
             Ok(file) => DocState::Ready(MdDoc::new(&file, &doc.path)),
+            Err(error) => DocState::Failed(error),
+        };
+        true
+    }
+
+    /// Fold a finished picture read in, as [`Self::apply_doc`] does a text one.
+    fn apply_picture(&mut self, seq: u32, result: Result<Picture, String>) -> bool {
+        let Some(doc) = self.doc.as_mut().filter(|doc| doc.seq == seq) else {
+            return false;
+        };
+        doc.state = match result {
+            Ok(picture) => DocState::Picture(picture),
             Err(error) => DocState::Failed(error),
         };
         true
@@ -725,6 +749,16 @@ impl PilusView {
                         self.files_begin_edit(cx);
                     }
                 }
+                FilesMsg::Picture {
+                    endpoint,
+                    seq,
+                    result,
+                } => {
+                    if current.is_some_and(|current| current != endpoint) {
+                        continue;
+                    }
+                    changed |= self.files_panel.apply_picture(seq, result);
+                }
                 FilesMsg::Saved {
                     endpoint,
                     path,
@@ -886,6 +920,12 @@ impl PilusView {
 
     /// Start (or restart) the read of the document at `path`.
     pub(super) fn files_read_doc(&mut self, path: String) {
+        self.files_read_doc_as(path, false);
+    }
+
+    /// Start the read of `path`: a picture when its name says so, unless
+    /// `as_text` asks for the file's text, as an SVG's source.
+    fn files_read_doc_as(&mut self, path: String, as_text: bool) {
         self.quick_open.note_opened(&path);
         let endpoint = self.active.clone();
         let target = match self.read_target(&endpoint) {
@@ -894,6 +934,7 @@ impl PilusView {
                 self.files_panel.doc_reads += 1;
                 self.files_panel.doc = Some(FileDoc {
                     path,
+                    as_text,
                     seq: self.files_panel.doc_reads,
                     state: DocState::Failed(error),
                     edit: None,
@@ -904,19 +945,37 @@ impl PilusView {
         let panel = &mut self.files_panel;
         panel.doc_reads += 1;
         let seq = panel.doc_reads;
-        // A reload keeps the text on screen until the new read lands.
+        let picture = if as_text {
+            None
+        } else {
+            image_view::kind(&path)
+        };
+        // A reload keeps what was on screen until the new read lands, as long
+        // as it is the same kind of view.
         let keep = panel.doc.take().filter(|doc| doc.path == path);
         panel.doc = Some(FileDoc {
             path: path.clone(),
+            as_text,
             seq,
             state: match keep.map(|doc| doc.state) {
-                Some(DocState::Ready(doc)) => DocState::Ready(doc),
+                Some(DocState::Ready(doc)) if picture.is_none() => DocState::Ready(doc),
+                Some(DocState::Picture(shown)) if picture.is_some() => DocState::Picture(shown),
                 _ => DocState::Loading,
             },
             edit: None,
         });
         let tx = panel.tx.clone();
         std::thread::spawn(move || {
+            if let Some(kind) = picture {
+                let result = image_view::load(target.as_ref(), &path, kind);
+                tx.send(FilesMsg::Picture {
+                    endpoint,
+                    seq,
+                    result,
+                })
+                .ok();
+                return;
+            }
             let result = read_text(target.as_ref(), Version::Disk(&path));
             tx.send(FilesMsg::Doc {
                 endpoint,
@@ -1205,8 +1264,21 @@ impl PilusView {
         if self.files_doc_unsaved("reload it", cx) {
             return;
         }
-        if let Some(path) = self.files_panel.doc_path().map(str::to_string) {
-            self.files_read_doc(path);
+        if let Some(doc) = self.files_panel.doc.as_ref() {
+            let (path, as_text) = (doc.path.clone(), doc.as_text);
+            self.files_read_doc_as(path, as_text);
+            cx.notify();
+        }
+    }
+
+    /// Switch an SVG between its picture and its source.
+    fn files_toggle_svg_source(&mut self, cx: &mut Context<Self>) {
+        if self.files_doc_unsaved("leave the source", cx) {
+            return;
+        }
+        if let Some(doc) = self.files_panel.doc.as_ref() {
+            let (path, as_text) = (doc.path.clone(), !doc.as_text);
+            self.files_read_doc_as(path, as_text);
             cx.notify();
         }
     }
@@ -1526,12 +1598,13 @@ impl PilusView {
 
     /// A click on a file row. A text file opens here, in the editor, even when
     /// Git reports it changed, since the Files tab is where it is edited; a
-    /// markdown file opens as a document first. A double click, and any other
-    /// file Git reports changed, goes to a pane and the Diff as before; the
-    /// rest are a preview.
+    /// markdown file opens as a document first, and an image or SVG as a
+    /// picture. A double click, and any other file Git reports changed, goes to
+    /// a pane and the Diff as before; the rest are a preview.
     fn files_click_file(&mut self, row: &FileRow, target: OpenTarget, cx: &mut Context<Self>) {
         if md_view::is_markdown(&row.path)
-            || (target == OpenTarget::Preview && highlight::is_text(&row.path))
+            || (target == OpenTarget::Preview
+                && (image_view::kind(&row.path).is_some() || highlight::is_text(&row.path)))
         {
             self.files_open_doc(&row.path, cx);
             return;
@@ -1750,6 +1823,29 @@ impl PilusView {
         let split = mode == Some(EditMode::Split) && self.files_panel.split_ok;
         let dirty = self.files_doc_dirty(cx);
         let mut edit_buttons: Vec<AnyElement> = Vec::new();
+        // An SVG is a picture that is also text: the pencil swaps one for the
+        // other, as it swaps a markdown file's preview for its source.
+        if image_view::kind(&doc.path) == Some(image_view::Kind::Svg)
+            && (doc.as_text || matches!(doc.state, DocState::Picture(_)))
+        {
+            let source = doc.as_text;
+            edit_buttons.push(
+                self.diff_icon_button(
+                    "pilus-files-doc-svg-source",
+                    include_bytes!("../../assets/icons/pencil.svg"),
+                    if source {
+                        "Show the image"
+                    } else {
+                        "Edit the source"
+                    }
+                    .to_string(),
+                    source,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.files_toggle_svg_source(cx)))
+                .into_any_element(),
+            );
+        }
         if editable && previewable {
             edit_buttons.push(
                 self.diff_icon_button(
@@ -1917,6 +2013,7 @@ impl PilusView {
         } else {
             match &self.files_panel.doc.as_ref().map(|doc| &doc.state) {
                 Some(DocState::Loading) | None => self.diff_message("Loading…").into_any_element(),
+                Some(DocState::Picture(picture)) => image_view::view(picture, &theme, &fonts),
                 Some(DocState::Failed(error)) => self
                     .diff_message(format!("Could not read this file: {error}"))
                     .into_any_element(),
@@ -2397,6 +2494,7 @@ impl PilusView {
         panel.doc_reads += 1;
         panel.doc = Some(FileDoc {
             path: path.to_string(),
+            as_text: false,
             seq: panel.doc_reads,
             state: DocState::Ready(MdDoc::new(
                 &TextFile {
@@ -2405,6 +2503,31 @@ impl PilusView {
                 },
                 path,
             )),
+            edit: None,
+        });
+        cx.notify();
+    }
+
+    /// Open `bytes` as the picture at `path`, as a finished read would.
+    pub(super) fn files_show_picture(
+        &mut self,
+        path: &str,
+        bytes: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        self.files_show_sample(cx);
+        let state = match image_view::kind(path).map(|kind| image_view::decode(kind, bytes)) {
+            Some(Ok(picture)) => DocState::Picture(picture),
+            Some(Err(error)) => DocState::Failed(error),
+            None => DocState::Failed("not a picture".to_string()),
+        };
+        let panel = &mut self.files_panel;
+        panel.doc_reads += 1;
+        panel.doc = Some(FileDoc {
+            path: path.to_string(),
+            as_text: false,
+            seq: panel.doc_reads,
+            state,
             edit: None,
         });
         cx.notify();

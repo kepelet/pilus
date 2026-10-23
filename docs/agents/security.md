@@ -12,6 +12,9 @@ from reaching past what it was given.
 - An SVG from another device (a sipil's logo) is parsed with
   `about::untrusted_svg_options`, which resolves only `data:` images.
   Otherwise usvg reads any path an `<image>` names.
+- An SVG or image the Files tab opens comes from whatever machine the tree is
+  on. It is parsed with the same `untrusted_svg_options` and read under a size
+  bound (`pilus_client::read_bytes`) on a worker thread.
 - Treat a sipil daemon's allow-list like SSH keys. An allowed device can run
   that daemon's agents' shell tools (see [sipil/network.md](sipil/network.md)).
 

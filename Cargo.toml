@@ -29,7 +29,8 @@ gpui-wry = "=0.6.6"
 # `gpui-wry` builds on wry but does not re-export it; the builder is ours to drive.
 wry = { package = "lb-wry", version = "0.53.3" }
 gpui = { package = "gpui-pre", version = "=0.3.6" }
-image = { version = "0.25", default-features = false, features = ["png"] }
+# The decoders GPUI already builds, so reading a picture's size costs no new code.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
 # `runtime_shaders` stitches the Metal shader source instead of invoking the
 # `metal` compiler at build time, so the app builds with only the command-line
 # tools installed. `font-kit` supplies the macOS text backend.

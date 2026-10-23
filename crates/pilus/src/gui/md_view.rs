@@ -747,6 +747,27 @@ impl PilusView {
         cx.notify();
     }
 
+    /// The app mark as an SVG file, drawn as a picture.
+    pub(super) fn files_show_svg_sample(&mut self, cx: &mut Context<Self>) {
+        self.files_show_picture(
+            "/work/pilus/crates/pilus/assets/pilus.svg",
+            include_bytes!("../../assets/pilus.svg").to_vec(),
+            cx,
+        );
+    }
+
+    /// A small PNG, which is shown at its own size rather than blown up.
+    pub(super) fn files_show_png_sample(&mut self, cx: &mut Context<Self>) {
+        let mut png = Vec::new();
+        let gradient = image::RgbaImage::from_fn(320, 200, |x, y| {
+            image::Rgba([(x * 255 / 320) as u8, (y * 255 / 200) as u8, 160, 255])
+        });
+        image::DynamicImage::ImageRgba8(gradient)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .ok();
+        self.files_show_picture("/work/pilus/docs/img/gradient.png", png, cx);
+    }
+
     /// The page of diagrams, drawn.
     pub(super) fn files_show_diagram_sample(&mut self, cx: &mut Context<Self>) {
         self.files_show_doc("/work/pilus/docs/data-flow.md", DIAGRAM_SAMPLE, cx);

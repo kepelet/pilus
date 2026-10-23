@@ -7,7 +7,8 @@
 //! holds it, which is the version a staged diff describes.
 //!
 //! Reads are bounded and refuse binary files, so a stray large or compiled file
-//! never reaches the renderer.
+//! never reaches the renderer. An image is the one binary file a client draws, so
+//! [`read_bytes`] returns raw bytes under a bound of its own.
 
 use std::io::Read;
 use std::process::Command;
@@ -17,6 +18,10 @@ use crate::transport::SshTarget;
 
 /// Most bytes of a file a read keeps.
 pub const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Most bytes of an image a read keeps. A cut image is not a smaller picture,
+/// so a longer file is refused rather than truncated.
+pub const MAX_IMAGE_BYTES: usize = 24 * 1024 * 1024;
 
 /// A file's text, cut at [`MAX_TEXT_BYTES`] when it was longer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,7 +42,7 @@ pub enum Version<'a> {
 /// Read `version` on this machine, or on `target`'s host.
 pub fn read_text(target: Option<&SshTarget>, version: Version<'_>) -> Result<TextFile, String> {
     let bytes = match (target, version) {
-        (None, Version::Disk(path)) => read_disk(path)?,
+        (None, Version::Disk(path)) => read_disk(path, MAX_TEXT_BYTES + 1)?,
         (Some(target), Version::Disk(path)) => run(
             target.shell(&format!(
                 "head -c {} -- {}",
@@ -67,10 +72,26 @@ pub fn read_text(target: Option<&SshTarget>, version: Version<'_>) -> Result<Tex
     decode(bytes)
 }
 
-fn read_disk(path: &str) -> Result<Vec<u8>, String> {
+/// The file at `path` on this machine, or on `target`'s host, whole. Fails when
+/// it is longer than `limit` bytes.
+pub fn read_bytes(target: Option<&SshTarget>, path: &str, limit: usize) -> Result<Vec<u8>, String> {
+    let bytes = match target {
+        None => read_disk(path, limit + 1)?,
+        Some(target) => run(
+            target.shell(&format!("head -c {} -- {}", limit + 1, sh_quote(path))),
+            "read the file",
+        )?,
+    };
+    if bytes.len() > limit {
+        return Err(format!("larger than {} MB", limit / (1024 * 1024)));
+    }
+    Ok(bytes)
+}
+
+fn read_disk(path: &str, limit: usize) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let mut bytes = Vec::new();
-    file.take(MAX_TEXT_BYTES as u64 + 1)
+    file.take(limit as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
     Ok(bytes)
@@ -140,6 +161,18 @@ mod tests {
         let file = read_text(None, Version::Disk(path.to_str().expect("utf8"))).expect("read");
         assert_eq!(file.text.len(), MAX_TEXT_BYTES);
         assert!(file.truncated);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bytes_are_whole_or_refused() {
+        let dir = std::env::temp_dir().join(format!("pilus-read-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("a.png");
+        std::fs::write(&path, [0u8, 1, 2, 3]).expect("write");
+        let path = path.to_str().expect("utf8");
+        assert_eq!(read_bytes(None, path, 4), Ok(vec![0, 1, 2, 3]));
+        assert!(read_bytes(None, path, 3).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -18,6 +18,26 @@ The Files tab edits text files in place. Saves go through
 - A truncated read, or a file larger than `md_view::EDIT_LIMIT`, is not opened
   for editing.
 
+## Images and SVGs
+
+A click on a file `image_view::kind` recognizes (png, jpg, gif, webp, bmp, ico,
+tiff, svg) opens it as a picture instead of handing it to the daemon. A double
+click still goes to the daemon.
+
+- The worker thread reads the bytes with `pilus_client::read_bytes`, locally or
+  over SSH, and builds the `Picture` there. The GUI thread parses and decodes
+  nothing it does not have to. `FilesMsg::Picture` carries the result.
+- A raster image stays encoded and GPUI decodes it at first paint. Only the
+  header is read for the size. It is drawn no larger than its own size.
+- An SVG is drawn to a bitmap with resvg, since GPUI's `svg()` flattens color,
+  and is fitted to the view. It shares `mermaid::fonts` for text.
+- Reads are bounded: `MAX_IMAGE_BYTES` for a raster file and `MAX_TEXT_BYTES`
+  for an SVG. A longer file is refused, not cut, since half an image is not a
+  smaller one.
+- An SVG is also text. The pencil in the header swaps the picture for the
+  source in the editor (`FileDoc::as_text`) and back, and a reload keeps the
+  mode. Leaving the source with unsaved changes is refused, as closing is.
+
 ## Highlighting
 
 The editor field (`md_editor_input`) is colored by `highlight::source`.

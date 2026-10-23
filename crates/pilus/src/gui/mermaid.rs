@@ -158,8 +158,9 @@ fn draw(source: &str, style: &Style) -> Option<Diagram> {
 }
 
 /// Every system font, loaded once. A diagram is mostly labels, and resvg
-/// draws none of them without a font database.
-fn fonts() -> Arc<fontdb::Database> {
+/// draws none of them without a font database. The Files tab's SVG viewer
+/// shares it.
+pub(super) fn fonts() -> Arc<fontdb::Database> {
     static FONTS: OnceLock<Arc<fontdb::Database>> = OnceLock::new();
     FONTS
         .get_or_init(|| {

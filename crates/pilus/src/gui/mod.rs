@@ -31,6 +31,7 @@ mod github_page;
 mod glass;
 mod highlight;
 mod home;
+mod image_view;
 mod keys;
 mod machines;
 mod markdown;

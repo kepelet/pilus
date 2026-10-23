@@ -11579,7 +11579,8 @@ impl PilusView {
             .flex_row()
             .items_center()
             .gap_1()
-            .flex_initial()
+            .when(self.tabs.len() == 1, |tabs| tabs.flex_1())
+            .when(self.tabs.len() != 1, |tabs| tabs.flex_initial())
             .min_w_0()
             .overflow_x_scroll()
             .overflow_y_hidden()
@@ -11677,9 +11678,11 @@ impl PilusView {
         // The right sidebar's toggle sits at the strip's far edge while the
         // column is away; open, the column's own close button replaces it.
         if self.right.openness() < 0.05 {
-            tab_strip = tab_strip
-                .child(div().flex_1())
-                .child(self.right_toolbar(cx));
+            // A lone tab already fills the strip, so no spacer shares it.
+            if self.tabs.len() != 1 {
+                tab_strip = tab_strip.child(div().flex_1());
+            }
+            tab_strip = tab_strip.child(self.right_toolbar(cx));
         }
         // An expanded right column covers the strip entirely.
         if self.right.expanded() && self.right.spread() >= 1.0 {
@@ -11731,7 +11734,7 @@ impl PilusView {
         };
         let agent = self.tab_agent(index);
         let session_title = agent.and_then(|agent| agent.session_title.as_deref());
-        let label = tab_label(&tab.name, session_title, &cwd, index);
+        let label = tab_label(&tab.name, session_title, &cwd, index, !lone);
         let slide = if cx.reduce_motion() {
             0.0
         } else {
@@ -11801,10 +11804,13 @@ impl PilusView {
             .flex_row()
             .items_center()
             .gap_2()
-            .flex_shrink_0()
             .h(px(TAB_HEIGHT))
-            .min_w(px(140.0))
-            .max_w(px(280.0))
+            // A lone tab fills the strip; with company each keeps a width of
+            // its own.
+            .when(lone, |tab| tab.flex_1())
+            .when(!lone, |tab| {
+                tab.flex_shrink_0().min_w(px(140.0)).max_w(px(280.0))
+            })
             .px_3()
             .radius_soft()
             .cursor_pointer()
@@ -17019,10 +17025,17 @@ fn abbreviate_path(path: &str) -> String {
 }
 
 /// A tab's label: the name the user gave it, else its agent's session title,
-/// else its abbreviated cwd, plus the `⌘N` shortcut. A name the user typed
-/// outranks the title because the title changes under them. The text is capped
-/// before the shortcut is appended, so `⌘N` is never truncated away.
-fn tab_label(name: &str, session_title: Option<&str>, cwd: &str, index: u16) -> String {
+/// else its abbreviated cwd, plus the `⌘N` shortcut when `shortcut` is set. A
+/// name the user typed outranks the title because the title changes under them.
+/// The text is capped before the shortcut is appended, so `⌘N` is never
+/// truncated away.
+fn tab_label(
+    name: &str,
+    session_title: Option<&str>,
+    cwd: &str,
+    index: u16,
+    shortcut: bool,
+) -> String {
     let name = name.trim();
     let title = session_title.map(str::trim).unwrap_or_default();
     let text = if !name.is_empty() {
@@ -17032,7 +17045,12 @@ fn tab_label(name: &str, session_title: Option<&str>, cwd: &str, index: u16) -> 
     } else {
         abbreviate_path(cwd)
     };
-    format!("{} ⌘{index}", truncate_label(&text, 24))
+    let text = truncate_label(&text, 24);
+    if shortcut {
+        format!("{text} ⌘{index}")
+    } else {
+        text
+    }
 }
 
 /// The command a terminal title names, or `None` while the shell is idle.
@@ -17629,9 +17647,15 @@ mod tests {
 
     #[test]
     fn tab_label_falls_back_to_cwd_and_keeps_shortcut() {
-        assert_eq!(tab_label("", None, "~/work/pilus", 3), "~/w/pilus ⌘3");
-        assert_eq!(tab_label("  ", Some(" "), "~", 1), "~ ⌘1");
-        let long = tab_label("", None, "~/work/a-directory-name-that-will-not-fit", 7);
+        assert_eq!(tab_label("", None, "~/work/pilus", 3, true), "~/w/pilus ⌘3");
+        assert_eq!(tab_label("  ", Some(" "), "~", 1, true), "~ ⌘1");
+        let long = tab_label(
+            "",
+            None,
+            "~/work/a-directory-name-that-will-not-fit",
+            7,
+            true,
+        );
         assert!(long.ends_with("… ⌘7"));
     }
 
@@ -17695,12 +17719,13 @@ mod tests {
 
     #[test]
     fn tab_label_prefers_the_name_over_the_cwd() {
-        assert_eq!(tab_label("api", None, "~/work/pilus", 2), "api ⌘2");
+        assert_eq!(tab_label("api", None, "~/work/pilus", 2, true), "api ⌘2");
+        assert_eq!(tab_label("api", None, "~/work/pilus", 2, false), "api");
         assert_eq!(
-            tab_label("api", Some("Fix the parser"), "~/work/pilus", 2),
+            tab_label("api", Some("Fix the parser"), "~/work/pilus", 2, true),
             "api ⌘2"
         );
-        let long = tab_label(&"n".repeat(40), None, "~/work/pilus", 9);
+        let long = tab_label(&"n".repeat(40), None, "~/work/pilus", 9, true);
         assert!(long.ends_with("… ⌘9"));
     }
 
@@ -17718,7 +17743,7 @@ mod tests {
     #[test]
     fn tab_label_takes_the_agent_session_title_before_the_cwd() {
         assert_eq!(
-            tab_label("", Some(" Fix the parser "), "~/work/pilus", 4),
+            tab_label("", Some(" Fix the parser "), "~/work/pilus", 4, true),
             "Fix the parser ⌘4"
         );
     }

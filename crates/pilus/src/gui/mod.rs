@@ -4864,10 +4864,12 @@ impl PilusView {
     }
 
     fn sync_settings(&mut self, cx: &mut Context<Self>) -> bool {
-        let latest = self.shared_settings.borrow().clone();
-        if latest == self.settings {
+        // Compared in place: this runs on every tick, and the settings carry
+        // maps and lists that a clone would copy only to throw away.
+        if *self.shared_settings.borrow() == self.settings {
             return false;
         }
+        let latest = self.shared_settings.borrow().clone();
         let update_changed = latest.update_channel != self.settings.update_channel
             || latest.update_feed_url != self.settings.update_feed_url;
         let auto_check_turned_on = latest.auto_check_updates && !self.settings.auto_check_updates;
@@ -10065,9 +10067,9 @@ impl PilusView {
         // A drag started on the grid may roam anywhere; anything else over
         // chrome belongs to the panels, not the daemon.
         if !self.dragging && self.hit_chrome(window, event.position) {
-            let hovered = self.hover_cell.take().is_some();
+            let reshaped = self.set_hover_cell(None);
             let parted = self.divider_hover.take().is_some();
-            if hovered || parted {
+            if reshaped || parted {
                 cx.notify();
             }
             return;
@@ -10112,7 +10114,7 @@ impl PilusView {
         // Hover: only tell the daemon when the pointer crosses into a new cell,
         // so links and scrollbars react without a message per pixel.
         let Some(cell) = self.cell_at(window, event.position) else {
-            if self.hover_cell.take().is_some() {
+            if self.set_hover_cell(None) {
                 cx.notify();
             }
             return;
@@ -10122,12 +10124,25 @@ impl PilusView {
         // released while the pointer was outside the window.
         self.control_held = event.modifiers.control;
         if self.hover_cell != Some(cell) {
-            self.hover_cell = Some(cell);
+            let reshaped = self.set_hover_cell(Some(cell));
             self.forward_mouse(MouseEventKind::Moved, cell, event.modifiers);
-            // The pointer cursor follows the link under the cursor, so the
-            // frame must repaint as the hovered cell changes.
-            cx.notify();
+            if reshaped {
+                cx.notify();
+            }
         }
+    }
+
+    /// Move the hovered cell, returning whether the window must repaint.
+    ///
+    /// The grid draws nothing for the hovered cell. Only the pointer's shape
+    /// follows it, a hand over a link (`hovered_link`), so crossing from one
+    /// plain cell to the next costs no render. Repainting on every cell made
+    /// a pointer sweeping the terminal redraw the whole window at the mouse's
+    /// rate.
+    fn set_hover_cell(&mut self, cell: Option<Cell>) -> bool {
+        let was_link = self.hovered_link();
+        self.hover_cell = cell;
+        self.hovered_link() != was_link
     }
 
     fn finish_selection(&mut self, event: &MouseUpEvent, window: &Window, cx: &mut Context<Self>) {

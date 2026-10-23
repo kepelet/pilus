@@ -19,6 +19,27 @@ counters.
 - A new animation driven from the loop must count as "moving" there, or it
   stutters at the idle rate.
 
+## Transitions and repaints
+
+Every GPUI frame re-renders the whole window: the sidebar, the tab strip and
+every terminal row. A frame costs a few milliseconds, so anything that asks
+for one at the display's refresh rate costs about half a core.
+
+- An element that eases on its own (`hover_fill`, `state_fill`, the toggle
+  knob, meters, the sidebar's hover pill, pane frames) calls
+  `request_animation_frame` until the value it paints equals its target. Get
+  the eased step from `style::ease_step`. It returns `None` once the time is
+  up, and the element then paints the target itself. An interpolated end can
+  miss the target: `style::mix` fades to a clear color in the other end's
+  hue, so a hover fill that faded out never matched its resting
+  `transparent_black`. After any hover the window then redrew at the refresh
+  rate until the next one.
+- The terminal repaints for the pointer only when its shape changes, over a
+  link or off one (`set_hover_cell`). The move itself still goes to the
+  daemon.
+- `PILUS_PERF=1` shows such a loop as `renders` well above
+  `repaint-state + repaint-motion + frames` while nothing is moving.
+
 ## The cursor
 
 The cursor does not blink unless `Settings::cursor_blink` is on. It is off by

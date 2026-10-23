@@ -26,7 +26,7 @@ use gpui::{
 };
 
 use super::pane_frames::PaneFrame;
-use super::style::{self, RADIUS_MD, ease_out_cubic, mix};
+use super::style::{self, RADIUS_MD, ease_step, mix};
 
 /// Thickness of a pane's frame in logical pixels.
 const BORDER_PX: f32 = 1.0;
@@ -413,9 +413,13 @@ struct Transition {
 }
 
 impl Transition {
+    /// Exactly `to` once the time is up: the frame keeps asking for repaints
+    /// until the look it paints equals its target (see [`ease_step`]).
     fn at(&self, now: Instant) -> Look {
-        let step = now.duration_since(self.started).as_secs_f32() / self.duration.as_secs_f32();
-        self.from.mix(self.to, ease_out_cubic(step.clamp(0.0, 1.0)))
+        match ease_step(self.started, now, self.duration) {
+            Some(step) => self.from.mix(self.to, step),
+            None => self.to,
+        }
     }
 }
 
@@ -600,6 +604,41 @@ mod tests {
             0,
             1,
         )
+    }
+
+    #[test]
+    fn a_look_fading_to_a_clear_border_comes_to_rest() {
+        // `mix` fades a solid border out in its own hue, not the clear
+        // target's, so the look must land on its target exactly, or the pane
+        // asks for frames forever and repaints the window with each one.
+        let focus = Look {
+            border: Rgba {
+                r: 0.3,
+                g: 0.3,
+                b: 0.35,
+                a: 1.0,
+            },
+            dim: 0.0,
+            shadow: 1.0,
+        };
+        let rest = Look {
+            border: Rgba {
+                r: 0.1,
+                g: 0.12,
+                b: 0.14,
+                a: 0.0,
+            },
+            dim: 0.35,
+            shadow: 0.0,
+        };
+        let started = Instant::now();
+        let fade = Transition {
+            from: focus,
+            to: rest,
+            started,
+            duration: FOCUS_EASE,
+        };
+        assert!(fade.at(started + FOCUS_EASE) == rest);
     }
 
     fn frame(left: u16, top: u16, right: u16, bottom: u16) -> PaneFrame {

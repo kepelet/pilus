@@ -1059,11 +1059,9 @@ impl Element for Knob {
                     to: target,
                     started: now,
                 });
-                let at = |state: &KnobState| {
-                    let step =
-                        now.duration_since(state.started).as_secs_f32() / FILL_EASE.as_secs_f32();
-                    let eased = ease_out_cubic(step.clamp(0.0, 1.0));
-                    state.from + (state.to - state.from) * eased
+                let at = |state: &KnobState| match ease_step(state.started, now, FILL_EASE) {
+                    Some(step) => state.from + (state.to - state.from) * step,
+                    None => state.to,
                 };
                 if state.to != target {
                     state.from = at(&state);
@@ -1267,8 +1265,10 @@ struct MeterState {
 
 impl MeterState {
     fn at(&self, now: Instant) -> f32 {
-        let step = now.duration_since(self.started).as_secs_f32() / METER_EASE.as_secs_f32();
-        self.from + (self.to - self.from) * ease_out_cubic(step.clamp(0.0, 1.0))
+        match ease_step(self.started, now, METER_EASE) {
+            Some(step) => self.from + (self.to - self.from) * step,
+            None => self.to,
+        }
     }
 }
 
@@ -1851,13 +1851,28 @@ struct FillState {
 
 impl FillState {
     fn at(&self, now: Instant) -> Rgba {
-        let step = now.duration_since(self.started).as_secs_f32() / FILL_EASE.as_secs_f32();
-        mix(self.from, self.to, ease_out_cubic(step.clamp(0.0, 1.0)))
+        match ease_step(self.started, now, FILL_EASE) {
+            Some(step) => mix(self.from, self.to, step),
+            None => self.to,
+        }
     }
 }
 
 pub(super) fn ease_out_cubic(step: f32) -> f32 {
     1.0 - (1.0 - step).powi(3)
+}
+
+/// How far an eased transition that began at `started` has come by `now`, or
+/// `None` once its `duration` is up.
+///
+/// A finished transition must paint its target exactly. Each caller asks for
+/// another frame while the value it painted differs from the target, and an
+/// interpolated end can miss it: a rounding error, or a fade to a clear color,
+/// which [`mix`] gives the other end's hue. A miss asks for frames forever, and
+/// every frame re-renders the whole window.
+pub(super) fn ease_step(started: Instant, now: Instant, duration: Duration) -> Option<f32> {
+    let step = now.duration_since(started).as_secs_f32() / duration.as_secs_f32();
+    (step < 1.0).then(|| ease_out_cubic(step.max(0.0)))
 }
 
 /// `color` at `alpha` of its own opacity: a wash that lets the surface under
@@ -2276,8 +2291,10 @@ struct HoverState {
 
 impl HoverState {
     fn alpha(&self, now: Instant) -> f32 {
-        let step = now.duration_since(self.fade_started).as_secs_f32() / FILL_EASE.as_secs_f32();
-        self.fade_from + (self.fade_to - self.fade_from) * ease_out_cubic(step.clamp(0.0, 1.0))
+        match ease_step(self.fade_started, now, FILL_EASE) {
+            Some(step) => self.fade_from + (self.fade_to - self.fade_from) * step,
+            None => self.fade_to,
+        }
     }
 
     fn fade_to(&mut self, to: f32, now: Instant) {
@@ -2846,8 +2863,10 @@ pub(super) const FOLD: Duration = Duration::from_millis(220);
 /// from 0 to 1, or `None` once it has settled. Reduce motion settles it at
 /// once.
 pub(super) fn eased(started: Instant, duration: Duration, cx: &App) -> Option<f32> {
-    let step = started.elapsed().as_secs_f32() / duration.as_secs_f32();
-    (!cx.reduce_motion() && step < 1.0).then(|| ease_out_cubic(step))
+    if cx.reduce_motion() {
+        return None;
+    }
+    ease_step(started, Instant::now(), duration)
 }
 
 /// The quiet zone around a QR code, in modules. The spec asks for four; three
@@ -3117,6 +3136,54 @@ pub(super) fn dot_grid(color: Hsla, step: f32) -> gpui::Canvas<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hover_fill_that_fades_out_comes_to_rest() {
+        // `hover_fill` rests on clear black; `mix` fades out in the hover's
+        // own hue, which never equals it, so a fill that missed would keep
+        // asking for frames after the pointer left.
+        let hover = Rgba {
+            r: 0.2,
+            g: 0.4,
+            b: 0.6,
+            a: 0.5,
+        };
+        let rest = Rgba::from(gpui::transparent_black());
+        let started = Instant::now();
+        let state = FillState {
+            from: hover,
+            to: rest,
+            started,
+        };
+        assert_ne!(state.at(started + FILL_EASE / 2), rest);
+        assert_eq!(state.at(started + FILL_EASE), rest);
+    }
+
+    #[test]
+    fn eased_values_land_on_their_targets() {
+        let started = Instant::now();
+        let done = started + METER_EASE;
+        // In f32, 0.7 + (0.1 - 0.7) is 0.10000002: a lerp to the end misses.
+        let meter = MeterState {
+            from: 0.7,
+            to: 0.1,
+            started,
+        };
+        assert_eq!(meter.at(done).to_bits(), 0.1_f32.to_bits());
+        let hover = HoverState {
+            flight: GlideState {
+                from: Bounds::default(),
+                to: Bounds::default(),
+                started,
+            },
+            fade_from: 0.3,
+            fade_to: 1.0,
+            fade_started: started,
+        };
+        assert_eq!(hover.alpha(started + FILL_EASE), 1.0);
+        assert_eq!(ease_step(started, started + FILL_EASE, FILL_EASE), None);
+        assert!(ease_step(started, started, FILL_EASE).is_some_and(|step| step == 0.0));
+    }
 
     #[test]
     fn a_tilted_square_stays_within_its_turned_extent() {

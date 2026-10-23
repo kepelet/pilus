@@ -226,9 +226,8 @@ impl AppearancesView {
 
         // View-menu font changes land in the shared settings, so mirror them
         // here without waiting for a window reopen.
-        let latest = self.shared_settings.borrow().clone();
-        if latest != self.settings {
-            self.settings = latest;
+        if *self.shared_settings.borrow() != self.settings {
+            self.settings = self.shared_settings.borrow().clone();
             changed = true;
         }
 

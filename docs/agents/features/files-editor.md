@@ -75,19 +75,21 @@ The editor field (`md_editor_input`) is colored by `highlight::source`.
 A `mermaid` fence in a markdown preview, a GitHub body or a sipil chat message
 is drawn as a diagram by `gui/mermaid.rs`.
 
-- The first sight of a diagram starts a worker thread (`mermaid-rs-renderer`
-  lays it out, resvg draws it) and the fence shows as a code card until the
-  bitmap lands. `PilusView::poll` repaints when `mermaid::generation` moves.
-  A source that does not parse stays a code card, so a half-typed diagram never
-  blanks the preview.
+- The first sight of a diagram starts a worker thread (`bezel-mermaid` lays it
+  out, resvg draws it) and the fence shows as a code card until the bitmap
+  lands. `PilusView::poll` repaints when `mermaid::generation` moves. A source
+  that does not parse stays a code card, so a half-typed diagram never blanks
+  the preview.
 - Bitmaps are cached by source and palette, 24 at most, least recently used
-  out. A theme or Interface font change draws the diagram again.
+  out. A theme change or an Interface size change draws the diagram again.
 - Colors come from `Theme` roles through `mermaid::Style`. Do not add a color
   literal there.
-- The source is capped at `MAX_SOURCE`, and the SVG is read with
-  `about::untrusted_svg_options` (see [security.md](../security.md)).
-- `mermaid-rs-renderer` copies the system font it measures with into
-  `~/.cache/mmdr/font-cache`, outside `~/.pilus`. We cannot turn that off.
+- Labels are measured with Arial's advances and drawn in Arial, not the
+  Interface font. resvg also ignores a font family set in the root's `style`, so
+  `with_family` puts it on the element as an attribute.
+- The source is capped at `MAX_SOURCE`, links and images are switched off in the
+  renderer, and the SVG is read with `about::untrusted_svg_options` (see
+  [security.md](../security.md)).
 
 ## Quick open (⌘P) and find (⌘F)
 

@@ -812,7 +812,7 @@ fn is_mermaid(lang: Option<&str>) -> bool {
 /// preview.
 fn mermaid_card(source: &str, paint: &Paint) -> AnyElement {
     let theme = paint.theme;
-    let state = mermaid::lookup(source, &theme, &paint.chrome, paint.fonts.body);
+    let state = mermaid::lookup(source, &theme, paint.fonts.body);
     let mermaid::State::Ready(diagram) = state else {
         return code_card(Some("mermaid"), source, paint);
     };

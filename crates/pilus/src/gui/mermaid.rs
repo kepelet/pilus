@@ -2,15 +2,19 @@
 //!
 //! `markdown` asks [`lookup`] for the diagram a ```` ```mermaid ```` fence
 //! describes and draws the fence as code until it is ready. A miss starts a
-//! worker thread that lays the diagram out (`mermaid-rs-renderer`), draws the
-//! SVG it returns with resvg, and parks the bitmap in a cache keyed by the
-//! source and the palette it was drawn in. The worker then bumps
+//! worker thread that lays the diagram out (`bezel-mermaid`), draws the SVG it
+//! returns with resvg, and parks the bitmap in a cache keyed by the source and
+//! the palette it was drawn in. The worker then bumps
 //! [`generation`] and signals the tick loop; `PilusView::poll` repaints on the
 //! bump, so the GUI thread never waits on a layout.
 //!
 //! The SVG comes from our own renderer, but its text comes from a file or a
 //! GitHub body, so it is parsed with `about::untrusted_svg_options` like any
-//! SVG from another machine, and the source is capped before it is laid out.
+//! SVG from another machine, the source is capped before it is laid out, and
+//! the renderer is told to leave links and images out of the drawing.
+//!
+//! Labels are measured with Arial's advances (`bezel::Metrics`), so they are
+//! drawn in Arial too: another face would run over or short of its box.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -19,10 +23,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use gpui::{RenderImage, Rgba};
-use mermaid_rs_renderer::{LayoutConfig, RenderOptions};
 use resvg::usvg::fontdb;
 
 use super::about;
+use super::style::mix;
 use super::theme::Theme;
 
 /// The longest diagram source laid out. Layout cost grows faster than the
@@ -31,6 +35,8 @@ const MAX_SOURCE: usize = 32 * 1024;
 /// Diagrams kept at once. A bitmap is a few megabytes, so the cache stays small
 /// and drops the one drawn least recently.
 const MAX_ENTRIES: usize = 24;
+/// The face labels are measured in and drawn in. See the module header.
+const FAMILY: &str = "Arial";
 /// Pixels drawn per logical pixel, so a diagram stays sharp on a retina screen.
 const SHARPNESS: f32 = 2.0;
 /// The longest edge of a bitmap, in pixels. A larger diagram is drawn smaller
@@ -70,14 +76,14 @@ pub(super) fn generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
 }
 
-/// The diagram for `source` in `theme`'s colors, set in `family` at `size`.
-/// Never blocks: a diagram not yet drawn comes back [`State::Pending`] and a
-/// worker draws it.
-pub(super) fn lookup(source: &str, theme: &Theme, family: &str, size: f32) -> State {
+/// The diagram for `source` in `theme`'s colors, with labels at `size`. Never
+/// blocks: a diagram not yet drawn comes back [`State::Pending`] and a worker
+/// draws it.
+pub(super) fn lookup(source: &str, theme: &Theme, size: f32) -> State {
     if source.len() > MAX_SOURCE || source.trim().is_empty() {
         return State::Failed;
     }
-    let style = Style::new(theme, family, size);
+    let style = Style::new(theme, size);
     let key = key(source, &style);
     let now = CLOCK.fetch_add(1, Ordering::Relaxed);
     {
@@ -143,18 +149,31 @@ fn key(source: &str, style: &Style) -> u64 {
 
 /// Lay out `source` and draw it.
 fn draw(source: &str, style: &Style) -> Option<Diagram> {
-    let options = RenderOptions {
-        theme: style.theme(),
-        layout: LayoutConfig::default(),
+    let options = bezel::Options {
+        font_family: Some(FAMILY.to_string()),
+        font_size: f64::from(style.size) / 10.0,
+        colors: Some(style.colors.clone()),
+        // A bitmap has nothing to click, and an image would be a fetch the
+        // source's author chose for the reader.
+        links: false,
+        images: false,
+        ..bezel::Options::default()
     };
-    let svg = match mermaid_rs_renderer::render_with_options(source, options) {
-        Ok(svg) => svg,
+    let svg = match bezel::render(source, &options, &bezel::Metrics) {
+        Ok(drawing) => drawing.svg,
         Err(error) => {
-            tracing::debug!(%error, "mermaid diagram did not parse");
+            tracing::debug!(?error, "mermaid diagram did not draw");
             return None;
         }
     };
-    rasterize(&svg)
+    rasterize(&with_family(&svg))
+}
+
+/// `svg` with its face set as an attribute. resvg reads a font family from an
+/// attribute but not from the `style` the renderer sets it in, and would draw
+/// every label in its serif default.
+fn with_family(svg: &str) -> String {
+    svg.replacen("<svg ", &format!("<svg font-family=\"{FAMILY}\" "), 1)
 }
 
 /// Every system font, loaded once. A diagram is mostly labels, and resvg
@@ -194,103 +213,51 @@ fn rasterize(svg: &str) -> Option<Diagram> {
     })
 }
 
-/// What a diagram's look depends on: the cache key, and the renderer's theme.
+/// What a diagram's look depends on: the cache key, and the renderer's colors.
 #[derive(Clone, Hash)]
 struct Style {
-    dark: bool,
-    family: String,
     /// Tenths of a pixel, so the key hashes.
     size: u32,
-    /// Node fill.
-    node: String,
-    /// Text.
-    text: String,
-    /// Lines, arrowheads and node outlines.
-    line: String,
-    /// What the diagram sits on, which edge labels paint over.
-    surface: String,
-    /// Group boxes and their outlines.
-    group: String,
-    group_edge: String,
-    /// Notes in a sequence diagram.
-    note: String,
-    note_edge: String,
-    /// One color per pie slice or git branch: the theme's hues, so a series
-    /// stays apart on the card.
-    series: Vec<String>,
+    colors: bezel::Colors,
 }
 
 impl Style {
-    fn new(theme: &Theme, family: &str, size: f32) -> Self {
-        // A family with a quote in it would end the SVG attribute it lands in.
-        let family: String = family.chars().filter(|c| !"\"'<>&".contains(*c)).collect();
-        Self {
-            dark: luminance(theme.bg) < 0.5,
-            family: format!("{family}, Helvetica Neue, Arial, sans-serif"),
-            size: (size * 10.0).round() as u32,
-            node: hex(theme.panel),
-            text: hex(theme.fg),
-            line: hex(theme.muted),
-            surface: hex(theme.panel_dim),
-            group: hex(theme.bg),
-            group_edge: hex(theme.border),
-            note: hex(theme.selection_bg),
-            note_edge: hex(theme.accent),
-            series: (1..=6).chain(9..=14).map(|slot| hex(theme.ansi[slot])).collect(),
-        }
-    }
-
-    /// The renderer's theme with our colors over the nearest of its own, so the
-    /// diagram types that color by series (pie, git) still get a palette.
-    fn theme(&self) -> mermaid_rs_renderer::Theme {
-        let mut theme = if self.dark {
-            mermaid_rs_renderer::Theme::dark()
-        } else {
-            mermaid_rs_renderer::Theme::modern()
+    fn new(theme: &Theme, size: f32) -> Self {
+        // Nodes stand a step above the card, and an edge label sits on it.
+        let rule = mix(theme.border, theme.muted, 0.3);
+        let colors = bezel::Colors {
+            bg: bytes(theme.panel_dim),
+            fg: bytes(theme.fg),
+            muted: bytes(theme.muted),
+            line: bytes(theme.muted),
+            surface: bytes(theme.panel),
+            surface_alt: bytes(theme.panel_dim),
+            border: bytes(rule),
+            accent: bytes(theme.accent),
+            critical: bytes(theme.alert),
+            // One hue per pie slice or branch, in the order the theme names them.
+            series: [
+                theme.accent,
+                theme.ok,
+                theme.branch,
+                theme.alert,
+                theme.ansi[3],
+                theme.ansi[6],
+                theme.ansi[5],
+                mix(theme.accent, theme.fg, 0.5),
+            ]
+            .map(bytes),
         };
-        theme.font_family = self.family.clone();
-        theme.font_size = self.size as f32 / 10.0;
-        // The card behind the diagram is the background.
-        theme.background = "none".into();
-        theme.primary_color = self.node.clone();
-        theme.primary_text_color = self.text.clone();
-        theme.primary_border_color = self.line.clone();
-        theme.text_color = self.text.clone();
-        theme.line_color = self.line.clone();
-        theme.secondary_color = self.group.clone();
-        theme.tertiary_color = self.surface.clone();
-        theme.edge_label_background = self.surface.clone();
-        theme.cluster_background = self.group.clone();
-        theme.cluster_border = self.group_edge.clone();
-        theme.sequence_actor_fill = self.node.clone();
-        theme.sequence_actor_border = self.line.clone();
-        theme.sequence_actor_line = self.line.clone();
-        theme.sequence_note_fill = self.note.clone();
-        theme.sequence_note_border = self.note_edge.clone();
-        theme.sequence_activation_fill = self.group_edge.clone();
-        theme.sequence_activation_border = self.line.clone();
-        for (slot, color) in theme.pie_colors.iter_mut().zip(&self.series) {
-            *slot = color.clone();
+        Self {
+            size: (size * 10.0).round() as u32,
+            colors,
         }
-        for (slot, color) in theme.git_colors.iter_mut().zip(&self.series) {
-            *slot = color.clone();
-        }
-        theme.pie_title_text_color = self.text.clone();
-        theme.pie_section_text_color = self.text.clone();
-        theme.pie_legend_text_color = self.text.clone();
-        theme.pie_stroke_color = self.surface.clone();
-        theme.pie_outer_stroke_color = self.group_edge.clone();
-        theme
     }
 }
 
-fn luminance(c: Rgba) -> f32 {
-    0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
-}
-
-fn hex(c: Rgba) -> String {
+fn bytes(c: Rgba) -> [u8; 4] {
     let byte = |channel: f32| (channel.clamp(0.0, 1.0) * 255.0).round() as u8;
-    format!("#{:02x}{:02x}{:02x}", byte(c.r), byte(c.g), byte(c.b))
+    [byte(c.r), byte(c.g), byte(c.b), byte(c.a)]
 }
 
 #[cfg(test)]
@@ -300,32 +267,30 @@ mod tests {
     const FLOW: &str = "flowchart LR\n  A[Client] --> B{Auth?}\n  B -->|yes| C[Daemon]\n  B -->|no| D[Reject]\n";
 
     #[test]
-    fn style_hashes_by_colors_and_family() {
-        let dark = Theme::default();
-        let a = Style::new(&dark, "Inter", 13.0);
-        let b = Style::new(&dark, "Inter", 13.0);
-        let c = Style::new(&dark, "Menlo", 13.0);
+    fn style_hashes_by_colors_and_size() {
+        let theme = Theme::default();
+        let a = Style::new(&theme, 13.0);
+        let b = Style::new(&theme, 13.0);
+        let c = Style::new(&theme, 14.0);
+        let mut other = theme;
+        other.panel = gpui::rgb(0x336699);
+        let d = Style::new(&other, 13.0);
         assert_eq!(key("x", &a), key("x", &b));
         assert_ne!(key("x", &a), key("x", &c));
+        assert_ne!(key("x", &a), key("x", &d));
         assert_ne!(key("x", &a), key("y", &a));
     }
 
     #[test]
-    fn family_cannot_break_out_of_its_attribute() {
-        let style = Style::new(&Theme::default(), "Evil\" onload=\"x", 13.0);
-        assert!(!style.family.contains('"'));
-    }
-
-    #[test]
     fn a_flowchart_draws_to_a_bitmap() {
-        let style = Style::new(&Theme::default(), "Helvetica Neue", 13.0);
+        let style = Style::new(&Theme::default(), 13.0);
         let diagram = draw(FLOW, &style).expect("flowchart draws");
         assert!(diagram.width > 50.0 && diagram.height > 20.0);
     }
 
     #[test]
     fn nonsense_fails_instead_of_panicking() {
-        let style = Style::new(&Theme::default(), "Helvetica Neue", 13.0);
+        let style = Style::new(&Theme::default(), 13.0);
         assert!(draw("this is not a diagram", &style).is_none());
     }
 
@@ -333,8 +298,41 @@ mod tests {
     fn oversized_source_is_refused_without_a_worker() {
         let source = "A-->B\n".repeat(MAX_SOURCE);
         assert!(matches!(
-            lookup(&source, &Theme::default(), "Inter", 13.0),
+            lookup(&source, &Theme::default(), 13.0),
             State::Failed
         ));
+    }
+
+    #[test]
+    fn a_source_cannot_ask_for_an_image() {
+        let options = bezel::Options {
+            images: false,
+            links: false,
+            ..bezel::Options::default()
+        };
+        let source = "flowchart LR\n  A@{ img: \"https://example.com/x.png\", label: \"hi\", pos: \"t\", w: 60, h: 60 }\n";
+        let drawing = bezel::render(source, &options, &bezel::Metrics).expect("node draws");
+        assert!(!drawing.svg.contains("<image"), "{}", drawing.svg);
+    }
+
+    #[test]
+    fn the_face_lands_on_the_root_element_only() {
+        let svg = with_family("<svg width=\"1\"><text>a</text><svg x=\"0\"/></svg>");
+        assert_eq!(
+            svg,
+            "<svg font-family=\"Arial\" width=\"1\"><text>a</text><svg x=\"0\"/></svg>"
+        );
+    }
+
+    #[test]
+    fn a_drawing_names_the_face_it_was_measured_in() {
+        let style = Style::new(&Theme::default(), 13.0);
+        let options = bezel::Options {
+            font_family: Some(FAMILY.to_string()),
+            colors: Some(style.colors),
+            ..bezel::Options::default()
+        };
+        let drawing = bezel::render(FLOW, &options, &bezel::Metrics).expect("flowchart draws");
+        assert!(drawing.svg.contains("font-family:Arial"));
     }
 }

@@ -30,6 +30,7 @@ mod github_account;
 mod machines;
 mod mission;
 pub mod netlog;
+mod paste;
 mod ports;
 pub mod process;
 mod read;
@@ -92,6 +93,7 @@ pub use mission::{
     AutomationDetail, AutomationHealth, AutomationRow, AutomationRun, MissionRow, MissionScope,
     MissionSnapshot, MissionUsage,
 };
+pub use paste::{MAX_PASTED_BYTES, PastedImage, is_image_file, shell_word, stash_image};
 pub use pilus_protocol as protocol;
 pub use ports::{ListeningPort, PortForward, free_local_port, kill_process, list_ports};
 pub use read::{MAX_IMAGE_BYTES, MAX_TEXT_BYTES, TextFile, Version, read_bytes, read_text};

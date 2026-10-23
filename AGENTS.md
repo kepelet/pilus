@@ -49,6 +49,7 @@ command-line tools can still build the app.
 | Home page and its idle-agent panel | [features/home.md](docs/agents/features/home.md) |
 | Search, Insights, the session page | [features/search-and-insights.md](docs/agents/features/search-and-insights.md) |
 | Files tab, editor, ⌘P, ⌘F, markdown notes | [features/files-editor.md](docs/agents/features/files-editor.md) |
+| Pasting or dropping images on the terminal | [features/terminal-images.md](docs/agents/features/terminal-images.md) |
 | Pinned and recent workspaces | [features/workspaces.md](docs/agents/features/workspaces.md) |
 | GitHub Repositories section | [features/github.md](docs/agents/features/github.md) |
 

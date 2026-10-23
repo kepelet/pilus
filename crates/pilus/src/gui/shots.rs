@@ -758,6 +758,34 @@ pub fn run_main() -> Result<()> {
     // task only sees them when the clock advances and tasks are drained.
     settle(&mut cx, 80);
     capture(&mut cx, window.into(), "main")?;
+    // A screenshot dragged in from outside, held over the terminal: a ring
+    // traces the grid, since a release pastes the image's path into the pane.
+    {
+        use gpui::{ExternalPaths, FileDropEvent, InputEvent as _};
+        let paths =
+            ExternalPaths(std::iter::once(std::path::PathBuf::from("/tmp/shot.png")).collect());
+        let over = point(px(500.0), px(300.0));
+        for event in [
+            FileDropEvent::Entered {
+                position: over,
+                paths,
+            },
+            FileDropEvent::Pending { position: over },
+        ] {
+            cx.update_window(window.into(), |_, window, app| {
+                window.dispatch_event(event.to_platform_input(), app);
+            })
+            .ok();
+            settle(&mut cx, 1);
+        }
+        settle(&mut cx, 6);
+        capture(&mut cx, window.into(), "main-terminal-drop")?;
+        cx.update_window(window.into(), |_, window, app| {
+            window.dispatch_event(FileDropEvent::Exited.to_platform_input(), app);
+        })
+        .ok();
+        settle(&mut cx, 6);
+    }
 
     // Connected to sipil: its two sections lead the sidebar lists.
     super::sipil::preview(sipil_fixture(true));

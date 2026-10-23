@@ -51,6 +51,7 @@ mod page_split;
 mod palette;
 mod pane_chrome;
 mod pane_frames;
+mod paste_image;
 mod perf;
 mod picker;
 mod pinned;
@@ -107,9 +108,9 @@ use github_page::GithubPage;
 use glass::Glass;
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DispatchPhase,
-    DisplayId, Div, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding,
-    KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle,
+    DisplayId, Div, ElementId, Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla,
+    KeyBinding, KeyDownEvent, Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle,
     ScrollWheelEvent, SharedString, Stateful, SystemNotification, TextRun, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, anchored, canvas, deferred, div, font,
     img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, size, svg,
@@ -5300,11 +5301,22 @@ impl PilusView {
 
     /// Send the system clipboard to the daemon, which applies the pane's own
     /// bracketed-paste rules.
+    ///
+    /// A clipboard that holds a picture instead of words (a screenshot, an image
+    /// file copied in Finder) is stored on the pane's machine and pastes its
+    /// path, the way an agent or viewer in the pane takes an image.
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(item) = cx.read_from_clipboard() else {
             return;
         };
-        if !text.is_empty() {
+        let images = paste_image::clipboard_images(&item);
+        if !images.is_empty() {
+            self.paste_images(images, cx);
+            return;
+        }
+        if let Some(text) = item.text()
+            && !text.is_empty()
+        {
             self.send_active(ClientMessage::Paste(text));
         }
     }
@@ -15191,6 +15203,7 @@ impl Render for PilusView {
             None if self.hovered_link() => grid.cursor_pointer(),
             None => grid,
         };
+        let drop_edge = theme.border_focus;
         let grid = grid
             .on_mouse_down(
                 MouseButton::Left,
@@ -15251,7 +15264,25 @@ impl Render for PilusView {
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, _| {
                 this.scroll(event, window);
-            }));
+            }))
+            // Images dropped on the terminal reach the pane as a path, on this
+            // machine or the remote one it shows. The cue is an overlay, not a
+            // fill on the grid, which its own rows would paint over; it is
+            // absolute so the cell geometry the daemon sized never moves.
+            .relative()
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.drop_on_terminal(paths.paths(), cx);
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .border_2()
+                    .border_color(drop_edge.opacity(0.0))
+                    .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                        style.bg(drop_edge.opacity(0.10)).border_color(drop_edge)
+                    }),
+            );
         let luvus_missing = self.luvus_missing();
         let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
         let sidebar = if luvus_missing {

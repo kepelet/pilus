@@ -21,7 +21,7 @@ use gpui::{
 
 use crate::settings::{CHROME_FONT, CORNER_RADIUS, DEFAULT_CORNER_RADIUS, Settings};
 
-use super::theme::Theme;
+use super::theme::{Theme, tile_glyph};
 use super::toast::ToastKind;
 
 /// How long a skeleton takes to fade from dim to lit and back. Long enough to
@@ -359,6 +359,9 @@ pub(super) fn glyph_tile(
     // foreground too loud.
     let edge = tint(theme.panel_fg, 0.2);
     let radius = Radius::Sm.pixels().as_f32();
+    // Square corners are the flat look; an outline on them would put a frame
+    // back, so the cards then tell apart by their fills alone.
+    let outlined = radius > 0.0;
     let mut deck = div()
         .relative()
         .flex_shrink_0()
@@ -388,10 +391,12 @@ pub(super) fn glyph_tile(
                             let shade = mix(face, theme.panel_fg, f32::from(depth) * 0.1);
                             window.paint_path(path, Hsla::from(shade));
                         }
-                        let mut line = PathBuilder::stroke(px(1.0));
-                        line.add_polygon(&outline, true);
-                        if let Ok(path) = line.build() {
-                            window.paint_path(path, Hsla::from(edge));
+                        if outlined {
+                            let mut line = PathBuilder::stroke(px(1.0));
+                            line.add_polygon(&outline, true);
+                            if let Ok(path) = line.build() {
+                                window.paint_path(path, Hsla::from(edge));
+                            }
                         }
                     }
                 },
@@ -412,8 +417,7 @@ pub(super) fn glyph_tile(
         .w(px(GLYPH_TILE))
         .h(px(GLYPH_TILE))
         .radius_sm()
-        .border_1()
-        .border_color(edge)
+        .when(outlined, |front| front.border_1().border_color(edge))
         .bg(front_face)
         .child(
             svg()
@@ -421,7 +425,7 @@ pub(super) fn glyph_tile(
                 .w(px(GLYPH_TILE * 0.6))
                 .h(px(GLYPH_TILE * 0.6))
                 .flex_shrink_0()
-                .text_color(theme.panel_fg),
+                .text_color(tile_glyph()),
         );
     deck.child(front)
 }

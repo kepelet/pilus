@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, Context, Div, FontWeight, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    SharedString, Stateful, div, list, prelude::*, px, relative,
+    Pixels, ScrollHandle, SharedString, Stateful, div, list, prelude::*, px, relative,
 };
 use pilus_client::{
     CommitDetail, CommitRefKind, DiffLayer, Error, GitCommit, GitStatus, SshTarget, show_commit,
@@ -42,6 +42,8 @@ const DEFAULT_LIST_HEIGHT: f32 = 240.0;
 const DIVIDER_HEIGHT: f32 = 7.0;
 /// Most of the tab the commit list may take before the detail is squeezed.
 const MAX_LIST_SHARE: f32 = 0.7;
+/// How close to the end of the list, in logical pixels, the next page is asked for.
+const LOAD_AHEAD: f32 = 240.0;
 
 /// What a background read reports back to the tab.
 pub(super) enum GitMsg {
@@ -100,6 +102,8 @@ pub(super) struct GitPanel {
     /// The file whose chevron was just turned, so only it animates.
     toggled: Option<usize>,
     list: ListState,
+    /// Scroll position of the commit list, read to load older commits as the end nears.
+    history_scroll: ScrollHandle,
     /// Height of the commit list above the detail, in logical pixels.
     list_h: f32,
     /// A divider drag in progress: pointer y and list height at its start.
@@ -124,6 +128,7 @@ impl GitPanel {
             collapsed: HashSet::new(),
             toggled: None,
             list: ListState::new(0, ListAlignment::Top, px(600.0)),
+            history_scroll: ScrollHandle::new(),
             list_h: DEFAULT_LIST_HEIGHT,
             divider: None,
             error: None,
@@ -165,6 +170,13 @@ impl GitPanel {
     /// Whether the last read filled the page, so older commits may exist.
     fn may_have_more(&self) -> bool {
         self.commits.len() >= self.limit as usize
+    }
+
+    /// Whether the commit list is scrolled to within [`LOAD_AHEAD`] of its
+    /// last row. A list that fits without scrolling counts as at its end.
+    fn near_end(&self) -> bool {
+        let left: Pixels = self.history_scroll.max_offset().y + self.history_scroll.offset().y;
+        left <= px(LOAD_AHEAD)
     }
 
     /// Fold a finished read in; true when what is drawn changed.
@@ -274,6 +286,7 @@ impl PilusView {
     /// anything changed.
     pub(super) fn git_tick(&mut self) -> bool {
         let mut changed = false;
+        let mut landed = false;
         while let Ok(message) = self.git_panel.rx.try_recv() {
             let current = self.git_panel.endpoint.clone();
             match message {
@@ -284,6 +297,7 @@ impl PilusView {
                     }
                     changed |= self.git_panel.apply(result);
                     changed |= self.git_open_newest();
+                    landed = true;
                 }
                 GitMsg::Commit {
                     endpoint,
@@ -304,6 +318,18 @@ impl PilusView {
             self.git_panel.reset();
             self.git_panel.endpoint = Some(self.active.clone());
             changed = true;
+        }
+        // Scrolling to the end asks for the next page. Raising the limit
+        // makes `may_have_more` false until that page lands, so one scroll
+        // loads one page. A read that just landed has not been laid out yet,
+        // so its scroll extent is stale: wait for the next tick.
+        if !landed
+            && self.git_panel.may_have_more()
+            && !self.git_panel.polling
+            && self.git_panel.near_end()
+        {
+            self.git_panel.limit = self.git_panel.limit.saturating_add(PAGE);
+            self.git_panel.mark_stale();
         }
         let panel = &mut self.git_panel;
         if panel.polling
@@ -570,6 +596,7 @@ impl PilusView {
             .h(px(panel.list_h))
             .max_h(relative(MAX_LIST_SHARE))
             .overflow_y_scroll()
+            .track_scroll(&panel.history_scroll)
             .child(column)
     }
 

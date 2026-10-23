@@ -368,6 +368,25 @@ fn enrich_tab_runtime(tabs: &mut [Tab], snapshot: &Value, titles: &HashMap<Strin
     }
 }
 
+/// The command a terminal title names, or `None` while the shell is idle.
+///
+/// A shell titles an idle prompt with the directory alone (`~`,
+/// `~/D/k/pilus`), or with its own name before it (`fish ~/D/k/pilus`), and a
+/// running command with the command line, so such a title says nothing the
+/// Directory line does not.
+pub fn running_command(title: &str) -> Option<&str> {
+    const SHELLS: [&str; 6] = ["fish", "zsh", "bash", "sh", "nu", "elvish"];
+    let title = title.trim();
+    let (first, rest) = title.split_once(char::is_whitespace).unwrap_or((title, ""));
+    let rest = rest.trim();
+    let path_shaped =
+        |text: &str| text.starts_with(['~', '/']) && !text.contains(char::is_whitespace);
+    let idle = title.is_empty()
+        || path_shaped(title)
+        || (SHELLS.contains(&first) && (rest.is_empty() || path_shaped(rest)));
+    (!idle).then_some(title)
+}
+
 /// Pane id to terminal title from `terminal.backend.inventory`.
 fn terminal_titles(inventory: &Value) -> HashMap<String, String> {
     inventory
@@ -920,11 +939,15 @@ impl ControlClient {
         Ok(())
     }
 
-    /// The focused pane's id when it runs no agent, so a launch can reuse it
-    /// instead of splitting a second pane beside a shell.
+    /// The focused pane's id when it is a shell waiting at its prompt, so a
+    /// launch can reuse it instead of splitting a second pane beside a shell.
     ///
     /// A pane's own `agent` field names its detected command (`fish`, `zsh`),
-    /// so membership in `agent.list` is what identifies a busy pane.
+    /// so membership in `agent.list` is what identifies a busy pane. A shell
+    /// running a foreground program (`npm run dev`) is busy too: whatever is
+    /// typed into it goes to that program, so the launch splits instead. A
+    /// daemon that lists no terminal titles cannot say, and its shell is
+    /// taken as idle.
     pub fn idle_pane(&mut self) -> Result<Option<String>> {
         let result = self.request("pane.current", json!({}))?;
         let Some(pane) = result
@@ -935,6 +958,16 @@ impl ControlClient {
             return Ok(None);
         };
         if self.agents()?.iter().any(|agent| agent.pane == pane) {
+            return Ok(None);
+        }
+        let titles = self
+            .request("terminal.backend.inventory", json!({}))
+            .map(|inventory| terminal_titles(&inventory))
+            .unwrap_or_default();
+        if titles
+            .get(&pane)
+            .is_some_and(|title| running_command(title).is_some())
+        {
             return Ok(None);
         }
         Ok(Some(pane))
@@ -1791,7 +1824,8 @@ fn is_structural(name: &str) -> bool {
 mod tests {
     use super::{
         Agent, AutomationSummary, FeedUpdate, PaneFrame, Tab, TaskSummary, enrich_tab_runtime,
-        is_structural, note_zoom, read_line_within, terminal_titles, worktree_blockers,
+        is_structural, note_zoom, read_line_within, running_command, terminal_titles,
+        worktree_blockers,
     };
     use crate::error::Error;
     use crate::transport::Stream;
@@ -1800,6 +1834,21 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_idle_shell_title_is_not_a_running_command() {
+        assert_eq!(running_command("~"), None);
+        assert_eq!(running_command(" ~/D/k/pilus "), None);
+        assert_eq!(running_command(""), None);
+        assert_eq!(running_command("fish ~/D/k/pilus"), None);
+        assert_eq!(running_command("zsh"), None);
+        assert_eq!(
+            running_command("python3 -m http.serv ~/D/k/pilus"),
+            Some("python3 -m http.serv ~/D/k/pilus")
+        );
+        assert_eq!(running_command("npm run dev"), Some("npm run dev"));
+        assert_eq!(running_command("fish -c build"), Some("fish -c build"));
+    }
 
     #[test]
     fn a_session_title_leads_the_label_then_the_alias_then_the_directory() {

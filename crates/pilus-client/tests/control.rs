@@ -344,3 +344,50 @@ fn mission_control_reads_and_row_actions() {
     client.set_automation_enabled("a1", true).expect("enable");
     server.join().expect("server thread");
 }
+
+/// What `idle_pane` makes of a focused shell whose terminal title is `title`.
+fn idle_pane_with_title(name: &str, title: &str) -> Option<String> {
+    let dir = std::env::temp_dir().join(format!("pilus-idle-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let socket = dir.join("luvus.sock");
+    let _ = std::fs::remove_file(&socket);
+
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let title = title.to_string();
+    let server = thread::spawn(move || {
+        for _ in 0..3 {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut writer = stream;
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read request");
+            let request: serde_json::Value = serde_json::from_str(&line).expect("json");
+            let result = match request["method"].as_str().expect("method") {
+                "pane.current" => serde_json::json!({ "type": "pane_current", "pane": "7" }),
+                "agent.list" => serde_json::json!({ "type": "agent_list", "agents": [] }),
+                "terminal.backend.inventory" => serde_json::json!({
+                    "type": "terminal_backend_inventory",
+                    "terminals": [{ "pane_id": "7", "terminal_title": title }]
+                }),
+                other => panic!("unexpected method: {other}"),
+            };
+            let response = serde_json::json!({ "id": request["id"], "result": result });
+            writeln!(writer, "{response}").expect("write response");
+        }
+    });
+    let mut client = ControlClient::connect(&socket).expect("connect");
+    let pane = client.idle_pane().expect("idle pane");
+    server.join().expect("server thread");
+    pane
+}
+
+#[test]
+fn a_shell_at_its_prompt_is_idle() {
+    assert_eq!(idle_pane_with_title("prompt", "~/r/api"), Some("7".into()));
+}
+
+#[test]
+fn a_shell_running_a_foreground_program_is_not_idle() {
+    // Typing into it would reach `npm run dev`, not a shell.
+    assert_eq!(idle_pane_with_title("busy", "npm run dev"), None);
+}

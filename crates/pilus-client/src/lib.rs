@@ -56,7 +56,7 @@ pub use connector::agent_binary;
 pub use control::{
     Agent, AgentFeed, AgentSession, Appearance, AutomationSummary, BarSegment, BarWidget,
     ControlClient, ControlTransport, FeedScope, FeedUpdate, PaneFrame, PaneInfo, Tab, TaskAction,
-    TaskSummary, ThemeInfo, WorktreeInfo, set_feed_slowdown, worktree_blockers,
+    TaskSummary, ThemeInfo, WorktreeInfo, running_command, set_feed_slowdown, worktree_blockers,
 };
 pub use diff::{
     DiffFile, DiffHunk, DiffLayer, DiffLine, DiffLineKind, DiffNote, DiffSnapshot, FileDiff,

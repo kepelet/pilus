@@ -125,7 +125,7 @@ use pilus_client::{
     SshTarget, Surface, SurfaceChange, Tab, TaskSummary, WorktreeInfo, agent_binary, config_dir,
     connect_machine, expand_local, expand_remote, generate_session_name, is_behind, list_machines,
     list_session_infos, luvus_binary, pilus_config_dir, refresh_machines, remote_home,
-    split_client_socket,
+    running_command, split_client_socket,
 };
 use pilus_protocol::{
     CellData, ClientMessage, FrameData, ShellDockRect, ShellSidebars, ShellWorkspace,
@@ -17048,17 +17048,6 @@ fn tab_label(name: &str, session_title: Option<&str>, cwd: &str, index: u16, lon
     }
 }
 
-/// The command a terminal title names, or `None` while the shell is idle.
-///
-/// A shell titles an idle prompt with the directory alone (`~`,
-/// `~/D/k/pilus`) and a running command with the command line, so a title that
-/// is one path-shaped word says nothing the Directory line does not.
-fn running_command(title: &str) -> Option<&str> {
-    let title = title.trim();
-    let bare_path = title.starts_with(['~', '/']) && !title.contains(char::is_whitespace);
-    (!title.is_empty() && !bare_path).then_some(title)
-}
-
 /// The longest name a tab takes, so one title cannot crowd the strip.
 const TAB_NAME_MAX: usize = 40;
 
@@ -17733,17 +17722,6 @@ mod tests {
         );
         let long = tab_label(&"n".repeat(40), None, "~/work/pilus", 9, false);
         assert!(long.ends_with("… ⌘9"));
-    }
-
-    #[test]
-    fn an_idle_shell_title_is_not_a_running_command() {
-        assert_eq!(running_command("~"), None);
-        assert_eq!(running_command(" ~/D/k/pilus "), None);
-        assert_eq!(running_command(""), None);
-        assert_eq!(
-            running_command("python3 -m http.serv ~/D/k/pilus"),
-            Some("python3 -m http.serv ~/D/k/pilus")
-        );
     }
 
     #[test]

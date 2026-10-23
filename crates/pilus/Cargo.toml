@@ -24,6 +24,9 @@ visual-test = ["gui", "gpui/test-support", "gpui_platform/test-support"]
 
 [dependencies]
 resvg = "=0.46.0"
+# Mermaid fences in markdown. The `png` feature would pull a second resvg; we
+# rasterize the SVG ourselves with the one above.
+mermaid-rs-renderer = { version = "0.3", default-features = false }
 anyhow.workspace = true
 crossterm.workspace = true
 gpui-updater-core.workspace = true

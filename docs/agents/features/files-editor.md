@@ -32,6 +32,25 @@ The editor field (`md_editor_input`) is colored by `highlight::source`.
   `{` is an MDX error. Do not make that parse stricter, or a half-typed file
   blanks the preview.
 
+## Mermaid diagrams
+
+A `mermaid` fence in a markdown preview, a GitHub body or a sipil chat message
+is drawn as a diagram by `gui/mermaid.rs`.
+
+- The first sight of a diagram starts a worker thread (`mermaid-rs-renderer`
+  lays it out, resvg draws it) and the fence shows as a code card until the
+  bitmap lands. `PilusView::poll` repaints when `mermaid::generation` moves.
+  A source that does not parse stays a code card, so a half-typed diagram never
+  blanks the preview.
+- Bitmaps are cached by source and palette, 24 at most, least recently used
+  out. A theme or Interface font change draws the diagram again.
+- Colors come from `Theme` roles through `mermaid::Style`. Do not add a color
+  literal there.
+- The source is capped at `MAX_SOURCE`, and the SVG is read with
+  `about::untrusted_svg_options` (see [security.md](../security.md)).
+- `mermaid-rs-renderer` copies the system font it measures with into
+  `~/.cache/mmdr/font-cache`, outside `~/.pilus`. We cannot turn that off.
+
 ## Quick open (⌘P) and find (⌘F)
 
 Both belong to the Files tab.

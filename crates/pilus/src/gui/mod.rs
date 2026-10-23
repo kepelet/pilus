@@ -39,6 +39,7 @@ mod md_notes_view;
 mod md_select;
 mod md_view;
 mod menubar;
+mod mermaid;
 mod mission;
 mod notify;
 mod orchestration;
@@ -2159,6 +2160,9 @@ struct PilusView {
     machine_signal: Rc<RefCell<MachineSignal>>,
     /// Last revision this window applied, so a manager mutation reloads once.
     seen_machine_revision: u64,
+    /// [`mermaid::generation`] at the last repaint, so a diagram that finishes
+    /// drawing replaces its code card.
+    seen_diagrams: u64,
     /// Fresh remote-home answers from the background resolver.
     home_resolve_rx: Receiver<HomeResolve>,
     /// Sender half for the background home resolver.
@@ -2754,6 +2758,7 @@ impl PilusView {
             daemon_restart_pending: false,
             machine_signal,
             seen_machine_revision: 0,
+            seen_diagrams: 0,
             home_resolve_rx,
             home_resolve_tx,
             home_resolve_pending: false,
@@ -3050,6 +3055,11 @@ impl PilusView {
         }
         // The machine manager bumps this on every successful mutation; reload
         // the catalog so added, removed, or re-enabled hosts appear at once.
+        let diagrams = mermaid::generation();
+        if diagrams != self.seen_diagrams {
+            self.seen_diagrams = diagrams;
+            changed = true;
+        }
         let machine_revision = self.machine_signal.borrow().revision;
         if machine_revision != self.seen_machine_revision {
             self.seen_machine_revision = machine_revision;

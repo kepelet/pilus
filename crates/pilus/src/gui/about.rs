@@ -103,7 +103,7 @@ impl AboutView {
 /// is a path by reading that file from this disk, so a logo could make the
 /// window read `/dev/zero` until it runs out of memory, or draw a private file.
 /// Only images embedded in the SVG itself (`data:` URLs) are taken.
-fn untrusted_svg_options() -> resvg::usvg::Options<'static> {
+pub(super) fn untrusted_svg_options() -> resvg::usvg::Options<'static> {
     resvg::usvg::Options {
         image_href_resolver: resvg::usvg::ImageHrefResolver {
             resolve_data: resvg::usvg::ImageHrefResolver::default_data_resolver(),
@@ -138,11 +138,17 @@ pub(super) fn rasterize(svg: &[u8], extent: u32) -> Option<Arc<RenderImage>> {
         resvg::tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );
+    image_from_pixmap(pixmap)
+}
+
+/// `pixmap` as an image GPUI can paint, or nothing when it drew nothing.
+pub(super) fn image_from_pixmap(pixmap: resvg::tiny_skia::Pixmap) -> Option<Arc<RenderImage>> {
     // A fully transparent raster paints as an empty box, so there is none.
     if pixmap.pixels().iter().all(|pixel| pixel.alpha() == 0) {
         return None;
     }
-    let mut buffer = image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())?;
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let mut buffer = image::ImageBuffer::from_raw(width, height, pixmap.take())?;
     // GPUI's image buffers are BGRA.
     for pixel in buffer.chunks_exact_mut(4) {
         pixel.swap(0, 2);

@@ -539,6 +539,13 @@ pub fn run() -> Result<()> {
         cx.update(|app| view.update(app, |view, cx| view.files_edit_code_sample(cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "files-tab-doc-code")?;
+        // Diagrams draw on a worker thread, so the clock the shots advance
+        // is not the one that matters: give it real time to finish.
+        cx.update(|app| view.update(app, |view, cx| view.files_show_diagram_sample(cx)));
+        settle(&mut cx, 12);
+        std::thread::sleep(Duration::from_secs(3));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-diagrams")?;
         // ⌘P over the tree: the file name outranks a scattered path.
         cx.update(|app| view.update(app, |view, cx| view.quick_open_show_sample("mod", cx)));
         settle(&mut cx, 12);

@@ -652,6 +652,41 @@ pub fn write_text(path: &Path, text: &str) -> Result<(), String> {
 }
 ";
 
+/// A page of diagrams: two that draw, and one that does not parse and stays
+/// code.
+#[cfg(feature = "visual-test")]
+const DIAGRAM_SAMPLE: &str = "# Data flow
+
+The window folds the daemon's frames into a surface, then paints it.
+
+```mermaid
+flowchart LR
+  D[Daemon] -->|frames| S[Surface]
+  S --> P{Dirty?}
+  P -->|yes| G[Paint]
+  P -->|no| I[Idle]
+```
+
+Who talks to whom:
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant P as pilus
+  participant D as Daemon
+  U->>P: open file
+  P->>D: attach
+  D-->>P: frame
+  Note right of P: fold into Surface
+```
+
+A diagram that does not parse stays readable:
+
+```mermaid
+this is not a diagram
+```
+";
+
 /// A canned MDX page: front matter, ESM, components, and an expression.
 #[cfg(feature = "visual-test")]
 const MDX_SAMPLE: &str = "---
@@ -710,6 +745,11 @@ impl PilusView {
         self.files_edit_doc_sample(cx);
         self.files_set_split();
         cx.notify();
+    }
+
+    /// The page of diagrams, drawn.
+    pub(super) fn files_show_diagram_sample(&mut self, cx: &mut Context<Self>) {
+        self.files_show_doc("/work/pilus/docs/data-flow.md", DIAGRAM_SAMPLE, cx);
     }
 
     /// A Rust file in the editor, as a click on it in the tree opens it.

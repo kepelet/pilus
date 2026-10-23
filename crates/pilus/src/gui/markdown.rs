@@ -6,7 +6,9 @@
 //! quotes, tables, and rules. An MDX file also reads its `import`/`export`
 //! lines, JSX, and `{expressions}`: the first is set as code, a component with
 //! content shows that content, and one without shows its tag, since the page
-//! it would draw lives in a build this window cannot run.
+//! it would draw lives in a build this window cannot run. A ```` ```mermaid ````
+//! fence is drawn as a diagram (see `mermaid`), and stays a code card until it
+//! is, or when it does not parse.
 //!
 //! A file is drawn a block at a time: [`Document`] keeps the parsed blocks
 //! with the source lines each covers, so the viewer can virtualize the list
@@ -27,13 +29,14 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, Div, FontStyle, FontWeight, Hsla, SharedString, StyledText, TextRun, canvas, div,
-    font, prelude::*, px, relative,
+    font, img, prelude::*, px, relative,
 };
 use markdown::mdast::Node;
 
 use crate::settings::Settings;
 
 use super::md_select::{LeafId, Leaves, Selection};
+use super::mermaid;
 use super::style::{self, Fonts, RadiusExt};
 use super::theme::Theme;
 
@@ -634,6 +637,7 @@ fn block(node: &Node, paint: &Paint) -> AnyElement {
                 title
             }
         }
+        Node::Code(code) if is_mermaid(code.lang.as_deref()) => mermaid_card(&code.value, paint),
         Node::Code(code) => code_card(
             code.lang.as_deref().filter(|lang| !lang.is_empty()),
             &code.value,
@@ -794,6 +798,41 @@ fn code_card(label: Option<&str>, value: &str, paint: &Paint) -> AnyElement {
     }
     let run = paint.run(value.len(), &paint.mono, theme.fg.into());
     card.child(paint.segment(leaf, 0, value.to_string(), vec![run]))
+        .into_any_element()
+}
+
+/// Whether a fence's language names a diagram this window draws.
+fn is_mermaid(lang: Option<&str>) -> bool {
+    lang.is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
+}
+
+/// A ```` ```mermaid ```` fence: the diagram once it is drawn, and its source
+/// as a code card until then, or for good when it does not parse. Showing the
+/// source rather than an error keeps a half-typed diagram readable in the
+/// preview.
+fn mermaid_card(source: &str, paint: &Paint) -> AnyElement {
+    let theme = paint.theme;
+    let state = mermaid::lookup(source, &theme, &paint.chrome, paint.fonts.body);
+    let mermaid::State::Ready(diagram) = state else {
+        return code_card(Some("mermaid"), source, paint);
+    };
+    // The picture has no text to select, but the source keeps its leaf so the
+    // painter's numbering agrees with the parse, and a selection that spans
+    // this block still copies the diagram's source.
+    paint.leaf(source);
+    div()
+        .flex()
+        .justify_center()
+        .radius_md()
+        .bg(theme.panel_dim)
+        .p_3()
+        .overflow_hidden()
+        .child(
+            img(diagram.image.clone())
+                .w(px(diagram.width))
+                .max_w_full()
+                .aspect_ratio(diagram.width / diagram.height),
+        )
         .into_any_element()
 }
 

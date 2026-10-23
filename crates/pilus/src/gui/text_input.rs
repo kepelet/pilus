@@ -26,6 +26,7 @@
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
@@ -273,6 +274,17 @@ pub(super) struct Buffer {
     head: usize,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    /// Changes whenever `text` does, and never repeats across buffers, so a
+    /// reader can tell whether what it computed from the text is still current
+    /// without comparing a long document.
+    revision: u64,
+}
+
+/// Source of [`Buffer::revision`]s.
+static REVISIONS: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    REVISIONS.fetch_add(1, Ordering::Relaxed)
 }
 
 /// One undo step.
@@ -292,6 +304,7 @@ impl Buffer {
             head,
             undo: Vec::new(),
             redo: Vec::new(),
+            revision: next_revision(),
         }
     }
 
@@ -398,6 +411,7 @@ impl Buffer {
             .max(start);
         self.snapshot();
         self.text.replace_range(start..end, &inserted);
+        self.revision = next_revision();
         let caret = start + inserted.len();
         self.head = caret;
         self.anchor = caret;
@@ -475,6 +489,7 @@ impl Buffer {
 
     fn restore(&mut self, snapshot: Snapshot) {
         self.text = snapshot.text;
+        self.revision = next_revision();
         self.anchor = self.clamp(snapshot.anchor);
         self.head = self.clamp(snapshot.head);
     }
@@ -673,6 +688,8 @@ pub(super) struct TextInput {
     /// The text the spans below were parsed from, so a frame only reparses
     /// when the text changed.
     highlighted: Option<(String, Vec<Span>)>,
+    /// Byte ranges painted under the text, such as the find bar's matches.
+    marks: Vec<Range<usize>>,
     /// When a Command chord last reached this field's key handler. The
     /// platform delivers an unclaimed chord's glyph a moment later as text,
     /// by which time the modifier state can already be stale.
@@ -724,6 +741,7 @@ impl TextInput {
             syntax: None,
             line_numbers: false,
             highlighted: None,
+            marks: Vec::new(),
             multiline,
             secret: false,
             placeholder: placeholder.into(),
@@ -806,6 +824,48 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Which text the buffer holds: it differs whenever the text does.
+    pub(super) fn revision(&self) -> u64 {
+        self.buffer.borrow().revision
+    }
+
+    /// Run `read` over the text without copying a long document out.
+    pub(super) fn with_text<R>(&self, read: impl FnOnce(&str) -> R) -> R {
+        read(&self.buffer.borrow().text)
+    }
+
+    /// Paint `marks` (byte ranges) under the text, or nothing when empty.
+    pub(super) fn set_marks(&mut self, marks: Vec<Range<usize>>, cx: &mut Context<Self>) {
+        if self.marks != marks {
+            self.marks = marks;
+            cx.notify();
+        }
+    }
+
+    /// Select `range`, leaving the caret at its end so a scrolling parent that
+    /// follows the caret brings it into view.
+    pub(super) fn select_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        {
+            let mut buffer = self.buffer.borrow_mut();
+            buffer.move_to(range.start, false);
+            buffer.move_to(range.end, true);
+        }
+        self.changed(cx);
+    }
+
+    /// The selected text, when there is a selection.
+    pub(super) fn selected_text(&self) -> Option<String> {
+        let buffer = self.buffer.borrow();
+        let range = buffer.range();
+        (!range.is_empty()).then(|| buffer.text[range].to_string())
+    }
+
+    /// Select the whole value, so typing replaces it.
+    pub(super) fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.buffer.borrow_mut().select_all();
+        self.changed(cx);
+    }
+
     /// Whether the value equals `text`, without copying a long document out.
     pub(super) fn holds(&self, text: &str) -> bool {
         self.buffer.borrow().text == text
@@ -823,6 +883,12 @@ impl TextInput {
         let last = last.as_ref()?;
         let (_, row) = last.caret(self.buffer.borrow().head)?;
         Some((px(last.line_height.as_f32() * row as f32), last.line_height))
+    }
+
+    /// Whether the field held the keyboard at its last paint, for a caller that
+    /// has no window to ask.
+    pub(super) fn was_focused(&self) -> bool {
+        self.focused
     }
 
     /// Whether this field currently owns the keyboard.
@@ -1453,6 +1519,8 @@ impl Render for TextInput {
         });
 
         let marked = self.marked.clone();
+        let marks = self.marks.clone();
+        let mark_color: Hsla = Hsla::from(theme.accent).opacity(0.3);
         let caret_visible = focused && self.caret_on;
         let row_count = pieces.len();
         let height = self.height(row_count);
@@ -1543,6 +1611,7 @@ impl Render for TextInput {
                     size: field.size,
                 };
                 window.with_content_mask(Some(gpui::ContentMask { bounds: field }), |window| {
+                    paint_marks(window, bounds, &pieces, &marks, line_height, mark_color);
                     // Selection sits under the glyphs so the foreground
                     // colour chosen above stays legible on it.
                     if selection.start < selection.end {
@@ -1695,6 +1764,63 @@ fn paint_range(
     }
 }
 
+/// Paint each of `marks` (sorted, non-overlapping byte ranges) under the text.
+///
+/// The field is as tall as its document, so a mark is found by its row and
+/// skipped when that row is outside what the window shows; a long file with
+/// thousands of matches then costs the rows on screen.
+fn paint_marks(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    pieces: &[Piece],
+    marks: &[Range<usize>],
+    line_height: Pixels,
+    color: Hsla,
+) {
+    if marks.is_empty() {
+        return;
+    }
+    let visible = window.content_mask().bounds;
+    for mark in marks {
+        let first = pieces
+            .partition_point(|piece| piece.byte_start <= mark.start)
+            .saturating_sub(1);
+        for (offset, piece) in pieces[first..].iter().enumerate() {
+            let row = first + offset;
+            if piece.byte_start >= mark.end && row > first {
+                break;
+            }
+            let y = bounds.origin.y + px(line_height.as_f32() * row as f32);
+            if y + line_height < visible.origin.y {
+                continue;
+            }
+            if y > visible.origin.y + visible.size.height {
+                break;
+            }
+            let end = pieces
+                .get(row + 1)
+                .map_or(usize::MAX, |next| next.byte_start);
+            let low = mark.start.max(piece.byte_start).min(end);
+            let high = mark.end.max(piece.byte_start).min(end);
+            if low >= high {
+                continue;
+            }
+            let x0 = piece.layout.x_for_index(low - piece.byte_start);
+            let x1 = piece.layout.x_for_index(high - piece.byte_start);
+            window.paint_quad(
+                fill(
+                    Bounds {
+                        origin: point(bounds.origin.x + x0, y),
+                        size: size(x1 - x0, line_height),
+                    },
+                    color,
+                )
+                .corner_radii(px(2.0)),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1755,6 +1881,20 @@ mod tests {
         buffer.replace(buffer.range(), "goodbye", false);
         assert_eq!(buffer.text, "goodbye world");
         assert_eq!(buffer.head, 7);
+    }
+
+    #[test]
+    fn the_revision_moves_with_the_text_and_not_with_the_caret() {
+        let mut buffer = Buffer::new("ab".to_string());
+        let first = buffer.revision;
+        buffer.move_to(0, false);
+        assert_eq!(buffer.revision, first);
+        buffer.replace(0..0, "x", false);
+        let edited = buffer.revision;
+        assert_ne!(edited, first);
+        assert!(buffer.undo());
+        assert_ne!(buffer.revision, edited);
+        assert_ne!(Buffer::new("ab".to_string()).revision, first);
     }
 
     #[test]

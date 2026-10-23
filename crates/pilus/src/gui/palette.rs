@@ -92,6 +92,11 @@ impl Palette {
         &self.input
     }
 
+    /// The query buffer, for a caller that sets the text itself.
+    pub fn input_mut(&mut self) -> &mut TextField {
+        &mut self.input
+    }
+
     /// Index of the highlighted row, before clamping to the filtered list.
     pub fn selected(&self) -> usize {
         self.selected

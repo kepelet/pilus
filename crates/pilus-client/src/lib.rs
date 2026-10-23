@@ -41,6 +41,7 @@ mod tasks;
 mod transport;
 mod uhp;
 mod upload;
+mod walk;
 mod write;
 pub use agents::AgentConfig;
 pub use agents::AgentModel;
@@ -101,6 +102,7 @@ pub use tasks::{NewTask, Task, TaskStatus, split_list};
 pub use transport::SshTarget;
 pub use uhp::{Capabilities, Event, EventStream, Frame, Observer, Terminal, UhpClient};
 pub use upload::upload_path;
+pub use walk::{FileList, MAX_FILES, list_files};
 pub use write::write_text;
 
 use std::path::PathBuf;

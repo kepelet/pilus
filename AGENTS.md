@@ -337,6 +337,16 @@ with only the command-line tools can build the app.
   (`markdown::mdx_options`) and falls back to plain markdown when MDX rejects
   the text, since a stray `<` or `{` is an error there; do not make that parse
   stricter, or a half-typed file blanks the preview.
+- Quick open (⌘P, `gui/quick_open.rs`) and find in file (⌘F, `gui/file_find.rs`)
+  belong to the Files tab. Quick open reads its own listing of the tree's root
+  with `pilus_client::list_files` (`git ls-files` in a repository, `find`
+  elsewhere, bounded by `MAX_FILES`; local or over SSH, on a worker thread),
+  because the daemon's tree only carries open folders; it is read again each time
+  the picker opens, and a pick goes through `files_open_path` like a tree click.
+  Find matches the editor's text (smart-case, ASCII folding so byte offsets stay
+  valid), repaints only when `TextInput::revision` or the query changed, paints
+  its matches through `TextInput::set_marks` and shows the current one as the
+  editor's selection. On a markdown preview ⌘F switches to the source first.
 - Editor chords are scoped by key context, never by a check in the handler: the
   editor div carries `MdEditor`, so Cmd+S saves instead of toggling the sidebar.
   A deeper context wins over the global binding, so a new editor chord is

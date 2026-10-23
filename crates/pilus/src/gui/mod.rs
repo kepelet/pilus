@@ -21,6 +21,7 @@ mod cursor_blink;
 mod database;
 mod diff;
 mod diff_model;
+mod file_find;
 mod dock;
 mod files_tab;
 mod fonts;
@@ -53,6 +54,7 @@ mod picker;
 mod pinned;
 mod ports_tab;
 mod process;
+mod quick_open;
 mod right_sidebar;
 mod scheme;
 mod search;
@@ -360,6 +362,10 @@ gpui::actions!([
     ToggleEnergyMode,
     /// Save the markdown file being edited in the Files tab.
     SaveDoc,
+    /// Find in the file open in the Files tab.
+    FindInFile,
+    /// Jump to a file in the active workspace by fuzzy name.
+    OpenQuickOpen,
     /// Show or hide the right sidebar (Changes and History).
     ToggleRightSidebar,
     /// Step back through the right sidebar's history.
@@ -991,6 +997,8 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         // The markdown editor takes Cmd+S from the sidebar toggle while it
         // holds the keyboard.
         KeyBinding::new("cmd-s", SaveDoc, Some("MdEditor")),
+        KeyBinding::new("cmd-f", FindInFile, None),
+        KeyBinding::new("cmd-p", OpenQuickOpen, None),
         KeyBinding::new("cmd-b", ToggleRightSidebar, None),
         KeyBinding::new("cmd-[", RightSidebarBack, None),
         KeyBinding::new("cmd-]", RightSidebarForward, None),
@@ -1148,6 +1156,7 @@ fn app_menus(energy: bool) -> Vec<Menu> {
             MenuItem::action("Open Local Terminal", OpenLocalTerminal),
             MenuItem::action("New Agent…", OpenHome),
             MenuItem::action("Open Workspace", OpenWorkspacePicker),
+            MenuItem::action("Go to File…", OpenQuickOpen),
             MenuItem::separator(),
             MenuItem::action("Split Vertical", SplitVertical),
             MenuItem::action("Split Horizontal", SplitHorizontal),
@@ -1160,6 +1169,8 @@ fn app_menus(energy: bool) -> Vec<Menu> {
             MenuItem::action("Copy", CopySelection),
             MenuItem::action("Paste", PasteClipboard),
             MenuItem::action("Select All", SelectAllGrid),
+            MenuItem::separator(),
+            MenuItem::action("Find in File", FindInFile),
         ]),
         Menu::new("View").items([
             MenuItem::action("Command Palette", OpenCommandPalette),
@@ -1294,6 +1305,8 @@ enum InputLayer {
     Picker,
     /// The command palette overlay.
     Palette,
+    /// The quick-open file picker overlay.
+    QuickOpen,
     /// The Home composer page.
     Home,
     /// The Settings page (machines, updates).
@@ -2190,6 +2203,12 @@ struct PilusView {
     md_note_input: Entity<TextInput>,
     /// The source of the markdown file being edited in the Files tab.
     md_editor_input: Entity<TextInput>,
+    /// Find in the file being edited, and its query field.
+    file_find: file_find::FileFind,
+    find_input: Entity<TextInput>,
+    /// The ⌘P file picker, and its query field.
+    quick_open: quick_open::QuickOpen,
+    quick_open_input: Entity<TextInput>,
     ports_panel: PortsPanel,
     browser_panel: BrowserPanel,
     /// The Browser tab's address bar, an IME-capable field of its own.
@@ -2394,6 +2413,29 @@ impl PilusView {
                 cx,
             )
         });
+        let find_input = cx.new(|cx| {
+            TextInput::new(
+                String::new(),
+                "Find",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
+        let quick_open = quick_open::QuickOpen::new();
+        let quick_open_input = cx.new(|cx| {
+            TextInput::from_shared(
+                quick_open.input().shared(),
+                "Go to file…",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+        });
         let picker = WorkspacePicker::default();
         let picker_path = cx.new(|cx| {
             TextInput::from_shared(
@@ -2475,6 +2517,15 @@ impl PilusView {
         // also notifies on caret blinks, which must not move the selection.
         cx.observe(&palette_input, |this, _, cx| {
             this.palette.refresh_selection();
+            cx.notify();
+        })
+        .detach();
+
+        // A query edit ranks the files again. The field also notifies on caret
+        // blinks, which `refresh` ignores.
+        cx.observe(&quick_open_input, |this, _, cx| {
+            let root = this.files_panel.tree_root();
+            this.quick_open.refresh(root.as_deref());
             cx.notify();
         })
         .detach();
@@ -2728,6 +2779,10 @@ impl PilusView {
             md_notes,
             md_note_input,
             md_editor_input,
+            file_find: file_find::FileFind::default(),
+            find_input,
+            quick_open,
+            quick_open_input,
             ports_panel: PortsPanel::new(),
             browser_panel: BrowserPanel::new(),
             browser_input,
@@ -3223,6 +3278,7 @@ impl PilusView {
         changed |= self.github_tick();
         changed |= self.github_page_tick();
         changed |= self.files_tick(cx);
+        changed |= self.quick_open_tick();
         changed |= self.ports_tick();
         changed |= self.browser_tick(cx);
         changed |= self.mission_tick();
@@ -4841,12 +4897,13 @@ impl PilusView {
         }
         // So does the markdown editor, whose field reads the typing itself.
         if self.md_editing() {
-            self.md_edit_key(event, cx);
+            self.md_edit_key(event, window, cx);
             return;
         }
         match self.input_layer() {
             InputLayer::Picker => self.picker_key(event, cx),
             InputLayer::Palette => self.palette_key(event, window, cx),
+            InputLayer::QuickOpen => self.quick_open_key(event, cx),
             InputLayer::Home => self.home_key(event, cx),
             InputLayer::Settings => self.settings_key(event, cx),
             InputLayer::Tasks => self.tasks_key(event, cx),
@@ -4872,6 +4929,9 @@ impl PilusView {
     /// routing and focus both read this, so they cannot disagree about who is
     /// on top.
     fn input_layer(&self) -> InputLayer {
+        if self.quick_open.is_open() && !self.picker.is_open() {
+            return InputLayer::QuickOpen;
+        }
         top_layer(
             self.picker.is_open(),
             self.palette.is_open(),
@@ -6472,9 +6532,12 @@ impl PilusView {
         }
         // The markdown editor holds the keyboard while it is up.
         if self.md_editing() {
-            let handle = self.md_editor_input.focus_handle(cx);
-            if !handle.is_focused(window) {
-                window.focus(&handle, cx);
+            // The find bar's field keeps the keyboard while the person types
+            // in it; anywhere else it is the editor's.
+            let editor = self.md_editor_input.focus_handle(cx);
+            let finding = self.file_find.is_open() && self.find_input.read(cx).is_focused(window);
+            if !finding && !editor.is_focused(window) {
+                window.focus(&editor, cx);
             }
             return;
         }
@@ -6500,6 +6563,7 @@ impl PilusView {
                 }
             }
             InputLayer::Palette => Some(self.palette_input.focus_handle(cx)),
+            InputLayer::QuickOpen => Some(self.quick_open_input.focus_handle(cx)),
             InputLayer::Home => {
                 if self.overview.reply_focused() {
                     Some(self.overview_reply.focus_handle(cx))
@@ -9709,6 +9773,7 @@ impl PilusView {
     fn overlay_open(&self) -> bool {
         self.session_menu_open
             || self.palette.is_open()
+            || self.quick_open.is_open()
             || self.picker.is_open()
             || self.context_menu.is_some()
             || self.menu_prompt.is_some()
@@ -15259,9 +15324,21 @@ impl Render for PilusView {
                     if this.palette.is_open() {
                         this.palette.close();
                     } else {
+                        this.quick_open.close();
                         this.palette.open();
                     }
                     cx.notify();
+                }))
+                .on_action(cx.listener(|this, _: &OpenQuickOpen, _window, cx| {
+                    // Like the palette, the chord toggles.
+                    if this.quick_open.is_open() {
+                        this.quick_open_close(cx);
+                    } else {
+                        this.quick_open_show(cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &FindInFile, window, cx| {
+                    this.find_open(window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &OpenWorkspacePicker, _window, cx| {
                     this.leave_settings_page();
@@ -15394,6 +15471,7 @@ impl Render for PilusView {
             .when(!luvus_missing, |root| {
                 root.child(self.session_menu(cx, cell_width, fullscreen))
                     .child(self.palette_overlay(cx))
+                    .child(self.quick_open_overlay(cx))
                     .child(self.picker_overlay(window, cx))
             })
             .child(self.context_menu_overlay(cx, window))

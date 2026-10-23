@@ -539,6 +539,15 @@ pub fn run() -> Result<()> {
         cx.update(|app| view.update(app, |view, cx| view.files_edit_code_sample(cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "files-tab-doc-code")?;
+        // ⌘P over the tree: the file name outranks a scattered path.
+        cx.update(|app| view.update(app, |view, cx| view.quick_open_show_sample("mod", cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-quick-open")?;
+        cx.update(|app| view.update(app, |view, cx| view.quick_open_close(cx)));
+        // ⌘F over that file: every match tinted, the first one selected.
+        cx.update(|app| view.update(app, |view, cx| view.find_show_sample("text", cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-find")?;
         cx.update(|app| view.update(app, |view, cx| view.files_show_doc_sample(cx)));
         settle(&mut cx, 12);
         cx.update(|app| view.update(app, |view, cx| view.files_show_doc_selection(cx)));

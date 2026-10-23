@@ -437,6 +437,16 @@ impl FilesPanel {
     }
 
     /// The open document's path, if the tab is showing one.
+    /// The folder the tree's top-level rows sit in, once the daemon has sent it.
+    pub(super) fn tree_root(&self) -> Option<String> {
+        self.tree.as_ref().map(|tree| tree.root.clone())
+    }
+
+    /// How the open document is shown, once it is being edited.
+    pub(super) fn edit_mode(&self) -> Option<EditMode> {
+        self.doc.as_ref()?.edit.as_ref().map(|edit| edit.mode)
+    }
+
     pub(super) fn doc_path(&self) -> Option<&str> {
         self.doc.as_ref().map(|doc| doc.path.as_str())
     }
@@ -861,8 +871,22 @@ impl PilusView {
         });
     }
 
+    /// Open the file at `path` as a click on its row would, for a caller that
+    /// holds the path but not the row.
+    pub(super) fn files_open_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        let row = FileRow {
+            depth: 0,
+            dir: false,
+            expanded: false,
+            name: base_name(path).to_string(),
+            path: path.to_string(),
+        };
+        self.files_click_file(&row, OpenTarget::Preview, cx);
+    }
+
     /// Start (or restart) the read of the document at `path`.
     pub(super) fn files_read_doc(&mut self, path: String) {
+        self.quick_open.note_opened(&path);
         let endpoint = self.active.clone();
         let target = match self.read_target(&endpoint) {
             Ok(target) => target,
@@ -937,9 +961,17 @@ impl PilusView {
                 .is_some_and(|edit| edit.mode.edits())
     }
 
-    /// Keys the editor's field leaves to the window: Escape steps back to the
-    /// preview.
-    pub(super) fn md_edit_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    /// Keys the editor's field leaves to the window: the find bar's, then
+    /// Escape, which steps back to the preview.
+    pub(super) fn md_edit_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find_key(event, window, cx) {
+            return;
+        }
         if event.keystroke.key == "escape" && self.files_doc_previewable() {
             self.files_preview_doc(cx);
         }
@@ -986,8 +1018,10 @@ impl PilusView {
                     caret_seen: Some(0),
                 });
                 // One field serves every document, so the grammar follows the
-                // file it was opened for.
+                // file it was opened for, and a search of the last one is over.
+                self.file_find.reset();
                 self.md_editor_input.update(cx, |input, cx| {
+                    input.set_marks(Vec::new(), cx);
                     input.set_syntax(Some(path), cx);
                     input.set_value_at_start(text, cx);
                 });
@@ -1699,6 +1733,7 @@ impl PilusView {
 
     /// The open document: its name over the rendered text.
     fn files_doc_page(&mut self, cx: &mut Context<Self>) -> Div {
+        self.find_refresh(cx);
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let Some(doc) = self.files_panel.doc.as_ref() else {
@@ -1898,6 +1933,7 @@ impl PilusView {
                 Some(DocState::Ready(_)) => self.md_list(Page::Files, cx),
             }
         };
+        let find_bar = self.find_bar(cx);
         div()
             .relative()
             .flex()
@@ -1906,6 +1942,7 @@ impl PilusView {
             .min_h(px(0.0))
             .child(header)
             .children(truncated)
+            .children(find_bar)
             .child(div().flex_1().min_h(px(0.0)).child(body))
     }
 

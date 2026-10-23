@@ -11709,11 +11709,18 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
-        let active = self.tab_active(tab);
+        // A lone tab has nothing to be told apart from, so it gets no raised
+        // pill, but its label stays at full strength.
+        let lone = self.tabs.len() == 1;
+        let active = self.tab_active(tab) && !lone;
         let index = tab.index;
         let tab_id = tab.id.clone();
         let close_index = tab.index;
-        let fg = if active { theme.panel_fg } else { theme.muted };
+        let fg = if active || lone {
+            theme.panel_fg
+        } else {
+            theme.muted
+        };
         // The cwd is the label until the tab is named or its agent reports a
         // session title. Until `session.snapshot` enriches the tab, it is the
         // workspace's breadcrumb cwd.

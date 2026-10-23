@@ -544,7 +544,7 @@ impl PilusView {
                 actions = actions.child(self.port_open_button(port, port, cx));
             }
             Some(Forward::Starting) => {
-                actions = actions.child(style::spinner("pilus-ports-spin", 14.0, theme.muted));
+                actions = actions.child(style::busy_dot(14.0, theme.muted));
                 text = text.child(self.port_note("Forwarding…", theme.muted));
             }
             Some(Forward::Active(active)) => {

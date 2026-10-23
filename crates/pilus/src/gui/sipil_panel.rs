@@ -374,12 +374,7 @@ impl SipilPanel {
         let (lead, status, detail) = match (daemon.phase, &daemon.error) {
             (Phase::Connected, _) => (dot(theme.ok).into_any_element(), "online", None),
             (Phase::Connecting, error) => (
-                style::spinner(
-                    format!("pilus-sipil-connecting-{}", daemon.id),
-                    fonts.label,
-                    theme.muted,
-                )
-                .into_any_element(),
+                style::busy_dot(fonts.label, theme.muted).into_any_element(),
                 if error.is_some() {
                     "reconnecting"
                 } else {

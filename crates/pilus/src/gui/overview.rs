@@ -892,21 +892,9 @@ impl PilusView {
         for (index, agent) in agents.iter().take(shown).enumerate() {
             let target = agent.target.clone();
             let tint = super::status_color(&agent.status, theme);
-            let lead = if agent.status == "working" {
-                style::spinner(format!("pilus-overview-spinner-{index}"), 12.0, tint)
-                    .into_any_element()
-            } else {
-                div()
-                    .w(px(8.0))
-                    .h(px(8.0))
-                    .radius_full()
-                    .bg(tint)
-                    .into_any_element()
-            };
-            // Working says so with its spinner; the others spell it out.
-            let detail = if agent.status == "working" {
-                agent.detail.clone()
-            } else if agent.detail.is_empty() {
+            let lead = style::status_dot(tint);
+            // The dot is only a color, so every state is spelled out too.
+            let detail = if agent.detail.is_empty() {
                 super::status_label(&agent.status)
             } else {
                 format!("{} · {}", super::status_label(&agent.status), agent.detail)

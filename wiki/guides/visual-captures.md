@@ -29,7 +29,7 @@ Render every native surface headlessly and review the PNGs before shipping a UI 
    This captures the main window and its overlays with sample data; it does not require a running daemon for the sample paths.
 3. **Read the output.** PNGs land in `/tmp/pilus-shots`.
 4. **Exercise scaling.** `PILUS_SHOT_FONT_SIZE=15` overrides the Interface size and is the quickest way to catch chrome that ignores the setting. `PILUS_SHOT_WIDTH` narrows the main window to exercise compact layouts; `PILUS_SHOT_RADIUS` and `PILUS_SHOT_OPACITY` do the same for corners and translucency.
-5. **Add a capture for a new surface.** Register it in [shots.rs](../../crates/pilus/src/gui/shots.rs), with sample data and no network or real database. The capture runs on the main thread (macOS requires it before handing out a Metal device) and sets reduce-motion so fades and spinners are caught at rest.
+5. **Add a capture for a new surface.** Register it in [shots.rs](../../crates/pilus/src/gui/shots.rs), with sample data and no network or real database. The capture runs on the main thread (macOS requires it before handing out a Metal device) and sets reduce-motion so fades are caught at rest.
 
 ## Relevant code
 

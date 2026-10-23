@@ -580,13 +580,7 @@ impl PilusView {
                 .flex()
                 .items_center()
                 .gap_2()
-                .children(loading.then(|| {
-                    style::spinner(
-                        "pilus-automations-refresh-spinner",
-                        fonts.secondary,
-                        theme.muted,
-                    )
-                }))
+                .children(loading.then(|| style::busy_dot(fonts.secondary, theme.muted)))
                 .child("Refresh"),
             ButtonKind::Secondary,
             theme,

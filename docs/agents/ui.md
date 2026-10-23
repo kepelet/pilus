@@ -53,8 +53,12 @@ State changes ease, with the two exceptions listed after these rules:
 - Hover and selection backgrounds go through `FillExt::hover_fill` /
   `state_fill`, never `.hover(|s| s.bg(..))` or a `.bg(..)` that depends on
   selection. Call them before adding children so the fill sits beneath.
-- Use `style::chevron` for disclosure, `style::toggle` for switches and
-  `style::spinner` for working status.
+- Use `style::chevron` for disclosure and `style::toggle` for switches.
+- Status is a still dot in its color: `style::status_dot`, or
+  `style::busy_dot` in place of a glyph while something works or loads.
+  Nothing turns or pulses for as long as a state lasts, because every frame
+  of such a loop redraws the whole window (see
+  [idle-cost.md](idle-cost.md#transitions-and-repaints)).
 - A new animation must count as moving in the tick loop and must honor
   `cx.reduce_motion()` (see [idle-cost.md](idle-cost.md)).
 

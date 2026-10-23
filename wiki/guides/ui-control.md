@@ -14,7 +14,7 @@ Add a button, field, label, switch, or other native element without letting it d
 ## Steps
 
 1. **Check the playground.** [ui_playground.rs](../../crates/pilus/src/gui/ui_playground.rs) is the visual contract; if the element already exists, use its builder instead of writing new chrome.
-2. **Add it to `style.rs`.** Implement the control once in [style.rs](../../crates/pilus/src/gui/style.rs) beside its siblings (`button`, `small_button`, `field`, `section_label`, `toggle`, `chevron`, `spinner`, `heat_cell`, `rank_row`, `tree_row`).
+2. **Add it to `style.rs`.** Implement the control once in [style.rs](../../crates/pilus/src/gui/style.rs) beside its siblings (`button`, `small_button`, `field`, `section_label`, `toggle`, `chevron`, `status_dot`, `heat_cell`, `rank_row`, `tree_row`).
 3. **Catalogue it.** Add a playground section that renders every state: default, hover, focused, disabled, and the compact size where relevant.
 4. **Scale type.** Resolve sizes with `style::Fonts::resolve` or `style::scaled`; a fixed `text_size(px(...))` for chrome text is a bug even when the default matches. Geometry is 28 px regular, 24 px compact, `rounded_md` for controls.
 5. **Use theme roles.** Colors come from `Theme`; literals belong only in [theme.rs](../../crates/pilus/src/gui/theme.rs) and [scheme.rs](../../crates/pilus/src/gui/scheme.rs). Every border is `theme.border`; a focused edge is `theme.border_focus`.

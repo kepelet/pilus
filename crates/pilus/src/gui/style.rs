@@ -16,7 +16,7 @@ use gpui::{
     DispatchPhase, Div, Edges, Element, ElementId, Font, FontWeight, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, Length, MouseMoveEvent, Path,
     PathBuilder, Pixels, Point, Position, Render, Rgba, SharedString, Stateful, Style,
-    Transformation, Window, canvas, div, font, percentage, point, prelude::*, px, svg,
+    Transformation, Window, canvas, div, font, point, prelude::*, px, svg,
 };
 
 use crate::settings::{CHROME_FONT, CORNER_RADIUS, DEFAULT_CORNER_RADIUS, Settings};
@@ -169,11 +169,6 @@ impl<E: Styled> RadiusExt for E {}
 
 /// How long a disclosure chevron takes to turn between its two states.
 const CHEVRON_TURN: Duration = Duration::from_millis(160);
-/// One full turn of the working spinner.
-const SPINNER_TURN: Duration = Duration::from_millis(900);
-/// The spinner's frame cap: a 7–14px glyph reads as smooth at 30fps, and a
-/// sidebar full of working agents should not hold the GPU at the display rate.
-const SPINNER_FPS: f32 = 30.0;
 
 /// Base chrome text: body copy, rows, and editable control values.
 pub(super) const TEXT_BODY: f32 = 13.0;
@@ -2719,31 +2714,37 @@ pub(super) fn chevron(
     }
 }
 
-/// The working indicator: a loader ring that turns for as long as it is
-/// painted.
-///
-/// It runs on its own animation clock, not on data arriving, so it keeps
-/// moving while an agent thinks without output. Every spinner shares one
-/// phase (`repeat_synced`), so a tab badge, a sidebar row, and the session
-/// dock turn together instead of drifting apart.
-pub(super) fn spinner(
-    id: impl Into<ElementId>,
-    size: f32,
-    color: impl Into<Hsla>,
-) -> impl IntoElement {
-    svg()
-        .data(include_bytes!("../../assets/icons/loader-circle.svg"))
-        .w(px(size))
-        .h(px(size))
+/// The diameter every status dot is drawn at: an agent's state, a daemon's
+/// link, something still loading.
+pub(super) const STATUS_DOT: f32 = 8.0;
+
+/// A status dot.
+pub(super) fn status_dot(color: impl Into<Hsla>) -> Div {
+    div()
+        .w(px(STATUS_DOT))
+        .h(px(STATUS_DOT))
         .flex_shrink_0()
-        .text_color(color.into())
-        .with_animation(
-            id,
-            Animation::new(SPINNER_TURN)
-                .repeat_synced()
-                .with_max_fps(SPINNER_FPS),
-            |svg, phase| svg.with_transformation(Transformation::rotate(percentage(phase))),
-        )
+        .radius_full()
+        .bg(color.into())
+}
+
+/// The busy indicator: a [`status_dot`] centered in a `size` box, so it sits
+/// where a glyph of that size would.
+///
+/// It does not move. A turning ring kept GPUI drawing the whole window, every
+/// terminal row included, up to 30 times a second for as long as anything was
+/// busy, and with agents at work that is most of the time. The color already
+/// says "working" (`theme.accent` for an agent), and the label beside the dot
+/// says what is being waited on.
+pub(super) fn busy_dot(size: f32, color: impl Into<Hsla>) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .w(px(size.max(STATUS_DOT)))
+        .h(px(size.max(STATUS_DOT)))
+        .child(status_dot(color))
 }
 
 /// One labelled field: a small muted label above a boxed control.

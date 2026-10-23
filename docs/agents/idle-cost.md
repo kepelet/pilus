@@ -34,6 +34,10 @@ for one at the display's refresh rate costs about half a core.
   hue, so a hover fill that faded out never matched its resting
   `transparent_black`. After any hover the window then redrew at the refresh
   rate until the next one.
+- Nothing animates for as long as a state lasts. A working agent, or anything
+  loading, is a still dot in its status color (`style::busy_dot`). The
+  spinner it replaced redrew the window 30 times a second while any agent
+  worked.
 - The terminal repaints for the pointer only when its shape changes, over a
   link or off one (`set_hover_cell`). The move itself still goes to the
   daemon.

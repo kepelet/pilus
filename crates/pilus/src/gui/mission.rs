@@ -947,13 +947,7 @@ impl PilusView {
                 .flex()
                 .items_center()
                 .gap_2()
-                .children(refreshing.then(|| {
-                    style::spinner(
-                        "pilus-mission-refresh-spinner",
-                        fonts.secondary,
-                        theme.muted,
-                    )
-                }))
+                .children(refreshing.then(|| style::busy_dot(fonts.secondary, theme.muted)))
                 .child(if refreshing { "Refreshing" } else { "Refresh" }),
             ButtonKind::Secondary,
             theme,
@@ -1409,24 +1403,17 @@ impl PilusView {
             .unwrap_or_else(dash);
         let context = usage.and_then(|usage| usage.context);
         let warns = context.is_some_and(|context| context >= COMPACT_AT);
-        let glyph = if row.state == "working" && !row.resumable() {
-            style::spinner(format!("pilus-mission-spin-{key}"), 10.0, state_color)
-                .into_any_element()
-        } else if row.resumable() {
+        // A resumable session is the dot's outline; any live one, working
+        // included, is the dot filled with its state's color.
+        let glyph = if row.resumable() {
             div()
-                .w(px(8.0))
-                .h(px(8.0))
+                .w(px(style::STATUS_DOT))
+                .h(px(style::STATUS_DOT))
                 .radius_full()
                 .border_1()
                 .border_color(state_color)
-                .into_any_element()
         } else {
-            div()
-                .w(px(8.0))
-                .h(px(8.0))
-                .radius_full()
-                .bg(state_color)
-                .into_any_element()
+            style::status_dot(state_color)
         };
         let key_owned = key.to_string();
         let square = style::Radius::None;

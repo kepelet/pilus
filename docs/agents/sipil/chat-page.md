@@ -25,8 +25,8 @@ The section is always there.
   separate "sipil" row.
   - A daemon that is up shows its primary agent with a green dot at the right,
     like a contact who is there.
-  - A daemon that is down stays listed with its logo and a grey offline dot (a
-    spinner while connecting). The reason is the tooltip, and a click opens the
+  - A daemon that is down stays listed with its logo and a grey offline dot,
+    also while it connects. The reason is the tooltip, and a click opens the
     Sipil tab.
   - The row draws the daemon's logo (`Daemon::own_logo`) at `SIDEBAR_LOGO`,
     larger than a glyph. Without a logo, `daemon_mark` draws the pilus mark in

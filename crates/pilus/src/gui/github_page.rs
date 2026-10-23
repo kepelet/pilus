@@ -642,11 +642,7 @@ impl PilusView {
     }
 
     fn github_spinner(&self) -> Div {
-        div().child(style::spinner(
-            "pilus-github-page-spinner",
-            SIDEBAR_GLYPH * 1.5,
-            self.theme.muted,
-        ))
+        div().child(style::busy_dot(SIDEBAR_GLYPH * 1.5, self.theme.muted))
     }
 
     fn github_caveat(&self, text: &str) -> Div {
@@ -1047,12 +1043,7 @@ impl PilusView {
                 theme.alert,
             )
             .into_any_element(),
-            RunState::Running => style::spinner(
-                format!("pilus-github-run-{}", run.id),
-                SIDEBAR_GLYPH,
-                theme.muted,
-            )
-            .into_any_element(),
+            RunState::Running => style::busy_dot(SIDEBAR_GLYPH, theme.muted).into_any_element(),
             RunState::Queued => icon(
                 include_bytes!("../../assets/icons/clock.svg"),
                 SIDEBAR_GLYPH,

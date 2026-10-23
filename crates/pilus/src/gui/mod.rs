@@ -2956,11 +2956,7 @@ impl PilusView {
             .items_center()
             .gap_2()
             .when(installing, |label| {
-                label.child(style::spinner(
-                    "pilus-install-luvus-spinner",
-                    fonts.secondary,
-                    theme.window_bg,
-                ))
+                label.child(style::busy_dot(fonts.secondary, theme.window_bg))
             })
             .child(if installing {
                 "Installing…"
@@ -7284,11 +7280,7 @@ impl PilusView {
                         .gap_2()
                         .text_size(px(self.footer_font()))
                         .text_color(theme.muted)
-                        .child(style::spinner(
-                            "pilus-remote-starting",
-                            self.footer_font(),
-                            theme.muted,
-                        ))
+                        .child(style::busy_dot(self.footer_font(), theme.muted))
                         .child("Starting…"),
                 );
             }
@@ -7453,11 +7445,7 @@ impl PilusView {
                     .gap_2()
                     .text_size(px(small))
                     .text_color(theme.muted)
-                    .child(style::spinner(
-                        "pilus-remote-restarting",
-                        small,
-                        theme.muted,
-                    ))
+                    .child(style::busy_dot(small, theme.muted))
                     .child("Updated. Restarting the service to use the new version…"),
             );
         }
@@ -14779,28 +14767,8 @@ impl PilusView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(if agent.status == "working" {
-                                // A working agent turns where the dot sits, so
-                                // the row says "busy" without waiting on a
-                                // status push.
-                                style::spinner(
-                                    format!(
-                                        "pilus-agent-spinner-{}-{}",
-                                        endpoint.key(),
-                                        agent.pane
-                                    ),
-                                    10.0,
-                                    status,
-                                )
-                                .into_any_element()
-                            } else {
-                                div()
-                                    .w(px(8.0))
-                                    .h(px(8.0))
-                                    .radius_full()
-                                    .bg(status)
-                                    .into_any_element()
-                            }),
+                            // Every state, working included, is its color.
+                            .child(style::status_dot(status)),
                     )
                     .child(
                         div()

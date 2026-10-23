@@ -1665,11 +1665,7 @@ impl UiPlaygroundView {
                     .gap_1()
                     .text_size(px(self.fonts().label))
                     .text_color(theme.accent)
-                    .child(style::spinner(
-                        "playground-agent-spinner",
-                        10.0,
-                        theme.accent,
-                    ))
+                    .child(style::busy_dot(10.0, theme.accent))
                     .child("working"),
             )
     }

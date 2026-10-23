@@ -35,7 +35,9 @@ pub struct TextFile {
 pub enum Version<'a> {
     /// The file on disk, at an absolute path.
     Disk(&'a str),
-    /// The index's copy of `path`, relative to the repository at `repo`.
+    /// The index's copy of `path`, relative to the repository at `repo`. A
+    /// `path` that starts with `./` is relative to `repo` itself, which can
+    /// then be any folder inside the repository.
     Index { repo: &'a str, path: &'a str },
 }
 

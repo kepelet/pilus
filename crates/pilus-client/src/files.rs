@@ -82,6 +82,9 @@ pub struct FileChange {
     pub status: String,
     /// The path the Diff names the file by, relative to the repository.
     pub path: String,
+    /// Identifies this version of the file's diff, so a reader can tell that
+    /// Git's view of the file moved without reading it.
+    pub fingerprint: String,
 }
 
 /// What Git reports changed, keyed by absolute path so tree rows look it up
@@ -113,6 +116,7 @@ impl FileChanges {
                 layer: file.layer,
                 status: file.status.clone(),
                 path: file.path.clone(),
+                fingerprint: file.fingerprint.clone(),
             });
         }
         changes

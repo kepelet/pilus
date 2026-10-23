@@ -187,6 +187,13 @@ pub(super) enum FilesMsg {
         text: String,
         result: Result<(), String>,
     },
+    /// The index's copy of the edited file, which the editor's gutter marks
+    /// compare against, or why there is none (most often: not tracked).
+    Base {
+        endpoint: EndpointId,
+        path: String,
+        result: Result<TextFile, String>,
+    },
 }
 
 /// What one create, rename, or delete did to the tree.
@@ -278,6 +285,15 @@ struct FileDoc {
     /// Set once the user starts editing: the source is then in the editor's
     /// field, and the document is dirty when that differs from `base`.
     edit: Option<DocEdit>,
+    /// The index's copy of the file, which the editor's gutter and the
+    /// preview's blocks mark their changes against. `None` until read, or for
+    /// a file Git does not track.
+    git_base: Option<String>,
+    /// The fingerprint of the file's Git change when `git_base` was last
+    /// asked for, so it is read again only when Git's view moved. The outer
+    /// `None` means it has not been asked for yet; the inner one, that Git
+    /// listed no change.
+    base_asked: Option<Option<String>>,
 }
 
 /// How an edited document is shown.
@@ -884,6 +900,41 @@ impl PilusView {
                     }
                     self.files_saved(&path, text, result);
                 }
+                FilesMsg::Base {
+                    endpoint,
+                    path,
+                    result,
+                } => {
+                    if current.is_some_and(|current| current != endpoint) {
+                        continue;
+                    }
+                    let Some(doc) = self.files_panel.doc.as_mut().filter(|doc| doc.path == path)
+                    else {
+                        continue;
+                    };
+                    let base = match result {
+                        // Half a base would mark the missing half removed.
+                        Ok(file) if !file.truncated => Some(file.text),
+                        Ok(_) => None,
+                        Err(error) => {
+                            tracing::debug!(%path, %error, "no index copy for the editor's marks");
+                            None
+                        }
+                    };
+                    if let DocState::Ready(md) = &mut doc.state {
+                        md.forget_marks();
+                    }
+                    // The editor's field serves whichever file is edited, so
+                    // it takes the copy only while this one is.
+                    if doc.edit.is_some() {
+                        let base = base.clone();
+                        self.md_editor_input
+                            .update(cx, |input, cx| input.set_diff_base(base, cx));
+                    }
+                    doc.git_base = base;
+                    // The header's counts come from the same marks.
+                    changed = true;
+                }
                 FilesMsg::Uploaded { endpoint, outcome } => {
                     for (kind, text) in outcome.toasts() {
                         self.toast(kind, text);
@@ -922,6 +973,9 @@ impl PilusView {
             }
         }
         self.files_save_folds();
+        // A new edit, or a commit, stage or write that moved the file's Git
+        // change, wants the gutter's base read (again). Cheap when it does not.
+        self.files_read_base();
         if !self.files_visible() {
             return changed;
         }
@@ -1141,6 +1195,8 @@ impl PilusView {
                     seq: self.files_panel.doc_reads,
                     state: DocState::Failed(error),
                     edit: None,
+                    git_base: None,
+                    base_asked: None,
                 });
                 return;
             }
@@ -1156,16 +1212,20 @@ impl PilusView {
         // A reload keeps what was on screen until the new read lands, as long
         // as it is the same kind of view.
         let keep = panel.doc.take().filter(|doc| doc.path == path);
+        // Git's copy stays too, so the marks hold until it is read again.
+        let (kept, git_base) = keep.map_or((None, None), |doc| (Some(doc.state), doc.git_base));
         panel.doc = Some(FileDoc {
             path: path.clone(),
             as_text,
             seq,
-            state: match keep.map(|doc| doc.state) {
+            state: match kept {
                 Some(DocState::Ready(doc)) if picture.is_none() => DocState::Ready(doc),
                 Some(DocState::Picture(shown)) if picture.is_some() => DocState::Picture(shown),
                 _ => DocState::Loading,
             },
             edit: None,
+            git_base,
+            base_asked: None,
         });
         let tx = panel.tx.clone();
         std::thread::spawn(move || {
@@ -1278,6 +1338,7 @@ impl PilusView {
                 started = true;
                 let text = md.source().to_string();
                 let path = doc.path.clone();
+                let git_base = doc.git_base.clone();
                 doc.edit = Some(DocEdit {
                     base: text.clone(),
                     mode: EditMode::Source,
@@ -1285,11 +1346,14 @@ impl PilusView {
                     scroll: ScrollHandle::new(),
                     caret_seen: Some(0),
                 });
-                // One field serves every document, so the grammar follows the
-                // file it was opened for, and a search of the last one is over.
+                // One field serves every document, so the grammar and the Git
+                // marks follow the file it was opened for, and a search of the
+                // last one is over. A markdown file was most likely previewed
+                // first, so its Git copy is already here.
                 self.file_find.reset();
                 self.md_editor_input.update(cx, |input, cx| {
                     input.set_marks(Vec::new(), cx);
+                    input.set_diff_base(git_base, cx);
                     input.set_syntax(Some(path), cx);
                     input.set_value_at_start(text, cx);
                 });
@@ -1327,6 +1391,20 @@ impl PilusView {
         if !input.holds(md.source()) {
             md.replace_source(input.value());
         }
+        self.files_mark_preview();
+    }
+
+    /// Bring the preview's Git marks up to date with its text, before its
+    /// rows are drawn: a row drawn before would show none for a frame.
+    fn files_mark_preview(&mut self) {
+        if let Some(FileDoc {
+            state: DocState::Ready(md),
+            git_base,
+            ..
+        }) = self.files_panel.doc.as_mut()
+        {
+            md.mark_against(git_base.as_deref());
+        }
     }
 
     /// Put the open document in side-by-side mode, without the window.
@@ -1339,6 +1417,30 @@ impl PilusView {
             .and_then(|doc| doc.edit.as_mut())
         {
             edit.mode = EditMode::Split;
+        }
+    }
+
+    /// Give the open edit `base` as its Git copy, without reading Git, so the
+    /// gutter's marks show in a capture.
+    #[cfg(feature = "visual-test")]
+    pub(super) fn files_set_sample_base(&mut self, base: &str, cx: &mut Context<Self>) {
+        let panel = &mut self.files_panel;
+        let Some(doc) = panel.doc.as_mut() else {
+            return;
+        };
+        let fingerprint = panel
+            .changes
+            .file(&doc.path)
+            .map(|change| change.fingerprint.clone());
+        doc.base_asked = Some(fingerprint);
+        doc.git_base = Some(base.to_string());
+        if let DocState::Ready(md) = &mut doc.state {
+            md.forget_marks();
+        }
+        if doc.edit.is_some() {
+            self.md_editor_input.update(cx, |input, cx| {
+                input.set_diff_base(Some(base.to_string()), cx)
+            });
         }
     }
 
@@ -1434,6 +1536,60 @@ impl PilusView {
             .ok();
         });
         cx.notify();
+    }
+
+    /// Read the index's copy of the open file on a worker, for the editor's
+    /// gutter and the preview's blocks, unless Git's change for the file is
+    /// the one it was last read for. `git show` runs where the file lives,
+    /// over SSH for a remote machine.
+    fn files_read_base(&mut self) {
+        let panel = &mut self.files_panel;
+        // Only text has lines to mark: not a picture, nor a read in flight.
+        let Some(doc) = panel
+            .doc
+            .as_mut()
+            .filter(|doc| matches!(doc.state, DocState::Ready(_)))
+        else {
+            return;
+        };
+        let fingerprint = panel
+            .changes
+            .file(&doc.path)
+            .map(|change| change.fingerprint.as_str());
+        if doc.base_asked.as_ref().map(Option::as_deref) == Some(fingerprint) {
+            return;
+        }
+        doc.base_asked = Some(fingerprint.map(str::to_string));
+        let path = doc.path.clone();
+        let endpoint = self.active.clone();
+        let target = match self.read_target(&endpoint) {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::debug!(%path, %error, "cannot read the editor's index copy");
+                return;
+            }
+        };
+        let tx = self.files_panel.tx.clone();
+        std::thread::spawn(move || {
+            let (dir, name) = super::diff::split_path(&path);
+            let dir = if dir.is_empty() { "/" } else { dir };
+            // `./name` is read relative to the folder, so the repository's
+            // root is never needed.
+            let relative = format!("./{name}");
+            let result = read_text(
+                target.as_ref(),
+                Version::Index {
+                    repo: dir,
+                    path: &relative,
+                },
+            );
+            tx.send(FilesMsg::Base {
+                endpoint,
+                path,
+                result,
+            })
+            .ok();
+        });
     }
 
     /// Settle a finished save: what was written is now the text on disk.
@@ -2021,6 +2177,7 @@ impl PilusView {
     /// The open document: its name over the rendered text.
     fn files_doc_page(&mut self, cx: &mut Context<Self>) -> Div {
         self.find_refresh(cx);
+        self.files_mark_preview();
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let Some(doc) = self.files_panel.doc.as_ref() else {
@@ -2036,6 +2193,42 @@ impl PilusView {
         // Too narrow a column shows the source alone until it is widened.
         let split = mode == Some(EditMode::Split) && self.files_panel.split_ok;
         let dirty = self.files_doc_dirty(cx);
+        // Lines added and removed since the index, as the marks show them: the
+        // editor's while the file is edited, so the counts follow each
+        // keystroke, and the preview's before that.
+        let counts = match &doc.state {
+            _ if doc.edit.is_some() => self.md_editor_input.update(cx, |input, _| {
+                input
+                    .line_changes()
+                    .map(|changes| (changes.insertions, changes.deletions))
+            }),
+            // A preview never edited has only the document's own marks.
+            DocState::Ready(md) => md.change_counts(),
+            _ => None,
+        };
+        let counts =
+            counts
+                .filter(|&(added, removed)| added + removed > 0)
+                .map(|(added, removed)| {
+                    let count = |text: String, color| {
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(fonts.label))
+                            .text_color(color)
+                            .child(text)
+                    };
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .flex_shrink_0()
+                        .children((added > 0).then(|| count(format!("+{added}"), theme.ok)))
+                        .children((removed > 0).then(|| count(format!("−{removed}"), theme.alert)))
+                });
+        let Some(doc) = self.files_panel.doc.as_ref() else {
+            return div();
+        };
         let mut edit_buttons: Vec<AnyElement> = Vec::new();
         // An SVG is a picture that is also text: the pencil swaps one for the
         // other, as it swaps a markdown file's preview for its source.
@@ -2169,6 +2362,7 @@ impl PilusView {
                             .child("•")
                     })),
             )
+            .children(counts)
             .children(edit_buttons)
             .child(
                 self.diff_icon_button(
@@ -2290,6 +2484,7 @@ impl PilusView {
         self.md_editor_input.update(cx, |input, cx| {
             input.set_style(theme, mono, px(fonts.body));
             input.set_line_numbers(true, cx);
+            input.set_current_line(true, cx);
         });
         let (caret, row) = {
             let input = self.md_editor_input.read(cx);
@@ -2718,6 +2913,8 @@ impl PilusView {
                 path,
             )),
             edit: None,
+            git_base: None,
+            base_asked: None,
         });
         cx.notify();
     }
@@ -2743,6 +2940,8 @@ impl PilusView {
             seq: panel.doc_reads,
             state,
             edit: None,
+            git_base: None,
+            base_asked: None,
         });
         cx.notify();
     }

@@ -22,6 +22,12 @@
 //! also show a gutter of line numbers ([`TextInput::set_line_numbers`]): one
 //! per logical line, on its first display row, so a wrapped line is numbered
 //! once.
+//!
+//! The editor also asks for two things only a code editor wants: a band
+//! behind the caret's line ([`TextInput::set_current_line`]), and Git's
+//! quick-diff marks in the gutter ([`TextInput::set_diff_base`]). The marks
+//! compare the text with a base the window reads off the GUI thread, and are
+//! recomputed when either changes, as the highlighting is.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -39,6 +45,8 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::highlight::{self, Span};
+use super::line_diff::{self, LineChanges};
+use super::style;
 use super::theme::Theme;
 
 /// Multiplier from font size to painted line height, matching the chrome's
@@ -57,6 +65,12 @@ const MIN_GUTTER_DIGITS: usize = 2;
 const COMMAND_CHORD_WINDOW: Duration = Duration::from_millis(150);
 /// Half of the on/off caret blink cycle, in milliseconds.
 const CARET_BLINK: Duration = Duration::from_millis(530);
+/// Width of a quick-diff bar in the gutter, and beside a rendered block.
+pub(super) const CHANGE_BAR_WIDTH: f32 = 3.0;
+/// Half the height of the red wedge where lines were removed.
+pub(super) const REMOVED_WEDGE: f32 = 4.0;
+/// How strongly the text color washes the caret's line.
+const CURRENT_LINE_WASH: f32 = 0.06;
 
 /// One shaped display row: part (or all) of one logical line. Wrapping a
 /// long line yields several pieces; an unwrapped line is exactly one.
@@ -690,6 +704,13 @@ pub(super) struct TextInput {
     highlighted: Option<(String, Vec<Span>)>,
     /// Byte ranges painted under the text, such as the find bar's matches.
     marks: Vec<Range<usize>>,
+    /// Whether a band marks the caret's line.
+    current_line: bool,
+    /// The text the gutter's quick-diff marks compare against, under an id
+    /// that changes with it.
+    diff_base: Option<(u64, String)>,
+    /// The marks, and the text revision and base id they were computed for.
+    line_changes: Option<((u64, u64), LineChanges)>,
     /// When a Command chord last reached this field's key handler. The
     /// platform delivers an unclaimed chord's glyph a moment later as text,
     /// by which time the modifier state can already be stale.
@@ -742,6 +763,9 @@ impl TextInput {
             line_numbers: false,
             highlighted: None,
             marks: Vec::new(),
+            current_line: false,
+            diff_base: None,
+            line_changes: None,
             multiline,
             secret: false,
             placeholder: placeholder.into(),
@@ -785,6 +809,49 @@ impl TextInput {
             self.line_numbers = on;
             cx.notify();
         }
+    }
+
+    /// Draw a band behind the caret's line. Only a multiline field has one.
+    pub(super) fn set_current_line(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.current_line != on {
+            self.current_line = on;
+            cx.notify();
+        }
+    }
+
+    /// Mark the gutter where the text differs from `base`, Git's copy of the
+    /// file; `None` clears the marks. The gutter must be on to show them.
+    pub(super) fn set_diff_base(&mut self, base: Option<String>, cx: &mut Context<Self>) {
+        let same = match (&self.diff_base, &base) {
+            (Some((_, held)), Some(base)) => held == base,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        self.diff_base = base.map(|base| (next_revision(), base));
+        self.line_changes = None;
+        cx.notify();
+    }
+
+    /// How the text differs from the diff base, brought up to date first.
+    /// `None` without a base.
+    pub(super) fn line_changes(&mut self) -> Option<&LineChanges> {
+        let Some((base_id, base)) = &self.diff_base else {
+            self.line_changes = None;
+            return None;
+        };
+        let key = (self.buffer.borrow().revision, *base_id);
+        if self
+            .line_changes
+            .as_ref()
+            .is_none_or(|(held, _)| *held != key)
+        {
+            let changes = line_diff::diff(base, &self.buffer.borrow().text);
+            self.line_changes = Some((key, changes));
+        }
+        self.line_changes.as_ref().map(|(_, changes)| changes)
     }
 
     /// Color the text by the grammar of the file at `path`; `None` paints it
@@ -1367,6 +1434,10 @@ impl Render for TextInput {
         } else {
             self.highlighted = None;
         }
+        let gutter_on = self.line_numbers && self.multiline;
+        if gutter_on {
+            self.line_changes();
+        }
         let spans: &[Span] = self
             .highlighted
             .as_ref()
@@ -1433,12 +1504,16 @@ impl Render for TextInput {
         let mut line_start = 0usize;
         // The logical line each display row opens, for the gutter.
         let mut numbers: Vec<Option<usize>> = Vec::new();
+        // The first display row of each logical line, so a line's rows can be
+        // found for the band and the quick-diff marks.
+        let mut first_rows: Vec<usize> = Vec::new();
         for (line_index, segment) in display.split('\n').enumerate() {
             let line_end = line_start + segment.len();
             let ranges: Vec<(usize, usize)> = match wrap_width {
                 Some(max) => wrap_pieces(segment, line_start, max, &measure),
                 None => vec![(line_start, line_end)],
             };
+            first_rows.push(pieces.len());
             for (nth, (piece_start, piece_end)) in ranges.into_iter().enumerate() {
                 numbers.push((nth == 0).then_some(line_index + 1));
                 let look = |span: &Span| {
@@ -1487,10 +1562,22 @@ impl Render for TextInput {
             line_start = line_end + 1;
         }
 
-        let gutter = (self.line_numbers && self.multiline).then(|| {
+        // The display rows of logical lines `lines`.
+        let rows_of = |lines: Range<usize>| {
+            let row = |line: usize| first_rows.get(line).copied().unwrap_or(pieces.len());
+            row(lines.start)..row(lines.end)
+        };
+        let caret_line = text[..head.min(text.len())].matches('\n').count() + 1;
+        // The band shows on a field that holds text; the placeholder is not a
+        // line to be on.
+        let current_rows = (self.current_line && self.multiline && !show_placeholder)
+            .then(|| rows_of(caret_line - 1..caret_line));
+        let current_color: Hsla = style::tint(theme.fg, CURRENT_LINE_WASH).into();
+
+        let gutter = gutter_on.then(|| {
             let total = numbers.iter().flatten().last().copied().unwrap_or(1);
             let digits = total.to_string().len().max(MIN_GUTTER_DIGITS);
-            let caret_line = text[..head.min(text.len())].matches('\n').count() + 1;
+            let changes = self.line_changes.as_ref().map(|(_, changes)| changes);
             let shape = |number: usize| {
                 let label = number.to_string();
                 let color: Hsla = if number == caret_line {
@@ -1515,6 +1602,23 @@ impl Render for TextInput {
             Gutter {
                 width: measure("0") * digits as f32 + px(LINE_NUMBER_GAP),
                 rows: numbers.iter().map(|number| number.map(shape)).collect(),
+                added: changes.map_or_else(Vec::new, |changes| {
+                    changes
+                        .added
+                        .iter()
+                        .map(|lines| rows_of(lines.clone()))
+                        .collect()
+                }),
+                removed: changes.map_or_else(Vec::new, |changes| {
+                    changes
+                        .removed
+                        .iter()
+                        .map(|&line| rows_of(line..line).start)
+                        .collect()
+                }),
+                added_color: theme.ok.into(),
+                removed_color: theme.alert.into(),
+                current: current_rows.clone().map(|rows| (rows, current_color)),
             }
         });
 
@@ -1611,6 +1715,11 @@ impl Render for TextInput {
                     size: field.size,
                 };
                 window.with_content_mask(Some(gpui::ContentMask { bounds: field }), |window| {
+                    // The band spans the whole field, so it ignores the
+                    // horizontal scroll the text takes.
+                    if let Some(rows) = current_rows.clone() {
+                        paint_rows(window, field, rows, line_height, current_color);
+                    }
                     paint_marks(window, bounds, &pieces, &marks, line_height, mark_color);
                     // Selection sits under the glyphs so the foreground
                     // colour chosen above stays legible on it.
@@ -1696,20 +1805,73 @@ impl Render for TextInput {
     }
 }
 
-/// The line numbers beside a multiline field, shaped for this frame.
+/// The line numbers beside a multiline field, shaped for this frame, with the
+/// caret line's band and the quick-diff marks.
 struct Gutter {
     width: Pixels,
     /// A number on each display row that opens a logical line.
     rows: Vec<Option<ShapedLine>>,
+    /// Display rows beside lines that are new or changed.
+    added: Vec<Range<usize>>,
+    /// Display rows that removed lines sat just above.
+    removed: Vec<usize>,
+    added_color: Hsla,
+    removed_color: Hsla,
+    /// The caret line's display rows and the band's color.
+    current: Option<(Range<usize>, Hsla)>,
 }
 
 impl Gutter {
     fn element(self, line_height: Pixels, height: Pixels) -> impl IntoElement {
-        let Self { width, rows } = self;
+        let Self {
+            width,
+            rows,
+            added,
+            removed,
+            added_color,
+            removed_color,
+            current,
+        } = self;
         div().flex_shrink_0().w(width).h(height).child(
             canvas(
                 |_, _, _| (),
                 move |bounds, (), window, cx| {
+                    if let Some((band, color)) = current.clone() {
+                        paint_rows(window, bounds, band, line_height, color);
+                    }
+                    // The marks sit in the gap between the numbers and the
+                    // text, centred in it.
+                    let bar_x = bounds.origin.x + width
+                        - px(LINE_NUMBER_GAP / 2.0 + CHANGE_BAR_WIDTH / 2.0);
+                    let visible = window.content_mask().bounds;
+                    let row_y =
+                        |row: usize| bounds.origin.y + px(line_height.as_f32() * row as f32);
+                    let on_screen = |top: Pixels, bottom: Pixels| {
+                        bottom >= visible.origin.y && top <= visible.origin.y + visible.size.height
+                    };
+                    for rows in &added {
+                        let (top, bottom) = (row_y(rows.start), row_y(rows.end));
+                        if !on_screen(top, bottom) {
+                            continue;
+                        }
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(bar_x, top),
+                                size: size(px(CHANGE_BAR_WIDTH), bottom - top),
+                            },
+                            added_color,
+                        ));
+                    }
+                    for &row in &removed {
+                        // A wedge pointing at the text, on the seam between
+                        // the rows the removed lines sat between.
+                        let y = row_y(row);
+                        let half = px(REMOVED_WEDGE);
+                        if !on_screen(y - half, y + half) {
+                            continue;
+                        }
+                        paint_removed_wedge(window, bar_x, y, removed_color);
+                    }
                     for (row, line) in rows.iter().enumerate() {
                         let Some(line) = line else {
                             continue;
@@ -1726,6 +1888,43 @@ impl Gutter {
             .size_full(),
         )
     }
+}
+
+/// The red wedge of a quick diff where lines were removed: its flat side at
+/// `x`, pointing right at the text, centred on `y`. The Files tab's markdown
+/// preview draws the same mark beside its blocks.
+pub(super) fn paint_removed_wedge(window: &mut Window, x: Pixels, y: Pixels, color: Hsla) {
+    let half = px(REMOVED_WEDGE);
+    let mut wedge = gpui::Path::new(point(x, y - half));
+    wedge.line_to(point(x + half + px(1.0), y));
+    wedge.line_to(point(x, y + half));
+    window.paint_path(wedge, color);
+}
+
+/// Fill display rows `rows` across the whole of `bounds`.
+fn paint_rows(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    rows: Range<usize>,
+    line_height: Pixels,
+    color: Hsla,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    window.paint_quad(fill(
+        Bounds {
+            origin: point(
+                bounds.origin.x,
+                bounds.origin.y + px(line_height.as_f32() * rows.start as f32),
+            ),
+            size: size(
+                bounds.size.width,
+                px(line_height.as_f32() * rows.len() as f32),
+            ),
+        },
+        color,
+    ));
 }
 
 /// Paint a selection or composition range, clipped per display row.

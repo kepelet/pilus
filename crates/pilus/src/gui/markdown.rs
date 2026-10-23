@@ -105,6 +105,10 @@ pub(super) struct Block {
     /// First and last source line, 1-based, as a review note counts them.
     pub(super) first_line: u32,
     pub(super) last_line: u32,
+    /// The last line that holds the block's text. A list's position runs to
+    /// the start of the blank line after it, which `last_line` counts and
+    /// this does not, so a change on that blank line is not the list's.
+    pub(super) text_last_line: u32,
     /// The plain text of each selectable leaf, in the order the painter
     /// numbers them.
     leaves: Vec<String>,
@@ -138,11 +142,21 @@ impl Document {
         let blocks = parse(source, true, mdx)
             .into_iter()
             .map(|node| {
-                let (first_line, last_line) = node
+                let (first_line, last_line, text_last_line) = node
                     .position()
-                    .map(|at| (at.start.line as u32, at.end.line as u32))
+                    .map(|at| {
+                        let (first, last) = (at.start.line as u32, at.end.line as u32);
+                        // An end at the first column is before anything on
+                        // that line.
+                        let text_last = if at.end.column <= 1 && last > first {
+                            last - 1
+                        } else {
+                            last
+                        };
+                        (first, last, text_last)
+                    })
                     // A node without a position sits where the last one ended.
-                    .unwrap_or((line, line));
+                    .unwrap_or((line, line, line));
                 line = last_line;
                 let mut leaves = Vec::new();
                 collect_leaves(&node, &mut leaves);
@@ -150,6 +164,7 @@ impl Document {
                     node,
                     first_line,
                     last_line,
+                    text_last_line,
                     leaves,
                 }
             })

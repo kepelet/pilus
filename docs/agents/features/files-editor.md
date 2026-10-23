@@ -89,6 +89,47 @@ The editor field (`md_editor_input`) is colored by `highlight::source`.
   `{` is an MDX error. Do not make that parse stricter, or a half-typed file
   blanks the preview.
 
+## Git marks and the caret's line
+
+The editor's gutter shows a quick diff against the index's copy of the file,
+like an IDE's: a green bar beside lines that are new or changed, and a red
+wedge where lines were removed. The header shows the same `+N −M` counts.
+
+The markdown preview shows the same marks per rendered block
+(`md_view::block_marks`): a green bar beside a block with a new or changed
+line, and a red wedge above a block, or inside it, where lines were removed.
+A block's marks use `Block::text_last_line`, not `last_line`, because a list's
+position runs onto the blank line after it.
+
+The Changes tab's rendered markdown shows the same block marks, read from the
+patch it already holds (`line_diff::from_hunks`) instead of from Git's copy, so
+they match the patch exactly: against the index for an unstaged change, against
+`HEAD` for a staged one. `DiffPanel::mark_markdown` applies them once the patch
+and the text are in for the same fingerprint, since each arrives on its own.
+
+- `files_read_base` reads the index copy with `git show :./name`, run in the
+  file's folder (over SSH for a remote machine) on a worker thread. The copy
+  lives on the open document (`FileDoc::git_base`), so a preview that was
+  never edited has it too. It runs from `files_tick`, once per opened file
+  and again whenever the file's `FileChange` fingerprint moves. A commit, a
+  stage or a save moves it; a tick that finds nothing new reads nothing.
+- An untracked file, a file outside a repository, or a truncated read has no
+  base and shows no marks.
+- `line_diff` compares the base with the buffer on each edit, on the GUI
+  thread. It trims the shared head and tail and runs Myers on the middle. A
+  middle past `MAX_EDITS` steps is marked changed as one block.
+- The band behind the caret's line (`TextInput::set_current_line`) is drawn
+  even while the terminal has the keyboard, so you can still see where you
+  left off.
+
+## Who has the keyboard
+
+The editor holds the keyboard only while the right column does
+(`right.focused`, which `md_editing` checks). A press on the terminal clears
+it. A press in the column, opening a file and ⌘F set it. Without that check
+`sync_focus` would give the keyboard back to the editor every frame, and the
+terminal could not be typed in while a file was open.
+
 ## Mermaid diagrams
 
 A `mermaid` fence in a markdown preview, a GitHub body or a sipil chat message

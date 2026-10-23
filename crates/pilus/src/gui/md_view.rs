@@ -12,18 +12,24 @@
 //!
 //! The text can be selected with the pointer (see `md_select`). A selection
 //! offers to be copied, or sent to a running agent as a quoted excerpt.
+//!
+//! On the Files tab a document also carries Git's quick-diff marks, as the
+//! editor's gutter does: a block any of whose lines are new or changed since
+//! the index gets a green bar, and a red wedge shows where lines were removed
+//! above or inside it (see [`block_marks`]).
 
 use gpui::{
     AnyElement, ClipboardItem, Context, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, SharedString, div, list, prelude::*, px,
+    MouseMoveEvent, MouseUpEvent, SharedString, canvas, div, list, prelude::*, px,
 };
 use pilus_client::{DiffNote, NoteSide, SshTarget, TextFile};
 
+use super::line_diff::{self, LineChanges};
 use super::markdown::{self, Document};
 use super::md_select::{self, Hits, Leaves, Selection, TextPoint};
 use super::style::{self, RadiusExt};
 use super::toast::ToastKind;
-use super::{PilusView, icon};
+use super::{PilusView, icon, text_input};
 
 /// Whether `path` names a markdown file, by extension.
 pub(super) fn is_markdown(path: &str) -> bool {
@@ -135,6 +141,64 @@ pub(super) fn rows(
     rows
 }
 
+/// How one rendered block shows Git's changes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct BlockMarks {
+    /// One of the block's lines is new or changed.
+    pub(super) added: bool,
+    /// Lines were removed between the block before and this one.
+    pub(super) removed_above: bool,
+    /// Lines were removed from inside the block.
+    pub(super) removed_within: bool,
+    /// Lines were removed after the last block.
+    pub(super) removed_below: bool,
+}
+
+impl BlockMarks {
+    fn any(self) -> bool {
+        self.added || self.removed_above || self.removed_within || self.removed_below
+    }
+}
+
+/// The marks of the block over source lines `first..=last` (1-based, as a
+/// note counts them), which follows a block that ended at line `after` (0 for
+/// the first block). The last block also takes removals past its end.
+pub(super) fn block_marks(
+    changes: &LineChanges,
+    after: u32,
+    first: u32,
+    last: u32,
+    last_block: bool,
+) -> BlockMarks {
+    // Zero-based, as the marks count: the gap above the block starts at
+    // `gap`, and the block holds `start..=end`. A removal names the line the
+    // removed ones sat above.
+    let gap = after as usize;
+    let start = first.saturating_sub(1) as usize;
+    let end = last.saturating_sub(1) as usize;
+    let at = changes.added.partition_point(|range| range.end <= start);
+    let mut marks = BlockMarks {
+        added: changes
+            .added
+            .get(at)
+            .is_some_and(|range| range.start <= end),
+        ..BlockMarks::default()
+    };
+    let from = changes.removed.partition_point(|&line| line < gap);
+    for &line in &changes.removed[from..] {
+        if line <= start {
+            marks.removed_above = true;
+        } else if line <= end {
+            marks.removed_within = true;
+        } else if last_block {
+            marks.removed_below = true;
+        } else {
+            break;
+        }
+    }
+    marks
+}
+
 /// A file's blocks and the list that scrolls them.
 pub(super) struct MdDoc {
     document: Document,
@@ -158,6 +222,9 @@ pub(super) struct MdDoc {
     dragging: bool,
     /// Where the text on screen landed, for mapping the pointer onto it.
     hits: Hits,
+    /// How the source differs from Git's copy, for the blocks' marks. `None`
+    /// with no copy, or until worked out against the current one.
+    changes: Option<LineChanges>,
 }
 
 impl MdDoc {
@@ -185,7 +252,43 @@ impl MdDoc {
             selection: None,
             dragging: false,
             hits: Hits::default(),
+            changes: None,
         }
+    }
+
+    /// Bring the marks up to date with `base`, Git's copy of the file. They
+    /// are worked out again only after the source or the base changed.
+    pub(super) fn mark_against(&mut self, base: Option<&str>) {
+        match base {
+            None => self.changes = None,
+            Some(base) if self.changes.is_none() => {
+                self.changes = Some(line_diff::diff(base, &self.source));
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Whether the marks are worked out.
+    pub(super) fn has_marks(&self) -> bool {
+        self.changes.is_some()
+    }
+
+    /// Take marks worked out elsewhere: the Changes tab reads them from the
+    /// patch it shows.
+    pub(super) fn set_marks(&mut self, changes: LineChanges) {
+        self.changes = Some(changes);
+    }
+
+    /// Drop the marks: the base they were worked out against is gone.
+    pub(super) fn forget_marks(&mut self) {
+        self.changes = None;
+    }
+
+    /// The marks' counts of lines added and removed, as the header shows them.
+    pub(super) fn change_counts(&self) -> Option<(usize, usize)> {
+        self.changes
+            .as_ref()
+            .map(|changes| (changes.insertions, changes.deletions))
     }
 
     pub(super) fn source(&self) -> &str {
@@ -204,6 +307,7 @@ impl MdDoc {
     pub(super) fn replace_source(&mut self, text: String) {
         self.document = Document::parse(&text, self.mdx);
         self.source = text;
+        self.changes = None;
         self.selection = None;
         self.dragging = false;
         self.stale = true;
@@ -547,6 +651,23 @@ impl PilusView {
                 &self.shared_settings,
                 &leaves,
             ));
+        if let Some(changes) = &doc.changes {
+            let blocks = doc.document.blocks();
+            let after = block_ix
+                .checked_sub(1)
+                .and_then(|prev| blocks.get(prev))
+                .map_or(0, |prev| prev.text_last_line);
+            let marks = block_marks(
+                changes,
+                after,
+                block.first_line,
+                block.text_last_line,
+                block_ix + 1 == blocks.len(),
+            );
+            if marks.any() {
+                row = row.children(self.md_git_marks(marks, top, bottom));
+            }
+        }
         if page == Page::Diff {
             let (first, last) = (block.first_line, block.last_line);
             let size = style::scaled(&self.shared_settings, 18.0);
@@ -584,7 +705,70 @@ impl PilusView {
         }
         row.into_any_element()
     }
+
+    /// A block's Git marks, laid over its row in the left padding: a green
+    /// bar down the block, and a red wedge where lines were removed. `top` and
+    /// `bottom` are the row's padding around the block itself.
+    fn md_git_marks(&self, marks: BlockMarks, top: f32, bottom: f32) -> Vec<AnyElement> {
+        let theme = self.theme;
+        let bar = text_input::CHANGE_BAR_WIDTH;
+        let wedge = text_input::REMOVED_WEDGE;
+        let mut out = Vec::new();
+        if marks.added {
+            out.push(
+                div()
+                    .absolute()
+                    .left(px(MARK_X))
+                    .top(px(top))
+                    .bottom(px(bottom))
+                    .w(px(bar))
+                    .bg(theme.ok)
+                    .into_any_element(),
+            );
+        }
+        // A wedge centred in a band of the row: it is drawn over the middle of
+        // the band its container spans.
+        let wedge_in = |band: gpui::Div| {
+            let color: gpui::Hsla = theme.alert.into();
+            band.absolute()
+                .left(px(MARK_X))
+                .w(px(wedge * 2.0))
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, (), window, _| {
+                            let y = bounds.origin.y + bounds.size.height / 2.0;
+                            text_input::paint_removed_wedge(window, bounds.origin.x, y, color);
+                        },
+                    )
+                    .size_full(),
+                )
+                .into_any_element()
+        };
+        if marks.removed_above {
+            // In the gap above the block, or on the seam when there is none.
+            let center = if top >= wedge * 2.0 { top / 2.0 } else { 0.0 };
+            out.push(wedge_in(div().top(px(center - wedge)).h(px(wedge * 2.0))));
+        }
+        if marks.removed_within {
+            out.push(wedge_in(div().top(px(top)).bottom(px(bottom))));
+        }
+        if marks.removed_below {
+            let center = if bottom >= wedge * 2.0 {
+                bottom / 2.0
+            } else {
+                0.0
+            };
+            out.push(wedge_in(
+                div().bottom(px(center - wedge)).h(px(wedge * 2.0)),
+            ));
+        }
+        out
+    }
 }
+
+/// How far into a block's row its Git marks sit, inside the row's padding.
+const MARK_X: f32 = 4.0;
 
 /// A canned document for the shot harness: every block kind the renderer
 /// draws, with line numbers the sample notes point at.
@@ -648,6 +832,22 @@ pub fn write_text(path: &Path, text: &str) -> Result<(), String> {
     if text.len() > LIMIT {
         return Err(format!(\"{} bytes is too long\", text.len()));
     }
+    std::fs::write(path, text).map_err(|error| error.to_string())
+}
+";
+
+/// [`CODE_SAMPLE`] as Git last had it: a line since removed, a doc comment
+/// since reworded, and no length check, so the gutter shows each kind of mark.
+#[cfg(feature = "visual-test")]
+const CODE_BASE: &str = "//! Saving a text file back where it was read.
+
+use std::fs;
+use std::path::Path;
+
+/// The largest file the editor opens.
+const LIMIT: usize = 1024 * 1024;
+
+pub fn write_text(path: &Path, text: &str) -> Result<(), String> {
     std::fs::write(path, text).map_err(|error| error.to_string())
 }
 ";
@@ -737,6 +937,15 @@ impl PilusView {
 
     pub(super) fn files_show_doc_sample(&mut self, cx: &mut Context<Self>) {
         self.files_show_doc("/work/pilus/docs/review-guide.md", SAMPLE, cx);
+        // As Git had it: one checklist item since reworded, and a paragraph
+        // since taken out, so the preview shows both kinds of mark.
+        let base = SAMPLE
+            .replace("- [ ] Run `cargo test`", "- [ ] Run the tests")
+            .replace(
+                "## Key bindings",
+                "Ask before you merge.\n\n## Key bindings",
+            );
+        self.files_set_sample_base(&base, cx);
     }
 
     /// The sample document with its source beside it, as the editor shows it
@@ -781,6 +990,7 @@ impl PilusView {
             cx,
         );
         self.files_begin_edit(cx);
+        self.files_set_sample_base(CODE_BASE, cx);
         cx.notify();
     }
 
@@ -804,6 +1014,8 @@ A line typed since the last save.
         );
         self.md_editor_input
             .update(cx, |input, cx| input.set_value_at_start(text, cx));
+        // The saved text is Git's too, so the typed line is marked new.
+        self.files_set_sample_base(SAMPLE, cx);
     }
 }
 
@@ -812,6 +1024,77 @@ mod tests {
     use fixtures::note;
 
     use super::*;
+
+    /// The marks of each block of `new`, compared with `old`.
+    fn marks_of(old: &str, new: &str) -> Vec<BlockMarks> {
+        let changes = line_diff::diff(old, new);
+        let document = Document::parse(new, false);
+        let blocks = document.blocks();
+        blocks
+            .iter()
+            .enumerate()
+            .map(|(ix, block)| {
+                let after = ix
+                    .checked_sub(1)
+                    .map_or(0, |prev| blocks[prev].text_last_line);
+                block_marks(
+                    &changes,
+                    after,
+                    block.first_line,
+                    block.text_last_line,
+                    ix + 1 == blocks.len(),
+                )
+            })
+            .collect()
+    }
+
+    const MARKED: &str = "# Title\n\nOne line.\nTwo line.\n\nEnd.\n";
+
+    #[test]
+    fn an_unchanged_document_has_no_marks() {
+        assert!(marks_of(MARKED, MARKED).iter().all(|marks| !marks.any()));
+    }
+
+    #[test]
+    fn a_changed_line_marks_only_its_block() {
+        let marks = marks_of(MARKED, "# Title\n\nOne line.\nTwo lines.\n\nEnd.\n");
+        assert_eq!(
+            marks.iter().map(|m| m.added).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+    }
+
+    #[test]
+    fn a_removed_block_marks_the_block_below_it() {
+        let marks = marks_of(MARKED, "# Title\n\nEnd.\n");
+        assert!(marks[1].removed_above, "{marks:?}");
+        assert!(!marks[0].any());
+    }
+
+    #[test]
+    fn a_line_removed_inside_a_block_marks_it_within() {
+        let marks = marks_of(
+            "# Title\n\nOne.\nTwo.\nThree.\n",
+            "# Title\n\nOne.\nThree.\n",
+        );
+        assert!(marks[1].removed_within && !marks[1].added, "{marks:?}");
+    }
+
+    #[test]
+    fn a_paragraph_removed_after_a_list_marks_the_heading_below_not_the_list() {
+        let marks = marks_of(
+            "### Order\n\n1. a\n2. b\n\nAsk.\n\n## Keys\n",
+            "### Order\n\n1. a\n2. b\n\n## Keys\n",
+        );
+        assert!(!marks[1].any(), "{marks:?}");
+        assert!(marks[2].removed_above, "{marks:?}");
+    }
+
+    #[test]
+    fn a_removal_past_the_end_marks_the_last_block_below() {
+        let marks = marks_of(MARKED, "# Title\n\nOne line.\nTwo line.\n");
+        assert!(marks[1].removed_below, "{marks:?}");
+    }
 
     /// Test notes without pulling in the daemon's JSON.
     mod fixtures {

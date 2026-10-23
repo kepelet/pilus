@@ -34,6 +34,7 @@ use super::diff_model::{
     SrcKind, TreeRow,
 };
 use super::highlight::{self, Token};
+use super::line_diff;
 use super::md_view::{self, Composing, MdDoc, Page};
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::text_input::TextInput;
@@ -414,6 +415,24 @@ impl DiffPanel {
             .flatten()
     }
 
+    /// Mark the rendered markdown's blocks from the patch on screen, once both
+    /// are in for the same version of the file. Each arrives on its own and a
+    /// new version replaces the document, so this runs every tick and does
+    /// nothing once the marks are set.
+    fn mark_markdown(&mut self) {
+        let (Some(md), Some(loaded)) = (self.md.as_mut(), self.loaded.as_ref()) else {
+            return;
+        };
+        if md.key != loaded.key || md.fingerprint != loaded.fingerprint {
+            return;
+        }
+        if let Ok(doc) = md.state.as_mut()
+            && !doc.has_marks()
+        {
+            doc.set_marks(line_diff::from_hunks(&loaded.diff.hunks));
+        }
+    }
+
     pub(super) fn md_view_mut(&mut self) -> Option<&mut MdDoc> {
         let md = self.md.as_mut()?;
         if self.selected.as_ref() != Some(&md.key) {
@@ -573,6 +592,7 @@ impl PilusView {
             self.diff_receive(message);
             changed = true;
         }
+        self.diff_panel.mark_markdown();
         if !self.diff_visible() {
             return changed;
         }
@@ -3962,13 +3982,20 @@ impl PilusView {
         panel.composer = None;
         panel.rendered = true;
         panel.refresh_file_notes();
-        let state = Ok(MdDoc::new(
+        let mut doc = MdDoc::new(
             &TextFile {
                 text: md_view::SAMPLE.to_string(),
                 truncated: false,
             },
             &key.1,
-        ));
+        );
+        // The sample has no patch to read marks from, so they come from a
+        // made-up earlier version: the intro reworded, a paragraph taken out.
+        let earlier = md_view::SAMPLE
+            .replace("Start from the **Diff** tab", "Open the **Diff** tab")
+            .replace("## Checklist", "Ask before you merge.\n\n## Checklist");
+        doc.set_marks(line_diff::diff(&earlier, md_view::SAMPLE));
+        let state = Ok(doc);
         panel.md = Some(MdText {
             key,
             fingerprint: "fp-guide".to_string(),

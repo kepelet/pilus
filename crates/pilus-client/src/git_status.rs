@@ -132,6 +132,13 @@ fn array<'a>(value: &'a Value, field: &str) -> &'a [Value] {
         .unwrap_or_default()
 }
 
+/// The daemon reads the count from `n`. Any other name, such as `limit`, is
+/// ignored without an error and the reply stops at the daemon's default of 30,
+/// which leaves the History tab unable to page past them.
+fn log_params(limit: u32) -> Value {
+    json!({ "n": limit })
+}
+
 impl ControlClient {
     /// Branch, tracking, and working-tree state of the active workspace.
     pub fn git_status(&mut self) -> Result<GitStatus> {
@@ -144,7 +151,7 @@ impl ControlClient {
 
     /// The newest `limit` commits of the active workspace, newest first.
     pub fn git_log(&mut self, limit: u32) -> Result<Vec<GitCommit>> {
-        let result = self.request("git.log", json!({ "limit": limit }))?;
+        let result = self.request("git.log", log_params(limit))?;
         Ok(array(&result, "commits")
             .iter()
             .filter_map(GitCommit::from_json)
@@ -205,5 +212,10 @@ mod tests {
         assert_eq!(commit.sha, "3e1a128");
         assert!(commit.author.is_empty() && commit.refs.is_empty());
         assert!(GitCommit::from_json(&json!({ "subject": "no hash" })).is_none());
+    }
+
+    #[test]
+    fn log_asks_for_its_count_as_n() {
+        assert_eq!(log_params(150), json!({ "n": 150 }));
     }
 }

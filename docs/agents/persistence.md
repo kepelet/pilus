@@ -13,7 +13,7 @@ of JSON files. The database holds the only copy of:
 - the window's per-item state, the `ui_state` document (`settings::UiState`):
   `Settings::window`, `session_labels`, `session_icons`, `github_pinned`,
   `sipil_order`, `last_session`, `last_endpoint`, `pinned_workspaces`,
-  `recent_workspaces` and the pane sizes.
+  `recent_workspaces`, `files_folded` and the pane sizes.
 
 Because it is the only copy, it is **migrated, never dropped**:
 

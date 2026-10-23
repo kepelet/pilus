@@ -6,8 +6,10 @@
 //! sidebar's selection rather than carrying a root of its own. The daemon can
 //! open a folder (`files.reveal`) but not close one, so folding is this
 //! window's own state: a set of folded paths that hides rows without touching
-//! the daemon. Clicking a file hands it to the daemon (`files.open`), which
-//! shows it in the terminal card. The exception is a text file: the tab reads it
+//! the daemon. The daemon keeps every folder open, so the folds are saved in
+//! `pilus.db` (`Settings::files_folded`) and come back after a relaunch.
+//! Clicking a file hands it to the daemon (`files.open`), which shows it in the
+//! terminal card. The exception is a text file: the tab reads it
 //! itself and opens it in place of the tree, in an editor (a markdown file is
 //! drawn as a document and edited beside its preview, see `md_view`). An image
 //! or an SVG is read as bytes and drawn as a picture instead (see
@@ -48,6 +50,8 @@ use pilus_client::{
     archive_name, create_entry, delete_entry, download_path, parent_of, read_text, rename_entry,
     upload_path, visible_rows, write_text,
 };
+
+use crate::settings::FilesFolded;
 
 use super::diff::status_glyph;
 use super::highlight;
@@ -323,6 +327,39 @@ enum FolderClick {
     Expand,
 }
 
+/// Drop the folds the daemon has made moot; true when any went.
+///
+/// A fold goes when the daemon lists its folder closed, or when the folder's
+/// parent is listed without it (it was deleted or renamed). A folder the tree
+/// does not mention at all stays folded: a `files.refresh` forgets every
+/// listing and the next `files.tree` comes back empty or half read, and
+/// dropping the folds then would show the whole tree open on the next poll.
+fn prune_folds(tree: &FileTree, folded: &mut HashSet<String>) -> bool {
+    if folded.is_empty() {
+        return false;
+    }
+    let rows = &tree.rows;
+    // Each listed folder: whether the daemon has it open, and whether its
+    // listing has arrived (an open folder whose children are being read shows
+    // none yet).
+    let mut listed: HashMap<&str, (bool, bool)> = HashMap::new();
+    for (at, row) in rows.iter().enumerate().filter(|(_, row)| row.dir) {
+        let read = row.expanded && rows.get(at + 1).is_some_and(|next| next.depth > row.depth);
+        listed.insert(row.path.as_str(), (row.expanded, read));
+    }
+    let root = tree.root.trim_end_matches('/');
+    let before = folded.len();
+    folded.retain(|path| match listed.get(path.as_str()) {
+        Some(&(open, _)) => open,
+        None => match parent_of(path) {
+            Some(parent) if parent.trim_end_matches('/') == root => rows.is_empty(),
+            Some(parent) => !listed.get(parent).is_some_and(|&(_, read)| read),
+            None => true,
+        },
+    });
+    folded.len() != before
+}
+
 /// Decide a folder click from the daemon's state and this window's.
 ///
 /// A folder the daemon has closed always expands, even when it is in `folded`:
@@ -339,13 +376,15 @@ fn folder_click(row: &FileRow, folded: &HashSet<String>) -> FolderClick {
 pub(super) struct FilesPanel {
     endpoint: Option<EndpointId>,
     tree: Option<FileTree>,
-    /// Folders the user closed here. Only folders the daemon has open stay in
-    /// it, so a folder the TUI closes and reopens comes back open.
+    /// Folders the user closed here. A folder the daemon closes drops out
+    /// (see [`prune_folds`]), so one the TUI closes and reopens comes back open.
     folded: HashSet<String>,
-    /// The folds of trees not on screen, by machine and root. The daemon keeps
-    /// every folder open for the TUI, so a fold forgotten on a switch away
-    /// would come back open when the user switches back.
-    shelved: HashMap<(Option<EndpointId>, String), HashSet<String>>,
+    /// The folds of trees not on screen, by machine key and root. The daemon
+    /// keeps every folder open for the TUI, so a fold forgotten on a switch
+    /// away would come back open when the user switches back.
+    shelved: HashMap<(String, String), HashSet<String>>,
+    /// The folds moved since they were last saved.
+    folds_changed: bool,
     /// Indices into the tree's rows that survive `folded`.
     visible: Vec<usize>,
     /// The folder whose chevron was just turned, so only it animates.
@@ -402,6 +441,7 @@ impl FilesPanel {
             tree: None,
             folded: HashSet::new(),
             shelved: HashMap::new(),
+            folds_changed: false,
             visible: Vec::new(),
             toggled: None,
             loading: None,
@@ -538,11 +578,56 @@ impl FilesPanel {
         let Some(tree) = &self.tree else {
             return;
         };
-        let key = (self.endpoint.clone(), tree.root.clone());
+        let key = (self.endpoint_key(), tree.root.clone());
         let folds = std::mem::take(&mut self.folded);
         if !folds.is_empty() {
             self.shelved.insert(key, folds);
         }
+    }
+
+    /// The machine the tab reads from, as the saved folds name it.
+    fn endpoint_key(&self) -> String {
+        self.endpoint
+            .as_ref()
+            .map(EndpointId::key)
+            .unwrap_or_default()
+    }
+
+    /// Take the folds saved by an earlier launch. They wait on the shelf until
+    /// their tree is read.
+    pub(super) fn restore_folds(&mut self, saved: &FilesFolded) {
+        for (endpoint, roots) in saved {
+            for (root, paths) in roots {
+                if !paths.is_empty() {
+                    let folds = paths.iter().cloned().collect();
+                    self.shelved.insert((endpoint.clone(), root.clone()), folds);
+                }
+            }
+        }
+    }
+
+    /// Every fold, on screen and shelved, to save. Sorted so an unchanged set
+    /// saves the same.
+    fn saved_folds(&self) -> FilesFolded {
+        let current = self
+            .tree
+            .as_ref()
+            .map(|tree| ((self.endpoint_key(), tree.root.clone()), &self.folded));
+        let mut saved = FilesFolded::new();
+        for ((endpoint, root), folds) in self
+            .shelved
+            .iter()
+            .map(|(key, folds)| (key.clone(), folds))
+            .chain(current)
+        {
+            if folds.is_empty() {
+                continue;
+            }
+            let mut paths: Vec<String> = folds.iter().cloned().collect();
+            paths.sort();
+            saved.entry(endpoint).or_default().insert(root, paths);
+        }
+        saved
     }
 
     /// Fold a finished read in; true when what is drawn changed.
@@ -560,21 +645,16 @@ impl FilesPanel {
                     // Another node: its folders are not the ones folded here,
                     // and its tree does not hold the open document.
                     self.shelve_folds();
-                    let key = (self.endpoint.clone(), tree.root.clone());
+                    let key = (self.endpoint_key(), tree.root.clone());
                     self.folded = self.shelved.remove(&key).unwrap_or_default();
                     if self.tree.is_some() {
                         self.doc = None;
                     }
                 }
-                let open: HashSet<&str> = tree
-                    .rows
-                    .iter()
-                    .filter(|row| row.dir && row.expanded)
-                    .map(|row| row.path.as_str())
-                    .collect();
-                let before = self.folded.len();
-                self.folded.retain(|path| open.contains(path.as_str()));
-                changed |= self.folded.len() != before;
+                if prune_folds(&tree, &mut self.folded) {
+                    self.folds_changed = true;
+                    changed = true;
+                }
                 if self.tree.as_ref() != Some(&tree) {
                     self.tree = Some(tree);
                     changed = true;
@@ -808,6 +888,7 @@ impl PilusView {
                 }
             }
         }
+        self.files_save_folds();
         if !self.files_visible() {
             return changed;
         }
@@ -843,7 +924,7 @@ impl PilusView {
                         .any(|row| row.dir && !row.expanded && row.path == *dir)
                 });
                 if closed {
-                    panel.folded.remove(dir);
+                    panel.folds_changed |= panel.folded.remove(dir);
                     Prelude::Expand(dir.clone())
                 } else {
                     Prelude::Refresh
@@ -863,7 +944,24 @@ impl PilusView {
                 Prelude::Refresh
             }
         };
+        self.files_save_folds();
         self.files_request(prelude);
+    }
+
+    /// Write the folds to `pilus.db` when they moved, so a relaunch shows the
+    /// tree as it was left.
+    fn files_save_folds(&mut self) {
+        if !std::mem::take(&mut self.files_panel.folds_changed) {
+            return;
+        }
+        let saved = self.files_panel.saved_folds();
+        if self.settings.files_folded != saved {
+            self.settings.files_folded = saved.clone();
+            self.settings.save(&self.pilus_root);
+            // A window opened later in this process, such as from the menu
+            // bar after this one closed, starts from the shared copy.
+            self.shared_settings.borrow_mut().files_folded = saved;
+        }
     }
 
     /// Run `prelude` on the daemon, then read the tree back.
@@ -1568,11 +1666,15 @@ impl PilusView {
         match action {
             FolderClick::Fold => {
                 panel.folded.insert(row.path.clone());
+                panel.folds_changed = true;
                 panel.relayout();
+                self.files_save_folds();
             }
             FolderClick::Unfold => {
                 panel.folded.remove(&row.path);
+                panel.folds_changed = true;
                 panel.relayout();
+                self.files_save_folds();
             }
             FolderClick::Expand => {
                 // A second click while it opens must not ask again.
@@ -1583,7 +1685,8 @@ impl PilusView {
                 {
                     return;
                 }
-                panel.folded.remove(&row.path);
+                panel.folds_changed |= panel.folded.remove(&row.path);
+                self.files_save_folds();
                 self.files_request(Prelude::Expand(row.path.clone()));
                 let panel = &mut self.files_panel;
                 panel.loading = Some(Loading {
@@ -2748,6 +2851,85 @@ mod tests {
         let reopened = vec![row("/w/a", 0, true, true), row("/w/a/x", 1, false, false)];
         panel.apply(3, Ok(tree("/w", reopened)));
         assert_eq!(panel.visible, [0, 1]);
+    }
+
+    #[test]
+    fn a_refresh_that_reads_back_an_empty_tree_keeps_the_folds() {
+        let mut panel = FilesPanel::new();
+        let rows = || {
+            vec![
+                row("/w/a", 0, true, true),
+                row("/w/a/b", 1, true, true),
+                row("/w/a/b/x", 2, false, false),
+                row("/w/c", 0, true, true),
+                row("/w/c/y", 1, false, false),
+            ]
+        };
+        panel.apply(1, Ok(tree("/w", rows())));
+        panel.folded = folded(&["/w/a/b", "/w/c"]);
+        // `files.refresh` forgot every listing: nothing is read yet.
+        panel.apply(2, Ok(tree("/w", Vec::new())));
+        // Then the root is back but `a` is still being read.
+        let half = vec![row("/w/a", 0, true, true), row("/w/c", 0, true, true)];
+        panel.apply(3, Ok(tree("/w", half)));
+        assert_eq!(panel.folded, folded(&["/w/a/b", "/w/c"]));
+        assert!(!panel.folds_changed);
+        panel.apply(4, Ok(tree("/w", rows())));
+        assert_eq!(panel.visible, [0, 1, 3]);
+    }
+
+    #[test]
+    fn a_fold_goes_with_its_deleted_folder() {
+        let mut panel = FilesPanel::new();
+        let rows = vec![
+            row("/w/a", 0, true, true),
+            row("/w/a/b", 1, true, true),
+            row("/w/a/b/x", 2, false, false),
+            row("/w/c", 0, true, true),
+            row("/w/c/y", 1, false, false),
+        ];
+        panel.apply(1, Ok(tree("/w", rows)));
+        panel.folded = folded(&["/w/a/b", "/w/c"]);
+        let after = vec![row("/w/a", 0, true, true), row("/w/a/z", 1, false, false)];
+        assert!(panel.apply(2, Ok(tree("/w", after))));
+        assert!(panel.folded.is_empty());
+        assert!(panel.folds_changed);
+    }
+
+    #[test]
+    fn saved_folds_come_back_in_a_new_window() {
+        let mut panel = FilesPanel::new();
+        panel.endpoint = Some(EndpointId::Machine("box".to_string()));
+        let rows = || vec![row("/w/a", 0, true, true), row("/w/a/x", 1, false, false)];
+        panel.apply(1, Ok(tree("/w", rows())));
+        panel.folded.insert("/w/a".to_string());
+        panel.apply(2, Ok(tree("/v", rows())));
+        panel.folded.insert("/w/a".to_string());
+        let saved = panel.saved_folds();
+        assert_eq!(
+            saved,
+            FilesFolded::from([(
+                "box".to_string(),
+                [
+                    ("/v".to_string(), vec!["/w/a".to_string()]),
+                    ("/w".to_string(), vec!["/w/a".to_string()]),
+                ]
+                .into_iter()
+                .collect(),
+            )])
+        );
+
+        let mut next = FilesPanel::new();
+        next.restore_folds(&saved);
+        next.endpoint = Some(EndpointId::Machine("box".to_string()));
+        next.apply(1, Ok(tree("/w", rows())));
+        assert_eq!(next.visible, [0]);
+        // Another machine with the same folder has folds of its own.
+        let mut other = FilesPanel::new();
+        other.restore_folds(&saved);
+        other.endpoint = Some(EndpointId::Local);
+        other.apply(1, Ok(tree("/w", rows())));
+        assert_eq!(other.visible, [0, 1]);
     }
 
     #[test]

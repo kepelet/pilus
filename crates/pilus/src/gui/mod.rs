@@ -2383,6 +2383,8 @@ impl PilusView {
         diff_panel.set_list_width(settings.diff_list_width);
         let mut git_panel = GitPanel::new();
         git_panel.set_list_height(settings.git_list_height);
+        let mut files_panel = FilesPanel::new();
+        files_panel.restore_folds(&settings.files_folded);
         let right = RightSidebar::new(
             settings.right_sidebar_visible,
             settings.right_sidebar_width,
@@ -2781,7 +2783,7 @@ impl PilusView {
             stats: StatsPage::default(),
             process: ProcessPage::default(),
             database: DatabasePage::default(),
-            files_panel: FilesPanel::new(),
+            files_panel,
             md_notes,
             md_note_input,
             md_editor_input,

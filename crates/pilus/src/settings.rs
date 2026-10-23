@@ -9,7 +9,8 @@
 //! `--check-updates` also read and a person may edit by hand. The state the
 //! window itself accumulates per item (where it sat, which label a session was
 //! given, which repositories are pinned, how the Sipil rows were dragged, which
-//! session it was last attached to, how wide its panes were left) is the
+//! session it was last attached to, how wide its panes were left, which Files
+//! folders were folded) is the
 //! one `ui_state` document of `pilus.db` instead (`UiState`). The fields stay
 //! on [`Settings`] so a reader does not care where they live; [`Settings::load`]
 //! fills them from the database and [`Settings::save`] writes them back there.
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize};
 const STATE_DOC: &str = "ui_state";
 
 /// The `Settings` fields that live in `pilus.db`, not in `settings.json`.
-const STATE_KEYS: [&str; 15] = [
+const STATE_KEYS: [&str; 16] = [
     "window",
     "session_labels",
     "session_icons",
@@ -40,6 +41,7 @@ const STATE_KEYS: [&str; 15] = [
     "git_list_height",
     "pinned_workspaces",
     "recent_workspaces",
+    "files_folded",
 ];
 
 /// How many opened folders the Home page and the sidebar remember.
@@ -154,6 +156,10 @@ fn trim_slashes(path: &str) -> &str {
     }
 }
 
+/// The Files tab's folded folders: endpoint key (`local` or a machine id), then
+/// the tree's root, then the folder paths folded under it.
+pub type FilesFolded = BTreeMap<String, BTreeMap<String, Vec<String>>>;
+
 /// The part of [`Settings`] that lives in `pilus.db` rather than `settings.json`.
 ///
 /// Kept apart from the preferences because it is the window's own bookkeeping:
@@ -168,6 +174,7 @@ struct UiState {
     sipil_order: Vec<String>,
     pinned_workspaces: Vec<SavedWorkspace>,
     recent_workspaces: Vec<SavedWorkspace>,
+    files_folded: FilesFolded,
     /// Absent in a document written before these moved, which means the file
     /// still holds them and they have not been taken yet.
     layout: Option<Layout>,
@@ -198,6 +205,7 @@ impl UiState {
             sipil_order: settings.sipil_order.clone(),
             pinned_workspaces: settings.pinned_workspaces.clone(),
             recent_workspaces: settings.recent_workspaces.clone(),
+            files_folded: settings.files_folded.clone(),
             layout: Some(Layout {
                 last_session: settings.last_session.clone(),
                 last_endpoint: settings.last_endpoint.clone(),
@@ -219,6 +227,7 @@ impl UiState {
         settings.sipil_order = self.sipil_order;
         settings.pinned_workspaces = self.pinned_workspaces;
         settings.recent_workspaces = self.recent_workspaces;
+        settings.files_folded = self.files_folded;
         if let Some(layout) = self.layout {
             settings.last_session = layout.last_session;
             settings.last_endpoint = layout.last_endpoint;
@@ -340,6 +349,10 @@ pub struct Settings {
     /// The folders opened last, newest first, at most `RECENT_WORKSPACES`.
     /// Kept in `pilus.db` (`UiState`).
     pub recent_workspaces: Vec<SavedWorkspace>,
+    /// The folders folded in the Files tab, by machine and root. The daemon
+    /// keeps every folder open and has no way to close one, so without this a
+    /// relaunch shows the whole tree open again. Kept in `pilus.db` (`UiState`).
+    pub files_folded: FilesFolded,
     /// Whether the right sidebar (Changes and History tabs) is open. This and the
     /// other pane layout fields below are kept in `pilus.db` (`UiState`).
     pub right_sidebar_visible: bool,
@@ -425,6 +438,7 @@ impl Default for Settings {
             sipil_order: Vec::new(),
             pinned_workspaces: Vec::new(),
             recent_workspaces: Vec::new(),
+            files_folded: BTreeMap::new(),
             right_sidebar_visible: false,
             right_sidebar_width: 0.0,
             right_sidebar_tab: String::new(),
@@ -1143,6 +1157,10 @@ mod tests {
                 path: "/work/site".to_string(),
                 name: String::new(),
             }],
+            files_folded: BTreeMap::from([(
+                "local".to_string(),
+                BTreeMap::from([("/work/site".to_string(), vec!["/work/site/src".to_string()])]),
+            )]),
             right_sidebar_visible: true,
             right_sidebar_width: 480.0,
             right_sidebar_tab: "git".to_string(),
@@ -1363,6 +1381,24 @@ mod tests {
         let back = Settings::load(&dir);
         assert_eq!(back.pinned_workspaces, settings.pinned_workspaces);
         assert_eq!(back.recent_workspaces, settings.recent_workspaces);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folded_files_folders_survive_a_relaunch_and_stay_out_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("pilus-ui-folds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut settings = Settings::load(&dir);
+        settings.files_folded = BTreeMap::from([(
+            "build-box".to_string(),
+            BTreeMap::from([("/srv/api".to_string(), vec!["/srv/api/docs".to_string()])]),
+        )]);
+        settings.save(&dir);
+
+        assert_eq!(Settings::load(&dir).files_folded, settings.files_folded);
+        let file = std::fs::read_to_string(dir.join("settings.json")).expect("read");
+        assert!(!file.contains("files_folded"), "{file}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

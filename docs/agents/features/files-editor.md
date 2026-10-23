@@ -3,6 +3,24 @@
 Read this before you change the Files tab (`files_tab.rs`), the editor, quick
 open, find in file, or markdown notes.
 
+## Folding folders
+
+The daemon can open a folder (`files.reveal`) but never close one, so a fold
+is pilus's own state (`FilesPanel::folded`), not the daemon's.
+
+- Folds are saved per machine and root in `Settings::files_folded`, in the
+  `ui_state` document of `pilus.db`, so a relaunch shows the tree as it was
+  left. The daemon keeps every folder open, so a fold that is not saved comes
+  back open.
+- `files_save_folds` writes the folds to `shared_settings` as well as the
+  view's own `settings`. `sync_settings` copies the shared copy over the
+  view's every tick, so a fold saved only to the view's copy is undone a
+  frame later and the next save writes it away.
+- `prune_folds` drops a fold only when the daemon lists the folder closed, or
+  lists its parent without it (deleted or renamed). A folder the tree does not
+  mention keeps its fold: `files.refresh` forgets every listing, and the tree
+  read straight after it is empty or half read.
+
 ## Opening and saving
 
 The Files tab edits text files in place. Saves go through

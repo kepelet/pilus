@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "skills": {
+    "codebase-wiki": {
+      "source": "inkeep/open-knowledge-skills",
+      "skill": "codebase-wiki",
+      "contentHash": "c6878b9ad691de50d37f7e12c668a55b0ffaf222343bb3bc10c6afd4e5f4448a",
+      "importedAt": "2026-10-23T10:37:53.445Z"
+    }
+  }
+}

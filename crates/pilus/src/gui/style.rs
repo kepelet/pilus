@@ -357,7 +357,7 @@ pub(super) fn glyph_tile(
     // Each card needs an edge that stands clear of its neighbor, or the deck
     // cannot be counted; the border role is too faint for that, the full
     // foreground too loud.
-    let edge = tint(theme.panel_fg, 0.35);
+    let edge = tint(theme.panel_fg, 0.2);
     let radius = Radius::Sm.pixels().as_f32();
     let mut deck = div()
         .relative()

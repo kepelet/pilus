@@ -1040,21 +1040,21 @@ mod tests {
     #[test]
     fn a_remote_url_names_its_repository() {
         for url in [
-            "git@github.com:kepelet/pilus.git",
-            "https://github.com/kepelet/pilus",
-            "https://github.com/kepelet/pilus.git/",
-            "ssh://git@github.com/kepelet/pilus.git",
+            "git@github.com:acme/pilus.git",
+            "https://github.com/acme/pilus",
+            "https://github.com/acme/pilus.git/",
+            "ssh://git@github.com/acme/pilus.git",
         ] {
             assert_eq!(
                 slug_of_github_remote(url).as_deref(),
-                Some("kepelet/pilus"),
+                Some("acme/pilus"),
                 "{url}"
             );
         }
         assert_eq!(slug_of_github_remote("/srv/git/pilus.git"), None);
         assert_eq!(
-            slug_of_github_remote("git@github.com:kepelet/pilus.git").as_deref(),
-            Some("kepelet/pilus")
+            slug_of_github_remote("git@github.com:acme/pilus.git").as_deref(),
+            Some("acme/pilus")
         );
         // Another host, or an alias for one, is not something `-R` can address.
         assert_eq!(

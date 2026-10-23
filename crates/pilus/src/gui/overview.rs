@@ -1366,7 +1366,7 @@ impl PilusView {
             size: 0,
         };
         let pull = |number, title: &str, author: &str, draft, ago: i64| ItemSummary {
-            repo: "kepelet/pilus".to_string(),
+            repo: "acme/pilus".to_string(),
             number,
             title: title.to_string(),
             author: author.to_string(),
@@ -1573,7 +1573,7 @@ impl PilusView {
             watch: Watch::Channel("0123456789abcdef".to_string()),
             place: "#project-x".to_string(),
             who: "Researcher".to_string(),
-            text: "I read through the **three open threads**:\n\n- the release notes can go out once the signing step is green\n- the alerts channel is waiting on `Rina`\n- the rest is [tracked here](https://github.com/kepelet/pilus/issues/198)\n\nWant me to draft the announcement?".to_string(),
+            text: "I read through the **three open threads**:\n\n- the release notes can go out once the signing step is green\n- the alerts channel is waiting on `Rina`\n- the rest is [tracked here](https://github.com/acme/pilus/issues/198)\n\nWant me to draft the announcement?".to_string(),
             at: u64::try_from(now - 420).unwrap_or(0),
             unread: 3,
         });

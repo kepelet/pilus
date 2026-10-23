@@ -177,7 +177,7 @@ fn a_device_nobody_can_find_is_unreachable() {
 fn agents_and_sessions_are_read_as_listed() {
     let script = Script::daemon(vec![
         ok(json!({"agents": [
-            {"id":"1","name":"sipil","role":"primary","status":"working","model":{"provider":"opencode-go","modelId":"kimi-k2"}}
+            {"id":"1","name":"sipil","role":"primary","status":"working","model":{"provider":"example","modelId":"model-a"}}
         ]})),
         ok(json!({"sessions": [
             {"id":"7","title":"Say hello","status":"idle","error":"401 Unauthorized: invalid API key"}
@@ -187,7 +187,7 @@ fn agents_and_sessions_are_read_as_listed() {
     let agents = sipil.agents().unwrap();
     assert_eq!(agents[0].role, Role::Primary);
     assert_eq!(agents[0].status, Activity::Working);
-    assert_eq!(agents[0].model.as_ref().unwrap().model_id, "kimi-k2");
+    assert_eq!(agents[0].model.as_ref().unwrap().model_id, "model-a");
     // `error` is only sent for a conversation whose latest turn failed.
     assert_eq!(agents[0].error, None);
     let sessions = sipil.sessions().unwrap();
@@ -293,7 +293,7 @@ fn stopping_a_conversation_sends_an_abort() {
 #[test]
 fn a_session_reports_the_model_it_runs() {
     let script = Script::daemon(vec![ok(json!({"sessions": [
-        {"id":"7","title":"t","status":"idle","model":{"provider":"opencode-go","modelId":"qwen3.8-max"}}
+        {"id":"7","title":"t","status":"idle","model":{"provider":"example","modelId":"model-b"}}
     ]}))]);
     let (sipil, _server) = daemon(&script);
     assert_eq!(
@@ -302,7 +302,7 @@ fn a_session_reports_the_model_it_runs() {
             .as_ref()
             .unwrap()
             .model_id,
-        "qwen3.8-max"
+        "model-b"
     );
 }
 

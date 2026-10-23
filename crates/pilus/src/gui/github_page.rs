@@ -1398,7 +1398,7 @@ impl GithubPage {
     pub(super) fn open_sample(&mut self, which: &str) {
         let item =
             |number: u64, title: &str, draft: bool, branch: &str, comments: u64| ItemSummary {
-                repo: "kepelet/luvus".to_string(),
+                repo: "acme/luvus".to_string(),
                 number,
                 title: title.to_string(),
                 author: "octocat".to_string(),
@@ -1439,12 +1439,12 @@ impl GithubPage {
             (_, Some(tab)) => {
                 self.go(
                     View::Repo {
-                        slug: "kepelet/luvus".to_string(),
+                        slug: "acme/luvus".to_string(),
                         tab,
                     },
                     true,
                 );
-                self.inside = Inside::new("kepelet/luvus");
+                self.inside = Inside::new("acme/luvus");
                 self.inside.issues.apply(Ok(listing(vec![
                     item(91, "Agents tab flickers on reconnect", false, "", 3),
                     item(
@@ -1500,7 +1500,7 @@ impl GithubPage {
         let (subject, detail) = if which == "issue" {
             (
                 Subject::Issue {
-                    repo: "kepelet/pilus".to_string(),
+                    repo: "acme/pilus".to_string(),
                     number: 212,
                 },
                 Detail::Issue(Box::new(IssueDetail {
@@ -1525,7 +1525,7 @@ impl GithubPage {
         } else {
             (
                 Subject::Pull {
-                    repo: "kepelet/pilus".to_string(),
+                    repo: "acme/pilus".to_string(),
                     number: 214,
                 },
                 Detail::Pull(Box::new(PullDetail {

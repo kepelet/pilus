@@ -750,13 +750,13 @@ mod tests {
     #[test]
     fn pinning_is_idempotent_and_ignores_case() {
         let mut settings = Settings::default();
-        settings.set_pinned("kepelet/pilus", true);
-        settings.set_pinned("Kepelet/Pilus", true);
+        settings.set_pinned("acme/pilus", true);
+        settings.set_pinned("Acme/Pilus", true);
         settings.set_pinned("o/second", true);
-        assert_eq!(settings.github_pinned, vec!["kepelet/pilus", "o/second"]);
-        assert!(settings.is_pinned("KEPELET/PILUS"));
+        assert_eq!(settings.github_pinned, vec!["acme/pilus", "o/second"]);
+        assert!(settings.is_pinned("ACME/PILUS"));
 
-        settings.set_pinned("KEPELET/pilus", false);
+        settings.set_pinned("ACME/pilus", false);
         settings.set_pinned("never/pinned", false);
         assert_eq!(settings.github_pinned, vec!["o/second"]);
     }

@@ -1065,7 +1065,7 @@ pub fn run_main() -> Result<()> {
         view.update(app, |view, cx| {
             view.close_context_menu();
             view.settings.set_pinned("alex/notes", true);
-            view.settings.set_pinned("kepelet/infra", true);
+            view.settings.set_pinned("acme/infra", true);
             // The window pulls the shared copy back each tick.
             *view.shared_settings.borrow_mut() = view.settings.clone();
             cx.notify();
@@ -1657,7 +1657,7 @@ pub fn run_main() -> Result<()> {
     // between.
     cx.update(|app| {
         view.update(app, |view, cx| {
-            for repo in ["alex/notes", "kepelet/infra", "alex/pilus"] {
+            for repo in ["alex/notes", "acme/infra", "alex/pilus"] {
                 view.settings.set_pinned(repo, true);
             }
             *view.shared_settings.borrow_mut() = view.settings.clone();
@@ -2468,8 +2468,8 @@ fn sipil_fixture(connected: bool) -> super::sipil::SipilState {
         };
     }
     let model = Some(client::ModelRef {
-        provider: "opencode-go".to_string(),
-        model_id: "qwen3.8-max".to_string(),
+        provider: "example".to_string(),
+        model_id: "model-b".to_string(),
     });
     let agent = |id: &str, name: &str, status| Agent {
         id: id.to_string(),
@@ -2893,7 +2893,7 @@ const DAEMON_LOGO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 fn about_fixture() -> pilus_client::sipil::About {
     use pilus_client::sipil::{About, AgentDetail, ModelDetail, Role};
     let model = |id: &str, name: &str| ModelDetail {
-        provider: "opencode-go".to_string(),
+        provider: "example".to_string(),
         provider_name: "OpenCode Go".to_string(),
         model_id: id.to_string(),
         name: name.to_string(),
@@ -2904,9 +2904,9 @@ fn about_fixture() -> pilus_client::sipil::About {
         platform: "darwin 25.0.0 arm64".to_string(),
         device_id: "26e9ba62f3c1d0a47b58e6c9a1f2d3e4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0".to_string(),
         version: "0.1.0".to_string(),
-        workspace: "/Users/alex/Developer/kepelet/sipil".to_string(),
+        workspace: "/Users/alex/Developer/acme/sipil".to_string(),
         home: "/Users/alex/.sipil".to_string(),
-        model: Some(model("qwen3.8-max", "Qwen 3.8 Max")),
+        model: Some(model("model-b", "Qwen 3.8 Max")),
         agents: vec![
             AgentDetail {
                 id: "sipil".to_string(),

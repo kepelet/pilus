@@ -954,7 +954,7 @@ impl GithubFeed {
                 1,
             ),
             repo(
-                "kepelet/luvus",
+                "acme/luvus",
                 false,
                 "Rust",
                 "A terminal workspace daemon",
@@ -963,7 +963,7 @@ impl GithubFeed {
                 12,
             ),
             repo(
-                "kepelet/site",
+                "acme/site",
                 false,
                 "TypeScript",
                 "The marketing site",
@@ -971,10 +971,10 @@ impl GithubFeed {
                 2,
                 0,
             ),
-            repo("kepelet/docs", false, "MDX", "Documentation", 31, 6, 1),
+            repo("acme/docs", false, "MDX", "Documentation", 31, 6, 1),
             repo("alex/notes", true, "Markdown", "", 0, 0, 0),
             repo(
-                "kepelet/infra",
+                "acme/infra",
                 true,
                 "HCL",
                 "Infrastructure as code",

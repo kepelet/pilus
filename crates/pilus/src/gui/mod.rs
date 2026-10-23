@@ -11846,33 +11846,10 @@ impl PilusView {
             .whitespace_nowrap();
         let (glyph, status) = match agent {
             Some(agent) => {
-                // An idle agent needs no badge; the tile alone is quieter and
-                // the tab reads the same as one with no agent.
-                let badge = (agent.status != "idle").then(|| {
-                    let status = status_color(&agent.status, theme);
-                    let indicator = if agent.status == "working" {
-                        style::spinner(format!("pilus-tab-agent-spinner-{index}"), 7.0, status)
-                            .into_any_element()
-                    } else {
-                        div()
-                            .w(px(5.0))
-                            .h(px(5.0))
-                            .radius_full()
-                            .bg(status)
-                            .into_any_element()
-                    };
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .w(px(8.0))
-                        .h(px(8.0))
-                        .radius_full()
-                        .bg(theme.panel.opacity(0.0))
-                        .child(indicator)
-                        .into_any_element()
-                });
-                (agent_icon(&agent.agent), badge)
+                // An idle agent keeps the plain tile, so the tab reads the
+                // same as one with no agent.
+                let wash = (agent.status != "idle").then(|| status_color(&agent.status, theme));
+                (agent_icon(&agent.agent), wash)
             }
             None => (
                 include_bytes!("../../assets/icons/terminal.svg").as_slice(),

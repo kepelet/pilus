@@ -329,11 +329,16 @@ const STACK_PAD: f32 = 2.0;
 /// They alternate so the deck looks handled rather than machined.
 const STACK_TILT: [f32; STACK_MAX as usize - 1] = [7.0, -6.0];
 
+/// How much of a status color the front card's fill takes: enough to read at a
+/// glance across the strip, little enough that the glyph keeps its contrast.
+const STATUS_WASH: f32 = 0.45;
+
 /// A bordered tile holding a glyph on the theme's panel fill, so the glyph
 /// reads on a surface rather than on the bare strip: a tab's terminal or agent
 /// mark. With `panes` above one it becomes a deck, one card more behind it per
-/// pane up to [`STACK_MAX`], each turned a little. `status` is drawn on the
-/// front card's upper right corner.
+/// pane up to [`STACK_MAX`], each turned a little. `status` washes the front
+/// card's fill with that color ([`STATUS_WASH`]); the cards behind stay neutral,
+/// so the deck still counts.
 ///
 /// The cards are opaque, since a translucent one would show the edge of the
 /// card behind it through the front. GPUI turns SVGs but not divs, so the cards
@@ -343,11 +348,12 @@ pub(super) fn glyph_tile(
     theme: Theme,
     glyph: &'static [u8],
     panes: u16,
-    status: Option<AnyElement>,
+    status: Option<Rgba>,
 ) -> Div {
     let cards = panes.clamp(1, STACK_MAX);
     let behind = f32::from(cards - 1);
     let face = theme.panel;
+    let front_face = status.map_or(face, |status| mix(face, status, STATUS_WASH));
     // Each card needs an edge that stands clear of its neighbor, or the deck
     // cannot be counted; the border role is too faint for that, the full
     // foreground too loud.
@@ -396,7 +402,7 @@ pub(super) fn glyph_tile(
             .size_full(),
         );
     }
-    let mut front = div()
+    let front = div()
         .absolute()
         .left_0()
         .top(px(STACK_PAD))
@@ -408,7 +414,7 @@ pub(super) fn glyph_tile(
         .radius_sm()
         .border_1()
         .border_color(edge)
-        .bg(face)
+        .bg(front_face)
         .child(
             svg()
                 .data(glyph)
@@ -417,9 +423,6 @@ pub(super) fn glyph_tile(
                 .flex_shrink_0()
                 .text_color(theme.panel_fg),
         );
-    if let Some(status) = status {
-        front = front.child(div().absolute().top(px(-3.0)).right(px(-3.0)).child(status));
-    }
     deck.child(front)
 }
 

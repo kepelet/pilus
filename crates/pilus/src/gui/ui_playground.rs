@@ -1208,13 +1208,17 @@ impl UiPlaygroundView {
     }
 
     /// The tab glyph tile: one card for a lone pane, a deck for several,
-    /// capped at three cards.
+    /// capped at three cards; then the fill an agent's status gives it
+    /// (working, blocked, done).
     fn glyph_tiles(&self) -> Div {
         let theme = self.theme;
         let terminal = include_bytes!("../../assets/icons/terminal.svg").as_slice();
         let mut row = div().flex().flex_row().items_center().gap_6();
         for panes in [1, 2, 3, 5] {
             row = row.child(style::glyph_tile(theme, terminal, panes, None));
+        }
+        for status in [theme.accent, theme.alert, theme.ok] {
+            row = row.child(style::glyph_tile(theme, terminal, 1, Some(status)));
         }
         row
     }

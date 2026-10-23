@@ -11714,6 +11714,7 @@ impl PilusView {
         let lone = self.tabs.len() == 1;
         let active = self.tab_active(tab) && !lone;
         let index = tab.index;
+        let panes = tab.panes;
         let tab_id = tab.id.clone();
         let close_index = tab.index;
         let fg = if active || lone {
@@ -11731,7 +11732,7 @@ impl PilusView {
         };
         let agent = self.tab_agent(index);
         let session_title = agent.and_then(|agent| agent.session_title.as_deref());
-        let label = tab_label(&tab.name, session_title, &cwd, index, lone);
+        let label = tab_label(&tab.name, session_title, &cwd, lone);
         let slide = if cx.reduce_motion() {
             0.0
         } else {
@@ -11806,7 +11807,10 @@ impl PilusView {
             // A lone tab is as wide as its label; with company each keeps a
             // width of its own.
             .when(!lone, |tab| tab.min_w(px(140.0)).max_w(px(280.0)))
-            .px_3()
+            // The tile sits near the tab's edge; the right side keeps room for
+            // the close button.
+            .pl(px(5.0))
+            .pr_3()
             .radius_soft()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
@@ -11840,36 +11844,24 @@ impl PilusView {
             .gap_2()
             .overflow_hidden()
             .whitespace_nowrap();
-        if let Some(agent) = agent {
-            let mut tile = div()
-                .relative()
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(14.0))
-                .h(px(14.0))
-                .flex_shrink_0()
-                .child(icon(agent_icon(&agent.agent), 12.0, fg));
-            // An idle agent needs no badge; the icon alone is quieter and the
-            // tab reads the same as one with no agent.
-            if agent.status != "idle" {
-                let status = status_color(&agent.status, theme);
-                let indicator = if agent.status == "working" {
-                    style::spinner(format!("pilus-tab-agent-spinner-{index}"), 7.0, status)
-                        .into_any_element()
-                } else {
+        let (glyph, status) = match agent {
+            Some(agent) => {
+                // An idle agent needs no badge; the tile alone is quieter and
+                // the tab reads the same as one with no agent.
+                let badge = (agent.status != "idle").then(|| {
+                    let status = status_color(&agent.status, theme);
+                    let indicator = if agent.status == "working" {
+                        style::spinner(format!("pilus-tab-agent-spinner-{index}"), 7.0, status)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .w(px(5.0))
+                            .h(px(5.0))
+                            .radius_full()
+                            .bg(status)
+                            .into_any_element()
+                    };
                     div()
-                        .w(px(5.0))
-                        .h(px(5.0))
-                        .radius_full()
-                        .bg(status)
-                        .into_any_element()
-                };
-                tile = tile.child(
-                    div()
-                        .absolute()
-                        .top(px(-2.0))
-                        .right(px(-2.0))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -11877,32 +11869,18 @@ impl PilusView {
                         .h(px(8.0))
                         .radius_full()
                         .bg(theme.panel.opacity(0.0))
-                        .child(indicator),
-                );
+                        .child(indicator)
+                        .into_any_element()
+                });
+                (agent_icon(&agent.agent), badge)
             }
-            content = content.child(tile);
-        } else {
-            content = content.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(14.0))
-                    .h(px(14.0))
-                    .flex_shrink_0()
-                    .child(icon(
-                        include_bytes!("../../assets/icons/terminal.svg"),
-                        12.0,
-                        fg,
-                    )),
-            );
-        }
-        content = content.child(
-            div()
-                .text_size(px(self.footer_font()))
-                .font_family(style::mono_family(&self.shared_settings))
-                .child(label),
-        );
+            None => (
+                include_bytes!("../../assets/icons/terminal.svg").as_slice(),
+                None,
+            ),
+        };
+        content = content.child(style::glyph_tile(theme, glyph, panes, status));
+        content = content.child(div().text_size(px(self.footer_font())).child(label));
         let tab = if active {
             tab.child(style::glide_target_shifted(selection, slide))
         } else {
@@ -17020,14 +16998,12 @@ fn abbreviate_path(path: &str) -> String {
 }
 
 /// A tab's label: the name the user gave it, else its agent's session title,
-/// else its abbreviated cwd, plus the `⌘N` shortcut. A name the user typed
-/// outranks the title because the title changes under them. The text is capped
-/// before the shortcut is appended, so `⌘N` is never truncated away.
+/// else its abbreviated cwd. A name the user typed outranks the title because
+/// the title changes under them.
 ///
 /// A `lone` tab is as wide as its label, so it needs none of that: the cwd
-/// stays whole, nothing is capped and there is no shortcut to tell it from
-/// others.
-fn tab_label(name: &str, session_title: Option<&str>, cwd: &str, index: u16, lone: bool) -> String {
+/// stays whole and nothing is capped.
+fn tab_label(name: &str, session_title: Option<&str>, cwd: &str, lone: bool) -> String {
     let name = name.trim();
     let title = session_title.map(str::trim).unwrap_or_default();
     let text = if !name.is_empty() {
@@ -17044,7 +17020,7 @@ fn tab_label(name: &str, session_title: Option<&str>, cwd: &str, index: u16, lon
     if lone {
         text
     } else {
-        format!("{} ⌘{index}", truncate_label(&text, 24))
+        truncate_label(&text, 24)
     }
 }
 
@@ -17630,28 +17606,19 @@ mod tests {
     }
 
     #[test]
-    fn tab_label_falls_back_to_cwd_and_keeps_shortcut() {
-        assert_eq!(
-            tab_label("", None, "~/work/pilus", 3, false),
-            "~/w/pilus ⌘3"
-        );
-        assert_eq!(tab_label("  ", Some(" "), "~", 1, false), "~ ⌘1");
-        let long = tab_label(
-            "",
-            None,
-            "~/work/a-directory-name-that-will-not-fit",
-            7,
-            false,
-        );
-        assert!(long.ends_with("… ⌘7"));
+    fn tab_label_falls_back_to_cwd() {
+        assert_eq!(tab_label("", None, "~/work/pilus", false), "~/w/pilus");
+        assert_eq!(tab_label("  ", Some(" "), "~", false), "~");
+        let long = tab_label("", None, "~/work/a-directory-name-that-will-not-fit", false);
+        assert!(long.ends_with('…'));
     }
 
     #[test]
-    fn a_lone_tab_label_is_whole_and_has_no_shortcut() {
+    fn a_lone_tab_label_is_whole() {
         let cwd = "~/work/a-directory-name-that-will-not-fit";
-        assert_eq!(tab_label("", None, cwd, 7, true), cwd);
+        assert_eq!(tab_label("", None, cwd, true), cwd);
         let name = "n".repeat(40);
-        assert_eq!(tab_label(&name, None, cwd, 7, true), name);
+        assert_eq!(tab_label(&name, None, cwd, true), name);
     }
 
     #[test]
@@ -17714,21 +17681,21 @@ mod tests {
 
     #[test]
     fn tab_label_prefers_the_name_over_the_cwd() {
-        assert_eq!(tab_label("api", None, "~/work/pilus", 2, false), "api ⌘2");
-        assert_eq!(tab_label("api", None, "~/work/pilus", 2, true), "api");
+        assert_eq!(tab_label("api", None, "~/work/pilus", false), "api");
+        assert_eq!(tab_label("api", None, "~/work/pilus", true), "api");
         assert_eq!(
-            tab_label("api", Some("Fix the parser"), "~/work/pilus", 2, false),
-            "api ⌘2"
+            tab_label("api", Some("Fix the parser"), "~/work/pilus", false),
+            "api"
         );
-        let long = tab_label(&"n".repeat(40), None, "~/work/pilus", 9, false);
-        assert!(long.ends_with("… ⌘9"));
+        let long = tab_label(&"n".repeat(40), None, "~/work/pilus", false);
+        assert!(long.ends_with('…'));
     }
 
     #[test]
     fn tab_label_takes_the_agent_session_title_before_the_cwd() {
         assert_eq!(
-            tab_label("", Some(" Fix the parser "), "~/work/pilus", 4, false),
-            "Fix the parser ⌘4"
+            tab_label("", Some(" Fix the parser "), "~/work/pilus", false),
+            "Fix the parser"
         );
     }
 

@@ -75,6 +75,9 @@ pub struct Tab {
     /// to the command line while one runs, which `process` (an executable
     /// name only) cannot say. Empty when the daemon reports none.
     pub title: String,
+    /// How many panes the tab holds, from `session.snapshot`; 0 until the
+    /// snapshot has enriched the tab.
+    pub panes: u16,
 }
 
 impl Tab {
@@ -103,6 +106,7 @@ impl Tab {
             cwd: String::new(),
             process: String::new(),
             title: String::new(),
+            panes: 0,
         })
     }
 
@@ -333,22 +337,21 @@ fn enrich_tab_runtime(tabs: &mut [Tab], snapshot: &Value, titles: &HashMap<Strin
             tab.cwd = workspace_cwd.to_string();
             continue;
         };
-        let pane = runtime
-            .get("panes")
-            .and_then(Value::as_array)
-            .and_then(|panes| {
-                panes
-                    .iter()
-                    .find(|pane| {
-                        pane.get("kind").and_then(Value::as_str) == Some("terminal")
-                            && pane.get("focused").and_then(Value::as_bool) == Some(true)
-                    })
-                    .or_else(|| {
-                        panes.iter().find(|pane| {
-                            pane.get("kind").and_then(Value::as_str) == Some("terminal")
-                        })
-                    })
-            });
+        let panes = runtime.get("panes").and_then(Value::as_array);
+        tab.panes = panes.map_or(0, |panes| u16::try_from(panes.len()).unwrap_or(u16::MAX));
+        let pane = panes.and_then(|panes| {
+            panes
+                .iter()
+                .find(|pane| {
+                    pane.get("kind").and_then(Value::as_str) == Some("terminal")
+                        && pane.get("focused").and_then(Value::as_bool) == Some(true)
+                })
+                .or_else(|| {
+                    panes
+                        .iter()
+                        .find(|pane| pane.get("kind").and_then(Value::as_str) == Some("terminal"))
+                })
+        });
         tab.cwd = pane
             .and_then(|pane| pane.get("cwd"))
             .and_then(Value::as_str)
@@ -2000,6 +2003,11 @@ mod tests {
         // A native-view tab (no terminal pane) shows the workspace cwd.
         assert_eq!(tabs[2].cwd, "/repo");
         assert_eq!(tabs[2].process, "");
+        // Every pane counts, whatever its kind.
+        assert_eq!(
+            tabs.iter().map(|tab| tab.panes).collect::<Vec<_>>(),
+            [2, 1, 1]
+        );
     }
 
     #[test]

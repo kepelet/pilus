@@ -1207,6 +1207,18 @@ impl UiPlaygroundView {
             .child(dot(theme.muted, "muted", theme))
     }
 
+    /// The tab glyph tile: one card for a lone pane, a deck for several,
+    /// capped at three cards.
+    fn glyph_tiles(&self) -> Div {
+        let theme = self.theme;
+        let terminal = include_bytes!("../../assets/icons/terminal.svg").as_slice();
+        let mut row = div().flex().flex_row().items_center().gap_6();
+        for panes in [1, 2, 3, 5] {
+            row = row.child(style::glyph_tile(theme, terminal, panes, None));
+        }
+        row
+    }
+
     /// The task status glyphs, each tinted by its role, beside the chip that
     /// qualifies a task row.
     fn task_status_demo(&self) -> Div {
@@ -2314,6 +2326,7 @@ impl Render for UiPlaygroundView {
             .child(self.section("TOAST", self.tray(self.toast_demos())))
             .child(self.section("SMALL BUTTONS", self.tray(self.small_buttons(cx))))
             .child(self.section("BADGES & DOTS", self.tray(self.badges())))
+            .child(self.section("TAB GLYPH", self.tray(self.glyph_tiles())))
             .child(self.section("TASK STATUS & CHIPS", self.tray(self.task_status_demo())))
             .child(self.section("BOARD", self.tray(self.board_demo())))
             .child(

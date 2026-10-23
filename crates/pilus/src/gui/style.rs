@@ -315,6 +315,156 @@ pub(super) fn chip(theme: Theme, text: impl IntoElement, size: f32) -> Div {
         .child(text)
 }
 
+/// Side of a [`glyph_tile`].
+pub(super) const GLYPH_TILE: f32 = 20.0;
+/// The most cards a [`glyph_tile`] stacks; past this the deck would only get
+/// wider.
+pub(super) const STACK_MAX: u16 = 3;
+/// How far each card behind the front one peeks out to its right.
+const STACK_STEP: f32 = 4.0;
+/// Room above and below the front card for the corners of a tilted one, since
+/// a tab clips its content to the deck's own height.
+const STACK_PAD: f32 = 2.0;
+/// How far each card behind the front one is turned, in degrees, by depth.
+/// They alternate so the deck looks handled rather than machined.
+const STACK_TILT: [f32; STACK_MAX as usize - 1] = [7.0, -6.0];
+
+/// A bordered tile holding a glyph on the theme's panel fill, so the glyph
+/// reads on a surface rather than on the bare strip: a tab's terminal or agent
+/// mark. With `panes` above one it becomes a deck, one card more behind it per
+/// pane up to [`STACK_MAX`], each turned a little. `status` is drawn on the
+/// front card's upper right corner.
+///
+/// The cards are opaque, since a translucent one would show the edge of the
+/// card behind it through the front. GPUI turns SVGs but not divs, so the cards
+/// behind are painted as paths on a canvas and only the front one is an
+/// element.
+pub(super) fn glyph_tile(
+    theme: Theme,
+    glyph: &'static [u8],
+    panes: u16,
+    status: Option<AnyElement>,
+) -> Div {
+    let cards = panes.clamp(1, STACK_MAX);
+    let behind = f32::from(cards - 1);
+    let face = theme.panel;
+    // Each card needs an edge that stands clear of its neighbor, or the deck
+    // cannot be counted; the border role is too faint for that, the full
+    // foreground too loud.
+    let edge = tint(theme.panel_fg, 0.35);
+    let radius = Radius::Sm.pixels().as_f32();
+    let mut deck = div()
+        .relative()
+        .flex_shrink_0()
+        .w(px(GLYPH_TILE + behind * STACK_STEP + STACK_PAD))
+        .h(px(GLYPH_TILE + 2.0 * STACK_PAD));
+    if cards > 1 {
+        deck = deck.child(
+            canvas(
+                |_bounds, _window, _cx| (),
+                move |bounds, (), window, _cx| {
+                    for depth in (1..cards).rev() {
+                        let center = point(
+                            bounds.origin.x + px(f32::from(depth) * STACK_STEP + GLYPH_TILE / 2.0),
+                            bounds.origin.y + px(STACK_PAD + GLYPH_TILE / 2.0),
+                        );
+                        // Inset by half the stroke so the line lies inside the
+                        // tile's footprint, as a border does.
+                        let outline = tilted_square(
+                            center,
+                            GLYPH_TILE / 2.0 - 0.5,
+                            radius,
+                            STACK_TILT[usize::from(depth) - 1].to_radians(),
+                        );
+                        let mut fill = PathBuilder::fill();
+                        fill.add_polygon(&outline, true);
+                        if let Ok(path) = fill.build() {
+                            let shade = mix(face, theme.panel_fg, f32::from(depth) * 0.1);
+                            window.paint_path(path, Hsla::from(shade));
+                        }
+                        let mut line = PathBuilder::stroke(px(1.0));
+                        line.add_polygon(&outline, true);
+                        if let Ok(path) = line.build() {
+                            window.paint_path(path, Hsla::from(edge));
+                        }
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
+        );
+    }
+    let mut front = div()
+        .absolute()
+        .left_0()
+        .top(px(STACK_PAD))
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(GLYPH_TILE))
+        .h(px(GLYPH_TILE))
+        .radius_sm()
+        .border_1()
+        .border_color(edge)
+        .bg(face)
+        .child(
+            svg()
+                .data(glyph)
+                .w(px(GLYPH_TILE * 0.6))
+                .h(px(GLYPH_TILE * 0.6))
+                .flex_shrink_0()
+                .text_color(theme.panel_fg),
+        );
+    if let Some(status) = status {
+        front = front.child(div().absolute().top(px(-3.0)).right(px(-3.0)).child(status));
+    }
+    deck.child(front)
+}
+
+/// The outline of a square of side `2 * half` with its corners rounded to
+/// `radius`, turned `tilt` radians clockwise about `center`.
+fn tilted_square(center: Point<Pixels>, half: f32, radius: f32, tilt: f32) -> Vec<Point<Pixels>> {
+    use std::f32::consts::FRAC_PI_2;
+    const SEGMENTS: usize = 4;
+    let (sin, cos) = tilt.sin_cos();
+    let at = |x: f32, y: f32| {
+        point(
+            center.x + px(x * cos - y * sin),
+            center.y + px(x * sin + y * cos),
+        )
+    };
+    let radius = radius.clamp(0.0, half);
+    // A zero radius (energy mode) would repeat each corner, which a stroke
+    // tessellates badly.
+    if radius < 0.5 {
+        return vec![
+            at(-half, -half),
+            at(half, -half),
+            at(half, half),
+            at(-half, half),
+        ];
+    }
+    let inner = half - radius;
+    let mut outline = Vec::with_capacity(4 * (SEGMENTS + 1));
+    // Clockwise from the top right corner, each arc a quarter turn.
+    for (corner, (side_x, side_y)) in [(1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let start = corner as f32 * FRAC_PI_2 - FRAC_PI_2;
+        for step in 0..=SEGMENTS {
+            let angle = start + FRAC_PI_2 * step as f32 / SEGMENTS as f32;
+            outline.push(at(
+                side_x * inner + radius * angle.cos(),
+                side_y * inner + radius * angle.sin(),
+            ));
+        }
+    }
+    outline
+}
+
 /// A window or panel title: bold body-colored text one step above the body.
 pub(super) fn title(theme: Theme, text: impl IntoElement, size: f32) -> Div {
     div()
@@ -2896,6 +3046,20 @@ pub(super) fn dot_grid(color: Hsla, step: f32) -> gpui::Canvas<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tilted_square_stays_within_its_turned_extent() {
+        let center = point(px(10.0), px(10.0));
+        let tilt = 7.0_f32.to_radians();
+        let reach = 10.0 * (tilt.cos() + tilt.sin());
+        let rounded = tilted_square(center, 10.0, 3.0, tilt);
+        assert_eq!(rounded.len(), 20);
+        for corner in &rounded {
+            assert!((corner.y.as_f32() - 10.0).abs() <= reach + 1e-3);
+        }
+        // Without a radius the outline is the four corners, not repeats.
+        assert_eq!(tilted_square(center, 10.0, 0.0, tilt).len(), 4);
+    }
 
     #[test]
     fn a_zero_radius_leaves_the_pill_and_the_tab_soft() {

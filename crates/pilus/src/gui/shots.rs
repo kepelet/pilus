@@ -991,6 +991,13 @@ pub fn run_main() -> Result<()> {
                     cwd: format!("~/Developer/project-{index}"),
                     process: if index == 2 { "devin" } else { "fish" }.to_string(),
                     kind: "panes".to_string(),
+                    panes: match index {
+                        1 => 2,
+                        3 => 3,
+                        4 => 4,
+                        5 => 6,
+                        _ => 1,
+                    },
                     name: match index {
                         2 => "devin review".to_string(),
                         4 => "api server".to_string(),

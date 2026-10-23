@@ -86,10 +86,6 @@ enum Place {
 }
 
 impl Place {
-    fn starts(self) -> bool {
-        matches!(self, Self::Only | Self::First)
-    }
-
     fn ends(self) -> bool {
         matches!(self, Self::Only | Self::Last)
     }
@@ -673,7 +669,7 @@ impl PilusView {
     /// One row of the list: the entry, in the page's column.
     fn session_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let view = &self.overview.session;
-        let (Some(row), Some(session)) = (view.rows.get(ix), view.open.as_ref()) else {
+        let Some(row) = view.rows.get(ix) else {
             return div().into_any_element();
         };
         let Some(entry) = view.entries.get(row.entry) else {
@@ -690,14 +686,13 @@ impl PilusView {
                     .max_w(px(style::scaled(&self.shared_settings, WIDTH)))
                     .px_4()
                     .when(row.place.ends(), |gap| gap.pb_3())
-                    .child(self.session_entry(session.agent, row, entry, cx)),
+                    .child(self.session_entry(row, entry, cx)),
             )
             .into_any_element()
     }
 
     fn session_entry(
         &self,
-        agent: Agent,
         row: &Row,
         entry: &Entry,
         cx: &mut Context<Self>,
@@ -705,53 +700,29 @@ impl PilusView {
         let index = row.entry;
         let theme = self.theme;
         let fonts = Fonts::resolve(&self.shared_settings);
-        let said = |who: String, at: i64, text: &str, fill: gpui::Rgba| {
+        let said = |text: &str, fill: Option<gpui::Rgba>| {
             let text = text.get(row.text.clone()).unwrap_or_default();
-            let when = if at > 0 {
-                format!(
-                    " · {} ago",
-                    age_label(unix_now(), u64::try_from(at).unwrap_or(0))
-                )
-            } else {
-                String::new()
-            };
-            // A long message is several rows; the card's edges are drawn on
-            // the first and last, and its sides on all.
-            let card = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .px_3()
-                .border_color(theme.border)
-                .bg(fill)
-                .border_l_1()
-                .border_r_1();
+            // A long message is several rows; a filled message rounds the
+            // corners of its first and last.
+            let card = div().flex().flex_col().px_3();
             let card = match row.place {
-                Place::Only => card.py_3().border_t_1().border_b_1().radius_md(),
-                Place::First => card.pt_3().pb_1().border_t_1().radius_t_md(),
+                Place::Only => card.py_3().radius_md(),
+                Place::First => card.pt_3().pb_1().radius_t_md(),
                 Place::Middle => card.py_1(),
-                Place::Last => card.pt_1().pb_3().border_b_1().radius_b_md(),
+                Place::Last => card.pt_1().pb_3().radius_b_md(),
             };
-            card.when(row.place.starts(), |card| {
-                card.child(style::section_label(
-                    theme,
-                    format!("{who}{when}").to_uppercase(),
-                    fonts.label,
-                ))
-            })
-            .child(div().text_size(px(fonts.body)).child(self.chat_text(
-                text,
-                theme.panel_fg,
-                fonts,
-                &self.shared_settings,
-            )))
-            .into_any_element()
+            card.when_some(fill, |card, fill| card.bg(fill))
+                .child(div().text_size(px(fonts.body)).child(self.chat_text(
+                    text,
+                    theme.panel_fg,
+                    fonts,
+                    &self.shared_settings,
+                )))
+                .into_any_element()
         };
         match entry {
-            Entry::User { text, at } => said("You".to_string(), *at, text, theme.panel),
-            Entry::Assistant { text, at } => {
-                said(agent.label().to_string(), *at, text, theme.panel_dim)
-            }
+            Entry::User { text, .. } => said(text, Some(theme.panel)),
+            Entry::Assistant { text, .. } => said(text, None),
             Entry::Tool {
                 name,
                 summary,

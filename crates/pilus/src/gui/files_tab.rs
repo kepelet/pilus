@@ -1212,8 +1212,14 @@ impl PilusView {
     }
 
     /// Whether the markdown editor's field holds the keyboard.
+    ///
+    /// Only while the column does: a press on the terminal clears
+    /// `right.focused`, and without that check `sync_focus` would hand the
+    /// keyboard back to the editor on the next frame, so the terminal could
+    /// never be typed in while a file was open.
     pub(super) fn md_editing(&self) -> bool {
         self.files_visible()
+            && self.right.focused
             && self.input_layer() == InputLayer::Terminal
             && self
                 .files_panel

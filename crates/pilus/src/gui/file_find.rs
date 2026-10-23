@@ -132,6 +132,8 @@ impl PilusView {
         if !self.files_visible() || self.files_panel.doc_view().is_none() {
             return;
         }
+        // Find in File from the terminal moves the keyboard to the file.
+        self.right.focused = true;
         self.files_begin_edit(cx);
         if !self.md_editing() {
             return;
@@ -274,11 +276,13 @@ impl PilusView {
             .flex_shrink_0()
             .px_1()
             .text_size(px(fonts.secondary))
-            .text_color(if self.file_find.query.is_empty() || !self.file_find.matches.is_empty() {
-                theme.muted
-            } else {
-                theme.alert
-            })
+            .text_color(
+                if self.file_find.query.is_empty() || !self.file_find.matches.is_empty() {
+                    theme.muted
+                } else {
+                    theme.alert
+                },
+            )
             .child(self.file_find.count_label());
         Some(
             div()

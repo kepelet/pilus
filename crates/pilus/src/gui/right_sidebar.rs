@@ -96,11 +96,12 @@ impl SidebarTab {
         }
     }
 
-    /// Whether the tab reads the keyboard. Only the Diff has shortcuts and
-    /// Sipil has fields, so the keys of a column showing Git or Files stay with
-    /// the terminal.
+    /// Whether the tab reads the keyboard. The Diff has shortcuts, Sipil has
+    /// fields and Files has the editor, so only the keys of a column showing
+    /// Git, Ports or the Browser stay with the terminal. Files gives them back
+    /// while no file is being edited (see `md_editing`).
     fn takes_keys(self) -> bool {
-        matches!(self, Self::Diff | Self::Sipil)
+        matches!(self, Self::Diff | Self::Sipil | Self::Files)
     }
 
     /// Whether the tab reads a git repo, so a plain folder has nothing for it.

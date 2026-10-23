@@ -1517,9 +1517,9 @@ impl GithubPage {
                         url: String::new(),
                         body: "When the title wraps, the second line keeps the default size.\n\n1. Set Interface size to 16\n2. Open a long-named workspace".to_string(),
                     },
-                    assignees: vec!["rizaldy".to_string()],
+                    assignees: vec!["alex".to_string()],
                     created_at: "2026-10-12T20:00:00Z".to_string(),
-                    comments: vec![comment("rizaldy", "Reproduced. `section_font` is fixed at 11.")],
+                    comments: vec![comment("alex", "Reproduced. `section_font` is fixed at 11.")],
                 })),
             )
         } else {
@@ -1534,7 +1534,7 @@ impl GithubPage {
                         title: "Show your repositories above WORKSPACES".to_string(),
                         state: "OPEN".to_string(),
                         draft: false,
-                        author: "rizaldy".to_string(),
+                        author: "alex".to_string(),
                         head: "github-repos".to_string(),
                         base: "main".to_string(),
                         review: "REVIEW_REQUIRED".to_string(),

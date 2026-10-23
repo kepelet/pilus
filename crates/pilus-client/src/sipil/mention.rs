@@ -258,17 +258,17 @@ mod tests {
                 if line.id == 1 {
                     "Rina".to_string()
                 } else {
-                    "rizaldy".to_string()
+                    "alex".to_string()
                 }
             },
         );
         assert!(text.contains("You are Researcher, taking part in a chat with Rina"));
-        assert!(text.contains("Rina: hi\nrizaldy: @Researcher summarise\n"));
+        assert!(text.contains("Rina: hi\nalex: @Researcher summarise\n"));
 
         // A reply says what it answers.
         let mut answering = line(3, "yes");
         answering.reply = Some(Quote::of("Rina", "ship it?"));
-        let text = prompt("CoS", "a chat", &[answering], &|_| "rizaldy".to_string());
-        assert!(text.contains("rizaldy (replying to Rina: \"ship it?\"): yes\n"));
+        let text = prompt("CoS", "a chat", &[answering], &|_| "alex".to_string());
+        assert!(text.contains("alex (replying to Rina: \"ship it?\"): yes\n"));
     }
 }

@@ -178,11 +178,11 @@ mod tests {
 
     #[test]
     fn parent_of_handles_roots_and_nesting() {
-        assert_eq!(parent_of("/Users/rizaldy"), Some("/Users".to_string()));
+        assert_eq!(parent_of("/Users/alex"), Some("/Users".to_string()));
         assert_eq!(parent_of("/Users"), Some("/".to_string()));
         assert_eq!(parent_of("/"), None);
         assert_eq!(parent_of(""), None);
-        assert_eq!(parent_of("/Users/rizaldy/"), Some("/Users".to_string()));
+        assert_eq!(parent_of("/Users/alex/"), Some("/Users".to_string()));
     }
 
     #[test]

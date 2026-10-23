@@ -1105,7 +1105,7 @@ impl UiPlaygroundView {
                             .gap_2()
                             .text_size(px(self.fonts().label))
                             .text_color(theme.muted)
-                            .child("rizaldy@mac-mini")
+                            .child("alex@mac-mini")
                             .child(div().text_color(theme.ok).child("online")),
                     ),
             )

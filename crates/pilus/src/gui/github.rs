@@ -930,13 +930,13 @@ impl GithubFeed {
             url: format!("https://github.com/{name}"),
             default_branch: "main".to_string(),
         };
-        self.login = Some("rizaldy".to_string());
+        self.login = Some("alex".to_string());
         self.reach = Reach::Ready {
-            login: "rizaldy".to_string(),
+            login: "alex".to_string(),
         };
         self.repos.items = vec![
             repo(
-                "rizaldy/pilus",
+                "alex/pilus",
                 false,
                 "Rust",
                 "Native client for a Luvus daemon",
@@ -945,7 +945,7 @@ impl GithubFeed {
                 3,
             ),
             repo(
-                "rizaldy/dotfiles",
+                "alex/dotfiles",
                 true,
                 "Shell",
                 "Private configuration",
@@ -972,7 +972,7 @@ impl GithubFeed {
                 0,
             ),
             repo("kepelet/docs", false, "MDX", "Documentation", 31, 6, 1),
-            repo("rizaldy/notes", true, "Markdown", "", 0, 0, 0),
+            repo("alex/notes", true, "Markdown", "", 0, 0, 0),
             repo(
                 "kepelet/infra",
                 true,

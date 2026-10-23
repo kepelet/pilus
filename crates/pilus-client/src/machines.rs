@@ -470,7 +470,7 @@ mod tests {
                 {
                     "id": "mac-mini",
                     "label": "Mac Mini",
-                    "destination": "rizaldy@mac-mini.duck-map.ts.net",
+                    "destination": "alex@mac-mini.duck-map.ts.net",
                     "enabled": true,
                 },
                 {"id": "lab", "enabled": false},
@@ -480,7 +480,7 @@ mod tests {
         let machines = parse_machines(value.to_string().as_bytes());
         assert_eq!(machines.len(), 2);
         assert_eq!(machines[0].display(), "Mac Mini");
-        assert_eq!(machines[0].destination, "rizaldy@mac-mini.duck-map.ts.net");
+        assert_eq!(machines[0].destination, "alex@mac-mini.duck-map.ts.net");
         assert!(machines[0].enabled);
         assert_eq!(machines[1].display(), "lab");
         assert!(!machines[1].enabled);

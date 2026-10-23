@@ -3432,7 +3432,7 @@ mod tests {
     fn a_channel_is_titled_for_what_it_is() {
         let state = SipilState {
             me: Me {
-                nickname: "rizaldy".to_string(),
+                nickname: "alex".to_string(),
                 channels: vec![ChannelRow {
                     channel: pilus_client::sipil::Channel {
                         id: "0123456789abcdef".to_string(),
@@ -3470,23 +3470,23 @@ mod tests {
             speaker: speaker.map(str::to_string),
         };
         assert_eq!(
-            line_nick(&item(ItemRole::User, "x", None), "rizaldy", "rina"),
-            "rizaldy:"
+            line_nick(&item(ItemRole::User, "x", None), "alex", "rina"),
+            "alex:"
         );
         assert_eq!(
-            line_nick(&item(ItemRole::Peer, "x", None), "rizaldy", "rina"),
+            line_nick(&item(ItemRole::Peer, "x", None), "alex", "rina"),
             "rina:"
         );
         assert_eq!(
             line_nick(
                 &item(ItemRole::User, "x", Some("Researcher")),
-                "rizaldy",
+                "alex",
                 "rina"
             ),
             "Researcher:"
         );
         assert_eq!(
-            line_nick(&item(ItemRole::Peer, "x", Some("rani")), "rizaldy", ""),
+            line_nick(&item(ItemRole::Peer, "x", Some("rani")), "alex", ""),
             "rani:"
         );
         assert_eq!(line_nick(&item(ItemRole::Tool, "x", None), "me", "s"), "-");

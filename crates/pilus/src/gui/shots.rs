@@ -864,7 +864,7 @@ pub fn run_main() -> Result<()> {
             view.sipil_chat.open = true;
             view.sipil_chat.fold_open_for_shot(
                 &["c-count", "c-sizes"],
-                "rizaldy",
+                "alex",
                 "How many files are in src?",
             );
             cx.notify();
@@ -1064,7 +1064,7 @@ pub fn run_main() -> Result<()> {
     cx.update(|app| {
         view.update(app, |view, cx| {
             view.close_context_menu();
-            view.settings.set_pinned("rizaldy/notes", true);
+            view.settings.set_pinned("alex/notes", true);
             view.settings.set_pinned("kepelet/infra", true);
             // The window pulls the shared copy back each tick.
             *view.shared_settings.borrow_mut() = view.settings.clone();
@@ -1657,7 +1657,7 @@ pub fn run_main() -> Result<()> {
     // between.
     cx.update(|app| {
         view.update(app, |view, cx| {
-            for repo in ["rizaldy/notes", "kepelet/infra", "rizaldy/pilus"] {
+            for repo in ["alex/notes", "kepelet/infra", "alex/pilus"] {
                 view.settings.set_pinned(repo, true);
             }
             *view.shared_settings.borrow_mut() = view.settings.clone();
@@ -2414,7 +2414,7 @@ fn sipil_me_fixture() -> super::sipil::Me {
         },
     };
     Me {
-        nickname: "rizaldy".to_string(),
+        nickname: "alex".to_string(),
         device_id: Some(
             "26e9ba62c5fedd08fce5f6eb4468d342f56712cea92c4efab93049ebd892258d".to_string(),
         ),
@@ -2718,7 +2718,7 @@ fn sipil_chat_fixture(
             ),
             TranscriptItem {
                 reply: Some(Quote::of(
-                    "rizaldy",
+                    "alex",
                     "Give me ten minutes, I am finishing the handshake test.",
                 )),
                 ..line(
@@ -2904,8 +2904,8 @@ fn about_fixture() -> pilus_client::sipil::About {
         platform: "darwin 25.0.0 arm64".to_string(),
         device_id: "26e9ba62f3c1d0a47b58e6c9a1f2d3e4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0".to_string(),
         version: "0.1.0".to_string(),
-        workspace: "/Users/rizaldy/Developer/kepelet/sipil".to_string(),
-        home: "/Users/rizaldy/.sipil".to_string(),
+        workspace: "/Users/alex/Developer/kepelet/sipil".to_string(),
+        home: "/Users/alex/.sipil".to_string(),
         model: Some(model("qwen3.8-max", "Qwen 3.8 Max")),
         agents: vec![
             AgentDetail {

@@ -1524,7 +1524,7 @@ impl PilusView {
             pull(
                 214,
                 "feat(gui): Home page with activity",
-                "rizaldy",
+                "alex",
                 false,
                 600,
             ),
@@ -1535,7 +1535,7 @@ impl PilusView {
                 false,
                 7_000,
             ),
-            pull(209, "docs: SSH vs UHP", "rizaldy", true, 40_000),
+            pull(209, "docs: SSH vs UHP", "alex", true, 40_000),
             pull(
                 203,
                 "fix(search): resume on a remote machine",
@@ -1562,7 +1562,7 @@ impl PilusView {
             pull(
                 198,
                 "Pin repositories from the Home page",
-                "rizaldy",
+                "alex",
                 false,
                 400_000,
             ),

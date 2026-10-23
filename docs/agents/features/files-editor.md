@@ -36,6 +36,25 @@ The Files tab edits text files in place. Saves go through
 - A truncated read, or a file larger than `md_view::EDIT_LIMIT`, is not opened
   for editing.
 
+## Paths clicked in the terminal
+
+A Cmd/Ctrl+click on a pane opens what is under it in the window first, and
+only then falls back to the daemon (which draws its own preview).
+
+- An `OSC 8` span with an http, https or mailto target opens in the system
+  (`surface::link_at`). Other schemes go to the daemon.
+- A word that reads like a path (`surface::path_at`: quotes, a trailing period
+  and `:line:col` dropped, no URL or `~`) is resolved against the tree's root
+  and checked with `pilus_client::is_file` on a worker thread, over SSH for a
+  remote machine. `FilesMsg::PathProbe` carries the answer: a hit goes through
+  `files_open_path`, a miss replays the click to the daemon.
+- Opening a document brings the right column back if it was closed
+  (`files_open_doc`), so a hit from the terminal is always visible. The probe
+  itself needs no open column: with no tree on screen the worker asks the
+  daemon for the active node's root.
+- The click is held back while the probe runs, so never make that check on the
+  GUI thread.
+
 ## Images and SVGs
 
 A click on a file `image_view::kind` recognizes (png, jpg, gif, webp, bmp, ico,

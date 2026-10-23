@@ -88,6 +88,18 @@ pub fn read_bytes(target: Option<&SshTarget>, path: &str, limit: usize) -> Resul
     Ok(bytes)
 }
 
+/// Whether `path` is a regular file on this machine, or on `target`'s host.
+///
+/// A click on text that merely looks like a path asks this before the window
+/// takes the click from the daemon, so it blocks on a `stat` and, remotely, an
+/// SSH round trip: call it from a worker thread.
+pub fn is_file(target: Option<&SshTarget>, path: &str) -> bool {
+    match target {
+        None => std::fs::metadata(path).is_ok_and(|meta| meta.is_file()),
+        Some(target) => run(target.shell(&format!("test -f {}", sh_quote(path))), "stat").is_ok(),
+    }
+}
+
 fn read_disk(path: &str, limit: usize) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let mut bytes = Vec::new();

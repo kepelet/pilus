@@ -9,6 +9,9 @@ from reaching past what it was given.
   in a pane, including on a remote host) reaches the system opener only when
   `surface::openable_url` allows it: http, https and mailto. `open` launches
   any registered scheme, and a `file:` URL starts an application.
+- An `OSC 8` link the window opens itself on Cmd/Ctrl+click (`surface::link_at`,
+  from `FrameData.hyperlinks`) passes the same `openable_url` check. A click it
+  does not handle goes to the daemon as before.
 - An SVG from another device (a sipil's logo) is parsed with
   `about::untrusted_svg_options`, which resolves only `data:` images.
   Otherwise usvg reads any path an `<image>` names.

@@ -250,10 +250,95 @@ pub fn openable_url(url: &str) -> bool {
     }
 }
 
+/// The `OSC 8` target under a cell, if the window may open it itself.
+///
+/// The window opens these on a modified click without asking the daemon, so a
+/// link works even when the daemon would not have reported it. A span whose
+/// scheme `openable_url` refuses is skipped, which leaves that click to the
+/// daemon (it refuses the same URLs on the way back).
+pub fn link_at(frame: &FrameData, column: u16, row: u16) -> Option<&str> {
+    if column >= frame.width || row >= frame.height {
+        return None;
+    }
+    let index = u32::from(row) * u32::from(frame.width) + u32::from(column);
+    frame
+        .hyperlinks
+        .iter()
+        .find(|link| link.start <= index && index < link.end && openable_url(&link.uri))
+        .map(|link| link.uri.as_str())
+}
+
+/// The file path written under a cell, if the text there reads like one.
+///
+/// Programs in a pane print paths as plain text (`docs/agents/security.md.`),
+/// not as `OSC 8` links, so the click looks at the word under the pointer. The
+/// result is only a candidate: the caller checks that the file exists before it
+/// takes the click from the daemon. Surrounding quotes and brackets, a trailing
+/// sentence period and a `:line:col` suffix are dropped.
+pub fn path_at(frame: &FrameData, column: u16, row: u16) -> Option<String> {
+    if column >= frame.width || row >= frame.height {
+        return None;
+    }
+    let width = usize::from(frame.width);
+    let start = usize::from(row) * width;
+    let cells = frame.cells.get(start..start + width)?;
+    let mut text = String::new();
+    let mut at = 0;
+    for (index, cell) in cells.iter().enumerate() {
+        if index == usize::from(column) {
+            at = text.len();
+        }
+        if cell.symbol.is_empty() {
+            text.push(' ');
+        } else {
+            text.push_str(&cell.symbol);
+        }
+    }
+    let breaks = |ch: char| ch.is_whitespace() || "\"'`<>()[]{}|".contains(ch);
+    if text[at..].chars().next().is_none_or(breaks) {
+        return None;
+    }
+    let from = text[..at]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| breaks(*ch))
+        .map_or(0, |(index, ch)| index + ch.len_utf8());
+    let to = text[at..]
+        .char_indices()
+        .find(|(_, ch)| breaks(*ch))
+        .map_or(text.len(), |(index, _)| at + index);
+    let mut word = text[from..to].trim_start_matches('@');
+    loop {
+        let trimmed = word.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        let without_position = trimmed
+            .rsplit_once(':')
+            .filter(|(_, tail)| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()))
+            .map_or(trimmed, |(head, _)| head);
+        if without_position == word {
+            break;
+        }
+        word = without_position;
+    }
+    let name = word.rsplit('/').next().unwrap_or(word);
+    let has_extension = name
+        .rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty());
+    let pathlike = word.contains('/') || has_extension;
+    if word.is_empty()
+        || word.contains("://")
+        || word.starts_with(['-', '~'])
+        || word.ends_with('/')
+        || !pathlike
+    {
+        return None;
+    }
+    Some(word.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pilus_protocol::{CellData, DiffRun, FrameDiff};
+    use pilus_protocol::{CellData, DiffRun, FrameDiff, FrameHyperlink};
 
     fn full(width: u16, height: u16) -> FrameData {
         FrameData {
@@ -463,5 +548,84 @@ mod tests {
         ] {
             assert!(!openable_url(url), "{url}");
         }
+    }
+
+    #[test]
+    fn link_at_finds_only_openable_spans_under_the_cell() {
+        let mut frame = full(10, 2);
+        frame.hyperlinks = vec![
+            FrameHyperlink {
+                start: 2,
+                end: 5,
+                uri: "https://luvus.dev".to_string(),
+            },
+            FrameHyperlink {
+                start: 12,
+                end: 15,
+                uri: "file:///Applications/Calculator.app".to_string(),
+            },
+        ];
+        assert_eq!(link_at(&frame, 2, 0), Some("https://luvus.dev"));
+        assert_eq!(link_at(&frame, 4, 0), Some("https://luvus.dev"));
+        assert_eq!(link_at(&frame, 5, 0), None);
+        assert_eq!(link_at(&frame, 2, 1), None);
+        assert_eq!(
+            link_at(&frame, 3, 1),
+            None,
+            "refused scheme goes to the daemon"
+        );
+        assert_eq!(link_at(&frame, 10, 0), None);
+        assert_eq!(link_at(&frame, 0, 2), None);
+    }
+
+    fn line(text: &str) -> FrameData {
+        let mut frame = full(u16::try_from(text.chars().count()).unwrap_or(0), 1);
+        for (cell, ch) in frame.cells.iter_mut().zip(text.chars()) {
+            cell.symbol = ch.to_string();
+        }
+        frame
+    }
+
+    #[test]
+    fn path_at_reads_the_path_under_the_cell() {
+        let frame = line("see `docs/agents/security.md.` and Cargo.toml:12:3, ok (src/lib.rs)");
+        let at =
+            |text: &str| u16::try_from(frame_text(&frame).find(text).unwrap_or(0)).unwrap_or(0);
+        assert_eq!(
+            path_at(&frame, at("agents"), 0).as_deref(),
+            Some("docs/agents/security.md")
+        );
+        assert_eq!(
+            path_at(&frame, at("Cargo"), 0).as_deref(),
+            Some("Cargo.toml")
+        );
+        assert_eq!(
+            path_at(&frame, at("src/"), 0).as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(path_at(&frame, at("and"), 0), None);
+        assert_eq!(path_at(&frame, at(" and"), 0), None, "a space is no path");
+    }
+
+    #[test]
+    fn path_at_leaves_urls_and_bare_words_to_the_daemon() {
+        for text in [
+            "https://luvus.dev/a.md",
+            "plain",
+            "~/notes.md",
+            "-flag.rs",
+            "dir/",
+        ] {
+            let frame = line(text);
+            assert_eq!(path_at(&frame, 1, 0), None, "{text}");
+        }
+    }
+
+    fn frame_text(frame: &FrameData) -> String {
+        frame
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect()
     }
 }

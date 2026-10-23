@@ -1887,6 +1887,9 @@ struct PilusView {
     /// flag is what lets a secondary click still reach the daemon as the
     /// `Ctrl`+left-click that opens a link.
     control_held: bool,
+    /// The right press in flight was taken as a link open, so its release is
+    /// the window's too and never reaches the daemon.
+    link_press: bool,
     /// Background poller for the current session's tabs and widgets.
     agent_feed: Option<AgentFeed>,
     /// State root the sessions list, derived from the launch target.
@@ -2629,6 +2632,7 @@ impl PilusView {
             divider_hover: None,
             divider_drag: None,
             control_held: false,
+            link_press: false,
             agent_feed,
             session_root,
             pilus_root,
@@ -10169,6 +10173,10 @@ impl PilusView {
             cx.notify();
             return;
         };
+        if self.open_link_at(cell, event.modifiers, cx) {
+            cx.notify();
+            return;
+        }
         self.forward_mouse(
             MouseEventKind::Down(TerminalMouseButton::Left),
             cell,
@@ -10180,6 +10188,33 @@ impl PilusView {
             event.modifiers,
         );
         cx.notify();
+    }
+
+    /// Open what a `Cmd`/`Ctrl` click landed on, if the window can.
+    ///
+    /// An `OSC 8` span's target is already in the frame, so it opens without a
+    /// round trip to the daemon. A path in plain text opens in the Files tab
+    /// once a worker has found the file. Anything else, or a scheme `link_at`
+    /// refuses, returns false and goes to the daemon as before: it still finds
+    /// plain URLs in the text.
+    fn open_link_at(&self, cell: Cell, modifiers: Modifiers, cx: &mut Context<Self>) -> bool {
+        if !keys::mouse_modifiers(modifiers).contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        let Some(frame) = self.shown_frame() else {
+            return false;
+        };
+        if let Some(url) = pilus_client::link_at(frame, cell.column, cell.row) {
+            cx.open_url(url);
+            return true;
+        }
+        // Plain text that reads like a path opens in the Files tab when the
+        // file is there, else the click still goes to the daemon (see
+        // `files_probe_path`).
+        pilus_client::path_at(frame, cell.column, cell.row).is_some_and(|word| {
+            let modifiers = keys::mouse_modifiers(modifiers) | KeyModifiers::CONTROL;
+            self.files_probe_path(&word, cell, modifiers)
+        })
     }
 
     fn press(&mut self, event: &MouseDownEvent, button: TerminalMouseButton, window: &Window) {
@@ -15225,7 +15260,18 @@ impl Render for PilusView {
                     // this window's own menu, so the daemon never draws its
                     // own over the grid.
                     if this.control_held {
-                        this.press(event, TerminalMouseButton::Right, window);
+                        // macOS may have cleared `Ctrl` from the event it
+                        // rewrote; `control_held` is the record of it.
+                        let modifiers = Modifiers {
+                            control: true,
+                            ..event.modifiers
+                        };
+                        this.link_press = this
+                            .cell_at(window, event.position)
+                            .is_some_and(|cell| this.open_link_at(cell, modifiers, cx));
+                        if !this.link_press {
+                            this.press(event, TerminalMouseButton::Right, window);
+                        }
                     } else {
                         this.open_terminal_menu(event, window, cx);
                     }
@@ -15247,7 +15293,11 @@ impl Render for PilusView {
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseUpEvent, window, _| {
                     // The press never reached the daemon unless it was a
-                    // Ctrl+click, so only that release does.
+                    // Ctrl+click, so only that release does. A press the
+                    // window opened as a link never reached it either.
+                    if std::mem::take(&mut this.link_press) {
+                        return;
+                    }
                     if this.control_held {
                         this.release(event, TerminalMouseButton::Right, window);
                     }

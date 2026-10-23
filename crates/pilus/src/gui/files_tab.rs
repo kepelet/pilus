@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use std::path::PathBuf;
 
+use crossterm::event::{KeyModifiers, MouseButton as TerminalMouseButton, MouseEventKind};
 use gpui::{
     AnyElement, ClickEvent, Context, Div, DragMoveEvent, ExternalPaths, Focusable, KeyDownEvent,
     ListAlignment, ListState, MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point,
@@ -47,8 +48,8 @@ use gpui::{
 };
 use pilus_client::{
     ControlClient, Error, FileChanges, FileRow, FileTree, OpenTarget, SshTarget, TextFile, Version,
-    archive_name, create_entry, delete_entry, download_path, parent_of, read_text, rename_entry,
-    upload_path, visible_rows, write_text,
+    archive_name, create_entry, delete_entry, download_path, is_file, parent_of, read_text,
+    rename_entry, upload_path, visible_rows, write_text,
 };
 
 use crate::settings::FilesFolded;
@@ -58,6 +59,7 @@ use super::highlight;
 use super::image_view::{self, Picture};
 use super::md_view::{self, MdDoc, Page};
 use super::right_sidebar::SidebarTab;
+use super::selection::Cell;
 use super::sidebar_menu::{Item, MenuTarget};
 use super::style::{self, RadiusExt as _, TreeEntry, TreeMark};
 use super::toast::ToastKind;
@@ -150,6 +152,16 @@ pub(super) enum FilesMsg {
         endpoint: EndpointId,
         seq: u32,
         result: Result<TextFile, String>,
+    },
+    /// A word a modified click landed on was checked as a file. The click
+    /// went to neither the daemon nor the tab until now, so a miss replays it
+    /// at `cell` with `modifiers`.
+    PathProbe {
+        endpoint: EndpointId,
+        path: String,
+        cell: Cell,
+        modifiers: KeyModifiers,
+        found: bool,
     },
     /// A picture was read and drawn, or why it could not be.
     Picture {
@@ -815,6 +827,27 @@ impl PilusView {
                         changed = true;
                     }
                 }
+                FilesMsg::PathProbe {
+                    endpoint,
+                    path,
+                    cell,
+                    modifiers,
+                    found,
+                } => {
+                    if found && endpoint == self.active {
+                        self.files_open_path(&path, cx);
+                        changed = true;
+                    } else if endpoint == self.active {
+                        // Not a file here: the daemon gets the click it would
+                        // have had, and may know the path better than the tab.
+                        for kind in [
+                            MouseEventKind::Down(TerminalMouseButton::Left),
+                            MouseEventKind::Up(TerminalMouseButton::Left),
+                        ] {
+                            self.forward_mouse_with(kind, cell, modifiers);
+                        }
+                    }
+                }
                 FilesMsg::Doc {
                     endpoint,
                     seq,
@@ -892,11 +925,7 @@ impl PilusView {
         if !self.files_visible() {
             return changed;
         }
-        if self.files_panel.endpoint.as_ref() != Some(&self.active) {
-            self.files_panel.reset();
-            self.files_panel.endpoint = Some(self.active.clone());
-            changed = true;
-        }
+        changed |= self.files_follow_endpoint();
         let panel = &self.files_panel;
         let every = if panel.loading.is_some() {
             LOADING_POLL
@@ -908,6 +937,21 @@ impl PilusView {
         }
         self.files_request(Prelude::Poll);
         changed
+    }
+
+    /// Point the tab at the active machine, dropping what another machine's
+    /// tree left. Returns whether it did.
+    ///
+    /// Opening a document starts by calling this: a tab that was never on
+    /// screen has no endpoint, so its first visible tick would reset it and
+    /// drop the document just requested.
+    fn files_follow_endpoint(&mut self) -> bool {
+        if self.files_panel.endpoint.as_ref() == Some(&self.active) {
+            return false;
+        }
+        self.files_panel.reset();
+        self.files_panel.endpoint = Some(self.active.clone());
+        true
     }
 
     /// Bring the tab in line with an edit that went through: move or close the
@@ -996,11 +1040,72 @@ impl PilusView {
         if self.files_doc_unsaved("open another file", cx) {
             return;
         }
+        self.files_follow_endpoint();
         let path = path.to_string();
+        // A path clicked in the terminal arrives with the column away, and a
+        // document read into a hidden column is a click that seems to do
+        // nothing, so bring the column back first.
+        if !self.right.visible {
+            self.toggle_right_sidebar(cx);
+        }
         self.right_navigate(cx, |this, _| {
             this.right.select_tab(SidebarTab::Files);
             this.files_read_doc(path);
         });
+    }
+
+    /// Check on a worker whether the word a click landed on names a file under
+    /// the tree's root, then open it here or hand the click back to the daemon.
+    ///
+    /// The root is the tab's own when it has one. With the sidebar closed the
+    /// tab is not polling, so the worker asks the daemon for the active node's
+    /// tree instead. Returns false, leaving the click to the caller, when there
+    /// is no way to reach the machine. The GUI thread never waits on the
+    /// `stat`, which is an SSH call for a remote machine.
+    pub(super) fn files_probe_path(&self, word: &str, cell: Cell, modifiers: KeyModifiers) -> bool {
+        let endpoint = self.active.clone();
+        let Ok(target) = self.read_target(&endpoint) else {
+            return false;
+        };
+        let shown_root = self.files_panel.tree_root();
+        let client = if shown_root.is_none() {
+            let Some(client) = self.control_client_for_endpoint(&endpoint) else {
+                return false;
+            };
+            Some(client)
+        } else {
+            None
+        };
+        let word = word.to_string();
+        let tx = self.files_panel.tx.clone();
+        std::thread::spawn(move || {
+            let root = shown_root.or_else(|| {
+                client?
+                    .files_tree()
+                    .ok()
+                    .map(|tree| tree.root)
+                    .filter(|root| !root.is_empty())
+            });
+            let path = match root {
+                _ if word.starts_with('/') => word.clone(),
+                Some(root) => format!(
+                    "{}/{}",
+                    root.trim_end_matches('/'),
+                    word.trim_start_matches("./")
+                ),
+                None => String::new(),
+            };
+            let found = !path.is_empty() && is_file(target.as_ref(), &path);
+            tx.send(FilesMsg::PathProbe {
+                endpoint,
+                path,
+                cell,
+                modifiers,
+                found,
+            })
+            .ok();
+        });
+        true
     }
 
     /// Open the file at `path` as a click on its row would, for a caller that

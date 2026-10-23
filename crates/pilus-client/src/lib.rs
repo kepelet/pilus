@@ -96,10 +96,12 @@ pub use mission::{
 pub use paste::{MAX_PASTED_BYTES, PastedImage, is_image_file, shell_word, stash_image};
 pub use pilus_protocol as protocol;
 pub use ports::{ListeningPort, PortForward, free_local_port, kill_process, list_ports};
-pub use read::{MAX_IMAGE_BYTES, MAX_TEXT_BYTES, TextFile, Version, read_bytes, read_text};
+pub use read::{
+    MAX_IMAGE_BYTES, MAX_TEXT_BYTES, TextFile, Version, is_file, read_bytes, read_text,
+};
 pub use relay::RelaySettings;
 pub use stage::{Discard, StageAction, discard, set_staged};
-pub use surface::{Surface, SurfaceChange};
+pub use surface::{Surface, SurfaceChange, link_at, path_at};
 pub use tasks::{NewTask, Task, TaskStatus, split_list};
 pub use transport::SshTarget;
 pub use uhp::{Capabilities, Event, EventStream, Frame, Observer, Terminal, UhpClient};

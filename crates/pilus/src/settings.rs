@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 const STATE_DOC: &str = "ui_state";
 
 /// The `Settings` fields that live in `pilus.db`, not in `settings.json`.
-const STATE_KEYS: [&str; 13] = [
+const STATE_KEYS: [&str; 15] = [
     "window",
     "session_labels",
     "session_icons",
@@ -38,7 +38,12 @@ const STATE_KEYS: [&str; 13] = [
     "diff_list_height",
     "diff_list_width",
     "git_list_height",
+    "pinned_workspaces",
+    "recent_workspaces",
 ];
+
+/// How many opened folders the Home page and the sidebar remember.
+pub const RECENT_WORKSPACES: usize = 8;
 
 /// The icons a session may take in the header, as `session_icons` values.
 pub const SESSION_ICONS: [&str; 7] = [
@@ -105,6 +110,50 @@ pub struct WindowGeometry {
     pub display: Option<String>,
 }
 
+/// A folder on one machine that can be opened again: where the Pinned and
+/// Recent workspace lists get their rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedWorkspace {
+    /// The endpoint that owns the folder: `local`, or a saved machine's id.
+    pub endpoint: String,
+    /// The folder on that machine, absolute when its home was known.
+    pub path: String,
+    /// What the row is called; the folder's own name when blank.
+    #[serde(default)]
+    pub name: String,
+}
+
+impl SavedWorkspace {
+    /// Whether this is the folder `path` on `endpoint`, whatever trailing
+    /// slash either spelling carries.
+    pub fn is(&self, endpoint: &str, path: &str) -> bool {
+        self.endpoint == endpoint && trim_slashes(&self.path) == trim_slashes(path)
+    }
+
+    /// The row's label: its name, else the last folder of the path, else the
+    /// path itself (`~` and `/` have no last folder).
+    pub fn label(&self) -> &str {
+        let name = self.name.trim();
+        if !name.is_empty() {
+            return name;
+        }
+        let path = trim_slashes(&self.path);
+        match path.rsplit('/').next() {
+            Some(last) if !last.is_empty() => last,
+            _ => path,
+        }
+    }
+}
+
+fn trim_slashes(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() && !path.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
 /// The part of [`Settings`] that lives in `pilus.db` rather than `settings.json`.
 ///
 /// Kept apart from the preferences because it is the window's own bookkeeping:
@@ -117,6 +166,8 @@ struct UiState {
     session_icons: BTreeMap<String, String>,
     github_pinned: Vec<String>,
     sipil_order: Vec<String>,
+    pinned_workspaces: Vec<SavedWorkspace>,
+    recent_workspaces: Vec<SavedWorkspace>,
     /// Absent in a document written before these moved, which means the file
     /// still holds them and they have not been taken yet.
     layout: Option<Layout>,
@@ -145,6 +196,8 @@ impl UiState {
             session_icons: settings.session_icons.clone(),
             github_pinned: settings.github_pinned.clone(),
             sipil_order: settings.sipil_order.clone(),
+            pinned_workspaces: settings.pinned_workspaces.clone(),
+            recent_workspaces: settings.recent_workspaces.clone(),
             layout: Some(Layout {
                 last_session: settings.last_session.clone(),
                 last_endpoint: settings.last_endpoint.clone(),
@@ -164,6 +217,8 @@ impl UiState {
         settings.session_icons = self.session_icons;
         settings.github_pinned = self.github_pinned;
         settings.sipil_order = self.sipil_order;
+        settings.pinned_workspaces = self.pinned_workspaces;
+        settings.recent_workspaces = self.recent_workspaces;
         if let Some(layout) = self.layout {
             settings.last_session = layout.last_session;
             settings.last_endpoint = layout.last_endpoint;
@@ -278,6 +333,13 @@ pub struct Settings {
     /// the ones that are, in the order the section would list it. Kept in
     /// `pilus.db` (`UiState`).
     pub sipil_order: Vec<String>,
+    /// Folders kept to open again in one click, local or on a saved machine, in
+    /// the order they were pinned. Shown under PINNED WORKSPACES in the sidebar
+    /// and on Home. Kept in `pilus.db` (`UiState`).
+    pub pinned_workspaces: Vec<SavedWorkspace>,
+    /// The folders opened last, newest first, at most `RECENT_WORKSPACES`.
+    /// Kept in `pilus.db` (`UiState`).
+    pub recent_workspaces: Vec<SavedWorkspace>,
     /// Whether the right sidebar (Changes and History tabs) is open. This and the
     /// other pane layout fields below are kept in `pilus.db` (`UiState`).
     pub right_sidebar_visible: bool,
@@ -361,6 +423,8 @@ impl Default for Settings {
             index_agents: false,
             index_machines: Vec::new(),
             sipil_order: Vec::new(),
+            pinned_workspaces: Vec::new(),
+            recent_workspaces: Vec::new(),
             right_sidebar_visible: false,
             right_sidebar_width: 0.0,
             right_sidebar_tab: String::new(),
@@ -588,6 +652,47 @@ impl Settings {
         if let Some(to) = to {
             self.github_pinned.swap(at, to);
         }
+    }
+
+    /// Whether the folder `path` on `endpoint` is pinned.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn workspace_pinned(&self, endpoint: &str, path: &str) -> bool {
+        self.pinned_workspaces
+            .iter()
+            .any(|saved| saved.is(endpoint, path))
+    }
+
+    /// Pin `workspace`, or unpin the folder it names. A folder pins once, and
+    /// unpinning one that was never pinned changes nothing.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn set_workspace_pinned(&mut self, workspace: SavedWorkspace, on: bool) {
+        let pinned = self.workspace_pinned(&workspace.endpoint, &workspace.path);
+        if on && !pinned {
+            self.pinned_workspaces.push(workspace);
+        } else if !on && pinned {
+            self.pinned_workspaces
+                .retain(|saved| !saved.is(&workspace.endpoint, &workspace.path));
+        }
+    }
+
+    /// Note that `workspace` was just opened: it leads the recent list, and the
+    /// oldest fall off past `RECENT_WORKSPACES`. A folder opened again moves
+    /// up instead of listing twice.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn remember_workspace(&mut self, workspace: SavedWorkspace) {
+        self.recent_workspaces
+            .retain(|saved| !saved.is(&workspace.endpoint, &workspace.path));
+        self.recent_workspaces.insert(0, workspace);
+        self.recent_workspaces.truncate(RECENT_WORKSPACES);
+    }
+
+    /// The recent folders that are not pinned, which are listed in their own
+    /// block so a folder never shows twice.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn recent_unpinned(&self) -> impl Iterator<Item = &SavedWorkspace> {
+        self.recent_workspaces
+            .iter()
+            .filter(|saved| !self.workspace_pinned(&saved.endpoint, &saved.path))
     }
 
     /// Drop the SIPIL row `from` into the slot of row `to`. `shown` is the rows
@@ -1013,6 +1118,16 @@ mod tests {
             index_agents: true,
             index_machines: vec!["local".to_string(), "build-box".to_string()],
             sipil_order: vec!["person:b".to_string(), "daemon:a".to_string()],
+            pinned_workspaces: vec![SavedWorkspace {
+                endpoint: "build-box".to_string(),
+                path: "/srv/api".to_string(),
+                name: "api".to_string(),
+            }],
+            recent_workspaces: vec![SavedWorkspace {
+                endpoint: "local".to_string(),
+                path: "/work/site".to_string(),
+                name: String::new(),
+            }],
             right_sidebar_visible: true,
             right_sidebar_width: 480.0,
             right_sidebar_tab: "git".to_string(),
@@ -1146,6 +1261,93 @@ mod tests {
         // Now the database has them, so the file no longer decides.
         std::fs::write(dir.join("settings.json"), r#"{"last_session":"other"}"#).expect("write");
         assert_eq!(Settings::load(&dir).last_session.as_deref(), Some("work"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn saved(endpoint: &str, path: &str) -> SavedWorkspace {
+        SavedWorkspace {
+            endpoint: endpoint.to_string(),
+            path: path.to_string(),
+            name: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_folder_pins_once_and_the_same_path_on_another_machine_is_another_pin() {
+        let mut settings = Settings::default();
+        settings.set_workspace_pinned(saved("local", "/work/api"), true);
+        settings.set_workspace_pinned(saved("local", "/work/api/"), true);
+        settings.set_workspace_pinned(saved("build-box", "/work/api"), true);
+        assert_eq!(settings.pinned_workspaces.len(), 2);
+        assert!(settings.workspace_pinned("local", "/work/api/"));
+
+        settings.set_workspace_pinned(saved("local", "/work/api"), false);
+        assert!(!settings.workspace_pinned("local", "/work/api"));
+        assert!(settings.workspace_pinned("build-box", "/work/api"));
+        // Unpinning what was never pinned is a no-op.
+        settings.set_workspace_pinned(saved("local", "/nowhere"), false);
+        assert_eq!(settings.pinned_workspaces.len(), 1);
+    }
+
+    #[test]
+    fn recent_folders_lead_with_the_newest_and_do_not_repeat() {
+        let mut settings = Settings::default();
+        for n in 0..RECENT_WORKSPACES + 3 {
+            settings.remember_workspace(saved("local", &format!("/w/{n}")));
+        }
+        assert_eq!(settings.recent_workspaces.len(), RECENT_WORKSPACES);
+        assert_eq!(settings.recent_workspaces[0].path, "/w/10");
+
+        // Opening an older one again moves it to the front instead of adding.
+        settings.remember_workspace(saved("local", "/w/5"));
+        assert_eq!(settings.recent_workspaces.len(), RECENT_WORKSPACES);
+        assert_eq!(settings.recent_workspaces[0].path, "/w/5");
+        assert_eq!(
+            settings
+                .recent_workspaces
+                .iter()
+                .filter(|saved| saved.path == "/w/5")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_pinned_folder_is_left_out_of_the_recent_block() {
+        let mut settings = Settings::default();
+        settings.remember_workspace(saved("local", "/w/a"));
+        settings.remember_workspace(saved("local", "/w/b"));
+        settings.set_workspace_pinned(saved("local", "/w/a"), true);
+        let rest: Vec<_> = settings
+            .recent_unpinned()
+            .map(|s| s.path.as_str())
+            .collect();
+        assert_eq!(rest, ["/w/b"]);
+    }
+
+    #[test]
+    fn a_row_is_named_for_its_folder_unless_it_has_a_name() {
+        assert_eq!(saved("local", "/work/api/").label(), "api");
+        assert_eq!(saved("local", "~").label(), "~");
+        assert_eq!(saved("local", "/").label(), "/");
+        let mut named = saved("local", "/work/api");
+        named.name = " Backend ".to_string();
+        assert_eq!(named.label(), "Backend");
+    }
+
+    #[test]
+    fn pinned_and_recent_folders_survive_the_database_round_trip() {
+        let dir = std::env::temp_dir().join(format!("pilus-ui-pins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut settings = Settings::load(&dir);
+        settings.set_workspace_pinned(saved("build-box", "/srv/api"), true);
+        settings.remember_workspace(saved("local", "/work/site"));
+        settings.save(&dir);
+
+        let back = Settings::load(&dir);
+        assert_eq!(back.pinned_workspaces, settings.pinned_workspaces);
+        assert_eq!(back.recent_workspaces, settings.recent_workspaces);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

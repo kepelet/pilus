@@ -34,6 +34,20 @@ pub enum MenuTarget {
         cwd: String,
         /// Current branch, for Copy Branch.
         branch: Option<String>,
+        /// Whether the folder is already pinned, which turns Pin into Unpin.
+        pinned: bool,
+    },
+    /// A saved folder in the PINNED WORKSPACES section or on Home's Pinned and
+    /// Recent blocks, which is not open as a workspace (yet).
+    Saved {
+        /// Endpoint key (`local` or a machine id).
+        endpoint: String,
+        /// The folder on that endpoint's machine.
+        path: String,
+        /// What the folder is called, kept if it is pinned from here.
+        name: String,
+        /// Whether it is pinned now, which turns Pin into Unpin.
+        pinned: bool,
     },
     /// A live AGENTS row, addressed by its pane id.
     Agent {
@@ -73,6 +87,10 @@ pub enum Item {
     Close,
     /// Rename the workspace's label, or give the agent's pane a live alias.
     Rename,
+    /// Keep the workspace's folder in PINNED WORKSPACES and on Home.
+    PinWorkspace,
+    /// Take the folder out of PINNED WORKSPACES again.
+    UnpinWorkspace,
     /// Toggle the second (path) line of every row in the owning section.
     TogglePaths,
     /// The parent row of the copy submenu.
@@ -145,6 +163,8 @@ impl Item {
         match self {
             Self::Close => "Close",
             Self::Rename => "Rename",
+            Self::PinWorkspace => "Pin this Workspace",
+            Self::UnpinWorkspace => "Unpin this Workspace",
             Self::TogglePaths => {
                 if paths_visible {
                     "Hide Path"
@@ -266,9 +286,10 @@ impl SidebarMenu {
     /// checkout as a linked worktree.
     pub fn rows(&self, linked: bool) -> Vec<Item> {
         match &self.target {
-            MenuTarget::Workspace { branch, .. } => {
-                workspace_rows(branch.as_deref().is_some(), linked)
+            MenuTarget::Workspace { branch, pinned, .. } => {
+                workspace_rows(branch.as_deref().is_some(), linked, *pinned)
             }
+            MenuTarget::Saved { pinned, .. } => saved_rows(*pinned),
             MenuTarget::Agent { .. } => agent_rows(),
             MenuTarget::Terminal { selection, agent } => terminal_rows(*selection, *agent),
             MenuTarget::Github => github_rows(),
@@ -306,12 +327,18 @@ impl SidebarMenu {
 }
 
 /// WORKSPACES top-level rows, in the daemon's render order: node actions,
-/// the copy submenu, then worktrees when the row is a git repo. The path
-/// toggle's label is applied at render.
-fn workspace_rows(is_repo: bool, linked: bool) -> Vec<Item> {
+/// the copy submenu, then worktrees when the row is a git repo. Pinning is
+/// pilus's own, so it sits with the row's own actions rather than among the
+/// daemon's. The path toggle's label is applied at render.
+fn workspace_rows(is_repo: bool, linked: bool, pinned: bool) -> Vec<Item> {
     let mut items = vec![
         Item::Close,
         Item::Rename,
+        if pinned {
+            Item::UnpinWorkspace
+        } else {
+            Item::PinWorkspace
+        },
         Item::TogglePaths,
         Item::QuickActions,
     ];
@@ -324,6 +351,19 @@ fn workspace_rows(is_repo: bool, linked: bool) -> Vec<Item> {
         items.push(Item::NewWorktree);
     }
     items
+}
+
+/// A saved folder's rows: a click already opens it, so the menu only pins or
+/// unpins it and hands over its path.
+fn saved_rows(pinned: bool) -> Vec<Item> {
+    vec![
+        if pinned {
+            Item::UnpinWorkspace
+        } else {
+            Item::PinWorkspace
+        },
+        Item::CopyPath,
+    ]
 }
 
 /// The GitHub section header's rows: the full list, a refresh, then the two
@@ -405,12 +445,13 @@ mod tests {
 
     #[test]
     fn workspace_rows_follow_the_daemons_order() {
-        let rows = workspace_rows(true, true);
+        let rows = workspace_rows(true, true, false);
         assert_eq!(
             rows,
             vec![
                 Item::Close,
                 Item::Rename,
+                Item::PinWorkspace,
                 Item::TogglePaths,
                 Item::QuickActions,
                 Item::DeleteWorktree,
@@ -419,13 +460,24 @@ mod tests {
         );
         // A non-repo row drops the git rows. The delete row needs a
         // confirmed linked checkout, not just any repo row.
-        let rows = workspace_rows(false, false);
+        let rows = workspace_rows(false, false, false);
         assert!(!rows.contains(&Item::DeleteWorktree));
         assert!(!rows.contains(&Item::NewWorktree));
-        let main = workspace_rows(true, false);
+        let main = workspace_rows(true, false, false);
         assert!(!main.contains(&Item::DeleteWorktree));
-        let linked = workspace_rows(true, true);
+        let linked = workspace_rows(true, true, false);
         assert!(linked.contains(&Item::DeleteWorktree));
+    }
+
+    #[test]
+    fn a_pinned_folder_offers_unpin_in_place_of_pin() {
+        let pin = workspace_rows(false, false, false);
+        assert!(pin.contains(&Item::PinWorkspace) && !pin.contains(&Item::UnpinWorkspace));
+        let unpin = workspace_rows(false, false, true);
+        assert!(unpin.contains(&Item::UnpinWorkspace) && !unpin.contains(&Item::PinWorkspace));
+        assert_eq!(Item::PinWorkspace.label(false, false), "Pin this Workspace");
+        assert_eq!(saved_rows(true), vec![Item::UnpinWorkspace, Item::CopyPath]);
+        assert_eq!(saved_rows(false), vec![Item::PinWorkspace, Item::CopyPath]);
     }
 
     #[test]
@@ -443,6 +495,7 @@ mod tests {
             name: "api".into(),
             cwd: "/repo/api".into(),
             branch: Some("main".into()),
+            pinned: false,
         };
         let menu = SidebarMenu::new(target, 0.0, 0.0);
         assert_eq!(menu.quick_rows(), vec![Item::CopyPath, Item::CopyBranch]);
@@ -572,6 +625,7 @@ mod tests {
                 name: "web".into(),
                 cwd: "/repo/web".into(),
                 branch: None,
+                pinned: false,
             },
             0.0,
             0.0,

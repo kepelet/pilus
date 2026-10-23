@@ -514,7 +514,13 @@ fn status_rank(status: &str) -> u8 {
 
 /// A titled block: the section frame the other pages use, with a count at the
 /// right of its label.
-fn card(theme: Theme, fonts: Fonts, label: &'static str, count: Option<usize>, body: Div) -> Div {
+pub(super) fn card(
+    theme: Theme,
+    fonts: Fonts,
+    label: &'static str,
+    count: Option<usize>,
+    body: Div,
+) -> Div {
     div()
         .flex()
         .flex_col()
@@ -543,7 +549,7 @@ fn card(theme: Theme, fonts: Fonts, label: &'static str, count: Option<usize>, b
 }
 
 /// What a block says when it has nothing to list.
-fn quiet(theme: Theme, fonts: Fonts, title: &str, detail: &str) -> Div {
+pub(super) fn quiet(theme: Theme, fonts: Fonts, title: &str, detail: &str) -> Div {
     div()
         .flex()
         .flex_col()
@@ -582,6 +588,8 @@ impl PilusView {
             .flex_1()
             .min_w(px(0.0))
             .gap_4()
+            .child(self.overview_pinned_card(cx))
+            .children(self.overview_recent_card(cx))
             .child(self.overview_agents_card(
                 "WORKING NOW",
                 &busy,
@@ -796,7 +804,7 @@ impl PilusView {
 
     /// One row of a block: a lead glyph, a title over a line of detail, and
     /// whatever trails. The caller adds the click.
-    fn overview_row(
+    pub(super) fn overview_row(
         &self,
         id: String,
         lead: impl IntoElement,
@@ -854,7 +862,7 @@ impl PilusView {
     }
 
     /// The small muted text at a row's right edge.
-    fn overview_trail(&self, text: String) -> AnyElement {
+    pub(super) fn overview_trail(&self, text: String) -> AnyElement {
         div()
             .flex_shrink_0()
             .text_size(px(Fonts::resolve(&self.shared_settings).label))
@@ -1377,6 +1385,21 @@ impl PilusView {
             url: String::new(),
         };
         self.settings.index_agents = true;
+        // Fixed folders, so a shot shows neither the person's pins nor a
+        // machine of theirs.
+        let folder = |endpoint: &str, path: &str, name: &str| crate::settings::SavedWorkspace {
+            endpoint: endpoint.to_string(),
+            path: path.to_string(),
+            name: name.to_string(),
+        };
+        self.settings.pinned_workspaces = vec![
+            folder("local", "/Users/me/Developer/kepelet/pilus", "pilus"),
+            folder("build-box", "/srv/sipil", "sipil"),
+        ];
+        self.settings.recent_workspaces = vec![
+            folder("local", "/Users/me/Developer/kepelet/site", ""),
+            folder("local", "/Users/me/Developer/kepelet/pilus", ""),
+        ];
         *self.shared_settings.borrow_mut() = self.settings.clone();
         let page = &mut self.overview;
         page.open = true;

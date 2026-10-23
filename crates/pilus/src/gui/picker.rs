@@ -66,6 +66,13 @@ pub enum PickerEvent {
     },
     /// A `workspace.open` request finished.
     Opened(Result<(), String>),
+    /// A pinned or recent folder's `workspace.open` finished.
+    SavedOpened {
+        /// The folder that was asked for, on the machine it belongs to.
+        saved: crate::settings::SavedWorkspace,
+        /// Whether the daemon opened it.
+        result: Result<(), String>,
+    },
     /// A `worktree.create` request finished.
     WorktreeOpened(Result<(), String>),
     /// A local terminal's `tab.new` finished.

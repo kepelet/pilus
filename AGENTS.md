@@ -61,6 +61,19 @@ with only the command-line tools can build the app.
   `--check-updates` (`Settings::preferences`, which does not open the database)
   also read.
 
+- Pinned and recent workspaces (`gui/pinned.rs`) are folders on a machine, not
+  open workspaces: `Settings::pinned_workspaces` and `recent_workspaces` (the
+  newest `RECENT_WORKSPACES`, written when the picker or a pin opens one), both in
+  the `ui_state` document, keyed by endpoint (`local` or a machine id) and path.
+  "Pin this Workspace" is in a WORKSPACES row's context menu; the sidebar's PINNED
+  WORKSPACES section (drawn only when something is pinned) and Home's Pinned and
+  Recent blocks open one the same way: `workspace.open` on a worker thread through
+  the control client, which reaches a saved machine over SSH whether or not the
+  window is attached to it, then `activate_opened_endpoint`. The window leaves its
+  page only when the daemon has answered, so a failed open can be retried. A pin
+  and a path are compared after expanding `~` against the machine's home, so the
+  same folder spelled two ways is one pin.
+
 - The GitHub Repositories section reads the signed-in account through `gh` on
   the machine `pilus` runs on, never through a daemon or SSH. It shows three
   repositories: `Settings::github_pinned` first, then the most recently pushed

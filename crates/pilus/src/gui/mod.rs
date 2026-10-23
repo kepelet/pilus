@@ -50,6 +50,7 @@ mod pane_chrome;
 mod pane_frames;
 mod perf;
 mod picker;
+mod pinned;
 mod ports_tab;
 mod process;
 mod right_sidebar;
@@ -2010,6 +2011,8 @@ struct PilusView {
     sidebar_revision: u64,
     /// Whether the native sidebar is expanded.
     sidebar_visible: bool,
+    /// Whether the PINNED WORKSPACES section is collapsed to its header.
+    pinned_collapsed: bool,
     /// Whether the WORKSPACES section is collapsed to its header.
     workspaces_collapsed: bool,
     /// Keys of the machines whose workspaces are folded under their row.
@@ -2620,6 +2623,7 @@ impl PilusView {
             worktree_probing: HashSet::new(),
             sidebar_revision: 0,
             sidebar_visible: true,
+            pinned_collapsed: false,
             workspaces_collapsed: false,
             machines_collapsed: HashSet::new(),
             machine_toggled: None,
@@ -3322,6 +3326,10 @@ impl PilusView {
                             );
                         }
                     }
+                    changed = true;
+                }
+                PickerEvent::SavedOpened { saved, result } => {
+                    self.saved_workspace_opened(saved, result, cx);
                     changed = true;
                 }
                 PickerEvent::WorktreeOpened(result) => {
@@ -5385,6 +5393,9 @@ impl PilusView {
             return;
         };
         self.close_picker();
+        if let Some(endpoint) = self.endpoint_for_source(&source) {
+            self.remember_folder(&endpoint.key(), &path);
+        }
         // Opening from the Home composer's picker should leave the composer
         // targeting the workspace it just opened, once the catalog catches up.
         if self.home.is_open() {
@@ -10170,6 +10181,7 @@ impl PilusView {
                 target.clone(),
             )),
             SidebarMenuTarget::Agent { .. }
+            | SidebarMenuTarget::Saved { .. }
             | SidebarMenuTarget::Terminal { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => None,
@@ -10211,6 +10223,7 @@ impl PilusView {
             SidebarMenuTarget::Workspace { branch: None, .. } => return,
             SidebarMenuTarget::Workspace { cwd, .. } => self.expand_cwd(endpoint_key, cwd),
             SidebarMenuTarget::Agent { .. }
+            | SidebarMenuTarget::Saved { .. }
             | SidebarMenuTarget::Terminal { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => return,
@@ -10258,6 +10271,7 @@ impl PilusView {
                 .get(&(endpoint.clone(), workspace_id.clone()))
                 .is_some_and(Option::is_some),
             SidebarMenuTarget::Agent { .. }
+            | SidebarMenuTarget::Saved { .. }
             | SidebarMenuTarget::Terminal { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => false,
@@ -10450,6 +10464,34 @@ impl PilusView {
                     "",
                     cx,
                 );
+            }
+            (
+                SidebarMenuTarget::Workspace {
+                    endpoint,
+                    cwd,
+                    name,
+                    ..
+                },
+                SidebarItem::PinWorkspace | SidebarItem::UnpinWorkspace,
+            ) => {
+                self.close_context_menu();
+                self.set_folder_pinned(endpoint, cwd, name, item == SidebarItem::PinWorkspace, cx);
+            }
+            (
+                SidebarMenuTarget::Saved {
+                    endpoint,
+                    path,
+                    name,
+                    ..
+                },
+                SidebarItem::PinWorkspace | SidebarItem::UnpinWorkspace,
+            ) => {
+                self.close_context_menu();
+                self.set_folder_pinned(endpoint, path, name, item == SidebarItem::PinWorkspace, cx);
+            }
+            (SidebarMenuTarget::Saved { path, .. }, SidebarItem::CopyPath) => {
+                self.close_context_menu();
+                self.menu_copy(path, cx);
             }
             (SidebarMenuTarget::Agent { .. }, SidebarItem::Rename) => {
                 self.close_context_menu();
@@ -11275,6 +11317,7 @@ impl PilusView {
         content = content.children(self.sipil_sections(cx));
 
         content = content.children(self.github_sidebar(cx));
+        content = content.children(self.pinned_section(cx));
         content = content.child(self.workspaces_section(cx));
         content = content.child(self.agents_section(cx));
 
@@ -12624,7 +12667,8 @@ impl PilusView {
             SidebarMenuTarget::Agent { .. } => {
                 (self.sidebar_agent_paths, self.agents_this_workspace)
             }
-            SidebarMenuTarget::Terminal { .. }
+            SidebarMenuTarget::Saved { .. }
+            | SidebarMenuTarget::Terminal { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => (false, false),
         };
@@ -13362,6 +13406,7 @@ impl PilusView {
                         name: workspace_name.clone(),
                         cwd: workspace_cwd.clone(),
                         branch: workspace_branch.clone(),
+                        pinned: this.folder_pinned(&menu_endpoint.key(), &workspace_cwd),
                     },
                     event.position,
                     cx,
@@ -16632,6 +16677,8 @@ fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
     match item {
         SidebarItem::Close => include_bytes!("../../assets/icons/x.svg"),
         SidebarItem::Rename => include_bytes!("../../assets/icons/pencil.svg"),
+        SidebarItem::PinWorkspace => include_bytes!("../../assets/icons/pin.svg"),
+        SidebarItem::UnpinWorkspace => include_bytes!("../../assets/icons/minus.svg"),
         SidebarItem::TogglePaths => include_bytes!("../../assets/icons/folder.svg"),
         SidebarItem::QuickActions => include_bytes!("../../assets/icons/chevron-right.svg"),
         SidebarItem::CopyPath | SidebarItem::CopyBranch => {

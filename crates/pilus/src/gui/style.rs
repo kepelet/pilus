@@ -21,7 +21,7 @@ use gpui::{
 
 use crate::settings::{CHROME_FONT, CORNER_RADIUS, DEFAULT_CORNER_RADIUS, Settings};
 
-use super::theme::{Theme, tile_glyph};
+use super::theme::Theme;
 use super::toast::ToastKind;
 
 /// How long a skeleton takes to fade from dim to lit and back. Long enough to
@@ -333,6 +333,11 @@ const STACK_TILT: [f32; STACK_MAX as usize - 1] = [7.0, -6.0];
 /// glance across the strip, little enough that the glyph keeps its contrast.
 const STATUS_WASH: f32 = 0.45;
 
+/// How much of the foreground a tile's glyph keeps: dimmed so the mark sits
+/// quietly in the strip, yet clear of the fill on a light theme, where the
+/// border role is too faint to read as a glyph.
+const GLYPH_DIM: f32 = 0.6;
+
 /// A bordered tile holding a glyph on the theme's panel fill, so the glyph
 /// reads on a surface rather than on the bare strip: a tab's terminal or agent
 /// mark. With `panes` above one it becomes a deck, one card more behind it per
@@ -425,7 +430,7 @@ pub(super) fn glyph_tile(
                 .w(px(GLYPH_TILE * 0.6))
                 .h(px(GLYPH_TILE * 0.6))
                 .flex_shrink_0()
-                .text_color(tile_glyph()),
+                .text_color(tint(theme.panel_fg, GLYPH_DIM)),
         );
     deck.child(front)
 }

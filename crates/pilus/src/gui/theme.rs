@@ -25,12 +25,6 @@ pub fn qr_light() -> Rgba {
     rgb(0xffffff)
 }
 
-/// The glyph on a tab's tile. It stays white in light and dark themes alike, so
-/// the mark reads the same whichever theme the tile's fill comes from.
-pub fn tile_glyph() -> Rgba {
-    rgb(0xffffff)
-}
-
 /// How far translucent chrome darkens `window_bg` toward black.
 const CHROME_SHADE: f32 = 0.35;
 /// How much of the remaining transparency translucent chrome fills in, so it

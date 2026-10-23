@@ -345,7 +345,7 @@ gpui::actions!([
     CloseAllWindows,
     /// Show the About window.
     OpenAbout,
-    /// Check for updates (not wired up yet).
+    /// Check for updates and show the Update window.
     CheckForUpdates,
     /// Grow the terminal font size.
     IncreaseFontSize,
@@ -560,6 +560,16 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
         cx.on_action(|_: &QuitApp, cx: &mut App| {
             cx.quit();
         });
+        // A main window handles these itself, against its own updater; these
+        // answer the application menu while none is open.
+        cx.on_action({
+            let app_shared = app_shared.clone();
+            move |_: &OpenAbout, cx: &mut App| app_shared.show_about(cx)
+        });
+        cx.on_action({
+            let app_shared = app_shared.clone();
+            move |_: &CheckForUpdates, cx: &mut App| app_shared.check_for_updates(cx)
+        });
         // Quitting leaves the menu bar item standing, in a helper process,
         // unless the user ended pilus from the item itself.
         cx.on_app_quit({
@@ -744,6 +754,27 @@ impl AppShared {
             .any(|window| window.downcast::<PilusView>().is_some())
     }
 
+    /// Open the About window. It needs no main window, so the menu bar item
+    /// and the application menu can reach it with every window closed.
+    fn show_about(&self, cx: &mut App) {
+        about::open(*self.theme.borrow(), self.settings.clone(), cx);
+        cx.activate(true);
+    }
+
+    /// Check for updates and show the Update window with no main window open.
+    /// A window's own check reuses its updater; this one builds a fresh
+    /// updater that the Update window keeps alive.
+    fn check_for_updates(&self, cx: &mut App) {
+        let request = {
+            let settings = self.settings.borrow();
+            UpdateRequest::from_settings(&settings.update_channel, settings.update_feed_url.clone())
+        };
+        let updater = cx.new(|cx| Updater::from_request(&request, cx));
+        updater.update(cx, |updater, cx| updater.check(cx));
+        update_window::show(updater, *self.theme.borrow(), self.settings.clone(), cx);
+        cx.activate(true);
+    }
+
     /// Open a main window, then focus `menu_pick` once its endpoint is up.
     fn open_window(&self, menu_pick: Option<(String, String)>, cx: &mut App) {
         // The helper has no Dock icon; a window makes it the full app, and
@@ -818,6 +849,8 @@ impl AppShared {
                     self.open_window(None, cx);
                     cx.activate(true);
                 }
+                menubar::Pick::About => self.show_about(cx),
+                menubar::Pick::CheckForUpdates => self.check_for_updates(cx),
                 menubar::Pick::Agent { endpoint, pane } => {
                     self.open_window(Some((endpoint, pane)), cx);
                     cx.activate(true);
@@ -9319,6 +9352,8 @@ impl PilusView {
                     return;
                 }
                 menubar::Pick::Show => self.raise_window(cx),
+                menubar::Pick::About => about::open(self.theme, self.shared_settings.clone(), cx),
+                menubar::Pick::CheckForUpdates => self.check_for_updates(cx),
                 menubar::Pick::Energy => self.toggle_energy_mode(cx),
                 menubar::Pick::Agent { endpoint, pane } => {
                     self.raise_window(cx);

@@ -38,6 +38,10 @@ pub enum Pick {
     Agent { endpoint: String, pane: String },
     /// Bring the window forward, opening one if none is left.
     Show,
+    /// Open the About window.
+    About,
+    /// Check for updates and show the result.
+    CheckForUpdates,
     /// Turn energy mode on or off.
     Energy,
     /// Quit pilus, as Cmd+Q does.
@@ -121,6 +125,8 @@ mod imp {
         match pick {
             Pick::Agent { endpoint, pane } => format!("agent{FIELD}{endpoint}{FIELD}{pane}"),
             Pick::Show => "show".to_string(),
+            Pick::About => "about".to_string(),
+            Pick::CheckForUpdates => "updates".to_string(),
             Pick::Energy => "energy".to_string(),
             Pick::Quit => "quit".to_string(),
         }
@@ -134,6 +140,8 @@ mod imp {
                 pane: fields.next()?.to_string(),
             }),
             "show" => Some(Pick::Show),
+            "about" => Some(Pick::About),
+            "updates" => Some(Pick::CheckForUpdates),
             "energy" => Some(Pick::Energy),
             "quit" => Some(Pick::Quit),
             _ => None,
@@ -329,6 +337,8 @@ mod imp {
             }
             menu.addItem(&NSMenuItem::separatorItem(self.mtm));
             menu.addItem(&self.action_item("Show pilus", Some(&Pick::Show)));
+            menu.addItem(&self.action_item("About pilus", Some(&Pick::About)));
+            menu.addItem(&self.action_item("Check for Updates", Some(&Pick::CheckForUpdates)));
             let toggle = self.action_item("Energy Mode", Some(&Pick::Energy));
             toggle.setState(if energy {
                 NSControlStateValueOn

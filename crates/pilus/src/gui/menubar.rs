@@ -9,7 +9,8 @@
 //! sidebar click. One status item serves the whole process and outlives every
 //! window: a single open window feeds it, so a second window does not stack a
 //! second icon, and with none open [`headless`] feeds it from the app's own
-//! watcher. Other platforms have no menu bar, so they do nothing.
+//! watcher. Pinned workspaces follow the agents, and a click on one opens
+//! that folder like the sidebar's PINNED WORKSPACES row does. Other platforms have no menu bar, so they do nothing.
 
 /// One agent in the menu.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,11 +32,27 @@ pub struct Row {
     pub color: [u8; 3],
 }
 
+/// One pinned workspace in the menu: a folder on an endpoint, not an open
+/// workspace.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pinned {
+    /// The owning endpoint's key, echoed back in the [`Pick`].
+    pub endpoint: String,
+    /// The folder, as it was pinned.
+    pub path: String,
+    /// The label to draw.
+    pub title: String,
+    /// The machine's display name, empty for this Mac.
+    pub host: String,
+}
+
 /// What a menu click asks the window to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Pick {
     /// Focus an agent's pane on its endpoint.
     Agent { endpoint: String, pane: String },
+    /// Open a pinned folder in a new terminal on its endpoint.
+    Pinned { endpoint: String, path: String },
     /// Bring the window forward, opening one if none is left.
     Show,
     /// Open the About window.
@@ -71,7 +88,7 @@ mod imp {
         NSAttributedString, NSData, NSMutableAttributedString, NSNumber, NSRange, NSSize, NSString,
     };
 
-    use super::{Pick, Row};
+    use super::{Pick, Pinned, Row};
 
     /// Separates the fields packed into a menu item's represented object.
     const FIELD: char = '\u{1f}';
@@ -124,6 +141,7 @@ mod imp {
     fn pack(pick: &Pick) -> String {
         match pick {
             Pick::Agent { endpoint, pane } => format!("agent{FIELD}{endpoint}{FIELD}{pane}"),
+            Pick::Pinned { endpoint, path } => format!("pinned{FIELD}{endpoint}{FIELD}{path}"),
             Pick::Show => "show".to_string(),
             Pick::About => "about".to_string(),
             Pick::CheckForUpdates => "updates".to_string(),
@@ -138,6 +156,10 @@ mod imp {
             "agent" => Some(Pick::Agent {
                 endpoint: fields.next()?.to_string(),
                 pane: fields.next()?.to_string(),
+            }),
+            "pinned" => Some(Pick::Pinned {
+                endpoint: fields.next()?.to_string(),
+                path: fields.next()?.to_string(),
             }),
             "show" => Some(Pick::Show),
             "about" => Some(Pick::About),
@@ -220,7 +242,7 @@ mod imp {
         glyph: Option<Retained<NSImage>>,
         /// The dot's font and baseline lift, measured once.
         dot: (Retained<NSFont>, f64),
-        shown: Option<(Vec<Row>, bool)>,
+        shown: Option<(Vec<Row>, Vec<Pinned>, bool)>,
         /// The window that feeds the menu; `None` leaves it to [`headless`].
         owner: Option<u64>,
     }
@@ -295,12 +317,10 @@ mod imp {
             item
         }
 
-        fn rebuild(&mut self, rows: &[Row], energy: bool) {
-            if self
-                .shown
-                .as_ref()
-                .is_some_and(|(shown, on)| shown.as_slice() == rows && *on == energy)
-            {
+        fn rebuild(&mut self, rows: &[Row], pinned: &[Pinned], energy: bool) {
+            if self.shown.as_ref().is_some_and(|(shown, kept, on)| {
+                shown.as_slice() == rows && kept.as_slice() == pinned && *on == energy
+            }) {
                 return;
             }
             let menu = NSMenu::new(self.mtm);
@@ -335,6 +355,24 @@ mod imp {
                 }
                 menu.addItem(&item);
             }
+            if !pinned.is_empty() {
+                menu.addItem(&NSMenuItem::separatorItem(self.mtm));
+                menu.addItem(&self.header("Pinned Workspaces"));
+                for workspace in pinned {
+                    let pick = Pick::Pinned {
+                        endpoint: workspace.endpoint.clone(),
+                        path: workspace.path.clone(),
+                    };
+                    let item = self.action_item(&workspace.title, Some(&pick));
+                    let tip = if workspace.host.is_empty() {
+                        workspace.path.clone()
+                    } else {
+                        format!("{}: {}", workspace.host, workspace.path)
+                    };
+                    item.setToolTip(Some(&NSString::from_str(&tip)));
+                    menu.addItem(&item);
+                }
+            }
             menu.addItem(&NSMenuItem::separatorItem(self.mtm));
             menu.addItem(&self.action_item("Show pilus", Some(&Pick::Show)));
             menu.addItem(&self.action_item("About pilus", Some(&Pick::About)));
@@ -352,15 +390,24 @@ mod imp {
             if let Some(button) = self.item.button(self.mtm) {
                 button.setImage(self.glyph.as_deref());
             }
-            self.shown = Some((rows.to_vec(), energy));
+            self.shown = Some((rows.to_vec(), pinned.to_vec(), energy));
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::logo_template;
-        use super::{DOT, DOT_SCALE, dot_style, ink_center};
+        use super::{DOT, DOT_SCALE, Pick, dot_style, ink_center, pack, unpack};
         use objc2_app_kit::NSFont;
+
+        #[test]
+        fn a_pinned_pick_survives_the_trip_through_a_menu_item() {
+            let pick = Pick::Pinned {
+                endpoint: "build-box".to_string(),
+                path: "/srv/my project".to_string(),
+            };
+            assert_eq!(unpack(&pack(&pick)), Some(pick));
+        }
 
         #[test]
         fn the_dot_is_lifted_onto_the_middle_of_the_label() {
@@ -416,7 +463,7 @@ mod imp {
 
         /// Show `rows`, installing the item when `enabled`, or remove it.
         /// While another window owns the item this does nothing.
-        pub fn sync(&mut self, enabled: bool, rows: &[Row], energy: bool) {
+        pub fn sync(&mut self, enabled: bool, rows: &[Row], pinned: &[Pinned], energy: bool) {
             let Some(mtm) = MainThreadMarker::new() else {
                 return;
             };
@@ -435,7 +482,7 @@ mod imp {
                 let state = shared.get_or_insert_with(|| Shared::install(mtm));
                 state.owner.get_or_insert(self.id);
                 if state.owner == Some(self.id) {
-                    state.rebuild(rows, energy);
+                    state.rebuild(rows, pinned, energy);
                 }
             });
         }
@@ -470,7 +517,7 @@ mod imp {
     /// Feed the item while no window owns it: install it when `enabled`,
     /// remove it otherwise, and return the clicks since the last call. Does
     /// nothing while a window owns the item.
-    pub fn headless(enabled: bool, rows: &[Row], energy: bool) -> Vec<Pick> {
+    pub fn headless(enabled: bool, rows: &[Row], pinned: &[Pinned], energy: bool) -> Vec<Pick> {
         let Some(mtm) = MainThreadMarker::new() else {
             return Vec::new();
         };
@@ -486,7 +533,7 @@ mod imp {
             if state.owner.is_some() {
                 return Vec::new();
             }
-            state.rebuild(rows, energy);
+            state.rebuild(rows, pinned, energy);
             state.rx.try_iter().collect()
         })
     }
@@ -494,11 +541,11 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    use super::{Pick, Row};
+    use super::{Pick, Pinned, Row};
 
     pub struct MenuBar;
 
-    pub fn headless(_enabled: bool, _rows: &[Row], _energy: bool) -> Vec<Pick> {
+    pub fn headless(_enabled: bool, _rows: &[Row], _pinned: &[Pinned], _energy: bool) -> Vec<Pick> {
         Vec::new()
     }
 
@@ -507,7 +554,7 @@ mod imp {
             Self
         }
 
-        pub fn sync(&mut self, _enabled: bool, _rows: &[Row], _energy: bool) {}
+        pub fn sync(&mut self, _enabled: bool, _rows: &[Row], _pinned: &[Pinned], _energy: bool) {}
 
         pub fn drain(&mut self) -> Vec<Pick> {
             Vec::new()

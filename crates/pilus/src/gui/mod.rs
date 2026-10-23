@@ -811,7 +811,7 @@ impl AppShared {
         let enabled = self.settings.borrow().menu_bar;
         if !enabled {
             *watch = None;
-            menubar::headless(false, &[], false);
+            menubar::headless(false, &[], &[], false);
             // The helper exists for the item alone, so without one it ends.
             if self.menubar_only {
                 background::quit_fully(cx);
@@ -841,8 +841,14 @@ impl AppShared {
             // new count.
             notify::set_badge(badge);
         }
-        let energy = self.settings.borrow().energy_mode;
-        for pick in menubar::headless(true, &rows, energy) {
+        let (energy, pinned) = {
+            let settings = self.settings.borrow();
+            let pinned = pinned::menu_rows(&settings.pinned_workspaces, |key| {
+                watch.group_of(key).unwrap_or_else(|| key.to_string())
+            });
+            (settings.energy_mode, pinned)
+        };
+        for pick in menubar::headless(true, &rows, &pinned, energy) {
             match pick {
                 menubar::Pick::Quit => background::quit_fully(cx),
                 menubar::Pick::Energy => toggle_energy(&self.settings, &self.pilus_root, cx),
@@ -855,6 +861,22 @@ impl AppShared {
                 menubar::Pick::Agent { endpoint, pane } => {
                     self.open_window(Some((endpoint, pane)), cx);
                     cx.activate(true);
+                }
+                menubar::Pick::Pinned { endpoint, path } => {
+                    let saved = self.settings.borrow().saved_workspace(&endpoint, &path);
+                    self.open_window(None, cx);
+                    cx.activate(true);
+                    // The window is built inside `open_window`, so it is
+                    // there to be handed the folder; it opens it once ready.
+                    if let Some(window) = cx
+                        .windows()
+                        .into_iter()
+                        .find_map(|window| window.downcast::<PilusView>())
+                    {
+                        let _ = window.update(cx, |view, _, _| {
+                            view.saved_pick = Some((saved, Instant::now()));
+                        });
+                    }
                 }
             }
         }
@@ -1814,6 +1836,9 @@ struct PilusView {
     /// a click with no window open starts a window, and the endpoint is not
     /// there yet. Dropped once it lands or after [`MENU_PICK_PATIENCE`].
     menu_pick: Option<(String, String, Instant)>,
+    /// A pinned folder the menu bar chose, opened once the machine catalog
+    /// has loaded. Dropped when it runs.
+    saved_pick: Option<(crate::settings::SavedWorkspace, Instant)>,
     /// Spots agents that start waiting on the user, across every endpoint.
     attention: attention::Watch,
     /// Measured monospace advance width, resolved once from the font.
@@ -2532,6 +2557,7 @@ impl PilusView {
             menubar: MenuBar::new(cx.entity_id().as_u64()),
             window_handle: window.window_handle(),
             menu_pick: None,
+            saved_pick: None,
             attention: attention::Watch::default(),
             cell_width: None,
             sent_cell: (0, 0),
@@ -9354,8 +9380,15 @@ impl PilusView {
                     .collect::<Vec<_>>()
             })
             .collect();
-        self.menubar
-            .sync(self.settings.menu_bar, &rows, self.settings.energy_mode);
+        let pinned = pinned::menu_rows(&self.settings.pinned_workspaces, |key| {
+            self.endpoint_label(&self.endpoint_by_key(key))
+        });
+        self.menubar.sync(
+            self.settings.menu_bar,
+            &rows,
+            &pinned,
+            self.settings.energy_mode,
+        );
         for pick in self.menubar.drain() {
             match pick {
                 menubar::Pick::Quit => {
@@ -9370,9 +9403,17 @@ impl PilusView {
                     self.raise_window(cx);
                     self.menu_pick = Some((endpoint, pane, Instant::now()));
                 }
+                menubar::Pick::Pinned { endpoint, path } => {
+                    self.raise_window(cx);
+                    self.saved_pick = Some((
+                        self.settings.saved_workspace(&endpoint, &path),
+                        Instant::now(),
+                    ));
+                }
             }
         }
         self.apply_menu_pick(cx);
+        self.apply_saved_pick(cx);
     }
 
     /// Bring this window in front of whatever app was active.
@@ -9384,6 +9425,24 @@ impl PilusView {
                 .update(cx, |_, window, _| window.activate_window())
                 .ok();
         });
+    }
+
+    /// Open the pinned folder a menu bar click chose. A folder on a saved
+    /// machine waits for the catalog, which a window that has just opened has
+    /// not read yet, since `open_saved_workspace` refuses an unknown machine;
+    /// past [`MENU_PICK_PATIENCE`] it runs anyway so the refusal is shown.
+    fn apply_saved_pick(&mut self, cx: &mut Context<Self>) {
+        let Some((saved, picked)) = self.saved_pick.clone() else {
+            return;
+        };
+        let known = match self.endpoint_by_key(&saved.endpoint) {
+            EndpointId::Local => true,
+            EndpointId::Machine(id) => self.machines.iter().any(|machine| machine.id == id),
+        };
+        if known || picked.elapsed() > MENU_PICK_PATIENCE {
+            self.saved_pick = None;
+            self.open_saved_workspace(saved, cx);
+        }
     }
 
     /// Focus the agent a menu bar click chose, once its endpoint is ready: a

@@ -122,6 +122,14 @@ impl Watch {
             .collect()
     }
 
+    /// The display name of the endpoint `key`, once its machine is known.
+    pub(super) fn group_of(&self, key: &str) -> Option<String> {
+        std::iter::once(&self.local)
+            .chain(self.machines.iter())
+            .find(|source| source.key == key)
+            .map(|source| source.group.clone())
+    }
+
     /// Take the blocked and finished transitions seen since the last call.
     pub(super) fn alerts(&mut self) -> Vec<attention::Event> {
         let events = self.attention.drain();

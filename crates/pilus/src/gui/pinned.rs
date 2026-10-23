@@ -360,3 +360,24 @@ impl PilusView {
         )
     }
 }
+
+/// The pins as the menu bar lists them. `host` names the machine behind an
+/// endpoint key; this Mac gets none.
+pub(super) fn menu_rows(
+    pinned: &[SavedWorkspace],
+    host: impl Fn(&str) -> String,
+) -> Vec<super::menubar::Pinned> {
+    pinned
+        .iter()
+        .map(|saved| super::menubar::Pinned {
+            endpoint: saved.endpoint.clone(),
+            path: saved.path.clone(),
+            title: saved.label().to_string(),
+            host: if saved.endpoint == "local" {
+                String::new()
+            } else {
+                host(&saved.endpoint)
+            },
+        })
+        .collect()
+}

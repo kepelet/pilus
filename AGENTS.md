@@ -72,7 +72,10 @@ with only the command-line tools can build the app.
   window is attached to it, then `activate_opened_endpoint`. The window leaves its
   page only when the daemon has answered, so a failed open can be retried. A pin
   and a path are compared after expanding `~` against the machine's home, so the
-  same folder spelled two ways is one pin.
+  same folder spelled two ways is one pin. The menu bar item lists the pins under
+  the agents (`menubar::Pinned`, a `Pick::Pinned` click); with no window open the
+  helper opens one and hands it the folder (`PilusView::saved_pick`), which waits
+  for the machine catalog before opening a remote pin.
 
 - The GitHub Repositories section reads the signed-in account through `gh` on
   the machine `pilus` runs on, never through a daemon or SSH. It shows three

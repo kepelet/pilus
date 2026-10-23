@@ -662,6 +662,21 @@ impl Settings {
             .any(|saved| saved.is(endpoint, path))
     }
 
+    /// The pin for the folder `path` on `endpoint`; a folder unpinned since a
+    /// menu was drawn comes back unnamed, so a stale click still opens it.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn saved_workspace(&self, endpoint: &str, path: &str) -> SavedWorkspace {
+        self.pinned_workspaces
+            .iter()
+            .find(|saved| saved.is(endpoint, path))
+            .cloned()
+            .unwrap_or_else(|| SavedWorkspace {
+                endpoint: endpoint.to_string(),
+                path: path.to_string(),
+                name: String::new(),
+            })
+    }
+
     /// Pin `workspace`, or unpin the folder it names. A folder pins once, and
     /// unpinning one that was never pinned changes nothing.
     #[cfg_attr(not(feature = "gui"), allow(dead_code))]

@@ -264,10 +264,10 @@ mod tests {
 
     #[test]
     fn link_puts_the_ticket_in_the_path_and_encodes_the_rest() {
-        let link = pairing_link("endpointabc", Some("AB12-CD34"), "Rizaldy's Mac");
+        let link = pairing_link("endpointabc", Some("AB12-CD34"), "Alex's Mac");
         assert_eq!(
             link,
-            "pilus://pair/endpointabc?code=AB12-CD34&name=Rizaldy%27s%20Mac"
+            "pilus://pair/endpointabc?code=AB12-CD34&name=Alex%27s%20Mac"
         );
     }
 

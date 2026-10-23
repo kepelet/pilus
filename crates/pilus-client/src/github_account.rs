@@ -1295,7 +1295,7 @@ esac"#,
         assert!(!valid_slug("-x/y"));
         assert!(!valid_slug("a/b c"));
         assert!(!valid_slug("a/b/c;rm"));
-        assert!(valid_login("faultables"));
+        assert!(valid_login("octocat"));
         assert!(!valid_login("a+b"));
         assert!(!valid_login(""));
     }

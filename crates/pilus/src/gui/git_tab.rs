@@ -1003,7 +1003,7 @@ impl PilusView {
             |sha: &str, subject: &str, when: &str, refs: &[(&str, CommitRefKind)]| GitCommit {
                 sha: sha.to_string(),
                 subject: subject.to_string(),
-                author: "faultables".to_string(),
+                author: "octocat".to_string(),
                 when: when.to_string(),
                 refs: refs
                     .iter()
@@ -1096,7 +1096,7 @@ impl PilusView {
             };
             let detail = CommitDetail {
                 sha: format!("{sha}0c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"),
-                author: "faultables".to_string(),
+                author: "octocat".to_string(),
                 date: "2026-10-09 14:02".to_string(),
                 message: "docs: cover pilus-agent, pilus-mobile, and the hub's model catalog\n\nThe hub grew a model catalog and a terminal pseudo-kind; the\narchitecture notes still described the old surface."
                     .to_string(),

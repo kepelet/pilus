@@ -92,7 +92,8 @@ impl Palette {
         &self.input
     }
 
-    /// The query buffer, for a caller that sets the text itself.
+    /// The query buffer, for the shot harness to type a query into.
+    #[cfg(feature = "visual-test")]
     pub fn input_mut(&mut self) -> &mut TextField {
         &mut self.input
     }

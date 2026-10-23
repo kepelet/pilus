@@ -316,12 +316,8 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) {
         // The permission is Search's: the index on, and this machine ticked.
-        let allowed = self.settings.index_agents
-            && self
-                .settings
-                .index_machines
-                .iter()
-                .any(|key| *key == session.machine);
+        let allowed =
+            self.settings.index_agents && self.settings.index_machines.contains(&session.machine);
         let source = self
             .search_choices()
             .into_iter()
@@ -691,12 +687,7 @@ impl PilusView {
             .into_any_element()
     }
 
-    fn session_entry(
-        &self,
-        row: &Row,
-        entry: &Entry,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn session_entry(&self, row: &Row, entry: &Entry, cx: &mut Context<Self>) -> AnyElement {
         let index = row.entry;
         let theme = self.theme;
         let fonts = Fonts::resolve(&self.shared_settings);

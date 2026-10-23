@@ -137,7 +137,9 @@ fn finish(key: u64, state: State) {
 }
 
 fn cache() -> MutexGuard<'static, Option<HashMap<u64, Entry>>> {
-    CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn key(source: &str, style: &Style) -> u64 {
@@ -199,8 +201,10 @@ fn rasterize(svg: &str) -> Option<Diagram> {
         return None;
     }
     let scale = SHARPNESS.min(MAX_EDGE / width).min(MAX_EDGE / height);
-    let mut pixmap =
-        resvg::tiny_skia::Pixmap::new((width * scale).ceil() as u32, (height * scale).ceil() as u32)?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(
+        (width * scale).ceil() as u32,
+        (height * scale).ceil() as u32,
+    )?;
     resvg::render(
         &tree,
         resvg::tiny_skia::Transform::from_scale(scale, scale),
@@ -264,7 +268,8 @@ fn bytes(c: Rgba) -> [u8; 4] {
 mod tests {
     use super::*;
 
-    const FLOW: &str = "flowchart LR\n  A[Client] --> B{Auth?}\n  B -->|yes| C[Daemon]\n  B -->|no| D[Reject]\n";
+    const FLOW: &str =
+        "flowchart LR\n  A[Client] --> B{Auth?}\n  B -->|yes| C[Daemon]\n  B -->|no| D[Reject]\n";
 
     #[test]
     fn style_hashes_by_colors_and_size() {

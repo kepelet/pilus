@@ -534,7 +534,11 @@ impl UiPlaygroundView {
         });
         let focused = entity.read(cx).is_focused(window);
         let multiline = id == InputId::Multi;
-        let build = if multiline { style::textarea } else { style::field };
+        let build = if multiline {
+            style::textarea
+        } else {
+            style::field
+        };
         build(
             match id {
                 InputId::Single => "pg-input-single",

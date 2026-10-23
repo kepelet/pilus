@@ -15,7 +15,7 @@ tested by pointing the feed URL at `http://127.0.0.1:8000/latest.json`.
 | Update window (live status + Retry) | `crates/pilus/src/gui/update_window.rs` |
 | DMG packaging | `scripts/package-macos-dmg.sh` |
 | Preview payload (DMG + manifest) | `scripts/preview-feed.sh` |
-| Release automation | `.github/workflows/release.yml` |
+| Upload to the releases bucket | `scripts/publish-release.sh` |
 
 The engine is `gpui-updater-core`: a blocking check → download → verify →
 install pipeline. The `Updater` entity runs it on GPUI's background executor
@@ -74,14 +74,14 @@ self-hosted feed):
 ## Shipping a release
 
 1. Bump `version` in the workspace `Cargo.toml`.
-2. Tag and push `vX.Y.Z`. The workflow packages
-   `pilus-v<version>-macos-arm64.dmg` (one `pilus.app` at the image root, beside an `Applications` link and a
-   drag-to-install background), writes
-   `SHA256SUMS`, and attaches everything to the GitHub release. Apple Silicon
-   only.
-3. Upload the DMG and write `stable.json` (or `preview.json`) on
-   `releases.kepelet.com` pointing at it. The client reads those manifests,
-   not GitHub.
+2. Run `just release-stable` on a Mac. It packages
+   `pilus-v<version>-macos-arm64.dmg` (one `pilus.app` at the image root,
+   beside an `Applications` link and a drag-to-install background) with its
+   `SHA256SUMS`, writes `target/release/stable.json` pointing at it, and
+   uploads both to `releases.kepelet.com` with `scripts/publish-release.sh`,
+   the manifest last. Apple Silicon only. There is no CI release workflow.
+3. Tag `vX.Y.Z` for the record. The client reads the manifests on
+   `releases.kepelet.com`, not GitHub.
 
 Asset names are load-bearing: the client matches on the `macos`, `arm64`,
 and `.dmg` substrings. Don't rename them.
@@ -190,9 +190,7 @@ Three layers, weakest first:
    `MINISIGN_SECRET_KEY=<path to it>` and each DMG gets a `.minisig`, which the
    manifest references as `signature_url`. Packaging skips signing silently when
    the key or `minisign` is missing, so `publish-release.sh` refuses to upload a
-   DMG without one. Builds before this key was set accept unsigned updates. To
-   sign in CI, use a key generated with `minisign -G -W` (no password) in the
-   `MINISIGN_SECRET_KEY` repo secret. Back the key up: losing it strands every
+   DMG without one. Builds before this key was set accept unsigned updates. Back the key up: losing it strands every
    client that has the public key.
 
    `LOCAL=true` is a developer-only waiver, set by hand and never by the app

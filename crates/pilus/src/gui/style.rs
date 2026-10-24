@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationElement, AnimationExt, AnyElement, App, Bounds, Context, Corners,
+    Animation, AnimationElement, AnimationExt, AnyElement, AnyView, App, Bounds, Context, Corners,
     DispatchPhase, Div, Edges, Element, ElementId, Font, FontWeight, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, Length, MouseMoveEvent, Path,
     PathBuilder, Pixels, Point, Position, Render, Rgba, SharedString, Stateful, Style,
@@ -1518,6 +1518,350 @@ pub(super) fn rank_row(
             theme,
             fonts.label * 0.5,
         ))
+}
+
+/// What a chart's hover target shows. The chart cannot build it, since only
+/// the caller knows what a mark stands for; shared so one tip serves the
+/// several targets that cover a single mark.
+pub(super) type ChartTip = Rc<dyn Fn(&mut Window, &mut App) -> AnyView>;
+
+/// A day as a row of dots bent into an arch: hour 0 at the left foot, hour 23
+/// at the right, the apex at midday. Each dot grows with its `fractions` entry
+/// (0 to 1), and the busiest hour alone takes the full accent, so the eye
+/// lands on it first. An empty hour is a small quiet dot, which keeps the arch
+/// whole. `hub` is the two lines written under the apex, and `feet` the labels
+/// under the left foot, the middle and the right foot. `tips` has one entry
+/// per hour.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn clock_chart(
+    id: impl Into<ElementId>,
+    theme: Theme,
+    fonts: Fonts,
+    size: f32,
+    fractions: [f32; 24],
+    hub: (String, String),
+    feet: [String; 3],
+    tips: &[ChartTip],
+) -> Stateful<Div> {
+    use std::f32::consts::PI;
+    const HOURS: usize = 24;
+    let biggest = size * 0.03;
+    let smallest = size * 0.011;
+    let quiet = size * 0.008;
+    let radius = size / 2.0 - biggest - 2.0;
+    let center_y = biggest + radius;
+    let label_h = fonts.label * 1.4;
+    let height = center_y + biggest + fonts.label * 0.8 + label_h;
+    // Spacing between neighbours along the arch: the most a target can take
+    // before it reaches into the next hour's.
+    let pitch = PI * radius / (HOURS - 1) as f32;
+    let peak = fractions
+        .iter()
+        .enumerate()
+        .filter(|(_, fraction)| **fraction > 0.0)
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(hour, _)| hour);
+    let spot = |hour: usize| {
+        let angle = PI + PI * hour as f32 / (HOURS - 1) as f32;
+        (
+            size / 2.0 + radius * angle.cos(),
+            center_y + radius * angle.sin(),
+        )
+    };
+
+    let mut chart = div()
+        .id(id)
+        .relative()
+        .flex_shrink_0()
+        .w(px(size))
+        .h(px(height));
+
+    for (hour, fraction) in fractions.iter().enumerate() {
+        let (x, y) = spot(hour);
+        let (dot, color) = if *fraction <= 0.0 {
+            (quiet, tint(theme.muted, 0.28))
+        } else if Some(hour) == peak {
+            (biggest, theme.accent)
+        } else {
+            // Neighbours of the peak stay dimmer than it however large they
+            // grow, so there is only ever one bright dot.
+            (
+                smallest + (biggest * 0.85 - smallest) * fraction,
+                tint(theme.accent, 0.38 + 0.2 * fraction),
+            )
+        };
+        let side = pitch.max(dot * 2.0);
+        let mut target = div()
+            .id(("pilus-clock-hit", hour))
+            .absolute()
+            .left(px(x - side / 2.0))
+            .top(px(y - side / 2.0))
+            .w(px(side))
+            .h(px(side))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(dot * 2.0))
+                    .h(px(dot * 2.0))
+                    .rounded_full()
+                    .bg(color),
+            );
+        if let Some(tip) = tips.get(hour) {
+            let tip = Rc::clone(tip);
+            target = target.tooltip(move |window, cx| tip(window, cx));
+        }
+        chart = chart.child(target);
+    }
+
+    // The figure sits in the arch's mouth, its caption on the line the feet
+    // stand on.
+    let hub_h = fonts.headline * 1.3 + label_h;
+    chart = chart.child(
+        div()
+            .absolute()
+            .left_0()
+            .top(px(center_y - hub_h + label_h * 0.5))
+            .w(px(size))
+            .h(px(hub_h))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_end()
+            .child(
+                div()
+                    .text_size(px(fonts.headline))
+                    .text_color(theme.panel_fg)
+                    .child(hub.0),
+            )
+            .child(
+                div()
+                    .text_size(px(fonts.secondary))
+                    .text_color(theme.muted)
+                    .child(hub.1),
+            ),
+    );
+
+    let label_w = fonts.label * 5.0;
+    for (hour, text) in [(0, &feet[0]), (HOURS / 2, &feet[1]), (HOURS - 1, &feet[2])] {
+        let (x, _) = spot(hour);
+        chart = chart.child(
+            div()
+                .absolute()
+                .left(px(x - label_w / 2.0))
+                .top(px(center_y + biggest + fonts.label * 0.8))
+                .w(px(label_w))
+                .h(px(label_h))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(fonts.label))
+                .text_color(theme.muted)
+                .child(text.clone()),
+        );
+    }
+    chart
+}
+
+/// The slope at each point of a curve through `ys` (one step apart) that never
+/// runs past its neighbours: where the line turns, the slope is flat, so a
+/// smoothed spike stays a spike and the curve never dips under a quiet day to
+/// round off a busy one.
+fn smooth_slopes(ys: &[f32]) -> Vec<f32> {
+    let steps: Vec<f32> = ys.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    (0..ys.len())
+        .map(
+            |at| match (at.checked_sub(1).and_then(|i| steps.get(i)), steps.get(at)) {
+                (Some(before), Some(after)) if before * after > 0.0 => {
+                    2.0 * before * after / (before + after)
+                }
+                (Some(_), Some(_)) => 0.0,
+                (Some(only), None) | (None, Some(only)) => *only,
+                (None, None) => 0.0,
+            },
+        )
+        .collect()
+}
+
+/// A line over time with the area under it washed in: `fractions` are the
+/// points, each 0 to 1 of the way up the plot. `top` labels the plot's
+/// ceiling and `ends` the first and last point. `tips` has one entry per
+/// point; each point owns the full-height column it sits in.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn line_chart(
+    id: impl Into<ElementId>,
+    theme: Theme,
+    fonts: Fonts,
+    height: f32,
+    fractions: Vec<f32>,
+    top: String,
+    ends: (String, String),
+    tips: &[ChartTip],
+) -> Stateful<Div> {
+    let rule = theme.border;
+    let line = theme.accent;
+    let wash = tint(theme.accent, 0.16);
+    let points = fractions.len();
+
+    let plot = canvas(
+        move |_bounds, _window, _cx| (),
+        move |bounds, (), window, _cx| {
+            let width = bounds.size.width.as_f32();
+            let tall = bounds.size.height.as_f32();
+            // Full, half and empty: enough to read a value against, no more.
+            for level in [0.0_f32, 0.5, 1.0] {
+                let y = bounds.origin.y + px((tall - 1.0) * (1.0 - level));
+                window.paint_quad(gpui::fill(
+                    Bounds::new(
+                        point(bounds.origin.x, y),
+                        gpui::size(bounds.size.width, px(1.0)),
+                    ),
+                    rule,
+                ));
+            }
+            if fractions.is_empty() {
+                return;
+            }
+            // Each point sits in the middle of its own column, so the hover
+            // columns and the line agree about where a point is.
+            let column = width / fractions.len() as f32;
+            let at = |index: usize, fraction: f32| {
+                point(
+                    bounds.origin.x + px(column * (index as f32 + 0.5)),
+                    bounds.origin.y + px(tall - 1.0 - (tall - 2.0) * fraction.clamp(0.0, 1.0)),
+                )
+            };
+            let floor = bounds.origin.y + px(tall - 1.0);
+            let line_points: Vec<Point<Pixels>> = fractions
+                .iter()
+                .enumerate()
+                .map(|(index, fraction)| at(index, *fraction))
+                .collect();
+            if let (Some(first), Some(last)) = (line_points.first(), line_points.last())
+                && line_points.len() > 1
+            {
+                // Slopes are per column, so a control point a third of the way
+                // along a segment is a third of the slope up or down.
+                let ys: Vec<f32> = line_points.iter().map(|p| p.y.as_f32()).collect();
+                let slopes = smooth_slopes(&ys);
+                let curve_to = |builder: &mut PathBuilder, from: usize| {
+                    let (a, b) = (line_points[from], line_points[from + 1]);
+                    let reach = (b.x - a.x) / 3.0;
+                    builder.cubic_bezier_to(
+                        b,
+                        point(a.x + reach, a.y + px(slopes[from] / 3.0)),
+                        point(b.x - reach, b.y - px(slopes[from + 1] / 3.0)),
+                    );
+                };
+                let mut area = PathBuilder::fill();
+                area.move_to(point(first.x, floor));
+                area.line_to(*first);
+                for from in 0..line_points.len() - 1 {
+                    curve_to(&mut area, from);
+                }
+                area.line_to(point(last.x, floor));
+                area.close();
+                if let Ok(path) = area.build() {
+                    window.paint_path(path, wash);
+                }
+                let mut stroke = PathBuilder::stroke(px(1.5));
+                stroke.move_to(*first);
+                for from in 0..line_points.len() - 1 {
+                    curve_to(&mut stroke, from);
+                }
+                if let Ok(path) = stroke.build() {
+                    window.paint_path(path, line);
+                }
+            } else if let Some(only) = line_points.first() {
+                // One point has no line to draw; a dot says it is there.
+                let half = px(2.5);
+                window.paint_quad(
+                    gpui::fill(
+                        Bounds::new(
+                            point(only.x - half, only.y - half),
+                            gpui::size(half * 2.0, half * 2.0),
+                        ),
+                        line,
+                    )
+                    .corner_radii(Corners::all(half)),
+                );
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full();
+
+    let mut hits = div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .flex_row();
+    for (index, tip) in tips.iter().enumerate().take(points) {
+        let tip = Rc::clone(tip);
+        hits = hits.child(
+            div()
+                .id(("pilus-line-hit", index))
+                .flex_1()
+                .h_full()
+                .tooltip(move |window, cx| tip(window, cx)),
+        );
+    }
+
+    let axis = |text: String| {
+        div()
+            .text_size(px(fonts.label))
+            .text_color(theme.muted)
+            .whitespace_nowrap()
+            .child(text)
+    };
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .gap_1()
+        .w_full()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .justify_between()
+                        .items_end()
+                        .flex_shrink_0()
+                        .w(px(fonts.label * 3.0))
+                        .h(px(height))
+                        .child(axis(top))
+                        .child(axis("0".to_string())),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .h(px(height))
+                        .child(plot)
+                        .child(hits),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                // The ends line up with the plot, not with the axis labels.
+                .pl(px(fonts.label * 3.0 + 8.0))
+                .child(axis(ends.0))
+                .child(axis(ends.1)),
+        )
 }
 
 /// A centered empty state: a glyph, a title, and a muted line of detail.
@@ -3137,6 +3481,24 @@ pub(super) fn dot_grid(color: Hsla, step: f32) -> gpui::Canvas<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_smoothed_line_never_overshoots_a_turn() {
+        // Rising, a peak, a valley, then rising again: the slope is flat at
+        // both turns, so the curve stays between the points either side.
+        let slopes = smooth_slopes(&[0.0, 4.0, 2.0, 2.0, 6.0]);
+        assert_eq!(slopes[1], 0.0, "a peak is flat");
+        assert_eq!(slopes[2], 0.0, "a valley is flat");
+        assert_eq!(slopes[3], 0.0, "a plateau's edge is flat");
+        assert!(
+            (slopes[0] - 4.0).abs() < f32::EPSILON,
+            "the ends follow their segment"
+        );
+        let climbing = smooth_slopes(&[0.0, 1.0, 4.0]);
+        assert!(climbing[1] > 1.0 && climbing[1] < 4.0, "{climbing:?}");
+        assert_eq!(smooth_slopes(&[3.0]), vec![0.0]);
+        assert!(smooth_slopes(&[]).is_empty());
+    }
 
     #[test]
     fn a_hover_fill_that_fades_out_comes_to_rest() {

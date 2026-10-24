@@ -857,6 +857,57 @@ impl UiPlaygroundView {
             ))
     }
 
+    /// The Stats page's clock and its token line, over made-up figures.
+    fn chart_demo(&self) -> Div {
+        let theme = self.theme;
+        let fonts = self.fonts();
+        let tip = || -> style::ChartTip { Rc::new(move |_, cx| cx.new(|_| gpui::Empty).into()) };
+        let mut hours = [0.0_f32; 24];
+        for (hour, bar) in hours.iter_mut().enumerate() {
+            let day = (hour as f32 - 14.0) / 4.5;
+            let evening = (hour as f32 - 21.0) / 1.8;
+            *bar = ((-day * day).exp() + 0.35 * (-evening * evening).exp()).min(1.0);
+        }
+        let days: Vec<f32> = (0..30_u32)
+            .map(|day| {
+                let weekend = matches!(day % 7, 5 | 6);
+                let swell = 0.45 + 0.4 * (day as f32 / 6.0).sin().abs();
+                if weekend { swell * 0.25 } else { swell }
+            })
+            .collect();
+        let tips: Vec<style::ChartTip> = (0..30).map(|_| tip()).collect();
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap_6()
+            .child(style::clock_chart(
+                "pg-clock",
+                theme,
+                fonts,
+                style::scaled(&self.settings, 340.0),
+                hours,
+                ("2 PM".to_string(), "busiest hour".to_string()),
+                [
+                    "12 AM".to_string(),
+                    "12 PM".to_string(),
+                    "11 PM".to_string(),
+                ],
+                &(0..24).map(|_| tip()).collect::<Vec<_>>(),
+            ))
+            .child(div().w(px(360.0)).child(style::line_chart(
+                "pg-line",
+                theme,
+                fonts,
+                style::scaled(&self.settings, 140.0),
+                days,
+                "1.2B".to_string(),
+                ("Sep 26".to_string(), "Oct 25".to_string()),
+                &tips,
+            )))
+    }
+
     fn empty_state_demo(&self) -> Div {
         let theme = self.theme;
         let fonts = self.fonts();
@@ -2298,6 +2349,7 @@ impl Render for UiPlaygroundView {
             .child(self.section("METER", self.tray(self.meter_demo())))
             .child(self.section("STAT TILE", self.tray(self.stat_tile_demo())))
             .child(self.section("HEATMAP AND RANKING", self.tray(self.heat_demo())))
+            .child(self.section("CLOCK AND LINE CHART", self.tray(self.chart_demo())))
             .child(self.section("EMPTY STATE", self.tray(self.empty_state_demo())))
             .child(self.section("QR CODE", self.tray(self.qr_demo())))
             .child(

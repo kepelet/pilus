@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::process::Command;
+use std::rc::Rc;
 
 use gpui::{
     Anchor, AnyElement, Context, Div, KeyDownEvent, ScrollHandle, anchored, deferred, div, point,
@@ -33,6 +34,12 @@ const HEAT_WEEKS: i64 = 52;
 const RANK_ROWS: usize = 6;
 /// Months of cost the page lists, newest first.
 const COST_MONTHS: usize = 6;
+/// The most points the token line has. A longer window groups days, so the
+/// line stays readable and its hover columns stay wide enough to hit.
+const TREND_POINTS: usize = 90;
+/// The width of the arch of hours; its height follows from it.
+const CLOCK_SIZE: f32 = 340.0;
+const TREND_HEIGHT: f32 = 168.0;
 const HEAT_SIDE: f32 = 11.0;
 const HEAT_GAP: f32 = 3.0;
 
@@ -77,6 +84,15 @@ struct Day {
     tokens: u64,
 }
 
+/// A run of consecutive local days, summed into one point of the token line.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Span {
+    first: i64,
+    last: i64,
+    turns: u64,
+    tokens: u64,
+}
+
 /// The day number (days since 1970-01-01) of unix `hour` for a viewer
 /// `offset` seconds east of UTC.
 fn local_day(hour: i64, offset: i64) -> i64 {
@@ -86,6 +102,64 @@ fn local_day(hour: i64, offset: i64) -> i64 {
 /// 0 for Sunday through 6 for Saturday. Day 0, 1970-01-01, was a Thursday.
 fn weekday(day: i64) -> usize {
     usize::try_from((day + 4).rem_euclid(7)).unwrap_or(0)
+}
+
+/// `5 PM`, `12 AM`: an hour of the day as a person says it.
+fn hour_label(hour: usize) -> String {
+    let half = if hour < 12 { "AM" } else { "PM" };
+    format!(
+        "{} {half}",
+        if hour.is_multiple_of(12) {
+            12
+        } else {
+            hour % 12
+        }
+    )
+}
+
+/// The hour on the viewer's clock (0 to 23) that unix `hour` falls in. A zone
+/// off the hour (UTC+5:30) is read at its whole hours, since a bucket is a
+/// whole hour and cannot be split.
+fn clock_hour(hour: i64, offset: i64) -> usize {
+    usize::try_from((hour + offset.div_euclid(3600)).rem_euclid(24)).unwrap_or(0)
+}
+
+/// Turns by hour of the viewer's day, for the hours at or after `since`.
+fn clock_turns(rows: &[Hourly], offset: i64, since: Option<i64>) -> [u64; 24] {
+    let mut clock = [0; 24];
+    for row in rows
+        .iter()
+        .filter(|row| since.is_none_or(|at| row.hour >= at))
+    {
+        clock[clock_hour(row.hour, offset)] += row.turns;
+    }
+    clock
+}
+
+/// The days from `first` to `today`, grouped into at most `limit` runs of
+/// equal length (the last may be shorter), each with its totals. Quiet days
+/// count: a gap in the line is a gap in use.
+fn spans(days: &BTreeMap<i64, Day>, first: i64, today: i64, limit: usize) -> Vec<Span> {
+    let length = (today - first + 1).max(1);
+    let limit = i64::try_from(limit.max(1)).unwrap_or(1);
+    let width = (length + limit - 1) / limit;
+    let mut runs = Vec::new();
+    let mut start = first;
+    while start <= today {
+        let last = (start + width - 1).min(today);
+        let mut run = Span {
+            first: start,
+            last,
+            ..Span::default()
+        };
+        for (_, day) in days.range(start..=last) {
+            run.turns += day.turns;
+            run.tokens += day.tokens;
+        }
+        runs.push(run);
+        start = last + 1;
+    }
+    runs
 }
 
 /// The calendar date of a day number, by the civil-calendar algorithm, so the
@@ -304,6 +378,10 @@ struct Data {
     months: Vec<(i64, usize, Cost)>,
     /// Active days inside the chosen window.
     active_days: u64,
+    /// Turns by hour of the viewer's day, over the chosen window.
+    clock: [u64; 24],
+    /// Tokens across the chosen window, a point per day or per run of days.
+    trend: Vec<Span>,
     today: i64,
 }
 
@@ -478,6 +556,12 @@ fn build(
         .range(range.days().map_or(i64::MIN, |days| today - days + 1)..)
         .filter(|(_, day)| day.turns > 0)
         .count() as u64;
+    let clock = clock_turns(&rows, offset, window.since_hour);
+    let trend_first = range.days().map_or_else(
+        || days.keys().next().copied().unwrap_or(today),
+        |back| today - back + 1,
+    );
+    let trend = spans(&days, trend_first, today, TREND_POINTS);
     let monthly = month_costs(&rows, offset);
     let months = listed
         .into_iter()
@@ -503,6 +587,8 @@ fn build(
         machines: index.top_machines(&window)?,
         days,
         active_days,
+        clock,
+        trend,
         today,
     })
 }
@@ -829,6 +915,8 @@ impl PilusView {
         let breakdown = self.breakdown(tokens);
         let costs = self.cost_block(data);
         let heat = self.heatmap(data, cx);
+        let clock = self.clock_block(data);
+        let trend = self.trend_block(data);
 
         // The cost by machine sits under the token breakdown. The blocks keep
         // their own height here, or the column would stretch them to match
@@ -857,6 +945,16 @@ impl PilusView {
             .pb_6()
             .child(tiles)
             .child(div().px_4().child(self.stats_block("ACTIVITY", heat)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_4()
+                    .px_4()
+                    .child(self.stats_block("PROMPTS BY HOUR", clock))
+                    .child(self.stats_block("TOKENS OVER TIME", trend)),
+            )
             .child(
                 div()
                     .flex()
@@ -1061,6 +1159,145 @@ impl PilusView {
             );
         }
         list
+    }
+
+    /// The day as a 24-hour clock: a bar for each hour, as long as the turns
+    /// the models answered in it across the window.
+    ///
+    /// A prompt is not stored, only the turns that answered it, so the bars
+    /// count turns and the tooltip says so.
+    fn clock_block(&self, data: &Data) -> Div {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let total: u64 = data.clock.iter().sum();
+        let busiest = data.clock.iter().copied().max().unwrap_or(0);
+        let mut fractions = [0.0_f32; 24];
+        let mut tips: Vec<style::ChartTip> = Vec::with_capacity(24);
+        for (hour, turns) in data.clock.iter().copied().enumerate() {
+            if busiest > 0 {
+                // Counts are far below f32's exact range, and this is a bar length.
+                #[allow(clippy::cast_precision_loss)]
+                let fraction = turns as f32 / busiest as f32;
+                fractions[hour] = fraction;
+            }
+            let share = if total > 0 {
+                // A share is for display, and counts are far below f64's exact range.
+                #[allow(clippy::cast_precision_loss)]
+                let share = turns as f64 * 100.0 / total as f64;
+                format!("{share:.1}% of the day")
+            } else {
+                String::new()
+            };
+            let mut lines = vec![(format!("{} turns", compact(turns)), theme.muted)];
+            if !share.is_empty() {
+                lines.push((share, theme.muted));
+            }
+            tips.push(Rc::new(super::row_tooltip(
+                format!("{} – {}", hour_label(hour), hour_label((hour + 1) % 24)),
+                theme.panel_fg,
+                lines,
+                theme,
+            )));
+        }
+        let peak = if busiest > 0 {
+            data.clock
+                .iter()
+                .position(|turns| *turns == busiest)
+                .map_or_else(|| "–".to_string(), hour_label)
+        } else {
+            "–".to_string()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_3()
+            .child(style::clock_chart(
+                "pilus-stats-clock",
+                theme,
+                fonts,
+                style::scaled(&self.shared_settings, CLOCK_SIZE),
+                fractions,
+                (peak, "busiest hour".to_string()),
+                [hour_label(0), hour_label(12), hour_label(23)],
+                &tips,
+            ))
+            .child(
+                div()
+                    .text_size(px(fonts.label))
+                    .text_color(theme.muted)
+                    .child("Model turns by hour of your day, in this Mac's time zone."),
+            )
+    }
+
+    /// Tokens across the window as a line, a point per day (or per run of
+    /// days once a window is longer than the line has points for).
+    fn trend_block(&self, data: &Data) -> Div {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let today = data.today;
+        let busiest = data.trend.iter().map(|run| run.tokens).max().unwrap_or(0);
+        let fractions = data
+            .trend
+            .iter()
+            .map(|run| {
+                // Counts are far below f32's exact range, and this is a height.
+                #[allow(clippy::cast_precision_loss)]
+                let fraction = run.tokens as f32 / busiest.max(1) as f32;
+                fraction
+            })
+            .collect();
+        let tips: Vec<style::ChartTip> = data
+            .trend
+            .iter()
+            .map(|run| {
+                let title = if run.first == run.last {
+                    date_label(run.first, today)
+                } else {
+                    format!(
+                        "{} – {}",
+                        date_label(run.first, today),
+                        date_label(run.last, today)
+                    )
+                };
+                Rc::new(super::row_tooltip(
+                    title,
+                    theme.panel_fg,
+                    vec![
+                        (format!("{} tokens", compact(run.tokens)), theme.muted),
+                        (format!("{} turns", compact(run.turns)), theme.muted),
+                    ],
+                    theme,
+                )) as style::ChartTip
+            })
+            .collect();
+        let first = data.trend.first().map_or(today, |run| run.first);
+        let width = data.trend.first().map_or(1, |run| run.last - run.first + 1);
+        let unit = if width > 1 {
+            format!("Tokens per {width} days")
+        } else {
+            "Tokens per day".to_string()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(style::line_chart(
+                "pilus-stats-trend",
+                theme,
+                fonts,
+                style::scaled(&self.shared_settings, TREND_HEIGHT),
+                fractions,
+                compact(busiest),
+                (date_label(first, today), date_label(today, today)),
+                &tips,
+            ))
+            .child(
+                div()
+                    .text_size(px(fonts.label))
+                    .text_color(theme.muted)
+                    .child(unit),
+            )
     }
 
     /// A year of days, a column per week, shaded by how many turns the models
@@ -1372,6 +1609,12 @@ impl PilusView {
                 ranked("studio", 115, 29_000_000, 6_000_000, 1_250_000_000),
             ],
             active_days: u64::try_from(days.len()).unwrap_or(0),
+            // Mornings and a long afternoon, a dip at lunch, a late evening.
+            clock: [
+                120, 40, 10, 0, 0, 0, 30, 260, 1_400, 3_100, 3_900, 3_400, 1_900, 3_000, 4_300,
+                4_100, 3_300, 2_300, 1_100, 900, 1_500, 1_900, 1_200, 480,
+            ],
+            trend: spans(&days, today - 29, today, TREND_POINTS),
             days,
             today,
         });
@@ -1470,6 +1713,69 @@ mod tests {
         );
         assert_eq!(heat_cuts(&BTreeMap::new()), [0, 0, 0]);
         assert_eq!(heat_level(7, [0, 0, 0]), 4);
+    }
+
+    #[test]
+    fn hours_are_said_the_way_people_say_them() {
+        assert_eq!(hour_label(0), "12 AM");
+        assert_eq!(hour_label(5), "5 AM");
+        assert_eq!(hour_label(12), "12 PM");
+        assert_eq!(hour_label(17), "5 PM");
+        assert_eq!(hour_label(23), "11 PM");
+    }
+
+    #[test]
+    fn the_clock_reads_the_viewers_hour() {
+        // 22:00 UTC is 05:00 at UTC+7, and 17:00 the day before at UTC-5.
+        assert_eq!(clock_hour(22, 0), 22);
+        assert_eq!(clock_hour(22, 7 * 3600), 5);
+        assert_eq!(clock_hour(22 + 24, -5 * 3600), 17);
+        assert_eq!(clock_hour(0, -3600), 23);
+        // Half an hour east is read at the whole hour below it.
+        assert_eq!(clock_hour(0, 19_800), 5);
+    }
+
+    #[test]
+    fn the_clock_counts_only_hours_inside_the_window() {
+        let clock = clock_turns(
+            &rows(&[(3, 2), (3 + 24, 5), (24 + 10, 1), (400, 9)]),
+            0,
+            Some(24),
+        );
+        assert_eq!(clock[3], 5, "the hour before the window is left out");
+        assert_eq!(clock[400 % 24], 9);
+        assert_eq!(clock[10], 1);
+        assert_eq!(clock.iter().sum::<u64>(), 15);
+        let all = clock_turns(&rows(&[(3, 2), (3 + 24, 5)]), 0, None);
+        assert_eq!(all[3], 7);
+    }
+
+    #[test]
+    fn days_group_into_a_bounded_number_of_runs() {
+        let days = day_totals(&rows(&[(0, 1), (24 * 2, 2), (24 * 9, 4)]), 0);
+        // Within the limit, every day is a point, quiet ones included.
+        let daily = spans(&days, 0, 9, 90);
+        assert_eq!(daily.len(), 10);
+        assert_eq!(
+            daily[1],
+            Span {
+                first: 1,
+                last: 1,
+                turns: 0,
+                tokens: 0
+            }
+        );
+        assert_eq!(daily[2].turns, 2);
+        // Past it, days pair up and nothing is lost or counted twice.
+        let paired = spans(&days, 0, 9, 5);
+        assert_eq!(paired.len(), 5);
+        assert_eq!((paired[0].first, paired[0].last), (0, 1));
+        assert_eq!((paired[4].first, paired[4].last), (8, 9));
+        assert_eq!(paired.iter().map(|run| run.turns).sum::<u64>(), 7);
+        // An odd length leaves a short run at the end.
+        let odd = spans(&days, 0, 10, 5);
+        assert_eq!(odd.last().map(|run| (run.first, run.last)), Some((9, 10)));
+        assert_eq!(spans(&BTreeMap::new(), 4, 4, 90).len(), 1);
     }
 
     #[test]

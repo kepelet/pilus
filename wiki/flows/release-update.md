@@ -50,7 +50,7 @@ sequenceDiagram
 - **Channel and URL disagree** — an explicit `update_feed_url` always wins, so a self-hosted manifest needs no code change.
 - **Manifest without artifact** — cannot happen by ordering, because the manifest is uploaded last; a manually published bad manifest opens the Update window with Retry.
 - **Wrong asset name** — the source refuses to match it; keep `pilus-v<version>-macos-<arch>.dmg`.
-- **Daemon updates are separate** — `luvus_update.rs` checks `luvus.dev/latest.json`, refuses a package-manager install, and restarts through `luvus server restart`; a machine row re-provisions with `luvus machine enable <id> --install`.
+- **Daemon updates are separate and pinned** — `luvus_update.rs` installs and updates only to the release in `crates/pilus/luvus.pin` (checked against its pinned SHA-256), installs it by itself on first run when no `luvus` exists, never downgrades, refuses a package-manager install, and restarts through `luvus server restart`; a machine row re-provisions with `luvus machine enable <id> --install`. Bump the pin with `just pin-luvus <version>`.
 - **Service binary replaced** — the connector reports `restart_needed` and the window restarts the service at launch; devices redial.
 
 ## Related

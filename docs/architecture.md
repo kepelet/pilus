@@ -1003,9 +1003,10 @@ Selection lives in `gui/selection.rs`: it normalizes a reversed drag, answers
   opens only.
 - Double-click to select a word, and triple-click to select a line.
 - Named-pipe transport on Windows.
-- Daemon upgrades: **Settings → ABOUT LUVUS** checks
-  `luvus.dev/latest.json` and installs the verified platform archive itself
-  (refusing a package-manager install), then restarts through
-  `luvus server restart`. The **Update Luvus** button on a machine's Settings row
+- Daemon upgrades: **Settings → ABOUT LUVUS** installs the release pinned in
+  `crates/pilus/luvus.pin`, checked against its pinned checksum (refusing a
+  package-manager install and never downgrading), then restarts through
+  `luvus server restart`. A missing `luvus` is installed the same way on first
+  run, without asking. The **Update Luvus** button on a machine's Settings row
   re-provisions a host with `luvus machine enable <id> --install`, and its rows
   show the remote daemon version from the last probe.

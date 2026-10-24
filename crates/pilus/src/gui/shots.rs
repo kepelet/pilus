@@ -1846,6 +1846,9 @@ pub fn run_main() -> Result<()> {
             view.session_menu_open = false;
             view.active_live = false;
             view.local_luvus_missing = true;
+            // A capture never installs anything: mark the automatic first-run
+            // install as spent so each state below stays on screen.
+            view.luvus_auto_install_tried = true;
             cx.notify();
         });
     });
@@ -1861,8 +1864,18 @@ pub fn run_main() -> Result<()> {
     capture(&mut cx, window.into(), "main-luvus-installing")?;
     cx.update(|app| {
         view.update(app, |view, cx| {
+            view.luvus_install = super::LuvusInstall::Starting;
+            cx.notify();
+        });
+    });
+    settle(&mut cx, 8);
+    capture(&mut cx, window.into(), "main-luvus-starting")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
             view.luvus_install = super::LuvusInstall::Failed(
-                "https://luvus.dev/latest.json: connection refused".to_string(),
+                "https://github.com/RizRiyz/luvus/releases/download/v0.14.3/\
+                 luvus-v0.14.3-aarch64-apple-darwin.tar.gz: connection refused"
+                    .to_string(),
             );
             cx.notify();
         });

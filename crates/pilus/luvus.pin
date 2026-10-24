@@ -1,0 +1,9 @@
+# The Luvus release this pilus build installs on first run and stops daemon
+# updates at. Bump it with `just pin-luvus <version>` once pilus has been tried
+# against that release. Each line after `version` is a release triple and the
+# SHA-256 of its `luvus-v<version>-<triple>.tar.gz`.
+version 0.14.3
+aarch64-apple-darwin 3365665adb7984116681a8f91b614dac9610e4a622bd77b1ff175a17304257c8
+x86_64-apple-darwin 5f463648c5958ed43c890e92a69c1704a99c4ff743f50b9b4ce18ea6af12c34c
+aarch64-unknown-linux-musl 6587fae1a661b9e5b97fc030f11e8b1896828dda41a4b22edab2dee7b20ed00d
+x86_64-unknown-linux-musl 1d96580525f23b21143c05850dbd9a1b4fe95e66d7e173dc27aab6caf9b676bf

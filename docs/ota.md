@@ -226,35 +226,67 @@ retrying with capped backoff, which keeps Settings, Updates, and the Remote
 Machines manager reachable. Remote machines already degrade per endpoint the
 same way, so a newer local `pilus` still opens even when every daemon is old.
 
+### The Luvus pin
+
+Each pilus build installs one Luvus release and never updates past it.
+`crates/pilus/luvus.pin` names that release and the SHA-256 of each platform
+archive, and is compiled in. Without it, a first install took whatever
+`latest.json` said, so two people on the same pilus build could end up on
+different daemons, and a Luvus with a new protocol would reach users before
+any pilus could speak it. A new Luvus now reaches users by bumping the pin in
+a pilus release:
+
+```sh
+just pin-luvus 0.14.4   # after trying pilus against that release
+```
+
+The script downloads every platform archive, hashes it, and refuses to write
+the pin unless the hash matches the release's `.sha256` sidecar. Bump
+`PROTOCOL_VERSION`/`FALLBACK_PROTOCOL_VERSION` in the same change when the new
+release moves the wire protocol.
+
+**First run.** When no `luvus` binary exists, the window installs the pinned
+release by itself and shows "Setting up pilus" instead of asking. It does this
+once per launch. If that fails (offline, GitHub blocked), the card says pilus
+couldn't finish setting up and offers **Try again**, **Check again**, and
+**Install manually**. The binary lands at `~/.local/bin/luvus`, which the
+`pilus-agent` service's `PATH` already includes.
+
 `pilus` updates itself through its OTA feed; the daemon gets a parallel path.
 **Settings → UPDATES → Luvus daemon** has three actions:
 
-- **Check Luvus** reads `https://luvus.dev/latest.json` and compares it to the
-  installed `luvus --version`, showing `installed X · latest Y`.
-- **Update Luvus** downloads the platform archive
-  (`luvus-v<version>-<triple>.tar.gz`), verifies its `.sha256` sidecar through
-  the same `gpui-updater-core` download/verify pipeline `pilus` uses, extracts
-  `luvus`, and atomically installs it. A Homebrew, Cargo, or Nix install is
-  refused so it keeps updating through its package manager; everything else
-  installs in place, or at `~/.local/bin/luvus` when the only `luvus` is the
-  remote-provisioning cache.
+- **Check Luvus** compares the installed `luvus --version` with the pin. It
+  also reads `https://luvus.dev/latest.json`, only to say when a newer Luvus is
+  out ("comes with a pilus update"). An install newer than the pin, from
+  Homebrew or by hand, is left alone and flagged as newer than this pilus was
+  tested with.
+- **Update Luvus** downloads the pinned platform archive
+  (`luvus-v<version>-<triple>.tar.gz`), checks it against the pinned checksum
+  through the same `gpui-updater-core` download/verify pipeline `pilus` uses,
+  extracts `luvus`, and atomically installs it. It never downgrades. A Homebrew,
+  Cargo, or Nix install is refused so it keeps updating through its package
+  manager; everything else installs in place, or at `~/.local/bin/luvus` when
+  the only `luvus` is the remote-provisioning cache.
 - **Restart Luvus** runs `luvus [--session NAME] server restart` so the running
   daemon loads the new binary. It is two-click because it stops every pane in
   the session.
 
-`LUVUS_UPDATE_MANIFEST` and `LUVUS_UPDATE_RELEASE_BASE` override the manifest
-and download host, matching the `luvus` CLI's own variables.
+`LUVUS_UPDATE_RELEASE_BASE` overrides the download host and
+`LUVUS_UPDATE_MANIFEST` the "newer Luvus" manifest, matching the `luvus` CLI's
+own variables. Neither moves the pin.
 
 - **Saved machines.** A profile bridges the versioned binary its
   `remote_binary` names, provisioned from the local install's
   `~/.local/share/luvus/remote/<version>/…` cache. Each enabled row in
-  **Remote Machines** has an **Update** button that re-provisions it with
-  `luvus machine enable <id> --install`, and the row shows the remote daemon's
-  version from the last `machine status` probe.
+  **Remote Machines** has an **Update** button that first brings this Mac to
+  the pin, then re-provisions the machine with
+  `luvus machine enable <id> --install`, so remotes follow the pinned version
+  too. The row shows the remote daemon's version from the last
+  `machine status` probe.
 
 Every daemon action runs off the GUI thread and reports its result in place,
 so a slow download, an offline host, or a package-manager refusal never blocks
 the window.
 
 Keep the two release notes in sync and say which daemon a client release
-needs.
+needs: the version in `luvus.pin`.

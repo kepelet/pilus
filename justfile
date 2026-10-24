@@ -72,6 +72,11 @@ release-stable: package-dmg
 serve-preview:
     python3 -m http.server 8000 --directory target/release/preview-feed
 
+# Pin the Luvus release pilus installs and caps daemon updates at, after
+# trying pilus against it. Downloads every platform archive to hash it.
+pin-luvus version:
+    ./scripts/pin-luvus.sh {{version}}
+
 # Check the OTA release source without opening a window.
 check-updates *args:
     cargo run -p pilus --no-default-features -- --check-updates {{args}}

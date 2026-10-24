@@ -1665,10 +1665,13 @@ struct MenuOpResult {
 /// The outcome of one background Luvus daemon operation.
 enum DaemonOutcome {
     /// A release check finished. `installed` is the binary's version and
-    /// `result` is the newer release, `None` when current, or an error string.
+    /// `result` is the pinned release when it is newer, `None` when current,
+    /// or an error string. `beyond_pin` is a published Luvus this build does
+    /// not install yet.
     Checked {
         installed: Option<Version>,
         result: Result<Option<Release>, String>,
+        beyond_pin: Option<String>,
     },
     /// An install finished; carries the new version and where it landed.
     Installed { version: Version, path: PathBuf },
@@ -1676,12 +1679,15 @@ enum DaemonOutcome {
     Message(Result<String, String>),
 }
 
-/// Progress of installing Luvus from the prompt shown when it is missing.
+/// Progress of setting up Luvus when it is missing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum LuvusInstall {
     #[default]
     Idle,
     Installing,
+    /// The binary is in place and the first attach is in flight. Kept apart
+    /// from `Idle` so the card does not flash "not installed" in between.
+    Starting,
     /// The reason the last attempt failed, shown under the buttons.
     Failed(String),
 }
@@ -2121,8 +2127,13 @@ struct PilusView {
     /// The last local attach failed because no `luvus` binary exists. The
     /// reconnect loop keeps probing, so installing it clears this by itself.
     local_luvus_missing: bool,
-    /// The in-window Luvus install, driven from the missing-Luvus prompt.
+    /// The in-window Luvus install. It starts by itself the first time Luvus
+    /// is found missing, so a new user sees setup, not a chore; the prompt's
+    /// buttons are the retry when that attempt fails.
     luvus_install: LuvusInstall,
+    /// Whether the automatic install already ran this launch, so a failure
+    /// waits for the user instead of retrying on every reconnect.
+    luvus_auto_install_tried: bool,
     luvus_install_rx: Receiver<Result<PathBuf, String>>,
     luvus_install_tx: Sender<Result<PathBuf, String>>,
     /// Whether the active connection is still alive; a dropped machine
@@ -2741,6 +2752,7 @@ impl PilusView {
             local_reconnect: None,
             local_luvus_missing: false,
             luvus_install: LuvusInstall::Idle,
+            luvus_auto_install_tried: false,
             luvus_install_rx,
             luvus_install_tx,
             active_live,
@@ -2926,103 +2938,138 @@ impl PilusView {
     /// Download and install Luvus off the GUI thread. The poll loop picks up
     /// the result and attaches to the daemon it starts.
     fn install_luvus(&mut self, cx: &mut Context<Self>) {
-        if self.luvus_install == LuvusInstall::Installing {
+        if matches!(
+            self.luvus_install,
+            LuvusInstall::Installing | LuvusInstall::Starting
+        ) {
             return;
         }
         self.luvus_install = LuvusInstall::Installing;
         let tx = self.luvus_install_tx.clone();
         std::thread::spawn(move || {
-            let engine = crate::luvus_update::first_install_engine();
+            let engine = crate::luvus_update::engine();
             let result = match crate::luvus_update::check(&engine) {
                 Ok(Some(release)) => crate::luvus_update::install(&engine, &release, |_, _| {})
                     .map_err(|error| error.to_string()),
-                Ok(None) => Err("no Luvus release is published for this platform".to_string()),
+                // A binary appeared between the probe and this check: let the
+                // reconnect attach to it instead of reporting a failure.
+                Ok(None) => crate::luvus_update::pin()
+                    .map(|_| PathBuf::new())
+                    .map_err(|error| error.to_string()),
                 Err(error) => Err(error.to_string()),
             };
+            if let Err(error) = &result {
+                tracing::warn!(%error, "installing Luvus failed");
+            }
             tx.send(result).ok();
         });
         cx.notify();
     }
 
-    /// The call to action that fills the card while Luvus is not installed.
+    /// What fills the card while Luvus is missing: first-run setup while the
+    /// automatic install runs, then a retry if it failed.
     fn install_luvus_prompt(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let installing = self.luvus_install == LuvusInstall::Installing;
-        let checking = self.connecting.contains(&EndpointId::Local);
-        let install_label = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .when(installing, |label| {
-                label.child(style::busy_dot(fonts.secondary, theme.window_bg))
-            })
-            .child(if installing {
-                "Installing…"
-            } else {
-                "Install Luvus"
-            });
-        let mut prompt = style::empty_state(
-            theme,
-            fonts,
+        let glyph = || {
             icon(
                 include_bytes!("../../assets/icons/server.svg"),
                 fonts.headline,
                 theme.muted,
-            ),
-            "Luvus is not installed",
-            "pilus is a client for the Luvus daemon. Install Luvus to start workspaces and agents.",
-        )
-        .size_full()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .child(
-                    style::button_enabled(
-                        "pilus-install-luvus",
-                        install_label,
-                        style::ButtonKind::Primary,
-                        theme,
-                        fonts.secondary,
-                        !installing,
+            )
+        };
+        let busy = match self.luvus_install {
+            LuvusInstall::Installing => Some("Installing Luvus…"),
+            LuvusInstall::Starting => Some("Starting Luvus…"),
+            LuvusInstall::Idle | LuvusInstall::Failed(_) => None,
+        };
+        if let Some(step) = busy {
+            return style::empty_state(
+                theme,
+                fonts,
+                glyph(),
+                "Setting up pilus",
+                "pilus runs your terminals and agents on the Luvus daemon. \
+                 Getting it ready takes a few seconds.",
+            )
+            .size_full()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(fonts.secondary))
+                    .text_color(theme.muted)
+                    .child(style::busy_dot(fonts.secondary, theme.accent))
+                    .child(step),
+            );
+        }
+        let failed = matches!(self.luvus_install, LuvusInstall::Failed(_));
+        let checking = self.connecting.contains(&EndpointId::Local);
+        let (title, detail, retry) = if failed {
+            (
+                "pilus couldn't finish setting up",
+                "pilus needs the Luvus daemon and couldn't download it. \
+                 Check your connection and try again.",
+                "Try again",
+            )
+        } else {
+            (
+                "Luvus is not installed",
+                "pilus is a client for the Luvus daemon. Install Luvus to start workspaces and agents.",
+                "Install Luvus",
+            )
+        };
+        let mut prompt = style::empty_state(theme, fonts, glyph(), title, detail)
+            .size_full()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(
+                        style::button(
+                            "pilus-install-luvus",
+                            retry,
+                            style::ButtonKind::Primary,
+                            theme,
+                            fonts.secondary,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.install_luvus(cx))),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| this.install_luvus(cx))),
-                )
-                .child(
-                    style::button(
-                        "pilus-recheck-luvus",
-                        if checking {
-                            "Checking…"
-                        } else {
-                            "Check again"
-                        },
-                        style::ButtonKind::Secondary,
-                        theme,
-                        fonts.secondary,
+                    .child(
+                        style::button(
+                            "pilus-recheck-luvus",
+                            if checking {
+                                "Checking…"
+                            } else {
+                                "Check again"
+                            },
+                            style::ButtonKind::Secondary,
+                            theme,
+                            fonts.secondary,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.recheck_luvus(cx))),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| this.recheck_luvus(cx))),
-                )
-                .child(
-                    style::button(
-                        "pilus-install-luvus-manually",
-                        "Install manually",
-                        style::ButtonKind::Ghost,
-                        theme,
-                        fonts.secondary,
-                    )
-                    .on_click(cx.listener(|_, _, _, cx| cx.open_url(LUVUS_INSTALL_URL))),
-                ),
-        );
+                    .child(
+                        style::button(
+                            "pilus-install-luvus-manually",
+                            "Install manually",
+                            style::ButtonKind::Ghost,
+                            theme,
+                            fonts.secondary,
+                        )
+                        .on_click(cx.listener(|_, _, _, cx| cx.open_url(LUVUS_INSTALL_URL))),
+                    ),
+            );
         if let LuvusInstall::Failed(error) = &self.luvus_install {
             prompt = prompt.child(
                 div()
                     .max_w(px(fonts.secondary * 30.0))
                     .text_size(px(fonts.secondary))
                     .text_color(theme.alert)
-                    .child(format!("Install failed: {error}")),
+                    .child(error.clone()),
             );
         }
         prompt
@@ -3099,6 +3146,17 @@ impl PilusView {
         changed |= self.poll_endpoints();
         self.sync_menubar(cx);
         changed |= self.poll_machine_connects();
+        // The first time Luvus is found missing, set it up without asking.
+        // Only once per launch: a failure waits on the prompt's retry rather
+        // than looping on every reconnect.
+        if self.local_luvus_missing
+            && !self.luvus_auto_install_tried
+            && self.luvus_install == LuvusInstall::Idle
+        {
+            self.luvus_auto_install_tried = true;
+            self.install_luvus(cx);
+            changed = true;
+        }
         self.pump_reconnects();
         self.drive_pending_switch();
         self.expire_pending_switch();
@@ -3355,7 +3413,7 @@ impl PilusView {
         while let Ok(result) = self.luvus_install_rx.try_recv() {
             match result {
                 Ok(_) => {
-                    self.luvus_install = LuvusInstall::Idle;
+                    self.luvus_install = LuvusInstall::Starting;
                     // The binary is in place; attach now rather than waiting
                     // out the reconnect backoff.
                     self.recheck_luvus(cx);
@@ -3368,10 +3426,19 @@ impl PilusView {
             self.daemon_busy = false;
             self.daemon_restart_pending = false;
             match outcome {
-                DaemonOutcome::Checked { installed, result } => {
+                DaemonOutcome::Checked {
+                    installed,
+                    result,
+                    beyond_pin,
+                } => {
                     let installed_label = installed
                         .as_ref()
                         .map_or_else(|| "unknown".to_string(), |version| version.to_string());
+                    let pinned = crate::luvus_update::pin().ok().map(|pin| pin.version);
+                    let ahead = matches!(
+                        (&installed, &pinned),
+                        (Some(installed), Some(pinned)) if installed > pinned
+                    );
                     self.daemon_installed = installed;
                     match result {
                         Ok(Some(release)) => {
@@ -3381,10 +3448,26 @@ impl PilusView {
                             );
                             self.daemon_latest = Some(release.version);
                         }
+                        // Installed by hand or a package manager past the pin:
+                        // it may work, but it is not what this build was tried
+                        // with, so say so before the user hits a mismatch.
+                        Ok(None) if ahead => {
+                            self.daemon_latest = None;
+                            self.daemon_status = format!(
+                                "Luvus {installed_label} is newer than this pilus was tested \
+                                 with ({}). If something looks wrong, update pilus.",
+                                pinned.map_or_else(String::new, |pin| pin.to_string())
+                            );
+                        }
                         Ok(None) => {
                             self.daemon_latest = None;
-                            self.daemon_status =
-                                format!("Luvus is up to date ({installed_label}).");
+                            self.daemon_status = match beyond_pin {
+                                Some(newer) => format!(
+                                    "Luvus is up to date for this pilus ({installed_label}). \
+                                     Luvus {newer} comes with a pilus update."
+                                ),
+                                None => format!("Luvus is up to date ({installed_label})."),
+                            };
                         }
                         Err(error) => {
                             self.daemon_status = format!("could not check Luvus: {error}");
@@ -3980,6 +4063,9 @@ impl PilusView {
                     }
                     self.local_reconnect = None;
                     self.local_luvus_missing = false;
+                    if self.luvus_install == LuvusInstall::Starting {
+                        self.luvus_install = LuvusInstall::Idle;
+                    }
                     if self.active == EndpointId::Local {
                         self.replace_active_local(connection);
                     } else {
@@ -4033,6 +4119,11 @@ impl PilusView {
                         self.status = format!("local server unavailable: {error}");
                     }
                     self.local_luvus_missing = luvus_missing;
+                    // The attach after a fresh install failed for another
+                    // reason; the card's own error line takes over from here.
+                    if self.luvus_install == LuvusInstall::Starting {
+                        self.luvus_install = LuvusInstall::Idle;
+                    }
                     changed = true;
                 }
             }
@@ -9315,7 +9406,14 @@ impl PilusView {
             let engine = crate::luvus_update::engine();
             let installed = crate::luvus_update::installed_version();
             let result = crate::luvus_update::check(&engine).map_err(|error| error.to_string());
-            tx.send(DaemonOutcome::Checked { installed, result }).ok();
+            let beyond_pin =
+                crate::luvus_update::newer_than_pin().map(|version| version.to_string());
+            tx.send(DaemonOutcome::Checked {
+                installed,
+                result,
+                beyond_pin,
+            })
+            .ok();
         });
         cx.notify();
     }

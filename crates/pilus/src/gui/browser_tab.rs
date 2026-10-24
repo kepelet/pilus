@@ -1,32 +1,48 @@
-//! The native Browser tab: a system webview in the right column, with an
-//! address bar over it.
+//! The native Browser tab: a system webview in the right column, with a strip
+//! of page tabs and an address bar over it.
 //!
 //! The page is a `wry` webview that `gpui-wry` hosts as a native child of the
 //! window, so it is drawn by the OS, above everything GPUI paints. That shapes
-//! the tab: the webview is created on the first address, kept alive while the
-//! tab is away, and shown only while nothing GPUI draws could land on it (see
-//! [`PilusView::browser_on_screen`]). Page events come back on a queue the
-//! webview's handlers fill, which [`PilusView::browser_tick`] drains with the
-//! other tabs' background work.
+//! the tab: a webview is created on a page's first address, kept alive while
+//! the tab is away, and shown only while nothing GPUI draws could land on it
+//! (see [`PilusView::browser_on_screen`]). Page events come back on a queue
+//! the webview's handlers fill, which [`PilusView::browser_tick`] drains with
+//! the other tabs' background work.
 //!
-//! The address bar is a [`TextInput`]. It follows the page's address while it
-//! is not being edited, and what the user typed becomes the next load.
+//! Each page tab owns its own webview and queue, so an event is never
+//! mistaken for another page's. Only the selected page is shown; the others
+//! are hidden and parked, and keep running like a browser's background tabs.
+//! A native webview is a whole WebContent process, so the strip holds at most
+//! [`MAX_PAGES`] of them.
+//!
+//! The address bar is a [`TextInput`]. It follows the selected page's address
+//! while it is not being edited, and what the user typed becomes the next load.
 
 use std::sync::{Arc, Mutex};
 
-use gpui::{AnyElement, Context, Div, Entity, MouseButton, Stateful, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, Div, Entity, MouseButton, SharedString, Stateful, Window, div, prelude::*,
+    px,
+};
 use gpui_wry::WebView;
 use wry::{NewWindowResponse, PageLoadEvent, WebViewBuilder};
 
 use super::browser_data;
 use super::style::{self, FillExt, RadiusExt};
+use super::toast::ToastKind;
 use super::{PilusView, icon};
+
+/// The most page tabs open at once. Each is a native webview with a
+/// WebContent process of its own, which costs far more than a terminal pane.
+const MAX_PAGES: usize = 8;
 
 /// What the webview's handlers report.
 enum Event {
     /// The page at this address started or finished loading.
     Loaded(String),
-    /// The page asked for a new window; the tab opens it in place instead.
+    /// The page's title changed.
+    Titled(String),
+    /// The page asked for a new window; the strip opens it as a tab instead.
     Opened(String),
 }
 
@@ -42,30 +58,39 @@ fn push(events: &Events, event: Event) {
     }
 }
 
-pub(super) struct BrowserPanel {
+/// One page tab. It has no `view` until its first address is loaded.
+struct Page {
     view: Option<Entity<WebView>>,
     events: Events,
     /// An address to load on the next frame, which has the window to build
     /// the webview with.
     pending: Option<String>,
-    /// The address bar holds the keyboard.
-    pub(super) editing: bool,
     /// The page's address, as the webview last reported it.
     url: String,
+    /// The page's title, as the webview last reported it.
+    title: String,
     /// The corner radius last pushed to the webview's layer, so an idle
     /// frame does not re-send it and a radius setting change reaches it.
     corner: Option<f32>,
 }
 
-impl BrowserPanel {
-    pub(super) fn new() -> Self {
+impl Page {
+    fn new() -> Self {
         Self {
             view: None,
             events: Arc::default(),
             pending: None,
-            editing: false,
             url: String::new(),
+            title: String::new(),
             corner: None,
+        }
+    }
+
+    /// A page that will load `url` once it is on screen.
+    fn loading(url: String) -> Self {
+        Self {
+            pending: Some(url),
+            ..Self::new()
         }
     }
 
@@ -74,23 +99,112 @@ impl BrowserPanel {
     /// (wry's `Drop` looks like it retains the view, but the `Retained` it
     /// gets back is dropped on the spot, so the count nets out). Blanking
     /// first silences the page's media right away instead of a frame later.
-    /// The queue is cleared so a late event cannot bring the old address back.
     fn close(&mut self, cx: &gpui::App) {
         if let Some(view) = self.view.take() {
             let _ = view.read(cx).raw().load_url("about:blank");
         }
+        self.forget();
+    }
+
+    /// Drop what the page knew. The queue is cleared so a late event cannot
+    /// bring the old address back.
+    fn forget(&mut self) {
+        self.view = None;
         self.pending = None;
-        self.editing = false;
         self.url.clear();
+        self.title.clear();
         self.corner = None;
         if let Ok(mut queue) = self.events.lock() {
             queue.clear();
         }
     }
 
-    /// Whether a page has been opened, so there is a webview to drive.
+    /// What the page's tab reads: its title, else its host, else a blank tab.
+    fn label(&self) -> String {
+        let title = self.title.trim();
+        if !title.is_empty() {
+            return title.to_string();
+        }
+        host_of(&self.url).unwrap_or_else(|| "New tab".to_string())
+    }
+}
+
+/// The host of `url`, for a tab whose page has no title yet.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?;
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+pub(super) struct BrowserPanel {
+    /// The open page tabs; never empty, and at most [`MAX_PAGES`].
+    pages: Vec<Page>,
+    /// The tab the column shows.
+    active: usize,
+    /// The address bar holds the keyboard.
+    pub(super) editing: bool,
+}
+
+impl BrowserPanel {
+    pub(super) fn new() -> Self {
+        Self {
+            pages: vec![Page::new()],
+            active: 0,
+            editing: false,
+        }
+    }
+
+    fn page(&self) -> &Page {
+        &self.pages[self.active.min(self.pages.len() - 1)]
+    }
+
+    fn page_mut(&mut self) -> &mut Page {
+        let ix = self.active.min(self.pages.len() - 1);
+        &mut self.pages[ix]
+    }
+
+    /// Whether the selected tab has a page open, so there is a webview to drive.
     pub(super) fn has_page(&self) -> bool {
-        self.view.is_some()
+        self.page().view.is_some()
+    }
+
+    fn full(&self) -> bool {
+        self.pages.len() >= MAX_PAGES
+    }
+
+    /// Close tab `ix`. The last tab is emptied instead of removed, so the
+    /// strip always has a page to show.
+    fn close_page(&mut self, ix: usize, cx: &gpui::App) {
+        if let Some(page) = self.pages.get_mut(ix) {
+            page.close(cx);
+        }
+        self.close_page_state(ix);
+    }
+
+    /// The bookkeeping of [`Self::close_page`], once the webview is gone.
+    fn close_page_state(&mut self, ix: usize) {
+        if ix >= self.pages.len() {
+            return;
+        }
+        self.pages[ix].forget();
+        if self.pages.len() == 1 {
+            return;
+        }
+        self.pages.remove(ix);
+        self.active = selected_after_close(self.active, ix, self.pages.len());
+    }
+}
+
+/// The selected tab once tab `closed` is gone and `left` remain. The same
+/// page stays selected: closing one before it moves the index down, and
+/// closing the selected one hands over to its right neighbour, or to the left
+/// one when it was last.
+fn selected_after_close(active: usize, closed: usize, left: usize) -> usize {
+    if closed < active || active >= left {
+        active.saturating_sub(1)
+    } else {
+        active
     }
 }
 
@@ -315,6 +429,7 @@ impl PilusView {
         self.browser_visible()
             && self
                 .browser_panel
+                .page()
                 .view
                 .as_ref()
                 .is_some_and(|view| page_holds_responder(view.read(cx).raw()))
@@ -329,7 +444,7 @@ impl PilusView {
         if event.keystroke.modifiers.platform {
             return;
         }
-        if let Some(view) = &self.browser_panel.view
+        if let Some(view) = &self.browser_panel.page().view
             && send_key_to_page(view.read(cx).raw())
         {
             cx.stop_propagation();
@@ -350,7 +465,7 @@ impl PilusView {
     pub(super) fn browser_begin_edit(&mut self, cx: &mut Context<Self>) {
         self.browser_panel.editing = true;
         self.right.focused = true;
-        if let Some(view) = &self.browser_panel.view {
+        if let Some(view) = &self.browser_panel.page().view {
             // The webview owns the OS-level first responder once clicked in;
             // take it back so the address bar's keys reach us.
             let _ = view.read(cx).raw().focus_parent();
@@ -361,10 +476,15 @@ impl PilusView {
     fn browser_end_edit(&mut self, cx: &mut Context<Self>) {
         self.browser_panel.editing = false;
         self.right.focused = false;
-        let url = self.browser_panel.url.clone();
+        self.browser_show_address(cx);
+        cx.notify();
+    }
+
+    /// Put the selected page's address in the address bar.
+    fn browser_show_address(&mut self, cx: &mut Context<Self>) {
+        let url = self.browser_panel.page().url.clone();
         self.browser_input
             .update(cx, |input, cx| input.set_value(url, cx));
-        cx.notify();
     }
 
     /// Load what the address bar holds.
@@ -376,7 +496,7 @@ impl PilusView {
         };
         self.browser_input
             .update(cx, |input, cx| input.set_value(url.clone(), cx));
-        self.browser_panel.pending = Some(url);
+        self.browser_panel.page_mut().pending = Some(url);
         self.browser_panel.editing = false;
         self.right.focused = false;
         cx.notify();
@@ -390,34 +510,70 @@ impl PilusView {
         }
     }
 
-    /// Stop the page and close the browser, not just hide it: the webview is
-    /// destroyed, and the next address builds a fresh one.
-    fn browser_stop(&mut self, cx: &mut Context<Self>) {
-        self.browser_panel.close(cx);
+    /// Open an empty tab and give it the address bar. At the cap, or from a
+    /// tab that is already empty, the selected tab is reused.
+    pub(super) fn browser_new_tab(&mut self, cx: &mut Context<Self>) {
+        if self.browser_panel.has_page() {
+            if self.browser_panel.full() {
+                self.toast(
+                    ToastKind::Info,
+                    format!("The Browser holds {MAX_PAGES} tabs. Close one to open another."),
+                );
+                return;
+            }
+            self.browser_panel.pages.push(Page::new());
+            self.browser_panel.active = self.browser_panel.pages.len() - 1;
+            self.browser_input.update(cx, |input, cx| input.clear(cx));
+        }
+        self.browser_begin_edit(cx);
+    }
+
+    /// Show tab `ix`. An empty tab opens with the address bar ready.
+    fn browser_select_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.browser_panel.pages.len() || ix == self.browser_panel.active {
+            return;
+        }
+        self.browser_panel.active = ix;
+        self.browser_panel.editing = false;
         self.right.focused = false;
-        self.browser_input.update(cx, |input, cx| input.clear(cx));
+        self.browser_show_address(cx);
+        if !self.browser_panel.has_page() && self.browser_panel.page().pending.is_none() {
+            self.browser_begin_edit(cx);
+        }
+        cx.notify();
+    }
+
+    /// Close tab `ix`: its webview is destroyed, and the next address in an
+    /// emptied tab builds a fresh one.
+    fn browser_close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let selected = ix == self.browser_panel.active;
+        self.browser_panel.close_page(ix, cx);
+        if selected {
+            self.browser_panel.editing = false;
+            self.right.focused = false;
+            self.browser_show_address(cx);
+            if !self.browser_panel.has_page() {
+                self.browser_begin_edit(cx);
+            }
+        }
         cx.notify();
     }
 
     /// Run `script` in the page, if there is one.
     fn browser_script(&self, script: &str, cx: &Context<Self>) {
-        if let Some(view) = &self.browser_panel.view {
+        if let Some(view) = &self.browser_panel.page().view {
             let _ = view.read(cx).raw().evaluate_script(script);
         }
     }
 
     fn browser_reload(&self, cx: &Context<Self>) {
-        if let Some(view) = &self.browser_panel.view {
+        if let Some(view) = &self.browser_panel.page().view {
             let _ = view.read(cx).raw().reload();
         }
     }
 
-    /// Drain what the page reported; true when the address bar changed.
+    /// Drain what the pages reported; true when anything on screen changed.
     pub(super) fn browser_tick(&mut self, cx: &mut Context<Self>) -> bool {
-        let events = match self.browser_panel.events.lock() {
-            Ok(mut queue) => std::mem::take(&mut *queue),
-            Err(_) => return false,
-        };
         let mut changed = false;
         // A click in the page moves the OS first responder without GPUI
         // hearing of it, so the address bar learns it lost the keyboard here.
@@ -425,32 +581,64 @@ impl PilusView {
             self.browser_end_edit(cx);
             changed = true;
         }
-        for event in events {
-            match event {
-                Event::Loaded(url) => {
-                    changed |= url != self.browser_panel.url;
-                    self.browser_panel.url = url;
-                }
-                Event::Opened(url) => {
-                    self.browser_panel.pending = Some(url);
-                    changed = true;
+        let active = self.browser_panel.active;
+        let mut address_changed = false;
+        // New windows the pages asked for, with the tab that asked.
+        let mut opened = Vec::new();
+        for (ix, page) in self.browser_panel.pages.iter_mut().enumerate() {
+            let events = match page.events.lock() {
+                Ok(mut queue) => std::mem::take(&mut *queue),
+                Err(_) => continue,
+            };
+            for event in events {
+                match event {
+                    Event::Loaded(url) => {
+                        if url != page.url {
+                            address_changed |= ix == active;
+                            changed = true;
+                        }
+                        page.url = url;
+                    }
+                    Event::Titled(title) => {
+                        changed |= title != page.title;
+                        page.title = title;
+                    }
+                    Event::Opened(url) => opened.push((ix, url)),
                 }
             }
         }
-        if changed && !self.browser_panel.editing {
-            let url = self.browser_panel.url.clone();
-            self.browser_input
-                .update(cx, |input, cx| input.set_value(url, cx));
+        for (from, url) in opened {
+            changed = true;
+            if self.browser_panel.full() {
+                // No room for another webview: the link loads where it was
+                // clicked, as it did before there were tabs.
+                self.browser_panel.pages[from].pending = Some(url);
+                continue;
+            }
+            // Beside the opener, and in front only when the opener was.
+            let at = from + 1;
+            self.browser_panel.pages.insert(at, Page::loading(url));
+            if from == self.browser_panel.active {
+                self.browser_panel.active = at;
+                address_changed = true;
+            } else if at <= self.browser_panel.active {
+                self.browser_panel.active += 1;
+            }
+        }
+        if address_changed && !self.browser_panel.editing {
+            self.browser_show_address(cx);
         }
         changed
     }
 
-    /// Bring the native webview in line with the tab: build it on the first
-    /// address, load what was asked for, and show it only while it may be seen.
+    /// Bring the native webviews in line with the tab: build the selected
+    /// page's on its first address, load what was asked for, and show it only
+    /// while it may be seen. Every other page is hidden and parked.
     pub(super) fn browser_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let on_screen = self.browser_on_screen();
-        if on_screen && let Some(url) = self.browser_panel.pending.take() {
-            match self.browser_panel.view.clone() {
+        let active = self.browser_panel.active;
+        if on_screen && let Some(url) = self.browser_panel.page_mut().pending.take() {
+            match self.browser_panel.page().view.clone() {
                 Some(view) => view.update(cx, |view, _| view.load_url(&url)),
                 None => self.browser_open(&url, window, cx),
             }
@@ -458,15 +646,19 @@ impl PilusView {
         // The frame's 1px border sits outside the page, so the page's
         // corner is that much tighter than the frame's.
         let corner = (style::Radius::Md.pixels().to_f64() as f32 - 1.0).max(0.0);
-        if let Some(view) = &self.browser_panel.view {
-            if self.browser_panel.corner != Some(corner) {
+        for (ix, page) in self.browser_panel.pages.iter_mut().enumerate() {
+            let Some(view) = &page.view else {
+                continue;
+            };
+            if page.corner != Some(corner) {
                 round_page_corner(view.read(cx).raw(), corner);
-                self.browser_panel.corner = Some(corner);
+                page.corner = Some(corner);
             }
+            let shown = on_screen && ix == active;
             view.update(cx, |view, _| {
-                if on_screen && !view.visible() {
+                if shown && !view.visible() {
                     view.show();
-                } else if !on_screen && view.visible() {
+                } else if !shown && view.visible() {
                     view.hide();
                     park_page(view.raw());
                 }
@@ -475,12 +667,16 @@ impl PilusView {
     }
 
     fn browser_open(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let loaded = self.browser_panel.events.clone();
-        let opened = self.browser_panel.events.clone();
+        let loaded = self.browser_panel.page().events.clone();
+        let titled = loaded.clone();
+        let opened = loaded.clone();
         let built = WebViewBuilder::new()
             .with_url(url)
             .with_on_page_load_handler(move |_: PageLoadEvent, url| {
                 push(&loaded, Event::Loaded(url));
+            })
+            .with_document_title_changed_handler(move |title| {
+                push(&titled, Event::Titled(title));
             })
             .with_new_window_req_handler(move |url, _| {
                 push(&opened, Event::Opened(url));
@@ -495,8 +691,9 @@ impl PilusView {
             .build_as_child(window);
         match built {
             Ok(webview) => {
-                self.browser_panel.url = url.to_string();
-                self.browser_panel.view = Some(cx.new(|cx| WebView::new(webview, window, cx)));
+                let page = self.browser_panel.page_mut();
+                page.url = url.to_string();
+                page.view = Some(cx.new(|cx| WebView::new(webview, window, cx)));
             }
             Err(error) => tracing::warn!(%error, "browser: could not create the webview"),
         }
@@ -512,8 +709,9 @@ impl PilusView {
             .flex_col()
             .size_full()
             .min_h(px(0.0))
+            .child(self.browser_tab_strip(cx))
             .child(self.browser_header(cx));
-        match self.browser_panel.view.clone() {
+        match self.browser_panel.page().view.clone() {
             // While the column moves the webview is hidden, so the body is
             // left empty rather than showing a stale frame.
             //
@@ -551,12 +749,100 @@ impl PilusView {
             )
     }
 
+    /// The strip of page tabs over the address bar, with a button for a new
+    /// one. The tabs share the width and shrink, with their titles cut short,
+    /// as a browser's do; the close button shows on the selected tab and on
+    /// the one under the pointer, and a middle click closes any tab.
+    fn browser_tab_strip(&mut self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let full = self.browser_panel.full();
+        let active = self.browser_panel.active;
+        let tabs: Vec<(usize, String)> = self
+            .browser_panel
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(ix, page)| (ix, page.label()))
+            .collect();
+        let tabs = tabs.into_iter().map(|(ix, label)| {
+            let group = SharedString::from(format!("pilus-browser-tab-group-{ix}"));
+            let selected = ix == active;
+            let close = div()
+                .id(("pilus-browser-tab-close", ix))
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .size(px(fonts.body + 4.0))
+                .radius_sm()
+                .opacity(if selected { 1.0 } else { 0.0 })
+                .group_hover(group.clone(), |style| style.opacity(1.0))
+                .hover_fill(theme.panel_dim, style::RADIUS_SM)
+                .child(icon(
+                    include_bytes!("../../assets/icons/x.svg"),
+                    fonts.label,
+                    theme.muted,
+                ))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.browser_close_tab(ix, cx);
+                        cx.stop_propagation();
+                    }),
+                );
+            style::tab(
+                ("pilus-browser-tab", ix),
+                div().flex_1().min_w(px(0.0)).truncate().child(label),
+                selected,
+                theme,
+                fonts.body,
+            )
+            .group(group)
+            .gap_1()
+            .px_2()
+            .flex_1()
+            .min_w(px(28.0))
+            .max_w(px(160.0))
+            .child(close)
+            .on_click(cx.listener(move |this, _, _, cx| this.browser_select_tab(ix, cx)))
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _, _, cx| this.browser_close_tab(ix, cx)),
+            )
+        });
+        let tip = if full {
+            format!("{MAX_PAGES} tabs is the most. Close one to open another.")
+        } else {
+            "New tab".to_string()
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .flex_shrink_0()
+            .px_3()
+            .pt_2()
+            .children(tabs)
+            .child(
+                self.diff_icon_button(
+                    "pilus-browser-new-tab",
+                    include_bytes!("../../assets/icons/plus.svg"),
+                    tip,
+                    !full,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.browser_new_tab(cx))),
+            )
+    }
+
     /// Back, forward and reload beside the address bar.
     fn browser_header(&mut self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let height = style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL);
-        let loaded = self.browser_panel.view.is_some();
+        let loaded = self.browser_panel.has_page();
         self.browser_input.update(cx, |input, _| {
             input.set_style(
                 theme,
@@ -569,7 +855,7 @@ impl PilusView {
         let address: AnyElement = if self.browser_panel.editing {
             self.browser_input.clone().into_any_element()
         } else {
-            let shown = self.browser_panel.url.clone();
+            let shown = self.browser_panel.page().url.clone();
             div()
                 .truncate()
                 .text_color(if shown.is_empty() {
@@ -640,16 +926,6 @@ impl PilusView {
                     false,
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.browser_reload(cx))),
-            )
-            .child(
-                self.diff_icon_button(
-                    "pilus-browser-stop",
-                    include_bytes!("../../assets/icons/square-fill.svg"),
-                    "Stop and close the page".to_string(),
-                    loaded,
-                    false,
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.browser_stop(cx))),
             )
             .child(field)
     }
@@ -722,7 +998,50 @@ impl PilusView {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize;
+    use super::{BrowserPanel, MAX_PAGES, Page, host_of, normalize, selected_after_close};
+
+    #[test]
+    fn closing_keeps_the_same_page_selected() {
+        // [a b c d], b selected: closing a shifts it to index 0.
+        assert_eq!(selected_after_close(1, 0, 3), 0);
+        // Closing the selected tab hands over to the one that slid into place.
+        assert_eq!(selected_after_close(1, 1, 3), 1);
+        // Closing the selected last tab falls back to its left neighbour.
+        assert_eq!(selected_after_close(3, 3, 3), 2);
+        // Closing a tab after the selected one changes nothing.
+        assert_eq!(selected_after_close(0, 2, 3), 0);
+    }
+
+    #[test]
+    fn the_last_tab_is_emptied_not_removed() {
+        let mut panel = BrowserPanel::new();
+        panel.pages[0].url = "https://example.com".to_string();
+        panel.pages[0].pending = Some("https://example.org".to_string());
+        panel.close_page_state(0);
+        assert_eq!(panel.pages.len(), 1);
+        assert!(panel.pages[0].url.is_empty());
+        assert!(panel.pages[0].pending.is_none());
+    }
+
+    #[test]
+    fn the_strip_stops_at_the_cap() {
+        let mut panel = BrowserPanel::new();
+        while !panel.full() {
+            panel.pages.push(Page::new());
+        }
+        assert_eq!(panel.pages.len(), MAX_PAGES);
+    }
+
+    #[test]
+    fn a_tab_reads_its_title_then_its_host() {
+        let mut page = Page::new();
+        assert_eq!(page.label(), "New tab");
+        page.url = "https://user@docs.rs:8080/gpui?q=1".to_string();
+        assert_eq!(page.label(), "docs.rs:8080");
+        page.title = "  gpui - Rust  ".to_string();
+        assert_eq!(page.label(), "gpui - Rust");
+        assert_eq!(host_of("about:blank"), None);
+    }
 
     #[test]
     fn full_addresses_pass_through() {

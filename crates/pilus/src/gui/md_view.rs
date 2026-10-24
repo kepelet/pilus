@@ -62,6 +62,8 @@ pub(super) enum Row {
     Composer,
     /// Heads the notes that have no block to sit under.
     Stray,
+    /// The Changes tab leaves out this many unchanged blocks here.
+    Gap(usize),
 }
 
 /// The note form's place in the document.
@@ -97,6 +99,18 @@ pub(super) fn rows(
     notes: &[DiffNote],
     composing: Option<Composing<'_>>,
 ) -> Vec<Row> {
+    rows_of(document, notes, composing, None)
+}
+
+/// [`rows`], keeping only the blocks `shown` marks, as the Changes tab does.
+/// A block with a note or the form is kept anyway, so neither loses its
+/// place; each run of blocks left out becomes one [`Row::Gap`].
+pub(super) fn rows_of(
+    document: &Document,
+    notes: &[DiffNote],
+    composing: Option<Composing<'_>>,
+    shown: Option<&[bool]>,
+) -> Vec<Row> {
     let count = document.blocks().len();
     let mut under: Vec<Vec<usize>> = vec![Vec::new(); count];
     let mut stray = Vec::new();
@@ -123,12 +137,28 @@ pub(super) fn rows(
             Row::Note(index)
         }
     };
+    let mut hidden = 0;
     for (block, group) in under.iter().enumerate() {
+        let form_here = new_form_block == Some(Some(block));
+        let keep = shown.is_none_or(|shown| shown.get(block).copied().unwrap_or(false))
+            || !group.is_empty()
+            || form_here;
+        if !keep {
+            hidden += 1;
+            continue;
+        }
+        if hidden > 0 {
+            rows.push(Row::Gap(hidden));
+            hidden = 0;
+        }
         rows.push(Row::Block(block));
         rows.extend(group.iter().map(|&index| note_row(index)));
-        if new_form_block == Some(Some(block)) {
+        if form_here {
             rows.push(Row::Composer);
         }
+    }
+    if hidden > 0 {
+        rows.push(Row::Gap(hidden));
     }
     if !stray.is_empty() {
         rows.push(Row::Stray);
@@ -225,6 +255,10 @@ pub(super) struct MdDoc {
     /// How the source differs from Git's copy, for the blocks' marks. `None`
     /// with no copy, or until worked out against the current one.
     changes: Option<LineChanges>,
+    /// Draw only the blocks Git's marks touch: the Changes tab shows a diff,
+    /// not the whole file. Until the marks are in nothing is drawn, so the
+    /// whole file never flashes up first.
+    changes_only: bool,
 }
 
 impl MdDoc {
@@ -253,7 +287,56 @@ impl MdDoc {
             dragging: false,
             hits: Hits::default(),
             changes: None,
+            changes_only: false,
         }
+    }
+
+    /// Draw only the changed blocks, with the rest folded into gaps.
+    pub(super) fn changes_only(mut self, on: bool) -> Self {
+        self.changes_only = on;
+        self
+    }
+
+    /// Switch between the changed blocks and all of them; the rows rebuild
+    /// on the next sync.
+    pub(super) fn set_changes_only(&mut self, on: bool) {
+        if self.changes_only != on {
+            self.changes_only = on;
+            self.stale = true;
+        }
+    }
+
+    /// The marks of the block at `index`.
+    fn marks_of_block(&self, changes: &LineChanges, index: usize) -> BlockMarks {
+        let blocks = self.document.blocks();
+        let after = index
+            .checked_sub(1)
+            .and_then(|prev| blocks.get(prev))
+            .map_or(0, |prev| prev.text_last_line);
+        match blocks.get(index) {
+            Some(block) => block_marks(
+                changes,
+                after,
+                block.first_line,
+                block.text_last_line,
+                index + 1 == blocks.len(),
+            ),
+            None => BlockMarks::default(),
+        }
+    }
+
+    /// Which blocks the rows draw, when only the changed ones are.
+    fn shown_blocks(&self) -> Option<Vec<bool>> {
+        if !self.changes_only {
+            return None;
+        }
+        let count = self.document.blocks().len();
+        Some(match &self.changes {
+            Some(changes) => (0..count)
+                .map(|index| self.marks_of_block(changes, index).any())
+                .collect(),
+            None => vec![false; count],
+        })
     }
 
     /// Bring the marks up to date with `base`, Git's copy of the file. They
@@ -277,6 +360,7 @@ impl MdDoc {
     /// patch it shows.
     pub(super) fn set_marks(&mut self, changes: LineChanges) {
         self.changes = Some(changes);
+        self.stale = true;
     }
 
     /// Drop the marks: the base they were worked out against is gone.
@@ -397,7 +481,8 @@ impl MdDoc {
     ) -> bool {
         if self.built != Some(stamp) || self.stale {
             let first = self.built.is_none();
-            self.rows = rows(&self.document, notes, composing);
+            let shown = self.shown_blocks();
+            self.rows = rows_of(&self.document, notes, composing, shown.as_deref());
             self.built = Some(stamp);
             self.stale = false;
             if first {
@@ -597,6 +682,17 @@ impl PilusView {
                 None => div().into_any_element(),
             },
             Row::Composer => self.diff_composer(0.0, cx),
+            Row::Gap(count) => div()
+                .px_3()
+                .py_2()
+                .text_size(px(style::Fonts::resolve(&self.shared_settings).label))
+                .text_color(self.theme.muted)
+                .child(if count == 1 {
+                    "1 unchanged block".to_string()
+                } else {
+                    format!("{count} unchanged blocks")
+                })
+                .into_any_element(),
             Row::Stray => div()
                 .px_3()
                 .pt_3()
@@ -652,18 +748,7 @@ impl PilusView {
                 &leaves,
             ));
         if let Some(changes) = &doc.changes {
-            let blocks = doc.document.blocks();
-            let after = block_ix
-                .checked_sub(1)
-                .and_then(|prev| blocks.get(prev))
-                .map_or(0, |prev| prev.text_last_line);
-            let marks = block_marks(
-                changes,
-                after,
-                block.first_line,
-                block.text_last_line,
-                block_ix + 1 == blocks.len(),
-            );
+            let marks = doc.marks_of_block(changes, block_ix);
             if marks.any() {
                 row = row.children(self.md_git_marks(marks, top, bottom));
             }
@@ -1181,6 +1266,30 @@ mod tests {
         // Past the end, the last block.
         assert_eq!(block_for_line(&document, 99), Some(2));
         assert_eq!(block_for_line(&Document::parse("", false), 1), None);
+    }
+
+    #[test]
+    fn only_the_shown_blocks_are_rows_and_the_rest_fold_into_gaps() {
+        let shown = [false, true, false];
+        assert_eq!(
+            rows_of(&document(), &[], None, Some(&shown)),
+            vec![Row::Gap(1), Row::Block(1), Row::Gap(1)]
+        );
+        let shown = [true, false, false];
+        assert_eq!(
+            rows_of(&document(), &[], None, Some(&shown)),
+            vec![Row::Block(0), Row::Gap(2)]
+        );
+    }
+
+    #[test]
+    fn a_block_with_a_note_stays_when_unchanged() {
+        let notes = [note("a", NoteSide::New, 6, 6)];
+        let shown = [true, false, false];
+        assert_eq!(
+            rows_of(&document(), &notes, None, Some(&shown)),
+            vec![Row::Block(0), Row::Gap(1), Row::Block(2), Row::Note(0)]
+        );
     }
 
     #[test]

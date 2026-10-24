@@ -107,6 +107,13 @@ they match the patch exactly: against the index for an unstaged change, against
 `HEAD` for a staged one. `DiffPanel::mark_markdown` applies them once the patch
 and the text are in for the same fingerprint, since each arrives on its own.
 
+The Changes tab draws only the marked blocks (`MdDoc::changes_only`), not the
+whole file; each run of unchanged blocks folds into one `Row::Gap`. A block with
+a note or the open form stays even if unchanged. The header's Changed / Full /
+Diff buttons (and `F`) switch between that, the whole rendered file
+(`DiffPanel::full`) and the patch. Nothing is drawn until the
+marks are in, so the full file never flashes up first.
+
 - `files_read_base` reads the index copy with `git show :./name`, run in the
   file's folder (over SSH for a remote machine) on a worker thread. The copy
   lives on the open document (`FileDoc::git_base`), so a preview that was

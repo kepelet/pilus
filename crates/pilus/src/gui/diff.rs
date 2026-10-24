@@ -189,6 +189,8 @@ pub(super) struct DiffPanel {
     mode: LayoutMode,
     /// Show a markdown file rendered rather than as a patch.
     rendered: bool,
+    /// Draw the whole rendered file, not just the blocks that changed.
+    full: bool,
     md: Option<MdText>,
     md_loading: Option<(FileKey, String)>,
     cursor: Cursor,
@@ -253,6 +255,7 @@ impl DiffPanel {
             follow: None,
             mode: LayoutMode::default(),
             rendered: true,
+            full: false,
             md: None,
             md_loading: None,
             cursor: Cursor::start(),
@@ -340,6 +343,7 @@ impl DiffPanel {
             query: std::mem::take(&mut self.query),
             mode: self.mode,
             rendered: self.rendered,
+            full: self.full,
             viewed: std::mem::take(&mut self.viewed),
             list_h: self.list_h,
             list_w: self.list_w,
@@ -681,6 +685,7 @@ impl PilusView {
                 result,
             } => {
                 let panel = &mut self.diff_panel;
+                let changes_only = !panel.full;
                 if panel.md_loading.as_ref() == Some(&(key.clone(), fingerprint.clone())) {
                     panel.md_loading = None;
                 }
@@ -693,7 +698,7 @@ impl PilusView {
                 if !current {
                     return;
                 }
-                let state = result.map(|file| MdDoc::new(&file, &key.1));
+                let state = result.map(|file| MdDoc::new(&file, &key.1).changes_only(changes_only));
                 panel.md = Some(MdText {
                     key,
                     fingerprint,
@@ -987,6 +992,12 @@ impl PilusView {
         cx.notify();
     }
 
+    /// Switch the rendered file between its changed blocks and all of it.
+    fn diff_toggle_full(&mut self, cx: &mut Context<Self>) {
+        self.diff_panel.full = !self.diff_panel.full;
+        cx.notify();
+    }
+
     /// Bring the laid-out rows up to date with the width and the notes.
     /// Returns whether another frame is wanted to finish a scroll.
     fn diff_sync(&mut self, split: bool) -> bool {
@@ -1053,9 +1064,11 @@ impl PilusView {
         panel.notes_gen.hash(&mut hasher);
         composing.hash(&mut hasher);
         let stamp = hasher.finish();
+        let changes_only = !panel.full;
         let Some(md) = panel.md.as_mut().and_then(|md| md.state.as_mut().ok()) else {
             return false;
         };
+        md.set_changes_only(changes_only);
         md.sync(stamp, &panel.file_notes, composing)
     }
 
@@ -1715,6 +1728,7 @@ impl PilusView {
             "J" => self.diff_step_file(1, cx),
             "K" => self.diff_step_file(-1, cx),
             "p" => self.diff_toggle_rendered(cx),
+            "F" => self.diff_toggle_full(cx),
             "t" => self.diff_toggle_view(cx),
             "m" => self.diff_toggle_viewed(cx),
             "S" => self.diff_toggle_staged(cx),
@@ -2915,9 +2929,9 @@ impl PilusView {
                 .flex_shrink_0()
                 .child(
                     style::small_button(
-                        "pilus-diff-view-preview",
-                        "Preview",
-                        if panel.rendered {
+                        "pilus-diff-view-changed",
+                        "Changed",
+                        if panel.rendered && !panel.full {
                             ButtonKind::Secondary
                         } else {
                             ButtonKind::Ghost
@@ -2928,6 +2942,30 @@ impl PilusView {
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.diff_panel.rendered {
                             this.diff_toggle_rendered(cx);
+                        }
+                        if this.diff_panel.full {
+                            this.diff_toggle_full(cx);
+                        }
+                    })),
+                )
+                .child(
+                    style::small_button(
+                        "pilus-diff-view-full",
+                        "Full",
+                        if panel.rendered && panel.full {
+                            ButtonKind::Secondary
+                        } else {
+                            ButtonKind::Ghost
+                        },
+                        theme,
+                        fonts.secondary,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.diff_panel.rendered {
+                            this.diff_toggle_rendered(cx);
+                        }
+                        if !this.diff_panel.full {
+                            this.diff_toggle_full(cx);
                         }
                     })),
                 )

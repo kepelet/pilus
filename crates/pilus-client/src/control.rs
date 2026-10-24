@@ -15,7 +15,7 @@
 //! refresh is a full SSH round trip, and a click waiting behind one reads as
 //! an unresponsive tab strip.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -673,6 +673,15 @@ pub enum ControlTransport {
 }
 
 impl ControlTransport {
+    /// A short name for logs: which endpoint, never a credential.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Socket(_) => "local".to_string(),
+            Self::Tcp(address) => format!("gateway {address}"),
+            Self::Ssh(target) => format!("ssh {}", target.destination),
+        }
+    }
+
     /// Open one fresh stream for a single request.
     pub(crate) fn stream(&self) -> Result<Stream> {
         match self {
@@ -1420,7 +1429,7 @@ impl AgentFeed {
         let (update_tx, updates) = unbounded();
         // Shared so a burst of structural events (one tab open emits several)
         // forwards a single snapshot instead of a redraw per event.
-        let last: Arc<Mutex<Option<FeedUpdate>>> = Arc::new(Mutex::new(None));
+        let last: Arc<Mutex<Held>> = Arc::new(Mutex::new(Held::default()));
         let reconcile_updates = update_tx.clone();
         let reconcile_last = Arc::clone(&last);
         let reconcile_transport = transport.clone();
@@ -1571,7 +1580,7 @@ fn run_reconcile(
     pokes: Receiver<()>,
     wakes: Receiver<()>,
     updates: Sender<FeedUpdate>,
-    last: Arc<Mutex<Option<FeedUpdate>>>,
+    last: Arc<Mutex<Held>>,
 ) {
     // Publish one snapshot immediately; remote feeds have no event stream to
     // trigger the first refresh.
@@ -1639,7 +1648,7 @@ fn run_reconcile(
 fn refresh_agents(
     transport: &ControlTransport,
     updates: &Sender<FeedUpdate>,
-    last: &Mutex<Option<FeedUpdate>>,
+    last: &Mutex<Held>,
 ) -> bool {
     let Some(agents) = ControlClient::from_transport(transport.clone())
         .agents()
@@ -1650,7 +1659,7 @@ fn refresh_agents(
     let Ok(mut guard) = last.lock() else {
         return true;
     };
-    let Some(snapshot) = guard.as_mut() else {
+    let Some(snapshot) = guard.snapshot.as_mut() else {
         // Nothing published yet; the opening refresh lands one momentarily.
         return true;
     };
@@ -1662,7 +1671,7 @@ fn refresh_agents(
 }
 
 /// Hold an event subscription, refreshing the snapshot on structural changes.
-fn run_events(socket: PathBuf, updates: Sender<FeedUpdate>, last: Arc<Mutex<Option<FeedUpdate>>>) {
+fn run_events(socket: PathBuf, updates: Sender<FeedUpdate>, last: Arc<Mutex<Held>>) {
     loop {
         let mut uhp = crate::uhp::UhpClient::connect(&socket);
         let Ok(mut stream) = uhp.subscribe() else {
@@ -1705,7 +1714,7 @@ fn run_events(socket: PathBuf, updates: Sender<FeedUpdate>, last: Arc<Mutex<Opti
 /// event is the only source of zoom state, so it is stored beside the
 /// snapshot, where [`refresh`] carries it across re-reads. `false` means the
 /// UI is gone.
-fn note_zoom(data: &Value, updates: &Sender<FeedUpdate>, last: &Mutex<Option<FeedUpdate>>) -> bool {
+fn note_zoom(data: &Value, updates: &Sender<FeedUpdate>, last: &Mutex<Held>) -> bool {
     let (Some(pane), Some(enabled)) = (
         data.get("pane").and_then(Value::as_str),
         data.get("enabled").and_then(Value::as_bool),
@@ -1716,7 +1725,7 @@ fn note_zoom(data: &Value, updates: &Sender<FeedUpdate>, last: &Mutex<Option<Fee
         return true;
     };
     // Nothing published yet; the opening refresh has no zoom to preserve.
-    let Some(snapshot) = guard.as_mut() else {
+    let Some(snapshot) = guard.snapshot.as_mut() else {
         return true;
     };
     let was_zoomed = snapshot.zoomed.iter().any(|zoomed| zoomed == pane);
@@ -1741,70 +1750,151 @@ fn refresh(
     transport: &ControlTransport,
     scope: FeedScope,
     updates: &Sender<FeedUpdate>,
-    last: &Mutex<Option<FeedUpdate>>,
+    last: &Mutex<Held>,
 ) -> bool {
-    let Some(mut update) = fetch_update(transport, scope) else {
+    let reads = fetch_reads(transport, scope);
+    let Ok(mut held) = last.lock() else {
         return true;
     };
-    let Ok(mut guard) = last.lock() else {
+    let Some(update) = merge(reads, &mut held, &transport.describe()) else {
         return true;
     };
-    if let Some(held) = guard.as_ref() {
-        update.zoomed.clone_from(&held.zoomed);
-    }
-    if guard.as_ref() == Some(&update) {
+    if held.snapshot.as_ref() == Some(&update) {
         return true;
     }
-    *guard = Some(update.clone());
-    drop(guard);
+    held.snapshot = Some(update.clone());
+    drop(held);
     updates.send(update).is_ok()
+}
+
+/// What a feed last published, and which of its reads are failing.
+#[derive(Debug, Default)]
+struct Held {
+    /// The snapshot the GUI was last sent.
+    snapshot: Option<FeedUpdate>,
+    /// The error each failing read last reported. A failure is logged when it
+    /// starts or changes and once more when it clears, never on every tick.
+    failing: BTreeMap<&'static str, String>,
+}
+
+/// One read's outcome, with the error already rendered for the log.
+type ReadResult<T> = std::result::Result<T, String>;
+
+/// One pass of chrome reads. `None` is a read this scope does not make.
+struct Reads {
+    agents: ReadResult<Vec<Agent>>,
+    bar: ReadResult<Vec<BarWidget>>,
+    tabs: ReadResult<Vec<Tab>>,
+    automations: Option<ReadResult<AutomationSummary>>,
+    tasks: Option<ReadResult<TaskSummary>>,
+    focused: Option<String>,
 }
 
 /// Read the requested snapshots in parallel.
 ///
-/// `None` means at least one read failed; the caller keeps the last good
-/// snapshot and retries on the next event or reconciliation tick.
-fn fetch_update(transport: &ControlTransport, scope: FeedScope) -> Option<FeedUpdate> {
-    if scope == FeedScope::Agents {
-        // A hidden endpoint caches the chrome the swap will show (tabs, the
-        // status bar) alongside its agents, so switching to it never lands on
-        // a stale or empty strip while its full feed warms up.
-        return thread::scope(|threads| -> Option<FeedUpdate> {
-            let agents =
-                threads.spawn(|| ControlClient::from_transport(transport.clone()).agents());
-            let tabs = threads.spawn(|| ControlClient::from_transport(transport.clone()).tabs());
-            let bar =
-                threads.spawn(|| ControlClient::from_transport(transport.clone()).bar_widgets());
-            Some(FeedUpdate {
-                agents: agents.join().ok()?.ok()?,
-                tabs: tabs.join().ok()?.ok()?,
-                bar: bar.join().ok()?.ok()?,
-                ..FeedUpdate::default()
-            })
-        });
+/// A hidden endpoint (`FeedScope::Agents`) still reads tabs and the status
+/// bar beside its agents, so switching to it never lands on a stale or empty
+/// strip while its full feed warms up.
+fn fetch_reads(transport: &ControlTransport, scope: FeedScope) -> Reads {
+    fn joined<T>(read: thread::ScopedJoinHandle<'_, Result<T>>) -> ReadResult<T> {
+        match read.join() {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err("the read panicked".to_string()),
+        }
     }
-    thread::scope(|threads| -> Option<FeedUpdate> {
-        let agents = threads.spawn(|| ControlClient::from_transport(transport.clone()).agents());
-        let bar = threads.spawn(|| ControlClient::from_transport(transport.clone()).bar_widgets());
-        let tabs = threads.spawn(|| ControlClient::from_transport(transport.clone()).tabs());
-        let automations =
-            threads.spawn(|| ControlClient::from_transport(transport.clone()).automation_summary());
-        let tasks =
-            threads.spawn(|| ControlClient::from_transport(transport.clone()).task_summary());
+    let client = || ControlClient::from_transport(transport.clone());
+    let full = scope == FeedScope::Full;
+    thread::scope(|threads| {
+        let agents = threads.spawn(|| client().agents());
+        let bar = threads.spawn(|| client().bar_widgets());
+        let tabs = threads.spawn(|| client().tabs());
+        let automations = full.then(|| threads.spawn(|| client().automation_summary()));
+        let tasks = full.then(|| threads.spawn(|| client().task_summary()));
         // Zoom state only exists where events run, so the focused pane is
         // only worth a request there.
-        let focused = matches!(transport, ControlTransport::Socket(_)).then(|| {
-            threads.spawn(|| ControlClient::from_transport(transport.clone()).focused_pane())
-        });
-        Some(FeedUpdate {
-            agents: agents.join().ok()?.ok()?,
-            bar: bar.join().ok()?.ok()?,
-            tabs: tabs.join().ok()?.ok()?,
-            automations: automations.join().ok()?.ok()?,
-            tasks: tasks.join().ok()?.ok()?,
-            zoomed: Vec::new(),
+        let focused = (full && matches!(transport, ControlTransport::Socket(_)))
+            .then(|| threads.spawn(|| client().focused_pane()));
+        Reads {
+            agents: joined(agents),
+            bar: joined(bar),
+            tabs: joined(tabs),
+            automations: automations.map(joined),
+            tasks: tasks.map(joined),
             focused: focused.and_then(|read| read.join().ok()?.ok()),
-        })
+        }
+    })
+}
+
+/// Fold one pass of reads into the held snapshot.
+///
+/// Each part stands alone: a read that failed keeps the value it last
+/// published, or starts empty. All-or-nothing used to let one refused method
+/// or one slow SSH hop freeze the whole sidebar without a word in the log.
+/// `None` when every read failed: the daemon is down, and the last snapshot is
+/// the best there is until it returns.
+fn merge(reads: Reads, held: &mut Held, endpoint: &str) -> Option<FeedUpdate> {
+    let prior = held.snapshot.clone().unwrap_or_default();
+    let mut any_ok = false;
+    let mut part = |name: &'static str, ok: bool, error: Option<String>| {
+        any_ok |= ok;
+        match error {
+            None => {
+                // At warn, like the failure: pilus.log keeps warnings only by
+                // default, and a failure with no matching recovery reads as
+                // still broken.
+                if held.failing.remove(name).is_some() {
+                    tracing::warn!(endpoint, read = name, "chrome read recovered");
+                }
+            }
+            Some(error) => {
+                if held.failing.get(name) != Some(&error) {
+                    tracing::warn!(
+                        endpoint,
+                        read = name,
+                        %error,
+                        "chrome read failed; showing its last value"
+                    );
+                    held.failing.insert(name, error);
+                }
+            }
+        }
+    };
+    fn settle<T>(read: ReadResult<T>, prior: T) -> (T, bool, Option<String>) {
+        match read {
+            Ok(value) => (value, true, None),
+            Err(error) => (prior, false, Some(error)),
+        }
+    }
+    let (agents, ok, error) = settle(reads.agents, prior.agents);
+    part("agent.list", ok, error);
+    let (bar, ok, error) = settle(reads.bar, prior.bar);
+    part("ui.bar.list", ok, error);
+    let (tabs, ok, error) = settle(reads.tabs, prior.tabs);
+    part("tab.list", ok, error);
+    let automations = match reads.automations {
+        Some(read) => {
+            let (value, ok, error) = settle(read, prior.automations);
+            part("automation.list", ok, error);
+            value
+        }
+        None => prior.automations,
+    };
+    let tasks = match reads.tasks {
+        Some(read) => {
+            let (value, ok, error) = settle(read, prior.tasks);
+            part("task.list", ok, error);
+            value
+        }
+        None => prior.tasks,
+    };
+    any_ok.then_some(FeedUpdate {
+        agents,
+        bar,
+        tabs,
+        automations,
+        tasks,
+        zoomed: prior.zoomed,
+        focused: reads.focused,
     })
 }
 
@@ -1826,9 +1916,9 @@ fn is_structural(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, AutomationSummary, FeedUpdate, PaneFrame, Tab, TaskSummary, enrich_tab_runtime,
-        is_structural, note_zoom, read_line_within, running_command, terminal_titles,
-        worktree_blockers,
+        Agent, AutomationSummary, FeedUpdate, Held, PaneFrame, Reads, Tab, TaskSummary,
+        enrich_tab_runtime, is_structural, merge, note_zoom, read_line_within, running_command,
+        terminal_titles, worktree_blockers,
     };
     use crate::error::Error;
     use crate::transport::Stream;
@@ -2079,10 +2169,13 @@ mod tests {
     #[test]
     fn zoom_events_track_the_focused_pane() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let last = Mutex::new(Some(FeedUpdate {
-            focused: Some("2".to_string()),
-            ..FeedUpdate::default()
-        }));
+        let last = Mutex::new(Held {
+            snapshot: Some(FeedUpdate {
+                focused: Some("2".to_string()),
+                ..FeedUpdate::default()
+            }),
+            ..Held::default()
+        });
 
         assert!(note_zoom(
             &json!({ "pane": "2", "enabled": true }),
@@ -2115,10 +2208,120 @@ mod tests {
         assert!(rx.try_recv().is_ok_and(|update| !update.focused_zoomed()));
     }
 
+    fn agent(pane: &str) -> Agent {
+        Agent {
+            pane: pane.to_string(),
+            ..Agent::default()
+        }
+    }
+
+    fn tasks(open: u32) -> TaskSummary {
+        TaskSummary {
+            open,
+            total: open,
+            ..TaskSummary::default()
+        }
+    }
+
+    fn reads(agents: Vec<Agent>, tasks: Result<TaskSummary, String>) -> Reads {
+        Reads {
+            agents: Ok(agents),
+            bar: Ok(Vec::new()),
+            tabs: Ok(Vec::new()),
+            automations: Some(Ok(AutomationSummary::default())),
+            tasks: Some(tasks),
+            focused: None,
+        }
+    }
+
+    #[test]
+    fn one_failing_read_does_not_freeze_the_others() {
+        let mut held = Held {
+            snapshot: Some(FeedUpdate {
+                agents: vec![agent("1")],
+                tasks: tasks(3),
+                ..FeedUpdate::default()
+            }),
+            ..Held::default()
+        };
+        let update = merge(
+            reads(vec![agent("2")], Err("method not found".to_string())),
+            &mut held,
+            "local",
+        )
+        .expect("the reads that worked still publish");
+        assert_eq!(update.agents, vec![agent("2")], "agents move on");
+        assert_eq!(update.tasks, tasks(3), "tasks keep their last value");
+        assert_eq!(
+            held.failing.get("task.list").map(String::as_str),
+            Some("method not found")
+        );
+    }
+
+    #[test]
+    fn the_first_pass_publishes_even_with_a_failed_read() {
+        let mut held = Held::default();
+        let update = merge(
+            reads(vec![agent("1")], Err("timed out".to_string())),
+            &mut held,
+            "ssh box",
+        )
+        .expect("a sidebar with agents beats an empty one");
+        assert_eq!(update.agents, vec![agent("1")]);
+        assert_eq!(update.tasks, TaskSummary::default());
+    }
+
+    #[test]
+    fn a_daemon_that_answers_nothing_keeps_the_last_snapshot() {
+        let mut held = Held::default();
+        let down = || "connection refused".to_string();
+        let reads = Reads {
+            agents: Err(down()),
+            bar: Err(down()),
+            tabs: Err(down()),
+            automations: Some(Err(down())),
+            tasks: Some(Err(down())),
+            focused: None,
+        };
+        assert!(merge(reads, &mut held, "local").is_none());
+        assert_eq!(held.failing.len(), 5, "every failing read is remembered");
+    }
+
+    #[test]
+    fn a_read_that_recovers_is_cleared() {
+        let mut held = Held::default();
+        merge(
+            reads(Vec::new(), Err("busy".to_string())),
+            &mut held,
+            "local",
+        );
+        assert!(held.failing.contains_key("task.list"));
+        let update = merge(reads(Vec::new(), Ok(tasks(1))), &mut held, "local").expect("publish");
+        assert_eq!(update.tasks, tasks(1));
+        assert!(held.failing.is_empty());
+    }
+
+    #[test]
+    fn a_hidden_feed_keeps_what_it_does_not_read() {
+        let mut held = Held {
+            snapshot: Some(FeedUpdate {
+                tasks: tasks(2),
+                ..FeedUpdate::default()
+            }),
+            ..Held::default()
+        };
+        let mut hidden = reads(vec![agent("1")], Ok(tasks(9)));
+        hidden.automations = None;
+        hidden.tasks = None;
+        let update = merge(hidden, &mut held, "local").expect("publish");
+        assert_eq!(update.tasks, tasks(2));
+        assert!(held.failing.is_empty(), "an unread part is not a failure");
+    }
+
     #[test]
     fn zoom_events_before_the_first_snapshot_are_dropped() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let last = Mutex::new(None);
+        let last = Mutex::new(Held::default());
         assert!(note_zoom(
             &json!({ "pane": "2", "enabled": true }),
             &tx,

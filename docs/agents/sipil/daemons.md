@@ -58,6 +58,9 @@ recently, and an outbox.
 - Snapshot writes are throttled and flushed by the poller. Outbox writes are
   not throttled.
 - `remove_daemon` forgets all of it.
+- The outbox is keyed by device ID, so it also holds the lines written to a
+  contact whose pilus is away (see
+  [people-and-channels.md](people-and-channels.md#contacts-and-direct-messages)).
 - A daemon that is away is never shown as working.
 
 ## Absence is cheap

@@ -293,6 +293,8 @@ pub fn set_channel_agent(channel: &str, daemon: &str, invited: bool) {
 /// Forget a contact.
 pub fn remove_contact(id: &str) {
     let _ = stores().directory.remove(id);
+    // Lines still waiting for them are not sent to a contact who is gone.
+    stores().offline.forget(id);
     // Leaving a chat with someone no longer listed would show a name that is gone.
     let watching = snapshot().watch.clone();
     if matches!(&watching, Watch::Peer(open) if open == id) {
@@ -408,7 +410,8 @@ fn conversation(watch: &Watch) -> Option<Conversation> {
 
 /// Say `text` in the open chat or channel, and bring in any agent of ours it
 /// mentions. Nothing is stored unless it reached someone, so a refusal leaves the
-/// composer to retry.
+/// composer to retry. A chat with a contact whose pilus is away is the exception:
+/// the line waits in their outbox and goes when they are back.
 pub(super) fn send_to_conversation(watching: &Watch, text: String, reply: Option<Quote>) {
     update(|state| {
         state.sending = true;
@@ -416,6 +419,20 @@ pub(super) fn send_to_conversation(watching: &Watch, text: String, reply: Option
     });
     let watching = watching.clone();
     thread::spawn(move || {
+        let away = match &watching {
+            Watch::Peer(id) => stores().directory.contact(id).filter(|_| is_away(id)),
+            _ => None,
+        };
+        // A contact known to be away is not dialed: that would hold the composer
+        // for the whole dial deadline just to learn it again.
+        if let Some(contact) = away {
+            let first = stores()
+                .offline
+                .queued(&contact.id, &contact.id)
+                .is_empty();
+            hold(&contact, &text, reply.as_ref(), first);
+            return;
+        }
         let outcome = go_online().and_then(|local| match conversation(&watching) {
             Some(conversation) => local
                 .say_replying(&conversation, &text, &request_id(), None, reply.as_ref())
@@ -424,6 +441,15 @@ pub(super) fn send_to_conversation(watching: &Watch, text: String, reply: Option
                 "That conversation is no longer in the list.".to_string(),
             )),
         });
+        // The dial found nobody: remember that, so the next line does not dial
+        // again, and keep this one for when they are back.
+        if let (Watch::Peer(id), Err(SipilError::Unreachable { .. })) = (&watching, &outcome)
+            && let Some(contact) = stores().directory.contact(id)
+        {
+            note_away(id);
+            hold(&contact, &text, reply.as_ref(), false);
+            return;
+        }
         let note = match &outcome {
             Ok((_, _, delivery)) => missed(delivery),
             Err(_) => None,
@@ -442,6 +468,131 @@ pub(super) fn send_to_conversation(watching: &Watch, text: String, reply: Option
             refresh_thread();
             bring_in_agents(&local, &conversation, &text);
         }
+    });
+}
+
+/// Whether a line to `id` waits instead of being dialed: the last check found
+/// them away, or earlier lines are already waiting, which this one must not pass.
+fn is_away(id: &str) -> bool {
+    lock().reach.get(id) == Some(&Reach::Offline) || !stores().offline.queued(id, id).is_empty()
+}
+
+/// Record that a dial to `id` just found nobody, as a presence check would.
+fn note_away(id: &str) {
+    let mut shared = lock();
+    if shared.reach.insert(id.to_string(), Reach::Offline) != Some(Reach::Offline) {
+        shared.reach_rev += 1;
+    }
+    shared
+        .probes
+        .entry(id.to_string())
+        .or_insert_with(Probe::new)
+        .backoff
+        .failed(Instant::now());
+}
+
+/// Keep `text` in `contact`'s outbox and count it as taken, so the composer
+/// clears and the line shows under the log as waiting. `wake` asks whether they
+/// are back at once, which writing to an absent contact is a reason for; it is
+/// left off when a dial or a check has just said they are not, and for lines
+/// that join ones already waiting.
+fn hold(contact: &Contact, text: &str, reply: Option<&Quote>, wake: bool) {
+    let queued = stores().offline.queue_replying(
+        &contact.id,
+        &contact.id,
+        text,
+        &request_id(),
+        reply,
+    );
+    let taken = queued.is_some();
+    update(|state| {
+        state.sending = false;
+        if taken {
+            state.queued = super::sipil::queue_of(&state.watch);
+            state.send_error = None;
+            state.sent += 1;
+        } else {
+            state.send_error =
+                Some("Too many messages are waiting for them to come back".to_string());
+        }
+    });
+    if !taken {
+        return;
+    }
+    // They may have come back since the outbox last emptied; the check that said
+    // so only delivered what was waiting then.
+    if lock().reach.get(&contact.id) == Some(&Reach::Online) {
+        deliver_waiting(contact.clone());
+    } else if wake {
+        wake_presence(&contact.id);
+    }
+}
+
+/// Contacts whose outbox is being handed over, one delivery each at a time so
+/// the lines keep their order.
+static DELIVERING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Hand `contact` the lines written while they were away, oldest first, each
+/// under the request id it was queued with so a delivery that was cut off and
+/// retried is not said twice. It stops at the first line that does not go, to
+/// keep them in order; the next sign of life tries again.
+fn deliver_waiting(contact: Contact) {
+    if stores().offline.queued(&contact.id, &contact.id).is_empty() {
+        return;
+    }
+    {
+        let mut busy = DELIVERING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if busy.contains(&contact.id) {
+            return;
+        }
+        busy.push(contact.id.clone());
+    }
+    thread::spawn(move || {
+        if let Some(node) = local() {
+            while let Some(next) = stores()
+                .offline
+                .queued(&contact.id, &contact.id)
+                .into_iter()
+                .next()
+            {
+                let outcome = node.send_replying(
+                    &contact,
+                    &next.text,
+                    &next.request,
+                    None,
+                    next.reply.as_ref(),
+                );
+                match outcome {
+                    Ok(()) => {
+                        stores().offline.settle(&contact.id, &next.request);
+                    }
+                    // Away again, slow, or yet to add this device (they may):
+                    // keep the rest, in order.
+                    Err(error) if error.is_unauthorized() => break,
+                    Err(SipilError::Refused { .. }) => {
+                        // Waiting will not change that. Say so, so it can be
+                        // written again.
+                        stores().offline.settle(&contact.id, &next.request);
+                        update(|state| {
+                            state.send_error = Some(format!(
+                                "A message written while {} was away was not taken: {}",
+                                contact.name, next.text
+                            ));
+                        });
+                    }
+                    Err(_) => break,
+                }
+                update(|state| state.queued = super::sipil::queue_of(&state.watch));
+            }
+        }
+        DELIVERING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|id| *id != contact.id);
+        update(|state| state.queued = super::sipil::queue_of(&state.watch));
+        refresh_thread();
     });
 }
 
@@ -804,6 +955,11 @@ fn heard(id: &str) {
         super::sipil::wake_daemon(id);
     } else {
         wake_presence(id);
+        // The call proves they are up, even while the app is behind another one
+        // and no check would run, so lines waiting for them go now.
+        if let Some(contact) = stores().directory.contact(id) {
+            deliver_waiting(contact);
+        }
     }
 }
 
@@ -873,12 +1029,20 @@ fn check_presence_at(now: Instant, front: bool) {
                 if shared.reach.insert(contact.id.clone(), found) != Some(found) {
                     shared.reach_rev += 1;
                 }
-                let probe = shared.probes.entry(contact.id).or_insert_with(Probe::new);
+                let probe = shared
+                    .probes
+                    .entry(contact.id.clone())
+                    .or_insert_with(Probe::new);
                 if found == Reach::Offline {
                     probe.backoff.failed(now);
                 } else {
                     probe.backoff.succeeded();
                     probe.refresh_at = Some(now + ONLINE_REFRESH);
+                }
+                drop(shared);
+                // They are back: what was written while they were away goes now.
+                if found == Reach::Online {
+                    deliver_waiting(contact);
                 }
             }
         }

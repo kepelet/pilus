@@ -853,8 +853,9 @@ impl PilusView {
                     )),
             );
         }
-        // What was written while the daemon was away, until it takes it.
-        if matches!(state.watch, Watch::On(..)) {
+        // What was written while the daemon or the contact was away, until they
+        // take it.
+        if matches!(state.watch, Watch::On(..) | Watch::Peer(_)) {
             let me = nick_of(state);
             for queued in &state.queued {
                 let request = queued.request.clone();

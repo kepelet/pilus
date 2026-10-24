@@ -511,11 +511,14 @@ fn remembered_agent(agent: RememberedAgent) -> Agent {
     }
 }
 
-/// The messages waiting for the conversation `watch` is.
-fn queue_of(watch: &Watch) -> Vec<Queued> {
+/// The messages waiting for the conversation `watch` is. A contact's chat is
+/// named by their device ID, which is also where their outbox is kept.
+pub(super) fn queue_of(watch: &Watch) -> Vec<Queued> {
     match watch {
         Watch::On(daemon, id) => offline().queued(daemon, id),
-        Watch::Off | Watch::Peer(_) | Watch::Channel(_) => Vec::new(),
+        Watch::Peer(id) => offline().queued(id, id),
+        // A channel has no store-and-forward: members who are away miss the line.
+        Watch::Off | Watch::Channel(_) => Vec::new(),
     }
 }
 
@@ -905,10 +908,12 @@ fn hold(shared: &mut Shared, daemon: &str, conversation: &str, text: &str) {
 /// Give up a message that is waiting for its daemon.
 pub fn discard_queued(request: &str) {
     let mut shared = lock();
-    let Watch::On(daemon, _) = shared.state.watch.clone() else {
-        return;
+    let owner = match shared.state.watch.clone() {
+        Watch::On(daemon, _) => daemon,
+        Watch::Peer(contact) => contact,
+        Watch::Off | Watch::Channel(_) => return,
     };
-    offline().settle(&daemon, request);
+    offline().settle(&owner, request);
     publish(&mut shared, |state| state.queued = queue_of(&state.watch));
 }
 

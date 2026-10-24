@@ -7,7 +7,9 @@
 //! leaves behind who the primary agent is, and the conversations a person has
 //! looked at leave their newest lines. A message written while the daemon is
 //! away goes in an outbox instead of being refused, and is handed over, in order,
-//! once the daemon answers again.
+//! once the daemon answers again. A contact's pilus that is switched off is no
+//! different, so the outbox is keyed by device ID and holds their messages too
+//! (they have no snapshots, since their thread is in the chat store).
 //!
 //! The copy is a snapshot, never a source of truth: the daemon's own transcript
 //! replaces it the moment one arrives, and nothing here is sent anywhere.
@@ -25,8 +27,8 @@ use std::time::{Duration, Instant};
 use pilus_db::Db;
 use serde::{Deserialize, Serialize};
 
-use super::TranscriptItem;
 use super::store;
+use super::{Quote, TranscriptItem};
 
 /// The document the snapshots and outboxes are kept in.
 const DOC: &str = "offline";
@@ -69,6 +71,10 @@ pub struct Queued {
     pub request: String,
     /// What was written, with any quote already in front.
     pub text: String,
+    /// The line it answers, for a message to a person: their chat carries the
+    /// quote as a field. A daemon's has it in `text` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<Quote>,
     /// Unix seconds when it was written.
     pub at: u64,
 }
@@ -225,6 +231,20 @@ impl Offline {
     /// Hold `text` for `conversation` on daemon `id` until it can be delivered.
     /// `None` when the outbox is full.
     pub fn queue(&self, id: &str, conversation: &str, text: &str, request: &str) -> Option<Queued> {
+        self.queue_replying(id, conversation, text, request, None)
+    }
+
+    /// [`Offline::queue`] for a line that answers another. `id` is a device ID,
+    /// so a contact's messages wait here just as a daemon's do; the contact's
+    /// conversation is their own ID.
+    pub fn queue_replying(
+        &self,
+        id: &str,
+        conversation: &str,
+        text: &str,
+        request: &str,
+        reply: Option<&Quote>,
+    ) -> Option<Queued> {
         let queued = self.edit(|file| {
             let daemon = file.daemons.entry(id.to_string()).or_default();
             if daemon.outbox.len() >= OUTBOX_LIMIT {
@@ -234,6 +254,7 @@ impl Offline {
                 conversation: conversation.to_string(),
                 request: request.to_string(),
                 text: text.to_string(),
+                reply: reply.cloned(),
                 at: store::now(),
             };
             daemon.outbox.push(queued.clone());
@@ -434,6 +455,28 @@ mod tests {
         assert!(offline.settle("d", "r1"));
         assert!(!offline.settle("d", "r1"), "a message leaves once");
         assert_eq!(offline.queued("d", "c1").len(), 1);
+    }
+
+    #[test]
+    fn a_waiting_reply_keeps_its_quote_across_a_restart() {
+        let dir = scratch("quote");
+        let offline = open(&dir);
+        let quote = Quote::of("Rina", "ship it");
+        offline.queue_replying("rina", "rina", "done", "r1", Some(&quote));
+        offline.queue("rina", "rina", "and another", "r2");
+        offline.flush();
+
+        let waiting = open(&dir).queued("rina", "rina");
+        assert_eq!(waiting[0].reply, Some(quote));
+        assert_eq!(waiting[1].reply, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_outbox_written_before_quotes_still_reads() {
+        let old = r#"{"conversation":"c","request":"r","text":"hi","at":1}"#;
+        let queued: Queued = serde_json::from_str(old).expect("reads");
+        assert_eq!(queued.reply, None);
     }
 
     #[test]

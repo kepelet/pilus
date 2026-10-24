@@ -849,6 +849,7 @@ pub fn run_main() -> Result<()> {
             conversation: "1".to_string(),
             request: format!("shot-{n}"),
             text: (*text).to_string(),
+            reply: None,
             at: 1_790_001_000 + n as u64 * 40,
         })
         .collect();

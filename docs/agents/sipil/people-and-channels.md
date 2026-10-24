@@ -12,6 +12,26 @@ is brought into a conversation.
   *request* that the person can accept.
 - A message is stored on the sender's side only once the receiver's pilus has
   taken it, so after a refusal the composer still holds it for a retry.
+- A contact whose pilus is away is not a refusal. The line goes in their outbox
+  (`Offline::queue_replying`, keyed by their device ID, the same store as a
+  daemon's), the composer clears, and the line shows under the log as "waiting"
+  with Discard. It enters the chat store only when it is delivered.
+  - A contact last found `Reach::Offline`, or with lines already waiting, is not
+    dialed at all: a dial to a switched-off device costs the 10 s deadline. A dial
+    that fails as `Unreachable` queues the line and marks them away
+    (`note_away`). A refusal (`unauthorized`, `unknown_method`) is still an error
+    that leaves the text in the composer.
+  - A new line never passes one already waiting: it joins the queue even if the
+    contact looks online, so the order holds.
+  - `deliver_waiting` hands the outbox over in order, under the request ids it
+    was queued with, when a presence check finds them `Online` or they call
+    (`heard`, which works while the app is behind another one). It stops at the
+    first line that does not go. `unauthorized` keeps the queue; any other
+    refusal drops that line and says so.
+  - Writing the first waiting line wakes the contact's probe (see
+    [daemons.md](daemons.md#absence-is-cheap)); later lines do not, so a burst of
+    writes costs one dial. Removing the contact drops the outbox.
+  - Channels are not covered: see below.
 - Messages arrive as `Event`s. `gui/sipil.rs::take_events` hands them to the
   main window as toasts, and as system notifications while the window is not
   in front. Nothing is delivered while the window is closed: the node lives in

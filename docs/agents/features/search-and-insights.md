@@ -63,17 +63,16 @@ shows Search's consent card, follows the same `index_agents` and
 - The heatmap cell and ranking row are `style::heat_cell` and `style::rank_row`,
   shown in the playground.
 - **Prompts by hour** is `style::clock_chart` (an arch of 24 dots, the busiest
-  hour alone in the full accent), and **Tokens over time** is
-  `style::line_chart` (a monotone curve, so it never dips under a quiet day or
-  rises over a spike). Both are in the playground. Both are built from the same
+  hour alone in the full accent). It sits beside the Activity heatmap in one
+  row: the clock keeps its own width and the heatmap takes the rest, so the page
+  column is 1240 wide to fit a year of weeks. `style::line_chart` is no longer
+  on the page but stays in the playground. Both charts are built from the same
   hourly rows as the heatmap, with no query of their own.
   - The clock counts model *turns*, not prompts: the index stores no user
     messages, and a prompt in an agent loop is answered by several turns. Counting
     real prompts would mean a parser change on both the local and `REMOTE_AWK`
     paths and a `store::SCHEMA` bump.
   - Hours of the day use the viewer's offset floored to whole hours.
-  - The line has at most `TREND_POINTS` points: a longer window groups days
-    (`spans`), and the page says so under the chart.
 
 ## The session page (`gui/session_view.rs`)
 

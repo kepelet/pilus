@@ -34,12 +34,8 @@ const HEAT_WEEKS: i64 = 52;
 const RANK_ROWS: usize = 6;
 /// Months of cost the page lists, newest first.
 const COST_MONTHS: usize = 6;
-/// The most points the token line has. A longer window groups days, so the
-/// line stays readable and its hover columns stay wide enough to hit.
-const TREND_POINTS: usize = 90;
 /// The width of the arch of hours; its height follows from it.
 const CLOCK_SIZE: f32 = 340.0;
-const TREND_HEIGHT: f32 = 168.0;
 const HEAT_SIDE: f32 = 11.0;
 const HEAT_GAP: f32 = 3.0;
 
@@ -80,15 +76,6 @@ impl Range {
 /// One local day's use.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Day {
-    turns: u64,
-    tokens: u64,
-}
-
-/// A run of consecutive local days, summed into one point of the token line.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct Span {
-    first: i64,
-    last: i64,
     turns: u64,
     tokens: u64,
 }
@@ -134,32 +121,6 @@ fn clock_turns(rows: &[Hourly], offset: i64, since: Option<i64>) -> [u64; 24] {
         clock[clock_hour(row.hour, offset)] += row.turns;
     }
     clock
-}
-
-/// The days from `first` to `today`, grouped into at most `limit` runs of
-/// equal length (the last may be shorter), each with its totals. Quiet days
-/// count: a gap in the line is a gap in use.
-fn spans(days: &BTreeMap<i64, Day>, first: i64, today: i64, limit: usize) -> Vec<Span> {
-    let length = (today - first + 1).max(1);
-    let limit = i64::try_from(limit.max(1)).unwrap_or(1);
-    let width = (length + limit - 1) / limit;
-    let mut runs = Vec::new();
-    let mut start = first;
-    while start <= today {
-        let last = (start + width - 1).min(today);
-        let mut run = Span {
-            first: start,
-            last,
-            ..Span::default()
-        };
-        for (_, day) in days.range(start..=last) {
-            run.turns += day.turns;
-            run.tokens += day.tokens;
-        }
-        runs.push(run);
-        start = last + 1;
-    }
-    runs
 }
 
 /// The calendar date of a day number, by the civil-calendar algorithm, so the
@@ -380,8 +341,6 @@ struct Data {
     active_days: u64,
     /// Turns by hour of the viewer's day, over the chosen window.
     clock: [u64; 24],
-    /// Tokens across the chosen window, a point per day or per run of days.
-    trend: Vec<Span>,
     today: i64,
 }
 
@@ -557,11 +516,6 @@ fn build(
         .filter(|(_, day)| day.turns > 0)
         .count() as u64;
     let clock = clock_turns(&rows, offset, window.since_hour);
-    let trend_first = range.days().map_or_else(
-        || days.keys().next().copied().unwrap_or(today),
-        |back| today - back + 1,
-    );
-    let trend = spans(&days, trend_first, today, TREND_POINTS);
     let monthly = month_costs(&rows, offset);
     let months = listed
         .into_iter()
@@ -588,7 +542,6 @@ fn build(
         days,
         active_days,
         clock,
-        trend,
         today,
     })
 }
@@ -916,7 +869,6 @@ impl PilusView {
         let costs = self.cost_block(data);
         let heat = self.heatmap(data, cx);
         let clock = self.clock_block(data);
-        let trend = self.trend_block(data);
 
         // The cost by machine sits under the token breakdown. The blocks keep
         // their own height here, or the column would stretch them to match
@@ -941,19 +893,23 @@ impl PilusView {
             .flex_col()
             .gap_4()
             .w_full()
-            .max_w(px(style::scaled(&self.shared_settings, 1040.0)))
+            .max_w(px(style::scaled(&self.shared_settings, 1240.0)))
             .pb_6()
             .child(tiles)
-            .child(div().px_4().child(self.stats_block("ACTIVITY", heat)))
             .child(
+                // The year of weeks takes the slack and the arch keeps its own
+                // width, so the heatmap is the wider of the two.
                 div()
                     .flex()
                     .flex_row()
                     .flex_wrap()
                     .gap_4()
                     .px_4()
-                    .child(self.stats_block("PROMPTS BY HOUR", clock))
-                    .child(self.stats_block("TOKENS OVER TIME", trend)),
+                    .child(
+                        self.stats_block("ACTIVITY", heat)
+                            .min_w(px(style::scaled(&self.shared_settings, 480.0))),
+                    )
+                    .child(self.stats_block("PROMPTS BY HOUR", clock).flex_none()),
             )
             .child(
                 div()
@@ -1227,76 +1183,6 @@ impl PilusView {
                     .text_size(px(fonts.label))
                     .text_color(theme.muted)
                     .child("Model turns by hour of your day, in this Mac's time zone."),
-            )
-    }
-
-    /// Tokens across the window as a line, a point per day (or per run of
-    /// days once a window is longer than the line has points for).
-    fn trend_block(&self, data: &Data) -> Div {
-        let theme = self.theme;
-        let fonts = style::Fonts::resolve(&self.shared_settings);
-        let today = data.today;
-        let busiest = data.trend.iter().map(|run| run.tokens).max().unwrap_or(0);
-        let fractions = data
-            .trend
-            .iter()
-            .map(|run| {
-                // Counts are far below f32's exact range, and this is a height.
-                #[allow(clippy::cast_precision_loss)]
-                let fraction = run.tokens as f32 / busiest.max(1) as f32;
-                fraction
-            })
-            .collect();
-        let tips: Vec<style::ChartTip> = data
-            .trend
-            .iter()
-            .map(|run| {
-                let title = if run.first == run.last {
-                    date_label(run.first, today)
-                } else {
-                    format!(
-                        "{} – {}",
-                        date_label(run.first, today),
-                        date_label(run.last, today)
-                    )
-                };
-                Rc::new(super::row_tooltip(
-                    title,
-                    theme.panel_fg,
-                    vec![
-                        (format!("{} tokens", compact(run.tokens)), theme.muted),
-                        (format!("{} turns", compact(run.turns)), theme.muted),
-                    ],
-                    theme,
-                )) as style::ChartTip
-            })
-            .collect();
-        let first = data.trend.first().map_or(today, |run| run.first);
-        let width = data.trend.first().map_or(1, |run| run.last - run.first + 1);
-        let unit = if width > 1 {
-            format!("Tokens per {width} days")
-        } else {
-            "Tokens per day".to_string()
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(style::line_chart(
-                "pilus-stats-trend",
-                theme,
-                fonts,
-                style::scaled(&self.shared_settings, TREND_HEIGHT),
-                fractions,
-                compact(busiest),
-                (date_label(first, today), date_label(today, today)),
-                &tips,
-            ))
-            .child(
-                div()
-                    .text_size(px(fonts.label))
-                    .text_color(theme.muted)
-                    .child(unit),
             )
     }
 
@@ -1614,7 +1500,6 @@ impl PilusView {
                 120, 40, 10, 0, 0, 0, 30, 260, 1_400, 3_100, 3_900, 3_400, 1_900, 3_000, 4_300,
                 4_100, 3_300, 2_300, 1_100, 900, 1_500, 1_900, 1_200, 480,
             ],
-            trend: spans(&days, today - 29, today, TREND_POINTS),
             days,
             today,
         });
@@ -1748,34 +1633,6 @@ mod tests {
         assert_eq!(clock.iter().sum::<u64>(), 15);
         let all = clock_turns(&rows(&[(3, 2), (3 + 24, 5)]), 0, None);
         assert_eq!(all[3], 7);
-    }
-
-    #[test]
-    fn days_group_into_a_bounded_number_of_runs() {
-        let days = day_totals(&rows(&[(0, 1), (24 * 2, 2), (24 * 9, 4)]), 0);
-        // Within the limit, every day is a point, quiet ones included.
-        let daily = spans(&days, 0, 9, 90);
-        assert_eq!(daily.len(), 10);
-        assert_eq!(
-            daily[1],
-            Span {
-                first: 1,
-                last: 1,
-                turns: 0,
-                tokens: 0
-            }
-        );
-        assert_eq!(daily[2].turns, 2);
-        // Past it, days pair up and nothing is lost or counted twice.
-        let paired = spans(&days, 0, 9, 5);
-        assert_eq!(paired.len(), 5);
-        assert_eq!((paired[0].first, paired[0].last), (0, 1));
-        assert_eq!((paired[4].first, paired[4].last), (8, 9));
-        assert_eq!(paired.iter().map(|run| run.turns).sum::<u64>(), 7);
-        // An odd length leaves a short run at the end.
-        let odd = spans(&days, 0, 10, 5);
-        assert_eq!(odd.last().map(|run| (run.first, run.last)), Some((9, 10)));
-        assert_eq!(spans(&BTreeMap::new(), 4, 4, 90).len(), 1);
     }
 
     #[test]

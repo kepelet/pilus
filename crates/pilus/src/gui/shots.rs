@@ -2985,6 +2985,7 @@ fn about_fixture() -> pilus_client::sipil::About {
                     .map(str::to_string)
                     .to_vec(),
                 extensions: vec!["coding".to_string(), "artifacts".to_string()],
+                model: Some(model("model-a", "Muse Spark 1.3")),
             },
         ],
         logo: Some(DAEMON_LOGO.to_string()),

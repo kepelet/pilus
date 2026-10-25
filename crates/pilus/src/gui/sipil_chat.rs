@@ -2012,16 +2012,30 @@ impl PilusView {
                 panel = panel.child(field(label, value));
             }
         }
-        panel = panel.child(field(
-            "Model",
-            about.model.as_ref().map_or_else(
-                || "none: no provider key is set".to_string(),
-                |model| format!("{} ({})", model.name, model.provider_name),
-            ),
-        ));
+        // The top row is the primary agent's own model, not the daemon's default,
+        // so the page never shows two models for one agent. A daemon from before
+        // `AgentDetail::model` falls back to the live id, then to its default.
+        let model_text = |model: &pilus_client::sipil::ModelDetail| {
+            format!("{} ({})", model.name, model.provider_name)
+        };
+        let primary_model = about
+            .agents
+            .first()
+            .and_then(|agent| agent.model.as_ref())
+            .map(model_text)
+            .or_else(|| {
+                daemon
+                    .agents
+                    .first()
+                    .and_then(|agent| agent.model.as_ref())
+                    .map(|model| format!("{}/{}", model.provider, model.model_id))
+            })
+            .or_else(|| about.model.as_ref().map(model_text))
+            .unwrap_or_else(|| "none: no provider key is set".to_string());
+        panel = panel.child(field("Model", primary_model));
 
         panel = panel.child(heading("Agents"));
-        for agent in &about.agents {
+        for (index, agent) in about.agents.iter().enumerate() {
             let open = self.sipil_chat.open_agents.contains(&agent.id);
             let toggle = {
                 let id = agent.id.clone();
@@ -2050,6 +2064,14 @@ impl PilusView {
                 );
             if !agent.summary.is_empty() {
                 card = card.child(div().text_color(theme.muted).child(agent.summary.clone()));
+            }
+            // The primary agent's model is the top row; the agents it hands work to show theirs here.
+            if let (true, Some(model)) = (index > 0, agent.model.as_ref()) {
+                card = card.child(
+                    div()
+                        .text_color(theme.muted)
+                        .child(format!("Model: {}", model_text(model))),
+                );
             }
             if !agent.tools.is_empty() {
                 card = card.child(

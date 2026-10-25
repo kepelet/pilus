@@ -322,6 +322,9 @@ pub struct AgentDetail {
     /// The extensions those tools come from.
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// The model it runs on. A daemon from before this field leaves it out.
+    #[serde(default)]
+    pub model: Option<ModelDetail>,
 }
 
 /// What a daemon says about itself to a device it allows: the `about` call. A

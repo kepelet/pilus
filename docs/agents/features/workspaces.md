@@ -21,6 +21,15 @@ Pinned and recent workspaces are folders on a machine, not open workspaces.
 - `recent_workspaces` is one list shared by every session, capped at
   `RECENT_WORKSPACES`, so a busy session pushes the others' folders out of it.
 
+## Order
+
+Pins are listed in the order of `pinned_workspaces`: new ones go last, and a
+sidebar row can be dragged onto another to take its slot
+(`Settings::move_workspace_pin`). The list is shared by every session, so a move
+only compares rows of one session and leaves the others' relative order alone.
+Home and the menu bar list the same order. The row opens on click rather than
+mouse down, so starting a drag does not open the workspace.
+
 ## Opening one
 
 "Pin this Workspace" is in a WORKSPACES row's context menu. Three places open a

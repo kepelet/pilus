@@ -15,12 +15,13 @@
 //! connected by the switch afterwards. Nothing here is asked of the daemon
 //! except that one call, which runs on a worker thread.
 
-use gpui::{Context, Div, MouseButton, MouseDownEvent, div, prelude::*, px};
+use gpui::{Context, Div, MouseButton, MouseDownEvent, Render, Window, div, prelude::*, px};
 
 use super::overview::{card, quiet};
 use super::picker::PickerEvent;
 use super::sidebar_menu::MenuTarget;
 use super::style::{self, Fonts, RadiusExt};
+use super::theme::Theme;
 use super::toast::ToastKind;
 use super::{
     EndpointId, PilusView, SIDEBAR_GLYPH, SIDEBAR_GLYPH_GAP, SIDEBAR_ROW_HEIGHT, SIDEBAR_ROW_PAD,
@@ -254,6 +255,11 @@ impl PilusView {
 
         let open = saved.clone();
         let menu = saved.clone();
+        let drag = PinDrag {
+            saved: saved.clone(),
+            theme,
+            font_size: self.chrome_font(),
+        };
         div()
             .id(format!("pilus-pinned-{index}"))
             .flex()
@@ -289,8 +295,28 @@ impl PilusView {
                     .text_color(theme.muted)
                     .child(host)
             }))
-            .on_mouse_down(
-                MouseButton::Left,
+            .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+            // The row under a drag shows the pill it would take, unless it is
+            // the one being dragged.
+            .drag_over::<PinDrag>({
+                let saved = saved.clone();
+                move |style, drag, _, _| {
+                    if drag
+                        .saved
+                        .is(saved.session.as_deref(), &saved.endpoint, &saved.path)
+                    {
+                        style
+                    } else {
+                        style.bg(theme.panel)
+                    }
+                }
+            })
+            .on_drop(cx.listener({
+                let saved = saved.clone();
+                move |this, drag: &PinDrag, _, cx| this.reorder_pin(&drag.saved, &saved, cx)
+            }))
+            // A click, not a mouse down, so starting a drag does not open it.
+            .on_click(
                 cx.listener(move |this, _, _, cx| this.open_saved_workspace(open.clone(), cx)),
             )
             .on_mouse_down(
@@ -299,6 +325,14 @@ impl PilusView {
                     this.open_saved_menu(&menu, event.position, cx)
                 }),
             )
+    }
+
+    /// Drop the pin `from` into the slot of `to`, and keep the order. Home and
+    /// the menu bar list the same order.
+    fn reorder_pin(&mut self, from: &SavedWorkspace, to: &SavedWorkspace, cx: &mut Context<Self>) {
+        self.settings.move_workspace_pin(from, to);
+        self.save_settings();
+        cx.notify();
     }
 
     /// Home's PINNED WORKSPACES. It is always there: with nothing pinned it
@@ -382,6 +416,30 @@ impl PilusView {
                 this.open_saved_menu(&menu, event.position, cx)
             }),
         )
+    }
+}
+
+/// A pinned row being dragged to a new place.
+#[derive(Clone)]
+struct PinDrag {
+    saved: SavedWorkspace,
+    theme: Theme,
+    font_size: f32,
+}
+
+/// What GPUI draws at the pointer for a pin drag: the selected row's pill.
+impl Render for PinDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .px_3()
+            .radius_md()
+            .bg(self.theme.panel)
+            .text_color(self.theme.panel_fg)
+            .text_size(px(self.font_size))
+            .child(self.saved.label().to_string())
     }
 }
 

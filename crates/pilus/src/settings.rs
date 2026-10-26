@@ -698,6 +698,30 @@ impl Settings {
             .filter(move |saved| saved.session.as_deref() == session)
     }
 
+    /// Drop the pin `from` into the slot of the pin `to`, which must be in the
+    /// same session. The list is shared by every session, so the pin moves
+    /// within it and the other sessions' pins keep their relative order. A pin
+    /// that is not there, or one dropped on itself, changes nothing.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn move_workspace_pin(&mut self, from: &SavedWorkspace, to: &SavedWorkspace) {
+        if from.session != to.session {
+            return;
+        }
+        let session = from.session.as_deref();
+        let find = |pins: &[SavedWorkspace], target: &SavedWorkspace| {
+            pins.iter()
+                .position(|saved| saved.is(session, &target.endpoint, &target.path))
+        };
+        let (Some(at), Some(into)) = (
+            find(&self.pinned_workspaces, from),
+            find(&self.pinned_workspaces, to),
+        ) else {
+            return;
+        };
+        let pin = self.pinned_workspaces.remove(at);
+        self.pinned_workspaces.insert(into, pin);
+    }
+
     /// The pin for the folder `path` on `endpoint` in `session`; a folder
     /// unpinned since a menu was drawn comes back unnamed, so a stale click
     /// still opens it.
@@ -1363,6 +1387,40 @@ mod tests {
         // Unpinning what was never pinned is a no-op.
         settings.set_workspace_pinned(saved("local", "/nowhere"), false);
         assert_eq!(settings.pinned_workspaces.len(), 1);
+    }
+
+    #[test]
+    fn a_pin_dropped_on_another_takes_its_slot_and_other_sessions_keep_theirs() {
+        let mut settings = Settings::default();
+        for pin in [
+            saved("local", "/w/a"),
+            saved_in("work", "local", "/w/x"),
+            saved("local", "/w/b"),
+            saved("local", "/w/c"),
+            saved_in("work", "local", "/w/y"),
+        ] {
+            settings.set_workspace_pinned(pin, true);
+        }
+        let order = |settings: &Settings, session: Option<&str>| -> Vec<String> {
+            settings
+                .pinned_in(session)
+                .map(|saved| saved.path.clone())
+                .collect()
+        };
+
+        settings.move_workspace_pin(&saved("local", "/w/c"), &saved("local", "/w/a"));
+        assert_eq!(order(&settings, None), ["/w/c", "/w/a", "/w/b"]);
+        assert_eq!(order(&settings, Some("work")), ["/w/x", "/w/y"]);
+
+        // Moving later lands after the row it was dropped on.
+        settings.move_workspace_pin(&saved("local", "/w/c"), &saved("local", "/w/b"));
+        assert_eq!(order(&settings, None), ["/w/a", "/w/b", "/w/c"]);
+
+        // A pin from another session, or one that is gone, changes nothing.
+        settings.move_workspace_pin(&saved_in("work", "local", "/w/x"), &saved("local", "/w/a"));
+        settings.move_workspace_pin(&saved("local", "/w/gone"), &saved("local", "/w/a"));
+        assert_eq!(order(&settings, None), ["/w/a", "/w/b", "/w/c"]);
+        assert_eq!(order(&settings, Some("work")), ["/w/x", "/w/y"]);
     }
 
     #[test]

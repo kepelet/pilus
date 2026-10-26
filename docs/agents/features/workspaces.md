@@ -11,6 +11,15 @@ Pinned and recent workspaces are folders on a machine, not open workspaces.
   the picker or a pin opens a workspace.
 - A pin and a path are compared after expanding `~` against the machine's home,
   so the same folder written two ways is one pin.
+- Both lists are namespaced by Luvus session (`SavedWorkspace::session`; `None`
+  is the default session). The sidebar, Home and the menu bar list only the
+  attached session's rows, because `workspace.open` goes to that session's
+  daemon and a machine id only exists inside the session that saved it. The
+  same folder pins once per session, and `open_saved_workspace` refuses a row
+  from another session. A row saved before sessions were recorded has no
+  `session` and reads as the default session's.
+- `recent_workspaces` is one list shared by every session, capped at
+  `RECENT_WORKSPACES`, so a busy session pushes the others' folders out of it.
 
 ## Opening one
 

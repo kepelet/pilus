@@ -47,6 +47,9 @@ impl Source {
 
 /// The windowless agent feeds.
 pub struct Watch {
+    /// The session `local` belongs to; `None` is the default session. Pinned
+    /// workspaces are per session, so the menu bar lists this one's.
+    session: Option<String>,
     local: Source,
     machines: Vec<Source>,
     /// The machine catalog, read off-thread because it shells out to `luvus`.
@@ -62,11 +65,13 @@ impl Watch {
     /// `session_root` once the catalog has loaded.
     pub fn new(socket: PathBuf, session_root: PathBuf, session: Option<String>) -> Self {
         let (tx, catalog) = channel();
+        let catalog_session = session.clone();
         std::thread::spawn(move || {
-            tx.send(list_machines(&session_root, session.as_deref()))
+            tx.send(list_machines(&session_root, catalog_session.as_deref()))
                 .ok();
         });
         Self {
+            session,
             local: Source {
                 key: "local".to_string(),
                 group: "Local".to_string(),
@@ -78,6 +83,11 @@ impl Watch {
             attention: attention::Watch::default(),
             open: HashSet::new(),
         }
+    }
+
+    /// The session being watched; `None` is the default session.
+    pub fn session(&self) -> Option<&str> {
+        self.session.as_deref()
     }
 
     /// Fold pending feed updates into menu rows: local first, then machines.

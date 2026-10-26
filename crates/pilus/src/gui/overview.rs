@@ -1376,6 +1376,7 @@ impl PilusView {
         // Fixed folders, so a shot shows neither the person's pins nor a
         // machine of theirs.
         let folder = |endpoint: &str, path: &str, name: &str| crate::settings::SavedWorkspace {
+            session: self.session_name.clone(),
             endpoint: endpoint.to_string(),
             path: path.to_string(),
             name: name.to_string(),

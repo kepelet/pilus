@@ -2,9 +2,11 @@
 //!
 //! A pin is made from a WORKSPACES row's context menu ("Pin this Workspace")
 //! and lives in `Settings::pinned_workspaces`; the folders opened last are
-//! `Settings::recent_workspaces`. The sidebar's PINNED WORKSPACES section and
-//! Home's Pinned and Recent blocks draw them, and all three open one the same
-//! way: `workspace.open` for the folder on the machine that owns it, then the
+//! `Settings::recent_workspaces`. Both are namespaced by Luvus session: a row
+//! is drawn and opened only in the session that saved it, because
+//! `workspace.open` goes to the attached session's daemon. The sidebar's PINNED
+//! WORKSPACES section and Home's Pinned and Recent blocks draw them, and all
+//! three open one the same way: `workspace.open` for the folder on the machine that owns it, then the
 //! window switches to that endpoint, so the terminal that appears is in the
 //! folder.
 //!
@@ -27,24 +29,31 @@ use super::{
 use crate::settings::SavedWorkspace;
 
 impl PilusView {
-    /// The saved form of the folder `cwd` on `endpoint_key`, with `~` expanded
-    /// against that machine so the same folder spelled two ways is one pin.
+    /// The saved form of the folder `cwd` on `endpoint_key` in the attached
+    /// session, with `~` expanded against that machine so the same folder
+    /// spelled two ways is one pin.
     pub(super) fn saved_folder(&self, endpoint_key: &str, cwd: &str, name: &str) -> SavedWorkspace {
         SavedWorkspace {
+            session: self.session_name.clone(),
             endpoint: endpoint_key.to_string(),
             path: self.expand_cwd(endpoint_key, cwd),
             name: name.to_string(),
         }
     }
 
-    /// The pin that names the folder `cwd` on `endpoint_key`, if there is one.
-    /// Both sides are expanded, since a pin made before a remote's home was
-    /// known still carries its `~`.
+    /// The attached session's pins, in the order they were pinned.
+    fn session_pins(&self) -> impl Iterator<Item = &SavedWorkspace> {
+        self.settings.pinned_in(self.session_name.as_deref())
+    }
+
+    /// The pin that names the folder `cwd` on `endpoint_key`, if the attached
+    /// session has one. Both sides are expanded, since a pin made before a
+    /// remote's home was known still carries its `~`.
     fn pin_for(&self, endpoint_key: &str, cwd: &str) -> Option<&SavedWorkspace> {
         let want = self.saved_folder(endpoint_key, cwd, "");
-        self.settings.pinned_workspaces.iter().find(|saved| {
+        self.session_pins().find(|saved| {
             let have = self.saved_folder(&saved.endpoint, &saved.path, "");
-            have.is(&want.endpoint, &want.path)
+            have.is(self.session_name.as_deref(), &want.endpoint, &want.path)
         })
     }
 
@@ -85,6 +94,17 @@ impl PilusView {
     /// the daemon has answered, so a refusal leaves the page it was clicked on
     /// in place to try again.
     pub(super) fn open_saved_workspace(&mut self, saved: SavedWorkspace, cx: &mut Context<Self>) {
+        // A menu bar pick can outlive the session it was made in: the window
+        // that opened for it may have attached to another one, whose daemon
+        // would open the folder instead.
+        if saved.session != self.session_name {
+            self.toast(
+                ToastKind::Error,
+                format!("{} belongs to another session", saved.label()),
+            );
+            cx.notify();
+            return;
+        }
         let endpoint = self.endpoint_by_key(&saved.endpoint);
         if let EndpointId::Machine(id) = &endpoint
             && !self.machines.iter().any(|machine| &machine.id == id)
@@ -173,7 +193,8 @@ impl PilusView {
     /// drawn until something is pinned, so a window that never pins one has no
     /// empty heading.
     pub(super) fn pinned_section(&self, cx: &mut Context<Self>) -> Option<Div> {
-        if self.settings.pinned_workspaces.is_empty() {
+        let pins: Vec<&SavedWorkspace> = self.session_pins().collect();
+        if pins.is_empty() {
             return None;
         }
         let section = div()
@@ -198,7 +219,7 @@ impl PilusView {
             return Some(section);
         }
         let mut rows = div().flex().flex_col().gap_1();
-        for (index, saved) in self.settings.pinned_workspaces.iter().enumerate() {
+        for (index, saved) in pins.into_iter().enumerate() {
             rows = rows.child(self.pinned_row(index, saved, cx));
         }
         Some(section.child(style::enter("pilus-pinned-rows", rows)))
@@ -285,7 +306,7 @@ impl PilusView {
     pub(super) fn overview_pinned_card(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = Fonts::resolve(&self.shared_settings);
-        let pinned = &self.settings.pinned_workspaces;
+        let pinned: Vec<&SavedWorkspace> = self.session_pins().collect();
         let mut body = div().flex().flex_col().gap_1();
         if pinned.is_empty() {
             body = body.child(quiet(
@@ -295,7 +316,7 @@ impl PilusView {
                 "Right-click a workspace in the sidebar and choose Pin this Workspace.",
             ));
         }
-        for (index, saved) in pinned.iter().enumerate() {
+        for (index, saved) in pinned.iter().copied().enumerate() {
             body = body.child(self.overview_saved_row(
                 format!("pilus-overview-pin-{index}"),
                 saved,
@@ -308,7 +329,10 @@ impl PilusView {
     /// Home's RECENT WORKSPACES: the folders opened last that are not pinned.
     /// Left out altogether when there are none.
     pub(super) fn overview_recent_card(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let recent: Vec<&SavedWorkspace> = self.settings.recent_unpinned().collect();
+        let recent: Vec<&SavedWorkspace> = self
+            .settings
+            .recent_unpinned(self.session_name.as_deref())
+            .collect();
         if recent.is_empty() {
             return None;
         }
@@ -363,12 +387,11 @@ impl PilusView {
 
 /// The pins as the menu bar lists them. `host` names the machine behind an
 /// endpoint key; this Mac gets none.
-pub(super) fn menu_rows(
-    pinned: &[SavedWorkspace],
+pub(super) fn menu_rows<'a>(
+    pinned: impl Iterator<Item = &'a SavedWorkspace>,
     host: impl Fn(&str) -> String,
 ) -> Vec<super::menubar::Pinned> {
     pinned
-        .iter()
         .map(|saved| super::menubar::Pinned {
             endpoint: saved.endpoint.clone(),
             path: saved.path.clone(),

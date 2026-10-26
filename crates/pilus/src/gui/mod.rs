@@ -853,7 +853,7 @@ impl AppShared {
         }
         let (energy, pinned) = {
             let settings = self.settings.borrow();
-            let pinned = pinned::menu_rows(&settings.pinned_workspaces, |key| {
+            let pinned = pinned::menu_rows(settings.pinned_in(watch.session()), |key| {
                 watch.group_of(key).unwrap_or_else(|| key.to_string())
             });
             (settings.energy_mode, pinned)
@@ -873,7 +873,10 @@ impl AppShared {
                     cx.activate(true);
                 }
                 menubar::Pick::Pinned { endpoint, path } => {
-                    let saved = self.settings.borrow().saved_workspace(&endpoint, &path);
+                    let saved =
+                        self.settings
+                            .borrow()
+                            .saved_workspace(watch.session(), &endpoint, &path);
                     self.open_window(None, cx);
                     cx.activate(true);
                     // The window is built inside `open_window`, so it is
@@ -9562,9 +9565,10 @@ impl PilusView {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let pinned = pinned::menu_rows(&self.settings.pinned_workspaces, |key| {
-            self.endpoint_label(&self.endpoint_by_key(key))
-        });
+        let pinned = pinned::menu_rows(
+            self.settings.pinned_in(self.session_name.as_deref()),
+            |key| self.endpoint_label(&self.endpoint_by_key(key)),
+        );
         self.menubar.sync(
             self.settings.menu_bar,
             &rows,
@@ -9588,7 +9592,11 @@ impl PilusView {
                 menubar::Pick::Pinned { endpoint, path } => {
                     self.raise_window(cx);
                     self.saved_pick = Some((
-                        self.settings.saved_workspace(&endpoint, &path),
+                        self.settings.saved_workspace(
+                            self.session_name.as_deref(),
+                            &endpoint,
+                            &path,
+                        ),
                         Instant::now(),
                     ));
                 }

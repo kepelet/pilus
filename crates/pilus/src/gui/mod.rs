@@ -288,8 +288,10 @@ const TRAFFIC_LIGHT_POSITION: Point<Pixels> =
 /// (the third light ends near 64px) with a comfortable gap before the toggle.
 const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
 /// Inset for the tab strip when nothing floats over its left edge: the sidebar
-/// is open, or fullscreen hides the traffic lights.
-const TAB_STRIP_EDGE: f32 = 12.0;
+/// is open, or fullscreen hides the traffic lights. It is the gap a terminal
+/// card keeps from the sidebar, so the first tab's edge lines up with the
+/// card's edge below it, as the strip's right padding does on the far side.
+const TAB_STRIP_EDGE: f32 = pane_chrome::GAP_PX;
 /// The narrowest a tab goes while the strip holds company, and the width of a
 /// placeholder tab.
 const TAB_MIN_WIDTH: f32 = 180.0;
@@ -12020,7 +12022,7 @@ impl PilusView {
             .gap_1()
             .h(px(TAB_STRIP_HEIGHT))
             .pl(px(pad))
-            .pr(px(8.0));
+            .pr(px(pane_chrome::GAP_PX));
         // The toggle lives in the sidebar while it is open. As the sidebar
         // leaves, a slot at the strip's head opens in step with it and the
         // toggle fades in, so the way back is there from the first frame and
@@ -12152,7 +12154,7 @@ impl PilusView {
         };
         let agent = self.tab_agent(index);
         let session_title = agent.and_then(|agent| agent.session_title.as_deref());
-        let label = tab_label(&tab.name, session_title, &cwd, lone);
+        let label = tab_label(&tab.name, session_title, &tab.process, &cwd, lone);
         let slide = if cx.reduce_motion() {
             0.0
         } else {
@@ -17377,12 +17379,20 @@ fn abbreviate_path(path: &str) -> String {
 }
 
 /// A tab's label: the name the user gave it, else its agent's session title,
-/// else its abbreviated cwd. A name the user typed outranks the title because
-/// the title changes under them.
+/// else its foreground process and abbreviated cwd (`fish  ~/D/k/pilus`). A
+/// name the user typed outranks the title because the title changes under
+/// them. The process leads so two tabs in one directory still tell apart; a
+/// native view reports none and keeps the bare cwd.
 ///
 /// A `lone` tab is as wide as its label, so it needs none of that: the cwd
 /// stays whole and nothing is capped.
-fn tab_label(name: &str, session_title: Option<&str>, cwd: &str, lone: bool) -> String {
+fn tab_label(
+    name: &str,
+    session_title: Option<&str>,
+    process: &str,
+    cwd: &str,
+    lone: bool,
+) -> String {
     let name = name.trim();
     let title = session_title.map(str::trim).unwrap_or_default();
     let text = if !name.is_empty() {
@@ -17390,10 +17400,14 @@ fn tab_label(name: &str, session_title: Option<&str>, cwd: &str, lone: bool) -> 
     } else if !title.is_empty() {
         title.to_string()
     } else {
-        if lone {
+        let path = if lone {
             cwd.to_string()
         } else {
             abbreviate_path(cwd)
+        };
+        match process.trim() {
+            "" => path,
+            process => format!("{process}  {path}"),
         }
     };
     if lone {
@@ -18006,18 +18020,28 @@ mod tests {
 
     #[test]
     fn tab_label_falls_back_to_cwd() {
-        assert_eq!(tab_label("", None, "~/work/pilus", false), "~/w/pilus");
-        assert_eq!(tab_label("  ", Some(" "), "~", false), "~");
-        let long = tab_label("", None, "~/work/a-directory-name-that-will-not-fit", false);
+        assert_eq!(tab_label("", None, "", "~/work/pilus", false), "~/w/pilus");
+        assert_eq!(tab_label("  ", Some(" "), "", "~", false), "~");
+        let long = tab_label("", None, "", "~/work/a-directory-name-that-will-not-fit", false);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn tab_label_leads_with_the_process() {
+        assert_eq!(
+            tab_label("", None, "fish", "~/Developer/kepelet/pilus", false),
+            "fish  ~/D/k/pilus"
+        );
+        assert_eq!(tab_label("", None, " ", "~/work/pilus", false), "~/w/pilus");
+        assert_eq!(tab_label("api", None, "fish", "~/work/pilus", false), "api");
     }
 
     #[test]
     fn a_lone_tab_label_is_whole() {
         let cwd = "~/work/a-directory-name-that-will-not-fit";
-        assert_eq!(tab_label("", None, cwd, true), cwd);
+        assert_eq!(tab_label("", None, "", cwd, true), cwd);
         let name = "n".repeat(40);
-        assert_eq!(tab_label(&name, None, cwd, true), name);
+        assert_eq!(tab_label(&name, None, "", cwd, true), name);
     }
 
     #[test]
@@ -18080,20 +18104,20 @@ mod tests {
 
     #[test]
     fn tab_label_prefers_the_name_over_the_cwd() {
-        assert_eq!(tab_label("api", None, "~/work/pilus", false), "api");
-        assert_eq!(tab_label("api", None, "~/work/pilus", true), "api");
+        assert_eq!(tab_label("api", None, "", "~/work/pilus", false), "api");
+        assert_eq!(tab_label("api", None, "", "~/work/pilus", true), "api");
         assert_eq!(
-            tab_label("api", Some("Fix the parser"), "~/work/pilus", false),
+            tab_label("api", Some("Fix the parser"), "", "~/work/pilus", false),
             "api"
         );
-        let long = tab_label(&"n".repeat(40), None, "~/work/pilus", false);
+        let long = tab_label(&"n".repeat(40), None, "", "~/work/pilus", false);
         assert!(long.ends_with('…'));
     }
 
     #[test]
     fn tab_label_takes_the_agent_session_title_before_the_cwd() {
         assert_eq!(
-            tab_label("", Some(" Fix the parser "), "~/work/pilus", false),
+            tab_label("", Some(" Fix the parser "), "", "~/work/pilus", false),
             "Fix the parser"
         );
     }

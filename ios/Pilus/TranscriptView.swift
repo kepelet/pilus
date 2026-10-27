@@ -152,7 +152,7 @@ struct SessionTranscriptView: View {
                 choosing = false
                 onStarted(agent)
             }
-            .presentationDetents([.medium])
+            .presentationDetents([.height(280)])
         }
         .refreshable { await load() }
         .navigationTitle(session.title)
@@ -202,38 +202,31 @@ struct TranscriptSkeleton: View {
     }
 }
 
-/// Continue the session where it left off, or fork it into a new one, with an
-/// optional first message for the agent.
+/// Continue the session where it left off, or fork it into a new one.
 struct ReopenSheet: View {
     let session: SessionSummary
     var onStarted: (Agent) -> Void
 
     @Environment(AppStore.self) private var store
     @Environment(\.dismiss) private var dismiss
-    @State private var prompt = ""
     @State private var starting: Bool?
     @State private var startError: String?
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section {
-                    TextField("First message (optional)", text: $prompt, axis: .vertical)
-                        .lineLimit(1...4)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
+            VStack(spacing: 20) {
+                choice(fork: false, title: "Continue", detail: "Pick up in this session",
+                       systemImage: "play.fill")
+                choice(fork: true, title: "Fork", detail: "Start a new session from here",
+                       systemImage: "arrow.branch")
+                if let startError {
+                    Text(startError)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
                 }
-                Section {
-                    choice(fork: false, title: "Continue", detail: "Pick up in this session",
-                           systemImage: "play.fill")
-                    choice(fork: true, title: "Fork", detail: "Start a new session from here",
-                           systemImage: "arrow.branch")
-                } footer: {
-                    if let startError {
-                        Text(startError).foregroundStyle(.red)
-                    }
-                }
+                Spacer(minLength: 0)
             }
+            .padding(20)
             .navigationTitle(session.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -244,36 +237,45 @@ struct ReopenSheet: View {
         }
     }
 
+    @ViewBuilder
     private func choice(fork: Bool, title: String, detail: String, systemImage: String) -> some View {
-        Button {
-            Task {
-                starting = fork
-                startError = nil
-                do {
-                    if let agent = try await store.reopen(session, fork: fork, prompt: prompt) {
-                        onStarted(agent)
+        VStack(alignment: .leading, spacing: 8) {
+            Text(detail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            let button = Button {
+                Task {
+                    starting = fork
+                    startError = nil
+                    do {
+                        if let agent = try await store.reopen(session, fork: fork) {
+                            onStarted(agent)
+                        } else {
+                            dismiss()
+                        }
+                    } catch {
+                        startError = error.localizedDescription
+                    }
+                    starting = nil
+                }
+            } label: {
+                HStack {
+                    if starting == fork {
+                        ProgressView()
                     } else {
-                        dismiss()
+                        Image(systemName: systemImage)
                     }
-                } catch {
-                    startError = error.localizedDescription
+                    Text(title)
                 }
-                starting = nil
+                .frame(maxWidth: .infinity)
             }
-        } label: {
-            HStack {
-                Label {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(title)
-                        Text(detail).font(.footnote).foregroundStyle(.secondary)
-                    }
-                } icon: {
-                    Image(systemName: systemImage)
-                }
-                Spacer()
-                if starting == fork { ProgressView() }
+            .controlSize(.large)
+            .disabled(starting != nil)
+            if fork {
+                button.buttonStyle(.bordered)
+            } else {
+                button.buttonStyle(.borderedProminent)
             }
         }
-        .disabled(starting != nil)
     }
 }

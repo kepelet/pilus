@@ -20,6 +20,8 @@ struct AgentDetailView: View {
         !lookedUp && ["claude", "pi"].contains(agent.kind) && store.hubAllows("hub.sessions", on: agent.machine)
     }
     @State private var refreshes = 0
+    /// Sent messages shown at the transcript's end until a re-read has them.
+    @State private var pending: [TranscriptEntry] = []
     @State private var reply = ""
     // Kept separate so a poll cannot erase a send error before it is read.
     @State private var loadError: String?
@@ -285,7 +287,7 @@ struct AgentDetailView: View {
                 }
                 Spacer(minLength: 0)
                 if let transcript {
-                    TranscriptList(entries: transcript.entries, earlier: transcript.earlier ?? false)
+                    TranscriptList(entries: transcript.entries + pending, earlier: transcript.earlier ?? false)
                 } else if awaitingTranscript {
                     TranscriptSkeleton()
                 } else {
@@ -333,7 +335,7 @@ struct AgentDetailView: View {
             do {
                 let found = try await store.session(
                     for: agent, sessionID: sessionID, cwd: cwd, title: title)
-                if found?.path != session?.path { transcript = nil }
+                if found?.path != session?.path { transcript = nil; pending = [] }
                 session = found
             } catch {}
         }
@@ -344,6 +346,10 @@ struct AgentDetailView: View {
         if let reply = try? await store.transcript(path: session.path, machine: session.machine) {
             transcript = reply
             truncated = false
+            let said = reply.entries.suffix(20).filter { $0.type == "user" }
+                .compactMap { $0.text?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            let stale = Int(Date().timeIntervalSince1970) - 120
+            pending.removeAll { said.contains($0.text ?? "") || ($0.at ?? 0) < stale }
         }
         lookedUp = true
     }
@@ -376,6 +382,14 @@ struct AgentDetailView: View {
         }
         sending = true
         defer { sending = false }
+        let echo = transcript != nil && input == nil
+            ? TranscriptEntry(type: "user", text: text, name: nil, summary: nil,
+                              output: nil, failed: nil, at: Int(Date().timeIntervalSince1970))
+            : nil
+        if let echo {
+            pending.append(echo)
+            reply = ""
+        }
         do {
             if let input {
                 try await store.terminalInput(agent: agent, input)
@@ -398,6 +412,10 @@ struct AgentDetailView: View {
         } catch {
             log.error("send failed: \(error.localizedDescription)")
             sendError = error.localizedDescription
+            if let echo, let index = pending.lastIndex(of: echo) {
+                pending.remove(at: index)
+                if reply.isEmpty { reply = text }
+            }
             if (error as? PilusError)?.isUnconfirmed == true { await refresh(silent: true) }
         }
     }

@@ -283,6 +283,9 @@ fn start_poller() {
 }
 
 fn poll_forever() {
+    // One restart per replaced binary: if it fails, retrying every poll would
+    // only spam launchctl, and the Restart button stays available.
+    let mut restart_tried = false;
     loop {
         thread::sleep(super::activity::scaled(POLL));
         if !lock().wanted {
@@ -291,6 +294,25 @@ fn poll_forever() {
         let status = agent_service::status();
         if lock().view.log_open {
             refresh_log();
+        }
+        let stale = status.as_ref().is_some_and(|status| status.restart_needed);
+        if !stale {
+            restart_tried = false;
+        } else if !restart_tried && lock().wanted {
+            // An update can replace the binary while the window stays open;
+            // `restart_if_stale` only covers launch.
+            restart_tried = true;
+            {
+                let mut shared = lock();
+                shared.view.phase = Phase::Starting;
+                // The socket goes quiet during the restart; don't let that read
+                // as a connector that failed to start.
+                shared.since = Some(Instant::now());
+            }
+            if let Err(error) = agent_service::restart() {
+                lock().view.error = Some(format!("Could not restart after an update: {error}"));
+            }
+            continue;
         }
         let now = now_unix();
         let mut shared = lock();

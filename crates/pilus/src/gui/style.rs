@@ -2516,6 +2516,26 @@ pub(super) fn glide(
         color,
         radius,
         bleed,
+        outlined: false,
+    }
+}
+
+/// [`glide`] drawn as a one-pixel border in `color` with nothing inside, for
+/// a selection that marks its item by edge alone. The target must carry a
+/// 1px border of its own for the edge to land on.
+pub(super) fn glide_outline(
+    id: impl Into<ElementId>,
+    slot: &GlideSlot,
+    color: Rgba,
+    radius: Radius,
+) -> impl IntoElement {
+    Glide {
+        id: id.into(),
+        slot: slot.clone(),
+        color,
+        radius,
+        bleed: 0.0,
+        outlined: true,
     }
 }
 
@@ -2865,6 +2885,7 @@ struct Glide {
     color: Rgba,
     radius: Radius,
     bleed: f32,
+    outlined: bool,
 }
 
 /// A glide's flight, in coordinates relative to the pill layer's origin so
@@ -2996,11 +3017,20 @@ impl Element for Glide {
             },
             self.bleed,
         );
-        let radius = self.radius.pixels();
-        window.paint_quad(
-            gpui::fill(pill, self.color)
-                .corner_radii(Corners::all(radius).clamp_radii_for_quad_size(pill.size)),
-        );
+        // The target marker fills its parent's padding box, which sits inside
+        // the parent's own 1px border; the edge goes back out onto that
+        // border so it lines up with the one a hovered item draws.
+        let pill = if self.outlined {
+            pill.dilate(px(1.0))
+        } else {
+            pill
+        };
+        let radius = Corners::all(self.radius.pixels()).clamp_radii_for_quad_size(pill.size);
+        window.paint_quad(if self.outlined {
+            gpui::outline(pill, self.color, gpui::BorderStyle::Solid).corner_radii(radius)
+        } else {
+            gpui::fill(pill, self.color).corner_radii(radius)
+        });
     }
 }
 

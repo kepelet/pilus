@@ -11982,15 +11982,14 @@ impl PilusView {
             .overflow_x_scroll()
             .overflow_y_hidden()
             .track_scroll(&self.tab_scroll);
-        // The raised fill is one pill that slides to the selected tab, so a
+        // The selected tab's border is one pill that slides to it, so a
         // switch reads as motion from the old tab to the new one.
         let selection = style::GlideSlot::default();
-        tabs = tabs.child(style::glide(
+        tabs = tabs.child(style::glide_outline(
             "pilus-tab-glide",
             &selection,
-            self.tab_raise(1.0),
+            self.theme.border,
             style::RADIUS_SOFT,
-            0.0,
         ));
         for tab in &self.tabs {
             tabs = tabs.child(self.tab_item(tab, &selection, cx));
@@ -12207,19 +12206,27 @@ impl PilusView {
             .when(!lone, |tab| tab.min_w(px(140.0)).max_w(px(280.0)))
             // The tile sits near the tab's edge; the right side keeps room for
             // the close button.
-            .pl(px(5.0))
+            .pl(px(2.0))
             .pr_3()
             .radius_soft()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            // The selected tab's raised fill is the strip's glide pill;
-            // hovering any other tab only hints at it.
-            .hover_fill(
-                self.tab_raise(if active { 0.0 } else { SIDEBAR_HOVER_WEIGHT }),
-                style::RADIUS_SOFT,
-            )
+            // The selected tab's border is the strip's glide pill; hovering
+            // a tab draws the same edge. The transparent border reserves its
+            // width, so the tab does not shift when it appears.
+            .border_1()
+            .border_color(gpui::transparent_black())
             .text_color(fg)
-            .hover(move |style| style.text_color(theme.panel_fg))
+            // The selected tab already wears the glide's border, which may
+            // still be flying in; a hover edge would show before it lands.
+            .hover(move |style| {
+                let style = style.text_color(theme.panel_fg);
+                if active {
+                    style
+                } else {
+                    style.border_color(theme.border)
+                }
+            })
             .tooltip(tip)
             .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
             // The tab under a drag shows the pill it would take, unless it is

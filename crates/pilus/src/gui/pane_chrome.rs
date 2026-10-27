@@ -7,7 +7,8 @@
 //! panes sit flush: each is outlined in the theme's border, and neighbors
 //! share one line. A pane that does not hold the caret is dimmed by a veil of
 //! that surface over its card and text, which lifts under the pointer. A
-//! floating card that holds the caret is outlined in the theme's border.
+//! floating card that holds the caret is outlined in the theme's border, and
+//! one that does not keeps a fainter ring of it.
 //!
 //! The grid is rebuilt every frame, so the transition lives in GPUI element
 //! state keyed by the pane's index. A pane seen for the first time fades in; a
@@ -238,6 +239,10 @@ const ENTER: Duration = Duration::from_millis(260);
 const FOCUS_EASE: Duration = Duration::from_millis(160);
 /// How much of the surface a dimmed pane is veiled with.
 const DIM: f32 = 0.4;
+
+/// How much of the theme's border a resting floating card keeps, so its
+/// ring is a hint beside the focused card's full one.
+pub(super) const REST_RING: f32 = 0.5;
 /// How far the focused pane's toolbar sits in from its card's top-right corner.
 const TOOLBAR_INSET_PX: f32 = 6.0;
 
@@ -428,13 +433,7 @@ pub(super) fn pane_chrome(
     };
     let stroke = if focused { focus_border } else { border };
     let rest = Look {
-        // A resting floating card keeps its ring clear, so it reads as the
-        // card alone and its geometry matches the focused card's.
-        border: if gaps && !focused {
-            Rgba { a: 0.0, ..stroke }
-        } else {
-            stroke
-        },
+        border: stroke,
         dim: if focused { 0.0 } else { 1.0 },
     };
     let round = if gaps {
@@ -988,8 +987,14 @@ mod tests {
     }
 
     #[test]
-    fn a_floating_card_is_outlined_only_while_it_holds_the_caret() {
+    fn a_floating_card_keeps_a_fainter_ring_until_it_holds_the_caret() {
         let tiled = frame(0, 1, 39, 20);
+        let faint = Rgba {
+            a: 0.5,
+            r: 0.5,
+            g: 0.5,
+            b: 0.5,
+        };
         let line = Rgba {
             r: 0.5,
             g: 0.5,
@@ -1004,7 +1009,7 @@ mod tests {
                 focused,
                 true,
                 line,
-                line,
+                faint,
                 line,
                 px(17.0),
                 8.4,
@@ -1015,7 +1020,7 @@ mod tests {
             )
         };
         assert_eq!(card(true).rest.border, line);
-        assert_eq!(card(false).rest.border.a, 0.0);
+        assert_eq!(card(false).rest.border, faint);
     }
 
     #[test]

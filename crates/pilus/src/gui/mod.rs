@@ -15650,12 +15650,13 @@ fn render_grid(
         .flex_col();
     let surface = theme.pane_surface(glass).opacity(glass);
     // Flush panes outline themselves with the theme's border, focus showing
-    // in the dimming of the others. A floating card is outlined only while
-    // it holds the caret.
+    // in the dimming of the others. A floating card keeps a faint ring at
+    // rest, so it still reads as a card on a busy surface, and takes the full
+    // border while it holds the caret.
     let (border, focus_border) = if pane_gaps {
         (
             gpui::Rgba {
-                a: 0.0,
+                a: theme.border.a * pane_chrome::REST_RING,
                 ..theme.border
             },
             theme.border,

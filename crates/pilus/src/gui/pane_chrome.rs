@@ -317,9 +317,9 @@ impl Look {
 /// setting. `surface` is the color the surface layer paints, which the dimming
 /// veil shares. A resting card has no visible stroke; the focused one strokes
 /// `focus_border`, the hairline the sidebar parts with when panes are flush.
-/// The stroke sits just outside the card. A top edge
-/// hidden behind the native tab strip is drawn flush with the grid's top, so
-/// the strip reads as opening into the card.
+/// The stroke sits just outside the card. The top row of cards meets the
+/// native tab strip, its stroke on the grid's first pixel row, so the strip
+/// reads as opening into the card.
 ///
 /// With `gaps` off the box is the card, outer edges included, and it draws its
 /// own `border`. A pane's stroke on an edge it shares reaches a pixel into
@@ -374,10 +374,12 @@ pub(super) fn pane_chrome(
         };
         // The top row of cards meets the tab strip with no gap, so the
         // selected tab, in the card's own fill, reads as opening into it.
+        // The stroke goes on the grid's first pixel row: any higher and the
+        // card's clip cuts it, leaving the outline's corners hanging.
         let top = if pane.top < skip_rows {
-            0.0
+            BORDER_PX
         } else if outer_top {
-            row_edge(pane.top) - slack.top
+            row_edge(pane.top) - slack.top + BORDER_PX
         } else {
             row_edge(pane.top) + GAP_PX / 2.0
         };
@@ -890,7 +892,8 @@ mod tests {
         let tiled = frame(0, 2, 39, 20);
         let card = chrome(tiled, tiled);
         assert_eq!(card.left + BORDER_PX, GAP_PX);
-        assert_eq!(card.top + BORDER_PX, (17.0f32 * 1.0).round());
+        // The stroke, just outside the card, lands on the grid's top edge.
+        assert_eq!(card.top, (17.0f32 * 1.0).round());
     }
 
     #[test]
@@ -981,9 +984,10 @@ mod tests {
         // The text starts at 0; the card's inner edge is the padding's
         // gap-wide outer part away from the surface's edge.
         assert_eq!(card.left + BORDER_PX, GAP_PX - pad.left);
-        assert_eq!(card.top + BORDER_PX, -pad.top);
+        assert_eq!(card.top, -pad.top);
         assert_eq!(-(card.left + BORDER_PX), PAD_LEAD_PX);
-        assert_eq!(-(card.top + BORDER_PX), PAD_Y_PX);
+        // Less the stroke, which now sits inside the padding.
+        assert_eq!(-(card.top + BORDER_PX), PAD_Y_PX - BORDER_PX);
         // The far side keeps the full room past the last column.
         let right_inner = card.left + card.width - BORDER_PX;
         assert_eq!((40.0f32 * 8.4).round() + pad.right - right_inner, GAP_PX);

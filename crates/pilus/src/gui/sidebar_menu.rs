@@ -1,20 +1,23 @@
-//! The native right-click context menus for the sidebar's WORKSPACES and
-//! AGENTS rows, for the terminal grid, and for the Files tab's tree.
+//! The right-click context menus for the sidebar's WORKSPACES and AGENTS
+//! rows, for the terminal grid, and for the Files tab's tree.
 //!
 //! Luvus opens a context menu on a WORKSPACES row (close, rename, path
 //! visibility, copy path/branch, new worktree, and the git/task/mission
 //! boards) and on an AGENTS row (rename, close, path visibility, and the
-//! dock's workspace scope). `pilus` draws those menus natively; the items a
-//! client can reach ride the control API (`workspace.*`, `agent.name`,
-//! `pane.close`, `worktree.create`), and the purely presentational ones (path
-//! toggle, scope) are client state, exactly as they are in the daemon's
-//! own TUI. The terminal's menu replaces the one the daemon draws into the grid
-//! on a right click: it offers the clipboard and the pane/tab actions a client
-//! can reach (split, fork, rename, move to a tab), so the click never reaches the daemon. The Files tab's menu
-//! creates, renames, and deletes the entries under the daemon's tree, which
-//! the client does over disk or SSH since the daemon never writes. This module owns the
-//! menu's state machine and item order; the window renders it and performs
-//! the actions, so nothing here knows GPUI.
+//! dock's workspace scope). `pilus` shows those menus as macOS context menus;
+//! the items a client can reach ride the control API (`workspace.*`,
+//! `agent.name`, `pane.close`, `worktree.create`), and the purely
+//! presentational ones (path toggle, scope) are client state, exactly as they
+//! are in the daemon's own TUI. The terminal's menu replaces the one the
+//! daemon draws into the grid on a right click: it offers the clipboard and
+//! the pane/tab actions a client can reach (split, fork, rename, move to a
+//! tab), so the click never reaches the daemon. The Files tab's menu creates,
+//! renames, and deletes the entries under the daemon's tree, which the client
+//! does over disk or SSH since the daemon never writes.
+//!
+//! This module owns each menu's items and their order, and folds them into
+//! [`Entry`] trees. [`super::native_menu`] turns a tree into an `NSMenu` and
+//! the window runs the picked item, so nothing here knows GPUI or AppKit.
 
 /// The sidebar row an open menu is anchored to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,9 +81,9 @@ pub enum MenuTarget {
     },
 }
 
-/// One row of the open context menu, in render order.
+/// One row of a context menu, in display order.
 ///
-/// `Divider` is a non-interactive separator.
+/// `Divider` is a separator line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
     /// Close the workspace, or close the agent's pane.
@@ -93,7 +96,7 @@ pub enum Item {
     UnpinWorkspace,
     /// Toggle the second (path) line of every row in the owning section.
     TogglePaths,
-    /// The parent row of the copy submenu.
+    /// The parent row of the copy submenu, which is never picked itself.
     QuickActions,
     CopyPath,
     CopyBranch,
@@ -143,20 +146,6 @@ pub enum Item {
 }
 
 impl Item {
-    /// Whether an item draws as a selection row rather than a label hairline.
-    pub fn selectable(self) -> bool {
-        self != Self::Divider
-    }
-
-    /// Whether the row is destructive (Close, Delete Worktree, Close Tab), painted in
-    /// the alert color.
-    pub fn destructive(self) -> bool {
-        matches!(
-            self,
-            Self::Close | Self::DeleteWorktree | Self::CloseTab | Self::Delete
-        )
-    }
-
     /// The label, resolved against the state the row toggles: `paths_visible`
     /// flips Show Path/Hide Path, and `scoped` flips the AGENTS scope row.
     pub fn label(self, paths_visible: bool, scoped: bool) -> &'static str {
@@ -205,102 +194,100 @@ impl Item {
             Self::Divider => "",
         }
     }
-}
 
-/// A selectable row's height in pixels.
-pub const ROW_HEIGHT: f32 = 26.0;
-/// A divider's height: its hairline plus the margin above and below.
-pub const DIVIDER_HEIGHT: f32 = 9.0;
-/// The panel's padding and border around its rows, top and bottom together.
-pub const PANEL_CHROME: f32 = 10.0;
-
-/// The distance from the panel's top edge to the top of `rows[index]`, so a
-/// flyout can line up with the row that opened it.
-pub fn row_offset(rows: &[Item], index: usize) -> f32 {
-    PANEL_CHROME / 2.0
-        + rows
-            .iter()
-            .take(index)
-            .map(|item| {
-                if item.selectable() {
-                    ROW_HEIGHT
+    /// The SF Symbol drawn beside the row, the way macOS menus mark their
+    /// items. A name the system lacks just leaves the row without one.
+    pub fn symbol(self, paths_visible: bool) -> &'static str {
+        match self {
+            Self::Close | Self::CloseTab => "xmark",
+            Self::Rename => "pencil",
+            Self::PinWorkspace => "pin",
+            Self::UnpinWorkspace => "pin.slash",
+            Self::TogglePaths => {
+                if paths_visible {
+                    "eye.slash"
                 } else {
-                    DIVIDER_HEIGHT
+                    "eye"
                 }
-            })
-            .sum::<f32>()
-}
-
-/// The panel's height for `rows`, which the renderer needs before layout to
-/// decide whether the menu opens below or above the pointer. Dividers are
-/// shorter than rows, so counting every entry as a row overshoots and parks an
-/// upward menu far above the pointer.
-pub fn panel_height(rows: &[Item]) -> f32 {
-    PANEL_CHROME
-        + rows
-            .iter()
-            .map(|item| {
-                if item.selectable() {
-                    ROW_HEIGHT
-                } else {
-                    DIVIDER_HEIGHT
-                }
-            })
-            .sum::<f32>()
-}
-
-/// The open context menu: target, anchor point in window pixels, and the
-/// keyboard cursor. Mouse users get no persistent selection, like every
-/// other native list here; `selected` is only painted when the keyboard is
-/// driving. `quick_open` shows the Quick Actions flyout beside the rows;
-/// `quick_selected` is the keyboard cursor inside it, and is `None` while the
-/// pointer (or the parent list) owns focus.
-pub struct SidebarMenu {
-    pub target: MenuTarget,
-    /// Anchor column in window pixels; the renderer clamps the panel to fit.
-    pub column: f32,
-    /// Anchor row in window pixels.
-    pub row: f32,
-    pub selected: Option<usize>,
-    pub quick_open: bool,
-    pub quick_selected: Option<usize>,
-}
-
-impl SidebarMenu {
-    pub fn new(target: MenuTarget, column: f32, row: f32) -> Self {
-        Self {
-            target,
-            column,
-            row,
-            selected: None,
-            quick_open: false,
-            quick_selected: None,
+            }
+            Self::QuickActions => "bolt",
+            Self::CopyPath | Self::CopyBranch | Self::CopySelection => "doc.on.doc",
+            Self::NewWorktree => "arrow.triangle.branch",
+            Self::DeleteWorktree | Self::Delete => "trash",
+            Self::ToggleScope => "macwindow",
+            Self::NewFile => "doc.badge.plus",
+            Self::NewFolder => "folder.badge.plus",
+            Self::Upload => "square.and.arrow.up",
+            Self::Download => "square.and.arrow.down",
+            Self::DownloadArchive => "archivebox",
+            Self::Paste => "doc.on.clipboard",
+            Self::SplitRight => "rectangle.split.2x1",
+            Self::SplitDown => "rectangle.split.1x2",
+            Self::ForkPane => "arrow.branch",
+            Self::MoveToTab => "arrow.turn.down.right",
+            Self::NewTab => "plus",
+            Self::GithubAll => "list.bullet",
+            Self::GithubRefresh => "arrow.clockwise",
+            Self::GithubHideSection => "eye.slash",
+            Self::GithubDisable => "power",
+            Self::Divider => "",
         }
     }
+}
 
-    /// The top-level rows. The Quick Actions flyout is drawn beside them, so
-    /// it never replaces them.
+/// One entry of a built menu, in display order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Entry {
+    /// A row that runs `item` when picked.
+    Action {
+        item: Item,
+        title: String,
+        symbol: &'static str,
+    },
+    /// A row that opens `entries` beside it.
+    Submenu {
+        title: String,
+        symbol: &'static str,
+        entries: Vec<Entry>,
+    },
+    Separator,
+}
+
+/// The window state some rows read their wording from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Labels {
+    /// The owning section shows its path lines, so the toggle hides them.
+    pub paths_visible: bool,
+    /// The AGENTS dock shows only the active workspace's agents.
+    pub scoped: bool,
+    /// How many repositories the GitHub section knows, shown on its first row.
+    pub repos: usize,
+}
+
+impl MenuTarget {
+    /// The top-level rows. Quick Actions stands for its submenu, whose rows
+    /// come from [`Self::quick_rows`].
     ///
     /// A WORKSPACES target's git rows appear when its branch says it is a repo, and the deleted-worktree row
     /// only when `linked` says the daemon's `worktree.list` found this row's
     /// checkout as a linked worktree.
     pub fn rows(&self, linked: bool) -> Vec<Item> {
-        match &self.target {
-            MenuTarget::Workspace { branch, pinned, .. } => {
+        match self {
+            Self::Workspace { branch, pinned, .. } => {
                 workspace_rows(branch.as_deref().is_some(), linked, *pinned)
             }
-            MenuTarget::Saved { pinned, .. } => saved_rows(*pinned),
-            MenuTarget::Agent { .. } => agent_rows(),
-            MenuTarget::Terminal { selection, agent } => terminal_rows(*selection, *agent),
-            MenuTarget::Github => github_rows(),
-            MenuTarget::File { root, dir, .. } => file_rows(*root, *dir),
+            Self::Saved { pinned, .. } => saved_rows(*pinned),
+            Self::Agent { .. } => agent_rows(),
+            Self::Terminal { selection, agent } => terminal_rows(*selection, *agent),
+            Self::Github => github_rows(),
+            Self::File { root, dir, .. } => file_rows(*root, *dir),
         }
     }
 
-    /// The rows of the Quick Actions flyout.
+    /// The rows of the Quick Actions submenu.
     pub fn quick_rows(&self) -> Vec<Item> {
         let mut items = vec![Item::CopyPath];
-        if let MenuTarget::Workspace { branch, .. } = &self.target
+        if let Self::Workspace { branch, .. } = self
             && branch.as_deref().is_some_and(|branch| !branch.is_empty())
         {
             items.push(Item::CopyBranch);
@@ -308,21 +295,39 @@ impl SidebarMenu {
         items
     }
 
-    /// The first selectable row index at or after `from`, wrapping, or `None`
-    /// when nothing is selectable. Divider rows are skipped.
-    pub fn next_selectable(&self, rows: &[Item], from: usize, dir: isize) -> Option<usize> {
-        if rows.iter().all(|item| !item.selectable()) {
-            return None;
-        }
-        let len = rows.len();
-        let mut cursor = from;
-        for _ in 0..len {
-            cursor = (cursor as isize + dir).rem_euclid(len as isize) as usize;
-            if rows[cursor].selectable() {
-                return Some(cursor);
-            }
-        }
-        None
+    /// The menu as it is shown: [`Self::rows`] with their wording resolved
+    /// against `labels`, dividers as separators, and Quick Actions holding
+    /// its rows as a submenu.
+    pub fn entries(&self, linked: bool, labels: Labels) -> Vec<Entry> {
+        self.rows(linked)
+            .into_iter()
+            .map(|item| match item {
+                Item::Divider => Entry::Separator,
+                Item::QuickActions => Entry::Submenu {
+                    title: item.label(labels.paths_visible, labels.scoped).to_string(),
+                    symbol: item.symbol(labels.paths_visible),
+                    entries: self
+                        .quick_rows()
+                        .into_iter()
+                        .map(|item| action(item, labels))
+                        .collect(),
+                },
+                item => action(item, labels),
+            })
+            .collect()
+    }
+}
+
+/// A row that runs `item`, worded for `labels`.
+fn action(item: Item, labels: Labels) -> Entry {
+    let mut title = item.label(labels.paths_visible, labels.scoped).to_string();
+    if item == Item::GithubAll {
+        title.push_str(&format!(" · {}", labels.repos));
+    }
+    Entry::Action {
+        item,
+        title,
+        symbol: item.symbol(labels.paths_visible),
     }
 }
 
@@ -497,9 +502,8 @@ mod tests {
             branch: Some("main".into()),
             pinned: false,
         };
-        let menu = SidebarMenu::new(target, 0.0, 0.0);
-        assert_eq!(menu.quick_rows(), vec![Item::CopyPath, Item::CopyBranch]);
-        assert_eq!(menu_without_branch().quick_rows(), vec![Item::CopyPath]);
+        assert_eq!(target.quick_rows(), vec![Item::CopyPath, Item::CopyBranch]);
+        assert_eq!(target_without_branch().quick_rows(), vec![Item::CopyPath]);
     }
 
     #[test]
@@ -528,7 +532,6 @@ mod tests {
         // Closing the tab sits alone at the end, away from the safe rows.
         assert_eq!(without.last(), Some(&Item::CloseTab));
         assert_eq!(without[without.len() - 2], Item::Divider);
-        assert!(Item::CloseTab.destructive());
         for item in [Item::Rename, Item::MoveToTab] {
             assert!(without.contains(&item));
         }
@@ -542,15 +545,11 @@ mod tests {
 
     #[test]
     fn the_terminal_target_builds_its_own_rows() {
-        let menu = SidebarMenu::new(
-            MenuTarget::Terminal {
-                selection: false,
-                agent: true,
-            },
-            0.0,
-            0.0,
-        );
-        assert_eq!(menu.rows(true), terminal_rows(false, true));
+        let target = MenuTarget::Terminal {
+            selection: false,
+            agent: true,
+        };
+        assert_eq!(target.rows(true), terminal_rows(false, true));
     }
 
     #[test]
@@ -571,7 +570,6 @@ mod tests {
         assert!(entry.contains(&Item::Rename));
         assert_eq!(entry.last(), Some(&Item::Delete));
         assert_eq!(entry[entry.len() - 2], Item::Divider);
-        assert!(Item::Delete.destructive());
     }
 
     #[test]
@@ -583,52 +581,115 @@ mod tests {
     }
 
     #[test]
-    fn panel_height_counts_a_divider_as_a_hairline() {
-        let rows = terminal_rows(false, true);
-        let dividers = rows.iter().filter(|item| !item.selectable()).count() as f32;
-        let selectable = rows.len() as f32 - dividers;
-        assert_eq!(
-            panel_height(&rows),
-            PANEL_CHROME + selectable * ROW_HEIGHT + dividers * DIVIDER_HEIGHT
-        );
-        assert!(panel_height(&rows) < 8.0 + rows.len() as f32 * 30.0);
+    fn quick_actions_become_a_submenu_of_its_copy_rows() {
+        let target = MenuTarget::Workspace {
+            endpoint: "local".into(),
+            workspace_id: "w1".into(),
+            index: 0,
+            name: "api".into(),
+            cwd: "/repo/api".into(),
+            branch: Some("main".into()),
+            pinned: false,
+        };
+        let entries = target.entries(false, Labels::default());
+        let quick = entries
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Submenu { title, entries, .. } => Some((title.as_str(), entries)),
+                _ => None,
+            })
+            .expect("a Quick Actions submenu");
+        assert_eq!(quick.0, "Quick Actions");
+        let picks: Vec<Item> = quick
+            .1
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Action { item, .. } => Some(*item),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(picks, vec![Item::CopyPath, Item::CopyBranch]);
+        // The parent stands for its submenu, so it is never a pick of its own.
+        assert!(!entries.iter().any(|entry| matches!(
+            entry,
+            Entry::Action {
+                item: Item::QuickActions,
+                ..
+            }
+        )));
     }
 
     #[test]
-    fn dividers_are_not_selectable() {
-        assert!(!Item::Divider.selectable());
-        assert!(Item::Close.selectable());
-    }
-
-    #[test]
-    fn keyboard_cursor_skips_dividers_and_wraps() {
-        let rows = vec![Item::Rename, Item::Close, Item::Divider, Item::ToggleScope];
+    fn dividers_become_separators_in_place() {
         let target = MenuTarget::Agent {
             endpoint: "local".into(),
             pane: "2".into(),
             name: "auth-fix".into(),
         };
-        let menu = SidebarMenu::new(target, 0.0, 0.0);
-        // The divider sits between rows 1 and 3; moving forward from 1 lands
-        // on the scope row, never the divider.
-        assert_eq!(menu.next_selectable(&rows, 1, 1), Some(3));
-        // Moving backward from 0 wraps to the end of the list.
-        assert_eq!(menu.next_selectable(&rows, 0, -1), Some(3));
+        let entries = target.entries(false, Labels::default());
+        assert_eq!(entries.len(), agent_rows().len());
+        assert_eq!(entries[3], Entry::Separator);
     }
 
-    fn menu_without_branch() -> SidebarMenu {
-        SidebarMenu::new(
-            MenuTarget::Workspace {
-                endpoint: "local".into(),
-                workspace_id: "w2".into(),
-                index: 1,
-                name: "web".into(),
-                cwd: "/repo/web".into(),
-                branch: None,
-                pinned: false,
+    #[test]
+    fn entries_take_their_wording_from_the_window() {
+        let agent = MenuTarget::Agent {
+            endpoint: "local".into(),
+            pane: "2".into(),
+            name: "auth-fix".into(),
+        };
+        let labels = Labels {
+            paths_visible: true,
+            scoped: true,
+            repos: 0,
+        };
+        let titles: Vec<String> = agent
+            .entries(false, labels)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Action { title, .. } => Some(title),
+                _ => None,
+            })
+            .collect();
+        assert!(titles.contains(&"Hide Path".to_string()));
+        assert!(titles.contains(&"Show All Workspaces".to_string()));
+        let github = MenuTarget::Github.entries(
+            false,
+            Labels {
+                repos: 12,
+                ..Labels::default()
             },
-            0.0,
-            0.0,
-        )
+        );
+        assert!(matches!(
+            &github[0],
+            Entry::Action { title, .. } if title == "All Repositories · 12"
+        ));
+    }
+
+    #[test]
+    fn every_row_but_the_divider_has_a_symbol() {
+        let target = MenuTarget::Terminal {
+            selection: true,
+            agent: true,
+        };
+        for item in target.rows(false) {
+            assert_eq!(item.symbol(false).is_empty(), item == Item::Divider);
+        }
+        assert_ne!(
+            Item::TogglePaths.symbol(true),
+            Item::TogglePaths.symbol(false)
+        );
+    }
+
+    fn target_without_branch() -> MenuTarget {
+        MenuTarget::Workspace {
+            endpoint: "local".into(),
+            workspace_id: "w2".into(),
+            index: 1,
+            name: "web".into(),
+            cwd: "/repo/web".into(),
+            branch: None,
+            pinned: false,
+        }
     }
 }

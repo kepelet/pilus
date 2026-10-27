@@ -280,9 +280,12 @@ number so a slow poll cannot overwrite the tree an expand returned. Rows are
 drawn with `style::tree_row` (catalogued in the playground) in a virtualized
 list.
 
-**Right-click menus.** WORKSPACES and AGENTS rows carry the daemon's native
-context menus, drawn by a floating GPUI panel mirroring the daemon's own menu
-structure: close, rename, pin, path visibility, and copy path/branch for
+**Right-click menus.** WORKSPACES and AGENTS rows carry the daemon's
+context menus, shown as macOS `NSMenu`s (`gui/native_menu.rs`) that mirror the
+daemon's own menu structure. The menu opens on the run loop's next pass rather
+than inside the GPUI listener, since `NSMenu` runs its own event loop and the
+app must not stay borrowed through it; a pick calls back into the view once
+AppKit hands it over. The items: close, rename, pin, path visibility, and copy path/branch for
 workspaces; rename, close, pin, path visibility, and the dock's workspace
 scope for agents. Destructive rows hang on the daemon's contract where one
 exists. Most items ride the control API — `workspace.close`/`rename`/`pin`,

@@ -43,6 +43,7 @@ mod md_view;
 mod menubar;
 mod mermaid;
 mod mission;
+mod native_menu;
 mod notify;
 mod orchestration;
 mod overview;
@@ -144,7 +145,9 @@ use right_sidebar::{RightSidebar, SidebarTab};
 use search::SearchPage;
 use selection::{Cell, CellRect, Selection};
 use session_ops::SessionVerb;
-use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
+use sidebar_menu::{
+    Entry as MenuEntry, Item as SidebarItem, Labels as MenuLabels, MenuTarget as SidebarMenuTarget,
+};
 use stats::StatsPage;
 use style::{FillExt, RadiusExt};
 use tasks::{TaskLayout, TasksInputs, TasksPanel};
@@ -2065,8 +2068,9 @@ struct PilusView {
     sidebar_agent_paths: bool,
     /// Whether AGENTS shows only the active workspace's agents.
     agents_this_workspace: bool,
-    /// The open right-click menu on a WORKSPACES or AGENTS row, if any.
-    context_menu: Option<SidebarMenu>,
+    /// The last right-click menu shown and the row it is on, so a worktree
+    /// probe that lands while it is up can add its row in place.
+    open_menu: Option<(SidebarMenuTarget, native_menu::Menu)>,
     /// The rename/alias/branch prompt a menu action opened, if any.
     menu_prompt: Option<MenuPrompt>,
     /// The prompt's buffer, shared with `menu_prompt_input` so edits stay in
@@ -2734,7 +2738,7 @@ impl PilusView {
             sidebar_workspace_paths,
             sidebar_agent_paths,
             agents_this_workspace: false,
-            context_menu: None,
+            open_menu: None,
             menu_prompt: None,
             menu_prompt_field,
             menu_prompt_input,
@@ -3590,7 +3594,7 @@ impl PilusView {
             if let Some((endpoint, pane, alias)) = op.renamed_agent {
                 self.rename_local_agent(&endpoint, &pane, &alias);
             }
-            // A probe answer updates the open menu's rows in place: a linked
+            // A probe answer updates the open menu in place: a linked
             // checkout adds the Delete Worktree row without another
             // right-click. Errors are reported but not cached, so the next
             // menu open retries the probe.
@@ -3599,23 +3603,10 @@ impl PilusView {
                 self.worktree_probing.remove(&key);
                 match result {
                     Ok(path) => {
-                        // The inserted row shifts every row index below it, so
-                        // the keyboard cursor is dropped for that menu: Enter
-                        // must not retarget a different item than the one the
-                        // user highlighted.
-                        let open_target = self.context_menu.as_ref().is_some_and(|menu| {
-                            matches!(
-                                &menu.target,
-                                SidebarMenuTarget::Workspace {
-                                    endpoint,
-                                    workspace_id,
-                                    ..
-                                } if endpoint == &key.0 && workspace_id == &key.1
-                            )
-                        });
-                        self.worktree_linked.insert(key, path);
-                        if open_target && let Some(menu) = self.context_menu.as_mut() {
-                            menu.selected = None;
+                        let linked = path.is_some();
+                        self.worktree_linked.insert(key.clone(), path);
+                        if linked {
+                            self.add_worktree_row(&key);
                         }
                     }
                     Err(error) => {
@@ -5006,12 +4997,7 @@ impl PilusView {
             self.browser_forward_key(event, cx);
             return;
         }
-        // An open context menu owns up/down/enter/escape until one runs or it
-        // closes; an open prompt owns Enter (submit) and Escape (cancel).
-        if self.context_menu.is_some() {
-            self.context_menu_key(event, cx);
-            return;
-        }
+        // An open prompt owns Enter (submit) and Escape (cancel).
         if self.menu_prompt.is_some() {
             self.menu_prompt_key(event, cx);
             return;
@@ -9916,7 +9902,6 @@ impl PilusView {
             || self.palette.is_open()
             || self.quick_open.is_open()
             || self.picker.is_open()
-            || self.context_menu.is_some()
             || self.menu_prompt.is_some()
     }
 
@@ -10515,13 +10500,9 @@ impl PilusView {
         }
     }
 
-    /// Open the right-click menu for a WORKSPACES or AGENTS row at `position`.
-    fn open_context_menu(
-        &mut self,
-        target: SidebarMenuTarget,
-        position: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
+    /// Show the right-click menu for `target` at the pointer. A pick runs
+    /// through [`Self::run_context_item`] once the menu has closed over it.
+    fn open_context_menu(&mut self, target: SidebarMenuTarget, cx: &mut Context<Self>) {
         self.menu_prompt = None;
         let workspace_probe = match &target {
             SidebarMenuTarget::Workspace {
@@ -10541,15 +10522,55 @@ impl PilusView {
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => None,
         };
-        self.context_menu = Some(SidebarMenu::new(
-            target,
-            f32::from(position.x),
-            f32::from(position.y),
-        ));
         if let Some((endpoint, workspace_id, index, target)) = workspace_probe {
             self.probe_worktree(&endpoint, &workspace_id, index, &target);
         }
+        let entries = target.entries(self.menu_linked(&target), self.menu_labels(&target));
+        let view = cx.weak_entity();
+        let mut app = cx.to_async();
+        let picked = target.clone();
+        let menu = native_menu::show(&entries, !self.theme.is_light(), move |item| {
+            // The menu calls back from AppKit's own loop, outside any GPUI
+            // update, so the view can be borrowed here.
+            let _ = view.update(&mut app, |view, cx| {
+                view.run_context_item(&picked, item, cx);
+                cx.notify();
+            });
+        });
+        self.open_menu = menu.map(|menu| (target, menu));
         cx.notify();
+    }
+
+    /// Add the Delete Worktree row to the menu still showing `key`'s
+    /// workspace, now that its probe found a linked checkout.
+    fn add_worktree_row(&self, key: &(String, String)) {
+        let Some((target, menu)) = self.open_menu.as_ref() else {
+            return;
+        };
+        let SidebarMenuTarget::Workspace {
+            endpoint,
+            workspace_id,
+            ..
+        } = target
+        else {
+            return;
+        };
+        if endpoint != &key.0 || workspace_id != &key.1 {
+            return;
+        }
+        let entries = target.entries(true, self.menu_labels(target));
+        let row = entries.iter().position(|entry| {
+            matches!(
+                entry,
+                MenuEntry::Action {
+                    item: SidebarItem::DeleteWorktree,
+                    ..
+                }
+            )
+        });
+        if let Some(index) = row {
+            menu.insert(index, &entries[index]);
+        }
     }
 
     /// Ask the daemon whether the row's checkout is a linked worktree, once
@@ -10604,19 +10625,11 @@ impl PilusView {
         });
     }
 
-    /// Close the context menu and any prompt it left behind.
-    fn close_context_menu(&mut self) {
-        self.context_menu = None;
-    }
-
-    /// The open menu's rows, resolved against the state they toggle.
-    fn menu_rows(&self) -> Vec<SidebarItem> {
-        let Some(menu) = self.context_menu.as_ref() else {
-            return Vec::new();
-        };
-        let linked = match &menu.target {
-            // Only a confirmed linked checkout offers Delete Worktree;
-            // unknown and known-not-linked leave the row out.
+    /// Whether the daemon confirmed `target`'s checkout as a linked
+    /// worktree, which is what offers Delete Worktree. Unknown and
+    /// known-not-linked both leave the row out.
+    fn menu_linked(&self, target: &SidebarMenuTarget) -> bool {
+        match target {
             SidebarMenuTarget::Workspace {
                 endpoint,
                 workspace_id,
@@ -10630,145 +10643,56 @@ impl PilusView {
             | SidebarMenuTarget::Terminal { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => false,
-        };
-        menu.rows(linked)
-    }
-
-    /// Drive the open context menu from the keyboard.
-    fn context_menu_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        let rows = self.menu_rows();
-        let (quick_open, quick_rows, in_quick) = self
-            .context_menu
-            .as_ref()
-            .map(|menu| {
-                (
-                    menu.quick_open,
-                    menu.quick_rows(),
-                    menu.quick_selected.is_some(),
-                )
-            })
-            .unwrap_or_default();
-        match keystroke.key.as_str() {
-            "escape" | "esc" => {
-                if quick_open {
-                    // Esc steps back out of the flyout before closing.
-                    if let Some(menu) = self.context_menu.as_mut() {
-                        menu.quick_open = false;
-                        menu.quick_selected = None;
-                    }
-                } else {
-                    self.close_context_menu();
-                }
-                cx.notify();
-            }
-            "up" | "down" => {
-                let Some(menu) = self.context_menu.as_mut() else {
-                    return;
-                };
-                let dir: isize = if keystroke.key == "up" { -1 } else { 1 };
-                if let Some(current) = menu.quick_selected {
-                    if let Some(next) = menu.next_selectable(&quick_rows, current, dir) {
-                        menu.quick_selected = Some(next);
-                    }
-                } else {
-                    let from = menu
-                        .selected
-                        .unwrap_or(if dir < 0 { 0 } else { usize::MAX });
-                    if let Some(next) = menu.next_selectable(&rows, from, dir) {
-                        menu.selected = Some(next);
-                        // Moving off the parent row folds the flyout away.
-                        menu.quick_open = false;
-                    }
-                }
-                cx.notify();
-            }
-            // A right arrow opens the flyout and moves into it; a left arrow
-            // climbs back to the parent row.
-            "right" => {
-                if !in_quick
-                    && rows.contains(&SidebarItem::QuickActions)
-                    && let Some(menu) = self.context_menu.as_mut()
-                {
-                    menu.quick_open = true;
-                    menu.quick_selected = Some(0);
-                    cx.notify();
-                }
-            }
-            "left" => {
-                if quick_open && let Some(menu) = self.context_menu.as_mut() {
-                    menu.quick_open = false;
-                    menu.quick_selected = None;
-                    cx.notify();
-                }
-            }
-            "enter" => {
-                if in_quick {
-                    let index = self
-                        .context_menu
-                        .as_ref()
-                        .and_then(|menu| menu.quick_selected);
-                    if let Some(item) = index.and_then(|index| quick_rows.get(index)) {
-                        self.run_context_item(*item, cx);
-                    }
-                    return;
-                }
-                let row = self
-                    .context_menu
-                    .as_ref()
-                    .and_then(|menu| menu.selected)
-                    .filter(|index| rows.get(*index).is_some_and(|item| item.selectable()))
-                    .or_else(|| rows.iter().position(|item| item.selectable()));
-                if let Some(index) = row {
-                    self.run_context_item(rows[index], cx);
-                    // From the keyboard, opening the flyout also steps into it.
-                    if rows[index] == SidebarItem::QuickActions
-                        && let Some(menu) = self.context_menu.as_mut()
-                    {
-                        menu.quick_selected = Some(0);
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
-    /// Run one hit context-menu row. The menu is cloned so the Quick Actions
-    /// parent row can pin its flyout open in place; everything else closes
-    /// it and runs the action.
-    fn run_context_item(&mut self, item: SidebarItem, cx: &mut Context<Self>) {
-        let Some(menu) = self.context_menu.as_ref() else {
-            return;
-        };
-        let target = menu.target.clone();
-        match (&target, item) {
-            (SidebarMenuTarget::Workspace { .. }, SidebarItem::QuickActions) => {
-                if let Some(menu) = self.context_menu.as_mut() {
-                    menu.quick_open = true;
-                }
-                cx.notify();
+    /// The window state `target`'s rows read their wording from.
+    fn menu_labels(&self, target: &SidebarMenuTarget) -> MenuLabels {
+        let (paths_visible, scoped) = match target {
+            SidebarMenuTarget::Workspace { .. } => (self.sidebar_workspace_paths, false),
+            SidebarMenuTarget::Agent { .. } => {
+                (self.sidebar_agent_paths, self.agents_this_workspace)
             }
+            SidebarMenuTarget::Saved { .. }
+            | SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::Github
+            | SidebarMenuTarget::File { .. } => (false, false),
+        };
+        MenuLabels {
+            paths_visible,
+            scoped,
+            repos: self.github.repos.items.len(),
+        }
+    }
+
+    /// Run the row picked from `target`'s menu.
+    fn run_context_item(
+        &mut self,
+        target: &SidebarMenuTarget,
+        item: SidebarItem,
+        cx: &mut Context<Self>,
+    ) {
+        match (target, item) {
             (SidebarMenuTarget::Workspace { .. }, SidebarItem::Close) => {
-                self.close_context_menu();
-                self.menu_close_workspace(&target, cx);
+                self.menu_close_workspace(target, cx);
             }
             (SidebarMenuTarget::Workspace { .. }, SidebarItem::Rename) => {
-                self.close_context_menu();
-                self.menu_open_rename(&target, cx);
+                self.menu_open_rename(target, cx);
             }
             (SidebarMenuTarget::Workspace { .. }, SidebarItem::TogglePaths) => {
-                self.close_context_menu();
                 self.menu_toggle_workspace_paths(cx);
             }
             (SidebarMenuTarget::Workspace { cwd, .. }, SidebarItem::CopyPath) => {
-                self.close_context_menu();
                 self.menu_copy(cwd, cx);
             }
-            (SidebarMenuTarget::Workspace { branch, .. }, SidebarItem::CopyBranch) => {
-                self.close_context_menu();
-                if let Some(branch) = branch {
-                    self.menu_copy(branch, cx);
-                }
+            (
+                SidebarMenuTarget::Workspace {
+                    branch: Some(branch),
+                    ..
+                },
+                SidebarItem::CopyBranch,
+            ) => {
+                self.menu_copy(branch, cx);
             }
             (
                 SidebarMenuTarget::Workspace {
@@ -10776,7 +10700,6 @@ impl PilusView {
                 },
                 SidebarItem::NewWorktree,
             ) => {
-                self.close_context_menu();
                 self.menu_new_worktree(
                     PromptAction::NewWorktree {
                         endpoint: self.endpoint_by_key(endpoint),
@@ -10799,12 +10722,10 @@ impl PilusView {
                 let key = (endpoint.clone(), workspace_id.clone());
                 let Some(path) = self.worktree_linked.get(&key).and_then(|path| path.clone())
                 else {
-                    self.close_context_menu();
                     self.toast(ToastKind::Info, "worktree status is still being checked");
                     cx.notify();
                     return;
                 };
-                self.close_context_menu();
                 self.open_menu_prompt(
                     PromptAction::DeleteWorktree {
                         endpoint: self.endpoint_by_key(endpoint),
@@ -10829,7 +10750,6 @@ impl PilusView {
                 },
                 SidebarItem::PinWorkspace | SidebarItem::UnpinWorkspace,
             ) => {
-                self.close_context_menu();
                 self.set_folder_pinned(endpoint, cwd, name, item == SidebarItem::PinWorkspace, cx);
             }
             (
@@ -10841,49 +10761,39 @@ impl PilusView {
                 },
                 SidebarItem::PinWorkspace | SidebarItem::UnpinWorkspace,
             ) => {
-                self.close_context_menu();
                 self.set_folder_pinned(endpoint, path, name, item == SidebarItem::PinWorkspace, cx);
             }
             (SidebarMenuTarget::Saved { path, .. }, SidebarItem::CopyPath) => {
-                self.close_context_menu();
                 self.menu_copy(path, cx);
             }
             (SidebarMenuTarget::Agent { .. }, SidebarItem::Rename) => {
-                self.close_context_menu();
-                self.menu_open_agent_rename(&target, cx);
+                self.menu_open_agent_rename(target, cx);
             }
             (SidebarMenuTarget::Agent { .. }, SidebarItem::Close) => {
-                self.close_context_menu();
-                self.menu_close_agent(&target, cx);
+                self.menu_close_agent(target, cx);
             }
             (SidebarMenuTarget::Agent { .. }, SidebarItem::TogglePaths) => {
-                self.close_context_menu();
                 self.menu_toggle_agent_paths(cx);
             }
             (SidebarMenuTarget::Agent { .. }, SidebarItem::ToggleScope) => {
-                self.close_context_menu();
                 self.agents_this_workspace = !self.agents_this_workspace;
                 cx.notify();
             }
             (SidebarMenuTarget::Terminal { .. }, item) => {
-                self.close_context_menu();
                 self.run_terminal_item(item, cx);
             }
             (SidebarMenuTarget::Github, item) => {
-                self.close_context_menu();
                 self.github_menu_item(item, cx);
             }
             (SidebarMenuTarget::File { path, .. }, SidebarItem::CopyPath) => {
-                self.close_context_menu();
                 self.menu_copy(path, cx);
             }
             (SidebarMenuTarget::File { .. }, item) => {
-                self.close_context_menu();
-                self.files_menu_item(&target, item, cx);
+                self.files_menu_item(target, item, cx);
             }
-            (_, SidebarItem::Divider) => {}
-            // Copy rows only exist on a WORKSPACES target; the arms above
-            // cover every row the builders can emit.
+            // Quick Actions and dividers are never picked, and copy rows only
+            // exist on a WORKSPACES target; the arms above cover every row the
+            // builders can emit.
             _ => {}
         }
     }
@@ -10988,11 +10898,7 @@ impl PilusView {
             .selection
             .is_some_and(|selection| !selection.is_collapsed());
         let agent = self.agents.iter().any(|agent| agent.focused);
-        self.open_context_menu(
-            SidebarMenuTarget::Terminal { selection, agent },
-            event.position,
-            cx,
-        );
+        self.open_context_menu(SidebarMenuTarget::Terminal { selection, agent }, cx);
     }
 
     /// Close a workspace from its context menu, reporting through the menu
@@ -12967,237 +12873,6 @@ impl PilusView {
             )
     }
 
-    /// One selectable row of the context menu or its flyout. The caller adds
-    /// the click and hover handlers.
-    fn context_menu_row(
-        &self,
-        id: String,
-        item: SidebarItem,
-        active: bool,
-        paths: bool,
-        scoped: bool,
-    ) -> Stateful<Div> {
-        let theme = self.theme;
-        let color = if item.destructive() {
-            theme.alert
-        } else {
-            theme.panel_fg
-        };
-        let mut label = item.label(paths, scoped).to_string();
-        if item == SidebarItem::GithubAll {
-            label.push_str(&format!(" · {}", self.github.repos.items.len()));
-        }
-        div()
-            .id(id)
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .h(px(26.0))
-            .px_2()
-            .radius_md()
-            .cursor_pointer()
-            .state_fill(
-                if active {
-                    theme.panel
-                } else {
-                    theme.window_bg.opacity(0.0)
-                },
-                theme.panel,
-                style::RADIUS_MD,
-            )
-            .text_size(px(self.chrome_font()))
-            .text_color(color)
-            .child(icon(sidebar_menu_icon(item), 15.0, color))
-            .child(div().flex_1().min_w_0().truncate().child(label))
-    }
-
-    /// The right-click context menu for a WORKSPACES or AGENTS row.
-    ///
-    /// A full-window catcher occludes the grid and sidebar while the menu is
-    /// up; the panel stops propagation so its own rows land. The keyboard
-    /// cursor (`selected`) and mouse hover share the panel pill, and the
-    /// menu clamps to the viewport so a row opened at the window's edge never
-    /// draws off-screen.
-    fn context_menu_overlay(&self, cx: &mut Context<Self>, window: &Window) -> AnyElement {
-        let Some(menu) = self.context_menu.as_ref() else {
-            return div().into_any_element();
-        };
-        let theme = self.theme;
-        let rows = self.menu_rows();
-        let (paths, scoped) = match &menu.target {
-            SidebarMenuTarget::Workspace { .. } => (self.sidebar_workspace_paths, false),
-            SidebarMenuTarget::Agent { .. } => {
-                (self.sidebar_agent_paths, self.agents_this_workspace)
-            }
-            SidebarMenuTarget::Saved { .. }
-            | SidebarMenuTarget::Terminal { .. }
-            | SidebarMenuTarget::Github
-            | SidebarMenuTarget::File { .. } => (false, false),
-        };
-
-        let quick_rows = if menu.quick_open {
-            menu.quick_rows()
-        } else {
-            Vec::new()
-        };
-        let mut items = div().flex().flex_col().gap_0();
-        for (index, item) in rows.iter().copied().enumerate() {
-            if item == SidebarItem::Divider {
-                items = items.child(div().mx_2().my_1().h(px(1.0)).bg(theme.border.opacity(0.5)));
-                continue;
-            }
-            let parent = item == SidebarItem::QuickActions;
-            // The parent row keeps its pill while the flyout is out, so the
-            // pointer can see which row the flyout belongs to.
-            let active = menu.selected == Some(index)
-                || (parent && menu.quick_open && menu.quick_selected.is_none());
-            items = items.child(
-                self.context_menu_row(
-                    format!("pilus-sidebar-menu-{index}"),
-                    item,
-                    active,
-                    paths,
-                    scoped,
-                )
-                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    if !*hovered {
-                        return;
-                    }
-                    // Hovering the parent row slides the flyout out;
-                    // hovering any other row folds it away.
-                    let Some(menu) = this.context_menu.as_mut() else {
-                        return;
-                    };
-                    if menu.quick_open != parent || menu.quick_selected.is_some() {
-                        menu.quick_open = parent;
-                        menu.quick_selected = None;
-                        cx.notify();
-                    }
-                }))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.run_context_item(item, cx);
-                })),
-            );
-        }
-
-        // Anchor at the cursor, flipping to the left and above when the panel
-        // would cross the opposite edges.
-        let width = 224.0f32;
-        let viewport_width = f32::from(window.viewport_size().width);
-        let viewport_height = f32::from(window.viewport_size().height);
-        let mut left = menu.column;
-        if left + width + 8.0 > viewport_width {
-            left = (viewport_width - width - 8.0).max(8.0);
-        }
-        let height = sidebar_menu::panel_height(&rows);
-        let mut top = menu.row + 6.0;
-        if top + height > viewport_height {
-            top = (menu.row - height - 6.0).max(8.0);
-        }
-
-        let panel = div()
-            .absolute()
-            .left(px(left))
-            .top(px(top))
-            .w(px(width))
-            .radius_md()
-            .bg(theme.sidebar_bg)
-            .border_1()
-            .border_color(theme.border)
-            .p_1()
-            .child(items)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, _, cx| cx.stop_propagation()),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|_, _, _, cx| cx.stop_propagation()),
-            );
-
-        // The Quick Actions flyout sits beside the panel, level with its
-        // parent row, and flips to the left edge when the right has no room.
-        let flyout = rows
-            .iter()
-            .position(|item| *item == SidebarItem::QuickActions)
-            .filter(|_| !quick_rows.is_empty())
-            .map(|parent| {
-                let fly_width = 168.0f32;
-                let gap = 2.0f32;
-                let mut fly_left = left + width + gap;
-                if fly_left + fly_width + 8.0 > viewport_width {
-                    fly_left = (left - fly_width - gap).max(8.0);
-                }
-                let fly_height = sidebar_menu::panel_height(&quick_rows);
-                let fly_top = (top + sidebar_menu::row_offset(&rows, parent) - 5.0)
-                    .min(viewport_height - fly_height - 8.0)
-                    .max(8.0);
-                let mut fly_items = div().flex().flex_col().gap_0();
-                for (index, item) in quick_rows.iter().copied().enumerate() {
-                    fly_items = fly_items.child(
-                        self.context_menu_row(
-                            format!("pilus-sidebar-quick-{index}"),
-                            item,
-                            menu.quick_selected == Some(index),
-                            paths,
-                            scoped,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.run_context_item(item, cx);
-                        })),
-                    );
-                }
-                div()
-                    .absolute()
-                    .left(px(fly_left))
-                    .top(px(fly_top))
-                    .w(px(fly_width))
-                    .radius_md()
-                    .bg(theme.sidebar_bg)
-                    .border_1()
-                    .border_color(theme.border)
-                    .p_1()
-                    .child(fly_items)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    )
-            });
-
-        style::enter(
-            "pilus-context-menu-enter",
-            div()
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
-                .right(px(0.0))
-                .bottom(px(0.0))
-                .occlude()
-                .child(panel)
-                .children(flyout)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.close_context_menu();
-                        cx.notify();
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|this, _, _, cx| {
-                        this.close_context_menu();
-                        cx.notify();
-                    }),
-                ),
-        )
-        .into_any_element()
-    }
-
     /// The rename/alias/branch prompt a context-menu action opened.
     ///
     /// Same shape as the palette: a dimmed catcher over everything and a
@@ -13759,7 +13434,7 @@ impl PilusView {
         )
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                 this.leave_settings_page();
                 this.open_context_menu(
                     SidebarMenuTarget::Workspace {
@@ -13771,7 +13446,6 @@ impl PilusView {
                         branch: workspace_branch.clone(),
                         pinned: this.folder_pinned(&menu_endpoint.key(), &workspace_cwd),
                     },
-                    event.position,
                     cx,
                 );
             }),
@@ -14416,12 +14090,8 @@ impl PilusView {
                     .when(menu, |header| {
                         header.on_mouse_down(
                             MouseButton::Right,
-                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                this.open_context_menu(
-                                    SidebarMenuTarget::Github,
-                                    event.position,
-                                    cx,
-                                );
+                            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                this.open_context_menu(SidebarMenuTarget::Github, cx);
                             }),
                         )
                     }),
@@ -15003,7 +14673,7 @@ impl PilusView {
         )
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                 this.leave_settings_page();
                 this.open_context_menu(
                     SidebarMenuTarget::Agent {
@@ -15013,7 +14683,6 @@ impl PilusView {
                         // alias, not the derived label.
                         name: menu_alias.clone(),
                     },
-                    event.position,
                     cx,
                 );
             }),
@@ -15795,7 +15464,6 @@ impl Render for PilusView {
                     .child(self.quick_open_overlay(cx))
                     .child(self.picker_overlay(window, cx))
             })
-            .child(self.context_menu_overlay(cx, window))
             .child(self.menu_prompt_overlay(cx))
             .child(self.toast_stack(cx))
     }
@@ -17280,44 +16948,6 @@ fn picker_option_row(
             )
         })
         .on_click(on_choose)
-}
-
-/// The leading glyph of one sidebar context-menu row.
-fn sidebar_menu_icon(item: SidebarItem) -> &'static [u8] {
-    match item {
-        SidebarItem::Close => include_bytes!("../../assets/icons/x.svg"),
-        SidebarItem::Rename => include_bytes!("../../assets/icons/pencil.svg"),
-        SidebarItem::PinWorkspace => include_bytes!("../../assets/icons/pin.svg"),
-        SidebarItem::UnpinWorkspace => include_bytes!("../../assets/icons/minus.svg"),
-        SidebarItem::TogglePaths => include_bytes!("../../assets/icons/folder.svg"),
-        SidebarItem::QuickActions => include_bytes!("../../assets/icons/chevron-right.svg"),
-        SidebarItem::CopyPath | SidebarItem::CopyBranch => {
-            include_bytes!("../../assets/icons/copy.svg")
-        }
-        SidebarItem::NewWorktree => include_bytes!("../../assets/icons/git-branch.svg"),
-        SidebarItem::DeleteWorktree => include_bytes!("../../assets/icons/trash-2.svg"),
-        SidebarItem::ToggleScope => include_bytes!("../../assets/icons/monitor.svg"),
-        SidebarItem::NewFile => include_bytes!("../../assets/icons/file-plus.svg"),
-        SidebarItem::NewFolder => include_bytes!("../../assets/icons/folder-plus.svg"),
-        SidebarItem::Upload => include_bytes!("../../assets/icons/upload.svg"),
-        SidebarItem::Download | SidebarItem::DownloadArchive => {
-            include_bytes!("../../assets/icons/download.svg")
-        }
-        SidebarItem::Delete => include_bytes!("../../assets/icons/trash-2.svg"),
-        SidebarItem::CopySelection => include_bytes!("../../assets/icons/copy.svg"),
-        SidebarItem::Paste => include_bytes!("../../assets/icons/clipboard.svg"),
-        SidebarItem::SplitRight => include_bytes!("../../assets/icons/columns-2.svg"),
-        SidebarItem::SplitDown => include_bytes!("../../assets/icons/rows-2.svg"),
-        SidebarItem::ForkPane => include_bytes!("../../assets/icons/git-fork.svg"),
-        SidebarItem::MoveToTab => include_bytes!("../../assets/icons/corner-down-right.svg"),
-        SidebarItem::NewTab => include_bytes!("../../assets/icons/plus.svg"),
-        SidebarItem::CloseTab => include_bytes!("../../assets/icons/x.svg"),
-        SidebarItem::GithubAll => include_bytes!("../../assets/icons/list.svg"),
-        SidebarItem::GithubRefresh => include_bytes!("../../assets/icons/refresh-cw.svg"),
-        SidebarItem::GithubHideSection => include_bytes!("../../assets/icons/minus.svg"),
-        SidebarItem::GithubDisable => include_bytes!("../../assets/icons/x.svg"),
-        SidebarItem::Divider => include_bytes!("../../assets/icons/plus.svg"),
-    }
 }
 
 /// Resolve a path's physical spelling, falling back to the given text when

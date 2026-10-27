@@ -417,7 +417,6 @@ impl PilusView {
             && !self.palette.is_open()
             && !self.home.is_open()
             && !self.settings_open
-            && self.context_menu.is_none()
             && self.menu_prompt.is_none()
     }
 

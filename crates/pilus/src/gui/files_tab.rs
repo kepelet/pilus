@@ -43,8 +43,8 @@ use std::path::PathBuf;
 use crossterm::event::{KeyModifiers, MouseButton as TerminalMouseButton, MouseEventKind};
 use gpui::{
     AnyElement, ClickEvent, Context, Div, DragMoveEvent, ExternalPaths, Focusable, KeyDownEvent,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point,
-    ScrollHandle, SharedString, Window, div, list, point, prelude::*, px, relative,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, PathPromptOptions, Pixels, ScrollHandle,
+    SharedString, Window, div, list, point, prelude::*, px, relative,
 };
 use pilus_client::{
     ControlClient, Error, FileChanges, FileRow, FileTree, OpenTarget, SshTarget, TextFile, Version,
@@ -1731,7 +1731,6 @@ impl PilusView {
         path: String,
         dir: bool,
         root: bool,
-        position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         self.open_context_menu(
@@ -1741,7 +1740,6 @@ impl PilusView {
                 dir,
                 root,
             },
-            position,
             cx,
         );
     }
@@ -2102,9 +2100,9 @@ impl PilusView {
                 // Rows stop the press, so this is the blank area and the header.
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
                         if let Some(root) = this.files_panel.tree.as_ref().map(|t| t.root.clone()) {
-                            this.files_open_menu(root, true, true, event.position, cx);
+                            this.files_open_menu(root, true, true, cx);
                         }
                     }),
                 )
@@ -2547,9 +2545,9 @@ impl PilusView {
                 false,
                 false,
             )
-            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 if let Some(root) = this.files_panel.tree.as_ref().map(|t| t.root.clone()) {
-                    this.files_open_menu(root, true, true, event.position(), cx);
+                    this.files_open_menu(root, true, true, cx);
                 }
             }));
         let upload = self
@@ -2681,10 +2679,10 @@ impl PilusView {
         }))
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                 cx.stop_propagation();
                 let (path, dir) = menu_entry.clone();
-                this.files_open_menu(path, dir, false, event.position, cx);
+                this.files_open_menu(path, dir, false, cx);
             }),
         )
         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {

@@ -171,12 +171,7 @@ impl PilusView {
     }
 
     /// The context menu of a saved folder, opened where the pointer is.
-    pub(super) fn open_saved_menu(
-        &mut self,
-        saved: &SavedWorkspace,
-        position: gpui::Point<gpui::Pixels>,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn open_saved_menu(&mut self, saved: &SavedWorkspace, cx: &mut Context<Self>) {
         let pinned = self.folder_pinned(&saved.endpoint, &saved.path);
         self.open_context_menu(
             MenuTarget::Saved {
@@ -185,7 +180,6 @@ impl PilusView {
                 name: saved.name.clone(),
                 pinned,
             },
-            position,
             cx,
         );
     }
@@ -321,9 +315,7 @@ impl PilusView {
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.open_saved_menu(&menu, event.position, cx)
-                }),
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| this.open_saved_menu(&menu, cx)),
             )
     }
 
@@ -412,9 +404,7 @@ impl PilusView {
         .on_click(cx.listener(move |this, _, _, cx| this.open_saved_workspace(open.clone(), cx)))
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                this.open_saved_menu(&menu, event.position, cx)
-            }),
+            cx.listener(move |this, _: &MouseDownEvent, _, cx| this.open_saved_menu(&menu, cx)),
         )
     }
 }

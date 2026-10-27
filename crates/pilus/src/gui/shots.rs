@@ -473,22 +473,9 @@ pub fn run() -> Result<()> {
             .ok();
             settle(&mut cx, 6);
         }
-        // The tree's right-click menu on a file, then its delete confirm and
-        // its rename prompt.
+        // The tree's delete confirm and rename prompt for a file. Its
+        // right-click menu is an `NSMenu`, which a capture cannot see.
         let file = "/work/pilus/crates/pilus-client/src/lib.rs";
-        cx.update(|app| {
-            view.update(app, |view, cx| {
-                view.files_open_menu(
-                    file.to_string(),
-                    false,
-                    false,
-                    point(px(930.0), px(330.0)),
-                    cx,
-                )
-            })
-        });
-        settle(&mut cx, 8);
-        capture(&mut cx, window.into(), "files-tab-menu")?;
         let target = super::sidebar_menu::MenuTarget::File {
             endpoint: "local".to_string(),
             path: file.to_string(),
@@ -499,12 +486,7 @@ pub fn run() -> Result<()> {
             (super::sidebar_menu::Item::Delete, "files-tab-delete"),
             (super::sidebar_menu::Item::Rename, "files-tab-rename"),
         ] {
-            cx.update(|app| {
-                view.update(app, |view, cx| {
-                    view.close_context_menu();
-                    view.files_menu_item(&target, item, cx)
-                })
-            });
+            cx.update(|app| view.update(app, |view, cx| view.files_menu_item(&target, item, cx)));
             settle(&mut cx, 8);
             capture(&mut cx, window.into(), name)?;
         }
@@ -1106,22 +1088,10 @@ pub fn run_main() -> Result<()> {
     });
     cx.run_until_parked();
 
-    // The GitHub section's menu, then each page, then `gh` signed out.
-    cx.update(|app| {
-        view.update(app, |view, cx| {
-            view.open_context_menu(
-                super::sidebar_menu::MenuTarget::Github,
-                point(px(120.0), px(110.0)),
-                cx,
-            );
-        });
-    });
-    settle(&mut cx, 6);
-    capture(&mut cx, window.into(), "main-github-menu")?;
+    // Each GitHub page, then `gh` signed out.
     // Two pins, one of them outside the sample list's recent five.
     cx.update(|app| {
         view.update(app, |view, cx| {
-            view.close_context_menu();
             view.settings.set_pinned("alex/notes", true);
             view.settings.set_pinned("acme/infra", true);
             // The window pulls the shared copy back each tick.
@@ -1283,24 +1253,6 @@ pub fn run_main() -> Result<()> {
         view.update(app, |view, _| view.toasts = super::toast::Toasts::new());
     });
 
-    // The terminal's own right-click menu, over a selection and without one.
-    cx.update(|app| {
-        view.update(app, |view, cx| {
-            view.palette.close();
-            view.open_context_menu(
-                super::sidebar_menu::MenuTarget::Terminal {
-                    selection: true,
-                    agent: true,
-                },
-                point(px(520.0), px(260.0)),
-                cx,
-            );
-        });
-    });
-    settle(&mut cx, 8);
-    capture(&mut cx, window.into(), "main-terminal-menu")?;
-    cx.update(|app| view.update(app, |view, _| view.close_context_menu()));
-
     // The session menu: a running session with its stop control, a stopped
     // one with delete, and a delete waiting on its second press.
     cx.update(|app| {
@@ -1373,162 +1325,6 @@ pub fn run_main() -> Result<()> {
     settle(&mut cx, 8);
     capture(&mut cx, window.into(), "main-session-rename")?;
     cx.update(|app| view.update(app, |view, _| view.menu_prompt = None));
-
-    // The WORKSPACES row context menu, with the keyboard cursor on Close,
-    // and its Quick Actions submenu underneath.
-    cx.update(|app| {
-        view.update(app, |view, cx| {
-            view.palette.close();
-            if let Some(workspace) = view.surface.workspaces().first() {
-                view.open_context_menu(
-                    super::sidebar_menu::MenuTarget::Workspace {
-                        endpoint: view.active.key(),
-                        workspace_id: workspace.id.clone(),
-                        index: workspace.index,
-                        name: workspace.name.clone(),
-                        cwd: workspace.cwd.clone(),
-                        branch: workspace.branch.clone(),
-                        pinned: false,
-                    },
-                    point(px(96.0), px(150.0)),
-                    cx,
-                );
-                if let Some(menu) = view.context_menu.as_mut() {
-                    menu.selected = Some(0);
-                }
-            }
-            cx.notify();
-        });
-    });
-    settle(&mut cx, 4);
-    capture(&mut cx, window.into(), "main-workspace-menu")?;
-    cx.update(|app| {
-        view.update(app, |view, cx| {
-            if let Some(menu) = view.context_menu.as_mut() {
-                menu.quick_open = true;
-                menu.selected = None;
-                menu.quick_selected = None;
-            }
-            cx.notify();
-        });
-    });
-    cx.run_until_parked();
-    capture(&mut cx, window.into(), "main-workspace-menu-copy")?;
-
-    // Walk every WORKSPACES row and capture the first menu whose linked-
-    // checkout probe confirms a worktree: the Delete Worktree row must render
-    // there. The probe runs on a background thread and is drained by the poll
-    // loop, so give it real time, then check through the view's own rows.
-    let rows: Vec<(String, String, u16, String, String, Option<String>)> = cx.update(|app| {
-        view.update(app, |view, _| {
-            view.endpoint_workspaces(&view.active)
-                .iter()
-                .map(|workspace| {
-                    (
-                        workspace.id.clone(),
-                        workspace.name.clone(),
-                        workspace.index,
-                        view.active.key(),
-                        workspace.cwd.clone(),
-                        workspace.branch.clone(),
-                    )
-                })
-                .collect()
-        })
-    });
-    let mut captured_delete = false;
-    for (id, name, index, endpoint, cwd, branch) in rows {
-        cx.update(|app| {
-            view.update(app, |view, cx| {
-                view.open_context_menu(
-                    super::sidebar_menu::MenuTarget::Workspace {
-                        endpoint: endpoint.clone(),
-                        workspace_id: id.clone(),
-                        index,
-                        name: name.clone(),
-                        cwd: cwd.clone(),
-                        branch: branch.clone(),
-                        pinned: false,
-                    },
-                    point(px(96.0), px(150.0)),
-                    cx,
-                );
-            });
-        });
-        std::thread::sleep(Duration::from_millis(400));
-        settle(&mut cx, 10);
-        let shows_delete = cx.update(|app| {
-            view.update(app, |view, _| {
-                view.menu_rows()
-                    .contains(&super::SidebarItem::DeleteWorktree)
-            })
-        });
-        if shows_delete && !captured_delete {
-            capture(&mut cx, window.into(), "main-workspace-menu-delete")?;
-            captured_delete = true;
-        }
-        cx.update(|app| {
-            view.update(app, |view, _| view.close_context_menu());
-        });
-        if captured_delete {
-            break;
-        }
-    }
-
-    // The AGENTS row context menu. The dev daemon may have no live agent, so
-    // the row is injected like the crowded-tab capture does; the daemon is
-    // untouched and the real list comes back on the next feed.
-    let saved_agents: Rc<RefCell<Option<Vec<pilus_client::Agent>>>> = Rc::new(RefCell::new(None));
-    cx.update(|app| {
-        view.update(app, |view, cx| {
-            if view.agents.is_empty() {
-                let workspace_id = view
-                    .surface
-                    .workspaces()
-                    .iter()
-                    .find(|workspace| workspace.active)
-                    .map(|workspace| workspace.id.clone())
-                    .unwrap_or_default();
-                *saved_agents.borrow_mut() = Some(std::mem::replace(
-                    &mut view.agents,
-                    vec![pilus_client::Agent {
-                        agent: "claude".to_string(),
-                        status: "working".to_string(),
-                        workspace_id,
-                        cwd: "~/Developer/project-2".to_string(),
-                        ..pilus_client::Agent::default()
-                    }],
-                ));
-                cx.notify();
-            }
-        });
-    });
-    cx.update(|app| {
-        view.update(app, |view, cx| {
-            if let Some(agent) = view.agents.first() {
-                view.open_context_menu(
-                    super::sidebar_menu::MenuTarget::Agent {
-                        endpoint: view.active.key(),
-                        pane: agent.pane.clone(),
-                        name: agent.name.clone(),
-                    },
-                    point(px(96.0), px(280.0)),
-                    cx,
-                );
-            }
-            cx.notify();
-        });
-    });
-    settle(&mut cx, 4);
-    capture(&mut cx, window.into(), "main-agent-menu")?;
-    cx.update(|app| {
-        view.update(app, |view, _| {
-            view.close_context_menu();
-            if let Some(agents) = saved_agents.borrow_mut().take() {
-                view.agents = agents;
-            }
-        });
-    });
 
     // The Delete Worktree confirm. The row only appears on confirmed linked
     // checkouts, so the cache is seeded for the first row and the confirm is

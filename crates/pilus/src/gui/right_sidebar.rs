@@ -847,7 +847,7 @@ impl PilusView {
         let theme = self.theme;
         let raise = theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT);
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let split = self.is_split();
+        let floating = self.floating_cards();
         let expanded = self.right.expanded();
         let shown = self.shown_tab();
         let is_repo = self.active_is_repo();
@@ -1048,12 +1048,12 @@ impl PilusView {
             .overflow_hidden()
             .bg(self.chrome_fill())
             .border_l_1()
-            // A split's tinted surface runs up to the column, so the edge
+            // Floating cards' tinted surface runs up to the column, so the edge
             // takes that surface's color and the terminal's surface meets the
             // column without a seam; the edge keeps its pixel so the content
             // box does not shift. Focus draws no edge: only Changes takes
             // keys, so it would mark one tab.
-            .border_color(if split {
+            .border_color(if floating {
                 let glass = self.glass_opacity();
                 theme.pane_surface(glass).opacity(glass)
             } else {

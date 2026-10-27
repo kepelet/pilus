@@ -1270,18 +1270,24 @@ struct CardLayout {
     card_x: f32,
     /// Card's right offset from the window edge: the right column's width.
     card_right: f32,
-    /// First visible cell's top-left corner in window pixels.
+    /// First visible cell's top-left corner in window pixels, past the
+    /// grid's padding.
     origin_x: f32,
     origin_y: f32,
+    /// Padding the grid keeps clear before the first column (`pad_x`) and
+    /// above the first row (`pad_y`); the far sides' are part of `slack_x`
+    /// and `slack_y`. Zero unless panes float as cards.
+    pad_x: f32,
+    pad_y: f32,
     /// Visible grid size in cells.
     cols: u16,
     rows: u16,
     /// Measured cell size in pixels.
     cell_w: f32,
     cell_h: f32,
-    /// Sub-cell remainder pooled at the right and bottom edges. The grid
-    /// paints its edge colors over this strip so no card-colored sliver
-    /// shows.
+    /// Sub-cell remainder pooled at the right and bottom edges, the
+    /// padding there included. The grid paints its edge colors over this strip so
+    /// no card-colored sliver shows.
     slack_x: f32,
     slack_y: f32,
     /// Pixels a split page takes from the card's leading edge or top, ahead
@@ -1886,6 +1892,9 @@ struct PilusView {
     /// The seams between the panes of the frame last painted, for grabbing
     /// one to resize a split.
     dividers: Vec<pane_frames::Divider>,
+    /// How far each pane of the frame last painted is pushed right, so the
+    /// pointer finds the cell that was drawn under it.
+    column_shifts: pane_chrome::ColumnShifts,
     /// The seam under the pointer, which turns the cursor into a resize arrow.
     divider_hover: Option<pane_frames::DividerAxis>,
     /// A seam held by the left button. The daemon owns the layout, so the
@@ -2644,6 +2653,7 @@ impl PilusView {
             press_anchor: None,
             hover_cell: None,
             dividers: Vec::new(),
+            column_shifts: pane_chrome::ColumnShifts::default(),
             divider_hover: None,
             divider_drag: None,
             control_held: false,
@@ -9962,9 +9972,19 @@ impl PilusView {
         );
         let y = (f32::from(position.y) - layout.origin_y) / layout.cell_h;
         let x = (f32::from(position.x) - layout.origin_x) / layout.cell_w;
-        if y < 0.0 || x < 0.0 {
+        // The padding belongs to the first column and row, as the far
+        // remainder belongs to the last, so a drag into it reaches the edge.
+        if y < -layout.pad_y / layout.cell_h || x < -layout.pad_x / layout.cell_w {
             return None;
         }
+        let y = y.max(0.0);
+        // Panes past a seam are drawn pushed right; find the cell drawn here.
+        let shown_row = skip_rows.saturating_add((y as u32).min(paint_h.saturating_sub(1)));
+        let x = (self
+            .column_shifts
+            .unshift(x * layout.cell_w, shown_row as u16)
+            / layout.cell_w)
+            .max(0.0);
         let column = skip.saturating_add((x as u32).min(paint_w.saturating_sub(1)));
         let row = skip_rows.saturating_add((y as u32).min(paint_h.saturating_sub(1)));
         Some(Cell {
@@ -10060,8 +10080,12 @@ impl PilusView {
         let layout = self.card_layout(window);
         let (skip_cols, skip_rows) = (self.skipped_cols(), self.skipped_rows());
         let slop = pane_chrome::divider_slop(self.settings.pane_gaps);
-        let x = f32::from(position.x) - layout.origin_x;
         let y = f32::from(position.y) - layout.origin_y;
+        let row = skip_rows.saturating_add((y / layout.cell_h).max(0.0) as u16);
+        // In the unshifted grid, where the seams sit at their cell edges.
+        let x = self
+            .column_shifts
+            .unshift(f32::from(position.x) - layout.origin_x, row);
         let edge =
             |cell: u16, skip: u16, size: f32| ((f32::from(cell) - f32::from(skip)) * size).round();
         self.dividers.iter().find_map(|divider| {
@@ -11636,7 +11660,7 @@ impl PilusView {
             .h(px(bottom))
             .flex()
             .flex_col()
-            .bg(self.chrome_fill())
+            .bg(self.sidebar_fill())
             .overflow_hidden()
             // Fixed clearance for the floating traffic lights; the sections
             // scroll under it instead of disappearing beneath the titlebar.
@@ -11660,9 +11684,9 @@ impl PilusView {
         // overlay rather than a border: a border would take a pixel from the
         // panel's content box and leave the rows' right inset one short of
         // their left.
-        // A split's tinted surface runs up to the sidebar, so it parts from
-        // it by fill alone.
-        panel.when(!self.is_split(), |panel| {
+        // With floating cards the sidebar is the cards' own tinted ground,
+        // so nothing parts it from the terminal.
+        panel.when(!self.floating_cards(), |panel| {
             panel.child(
                 div()
                     .absolute()
@@ -14954,8 +14978,9 @@ impl PilusView {
     /// Measure the terminal card and the grid that fits inside it.
     ///
     /// The card runs from the sidebar to the right column and from the tab
-    /// strip to the window's bottom edge, with no gap or border: the grid
-    /// spends every pixel on cells.
+    /// strip to the window's bottom edge, with no gap or border. Flush, the
+    /// grid spends every pixel on cells; with floating panes it keeps a
+    /// padding clear around itself (`pane_chrome::grid_pad`).
     fn card_layout(&mut self, window: &Window) -> CardLayout {
         let cell_w = self.cell_width(window);
         let cell_h = self.cell_height();
@@ -14972,13 +14997,25 @@ impl PilusView {
             None => (0.0, 0.0),
         };
         let (inner_w, inner_h) = (inner_w - page_w, inner_h - page_h);
+        let floating = self.floating_cards();
+        let panes = if floating {
+            self.shown_panes()
+        } else {
+            pane_frames::PaneFrames::default()
+        };
+        let mut pad = pane_chrome::grid_pad(floating, !panes.panes().is_empty());
+        // Every seam a row crosses pushes the panes past it right by a step;
+        // the room comes out of the grid's width.
+        pad.right += f32::from(panes.max_depth()) * pane_chrome::seam_step(floating, cell_w);
+        let (pad_x, pad_y) = (pad.left, pad.y);
+        let (inner_w, inner_h) = (inner_w - pad.left - pad.right, inner_h - 2.0 * pad_y);
         let cols = (inner_w / cell_w).clamp(20.0, 500.0) as u16;
         let rows = (inner_h / cell_h).clamp(5.0, 300.0) as u16;
         // The grid pins to the top-left so the terminal truly reaches the
         // edges; the leftover fraction pools at the far edges, where the grid
         // extends its edge colors over it.
         let slack_x = (inner_w - f32::from(cols) * cell_w).max(0.0);
-        let slack_y = (inner_h - f32::from(rows) * cell_h).max(0.0);
+        let slack_y = (inner_h - f32::from(rows) * cell_h).max(0.0) + pad_y;
         // The left sidebar is whole cells wide, so the card's left edge is
         // cell-aligned. The right column is free-width, which would leave up
         // to a cell of remainder between the grid and it, a margin the left
@@ -14988,12 +15025,14 @@ impl PilusView {
         // and trimming the card would leave a bare strip along the edge; the
         // grid's own fillers pool the remainder there instead.
         let absorbed = absorbed_remainder(right_px, self.right.tweening(), slack_x, cell_w);
-        let (slack_x, content_w) = (slack_x - absorbed, content_w - absorbed);
+        let (slack_x, content_w) = (slack_x - absorbed + pad.right, content_w - absorbed);
         CardLayout {
             card_x,
             card_right: right_px + absorbed,
-            origin_x: card_x + page_w,
-            origin_y: HEADER_HEIGHT + page_h,
+            origin_x: card_x + page_w + pad_x,
+            origin_y: HEADER_HEIGHT + page_h + pad_y,
+            pad_x,
+            pad_y,
             cols,
             rows,
             cell_w,
@@ -15006,9 +15045,9 @@ impl PilusView {
         }
     }
 
-    /// The tab strip's background. A split always takes the pane surface, the
-    /// tinted ground its cards sit on, opaque or not. One pane has no cards:
-    /// opaque, its strip is the sidebar's own fill; translucent, it takes the
+    /// The tab strip's background. Floating cards always take the pane
+    /// surface, the tinted ground they sit on, opaque or not. Flush panes:
+    /// opaque, the strip is the sidebar's own fill; translucent, it takes the
     /// pane surface so one pane and many look alike. A native page alone in the
     /// card sits in the chrome's fill, so the strip keeps to it.
     fn tab_strip_fill(&self) -> gpui::Rgba {
@@ -15016,41 +15055,55 @@ impl PilusView {
         let surface = self.theme.pane_surface(glass).opacity(glass);
         if self.split_page_open() && self.page_split().is_none() {
             self.chrome_fill()
-        } else if self.is_split() || (self.settings.pane_ui && glass < 1.0) {
+        } else if self.floating_cards() || (self.settings.pane_ui && glass < 1.0) {
             surface
         } else {
             self.chrome_fill()
         }
     }
 
-    /// The fill of the selected (`weight` 1) and hovered tab. In a split the
-    /// strip sits on the tinted surface, so a tab is raised in the card's own
-    /// fill, which reads as the tab opening into the terminal card below it
-    /// and takes no weight. Otherwise it is the sidebar's raised pill, so a
+    /// The fill of the selected (`weight` 1) and hovered tab. With floating
+    /// cards the strip sits on the tinted surface, so a tab is raised in the
+    /// card's own fill, which reads as the tab opening into the terminal card
+    /// below it and takes no weight. Otherwise it is the sidebar's raised pill, so a
     /// tab and a sidebar row look alike at any window opacity.
     fn tab_raise(&self, weight: f32) -> gpui::Rgba {
         let glass = self.glass_opacity();
-        if self.is_split() {
+        if self.floating_cards() {
             self.theme.bg.opacity(glass * weight.min(1.0).ceil())
         } else {
             self.theme.sidebar_raise(glass, weight)
         }
     }
 
-    /// Whether the shown frame is a split of floating cards, which is when the
-    /// terminal sits on the tinted surface the tab strip matches. Flush panes
-    /// cover that surface, so they chrome like a single pane.
-    fn is_split(&self) -> bool {
-        self.settings.pane_ui
-            && self.settings.pane_gaps
-            && self.shown_frame().is_some_and(|frame| {
-                !pane_frames::PaneFrames::find(
+    /// Whether panes float as cards, an unsplit tab included as one card:
+    /// then the terminal sits on the tinted surface the tab strip and the
+    /// sidebar match. Flush panes cover that surface, so they keep the
+    /// chrome's own fill.
+    fn floating_cards(&self) -> bool {
+        self.settings.pane_ui && self.settings.pane_gaps
+    }
+
+    /// The panes the daemon boxes in the shown frame; none when unsplit.
+    fn shown_panes(&self) -> pane_frames::PaneFrames {
+        self.shown_frame()
+            .map(|frame| {
+                pane_frames::PaneFrames::find(
                     frame,
                     frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS),
                 )
-                .panes()
-                .is_empty()
             })
+            .unwrap_or_default()
+    }
+
+    /// The sidebar's fill: the tab strip's while cards float, so the card
+    /// sits on one continuous ground, else the chrome's.
+    fn sidebar_fill(&self) -> gpui::Rgba {
+        if self.floating_cards() {
+            self.tab_strip_fill()
+        } else {
+            self.chrome_fill()
+        }
     }
 
     /// The fill behind the sidebar, the tab strip, and a native page: a
@@ -15266,6 +15319,12 @@ impl Render for PilusView {
             _ => pane_frames::PaneFrames::default(),
         };
         self.dividers = panes.dividers();
+        self.column_shifts = pane_chrome::ColumnShifts::new(
+            &panes,
+            pane_chrome::seam_step(self.settings.pane_gaps, layout.cell_w),
+            layout.cell_w,
+            self.skipped_cols(),
+        );
         let grid = match self.shown_frame() {
             Some(frame) => perf::grid_build(|| {
                 render_grid(
@@ -15281,6 +15340,8 @@ impl Render for PilusView {
                     layout.cols,
                     layout.rows,
                     glass,
+                    layout.pad_x,
+                    layout.pad_y,
                     layout.slack_x,
                     layout.slack_y,
                     panes,
@@ -15720,6 +15781,11 @@ async fn tick_or_arrival(timer: impl Future<Output = ()>) {
 /// Paint the visible window of the grid, clamped to the layout: the daemon
 /// can lag a resize in either direction, and anything outside the card is
 /// clipped anyway, so pointer and paint must agree on the same bounds.
+///
+/// The first cell starts `pad_x` and `pad_y` in from the element's top-left
+/// corner; the far sides' padding is part of `slack_x` and `slack_y`. With
+/// `pane_gaps` the cards grow over it all and the surface lies under it;
+/// flush, the rows extend their edge colors over the remainder.
 #[allow(clippy::too_many_arguments)]
 fn render_grid(
     frame: &FrameData,
@@ -15734,6 +15800,8 @@ fn render_grid(
     max_cols: u16,
     max_rows: u16,
     glass: f32,
+    pad_x: f32,
+    pad_y: f32,
     slack_x: f32,
     slack_y: f32,
     panes: pane_frames::PaneFrames,
@@ -15744,41 +15812,72 @@ fn render_grid(
     let end_row = skip_rows
         .saturating_add(max_rows)
         .min(frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS));
-    let mut column = div().relative().flex().flex_col().size_full();
-    let surface_base = theme.pane_surface(glass);
-    let surface = surface_base.opacity(glass);
-    // What lies beyond the cell grid inside a split: the gutter when cards
-    // float, but the card itself when panes are flush, since the cards then
-    // grow over the remainder and any other color reads as an odd row.
-    let remainder_base = if pane_gaps { surface_base } else { theme.bg };
-    // Floating cards stroke in the surface's own color, so the ring reads as
-    // gutter; flush panes outline themselves with the theme's border.
-    let (border, focus_border) = if !pane_gaps {
-        // Focus shows in the dimming of the other panes, not in the border.
-        (theme.border, theme.border)
-    } else if glass < 1.0 {
-        let clear = gpui::Rgba { a: 0.0, ..surface };
-        (clear, theme.border)
+    // Everything below is laid out from the first cell; the padding around
+    // it is painted at negative offsets inside the outer element.
+    let mut column = div()
+        .absolute()
+        .top(px(pad_y))
+        .bottom_0()
+        .left(px(pad_x))
+        .right_0()
+        .flex()
+        .flex_col();
+    let surface = theme.pane_surface(glass).opacity(glass);
+    // Flush panes outline themselves with the theme's border, focus showing
+    // in the dimming of the others. A floating card is outlined only while
+    // it holds the caret.
+    let (border, focus_border) = if pane_gaps {
+        (
+            gpui::Rgba {
+                a: 0.0,
+                ..theme.border
+            },
+            theme.border,
+        )
     } else {
-        (surface, theme.border)
+        (theme.border, theme.border)
     };
-    let tiled = panes.bounds();
-    // A frame still short of the card (the daemon lags a resize) leaves its
-    // missing columns to the row filler, which paints them as surface; the
-    // outermost cards grow over them too, or a wide gutter reads as a column.
-    let card_slack = (
-        slack_x + unpainted_width(frame.width, skip_cols, max_cols, cell_width),
-        slack_y,
+    // While cards float, an unsplit tab is one card too: a box over the whole
+    // painted grid. It has no border cells of its own, so none are hidden.
+    let painted_cols = max_cols.min(frame.width.saturating_sub(skip_cols));
+    let lone = (pane_gaps && panes.panes().is_empty() && end_row > skip_rows && painted_cols > 0)
+        .then(|| pane_frames::PaneFrame {
+            left: skip_cols,
+            top: skip_rows,
+            right: skip_cols + painted_cols - 1,
+            bottom: end_row - 1,
+        });
+    let cards = match lone.as_ref() {
+        Some(lone) => std::slice::from_ref(lone),
+        None => panes.panes(),
+    };
+    let tiled = panes.bounds().or(lone);
+    // Panes past a seam are pushed right so each card keeps its padding there.
+    let shifts = pane_chrome::ColumnShifts::new(
+        &panes,
+        pane_chrome::seam_step(pane_gaps, cell_width),
+        cell_width,
+        skip_cols,
     );
-    let chromes: Vec<pane_chrome::PaneChrome> = panes
-        .panes()
+    // A frame still short of the card (the daemon lags a resize) leaves its
+    // missing columns to the surface; the outermost cards grow over them
+    // too, or a wide gutter reads as a column.
+    let card_slack = pane_chrome::Slack {
+        left: pad_x,
+        top: pad_y,
+        right: slack_x + unpainted_width(frame.width, skip_cols, max_cols, cell_width),
+        bottom: slack_y,
+    };
+    let chromes: Vec<pane_chrome::PaneChrome> = cards
         .iter()
         .enumerate()
         .filter_map(|(index, pane)| {
             let tiled = tiled.as_ref()?;
-            let focused = frame
-                .cursor
-                .is_some_and(|(cursor_column, cursor_row)| pane.holds(cursor_column, cursor_row));
+            // The lone card is the whole tab, so it always holds the caret.
+            let focused = lone.is_some()
+                || frame.cursor.is_some_and(|(cursor_column, cursor_row)| {
+                    pane.holds(cursor_column, cursor_row)
+                });
             Some(pane_chrome::pane_chrome(
                 index,
                 pane,
@@ -15791,6 +15890,7 @@ fn render_grid(
                 line_height,
                 cell_width,
                 card_slack,
+                &shifts,
                 skip_cols,
                 skip_rows,
             ))
@@ -15799,13 +15899,14 @@ fn render_grid(
     // The surface and the cards sit under the rows. Cells the daemon paints
     // in its base color skip their fill inside the tiled box (`render_row`),
     // so the cards show through; the gutters keep the surface.
-    if let Some(tiled) = panes.bounds() {
+    if let Some(tiled) = tiled {
         column = column.child(pane_chrome::surface(
             &tiled,
             surface,
             line_height,
             cell_width,
-            slack_x,
+            pane_gaps,
+            card_slack,
             skip_cols,
             skip_rows,
         ));
@@ -15813,24 +15914,68 @@ fn render_grid(
             column = column.child(chrome.card(theme.bg.opacity(glass)));
         }
     }
+    // The lone card's padding above the first row: that row's colors carry
+    // up to the card's edge, a gap short of the padding's.
+    if lone.is_some() && pad_y > pane_chrome::GAP_PX {
+        column = column.child(
+            div()
+                .absolute()
+                .left_0()
+                .top(px(pane_chrome::GAP_PX - pad_y))
+                .child(bottom_fill(
+                    frame, skip_rows, theme, selection, cell_width, skip_cols, max_cols, pad_x,
+                    slack_x, pad_y, glass, tiled, pane_gaps, &shifts,
+                )),
+        );
+    }
+    let grid_end = skip_cols.saturating_add(max_cols);
     for row in skip_rows..end_row.max(skip_rows) {
-        column = column.child(render_row(
-            frame,
-            &panes,
-            row,
-            theme,
-            font_size,
-            font_family,
-            line_height,
-            selection,
-            cell_width,
-            skip_cols,
-            max_cols,
-            glass,
-            slack_x,
-            remainder_base,
-            cursor_alpha,
-        ));
+        let segments = shifts.segments(row, skip_cols, grid_end);
+        let paint = |first: u16, cols: u16, pad_x: f32, slack_x: f32| {
+            render_row(
+                frame,
+                &panes,
+                tiled,
+                row,
+                theme,
+                font_size,
+                font_family,
+                line_height,
+                selection,
+                cell_width,
+                first,
+                cols,
+                glass,
+                pad_x,
+                slack_x,
+                pane_gaps,
+                cursor_alpha,
+            )
+        };
+        if segments.iter().all(|&(.., shift)| shift == 0.0) {
+            column = column.child(paint(skip_cols, max_cols, pad_x, slack_x));
+            continue;
+        }
+        // One slice per run of equal shift, each drawn where its pane is
+        // pushed; the padding goes with the first and the remainder with the
+        // last, which the step has already eaten into.
+        let last = segments.len().saturating_sub(1);
+        let mut line = div().relative().flex_shrink_0().h(line_height).w_full();
+        for (index, &(start, end, shift)) in segments.iter().enumerate() {
+            let (cols, slack) = if index == last {
+                (grid_end - start, (slack_x - shift).max(0.0))
+            } else {
+                (end - start, 0.0)
+            };
+            let lead = if index == 0 { pad_x } else { 0.0 };
+            line = line.child(
+                paint(start, cols, lead, slack)
+                    .absolute()
+                    .top_0()
+                    .left(px(f32::from(start - skip_cols) * cell_width + shift)),
+            );
+        }
+        column = column.child(line);
     }
     // Full-bleed pools the sub-cell remainder below the last row; extend
     // that row's colors over it so no card-colored sliver shows. Always emit
@@ -15845,15 +15990,18 @@ fn render_grid(
             cell_width,
             skip_cols,
             max_cols,
+            pad_x,
             slack_x,
             slack_y,
             glass,
-            panes.bounds(),
-            remainder_base,
+            tiled,
+            pane_gaps,
+            &shifts,
         ));
     }
     // Above the frames, so the focused pane's buttons take the pointer. An
-    // unsplit tab has no frames: its one pane is the whole grid.
+    // unsplit tab with flush panes has no frames: its one pane is the whole
+    // grid.
     let toolbar = toolbar.and_then(|bar| {
         if chromes.is_empty() {
             Some(pane_chrome::lone_toolbar(bar))
@@ -15867,7 +16015,7 @@ fn render_grid(
     for chrome in chromes {
         column = column.child(chrome);
     }
-    column.children(toolbar)
+    div().relative().size_full().child(column.children(toolbar))
 }
 
 /// The sub-cell remainder the right column takes from the card, so the grid
@@ -15976,6 +16124,7 @@ fn without_zoom_chrome(
 fn render_row(
     frame: &FrameData,
     panes: &pane_frames::PaneFrames,
+    tiled: Option<pane_frames::PaneFrame>,
     row: u16,
     theme: Theme,
     font_size: f32,
@@ -15986,8 +16135,9 @@ fn render_row(
     skip_cols: u16,
     max_cols: u16,
     glass: f32,
+    pad_x: f32,
     slack_x: f32,
-    surface: gpui::Rgba,
+    gaps: bool,
     cursor_alpha: f32,
 ) -> Div {
     let width = usize::from(frame.width);
@@ -16028,9 +16178,7 @@ fn render_row(
     // Fill first, in color-only runs: a uniformly-filled row is then one rect
     // instead of one per fallback glyph, so the device-snapped edges cannot
     // leave backdrop-colored hairlines between them.
-    let tiled = panes
-        .bounds()
-        .filter(|tiled| (tiled.top..=tiled.bottom).contains(&row));
+    let tiled = tiled.filter(|tiled| (tiled.top..=tiled.bottom).contains(&row));
     let fills = collect_background_runs(frame.width, &rendered, theme, row, selection)
         .into_iter()
         .flat_map(|(start, cells, bg)| match tiled {
@@ -16210,10 +16358,39 @@ fn render_row(
             .inset_0(),
         );
     }
+    // Floating cards grow over the padding and remainder, with the surface
+    // under them, so the fillers leave the base color to those and stop at
+    // the card's edge, a gap short: a filler would otherwise cover the card.
+    // Flush, the fillers run to the element's edge in every color.
+    let floating = gaps && tiled.is_some();
+    let card_inset = if floating { pane_chrome::GAP_PX } else { 0.0 };
+    let paints = |bg: gpui::Rgba| !(floating && bg == theme.bg);
+    // The left padding continues the first cell's own background: never the
+    // caret's or the selection's, which would read as spilling out of the
+    // grid.
+    let lead = pad_x - card_inset;
+    if lead > 0.0 {
+        let edge_bg = match rendered.first() {
+            Some((_, cell, _)) => style_of(cell, theme, false, false).1,
+            None => theme::resolve(0, theme.bg, &theme.ansi),
+        };
+        if paints(edge_bg) {
+            element = element.child(
+                div()
+                    .absolute()
+                    .left(px(-lead))
+                    .top(px(0.0))
+                    .w(px(lead))
+                    .h(line_height)
+                    .bg(edge_bg.opacity(glass)),
+            );
+        }
+    }
     // Full-bleed pools the sub-cell remainder at the row's right edge, and a
     // lagging daemon leaves whole columns of it: extend the last background
     // over both, or the transparent card shows the backdrop as a black band
     // while the sidebar resizes.
+    let trail = (f32::from(max_cols) - paint_w as f32).max(0.0) * cell_width + slack_x;
     if slack_x > 0.5 || paint_w < usize::from(max_cols) {
         let edge_bg = match rendered.last() {
             Some((column, cell, cursor)) => {
@@ -16222,32 +16399,27 @@ fn render_row(
             }
             None => theme::resolve(0, theme.bg, &theme.ansi),
         };
-        // Inside a split the base is the card, which stops at the cell grid;
-        // the remainder beyond it belongs to the surface, or a strip of card
-        // color shows along the right edge.
-        let edge_bg = if tiled.is_some() && edge_bg == theme.bg {
-            surface
-        } else {
-            edge_bg
-        };
-        element = element.child(
-            div()
-                .absolute()
-                .left(px(paint_w as f32 * cell_width))
-                .top(px(0.0))
-                .w(px((f32::from(max_cols) - paint_w as f32).max(0.0)
-                    * cell_width
-                    + slack_x))
-                .h(line_height)
-                .bg(edge_bg.opacity(glass)),
-        );
+        if paints(edge_bg) && trail > card_inset {
+            element = element.child(
+                div()
+                    .absolute()
+                    .left(px(paint_w as f32 * cell_width))
+                    .top(px(0.0))
+                    .w(px(trail - card_inset))
+                    .h(line_height)
+                    .bg(edge_bg.opacity(glass)),
+            );
+        }
     }
     element
 }
 
-/// A background-only strip continuing one row's colors to the container's
-/// bottom edge: that row's background runs, the last stretched over the
-/// sub-cell remainder. No text paints: glyphs would clip mid-cell.
+/// A background-only strip `height` tall continuing one row's colors to the
+/// container's bottom edge (or, for the first row, up over the padding):
+/// that row's background runs, the last stretched over the sub-cell
+/// remainder. No text paints: glyphs would clip mid-cell. Like `render_row`,
+/// it leaves a floating card's base color to the card and stops a gap short
+/// of the edge.
 #[allow(clippy::too_many_arguments)]
 fn bottom_fill(
     frame: &FrameData,
@@ -16257,49 +16429,73 @@ fn bottom_fill(
     cell_width: f32,
     skip_cols: u16,
     max_cols: u16,
+    pad_x: f32,
     slack_x: f32,
-    slack_y: f32,
+    height: f32,
     glass: f32,
     tiled: Option<pane_frames::PaneFrame>,
-    surface: gpui::Rgba,
+    gaps: bool,
+    shifts: &pane_chrome::ColumnShifts,
 ) -> Div {
     let spans = bottom_fill_spans(frame, row, theme, selection, skip_cols, max_cols);
-    // The same remainder rule as `render_row`: under a split, the base color
-    // below the last row is the surface, not the card.
+    // A span sits where its first cell's pane is drawn, and ends where its
+    // last cell's pane puts that cell's far edge.
+    let shift = |offset: u16| shifts.at(skip_cols.saturating_add(offset), row);
     let tiled = tiled.filter(|tiled| (tiled.top..=tiled.bottom).contains(&row));
-    let strip_width = f32::from(max_cols) * cell_width + slack_x;
+    let card_inset = if gaps && tiled.is_some() {
+        pane_chrome::GAP_PX
+    } else {
+        0.0
+    };
+    let strip_width = (f32::from(max_cols) * cell_width + slack_x - card_inset).max(0.0);
     let mut strip = div()
         .relative()
         .flex_shrink_0()
-        .h(px(slack_y))
+        .h(px((height - card_inset).max(0.0)))
         .w(px(strip_width));
+    let paints = |offset: u16, bg: gpui::Rgba| match tiled {
+        Some(tiled) if gaps => !(bg == theme.bg && skip_cols.saturating_add(offset) >= tiled.left),
+        _ => true,
+    };
+    // The left padding's corner, in the first span's color.
+    let lead = pad_x - card_inset;
+    if lead > 0.0
+        && let Some((offset, _, bg)) = spans.first()
+        && paints(*offset, *bg)
+    {
+        strip = strip.child(
+            div()
+                .absolute()
+                .left(px(-lead))
+                .top(px(0.0))
+                .w(px(lead))
+                .h_full()
+                .bg(bg.opacity(glass)),
+        );
+    }
     for (index, (offset, run_cells, bg)) in spans.iter().enumerate() {
+        if !paints(*offset, *bg) {
+            continue;
+        }
         // The last span absorbs the unpainted tail (a resize the daemon has
         // not caught up with) plus the remainder, so the strip always reaches
         // the container edge. Every other span pins its right edge to the next
         // span's shared boundary, so the translucent backgrounds tile instead
         // of leaving a backdrop-colored hairline between them.
+        let end = offset.saturating_add(*run_cells);
         let right = if index + 1 == spans.len() {
             0.0
         } else {
-            strip_width - f32::from(offset.saturating_add(*run_cells)) * cell_width
+            strip_width - f32::from(end) * cell_width - shift(end.saturating_sub(1))
         };
         strip = strip.child(
             div()
                 .absolute()
-                .left(px(f32::from(*offset) * cell_width))
+                .left(px(f32::from(*offset) * cell_width + shift(*offset)))
                 .top(px(0.0))
                 .right(px(right))
                 .h_full()
-                .bg(match tiled {
-                    Some(tiled)
-                        if *bg == theme.bg && skip_cols.saturating_add(*offset) >= tiled.left =>
-                    {
-                        surface
-                    }
-                    _ => *bg,
-                }
-                .opacity(glass)),
+                .bg(bg.opacity(glass)),
         );
     }
     strip

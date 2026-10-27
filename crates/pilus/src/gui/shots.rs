@@ -40,8 +40,9 @@ fn shot_width() -> f32 {
 
 /// Fresh settings for one captured window. `PILUS_SHOT_FONT_SIZE` overrides the
 /// Interface size so scaling can be reviewed without editing the app;
-/// `PILUS_SHOT_RADIUS` does the same for the corner radius, and
-/// `PILUS_SHOT_OPACITY` for the window.
+/// `PILUS_SHOT_RADIUS` does the same for the corner radius,
+/// `PILUS_SHOT_OPACITY` for the window, and `PILUS_SHOT_PANE_GAPS=1` floats
+/// the terminal as a card.
 fn settings() -> Rc<RefCell<Settings>> {
     let mut settings = Settings::default();
     if let Some(size) = std::env::var("PILUS_SHOT_FONT_SIZE")
@@ -61,6 +62,9 @@ fn settings() -> Rc<RefCell<Settings>> {
         .and_then(|value| value.parse().ok())
     {
         settings.opacity = opacity;
+    }
+    if std::env::var("PILUS_SHOT_PANE_GAPS").is_ok_and(|value| value == "1") {
+        settings.pane_gaps = true;
     }
     super::style::sync_corner_radius(&settings);
     Rc::new(RefCell::new(settings))
@@ -124,17 +128,19 @@ pub fn run() -> Result<()> {
         Duration::ZERO,
         |_, cx| cx.new(|_| GlyphGridView),
     )?;
-    for (name, id, gaps) in [
-        ("panes-dawn", "rose-pine-dawn", true),
-        ("panes-noir", "noir", true),
-        ("panes-dracula", "dracula", true),
-        ("panes-paper", "paper", true),
-        ("panes-flush-dawn", "rose-pine-dawn", false),
-        ("panes-flush-noir", "noir", false),
+    for (name, id, gaps, split) in [
+        ("panes-dawn", "rose-pine-dawn", true, true),
+        ("panes-noir", "noir", true, true),
+        ("panes-dracula", "dracula", true, true),
+        ("panes-paper", "paper", true, true),
+        ("panes-flush-dawn", "rose-pine-dawn", false, true),
+        ("panes-flush-noir", "noir", false, true),
+        ("panes-single-dawn", "rose-pine-dawn", true, false),
+        ("panes-single-noir", "noir", true, false),
     ] {
         let theme = super::scheme::builtin(id).map_or_else(Theme::default, Theme::from_palette);
-        shoot(&mut cx, name, 560.0, 420.0, Duration::ZERO, move |_, cx| {
-            cx.new(|_| PaneGridView { theme, gaps })
+        shoot(&mut cx, name, 600.0, 420.0, Duration::ZERO, move |_, cx| {
+            cx.new(|_| PaneGridView { theme, gaps, split })
         })?;
     }
     shoot(
@@ -2023,6 +2029,8 @@ impl Render for GlyphGridView {
                 1.0,
                 0.0,
                 0.0,
+                0.0,
+                0.0,
                 super::pane_frames::PaneFrames::find(
                     &frame,
                     frame
@@ -2059,12 +2067,14 @@ fn grid_cell_width(window: &Window, settings: &Settings) -> f32 {
 
 /// A three-pane split painted through [`super::render_grid`] from a synthetic
 /// frame, with the caret in the left pane, so the pane surface, frames, and
-/// the active pane's inner shadow can be reviewed in any scheme without a
-/// daemon.
+/// the active pane's outline can be reviewed in any scheme without a daemon.
+/// Unsplit, the same shell fills the whole grid as one card.
 struct PaneGridView {
     theme: Theme,
     /// Floating cards when set, flush bordered panes when not.
     gaps: bool,
+    /// Three boxed panes when set, one unboxed shell when not.
+    split: bool,
 }
 
 impl Render for PaneGridView {
@@ -2075,12 +2085,17 @@ impl Render for PaneGridView {
     ) -> impl gpui::IntoElement {
         use gpui::{ParentElement as _, Styled as _};
         use pilus_protocol::FrameData;
-        let (theme, gaps) = (self.theme, self.gaps);
+        let (theme, gaps, split) = (self.theme, self.gaps, self.split);
         let settings = Settings::default();
         let skip_rows = super::SKIPPED_DAEMON_ROWS;
         let body: u16 = 16;
         let (width, height) = (60u16, skip_rows + body + super::SKIPPED_DAEMON_BOTTOM_ROWS);
-        let mut frame = FrameData::blank(width, height, 0, 0);
+        // The daemon paints its base as its theme's own color, which the grid
+        // maps onto the card; a default cell would land a shade off it.
+        let channel = |c: f32| (c * 255.0).round() as u32;
+        let base =
+            2 << 24 | channel(theme.bg.r) << 16 | channel(theme.bg.g) << 8 | channel(theme.bg.b);
+        let mut frame = FrameData::blank(width, height, 0, base);
         let mut put = |column: u16, row: u16, text: &str| {
             for (offset, c) in text.chars().enumerate() {
                 frame.cells[usize::from(row) * usize::from(width) + usize::from(column) + offset]
@@ -2099,20 +2114,35 @@ impl Render for PaneGridView {
                 put(r, row, "│");
             }
         };
-        boxed(&mut put, 0, top, 29, bottom);
-        boxed(&mut put, 30, top, 59, middle - 1);
-        boxed(&mut put, 30, middle, 59, bottom);
-        put(2, top + 1, "~/pilus $ cargo test");
-        put(2, top + 2, "   Compiling pilus v0.1.0");
-        put(2, top + 3, "test result: ok. 214 passed");
-        put(2, top + 4, "~/pilus $");
-        put(32, top + 1, "~/pilus $ git status");
-        put(32, middle + 1, "~/pilus $ tail -f log");
-        frame.cursor = Some((12, top + 4));
+        // A shell sits against its box's border, or the grid's own edge.
+        let lead = if split {
+            boxed(&mut put, 0, top, 29, bottom);
+            boxed(&mut put, 30, top, 59, middle - 1);
+            boxed(&mut put, 30, middle, 59, bottom);
+            put(31, top + 1, "~/pilus $ git status");
+            put(31, middle + 1, "~/pilus $ tail -f log");
+            (1, 1)
+        } else {
+            (0, 0)
+        };
+        put(lead.0, top + lead.1, "~/pilus $ cargo test");
+        put(lead.0, top + lead.1 + 1, "   Compiling pilus v0.1.0");
+        put(lead.0, top + lead.1 + 2, "test result: ok. 214 passed");
+        put(lead.0, top + lead.1 + 3, "~/pilus $");
+        frame.cursor = Some((lead.0 + 10, top + lead.1 + 3));
         frame.cursor_visible = true;
         let font_size = settings.terminal_font_size;
         let cell_height = (font_size * super::LINE_HEIGHT_RATIO).round().max(1.0);
         let cell_width = grid_cell_width(window, &settings);
+        let panes = super::pane_frames::PaneFrames::find(
+            &frame,
+            frame
+                .height
+                .saturating_sub(super::SKIPPED_DAEMON_BOTTOM_ROWS),
+        );
+        let mut pad = super::pane_chrome::grid_pad(gaps, split);
+        // The room each seam's step takes, as `card_layout` reserves it.
+        pad.right += f32::from(panes.max_depth()) * super::pane_chrome::seam_step(gaps, cell_width);
         // The window's own glass is opaque here: cards in the chrome fill on
         // the tinted surface.
         let card = theme.chrome_cell(1.0);
@@ -2138,16 +2168,14 @@ impl Render for PaneGridView {
                 width,
                 body,
                 1.0,
+                pad.left,
+                pad.y,
                 // A window is rarely a whole number of cells, and the
-                // remainder is surface the cards must grow over.
-                5.0,
-                9.0,
-                super::pane_frames::PaneFrames::find(
-                    &frame,
-                    frame
-                        .height
-                        .saturating_sub(super::SKIPPED_DAEMON_BOTTOM_ROWS),
-                ),
+                // remainder is surface the cards must grow over, past the
+                // padding on the right and below.
+                pad.right + 5.0,
+                pad.y + 9.0,
+                panes,
                 gaps,
                 Some(
                     super::style::pane_toolbar()
@@ -2708,6 +2736,7 @@ fn sipil_chat_fixture(
         // Mornings apart from the minute, so the log reads as a day's talk.
         at: Some(1_790_000_000 + id * 47),
         speaker: None,
+        pane: None,
         id,
         role,
         text: text.to_string(),

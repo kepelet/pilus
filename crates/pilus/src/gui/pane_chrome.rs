@@ -2,30 +2,30 @@
 //!
 //! `render_grid` hides the daemon's square border glyphs (`pane_frames`) and
 //! asks this module for one [`PaneChrome`] per pane. With gaps on, a pane is a
-//! rounded card floating on the surface, a gap from its neighbors, its border
-//! in the surface color so it reads as the card alone. With gaps off, panes
-//! sit flush: each is outlined in the theme's border, and neighbors share one
-//! line. A pane that does not hold the caret is dimmed by a
-//! veil of that surface over its card and text, which lifts under the pointer.
-//! The pane that does hold the caret also casts a soft shadow around its card.
+//! rounded card floating on the surface, a gap from its neighbors; an unsplit
+//! tab is one such card, inset from the window the same way. With gaps off,
+//! panes sit flush: each is outlined in the theme's border, and neighbors
+//! share one line. A pane that does not hold the caret is dimmed by a veil of
+//! that surface over its card and text, which lifts under the pointer. A
+//! floating card that holds the caret is outlined in the theme's border.
 //!
 //! The grid is rebuilt every frame, so the transition lives in GPUI element
 //! state keyed by the pane's index. A pane seen for the first time fades in; a
 //! pane whose focus or hover changes eases between the dimmed and clear look,
-//! and its shadow with the focus.
+//! and its outline with the focus.
 //! State carries colors, not geometry, so resizing a split never replays the
 //! fade.
 
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, BorderStyle, Bounds, BoxShadow, ContentMask, Corners, DispatchPhase, Div, Edges, Element,
-    ElementId, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    Length, MouseMoveEvent, ParentElement as _, Pixels, Rgba, Size, Style, Styled as _, Window,
-    black, div, point, px, quad, transparent_black,
+    App, BorderStyle, Bounds, Corners, DispatchPhase, Div, Edges, Element, ElementId,
+    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Length,
+    MouseMoveEvent, ParentElement as _, Pixels, Rgba, Size, Style, Styled as _, Window, div, px,
+    quad, transparent_black,
 };
 
-use super::pane_frames::PaneFrame;
+use super::pane_frames::{self, PaneFrame, PaneFrames};
 use super::style::{self, RADIUS_MD, ease_step, mix};
 
 /// Thickness of a pane's frame in logical pixels.
@@ -34,6 +34,182 @@ const BORDER_PX: f32 = 1.0;
 /// surface, in logical pixels. Cells are wider than they are tall, so a gap
 /// that fell out of the cell grid would differ by axis.
 pub(super) const GAP_PX: f32 = 8.0;
+/// The room between a floating card's edge and its text, in logical pixels:
+/// sideways, and above and below an unsplit tab's card.
+const PAD_X_PX: f32 = 12.0;
+const PAD_Y_PX: f32 = 8.0;
+/// The room before an unsplit card's text, in logical pixels. It is the only
+/// card beside the sidebar, which already sets it apart, so it keeps the
+/// lead short.
+const PAD_LEAD_PX: f32 = 4.0;
+
+/// The padding the grid keeps clear around itself, in logical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct GridPad {
+    pub left: f32,
+    pub right: f32,
+    /// Above and below alike.
+    pub y: f32,
+}
+
+/// The grid's padding. Flush panes keep none: the grid spends every pixel on
+/// cells. In a split the daemon's border cells already hold each card's gap
+/// and its rows above and below, so only the sides need room: a border column
+/// is about as wide as the gap, which would otherwise leave a card's edge
+/// against its text. An unsplit tab has no border cells, so its padding holds
+/// the whole gap too.
+pub(super) fn grid_pad(gaps: bool, split: bool) -> GridPad {
+    match (gaps, split) {
+        (false, _) => GridPad::default(),
+        (true, true) => GridPad {
+            left: PAD_X_PX,
+            right: PAD_X_PX,
+            y: 0.0,
+        },
+        (true, false) => GridPad {
+            left: GAP_PX + PAD_LEAD_PX,
+            right: GAP_PX + PAD_X_PX,
+            y: GAP_PX + PAD_Y_PX,
+        },
+    }
+}
+/// How far each seam between side-by-side floating cards pushes the panes
+/// right of it, in whole logical pixels (and even, so each card takes half).
+/// The daemon spends two border columns on a seam, too little for the gap and
+/// a [`PAD_X_PX`] on either side of it at most font sizes; the step makes up
+/// the rest. None for flush panes, or when two columns are already enough.
+pub(super) fn seam_step(gaps: bool, cell_width: f32) -> f32 {
+    if !gaps {
+        return 0.0;
+    }
+    let short = 2.0 * PAD_X_PX + GAP_PX - 2.0 * cell_width;
+    (short.max(0.0) / 2.0).ceil() * 2.0
+}
+
+/// How far each pane's cells sit right of where the cell grid puts them, in
+/// pixels: a [`seam_step`] for every seam between the pane and the split's
+/// left edge. Painting, the cards, and the pointer all go through it, so a
+/// cell is drawn, framed, and hit in the same place.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ColumnShifts {
+    /// Each pane with its shift and its reach: how much further its card's
+    /// right edge runs to meet the nearest card past its seam, when that card
+    /// is pushed more than one step (a deeper run of panes beside it).
+    panes: Vec<(PaneFrame, f32, f32)>,
+    step: f32,
+    cell_width: f32,
+    skip_cols: u16,
+}
+
+impl ColumnShifts {
+    pub(super) fn new(panes: &PaneFrames, step: f32, cell_width: f32, skip_cols: u16) -> Self {
+        if step <= 0.0 {
+            return Self::default();
+        }
+        let shifts: Vec<f32> = panes
+            .depths()
+            .into_iter()
+            .map(|depth| f32::from(depth) * step)
+            .collect();
+        let all = panes.panes();
+        let panes = all
+            .iter()
+            .zip(&shifts)
+            .map(|(pane, &shift)| {
+                let reach = all
+                    .iter()
+                    .zip(&shifts)
+                    .filter(|(other, _)| pane_frames::beside(pane, other))
+                    .map(|(_, &next)| next - shift - step)
+                    .reduce(f32::min)
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                (*pane, shift, reach)
+            })
+            .collect();
+        Self {
+            panes,
+            step,
+            cell_width,
+            skip_cols,
+        }
+    }
+
+    /// The step between two cards side by side; zero when nothing shifts.
+    pub(super) fn step(&self) -> f32 {
+        self.step
+    }
+
+    /// The shift and reach of the pane at `index` in `PaneFrames::panes`.
+    fn of(&self, index: usize) -> (f32, f32) {
+        self.panes
+            .get(index)
+            .map_or((0.0, 0.0), |&(_, shift, reach)| (shift, reach))
+    }
+
+    /// The panes crossing `row`, left to right, with their shifts.
+    fn in_row(&self, row: u16) -> Vec<(PaneFrame, f32)> {
+        let mut panes: Vec<(PaneFrame, f32)> = self
+            .panes
+            .iter()
+            .filter(|(pane, ..)| (pane.top..=pane.bottom).contains(&row))
+            .map(|&(pane, shift, _)| (pane, shift))
+            .collect();
+        panes.sort_by_key(|(pane, _)| pane.left);
+        panes
+    }
+
+    /// The columns `first..end` of `row` cut where the shift changes:
+    /// `(start, end, shift)` runs, end exclusive. Columns before the first
+    /// pane keep no shift; columns past the last keep its shift.
+    pub(super) fn segments(&self, row: u16, first: u16, end: u16) -> Vec<(u16, u16, f32)> {
+        let mut segments: Vec<(u16, u16, f32)> = Vec::new();
+        let mut push = |start: u16, stop: u16, shift: f32| {
+            if start >= stop {
+                return;
+            }
+            match segments.last_mut() {
+                Some(last) if last.1 == start && last.2 == shift => last.1 = stop,
+                _ => segments.push((start, stop, shift)),
+            }
+        };
+        let mut at = first;
+        let mut shift = 0.0;
+        for (pane, pane_shift) in self.in_row(row) {
+            push(at, pane.left.clamp(at, end), shift);
+            at = at.max(pane.left).min(end);
+            shift = pane_shift;
+            let stop = pane.right.saturating_add(1).clamp(at, end);
+            push(at, stop, shift);
+            at = stop;
+        }
+        push(at, end, shift);
+        segments
+    }
+
+    /// The shift of the cell at `column`, `row`.
+    pub(super) fn at(&self, column: u16, row: u16) -> f32 {
+        self.segments(row, column, column.saturating_add(1))
+            .first()
+            .map_or(0.0, |&(_, _, shift)| shift)
+    }
+
+    /// Undo the shift at `x`, pixels from the first visible column, on
+    /// `row`: where the unshifted grid has that point. A point in the room a
+    /// seam's step adds lands on the seam itself.
+    pub(super) fn unshift(&self, x: f32, row: u16) -> f32 {
+        let mut before = 0.0;
+        for (pane, shift) in self.in_row(row) {
+            let start = (f32::from(pane.left) - f32::from(self.skip_cols)) * self.cell_width;
+            if x < start + shift {
+                return (x - before).min(start);
+            }
+            before = shift;
+        }
+        x - before
+    }
+}
+
 /// How far either side of a seam a press still grabs it, in logical pixels:
 /// the gutter between floating cards, or a little slack around the single
 /// shared line of flush panes, which is too thin to aim at.
@@ -46,13 +222,20 @@ const ENTER: Duration = Duration::from_millis(260);
 const FOCUS_EASE: Duration = Duration::from_millis(160);
 /// How much of the surface a dimmed pane is veiled with.
 const DIM: f32 = 0.4;
-/// The focused card's shadow: how dark and how soft; kept faint. It is painted with the
-/// frame, above the rows, because the row fills cover anything drawn under
-/// them; [`paint_shadow_outside`] keeps it off the card.
-const SHADOW_ALPHA: f32 = 0.1;
-const SHADOW_BLUR_PX: f32 = 6.0;
 /// How far the focused pane's toolbar sits in from its card's top-right corner.
 const TOOLBAR_INSET_PX: f32 = 6.0;
+
+/// Surface beyond the cell grid that the outermost cards grow over, in
+/// pixels: the padding before the first column and above the first row, and
+/// the padding plus the sub-cell remainder past the last column and below the
+/// last row.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct Slack {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
 
 /// Where a pane's frame sits and what it looks like right now. Geometry is
 /// in pixels relative to the grid's top-left.
@@ -112,8 +295,6 @@ struct Look {
     border: Rgba,
     /// How much the pane is dimmed, 0 to 1.
     dim: f32,
-    /// How much of the focused card's shadow shows, 0 to 1.
-    shadow: f32,
 }
 
 impl Look {
@@ -121,7 +302,6 @@ impl Look {
         Look {
             border: mix(self.border, other.border, step),
             dim: self.dim + (other.dim - self.dim) * step,
-            shadow: self.shadow + (other.shadow - self.shadow) * step,
         }
     }
 }
@@ -129,21 +309,20 @@ impl Look {
 /// One pane's frame. With `gaps` on, each card is its box of cells pulled in
 /// from the cell boundaries: half the gap on an edge it shares with a neighbor, so two cards
 /// are a whole gap apart whichever way they are split, and a whole gap on an
-/// edge that meets the surface's border. The grid's sub-cell remainder
-/// (`slack`) is surface too, so the outermost right and bottom cards grow
-/// over it, keeping those margins a gap whatever the window's size. The corner radius follows the
+/// edge that meets the surface's border. The grid's padding and sub-cell
+/// remainder (`slack`) are surface too, so the outermost cards grow over
+/// them, keeping those margins a gap whatever the window's size. The corner radius follows the
 /// setting. `surface` is the color the surface layer paints, which the dimming
-/// veil shares; `border` is the stroke's color, clear when the window is
-/// translucent, since a stroke over the surface there would double its alpha
-/// into a visible ring. The focused pane strokes `focus_border` instead, the
-/// hairline the sidebar parts with. The stroke sits just outside the card. A top edge
+/// veil shares. A resting card has no visible stroke; the focused one strokes
+/// `focus_border`, the hairline the sidebar parts with when panes are flush.
+/// The stroke sits just outside the card. A top edge
 /// hidden behind the native tab strip is drawn flush with the grid's top, so
 /// the strip reads as opening into the card.
 ///
 /// With `gaps` off the box is the card, outer edges included, and it draws its
 /// own `border`. A pane's stroke on an edge it shares reaches a pixel into
 /// the neighbor, whose own stroke lands on the same pixels, so a seam is one
-/// line, not two. The card casts no shadow, which would fall on the neighbor.
+/// line, not two.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pane_chrome(
     index: usize,
@@ -156,7 +335,8 @@ pub(super) fn pane_chrome(
     focus_border: Rgba,
     line_height: Pixels,
     cell_width: f32,
-    slack: (f32, f32),
+    slack: Slack,
+    shifts: &ColumnShifts,
     skip_cols: u16,
     skip_rows: u16,
 ) -> PaneChrome {
@@ -168,20 +348,34 @@ pub(super) fn pane_chrome(
     let outer_right = pane.right == tiled.right;
     let outer_top = pane.top == tiled.top;
     let outer_bottom = pane.bottom == tiled.bottom;
-    let slack = (
-        if outer_right { slack.0 } else { 0.0 },
-        if outer_bottom { slack.1 } else { 0.0 },
-    );
+    let slack = Slack {
+        left: if outer_left { slack.left } else { 0.0 },
+        top: if outer_top { slack.top } else { 0.0 },
+        right: if outer_right { slack.right } else { 0.0 },
+        bottom: if outer_bottom { slack.bottom } else { 0.0 },
+    };
     let (left, top, right, bottom) = if gaps {
         let inset = |outer: bool| if outer { GAP_PX } else { GAP_PX / 2.0 };
-        let left = column_edge(pane.left) + inset(outer_left);
-        let right = column_edge(pane.right + 1) + slack.0 - inset(outer_right);
+        // A card at a seam moves with its pane's shift, half a step into the
+        // room the step made, so the cards on either side meet a gap apart.
+        let (shift, reach) = shifts.of(index);
+        let half = shifts.step() / 2.0;
+        let left = if outer_left {
+            column_edge(pane.left) - slack.left + GAP_PX
+        } else {
+            column_edge(pane.left) + shift - half + GAP_PX / 2.0
+        };
+        let right = if outer_right {
+            column_edge(pane.right + 1) + slack.right - GAP_PX
+        } else {
+            column_edge(pane.right + 1) + shift + half + reach - GAP_PX / 2.0
+        };
         let top = if pane.top < skip_rows {
             0.0
         } else {
-            row_edge(pane.top) + inset(outer_top)
+            row_edge(pane.top) - slack.top + inset(outer_top)
         };
-        let bottom = row_edge(pane.bottom + 1) + slack.1 - inset(outer_bottom);
+        let bottom = row_edge(pane.bottom + 1) + slack.bottom - inset(outer_bottom);
         // The stroke grows the box outward, leaving the card as the inner area.
         (
             left - BORDER_PX,
@@ -190,7 +384,7 @@ pub(super) fn pane_chrome(
             bottom + BORDER_PX,
         )
     } else {
-        let left = column_edge(pane.left);
+        let left = column_edge(pane.left) - slack.left;
         let top = if pane.top < skip_rows {
             0.0
         } else {
@@ -200,22 +394,20 @@ pub(super) fn pane_chrome(
         (
             left,
             top,
-            column_edge(pane.right + 1) + slack.0 + overlap(outer_right),
-            row_edge(pane.bottom + 1) + slack.1 + overlap(outer_bottom),
+            column_edge(pane.right + 1) + slack.right + overlap(outer_right),
+            row_edge(pane.bottom + 1) + slack.bottom + overlap(outer_bottom),
         )
     };
     let stroke = if focused { focus_border } else { border };
     let rest = Look {
-        // Floating cards keep the stroke's ring as surface, so the geometry
-        // and the shadow's overlap match an outlined card's; it only shows
-        // when the panes are flush.
-        border: if gaps {
+        // A resting floating card keeps its ring clear, so it reads as the
+        // card alone and its geometry matches the focused card's.
+        border: if gaps && !focused {
             Rgba { a: 0.0, ..stroke }
         } else {
             stroke
         },
         dim: if focused { 0.0 } else { 1.0 },
-        shadow: if focused && gaps { 1.0 } else { 0.0 },
     };
     let round = if gaps {
         RoundedCorners::ALL
@@ -299,18 +491,24 @@ impl PaneChrome {
 /// so the gutters between cards and the margin around them show it. A top
 /// row hidden behind the native tab strip starts at the grid's top.
 ///
-/// The right edge runs a pixel past the cell grid when the remainder (`slack_x`)
-/// is too thin for the row filler to paint (`render_row` skips it at 0.5px or
-/// less): the cell edge is rounded, so without this a strip of card color
-/// shows along the sidebar. A wider remainder is the filler's, and covering it
-/// here too would double the tint under translucency. The card clips the
-/// overshoot.
+/// Floating cards (`gaps`) grow over the padding and remainder (`slack`), so
+/// the surface spreads over them too, and the row fillers leave the base
+/// color to it: a filler painting the surface would cover a card's edge, and
+/// both painting it would double the tint under translucency.
+///
+/// Flush, the remainder is the row filler's. The right edge then runs a pixel
+/// past the cell grid when the remainder is too thin for the filler to paint
+/// (`render_row` skips it at 0.5px or less): the cell edge is rounded, so
+/// without this a strip of card color shows along the sidebar. The card clips
+/// the overshoot.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn surface(
     tiled: &PaneFrame,
     fill: Rgba,
     line_height: Pixels,
     cell_width: f32,
-    slack_x: f32,
+    gaps: bool,
+    slack: Slack,
     skip_cols: u16,
     skip_rows: u16,
 ) -> Div {
@@ -318,12 +516,26 @@ pub(super) fn surface(
     let left = ((f32::from(tiled.left) - f32::from(skip_cols)) * cell_width)
         .round()
         .max(0.0);
-    let right = ((f32::from(tiled.right) + 1.0 - f32::from(skip_cols)) * cell_width).round()
-        + if slack_x > 0.5 { 0.0 } else { slack_x + 1.0 };
+    let right = ((f32::from(tiled.right) + 1.0 - f32::from(skip_cols)) * cell_width).round();
     let top = ((f32::from(tiled.top) - f32::from(skip_rows)) * height)
         .round()
         .max(0.0);
     let bottom = ((f32::from(tiled.bottom) + 1.0 - f32::from(skip_rows)) * height).round();
+    let (left, top, right, bottom) = if gaps {
+        (
+            left - slack.left,
+            top - slack.top,
+            right + slack.right,
+            bottom + slack.bottom,
+        )
+    } else {
+        let overshoot = if slack.right > 0.5 {
+            0.0
+        } else {
+            slack.right + 1.0
+        };
+        (left, top, right + overshoot, bottom)
+    };
     div()
         .absolute()
         .left(px(left))
@@ -331,77 +543,6 @@ pub(super) fn surface(
         .w(px((right - left).max(0.0)))
         .h(px((bottom - top).max(0.0)))
         .bg(fill)
-}
-
-/// The focused card's shadow along its straight edges only. GPUI's drop
-/// shadow also fills the element it belongs to, which would dim the card's text
-/// and show through a translucent window, and a content mask can only be a
-/// rectangle, so the shadow is painted once per side of the card instead.
-///
-/// Each side's shadow rectangle is shortened along the edge by the corner
-/// radius plus the blur's reach, so it fades out by itself before the corner
-/// rather than ending at a mask's hard cut.
-///
-/// The scene drops a shadow whose own rectangle (without its blur) misses the
-/// mask, so each side reaches [`BORDER_PX`] into the card, under the frame's
-/// stroke. That also rules out an offset: it would pull a side off the card
-/// again.
-fn paint_shadow_outside(
-    window: &mut Window,
-    bounds: Bounds<Pixels>,
-    corners: Corners<Pixels>,
-    strength: f32,
-) {
-    let stroke = px(BORDER_PX);
-    let radius = corners
-        .top_left
-        .max(corners.top_right)
-        .max(corners.bottom_left)
-        .max(corners.bottom_right);
-    let (left, top) = (bounds.origin.x, bounds.origin.y);
-    let (right, bottom) = (bounds.right(), bounds.bottom());
-    let reach = px(SHADOW_BLUR_PX * 3.0);
-    let shrink = (radius + px(SHADOW_BLUR_PX * 2.0))
-        .min(bounds.size.width / 2.0 - px(1.0))
-        .min(bounds.size.height / 2.0 - px(1.0))
-        .max(px(0.0));
-    let shadow = [BoxShadow {
-        color: black().opacity(SHADOW_ALPHA * strength),
-        offset: point(px(0.0), px(0.0)),
-        blur_radius: px(SHADOW_BLUR_PX),
-        spread_radius: px(0.0),
-        inset: false,
-    }];
-    for (rect, from, to) in [
-        // Top, bottom, left, right.
-        (
-            Bounds::from_corners(point(left + shrink, top), point(right - shrink, bottom)),
-            point(left - reach, top - reach),
-            point(right + reach, top + stroke),
-        ),
-        (
-            Bounds::from_corners(point(left + shrink, top), point(right - shrink, bottom)),
-            point(left - reach, bottom - stroke),
-            point(right + reach, bottom + reach),
-        ),
-        (
-            Bounds::from_corners(point(left, top + shrink), point(right, bottom - shrink)),
-            point(left - reach, top - reach),
-            point(left + stroke, bottom + reach),
-        ),
-        (
-            Bounds::from_corners(point(left, top + shrink), point(right, bottom - shrink)),
-            point(right - stroke, top - reach),
-            point(right + reach, bottom + reach),
-        ),
-    ] {
-        let mask = ContentMask {
-            bounds: Bounds::from_corners(from, to),
-        };
-        window.with_content_mask(Some(mask), |window| {
-            window.paint_drop_shadows(rect, Corners::default(), &shadow);
-        });
-    }
 }
 
 /// A look's transition, kept across frames under the pane's element id.
@@ -505,7 +646,6 @@ impl Element for PaneChrome {
                             ..target.border
                         },
                         dim: target.dim,
-                        shadow: 0.0,
                     },
                     to: target,
                     started: now,
@@ -531,9 +671,6 @@ impl Element for PaneChrome {
             .round
             .pixels(radius)
             .clamp_radii_for_quad_size(bounds.size);
-        if look.shadow > 0.0 && !style::energy() {
-            paint_shadow_outside(window, bounds, corners, look.shadow);
-        }
         if look.dim > 0.0 {
             let veil = Rgba {
                 a: self.surface.a * DIM * look.dim,
@@ -600,7 +737,8 @@ mod tests {
             clear,
             px(17.0),
             8.4,
-            (0.0, 0.0),
+            Slack::default(),
+            &ColumnShifts::default(),
             0,
             1,
         )
@@ -619,7 +757,6 @@ mod tests {
                 a: 1.0,
             },
             dim: 0.0,
-            shadow: 1.0,
         };
         let rest = Look {
             border: Rgba {
@@ -629,7 +766,6 @@ mod tests {
                 a: 0.0,
             },
             dim: 0.35,
-            shadow: 0.0,
         };
         let started = Instant::now();
         let fade = Transition {
@@ -690,12 +826,57 @@ mod tests {
             clear,
             px(17.0),
             8.4,
-            (5.0, 9.0),
+            Slack {
+                right: 5.0,
+                bottom: 9.0,
+                ..Slack::default()
+            },
+            &ColumnShifts::default(),
             0,
             1,
         );
         assert_eq!(slack.width - bare.width, 5.0);
         assert_eq!(slack.height - bare.height, 9.0);
+    }
+
+    #[test]
+    fn the_padding_before_the_grid_keeps_the_margin_a_gap() {
+        let tiled = frame(0, 1, 39, 20);
+        let clear = Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+        let padded = |pane| {
+            pane_chrome(
+                0,
+                &pane,
+                &tiled,
+                true,
+                true,
+                clear,
+                clear,
+                clear,
+                px(17.0),
+                8.4,
+                Slack {
+                    left: 12.0,
+                    right: 12.0,
+                    ..Slack::default()
+                },
+                &ColumnShifts::default(),
+                0,
+                1,
+            )
+        };
+        // The outer card grows over the padding, a gap in from its edge.
+        let left = padded(frame(0, 1, 19, 20));
+        assert_eq!(left.left + BORDER_PX, GAP_PX - 12.0);
+        // A pane away from the edge ignores it: its seam does not move.
+        let right = padded(frame(20, 1, 39, 20));
+        let bare = chrome(frame(20, 1, 39, 20), tiled);
+        assert_eq!(right.left, bare.left);
     }
 
     #[test]
@@ -721,13 +902,85 @@ mod tests {
     }
 
     #[test]
-    fn flush_panes_have_no_margin_and_cast_no_shadow() {
+    fn flush_panes_have_no_margin() {
         let tiled = frame(0, 2, 39, 20);
         let card = chrome_with(tiled, tiled, false);
         assert_eq!(card.left, 0.0);
         assert_eq!(card.top, 17.0);
-        assert_eq!(card.rest.shadow, 0.0);
-        assert_eq!(chrome(tiled, tiled).rest.shadow, 1.0);
+    }
+
+    #[test]
+    fn a_floating_card_is_outlined_only_while_it_holds_the_caret() {
+        let tiled = frame(0, 1, 39, 20);
+        let line = Rgba {
+            r: 0.5,
+            g: 0.5,
+            b: 0.5,
+            a: 1.0,
+        };
+        let card = |focused| {
+            pane_chrome(
+                0,
+                &tiled,
+                &tiled,
+                focused,
+                true,
+                line,
+                line,
+                line,
+                px(17.0),
+                8.4,
+                Slack::default(),
+                &ColumnShifts::default(),
+                0,
+                1,
+            )
+        };
+        assert_eq!(card(true).rest.border, line);
+        assert_eq!(card(false).rest.border.a, 0.0);
+    }
+
+    #[test]
+    fn an_unsplit_card_sits_a_gap_inside_its_padding() {
+        // One pane spanning the whole grid, with the unsplit padding.
+        let whole = frame(0, 1, 39, 20);
+        let pad = grid_pad(true, false);
+        let clear = Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+        let card = pane_chrome(
+            0,
+            &whole,
+            &whole,
+            true,
+            true,
+            clear,
+            clear,
+            clear,
+            px(17.0),
+            8.4,
+            Slack {
+                left: pad.left,
+                top: pad.y,
+                right: pad.right,
+                bottom: pad.y,
+            },
+            &ColumnShifts::default(),
+            0,
+            1,
+        );
+        // The text starts at 0; the card's inner edge is the padding's
+        // gap-wide outer part away from the surface's edge.
+        assert_eq!(card.left + BORDER_PX, GAP_PX - pad.left);
+        assert_eq!(card.top + BORDER_PX, GAP_PX - pad.y);
+        assert_eq!(-(card.left + BORDER_PX), PAD_LEAD_PX);
+        assert_eq!(-(card.top + BORDER_PX), PAD_Y_PX);
+        // The far side keeps the full room past the last column.
+        let right_inner = card.left + card.width - BORDER_PX;
+        assert_eq!((40.0f32 * 8.4).round() + pad.right - right_inner, GAP_PX);
     }
 
     #[test]
@@ -758,5 +1011,66 @@ mod tests {
             chrome(frame(0, 1, 19, 20), tiled).round,
             RoundedCorners::ALL
         );
+    }
+
+    #[test]
+    fn a_seam_keeps_the_text_padding_on_both_sides() {
+        let tiled = frame(0, 1, 39, 20);
+        let (left, right) = (frame(0, 1, 19, 20), frame(20, 1, 39, 20));
+        let panes = PaneFrames::from_panes(vec![left, right]);
+        let cell = 8.4;
+        let step = seam_step(true, cell);
+        let shifts = ColumnShifts::new(&panes, step, cell, 0);
+        let clear = Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+        let card = |index, pane| {
+            pane_chrome(
+                index,
+                &pane,
+                &tiled,
+                true,
+                true,
+                clear,
+                clear,
+                clear,
+                px(17.0),
+                cell,
+                Slack::default(),
+                &shifts,
+                0,
+                1,
+            )
+        };
+        let (a, b) = (card(0, left), card(1, right));
+        let a_inner_right = a.left + a.width - BORDER_PX;
+        let b_inner_left = b.left + BORDER_PX;
+        assert_eq!(b_inner_left - a_inner_right, GAP_PX);
+        // The left pane's text ends where its border column starts; the
+        // right pane's starts a column past its own, pushed by the step.
+        let a_text_end = 19.0 * cell;
+        let b_text_start = 21.0 * cell + shifts.at(21, 5);
+        assert!(a_inner_right - a_text_end >= PAD_X_PX);
+        assert!(b_text_start - b_inner_left >= PAD_X_PX);
+    }
+
+    #[test]
+    fn unshifting_maps_the_step_onto_the_seam() {
+        let panes = PaneFrames::from_panes(vec![frame(0, 1, 19, 20), frame(20, 1, 39, 20)]);
+        let shifts = ColumnShifts::new(&panes, 16.0, 10.0, 0);
+        assert_eq!(
+            shifts.segments(5, 0, 40),
+            vec![(0, 20, 0.0), (20, 40, 16.0)]
+        );
+        // The left pane is as drawn; the room the step adds is the seam; the
+        // right pane comes back by the step.
+        assert_eq!(shifts.unshift(55.0, 5), 55.0);
+        assert_eq!(shifts.unshift(205.0, 5), 200.0);
+        assert_eq!(shifts.unshift(226.0, 5), 210.0);
+        // Rows outside the split are not shifted.
+        assert_eq!(shifts.unshift(226.0, 30), 226.0);
     }
 }

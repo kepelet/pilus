@@ -139,6 +139,12 @@ impl PaneFrames {
         Self { panes: outer }
     }
 
+    /// Panes known up front, for tests elsewhere that need a split.
+    #[cfg(test)]
+    pub(super) fn from_panes(panes: Vec<PaneFrame>) -> Self {
+        Self { panes }
+    }
+
     pub(super) fn panes(&self) -> &[PaneFrame] {
         &self.panes
     }
@@ -192,6 +198,40 @@ impl PaneFrames {
     pub(super) fn is_border(&self, column: u16, row: u16) -> bool {
         self.panes.iter().any(|pane| pane.on_border(column, row))
     }
+
+    /// How many seams lie between each pane and the split's left edge, along
+    /// the longest run of side-by-side panes leading to it; in `panes()`
+    /// order. A pane on the left edge is 0.
+    pub(super) fn depths(&self) -> Vec<u16> {
+        let mut order: Vec<usize> = (0..self.panes.len()).collect();
+        order.sort_by_key(|&index| self.panes[index].left);
+        let mut depths = vec![0u16; self.panes.len()];
+        for &index in &order {
+            let pane = &self.panes[index];
+            // A left neighbor starts further left, so its depth is settled.
+            depths[index] = self
+                .panes
+                .iter()
+                .zip(&depths)
+                .filter(|(other, _)| beside(other, pane))
+                .map(|(_, depth)| depth + 1)
+                .max()
+                .unwrap_or(0);
+        }
+        depths
+    }
+
+    /// The deepest of [`Self::depths`]: how many seams a row crosses at most.
+    pub(super) fn max_depth(&self) -> u16 {
+        self.depths().into_iter().max().unwrap_or(0)
+    }
+}
+
+/// Whether `left` meets `right` along a seam, side by side: `right` starts
+/// the column after `left` ends and they share a stretch of rows, as a
+/// [`Divider`] needs.
+pub(super) fn beside(left: &PaneFrame, right: &PaneFrame) -> bool {
+    left.right + 1 == right.left && left.top.max(right.top) + 1 < left.bottom.min(right.bottom)
 }
 
 /// Whether `panes` are a split filling the frame down to its right and bottom
@@ -475,5 +515,26 @@ mod tests {
         let found = PaneFrames::find(&frame, frame.height);
         assert!(found.is_border(0, 1) && found.is_border(4, 3) && found.is_border(5, 0));
         assert!(!found.is_border(2, 1));
+    }
+
+    #[test]
+    fn depth_counts_the_seams_to_the_left_edge() {
+        let frame = |left, top, right, bottom| PaneFrame {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        // [A | B] over C, with D down the whole right side.
+        let panes = PaneFrames {
+            panes: vec![
+                frame(0, 0, 9, 9),
+                frame(10, 0, 19, 9),
+                frame(0, 10, 19, 19),
+                frame(20, 0, 29, 19),
+            ],
+        };
+        assert_eq!(panes.depths(), vec![0, 1, 0, 2]);
+        assert_eq!(panes.max_depth(), 2);
     }
 }

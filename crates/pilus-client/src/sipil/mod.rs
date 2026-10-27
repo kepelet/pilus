@@ -539,6 +539,10 @@ pub struct TranscriptItem {
     /// in a channel, or an agent in a chat between people.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker: Option<String>,
+    /// With `speaker`: the pane that agent said it from, when it was one. It ties
+    /// a report to the call that started the agent there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
 }
 
 /// What a reply answers: who said the line and the start of it, copied, because

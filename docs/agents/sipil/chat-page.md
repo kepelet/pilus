@@ -59,6 +59,20 @@ the terminal's card with its own `InputLayer::Sipil`, flush to the sidebar
 
 - The page has a topic bar, a log of `time nick: text` lines in the terminal
   font (no brackets), and an input line.
+- On a daemon's page, another agent is never a speaker. A report from a pane
+  (`sipil tell`), an answer to `ask_agent` or a routine's note arrives as a user
+  line with a `speaker`; it is drawn as a muted `--` notice ("from Briefing")
+  with no nick column (`is_report`). It is a reply to the nearest earlier line of
+  the agent's that started the sender, else made a call naming it
+  (`ask_agent briefing`). The daemon ends a `pilus_start_agent` result with
+  `[pane 12]` and puts the pane a `sipil tell` or a watch report came from on the
+  notice (`TranscriptItem::pane`), so a report goes under the spawn that made
+  that pane and not under a later call about it (`started_agent`). A report with
+  no pane is matched by the agent's name. So it
+  leaves the log and that line shows "1 reply"; `group_threads` attaches it, and
+  what the agent says next stays in the log. A report no call names stays in the
+  log as a plain notice. In a chat with people the same shape is the
+  person's own agent speaking, and stays a normal line.
 - Tool calls are `*` lines, tool output `-` lines, and a failed turn a `!!`
   line. Nicks are colored from the theme's ANSI hues by name.
 - A line's text is drawn as Markdown when it reads as Markdown

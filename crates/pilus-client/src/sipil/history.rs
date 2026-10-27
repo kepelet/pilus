@@ -77,6 +77,7 @@ mod tests {
             error: None,
             at: None,
             speaker: None,
+            pane: None,
         }
     }
 

@@ -234,6 +234,7 @@ impl SipilChat {
         self.synced = Some(Arc::clone(state));
         let subject = Subject::of(state);
         let me = nick_of(state);
+        let daemon = matches!(state.watch, Watch::On(..));
         let working = subject.activity == Activity::Working;
         let items = &state.transcript;
         let known = known_calls(items);
@@ -269,7 +270,11 @@ impl SipilChat {
             .collect();
         let nick_columns = items
             .iter()
-            .map(|item| line_nick(item, &me, &subject.speaker).chars().count())
+            .map(|item| {
+                shown_nick(item, &me, &subject.speaker, daemon)
+                    .chars()
+                    .count()
+            })
             .max()
             .unwrap_or(0)
             .clamp(4, 24);
@@ -553,7 +558,12 @@ impl PilusView {
         let body = reply_of(item, matches!(self.sipil.watch, Watch::On(..)))
             .map_or_else(|| item.text.clone(), |(_, body)| body);
         Some(Quote::of(
-            line_nick(item, &built.me, &built.speaker).trim_end_matches(':'),
+            &quoted_who(
+                item,
+                &built.me,
+                &built.speaker,
+                matches!(built.watch, Watch::On(..)),
+            ),
             &body,
         ))
     }
@@ -2398,6 +2408,7 @@ impl PilusView {
         let (me, speaker) = names;
         let (time_width, nick_width) = widths;
         let theme = self.theme;
+        let daemon = matches!(self.sipil_chat.built.watch, Watch::On(..));
         let time = item
             .at
             .map(pilus_client::sipil::clock_label)
@@ -2410,12 +2421,7 @@ impl PilusView {
             ItemRole::User | ItemRole::Peer | ItemRole::Assistant
         ) && item.error.is_none()
             && !item.text.trim().is_empty();
-        let quote = said.then(|| {
-            Quote::of(
-                line_nick(item, me, speaker).trim_end_matches(':'),
-                &item.text,
-            )
-        });
+        let quote = said.then(|| Quote::of(&quoted_who(item, me, speaker, daemon), &item.text));
         let reply = quote.map(|quote| {
             style::icon_button(
                 format!("pilus-sipil-reply-{}", item.id),
@@ -2510,6 +2516,26 @@ impl PilusView {
                 .into_any_element()
         };
         match item.role {
+            // Another agent reporting to this daemon's agent is a notice, not
+            // someone in the room: the conversation is the person's and the agent's.
+            ItemRole::User if is_report(item, daemon) => {
+                let from = report_source(item.speaker.as_deref().unwrap_or_default());
+                row(
+                    "--".to_string(),
+                    theme.muted,
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .italic()
+                                .text_color(theme.muted)
+                                .child(format!("from {from}")),
+                        )
+                        .child(self.chat_text(&item.text, theme.muted, fonts, settings))
+                        .into_any_element(),
+                )
+            }
             ItemRole::User | ItemRole::Peer => {
                 let nick = line_nick(item, me, speaker);
                 let color = match (&item.speaker, item.role) {
@@ -2981,10 +3007,41 @@ fn group_threads(
     let body = |at: usize| {
         reply_of(&items[at], daemon).map_or_else(|| items[at].text.clone(), |(_, body)| body)
     };
+    let results: HashMap<&str, &str> = items
+        .iter()
+        .filter(|item| item.role == ItemRole::Tool)
+        .filter_map(|item| Some((item.call_id.as_deref()?, item.text.as_str())))
+        .collect();
     let mut threads: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut root_of: HashMap<usize, usize> = HashMap::new();
     let mut current: Option<usize> = None;
     for (at, item) in items.iter().enumerate() {
+        // Another agent's report answers the call that asked for it: the one that
+        // started the agent, else the latest that names it. It joins that line's
+        // thread, but what the agent says next is its own line.
+        if is_report(item, daemon) {
+            current = None;
+            let from = item.speaker.as_deref().unwrap_or_default();
+            let by_agent = |earlier: &usize| items[*earlier].role == ItemRole::Assistant;
+            let asked = (0..at)
+                .rev()
+                .filter(by_agent)
+                .find(|&earlier| {
+                    started_agent(&items[earlier], from, item.pane.as_deref(), &results)
+                })
+                .or_else(|| {
+                    (0..at)
+                        .rev()
+                        .filter(by_agent)
+                        .find(|&earlier| names_in_call(&items[earlier], from))
+                })
+                .map(|earlier| root_of.get(&earlier).copied().unwrap_or(earlier));
+            if let Some(root) = asked {
+                threads.entry(root).or_default().push(at);
+                root_of.insert(at, root);
+            }
+            continue;
+        }
         let reply = matches!(item.role, ItemRole::User | ItemRole::Peer)
             .then(|| reply_of(item, daemon))
             .flatten();
@@ -3059,6 +3116,78 @@ fn line_nick(item: &TranscriptItem, me: &str, speaker: &str) -> String {
         ItemRole::Assistant if item.text.is_empty() => "*".to_string(),
         ItemRole::Assistant => format!("{}:", item.speaker.as_deref().unwrap_or(speaker)),
         ItemRole::Tool => "-".to_string(),
+    }
+}
+
+/// How a report's sender reads in the log. The daemon names a `sipil tell` it
+/// cannot place `pane-<id>` (no coding agent runs in that pane now) or `tell`
+/// (it came from outside any pane); a bare terminal number says nothing.
+fn report_source(speaker: &str) -> String {
+    match speaker {
+        "tell" => "a process outside pilus".to_string(),
+        _ => match speaker.strip_prefix("pane-") {
+            Some(pane) => format!("terminal pane {pane}, which no agent is running in now"),
+            None => speaker.to_string(),
+        },
+    }
+}
+
+/// Whether a call `item` made names `agent`, as `ask_agent briefing` names
+/// Briefing: the line a report from it answers.
+fn names_in_call(item: &TranscriptItem, agent: &str) -> bool {
+    let agent = agent.to_lowercase();
+    !agent.is_empty()
+        && item.calls.iter().any(|call| {
+            call.summary.to_lowercase().contains(&agent)
+                || call.args.to_lowercase().contains(&agent)
+        })
+}
+
+/// Whether `item` started the agent a report comes from. The daemon ends the
+/// result of `pilus_start_agent` with `[pane N]`, and a report says the pane it
+/// came from, so a pane is told apart by that. Without a pane the agent's name,
+/// which the result also says, is all there is.
+fn started_agent(
+    item: &TranscriptItem,
+    agent: &str,
+    pane: Option<&str>,
+    results: &HashMap<&str, &str>,
+) -> bool {
+    let name = agent.to_lowercase();
+    item.calls
+        .iter()
+        .filter(|call| call.name == "pilus_start_agent")
+        .filter_map(|call| results.get(call.id.as_str()))
+        .any(|result| match pane {
+            Some(pane) => result.contains(&format!("[pane {pane}]")),
+            None => !name.is_empty() && result.to_lowercase().contains(&name),
+        })
+}
+
+/// Whether `item` is another agent reporting to a daemon's own agent (`sipil
+/// tell`, an answer to `ask_agent`, a routine's note). The daemon names the
+/// sender as the line's speaker. In a chat with people the same shape is our own
+/// agent speaking, which is a line like any other.
+fn is_report(item: &TranscriptItem, daemon: bool) -> bool {
+    daemon && item.role == ItemRole::User && item.speaker.is_some()
+}
+
+/// [`line_nick`], except that a report is marked `--` and takes no nick column.
+fn shown_nick(item: &TranscriptItem, me: &str, speaker: &str, daemon: bool) -> String {
+    if is_report(item, daemon) {
+        "--".to_string()
+    } else {
+        line_nick(item, me, speaker)
+    }
+}
+
+/// Who a reply to `item` names as its author.
+fn quoted_who(item: &TranscriptItem, me: &str, speaker: &str, daemon: bool) -> String {
+    match &item.speaker {
+        Some(from) if is_report(item, daemon) => from.clone(),
+        _ => line_nick(item, me, speaker)
+            .trim_end_matches(':')
+            .to_string(),
     }
 }
 
@@ -3238,6 +3367,7 @@ mod tests {
             error: None,
             at: None,
             speaker: None,
+            pane: None,
         };
         let items = vec![
             item(1, ItemRole::Assistant, None, &["a", "b"]),
@@ -3265,6 +3395,7 @@ mod tests {
             error: None,
             at: None,
             speaker: None,
+            pane: None,
         }
     }
 
@@ -3424,6 +3555,87 @@ mod tests {
     }
 
     #[test]
+    fn with_a_daemon_another_agents_report_is_a_reply_to_the_call_that_asked_for_it() {
+        let ask = |id, agent: &str| TranscriptItem {
+            calls: vec![ToolCall {
+                id: format!("c{id}"),
+                name: "ask_agent".to_string(),
+                summary: format!("ask_agent {agent}"),
+                args: String::new(),
+            }],
+            ..line(id, ItemRole::Assistant, "")
+        };
+        let report = |id, from: &str| TranscriptItem {
+            speaker: Some(from.to_string()),
+            ..line(id, ItemRole::User, "answered")
+        };
+        let items = vec![
+            line(1, ItemRole::User, "tell Briefing to say hi"),
+            ask(2, "briefing"),
+            line(3, ItemRole::Assistant, "Asked."),
+            report(4, "Briefing"),
+            line(5, ItemRole::Assistant, "It refused."),
+            report(6, "phone-pi-c3baf6-2"),
+            TranscriptItem {
+                calls: vec![ToolCall {
+                    id: "s7".to_string(),
+                    name: "pilus_start_agent".to_string(),
+                    summary: "pi in sipil".to_string(),
+                    args: String::new(),
+                }],
+                ..line(7, ItemRole::Assistant, "")
+            },
+            TranscriptItem {
+                call_id: Some("s7".to_string()),
+                ..line(
+                    8,
+                    ItemRole::Tool,
+                    "Pi started as \"phone-pi-c3baf6-2\" in sipil. Prompt delivered. [pane 12]",
+                )
+            },
+            TranscriptItem {
+                pane: Some("12".to_string()),
+                ..report(9, "pane-12")
+            },
+            // A later call on the same pane does not take its reports from the spawn.
+            TranscriptItem {
+                calls: vec![ToolCall {
+                    id: "s10".to_string(),
+                    name: "pilus_agent_send".to_string(),
+                    summary: "pane 12".to_string(),
+                    args: String::new(),
+                }],
+                ..line(10, ItemRole::Assistant, "")
+            },
+            TranscriptItem {
+                pane: Some("12".to_string()),
+                ..report(11, "pane-12")
+            },
+            TranscriptItem {
+                pane: Some("1".to_string()),
+                ..report(12, "pane-1")
+            },
+        ];
+        let (threads, root_of) = group_threads(&items, true);
+        assert_eq!(threads.get(&1), Some(&vec![3]));
+        assert!(
+            !root_of.contains_key(&4),
+            "what the agent says next stays in the log"
+        );
+        assert!(
+            !root_of.contains_key(&5),
+            "a report no call asked for is a notice, not a reply"
+        );
+        assert_eq!(
+            threads.get(&6),
+            Some(&vec![8, 10]),
+            "a report from a pane goes under the call that started it"
+        );
+        assert!(!root_of.contains_key(&11), "pane 1 is not pane 12");
+        assert!(group_threads(&items, false).1.is_empty());
+    }
+
+    #[test]
     fn a_session_is_titled_by_what_was_said_and_an_unlisted_one_is_new() {
         let daemon = Daemon {
             label: "CoS".to_string(),
@@ -3491,6 +3703,7 @@ mod tests {
             error: None,
             at: None,
             speaker: speaker.map(str::to_string),
+            pane: None,
         };
         assert_eq!(
             line_nick(&item(ItemRole::User, "x", None), "alex", "rina"),
@@ -3513,6 +3726,22 @@ mod tests {
             "rani:"
         );
         assert_eq!(line_nick(&item(ItemRole::Tool, "x", None), "me", "s"), "-");
+
+        // On a daemon's page another agent's report is a notice with no nick of
+        // its own; in a chat with people the same line is our agent speaking.
+        let report = item(ItemRole::User, "done", Some("phone-pi-c3baf6-2"));
+        assert!(is_report(&report, true));
+        assert!(!is_report(&report, false));
+        assert!(!is_report(&item(ItemRole::User, "hi", None), true));
+        assert_eq!(shown_nick(&report, "alex", "sipil", true), "--");
+        assert_eq!(
+            shown_nick(&report, "alex", "sipil", false),
+            "phone-pi-c3baf6-2:"
+        );
+        assert_eq!(
+            quoted_who(&report, "alex", "sipil", true),
+            "phone-pi-c3baf6-2"
+        );
         let call = TranscriptItem {
             tools: vec!["bash".to_string()],
             ..item(ItemRole::Assistant, "", None)

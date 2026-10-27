@@ -9,6 +9,11 @@ struct AgentDetailView: View {
     @Environment(AppStore.self) private var store
     @State private var detail: AgentDetail?
     @State private var content = ""
+    /// The agent's own transcript, once its session is found; until then
+    /// (or for a kind whose transcripts are not read) the pane is shown.
+    @State private var transcript: TranscriptReply?
+    @State private var session: SessionSummary?
+    @State private var sessionLookups = 0
     @State private var reply = ""
     // Kept separate so a poll cannot erase a send error before it is read.
     @State private var loadError: String?
@@ -284,6 +289,9 @@ struct AgentDetailView: View {
                     .onAppear { Task { await loadOlder() } }
                 }
                 Spacer(minLength: 0)
+                if let transcript {
+                    TranscriptList(entries: transcript.entries, earlier: transcript.earlier ?? false)
+                } else {
                 Text(content.isEmpty
                      ? AttributedString("Reading pane")
                      : ANSIRenderer.attributed(content))
@@ -291,6 +299,7 @@ struct AgentDetailView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding()
                     .textSelection(.enabled)
+                }
             }
             // The pane fills the viewport like a terminal would: short
             // output hugs the bottom edge, long output opens scrolled to
@@ -307,10 +316,25 @@ struct AgentDetailView: View {
             content = screen.text
             truncated = screen.truncated
             loadError = nil
+            await refreshTranscript(sessionID: detail?.session, cwd: detail?.cwd)
             return true
         } catch {
             if !silent { loadError = error.localizedDescription }
             return false
+        }
+    }
+
+    /// Find the agent's session (a few tries — a fresh agent writes its
+    /// transcript only after the first turn) and re-read its newest entries.
+    private func refreshTranscript(sessionID: String?, cwd: String?) async {
+        if session == nil, sessionLookups < 5 {
+            sessionLookups += 1
+            session = try? await store.session(for: agent, sessionID: sessionID, cwd: cwd)
+        }
+        guard let session else { return }
+        if let reply = try? await store.transcript(path: session.path, machine: session.machine) {
+            transcript = reply
+            truncated = false
         }
     }
 

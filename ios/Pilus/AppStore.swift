@@ -9,6 +9,9 @@ final class AppStore {
     var workspaces: [Workspace] = []
     var agents: [Agent] = []
     var tasks: [OrchTask] = []
+    /// The newest agent sessions across machines, newest first (`hub.sessions`).
+    var sessions: [SessionSummary] = []
+    var sessionsLoaded = false
     var machines: [Machine] = []
     var hostLabel: String?
     /// Agent-kind catalog per machine (`hub.agents` answers per machine).
@@ -783,6 +786,54 @@ final class AppStore {
     ///
     /// When the reply is lost the workspace list says whether it landed, so a
     /// retry is never needed.
+    /// Whether the connector reads agent transcripts (`hub.sessions`).
+    var canReadSessions: Bool { hubAllows("hub.sessions") }
+
+    /// A method the hub answers itself (`hub.*`), so a machine's own daemon
+    /// capabilities say nothing about it — only the device's level does.
+    func hubAllows(_ method: String, on machine: String = "local") -> Bool {
+        usesHub && allowedMethods.contains(method) && unsupported[machine]?.contains(method) != true
+    }
+
+    /// The newest sessions on every machine, merged newest first. A machine
+    /// that fails keeps what it last listed.
+    func loadSessions(limit: Int = 20) async {
+        guard canReadSessions else { return }
+        var merged: [SessionSummary] = []
+        for id in machineOrder {
+            do {
+                let reply: SessionList = try await call(
+                    method: "hub.sessions", params: ["limit": limit], machine: id)
+                merged += reply.sessions.map { var row = $0; row.machine = id; return row }
+            } catch {
+                merged += sessions.filter { $0.machine == id }
+            }
+        }
+        sessions = Array(merged.sorted { ($0.updated ?? 0) > ($1.updated ?? 0) }.prefix(limit))
+        sessionsLoaded = true
+    }
+
+    /// The session a live agent runs on, matched by kind and folder (and the
+    /// daemon's session id when `agent.get` reported one). `nil` for a kind
+    /// whose transcripts are not read, or when nothing matches yet.
+    func session(for agent: Agent, sessionID: String?, cwd: String?) async throws -> SessionSummary? {
+        guard hubAllows("hub.sessions", on: agent.machine),
+              ["claude", "pi"].contains(agent.kind),
+              let cwd = cwd ?? agent.cwd, !cwd.isEmpty else { return nil }
+        var params: [String: Any] = ["agent": agent.kind, "cwd": cwd]
+        if let sessionID, !sessionID.isEmpty { params["session"] = sessionID }
+        let reply: SessionList = try await call(
+            method: "hub.sessions", params: params, machine: agent.machine)
+        return reply.sessions.first.map { var row = $0; row.machine = agent.machine; return row }
+    }
+
+    /// The newest entries of a session's transcript.
+    func transcript(path: String, machine: String, limit: Int = 200) async throws -> TranscriptReply {
+        try await call(method: "hub.transcript",
+                       params: ["path": path, "limit": limit],
+                       machine: machine)
+    }
+
     func openWorkspace(path: String, machine: String) async throws {
         do {
             let _: EmptyReply = try await call(
@@ -841,39 +892,6 @@ final class AppStore {
     /// the daemon answers a reused key with different input as a conflict. A
     /// repeat after a lost reply therefore gets the original automation and its
     /// original run.
-    func createTask(workspaceID: String, agent: String, title: String, prompt: String) async throws {
-        let machine = workspaces.first(where: { $0.workspace_id == workspaceID })?.machine ?? "local"
-        let signature = ["task", machine, workspaceID, agent, title, prompt].joined(separator: "\u{1f}")
-        let pending = replayKey(for: signature)
-        var created = false
-        do {
-            let automation: AutomationCreated = try await call(method: "automation.create", params: [
-                "name": title,
-                "trigger": ["kind": "once", "at_utc": Int(pending.at.timeIntervalSince1970) + 86_400],
-                "target": ["kind": "new_worker"],
-                "task": [
-                    "title": title,
-                    "prompt": prompt,
-                    "agent_id": agent,
-                    "workspace_id": workspaceID,
-                    "mode": "workspace",
-                ],
-                "idempotency_key": pending.key,
-            ], machine: machine)
-            created = true
-            let _: EmptyReply = try await call(
-                method: "automation.run",
-                params: ["id": automation.automation.id, "idempotency_key": pending.key + ".run"],
-                machine: machine)
-            pendingKeys[signature] = nil
-        } catch let error as PilusError {
-            // Once the automation exists, a repeat reuses it under the same
-            // key rather than creating a second.
-            if !created && !error.isUnconfirmed { pendingKeys[signature] = nil }
-            throw error
-        }
-    }
-
     func disconnect() {
         watchTask?.cancel()
         watchTask = nil

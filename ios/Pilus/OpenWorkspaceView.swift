@@ -8,6 +8,9 @@ struct OpenWorkspaceView: View {
     @Environment(AppStore.self) private var store
     @Environment(\.dismiss) private var dismiss
 
+    /// Told the folder and machine once the workspace is open.
+    var onOpened: ((String, String) -> Void)? = nil
+
     @State private var machine = "local"
     @State private var path = "~"
     @State private var listing: HubFolders?
@@ -124,6 +127,7 @@ struct OpenWorkspaceView: View {
             do {
                 try await store.openWorkspace(path: path, machine: machine)
                 await store.refresh()
+                onOpened?(path, machine)
                 dismiss()
             } catch {
                 sendError = error.localizedDescription

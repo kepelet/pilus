@@ -303,3 +303,46 @@ struct Capabilities: Decodable {
 
 /// Write-method replies (`{"type":"ok","revision":…}`) whose body we ignore.
 struct EmptyReply: Decodable {}
+
+/// One agent session from `hub.sessions` — read from the agent's own
+/// transcript on the machine, like the desktop's Search and Home pages.
+struct SessionSummary: Decodable, Identifiable, Hashable {
+    let agent: String
+    let session_id: String
+    let title: String
+    let cwd: String?
+    let branch: String?
+    let started: Int?
+    let updated: Int?
+    let path: String
+
+    /// Stamped client-side after decode, like `Agent.machine`.
+    var machine = "local"
+
+    var id: String { "\(machine):\(path)" }
+    var kind: String { agent }
+
+    private enum CodingKeys: String, CodingKey {
+        case agent, session_id, title, cwd, branch, started, updated, path
+    }
+}
+
+struct SessionList: Decodable {
+    let sessions: [SessionSummary]
+}
+
+/// One thing said or done in a session, as `hub.transcript` folds it.
+struct TranscriptEntry: Decodable, Hashable {
+    let type: String
+    let text: String?
+    let name: String?
+    let summary: String?
+    let output: String?
+    let failed: Bool?
+    let at: Int?
+}
+
+struct TranscriptReply: Decodable {
+    let entries: [TranscriptEntry]
+    let earlier: Bool?
+}

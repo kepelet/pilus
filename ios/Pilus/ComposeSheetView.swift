@@ -17,6 +17,7 @@ struct ComposeSheetView: View {
     var onLaunched: (Agent) -> Void
 
     @State private var running = false
+    @State private var showingOpenWorkspace = false
     @State private var sendError: String?
     @FocusState private var editorFocused: Bool
 
@@ -75,6 +76,16 @@ struct ComposeSheetView: View {
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.hidden)
+        .sheet(isPresented: $showingOpenWorkspace) {
+            OpenWorkspaceView { path, machine in
+                if let opened = store.workspaces.first(where: {
+                    $0.machine == machine && ($0.cwd == path || $0.terminal_cwd == path)
+                }) {
+                    workspaceID.wrappedValue = opened.workspace_id
+                }
+            }
+            .presentationDragIndicator(.hidden)
+        }
         .onAppear {
             applyDefaults()
             Task { editorFocused = true }
@@ -182,6 +193,10 @@ struct ComposeSheetView: View {
                         }
                     }
                 }
+            }
+            if store.canRunAgents {
+                Divider()
+                Button("Open Workspace…") { showingOpenWorkspace = true }
             }
         } label: {
             pickerLabel(currentWorkspace?.title ?? "workspace", asset: "lucide-server")

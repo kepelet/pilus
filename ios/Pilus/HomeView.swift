@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// The single screen: host header, then every workspace across every
-/// machine with its agents grouped beneath, then orphan agents and tasks.
+/// The single screen: host header, then the live agents on every machine,
+/// then the newest agent sessions — both open on their transcript.
 /// Deliberately not a `List` — no separators, disclosure chevrons, or
 /// section chrome; rows are plain text on the system background and the
 /// only accent is monochrome.
@@ -11,12 +11,10 @@ struct HomeView: View {
     /// The draft lives here so closing the compose sheet never throws
     /// text away.
     @State private var composerDraft = ""
-    @State private var showingNewTask = false
     @State private var showingOpenWorkspace = false
     @State private var showingPairing = false
     @State private var showingSettings = false
     @State private var showingCompose = false
-    @State private var openingTaskID: String?
     /// Focus opens the composer; this state stays expanded when the keyboard
     /// dismisses so picker menus remain available.
     @State private var composerExpanded = false
@@ -28,116 +26,8 @@ struct HomeView: View {
     private enum HomeRoute: Hashable {
         case notifications
     }
-    @AppStorage("home.machines.expanded") private var machinesExpanded = true
     @AppStorage("home.agents.expanded") private var agentsExpanded = true
-    @AppStorage("home.tasks.expanded") private var tasksExpanded = true
-
-    /// A top-level workspace row plus the linked worktrees hanging under it.
-    private struct WorkspaceNode {
-        let workspace: Workspace
-        var worktrees: [Workspace] = []
-    }
-
-    /// Workspaces grouped under their machine in `hub.machines` order,
-    /// each group sorted by the daemon's own display position. Worktree
-    /// workspaces fold into their repo's workspace as indented children.
-    private var machineGroups: [(machine: String, workspaces: [WorkspaceNode])] {
-        store.machineOrder.compactMap { id in
-            let ws = store.workspaces
-                .filter { $0.machine == id && !isHomeWorkspace($0) }
-                .sorted {
-                    (Int($0.display_position ?? "") ?? 0) < (Int($1.display_position ?? "") ?? 0)
-                }
-            let nodes = groupWorktrees(ws)
-            return nodes.isEmpty ? nil : (id, nodes)
-        }
-    }
-
-    /// The daemon's linked-worktree convention: checkouts live at
-    /// `$LUVUS_HOME/worktrees/<repo>/<branch>`, so a workspace rooted under
-    /// `.luvus*/worktrees/` is a child of the workspace holding that repo's
-    /// main checkout. Returns the repo slug, nil when it isn't a worktree.
-    private func worktreeRepo(_ workspace: Workspace) -> String? {
-        for candidate in [workspace.cwd, workspace.terminal_cwd] {
-            guard let path = candidate,
-                  // `.luvus` prefix also covers alternate homes like
-                  // `.luvus-dev`; the worktrees root sits directly under it.
-                  let home = path.range(of: "/.luvus"),
-                  let marker = path.range(of: "/worktrees/",
-                                          range: home.upperBound..<path.endIndex)
-            else { continue }
-            let tail = path[marker.upperBound...]
-            let repo = tail.prefix(while: { $0 != "/" })
-            if !repo.isEmpty, tail.count > repo.count + 1 {
-                return String(repo)
-            }
-        }
-        return nil
-    }
-
-    /// Fold worktree workspaces under their repo's workspace; a worktree whose
-    /// repo isn't open stays a top-level row so it never goes missing.
-    private func groupWorktrees(_ workspaces: [Workspace]) -> [WorkspaceNode] {
-        var nodes: [WorkspaceNode] = []
-        var children: [(workspace: Workspace, repo: String)] = []
-        for workspace in workspaces {
-            if let repo = worktreeRepo(workspace) {
-                children.append((workspace, repo))
-            } else {
-                nodes.append(WorkspaceNode(workspace: workspace))
-            }
-        }
-        for child in children {
-            if let index = nodes.firstIndex(where: { lastPathComponent($0.workspace) == child.repo }) {
-                nodes[index].worktrees.append(child.workspace)
-            } else {
-                nodes.append(WorkspaceNode(workspace: child.workspace))
-            }
-        }
-        return nodes
-    }
-
-    private func lastPathComponent(_ workspace: Workspace) -> String? {
-        (workspace.cwd ?? workspace.terminal_cwd)?
-            .split(separator: "/")
-            .last
-            .map(String.init)
-    }
-
-    /// Bare home directories carry no context — they clutter the list, so
-    /// they hide. Matches `~` and a resolved home path alike.
-    private func isHomeWorkspace(_ workspace: Workspace) -> Bool {
-        workspace.title == "~" || workspace.cwd == "~" || workspace.cwd == "/"
-    }
-
-    /// The machine group header only earns its row when the list actually
-    /// spans more than one machine.
-    private var spansMachines: Bool {
-        machineGroups.count > 1
-    }
-
-    /// Agents `agent.list` attributes to this workspace — by id first, then by
-    /// display name for replies that only carry one of them; always same
-    /// machine, since pane ids repeat across daemons.
-    private func agents(in workspace: Workspace) -> [Agent] {
-        store.agents.filter {
-            $0.machine == workspace.machine
-                && ($0.workspace_id == workspace.workspace_id
-                    || ($0.workspace_id == nil && $0.workspace_name == workspace.title))
-        }
-    }
-
-    private var orphanAgents: [Agent] {
-        store.agents.filter { agent in
-            !store.workspaces.contains {
-                // Hidden home workspaces can't hold rows; their agents
-                // fall through to the flat Agents section.
-                !isHomeWorkspace($0)
-                    && $0.machine == agent.machine
-                    && ($0.workspace_id == agent.workspace_id || $0.title == agent.workspace_name)
-            }
-        }
-    }
+    @AppStorage("home.sessions.expanded") private var sessionsExpanded = true
 
     var body: some View {
         NavigationStack(path: $navPath) {
@@ -146,7 +36,19 @@ struct HomeView: View {
             // draws no material of its own — logo and bell sit bare on it.
             .ignoresSafeArea(.container, edges: .top)
             .toolbarBackground(.hidden, for: .navigationBar)
-            .refreshable { await store.refresh() }
+            .refreshable {
+                await store.refresh()
+                await store.loadSessions()
+            }
+            // Sessions have no event feed; a slow re-read keeps the list
+            // fresh without streaming anything.
+            .task(id: store.loaded) {
+                guard store.loaded else { return }
+                while !Task.isCancelled {
+                    await store.loadSessions()
+                    try? await Task.sleep(for: .seconds(30))
+                }
+            }
             // A tap anywhere outside the composer resigns it — rows and
             // section headers keep their own handlers.
             .onTapGesture { collapseComposer() }
@@ -197,17 +99,21 @@ struct HomeView: View {
             .navigationDestination(for: Agent.self) { agent in
                 AgentDetailView(agent: agent)
             }
+            .navigationDestination(for: SessionSummary.self) { session in
+                SessionTranscriptView(session: session)
+            }
             .navigationDestination(for: HomeRoute.self) { route in
                 switch route {
                 case .notifications: NotificationsView()
                 }
             }
-            .sheet(isPresented: $showingNewTask) {
-                NewTaskView()
-                    .presentationDragIndicator(.hidden)
-            }
             .sheet(isPresented: $showingOpenWorkspace) {
-                OpenWorkspaceView()
+                OpenWorkspaceView { path, machine in
+                    // The composer follows the workspace just opened.
+                    composerWorkspaceID = store.workspaces.first {
+                        $0.machine == machine && ($0.cwd == path || $0.terminal_cwd == path)
+                    }?.workspace_id ?? composerWorkspaceID
+                }
                     .presentationDragIndicator(.hidden)
             }
             .sheet(isPresented: $showingPairing) {
@@ -264,19 +170,16 @@ struct HomeView: View {
                         .foregroundStyle(.red)
                         .padding(.top, 8)
                 }
-                if store.workspaces.isEmpty && !store.loaded {
+                if store.agents.isEmpty && !store.loaded {
                     skeleton
                 } else {
-                    // An empty or unreachable host shows no section at
-                    // all — no header, no hairline.
-                    if !store.workspaces.isEmpty {
-                        machinesSection
-                    }
-                    if !orphanAgents.isEmpty {
+                    // An empty list shows no section at all — no header,
+                    // no hairline.
+                    if !store.agents.isEmpty {
                         agentsSection
                     }
-                    if !store.tasks.isEmpty {
-                        tasksSection
+                    if !store.sessions.isEmpty {
+                        sessionsSection
                     }
                 }
             }
@@ -484,6 +387,10 @@ struct HomeView: View {
                     }
                 }
             }
+            if store.canRunAgents {
+                Divider()
+                Button("Open Workspace…") { showingOpenWorkspace = true }
+            }
         } label: {
             composerPickerLabel(composerWorkspace?.title ?? "workspace",
                                 asset: "lucide-server")
@@ -652,7 +559,6 @@ struct HomeView: View {
 
     private var hostMenu: some View {
         Menu {
-            Button("New Task") { showingNewTask = true }
             if store.canRunAgents {
                 Button("Open Workspace") { showingOpenWorkspace = true }
             }
@@ -727,31 +633,6 @@ struct HomeView: View {
         .padding(.bottom, 6)
     }
 
-    private var machinesSection: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            sectionHeading("Workspaces",
-                           expanded: machinesExpanded) {
-                machinesExpanded.toggle()
-            }
-            if machinesExpanded {
-                ForEach(Array(machineGroups.enumerated()), id: \.offset) { _, group in
-                    if spansMachines {
-                        Text(store.machineTitle(group.machine))
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 18)
-                    }
-                    ForEach(group.workspaces, id: \.workspace.id) { node in
-                        workspaceGroup(node.workspace)
-                        ForEach(node.worktrees) { worktree in
-                            worktreeGroup(worktree)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     private var agentsSection: some View {
         VStack(alignment: .leading, spacing: 0) {
             sectionHeading("Agents",
@@ -759,120 +640,64 @@ struct HomeView: View {
                 agentsExpanded.toggle()
             }
             if agentsExpanded {
-                ForEach(orphanAgents) { agent in
+                ForEach(store.agents) { agent in
                     agentRow(agent)
                 }
             }
         }
     }
 
-    private var tasksSection: some View {
+    private var sessionsSection: some View {
         VStack(alignment: .leading, spacing: 0) {
-            sectionHeading("Tasks",
-                           expanded: tasksExpanded) {
-                tasksExpanded.toggle()
+            sectionHeading("Recent Sessions",
+                           expanded: sessionsExpanded) {
+                sessionsExpanded.toggle()
             }
-            if tasksExpanded {
-                ForEach(store.tasks, id: \.uiID) { task in
-                    taskRow(task)
+            if sessionsExpanded {
+                ForEach(store.sessions) { session in
+                    sessionRow(session)
                 }
             }
         }
     }
 
-    // MARK: - Groups
-
-    private func workspaceGroup(_ workspace: Workspace) -> some View {
-        let rows = agents(in: workspace)
-        return VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(workspace.title)
-                    .font(.headline)
-                Spacer()
-            }
-            .padding(.top, 18)
-            .padding(.bottom, 6)
-            if rows.isEmpty {
-                // No agents under a workspace still earns a line: its folder.
-                HStack(spacing: 10) {
-                    Image("lucide-server")
-                        .resizable()
-                        .renderingMode(.template)
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 16, height: 16)
-                        .foregroundStyle(.primary)
-                    Text(workspace.cwd ?? workspace.terminal_cwd ?? "")
-                        .font(.callout)
+    private func sessionRow(_ session: SessionSummary) -> some View {
+        Button {
+            navPath.append(session)
+        } label: {
+            HStack(spacing: 12) {
+                AgentIconView(kind: session.kind, size: 20)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(session.title)
+                        .font(.body.weight(.medium))
+                        .lineLimit(1)
+                    Text(sessionSubtitle(session))
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
-                .padding(.vertical, 6)
-            } else {
-                ForEach(rows) { agent in
-                    agentRow(agent)
-                }
-            }
-        }
-    }
-
-    /// A linked worktree hangs off its repo's workspace as an indented
-    /// group. No label: the daemon names the workspace after its branch, and
-    /// the agents already carry that branch in their subtitle.
-    private func worktreeGroup(_ workspace: Workspace) -> some View {
-        let rows = agents(in: workspace)
-        return VStack(alignment: .leading, spacing: 0) {
-            if rows.isEmpty {
-                // Nothing hangs under the indent — fall back to the path,
-                // like an agentless workspace's folder line.
-                Text(workspace.cwd ?? workspace.terminal_cwd ?? "")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .padding(.top, 10)
-            } else {
-                ForEach(rows) { agent in
-                    agentRow(agent)
-                }
-            }
-        }
-        .padding(.leading, 20)
-    }
-
-    /// A task row opens the pane its workspace worker runs in — the task
-    /// carries a `tab_id`, `tab.get` answers the pane.
-    private func taskRow(_ task: OrchTask) -> some View {
-        Button {
-            guard openingTaskID == nil else { return }
-            openingTaskID = task.uiID
-            Task {
-                defer { openingTaskID = nil }
-                if let agent = try? await store.taskAgent(task) {
-                    navPath.append(agent)
-                }
-            }
-        } label: {
-            HStack(spacing: 12) {
-                TaskIconView(status: task.status, size: 26)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(task.title ?? task.id)
-                        .font(.body.weight(.medium))
-                    if let status = task.status {
-                        Text(status)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Spacer()
-                if openingTaskID == task.uiID {
-                    ProgressView().controlSize(.small)
-                }
+                Spacer(minLength: 8)
             }
             .padding(.vertical, 8)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    private func sessionSubtitle(_ session: SessionSummary) -> String {
+        var parts: [String] = []
+        if let updated = session.updated, updated > 0 {
+            parts.append(Date(timeIntervalSince1970: TimeInterval(updated))
+                .formatted(.relative(presentation: .named)))
+        }
+        if let cwd = session.cwd, !cwd.isEmpty {
+            parts.append((cwd as NSString).lastPathComponent)
+        }
+        if store.machineOrder.count > 1 {
+            parts.append(store.machineTitle(session.machine))
+        }
+        return parts.joined(separator: " · ")
     }
 
     private func agentRow(_ agent: Agent) -> some View {

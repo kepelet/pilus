@@ -12,6 +12,9 @@ pub enum Error {
     /// A remote machine did not answer, or answered with a failure.
     #[error("{0}")]
     Remote(String),
+    /// A path that is not a session transcript, which is never opened.
+    #[error("not a session transcript")]
+    NotTranscript,
 }
 
 /// A result carrying an indexing [`Error`].

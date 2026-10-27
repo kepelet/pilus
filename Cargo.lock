@@ -6588,6 +6588,7 @@ dependencies = [
  "iroh-services",
  "iroh-tickets",
  "pilus-client",
+ "pilus-index",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",

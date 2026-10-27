@@ -88,6 +88,22 @@ const GH_READS: &[&str] = &[
     "hub.gh.pull_draft",
 ];
 
+/// The session reads, answered from the agents' own transcript files on the
+/// machine. A `Control` device may call them: a transcript says no more than the
+/// pane the agent ran in already showed it.
+const SESSION_READS: &[&str] = &["hub.sessions", "hub.transcript"];
+
+/// Sessions a `hub.sessions` listing returns unless asked for fewer.
+const SESSIONS_DEFAULT: u64 = 30;
+/// Most sessions a listing returns.
+const SESSIONS_MAX: u64 = 100;
+/// The transcript bytes `hub.transcript` reads unless asked for a window.
+const TRANSCRIPT_WINDOW: u64 = 1024 * 1024;
+/// Newest entries a transcript reply carries unless asked for fewer.
+const TRANSCRIPT_ENTRIES: u64 = 200;
+/// Most entries a transcript reply carries.
+const TRANSCRIPT_ENTRIES_MAX: u64 = 600;
+
 /// The GitHub writes. They act as the host's GitHub account (a comment, or a
 /// pull request after pushing the branch), which is more than the gateway
 /// token grants, so like `hub.run` they need an `Operate` device and are
@@ -177,8 +193,8 @@ pub fn effective_methods(level: Level, gateway: &[String]) -> Vec<String> {
     // they are listed so a device can tell which of them its level carries.
     let extras: &[&[&str]] = match level {
         Level::View => &[],
-        Level::Control => &[REVIEW, GH_READS],
-        Level::Operate => &[REVIEW, OPERATE, GH_READS, GH_WRITES],
+        Level::Control => &[REVIEW, GH_READS, SESSION_READS],
+        Level::Operate => &[REVIEW, OPERATE, GH_READS, GH_WRITES, SESSION_READS],
     };
     for method in extras.iter().copied().flatten() {
         if !methods.iter().any(|name| name == method) {
@@ -321,6 +337,21 @@ impl Hub {
 
         if method == "hub.machines" {
             return reply(&id, Ok(self.machines().await));
+        }
+        if SESSION_READS.contains(&method) {
+            let outcome = if level < Level::Control {
+                Err(failure(
+                    "forbidden",
+                    &format!("{method} is not allowed for a {} device", level.as_str()),
+                ))
+            } else {
+                tokio::time::timeout(CALL_TIMEOUT, self.sessions(machine, method, &params))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(failure("timeout", "the machine did not answer in time"))
+                    })
+            };
+            return reply(&id, outcome);
         }
         if method.starts_with("hub.gh.") {
             let outcome = self.gh_call(level, device, machine, method, &params).await;
@@ -984,6 +1015,46 @@ impl Hub {
             .map_err(|error| failure("internal", &error.to_string()))?
     }
 
+    /// `hub.sessions` and `hub.transcript`: the newest sessions on `machine`, the
+    /// one a live agent runs on (`agent` + `cwd`, and `session` when known), or
+    /// the end of one transcript by `path`.
+    async fn sessions(&self, machine: &str, method: &str, params: &Value) -> Result<Value, Value> {
+        let (target, _permit) = if machine == LOCAL {
+            (None, None)
+        } else {
+            let known = self.catalog().await;
+            let target = known
+                .into_iter()
+                .find(|info| info.id == machine && info.enabled)
+                .and_then(|info| info.ssh_target())
+                .ok_or_else(|| failure("not_found", &format!("no usable machine `{machine}`")))?;
+            let permit = self
+                .ssh
+                .acquire()
+                .await
+                .map_err(|_| failure("unavailable", "the hub is shutting down"))?;
+            (Some(target), Some(permit))
+        };
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let machine = machine.to_string();
+        let method = method.to_string();
+        let params = params.clone();
+        tokio::task::spawn_blocking(move || {
+            let source = match (&target, home) {
+                (Some(target), _) => pilus_index::Source::Remote(target),
+                (None, Some(home)) => pilus_index::Source::Local(home),
+                (None, None) => return Err(failure("unavailable", "no home directory")),
+            };
+            if method == "hub.transcript" {
+                transcript_reply(&source, &params)
+            } else {
+                sessions_reply(&source, &machine, &params)
+            }
+        })
+        .await
+        .map_err(|error| failure("internal", &error.to_string()))?
+    }
+
     /// The agents installed on `machine`, as a picker should list them.
     async fn agents(&self, machine: &str) -> Result<Value, Value> {
         let found = self.installed_agents(machine).await?;
@@ -1634,6 +1705,122 @@ fn extra_args(value: Option<&Value>) -> Result<Vec<String>, String> {
 }
 
 /// `{"id","result"}` or `{"id","error"}`.
+fn index_failure(error: &pilus_index::Error) -> Value {
+    match error {
+        pilus_index::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            failure("not_found", "that session's transcript is gone")
+        }
+        other => failure("unavailable", &other.to_string()),
+    }
+}
+
+fn session_json(session: &pilus_index::Session) -> Value {
+    json!({
+        "agent": session.agent.kind(),
+        "session_id": session.session_id,
+        "title": session.title,
+        "cwd": session.cwd,
+        "branch": session.branch,
+        "started": session.started,
+        "updated": session.updated,
+        "path": session.path,
+        "size": session.size,
+    })
+}
+
+fn sessions_reply(
+    source: &pilus_index::Source<'_>,
+    machine: &str,
+    params: &Value,
+) -> Result<Value, Value> {
+    let text = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let agent = match text("agent") {
+        Some(kind) => Some(pilus_index::Agent::from_kind(kind).ok_or_else(|| {
+            failure(
+                "unsupported",
+                &format!("no transcripts are read for `{kind}`"),
+            )
+        })?),
+        None => None,
+    };
+    let sessions = match (agent, text("cwd")) {
+        (Some(agent), Some(cwd)) => {
+            pilus_index::session_for_source(source, machine, agent, cwd, text("session"))
+                .map_err(|error| index_failure(&error))?
+                .into_iter()
+                .collect()
+        }
+        _ => {
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(SESSIONS_DEFAULT)
+                .clamp(1, SESSIONS_MAX);
+            pilus_index::recent(source, machine, agent, usize::try_from(limit).unwrap_or(30))
+                .map_err(|error| index_failure(&error))?
+        }
+    };
+    Ok(json!({ "sessions": sessions.iter().map(session_json).collect::<Vec<_>>() }))
+}
+
+fn transcript_reply(source: &pilus_index::Source<'_>, params: &Value) -> Result<Value, Value> {
+    let path = params
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| failure("bad_request", "`path` must be a session's transcript"))?;
+    let window = params
+        .get("window")
+        .and_then(Value::as_u64)
+        .unwrap_or(TRANSCRIPT_WINDOW)
+        .clamp(64 * 1024, pilus_index::MAX_WINDOW);
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(TRANSCRIPT_ENTRIES)
+        .clamp(1, TRANSCRIPT_ENTRIES_MAX);
+    let transcript = pilus_index::transcript_at(source, path, window).map_err(|error| {
+        if matches!(error, pilus_index::Error::NotTranscript) {
+            failure("forbidden", "not a session transcript")
+        } else {
+            index_failure(&error)
+        }
+    })?;
+    let limit = usize::try_from(limit).unwrap_or(200);
+    let skip = transcript.entries.len().saturating_sub(limit);
+    let entries: Vec<Value> = transcript.entries[skip..]
+        .iter()
+        .map(|entry| match entry {
+            pilus_index::Entry::User { text, at } => {
+                json!({ "type": "user", "text": text, "at": at })
+            }
+            pilus_index::Entry::Assistant { text, at } => {
+                json!({ "type": "assistant", "text": text, "at": at })
+            }
+            pilus_index::Entry::Tool {
+                name,
+                summary,
+                output,
+                failed,
+                at,
+            } => json!({
+                "type": "tool",
+                "name": name,
+                "summary": summary,
+                "output": output,
+                "failed": failed,
+                "at": at,
+            }),
+        })
+        .collect();
+    Ok(json!({ "entries": entries, "earlier": transcript.earlier || skip > 0 }))
+}
+
 fn reply(id: &Value, outcome: Result<Value, Value>) -> Value {
     match outcome {
         Ok(result) => json!({ "id": id, "result": result }),
@@ -2127,10 +2314,18 @@ mod tests {
         .collect();
         let view = effective_methods(Level::View, &gateway);
         assert_eq!(view, vec!["workspace.list", "agent.read"]);
-        // Control adds the review calls and the GitHub reads, nothing else.
+        // Control adds the review calls, the GitHub reads and the session
+        // reads, nothing else.
         let control = effective_methods(Level::Control, &gateway);
         assert_eq!(control[..gateway.len()], gateway[..]);
-        assert_eq!(control.len(), gateway.len() + REVIEW.len() + GH_READS.len());
+        assert_eq!(
+            control.len(),
+            gateway.len() + REVIEW.len() + GH_READS.len() + SESSION_READS.len()
+        );
+        for method in SESSION_READS {
+            assert!(control.iter().any(|name| name == method), "{method}");
+            assert!(!view.iter().any(|name| name == method), "{method}");
+        }
         for method in GH_READS {
             assert!(control.iter().any(|name| name == method), "{method}");
             assert!(!view.iter().any(|name| name == method), "{method}");

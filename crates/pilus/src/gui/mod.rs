@@ -142,7 +142,7 @@ use ports_tab::PortsPanel;
 use process::ProcessPage;
 use right_sidebar::{RightSidebar, SidebarTab};
 use search::SearchPage;
-use selection::{Cell, Selection};
+use selection::{Cell, CellRect, Selection};
 use session_ops::SessionVerb;
 use sidebar_menu::{Item as SidebarItem, MenuTarget as SidebarMenuTarget, SidebarMenu};
 use stats::StatsPage;
@@ -1881,6 +1881,9 @@ struct PilusView {
     sent_cell: (u16, u16),
     /// Active native selection, if any.
     selection: Option<Selection>,
+    /// The panes the selection was made over. Its cells mean nothing once a
+    /// split, close or resize moves them, so render drops it then.
+    selection_panes: Vec<pane_frames::PaneFrame>,
     /// Whether the left button is held and dragging across the grid.
     dragging: bool,
     /// Whether a drag left its anchor, making it a selection rather than a click.
@@ -2649,6 +2652,7 @@ impl PilusView {
             cell_width: None,
             sent_cell: (0, 0),
             selection: None,
+            selection_panes: Vec::new(),
             dragging: false,
             drag_moved: false,
             press_anchor: None,
@@ -10213,20 +10217,24 @@ impl PilusView {
             if cell == anchor {
                 return;
             }
-            match self.selection.as_mut() {
-                Some(selection) if selection.cursor != cell => {
-                    selection.cursor = cell;
-                    self.drag_moved = true;
-                    cx.notify();
-                }
+            let moved = match self.selection.as_mut() {
+                Some(selection) => selection.move_cursor(cell),
                 None => {
-                    let mut created = Selection::new(anchor);
-                    created.cursor = cell;
+                    // In a split tab the drag keeps to the pane it started
+                    // in, however far the pointer wanders.
+                    let visible = self.visible_bounds(window);
+                    let bounds =
+                        self.pane_bounds(visible, |pane| pane.holds(anchor.column, anchor.row));
+                    let mut created = Selection::within(anchor, bounds);
+                    created.move_cursor(cell);
                     self.selection = Some(created);
-                    self.drag_moved = true;
-                    cx.notify();
+                    self.selection_panes = self.shown_panes().panes().to_vec();
+                    true
                 }
-                _ => {}
+            };
+            if moved {
+                self.drag_moved = true;
+                cx.notify();
             }
             return;
         }
@@ -10437,22 +10445,50 @@ impl PilusView {
         }
     }
 
-    /// Select the whole visible grid, so Cmd+A followed by Cmd+C copies it.
+    /// Select the focused pane, or the whole visible grid when the tab is not
+    /// split, so Cmd+A followed by Cmd+C copies it. The focused pane is the
+    /// one holding the caret, the same pane the chrome outlines.
     fn select_all(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let layout = self.card_layout(window);
-        let skip = self.skipped_cols();
-        let skip_rows = self.skipped_rows();
-        self.selection = Some(Selection {
-            anchor: Cell {
-                column: skip,
-                row: skip_rows,
-            },
-            cursor: Cell {
-                column: skip.saturating_add(layout.cols).saturating_sub(1),
-                row: skip_rows.saturating_add(layout.rows).saturating_sub(1),
-            },
-        });
+        let visible = self.visible_bounds(window);
+        let caret = self.shown_frame().and_then(|frame| frame.cursor);
+        let bounds = caret
+            .and_then(|(column, row)| self.pane_bounds(visible, |pane| pane.holds(column, row)))
+            .unwrap_or(visible);
+        self.selection = Some(Selection::all(bounds));
+        self.selection_panes = self.shown_panes().panes().to_vec();
         cx.notify();
+    }
+
+    /// The cells the card paints: past the dock and the skipped top rows.
+    fn visible_bounds(&mut self, window: &Window) -> CellRect {
+        let layout = self.card_layout(window);
+        let left = self.skipped_cols();
+        let top = self.skipped_rows();
+        CellRect {
+            left,
+            top,
+            right: left.saturating_add(layout.cols).saturating_sub(1),
+            bottom: top.saturating_add(layout.rows).saturating_sub(1),
+        }
+    }
+
+    /// The inside of the first pane `pick` accepts, border excluded and cut
+    /// to `visible`. `None` when the tab is not split, so a selection there
+    /// spans the grid as before.
+    fn pane_bounds(
+        &self,
+        visible: CellRect,
+        pick: impl Fn(&pane_frames::PaneFrame) -> bool,
+    ) -> Option<CellRect> {
+        let panes = self.shown_panes();
+        let pane = panes.panes().iter().find(|pane| pick(pane))?;
+        let bounds = CellRect {
+            left: pane.left.saturating_add(1).max(visible.left),
+            top: pane.top.saturating_add(1).max(visible.top),
+            right: pane.right.saturating_sub(1).min(visible.right),
+            bottom: pane.bottom.saturating_sub(1).min(visible.bottom),
+        };
+        (bounds.left <= bounds.right && bounds.top <= bounds.bottom).then_some(bounds)
     }
 
     /// Resolve a control client for any endpoint, active or stashed.
@@ -15282,6 +15318,13 @@ impl Render for PilusView {
         let cell_width = self.cell_width(window);
         let layout = self.card_layout(window);
         let line_height = px(cell_height);
+        // After a split the old cells sit under a different pane (or two), so
+        // the highlight would spill into the new one. Scanned only while
+        // something is selected.
+        if self.selection.is_some() && self.shown_panes().panes() != self.selection_panes.as_slice()
+        {
+            self.selection = None;
+        }
         let selection = self.selection;
         // The terminal shares the sidebar's background: one uniform base
         // under the grid, the card, and the chrome, whatever the running app

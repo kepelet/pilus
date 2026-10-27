@@ -426,10 +426,7 @@ pub(super) fn send_to_conversation(watching: &Watch, text: String, reply: Option
         // A contact known to be away is not dialed: that would hold the composer
         // for the whole dial deadline just to learn it again.
         if let Some(contact) = away {
-            let first = stores()
-                .offline
-                .queued(&contact.id, &contact.id)
-                .is_empty();
+            let first = stores().offline.queued(&contact.id, &contact.id).is_empty();
             hold(&contact, &text, reply.as_ref(), first);
             return;
         }
@@ -497,13 +494,10 @@ fn note_away(id: &str) {
 /// left off when a dial or a check has just said they are not, and for lines
 /// that join ones already waiting.
 fn hold(contact: &Contact, text: &str, reply: Option<&Quote>, wake: bool) {
-    let queued = stores().offline.queue_replying(
-        &contact.id,
-        &contact.id,
-        text,
-        &request_id(),
-        reply,
-    );
+    let queued =
+        stores()
+            .offline
+            .queue_replying(&contact.id, &contact.id, text, &request_id(), reply);
     let taken = queued.is_some();
     update(|state| {
         state.sending = false;
@@ -860,6 +854,7 @@ fn item_of(directory: &Directory, watching: &Watch, line: Line) -> TranscriptIte
         error: None,
         at: Some(line.at),
         speaker,
+        pane: None,
     }
 }
 

@@ -23,7 +23,7 @@ targets:
         # INFOPLIST_KEY_* can't express (URL types for pilus://pair/…).
         INFOPLIST_FILE: Pilus/Info.plist
         MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "61"
+        CURRENT_PROJECT_VERSION: "62"
         DEVELOPMENT_TEAM: 8BJ4LW5J8P
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"

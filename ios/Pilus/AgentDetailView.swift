@@ -20,6 +20,7 @@ struct AgentDetailView: View {
         !lookedUp && ["claude", "pi"].contains(agent.kind) && store.hubAllows("hub.sessions", on: agent.machine)
     }
     @State private var refreshes = 0
+    @State private var transcriptError: String?
     /// Sent messages shown at the transcript's end until a re-read has them.
     @State private var pending: [TranscriptEntry] = []
     @State private var reply = ""
@@ -180,6 +181,10 @@ struct AgentDetailView: View {
         // watch is up; without it (no hub, or a saved SSH machine, which has no
         // event feed) it is the way the screen stays current.
         .task {
+            if session == nil, let known = store.agentSessions[agent.id] {
+                session = known
+                transcript = store.cachedTranscript(path: known.path, machine: known.machine)
+            }
             await refresh()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(watchDriven ? 20 : 4))
@@ -287,7 +292,13 @@ struct AgentDetailView: View {
                 }
                 Spacer(minLength: 0)
                 if let transcript {
-                    TranscriptList(entries: transcript.entries + pending, earlier: transcript.earlier ?? false)
+                    if transcript.entries.isEmpty && pending.isEmpty {
+                        TranscriptNotice(title: "Nothing said yet")
+                    } else {
+                        TranscriptList(entries: transcript.entries + pending, earlier: transcript.earlier ?? false)
+                    }
+                } else if let transcriptError {
+                    TranscriptNotice(title: "Couldn't read this chat", detail: transcriptError)
                 } else if awaitingTranscript {
                     TranscriptSkeleton()
                 } else {
@@ -343,13 +354,17 @@ struct AgentDetailView: View {
             lookedUp = true
             return
         }
-        if let reply = try? await store.transcript(path: session.path, machine: session.machine) {
+        do {
+            let reply = try await store.transcript(path: session.path, machine: session.machine)
             transcript = reply
+            transcriptError = nil
             truncated = false
             let said = reply.entries.suffix(20).filter { $0.type == "user" }
                 .compactMap { $0.text?.trimmingCharacters(in: .whitespacesAndNewlines) }
             let stale = Int(Date().timeIntervalSince1970) - 120
             pending.removeAll { said.contains($0.text ?? "") || ($0.at ?? 0) < stale }
+        } catch {
+            if transcript == nil { transcriptError = error.localizedDescription }
         }
         lookedUp = true
     }

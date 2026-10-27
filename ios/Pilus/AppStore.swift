@@ -12,6 +12,12 @@ final class AppStore {
     /// The newest agent sessions across machines, newest first (`hub.sessions`).
     var sessions: [SessionSummary] = []
     var sessionsLoaded = false
+    /// The last transcript read per session (`SessionSummary.id`) and the
+    /// session matched per live agent (`Agent.id`), so a screen opens on
+    /// what was seen before while the hub is re-asked. Kept on disk.
+    private(set) var transcriptCache: [String: TranscriptReply] = [:]
+    private var transcriptOrder: [String] = []
+    private(set) var agentSessions: [String: SessionSummary] = [:]
     var machines: [Machine] = []
     var hostLabel: String?
     /// Agent-kind catalog per machine (`hub.agents` answers per machine).
@@ -98,6 +104,7 @@ final class AppStore {
     var canReviewDiff: Bool { allowedMethods.contains("diff.note.add") }
 
     init() {
+        restoreSessionCache()
         deviceId = try? PilusClient.deviceId()
         if let client = PilusClient.resume() {
             self.client = client
@@ -813,6 +820,7 @@ final class AppStore {
         }
         sessions = Array(merged.sorted { ($0.updated ?? 0) > ($1.updated ?? 0) }.prefix(limit))
         sessionsLoaded = true
+        saveSessionCache()
     }
 
     /// The session a live agent runs on: the daemon's session id when
@@ -839,14 +847,58 @@ final class AppStore {
         if let title, !title.isEmpty { params["title"] = title }
         let reply: SessionList = try await call(
             method: "hub.sessions", params: params, machine: agent.machine)
-        return reply.sessions.first.map { var row = $0; row.machine = agent.machine; return row }
+        let found = reply.sessions.first.map { var row = $0; row.machine = agent.machine; return row }
+        agentSessions[agent.id] = found
+        return found
     }
 
     /// The newest entries of a session's transcript.
     func transcript(path: String, machine: String, limit: Int = 200) async throws -> TranscriptReply {
-        try await call(method: "hub.transcript",
-                       params: ["path": path, "limit": limit],
-                       machine: machine)
+        let reply: TranscriptReply = try await call(
+            method: "hub.transcript", params: ["path": path, "limit": limit], machine: machine)
+        let key = "\(machine):\(path)"
+        transcriptCache[key] = reply
+        transcriptOrder.removeAll { $0 == key }
+        transcriptOrder.append(key)
+        while transcriptOrder.count > Self.cachedTranscripts {
+            transcriptCache[transcriptOrder.removeFirst()] = nil
+        }
+        saveSessionCache()
+        return reply
+    }
+
+    func cachedTranscript(path: String, machine: String) -> TranscriptReply? {
+        transcriptCache["\(machine):\(path)"]
+    }
+
+    private static let cachedTranscripts = 30
+    private struct SessionCache: Codable {
+        var sessions: [SessionSummary]
+        var transcripts: [String: TranscriptReply]
+        var order: [String]
+        var agents: [String: SessionSummary]
+    }
+    private static var sessionCacheURL: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("sessions-cache.json")
+    }
+
+    private func restoreSessionCache() {
+        guard let data = try? Data(contentsOf: Self.sessionCacheURL),
+              let cache = try? JSONDecoder().decode(SessionCache.self, from: data) else { return }
+        sessions = cache.sessions
+        sessionsLoaded = !cache.sessions.isEmpty
+        transcriptCache = cache.transcripts
+        transcriptOrder = cache.order
+        agentSessions = cache.agents
+    }
+
+    private func saveSessionCache() {
+        let cache = SessionCache(
+            sessions: sessions, transcripts: transcriptCache,
+            order: transcriptOrder, agents: agentSessions)
+        guard let data = try? JSONEncoder().encode(cache) else { return }
+        try? data.write(to: Self.sessionCacheURL, options: .atomic)
     }
 
     /// Whether `session` can be continued or forked from here: an Operate

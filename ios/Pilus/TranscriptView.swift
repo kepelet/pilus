@@ -51,21 +51,24 @@ private struct TranscriptRow: View {
     private var tool: some View {
         VStack(alignment: .leading, spacing: 4) {
             Button {
-                if hasOutput { expanded.toggle() }
+                guard hasOutput else { return }
+                var plain = Transaction()
+                plain.disablesAnimations = true
+                withTransaction(plain) { expanded.toggle() }
             } label: {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Image(systemName: entry.failed == true ? "xmark.circle" : "wrench.and.screwdriver")
-                        .font(.caption2)
-                        .foregroundStyle(entry.failed == true ? .red : .secondary)
+                VStack(alignment: .leading, spacing: 2) {
                     Text(entry.name ?? "tool")
                         .font(.caption.weight(.semibold))
-                    Text(entry.summary ?? "")
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(expanded ? nil : 1)
-                        .truncationMode(.middle)
-                    Spacer(minLength: 0)
+                        .foregroundStyle(entry.failed == true ? .red : .primary)
+                    if let summary = entry.summary, !summary.isEmpty {
+                        Text(summary)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(expanded ? nil : 1)
+                            .truncationMode(.middle)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -79,6 +82,7 @@ private struct TranscriptRow: View {
                     .textSelection(.enabled)
             }
         }
+        .animation(nil, value: expanded)
     }
 
     private var hasOutput: Bool { !(entry.output ?? "").isEmpty }
@@ -106,18 +110,12 @@ struct SessionTranscriptView: View {
         ScrollView {
             if let reply {
                 if reply.entries.isEmpty {
-                    Text("Nothing said yet")
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 40)
+                    TranscriptNotice(title: "Nothing said yet")
                 } else {
                     TranscriptList(entries: reply.entries, earlier: reply.earlier ?? false)
                 }
             } else if let loadError {
-                Text(loadError)
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-                    .padding()
+                TranscriptNotice(title: "Couldn't read this chat", detail: loadError)
             } else {
                 TranscriptSkeleton()
             }
@@ -152,12 +150,15 @@ struct SessionTranscriptView: View {
                 choosing = false
                 onStarted(agent)
             }
-            .presentationDetents([.height(280)])
+            .presentationDetents([.height(200)])
         }
         .refreshable { await load() }
         .navigationTitle(session.title)
         .navigationBarTitleDisplayMode(.inline)
         .task {
+            if reply == nil {
+                reply = store.cachedTranscript(path: session.path, machine: session.machine)
+            }
             while !Task.isCancelled {
                 await load()
                 try? await Task.sleep(for: .seconds(15))
@@ -214,11 +215,9 @@ struct ReopenSheet: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 20) {
-                choice(fork: false, title: "Continue", detail: "Pick up in this session",
-                       systemImage: "play.fill")
-                choice(fork: true, title: "Fork", detail: "Start a new session from here",
-                       systemImage: "arrow.branch")
+            VStack(spacing: 12) {
+                choice(fork: false, title: "Continue")
+                choice(fork: true, title: "Fork")
                 if let startError {
                     Text(startError)
                         .font(.footnote)
@@ -238,44 +237,58 @@ struct ReopenSheet: View {
     }
 
     @ViewBuilder
-    private func choice(fork: Bool, title: String, detail: String, systemImage: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(detail)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            let button = Button {
-                Task {
-                    starting = fork
-                    startError = nil
-                    do {
-                        if let agent = try await store.reopen(session, fork: fork) {
-                            onStarted(agent)
-                        } else {
-                            dismiss()
-                        }
-                    } catch {
-                        startError = error.localizedDescription
-                    }
-                    starting = nil
-                }
-            } label: {
-                HStack {
-                    if starting == fork {
-                        ProgressView()
+    private func choice(fork: Bool, title: String) -> some View {
+        let button = Button {
+            Task {
+                starting = fork
+                startError = nil
+                do {
+                    if let agent = try await store.reopen(session, fork: fork) {
+                        onStarted(agent)
                     } else {
-                        Image(systemName: systemImage)
+                        dismiss()
                     }
-                    Text(title)
+                } catch {
+                    startError = error.localizedDescription
                 }
-                .frame(maxWidth: .infinity)
+                starting = nil
             }
-            .controlSize(.large)
-            .disabled(starting != nil)
-            if fork {
-                button.buttonStyle(.bordered)
-            } else {
-                button.buttonStyle(.borderedProminent)
+        } label: {
+            Group {
+                if starting == fork { ProgressView() } else { Text(title) }
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .controlSize(.large)
+        .disabled(starting != nil)
+        if fork {
+            button.buttonStyle(.bordered)
+        } else {
+            button.buttonStyle(.borderedProminent)
+        }
+    }
+}
+
+/// A line in place of a transcript that is empty or could not be read.
+struct TranscriptNotice: View {
+    let title: String
+    var detail: String?
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(.secondary)
+            if let detail {
+                Text(detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .textSelection(.enabled)
             }
         }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 24)
+        .padding(.top, 40)
     }
 }

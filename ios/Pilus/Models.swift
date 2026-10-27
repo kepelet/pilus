@@ -306,7 +306,7 @@ struct EmptyReply: Decodable {}
 
 /// One agent session from `hub.sessions` — read from the agent's own
 /// transcript on the machine, like the desktop's Search and Home pages.
-struct SessionSummary: Decodable, Identifiable, Hashable {
+struct SessionSummary: Codable, Identifiable, Hashable {
     let agent: String
     let session_id: String
     let title: String
@@ -323,7 +323,21 @@ struct SessionSummary: Decodable, Identifiable, Hashable {
     var kind: String { agent }
 
     private enum CodingKeys: String, CodingKey {
-        case agent, session_id, title, cwd, branch, started, updated, path
+        case agent, session_id, title, cwd, branch, started, updated, path, machine
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        agent = try c.decode(String.self, forKey: .agent)
+        session_id = try c.decode(String.self, forKey: .session_id)
+        title = try c.decode(String.self, forKey: .title)
+        cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
+        branch = try c.decodeIfPresent(String.self, forKey: .branch)
+        started = try c.decodeIfPresent(Int.self, forKey: .started)
+        updated = try c.decodeIfPresent(Int.self, forKey: .updated)
+        path = try c.decode(String.self, forKey: .path)
+        // Hubs never send it; the on-device cache does.
+        machine = try c.decodeIfPresent(String.self, forKey: .machine) ?? "local"
     }
 }
 
@@ -332,7 +346,7 @@ struct SessionList: Decodable {
 }
 
 /// One thing said or done in a session, as `hub.transcript` folds it.
-struct TranscriptEntry: Decodable, Hashable {
+struct TranscriptEntry: Codable, Hashable {
     let type: String
     let text: String?
     let name: String?
@@ -342,7 +356,7 @@ struct TranscriptEntry: Decodable, Hashable {
     let at: Int?
 }
 
-struct TranscriptReply: Decodable {
+struct TranscriptReply: Codable {
     let entries: [TranscriptEntry]
     let earlier: Bool?
 }

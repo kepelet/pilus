@@ -11594,7 +11594,8 @@ impl PilusView {
             .flex_col()
             .gap_1()
             .w(px(panel_w))
-            .px(px(SIDEBAR_ROW_EDGE))
+            .pl(px(SIDEBAR_ROW_EDGE))
+            .pr(px(self.sidebar_row_edge_right()))
             .pb(px(SIDEBAR_LIST_PAD));
 
         // One hover pill glides between rows, the way the tab strip's
@@ -14330,7 +14331,7 @@ impl PilusView {
             .h(px(SIDEBAR_BAND_HEIGHT))
             // The hairline runs to the panel edge, breaking out of the row
             // inset; the chevron stays on the row glyph column.
-            .mr(px(-SIDEBAR_ROW_EDGE))
+            .mr(px(-self.sidebar_row_edge_right()))
             .child(
                 div()
                     .id(id)
@@ -15097,6 +15098,17 @@ impl PilusView {
                 )
             })
             .unwrap_or_default()
+    }
+
+    /// The rows' inset from the sidebar's right edge. Floating cards keep a
+    /// gap from the sidebar already, the same ground on both sides, so the
+    /// rows run to the edge and leave that gap as the only space.
+    fn sidebar_row_edge_right(&self) -> f32 {
+        if self.floating_cards() {
+            0.0
+        } else {
+            SIDEBAR_ROW_EDGE
+        }
     }
 
     /// The sidebar's fill: the tab strip's while cards float, so the card

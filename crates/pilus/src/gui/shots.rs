@@ -1705,6 +1705,18 @@ pub fn run_main() -> Result<()> {
     });
     cx.run_until_parked();
     capture(&mut cx, window.into(), "main-latte")?;
+
+    // The tab strip before the daemon's first tab list: three skeleton tabs.
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.agent_feed = None;
+            view.agents_loaded = false;
+            view.tabs = Vec::new();
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    capture(&mut cx, window.into(), "main-tabs-loading")?;
     // Drop the entity handle held for the overlay captures, or the app's
     // leak detector reports it at shutdown.
     view_cell.borrow_mut().take();

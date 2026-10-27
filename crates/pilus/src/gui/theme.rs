@@ -213,23 +213,26 @@ impl Theme {
         .chrome_cell(glass)
     }
 
-    /// The raised fill under a selected or hovered sidebar row, at window
-    /// opacity `glass`.
+    /// The raised fill under a selected or hovered sidebar row or tab: the
+    /// terminal card's own color, so the selection reads as one piece with
+    /// the card it opens. `weight` thins it out for hover.
     ///
-    /// `panel` is tuned against the opaque `window_bg`, but under translucency
-    /// the sidebar is shaded darker than that (`chrome_glass`), so the same
-    /// pill stands out harder than the opaque one does. Blending the pill
-    /// toward the chrome shade as the window turns translucent keeps its
-    /// contrast with the sidebar constant; `weight` scales it down for hover.
-    pub fn sidebar_raise(self, glass: f32, weight: f32) -> Rgba {
-        let chrome = self.chrome_glass(glass);
-        let keep = glass.clamp(0.0, 1.0);
-        let mix = |panel: f32, base: f32| panel * keep + base * (1.0 - keep);
+    /// It stays opaque however translucent the window is, so the selection
+    /// never takes on the desktop behind it.
+    pub fn card_raise(self, weight: f32) -> Rgba {
         Rgba {
-            r: mix(self.panel.r, chrome.r),
-            g: mix(self.panel.g, chrome.g),
-            b: mix(self.panel.b, chrome.b),
-            a: chrome.a * weight,
+            a: weight.clamp(0.0, 1.0),
+            ..self.bg
+        }
+    }
+
+    /// The ground under the sidebar and the tab strip: `window_bg` opaque,
+    /// tinted toward the accent while cards float over it.
+    pub fn chrome_ground(self, tinted: bool) -> Rgba {
+        if tinted {
+            self.pane_surface(1.0)
+        } else {
+            self.window_bg
         }
     }
 

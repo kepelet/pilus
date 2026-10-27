@@ -290,6 +290,11 @@ const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
 /// Inset for the tab strip when nothing floats over its left edge: the sidebar
 /// is open, or fullscreen hides the traffic lights.
 const TAB_STRIP_EDGE: f32 = 12.0;
+/// The narrowest a tab goes while the strip holds company, and the width of a
+/// placeholder tab.
+const TAB_MIN_WIDTH: f32 = 180.0;
+/// How many placeholder tabs a loading strip shows.
+const TAB_SKELETONS: usize = 3;
 /// Section label size (SIPIL / WORKSPACES).
 const SECTION_FONT: f32 = 11.0;
 /// Opening size of the main window when nothing is remembered.
@@ -11576,7 +11581,7 @@ impl PilusView {
             "pilus-sidebar-hover",
             &self.sidebar_hover,
             self.theme
-                .sidebar_raise(self.glass_opacity(), SIDEBAR_HOVER_WEIGHT),
+                .card_raise(SIDEBAR_HOVER_WEIGHT),
             style::RADIUS_MD,
             SIDEBAR_ROW_EDGE,
         ));
@@ -11588,14 +11593,14 @@ impl PilusView {
             "pilus-sidebar-context",
             &self.sidebar_context,
             self.theme
-                .sidebar_raise(self.glass_opacity(), SIDEBAR_CONTEXT_WEIGHT),
+                .card_raise(SIDEBAR_CONTEXT_WEIGHT),
             style::RADIUS_MD,
             SIDEBAR_ROW_EDGE,
         ));
         content = content.child(style::glide(
             "pilus-sidebar-selection",
             &self.sidebar_selection,
-            self.theme.sidebar_raise(self.glass_opacity(), 1.0),
+            self.theme.card_raise(1.0),
             style::RADIUS_MD,
             SIDEBAR_ROW_EDGE,
         ));
@@ -11814,7 +11819,6 @@ impl PilusView {
     /// hidden so the sidebar can always come back.
     fn sidebar_toggle(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let glass = self.glass_opacity();
         div()
             .id(id)
             .occlude()
@@ -11827,7 +11831,7 @@ impl PilusView {
             .radius_md()
             .cursor_pointer()
             .hover_fill(
-                theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT),
+                theme.card_raise(SIDEBAR_HOVER_WEIGHT),
                 style::RADIUS_MD,
             )
             .child(icon(
@@ -11953,14 +11957,16 @@ impl PilusView {
             .overflow_x_scroll()
             .overflow_y_hidden()
             .track_scroll(&self.tab_scroll);
-        // The selected tab's border is one pill that slides to it, so a
-        // switch reads as motion from the old tab to the new one.
+        // The selected tab's card-colored fill and border are one pill that
+        // slides to it, so a switch reads as motion from the old tab to the
+        // new one.
         let selection = style::GlideSlot::default();
-        tabs = tabs.child(style::glide_outline(
+        tabs = tabs.child(style::glide_bordered(
             "pilus-tab-glide",
             &selection,
-            self.theme.border,
+            self.tab_raise(1.0),
             style::RADIUS_SOFT,
+            self.theme.border,
         ));
         for tab in &self.tabs {
             tabs = tabs.child(self.tab_item(tab, &selection, cx));
@@ -12041,7 +12047,14 @@ impl PilusView {
         // The strip stays up under a page; any tab action closes the page.
         // The plus follows the tabs until overflow makes the scroll viewport
         // shrink.
-        tab_strip = tab_strip.child(tabs).child(new_tab);
+        // The strip shows placeholder tabs until the daemon lists its own.
+        tab_strip = tab_strip
+            .child(if self.tabs_loading() {
+                self.tab_skeletons().into_any_element()
+            } else {
+                tabs.into_any_element()
+            })
+            .child(new_tab);
         // The right sidebar's toggle sits at the strip's far edge while the
         // column is away; open, the column's own close button replaces it.
         if self.right.openness() < 0.05 {
@@ -12068,6 +12081,44 @@ impl PilusView {
             .bg(self.tab_strip_fill())
             .border_color(theme.border)
             .child(tab_strip)
+    }
+
+    /// Whether the daemon has yet to report its first tab list, so an empty
+    /// strip means waiting rather than no tabs.
+    fn tabs_loading(&self) -> bool {
+        !self.agents_loaded && self.tabs.is_empty()
+    }
+
+    /// Placeholder tabs for a strip still loading: a tile and a label bar
+    /// each, at a tab's minimum width, so the real tabs land in their place.
+    fn tab_skeletons(&self) -> Div {
+        const LABELS: [f32; TAB_SKELETONS] = [84.0, 60.0, 96.0];
+        let mut row = div().flex().flex_row().items_center().gap_1();
+        for (nth, label) in LABELS.into_iter().enumerate() {
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(TAB_HEIGHT))
+                    .w(px(TAB_MIN_WIDTH))
+                    .pl(px(5.0))
+                    .child(style::skeleton(
+                        format!("pilus-tab-skeleton-tile-{nth}"),
+                        self.theme,
+                        px(20.0),
+                        20.0,
+                    ))
+                    .child(style::skeleton(
+                        format!("pilus-tab-skeleton-label-{nth}"),
+                        self.theme,
+                        px(label),
+                        10.0,
+                    )),
+            );
+        }
+        row
     }
 
     fn tab_item(
@@ -12175,7 +12226,7 @@ impl PilusView {
             .flex_shrink_0()
             // A lone tab is as wide as its label; with company each keeps a
             // width of its own.
-            .when(!lone, |tab| tab.min_w(px(140.0)).max_w(px(280.0)))
+            .when(!lone, |tab| tab.min_w(px(TAB_MIN_WIDTH)).max_w(px(280.0)))
             // The tile sits near the tab's edge; the right side keeps room for
             // the close button.
             .pl(px(2.0))
@@ -12183,13 +12234,13 @@ impl PilusView {
             .radius_soft()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
-            // The selected tab's border is the strip's glide pill; hovering
-            // a tab draws the same edge. The transparent border reserves its
-            // width, so the tab does not shift when it appears.
+            // The selected tab's edge is the strip's glide pill; hovering
+            // an unselected tab draws the same edge. The transparent border
+            // reserves its width, so the tab does not shift when it appears.
             .border_1()
             .border_color(gpui::transparent_black())
             .text_color(fg)
-            // The selected tab already wears the glide's border, which may
+            // The selected tab already wears the glide's fill, which may
             // still be flying in; a hover edge would show before it lands.
             .hover(move |style| {
                 let style = style.text_color(theme.panel_fg);
@@ -12362,7 +12413,6 @@ impl PilusView {
     /// menu below it. The name lives in the tooltip and the menu.
     fn session_picker(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
-        let glass = self.glass_opacity();
         let session = self.current_session_name();
         div()
             .id(id)
@@ -12377,11 +12427,11 @@ impl PilusView {
             .cursor_pointer()
             .state_fill(
                 if self.session_menu_open {
-                    theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT)
+                    theme.card_raise(SIDEBAR_HOVER_WEIGHT)
                 } else {
                     gpui::Rgba::default()
                 },
-                theme.sidebar_raise(glass, SIDEBAR_HOVER_WEIGHT),
+                theme.card_raise(SIDEBAR_HOVER_WEIGHT),
                 style::RADIUS_MD,
             )
             .child(icon(
@@ -14814,34 +14864,24 @@ impl PilusView {
         }
     }
 
-    /// The tab strip's background. Floating cards always take the pane
-    /// surface, the tinted ground they sit on, opaque or not. Flush panes:
-    /// opaque, the strip is the sidebar's own fill; translucent, it takes the
-    /// pane surface so one pane and many look alike. A native page alone in the
-    /// card sits in the chrome's fill, so the strip keeps to it.
+    /// The tab strip's background, opaque whatever the window opacity: the
+    /// tinted ground the cards float on, or the plain chrome ground when
+    /// panes are flush or a native page alone fills the card.
     fn tab_strip_fill(&self) -> gpui::Rgba {
-        let glass = self.glass_opacity();
-        let surface = self.theme.pane_surface(glass).opacity(glass);
-        if self.split_page_open() && self.page_split().is_none() {
-            self.chrome_fill()
-        } else if self.floating_cards() || (self.settings.pane_ui && glass < 1.0) {
-            surface
-        } else {
-            self.chrome_fill()
-        }
+        let alone_page = self.split_page_open() && self.page_split().is_none();
+        self.theme
+            .chrome_ground(self.floating_cards() && !alone_page)
     }
 
-    /// The fill of the selected (`weight` 1) and hovered tab. With floating
-    /// cards the strip sits on the tinted surface, so a tab is raised in the
-    /// card's own fill, which reads as the tab opening into the terminal card
-    /// below it and takes no weight. Otherwise it is the sidebar's raised pill, so a
-    /// tab and a sidebar row look alike at any window opacity.
+    /// The fill of the selected (`weight` 1) and hovered tab: the terminal
+    /// card's color, which reads as the tab opening into the card below it.
+    /// With floating cards a hovered tab takes it whole; flush, it is thinned
+    /// by `weight` like a sidebar row.
     fn tab_raise(&self, weight: f32) -> gpui::Rgba {
-        let glass = self.glass_opacity();
         if self.floating_cards() {
-            self.theme.bg.opacity(glass * weight.min(1.0).ceil())
+            self.theme.card_raise(weight.min(1.0).ceil())
         } else {
-            self.theme.sidebar_raise(glass, weight)
+            self.theme.card_raise(weight)
         }
     }
 
@@ -14876,13 +14916,13 @@ impl PilusView {
         }
     }
 
-    /// The sidebar's fill: the tab strip's while cards float, so the card
-    /// sits on one continuous ground, else the chrome's.
+    /// The sidebar's fill, opaque: the tab strip's while cards float, so the
+    /// card sits on one continuous ground, else the plain chrome ground.
     fn sidebar_fill(&self) -> gpui::Rgba {
         if self.floating_cards() {
             self.tab_strip_fill()
         } else {
-            self.chrome_fill()
+            self.theme.chrome_ground(false)
         }
     }
 

@@ -36,10 +36,16 @@ is the only implementation of it.
     frame color.
   - The exception is focus: the edge of a focused field, panel or card is
     `theme.border_focus`.
-  - The selected tab is raised by its panel fill alone and has no border.
+  - The selected tab is raised by the card-colored fill and the same border a
+    hovered tab draws. Its label keeps the same weight as the others, so
+    switching tabs never resizes one. While the first tab list loads, the strip
+    holds three skeleton tabs.
   - Accent means progress or focus. It is never a panel edge.
-- **Selection** in the sidebar (workspace, worktree, agent) is the
-  `theme.panel` pill with `panel_fg`/`muted` text and a bold name.
+- **Selection** in the sidebar (workspace, worktree, agent) is a pill in the
+  terminal card's color (`Theme::card_raise`) with `panel_fg`/`muted` text and
+  a bold name. The selected tab takes the same fill. Both are opaque at any
+  window opacity, and so are the sidebar and tab strip grounds
+  (`Theme::chrome_ground`).
   `selection_bg`/`selection_fg` are for text selection and list highlighting,
   not sidebar rows.
 

@@ -741,7 +741,7 @@ impl PilusView {
             .radius_sm()
             .cursor_pointer()
             .hover_fill(
-                theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT),
+                theme.card_raise(super::SIDEBAR_HOVER_WEIGHT),
                 style::RADIUS_SM,
             )
             .tooltip(super::row_tooltip(
@@ -777,7 +777,7 @@ impl PilusView {
             .radius_sm()
             .cursor_pointer()
             .hover_fill(
-                theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT),
+                theme.card_raise(super::SIDEBAR_HOVER_WEIGHT),
                 style::RADIUS_SM,
             )
             .tooltip(super::row_tooltip(
@@ -805,7 +805,7 @@ impl PilusView {
             .radius_sm()
             .cursor_pointer()
             .hover_fill(
-                theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT),
+                theme.card_raise(super::SIDEBAR_HOVER_WEIGHT),
                 style::RADIUS_SM,
             )
             .child(icon(
@@ -845,7 +845,7 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = self.theme;
-        let raise = theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT);
+        let raise = theme.card_raise(super::SIDEBAR_HOVER_WEIGHT);
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let floating = self.floating_cards();
         let expanded = self.right.expanded();

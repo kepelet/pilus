@@ -415,7 +415,7 @@ impl UiPlaygroundView {
     fn pill_demo(&self) -> Div {
         let theme = self.theme;
         let fonts = self.fonts();
-        let raise = theme.sidebar_raise(1.0, 0.5);
+        let raise = theme.card_raise(0.5);
         let button = |id: &'static str, glyph: &'static [u8]| {
             div()
                 .id(id)

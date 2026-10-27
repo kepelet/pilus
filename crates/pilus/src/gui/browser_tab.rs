@@ -954,7 +954,7 @@ impl PilusView {
             .radius_sm()
             .cursor_pointer()
             .hover_fill(
-                theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT),
+                theme.card_raise(super::SIDEBAR_HOVER_WEIGHT),
                 style::RADIUS_SM,
             )
             .tooltip(super::row_tooltip(
@@ -980,7 +980,7 @@ impl PilusView {
             .radius_sm()
             .cursor_pointer()
             .hover_fill(
-                theme.sidebar_raise(self.glass_opacity(), super::SIDEBAR_HOVER_WEIGHT),
+                theme.card_raise(super::SIDEBAR_HOVER_WEIGHT),
                 style::RADIUS_SM,
             )
             .flex_shrink_0()

@@ -691,7 +691,7 @@ pub(super) fn segment(
         .child(label)
 }
 
-/// One tab of a strip: the selected tab is raised by its panel fill alone,
+/// One tab of a strip: the selected tab is raised by the card-colored fill and a border,
 /// with no border, and the others rest on the strip. Callers attach their own
 /// handler.
 pub(super) fn tab(
@@ -2516,18 +2516,19 @@ pub(super) fn glide(
         color,
         radius,
         bleed,
-        outlined: false,
+        edge: None,
     }
 }
 
-/// [`glide`] drawn as a one-pixel border in `color` with nothing inside, for
-/// a selection that marks its item by edge alone. The target must carry a
-/// 1px border of its own for the edge to land on.
-pub(super) fn glide_outline(
+/// [`glide`] with a one-pixel `edge` drawn around the pill, for a selection
+/// that wears a border as well as a fill. The target must carry a 1px border
+/// of its own for the pill to cover, so the edge lands on it.
+pub(super) fn glide_bordered(
     id: impl Into<ElementId>,
     slot: &GlideSlot,
     color: Rgba,
     radius: Radius,
+    edge: Rgba,
 ) -> impl IntoElement {
     Glide {
         id: id.into(),
@@ -2535,7 +2536,7 @@ pub(super) fn glide_outline(
         color,
         radius,
         bleed: 0.0,
-        outlined: true,
+        edge: Some(edge),
     }
 }
 
@@ -2885,7 +2886,7 @@ struct Glide {
     color: Rgba,
     radius: Radius,
     bleed: f32,
-    outlined: bool,
+    edge: Option<Rgba>,
 }
 
 /// A glide's flight, in coordinates relative to the pill layer's origin so
@@ -3018,19 +3019,20 @@ impl Element for Glide {
             self.bleed,
         );
         // The target marker fills its parent's padding box, which sits inside
-        // the parent's own 1px border; the edge goes back out onto that
-        // border so it lines up with the one a hovered item draws.
-        let pill = if self.outlined {
+        // the parent's own 1px border; a bordered pill goes back out onto
+        // that border so its edge lines up with the one a hovered item draws.
+        let pill = if self.edge.is_some() {
             pill.dilate(px(1.0))
         } else {
             pill
         };
         let radius = Corners::all(self.radius.pixels()).clamp_radii_for_quad_size(pill.size);
-        window.paint_quad(if self.outlined {
-            gpui::outline(pill, self.color, gpui::BorderStyle::Solid).corner_radii(radius)
-        } else {
-            gpui::fill(pill, self.color).corner_radii(radius)
-        });
+        window.paint_quad(gpui::fill(pill, self.color).corner_radii(radius));
+        if let Some(edge) = self.edge {
+            window.paint_quad(
+                gpui::outline(pill, edge, gpui::BorderStyle::Solid).corner_radii(radius),
+            );
+        }
     }
 }
 

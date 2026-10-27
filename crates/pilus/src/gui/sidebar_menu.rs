@@ -11,7 +11,8 @@
 //! are in the daemon's own TUI. The terminal's menu replaces the one the
 //! daemon draws into the grid on a right click: it offers the clipboard and
 //! the pane/tab actions a client can reach (split, fork, rename, move to a
-//! tab), so the click never reaches the daemon. The Files tab's menu creates,
+//! tab), so the click never reaches the daemon. A tab in the strip offers
+//! renaming and closing that tab. The Files tab's menu creates,
 //! renames, and deletes the entries under the daemon's tree, which the client
 //! does over disk or SSH since the daemon never writes.
 //!
@@ -65,6 +66,10 @@ pub enum MenuTarget {
     /// is what Copy needs, so the row only appears when it can work. `agent`
     /// is whether the focused pane runs an agent, which Fork needs.
     Terminal { selection: bool, agent: bool },
+    /// A tab in the strip, addressed by the daemon's stable tab id rather
+    /// than its position, so a reorder while the menu is up cannot retarget
+    /// the pick.
+    Tab { tab_id: String },
     /// The GitHub section's header in the sidebar.
     Github,
     /// A row of the Files tab's tree, or its blank area (`root`), which acts
@@ -140,7 +145,10 @@ pub enum Item {
     /// Turn the GitHub integration off, which also stops its requests.
     GithubDisable,
     NewTab,
-    /// Close the active tab. Destructive: it ends every pane in it.
+    /// Rename the right-clicked tab in the strip.
+    RenameTab,
+    /// Close the active tab, or the right-clicked one in the strip.
+    /// Destructive: it ends every pane in it.
     CloseTab,
     Divider,
 }
@@ -190,6 +198,7 @@ impl Item {
             Self::GithubHideSection => "Hide Section",
             Self::GithubDisable => "Turn Off GitHub",
             Self::NewTab => "New Tab",
+            Self::RenameTab => "Rename Tab",
             Self::CloseTab => "Close Tab",
             Self::Divider => "",
         }
@@ -200,7 +209,7 @@ impl Item {
     pub fn symbol(self, paths_visible: bool) -> &'static str {
         match self {
             Self::Close | Self::CloseTab => "xmark",
-            Self::Rename => "pencil",
+            Self::Rename | Self::RenameTab => "pencil",
             Self::PinWorkspace => "pin",
             Self::UnpinWorkspace => "pin.slash",
             Self::TogglePaths => {
@@ -279,6 +288,7 @@ impl MenuTarget {
             Self::Saved { pinned, .. } => saved_rows(*pinned),
             Self::Agent { .. } => agent_rows(),
             Self::Terminal { selection, agent } => terminal_rows(*selection, *agent),
+            Self::Tab { .. } => tab_rows(),
             Self::Github => github_rows(),
             Self::File { root, dir, .. } => file_rows(*root, *dir),
         }
@@ -381,6 +391,12 @@ fn github_rows() -> Vec<Item> {
         Item::GithubHideSection,
         Item::GithubDisable,
     ]
+}
+
+/// A strip tab's rows: the rename, then the destructive close alone below a
+/// divider.
+fn tab_rows() -> Vec<Item> {
+    vec![Item::RenameTab, Item::Divider, Item::CloseTab]
 }
 
 /// A live agent's rows: pane actions, path toggle, then the dock's
@@ -550,6 +566,26 @@ mod tests {
             agent: true,
         };
         assert_eq!(target.rows(true), terminal_rows(false, true));
+    }
+
+    #[test]
+    fn a_tab_offers_rename_then_close() {
+        let target = MenuTarget::Tab {
+            tab_id: "t1".into(),
+        };
+        assert_eq!(
+            target.rows(false),
+            vec![Item::RenameTab, Item::Divider, Item::CloseTab]
+        );
+        let titles: Vec<String> = target
+            .entries(false, Labels::default())
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Action { title, .. } => Some(title),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, vec!["Rename Tab", "Close Tab"]);
     }
 
     #[test]

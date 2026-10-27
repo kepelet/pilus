@@ -287,7 +287,8 @@ than inside the GPUI listener, since `NSMenu` runs its own event loop and the
 app must not stay borrowed through it; a pick calls back into the view once
 AppKit hands it over. The items: close, rename, pin, path visibility, and copy path/branch for
 workspaces; rename, close, pin, path visibility, and the dock's workspace
-scope for agents. Destructive rows hang on the daemon's contract where one
+scope for agents. A tab in the strip offers Rename Tab and Close Tab, the
+same prompt and close a double-click and the tab's ✕ reach. Destructive rows hang on the daemon's contract where one
 exists. Most items ride the control API — `workspace.close`/`rename`/`pin`,
 `pane.close`, `agent.name`, `worktree.create` (targeting the right-clicked
 workspace's repo via its index) — and run on a background thread reported

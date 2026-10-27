@@ -10519,6 +10519,7 @@ impl PilusView {
             SidebarMenuTarget::Agent { .. }
             | SidebarMenuTarget::Saved { .. }
             | SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => None,
         };
@@ -10601,6 +10602,7 @@ impl PilusView {
             SidebarMenuTarget::Agent { .. }
             | SidebarMenuTarget::Saved { .. }
             | SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => return,
         };
@@ -10641,6 +10643,7 @@ impl PilusView {
             SidebarMenuTarget::Agent { .. }
             | SidebarMenuTarget::Saved { .. }
             | SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => false,
         }
@@ -10655,6 +10658,7 @@ impl PilusView {
             }
             SidebarMenuTarget::Saved { .. }
             | SidebarMenuTarget::Terminal { .. }
+            | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::File { .. } => (false, false),
         };
@@ -10782,6 +10786,9 @@ impl PilusView {
             (SidebarMenuTarget::Terminal { .. }, item) => {
                 self.run_terminal_item(item, cx);
             }
+            (SidebarMenuTarget::Tab { tab_id }, item) => {
+                self.run_tab_item(tab_id, item, cx);
+            }
             (SidebarMenuTarget::Github, item) => {
                 self.github_menu_item(item, cx);
             }
@@ -10827,6 +10834,28 @@ impl PilusView {
             ),
             SidebarItem::NewTab => self.new_tab(cx),
             SidebarItem::CloseTab => self.close_active_tab(),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Run one row of a strip tab's menu. The tab is found by id at pick time,
+    /// so a tab that closed while the menu was up is simply skipped.
+    fn run_tab_item(&mut self, tab_id: &str, item: SidebarItem, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let (index, active) = (tab.index, self.tab_active(tab));
+        match item {
+            SidebarItem::RenameTab => self.open_tab_rename(index, cx),
+            SidebarItem::CloseTab => {
+                // Closing the active tab hands focus to another, which a page
+                // covering the card must not hide.
+                if active && self.tabs.len() > 1 {
+                    self.leave_settings_page();
+                }
+                self.close_tab(index);
+            }
             _ => {}
         }
         cx.notify();
@@ -12055,6 +12084,7 @@ impl PilusView {
         let index = tab.index;
         let panes = tab.panes;
         let tab_id = tab.id.clone();
+        let menu_tab_id = tab.id.clone();
         let close_index = tab.index;
         let fg = if active || lone {
             theme.panel_fg
@@ -12107,7 +12137,7 @@ impl PilusView {
             ));
         }
         tip_lines.push((
-            "Double-click to rename · drag to reorder".to_string(),
+            "Double-click or right-click to rename · drag to reorder".to_string(),
             theme.muted,
         ));
         let tip = row_tooltip(format!("Tab {index}"), fg, tip_lines, theme);
@@ -12182,7 +12212,19 @@ impl PilusView {
             })
             .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
                 this.reorder_tab(drag.index, index, cx);
-            }));
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.open_context_menu(
+                        SidebarMenuTarget::Tab {
+                            tab_id: menu_tab_id.clone(),
+                        },
+                        cx,
+                    );
+                }),
+            );
         let mut content = div()
             .flex_1()
             .flex()

@@ -259,6 +259,10 @@ pub(super) struct PaneChrome {
     top: f32,
     width: f32,
     height: f32,
+    /// The pane's first text row, below the daemon's top border row, whose
+    /// center the toolbar lines up with.
+    first_row_top: f32,
+    row_height: f32,
     rest: Look,
     hover: Look,
     surface: Rgba,
@@ -450,6 +454,8 @@ pub(super) fn pane_chrome(
         top,
         width: (right - left).max(0.0),
         height: (bottom - top).max(0.0),
+        first_row_top: row_edge(pane.top.saturating_add(1)),
+        row_height: height,
         rest,
         hover: Look { dim: 0.0, ..rest },
         surface,
@@ -458,13 +464,18 @@ pub(super) fn pane_chrome(
     }
 }
 
-/// `bar` pinned to the grid's top-right corner, for a tab with one pane and
-/// so no frame to measure from.
-pub(super) fn lone_toolbar(bar: Div) -> Div {
+/// `bar` pinned to the grid's top-right corner and centered on the first row
+/// of text, for a tab with one pane and so no frame to measure from. The row
+/// is `row_height` tall, so the buttons sit level with the text beside them.
+pub(super) fn lone_toolbar(bar: Div, row_height: Pixels) -> Div {
     div()
         .absolute()
-        .top(px(TOOLBAR_INSET_PX))
+        .top_0()
         .right(px(TOOLBAR_INSET_PX))
+        .h(row_height)
+        .flex()
+        .flex_row()
+        .items_center()
         .child(style::enter("pilus-pane-toolbar-lone", bar))
 }
 
@@ -474,17 +485,20 @@ impl PaneChrome {
         self.focused
     }
 
-    /// `bar` pinned inside the card's top-right corner. The fade is keyed by
-    /// the pane, so moving focus to another pane replays it there.
+    /// `bar` pinned inside the card's top-right corner, centered on the
+    /// pane's first row of text. The fade is keyed by the pane, so moving
+    /// focus to another pane replays it there.
     pub(super) fn toolbar(&self, bar: Div) -> Div {
         div()
             .absolute()
             .left(px(self.left))
-            .top(px(self.top + BORDER_PX + TOOLBAR_INSET_PX))
+            .top(px(self.first_row_top))
             .w(px(self.width))
+            .h(px(self.row_height))
             .pr(px(BORDER_PX + TOOLBAR_INSET_PX))
             .flex()
             .flex_row()
+            .items_center()
             .justify_end()
             .child(style::enter(("pilus-pane-toolbar", self.index as u64), bar))
     }

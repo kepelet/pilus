@@ -16025,7 +16025,7 @@ fn render_grid(
     // grid.
     let toolbar = toolbar.and_then(|bar| {
         if chromes.is_empty() {
-            Some(pane_chrome::lone_toolbar(bar))
+            Some(pane_chrome::lone_toolbar(bar, line_height))
         } else {
             chromes
                 .iter()

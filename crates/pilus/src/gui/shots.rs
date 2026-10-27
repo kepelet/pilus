@@ -2169,12 +2169,12 @@ impl Render for PaneGridView {
                 body,
                 1.0,
                 pad.left,
-                pad.y,
+                pad.top,
                 // A window is rarely a whole number of cells, and the
                 // remainder is surface the cards must grow over, past the
                 // padding on the right and below.
                 pad.right + 5.0,
-                pad.y + 9.0,
+                pad.bottom + 9.0,
                 panes,
                 gaps,
                 Some(

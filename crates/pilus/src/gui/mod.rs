@@ -15007,15 +15007,18 @@ impl PilusView {
         // Every seam a row crosses pushes the panes past it right by a step;
         // the room comes out of the grid's width.
         pad.right += f32::from(panes.max_depth()) * pane_chrome::seam_step(floating, cell_w);
-        let (pad_x, pad_y) = (pad.left, pad.y);
-        let (inner_w, inner_h) = (inner_w - pad.left - pad.right, inner_h - 2.0 * pad_y);
+        let (pad_x, pad_y) = (pad.left, pad.top);
+        let (inner_w, inner_h) = (
+            inner_w - pad.left - pad.right,
+            inner_h - pad.top - pad.bottom,
+        );
         let cols = (inner_w / cell_w).clamp(20.0, 500.0) as u16;
         let rows = (inner_h / cell_h).clamp(5.0, 300.0) as u16;
         // The grid pins to the top-left so the terminal truly reaches the
         // edges; the leftover fraction pools at the far edges, where the grid
         // extends its edge colors over it.
         let slack_x = (inner_w - f32::from(cols) * cell_w).max(0.0);
-        let slack_y = (inner_h - f32::from(rows) * cell_h).max(0.0) + pad_y;
+        let slack_y = (inner_h - f32::from(rows) * cell_h).max(0.0) + pad.bottom;
         // The left sidebar is whole cells wide, so the card's left edge is
         // cell-aligned. The right column is free-width, which would leave up
         // to a cell of remainder between the grid and it, a margin the left
@@ -15915,18 +15918,12 @@ fn render_grid(
         }
     }
     // The lone card's padding above the first row: that row's colors carry
-    // up to the card's edge, a gap short of the padding's.
-    if lone.is_some() && pad_y > pane_chrome::GAP_PX {
-        column = column.child(
-            div()
-                .absolute()
-                .left_0()
-                .top(px(pane_chrome::GAP_PX - pad_y))
-                .child(bottom_fill(
-                    frame, skip_rows, theme, selection, cell_width, skip_cols, max_cols, pad_x,
-                    slack_x, pad_y, glass, tiled, pane_gaps, &shifts,
-                )),
-        );
+    // up to the card's top, which meets the tab strip.
+    if lone.is_some() && pad_y > 0.0 {
+        column = column.child(div().absolute().left_0().top(px(-pad_y)).child(bottom_fill(
+            frame, skip_rows, theme, selection, cell_width, skip_cols, max_cols, pad_x, slack_x,
+            pad_y, true, glass, tiled, pane_gaps, &shifts,
+        )));
     }
     let grid_end = skip_cols.saturating_add(max_cols);
     for row in skip_rows..end_row.max(skip_rows) {
@@ -15993,6 +15990,7 @@ fn render_grid(
             pad_x,
             slack_x,
             slack_y,
+            false,
             glass,
             tiled,
             pane_gaps,
@@ -16419,7 +16417,8 @@ fn render_row(
 /// that row's background runs, the last stretched over the sub-cell
 /// remainder. No text paints: glyphs would clip mid-cell. Like `render_row`,
 /// it leaves a floating card's base color to the card and stops a gap short
-/// of the edge.
+/// of the edge, except along a `flush` edge the card reaches (the top, under
+/// the tab strip).
 #[allow(clippy::too_many_arguments)]
 fn bottom_fill(
     frame: &FrameData,
@@ -16432,6 +16431,7 @@ fn bottom_fill(
     pad_x: f32,
     slack_x: f32,
     height: f32,
+    flush: bool,
     glass: f32,
     tiled: Option<pane_frames::PaneFrame>,
     gaps: bool,
@@ -16451,7 +16451,11 @@ fn bottom_fill(
     let mut strip = div()
         .relative()
         .flex_shrink_0()
-        .h(px((height - card_inset).max(0.0)))
+        .h(px(if flush {
+            height
+        } else {
+            (height - card_inset).max(0.0)
+        }))
         .w(px(strip_width));
     let paints = |offset: u16, bg: gpui::Rgba| match tiled {
         Some(tiled) if gaps => !(bg == theme.bg && skip_cols.saturating_add(offset) >= tiled.left),

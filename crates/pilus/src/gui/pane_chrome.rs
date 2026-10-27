@@ -48,8 +48,8 @@ const PAD_LEAD_PX: f32 = 4.0;
 pub(super) struct GridPad {
     pub left: f32,
     pub right: f32,
-    /// Above and below alike.
-    pub y: f32,
+    pub top: f32,
+    pub bottom: f32,
 }
 
 /// The grid's padding. Flush panes keep none: the grid spends every pixel on
@@ -57,19 +57,21 @@ pub(super) struct GridPad {
 /// and its rows above and below, so only the sides need room: a border column
 /// is about as wide as the gap, which would otherwise leave a card's edge
 /// against its text. An unsplit tab has no border cells, so its padding holds
-/// the whole gap too.
+/// the whole gap too, except at the top, where every card meets the tab strip.
 pub(super) fn grid_pad(gaps: bool, split: bool) -> GridPad {
     match (gaps, split) {
         (false, _) => GridPad::default(),
         (true, true) => GridPad {
             left: PAD_X_PX,
             right: PAD_X_PX,
-            y: 0.0,
+            top: 0.0,
+            bottom: 0.0,
         },
         (true, false) => GridPad {
             left: GAP_PX + PAD_LEAD_PX,
             right: GAP_PX + PAD_X_PX,
-            y: GAP_PX + PAD_Y_PX,
+            top: PAD_Y_PX,
+            bottom: GAP_PX + PAD_Y_PX,
         },
     }
 }
@@ -370,10 +372,14 @@ pub(super) fn pane_chrome(
         } else {
             column_edge(pane.right + 1) + shift + half + reach - GAP_PX / 2.0
         };
+        // The top row of cards meets the tab strip with no gap, so the
+        // selected tab, in the card's own fill, reads as opening into it.
         let top = if pane.top < skip_rows {
             0.0
+        } else if outer_top {
+            row_edge(pane.top) - slack.top
         } else {
-            row_edge(pane.top) - slack.top + inset(outer_top)
+            row_edge(pane.top) + GAP_PX / 2.0
         };
         let bottom = row_edge(pane.bottom + 1) + slack.bottom - inset(outer_bottom);
         // The stroke grows the box outward, leaving the card as the inner area.
@@ -880,11 +886,11 @@ mod tests {
     }
 
     #[test]
-    fn the_surface_margin_matches_the_gap() {
+    fn the_surface_margin_matches_the_gap_but_the_top_meets_the_strip() {
         let tiled = frame(0, 2, 39, 20);
         let card = chrome(tiled, tiled);
         assert_eq!(card.left + BORDER_PX, GAP_PX);
-        assert_eq!(card.top + BORDER_PX, (17.0f32 * 1.0).round() + GAP_PX);
+        assert_eq!(card.top + BORDER_PX, (17.0f32 * 1.0).round());
     }
 
     #[test]
@@ -964,9 +970,9 @@ mod tests {
             8.4,
             Slack {
                 left: pad.left,
-                top: pad.y,
+                top: pad.top,
                 right: pad.right,
-                bottom: pad.y,
+                bottom: pad.bottom,
             },
             &ColumnShifts::default(),
             0,
@@ -975,7 +981,7 @@ mod tests {
         // The text starts at 0; the card's inner edge is the padding's
         // gap-wide outer part away from the surface's edge.
         assert_eq!(card.left + BORDER_PX, GAP_PX - pad.left);
-        assert_eq!(card.top + BORDER_PX, GAP_PX - pad.y);
+        assert_eq!(card.top + BORDER_PX, -pad.top);
         assert_eq!(-(card.left + BORDER_PX), PAD_LEAD_PX);
         assert_eq!(-(card.top + BORDER_PX), PAD_Y_PX);
         // The far side keeps the full room past the last column.

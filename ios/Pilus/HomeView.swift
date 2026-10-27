@@ -100,7 +100,10 @@ struct HomeView: View {
                 AgentDetailView(agent: agent)
             }
             .navigationDestination(for: SessionSummary.self) { session in
-                SessionTranscriptView(session: session)
+                SessionTranscriptView(session: session) { agent in
+                    navPath.removeLast()
+                    navPath.append(agent)
+                }
             }
             .navigationDestination(for: HomeRoute.self) { route in
                 switch route {
@@ -178,7 +181,7 @@ struct HomeView: View {
                     if !store.agents.isEmpty {
                         agentsSection
                     }
-                    if !store.sessions.isEmpty {
+                    if !store.sessions.isEmpty || (store.canReadSessions && !store.sessionsLoaded) {
                         sessionsSection
                     }
                 }
@@ -654,6 +657,21 @@ struct HomeView: View {
                 sessionsExpanded.toggle()
             }
             if sessionsExpanded {
+                if store.sessions.isEmpty && !store.sessionsLoaded {
+                    ForEach(0..<4, id: \.self) { _ in
+                        HStack(spacing: 12) {
+                            Circle()
+                                .fill(.secondary.opacity(0.18))
+                                .frame(width: 20, height: 20)
+                            VStack(alignment: .leading, spacing: 6) {
+                                SkeletonBar(height: 14)
+                                SkeletonBar(height: 10)
+                                    .frame(width: 140)
+                            }
+                        }
+                        .padding(.vertical, 8)
+                    }
+                }
                 ForEach(store.sessions) { session in
                     sessionRow(session)
                 }
@@ -683,6 +701,24 @@ struct HomeView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            if store.canReopen(session) {
+                Button("Continue", systemImage: "play") { reopen(session, fork: false) }
+                Button("Fork", systemImage: "arrow.branch") { reopen(session, fork: true) }
+            }
+        }
+    }
+
+    private func reopen(_ session: SessionSummary, fork: Bool) {
+        Task {
+            do {
+                if let agent = try await store.reopen(session, fork: fork) {
+                    navPath.append(agent)
+                }
+            } catch {
+                composerError = error.localizedDescription
+            }
+        }
     }
 
     private func sessionSubtitle(_ session: SessionSummary) -> String {

@@ -94,10 +94,14 @@ private struct TranscriptRow: View {
 /// A recent session from Home, opened on its transcript.
 struct SessionTranscriptView: View {
     let session: SessionSummary
+    /// Opens the agent a Continue or Fork started.
+    var onStarted: (Agent) -> Void = { _ in }
 
     @Environment(AppStore.self) private var store
     @State private var reply: TranscriptReply?
     @State private var loadError: String?
+    @State private var starting = false
+    @State private var startError: String?
 
     var body: some View {
         ScrollView {
@@ -116,10 +120,28 @@ struct SessionTranscriptView: View {
                     .foregroundStyle(.red)
                     .padding()
             } else {
-                ProgressView().padding(.top, 40)
+                TranscriptSkeleton()
             }
         }
         .defaultScrollAnchor(.bottom)
+        .safeAreaInset(edge: .bottom) {
+            if store.canReopen(session) {
+                VStack(spacing: 6) {
+                    if let startError {
+                        Text(startError)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                    HStack(spacing: 10) {
+                        reopenButton("Continue", systemImage: "play.fill", fork: false)
+                        reopenButton("Fork", systemImage: "arrow.branch", fork: true)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(.bar)
+            }
+        }
         .refreshable { await load() }
         .navigationTitle(session.title)
         .navigationBarTitleDisplayMode(.inline)
@@ -131,6 +153,29 @@ struct SessionTranscriptView: View {
         }
     }
 
+    private func reopenButton(_ title: String, systemImage: String, fork: Bool) -> some View {
+        Button {
+            Task {
+                starting = true
+                startError = nil
+                do {
+                    if let agent = try await store.reopen(session, fork: fork) {
+                        onStarted(agent)
+                    }
+                } catch {
+                    startError = error.localizedDescription
+                }
+                starting = false
+            }
+        } label: {
+            Label(title, systemImage: systemImage)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.large)
+        .disabled(starting)
+    }
+
     private func load() async {
         do {
             reply = try await store.transcript(path: session.path, machine: session.machine)
@@ -138,5 +183,32 @@ struct SessionTranscriptView: View {
         } catch {
             if reply == nil { loadError = error.localizedDescription }
         }
+    }
+}
+
+/// Gray bubbles and lines standing in for a transcript still being read.
+struct TranscriptSkeleton: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ForEach(0..<3, id: \.self) { _ in
+                HStack {
+                    Spacer(minLength: 80)
+                    RoundedRectangle(cornerRadius: 14)
+                        .fill(.secondary.opacity(0.14))
+                        .frame(width: 180, height: 34)
+                }
+                ForEach([1.0, 0.9, 0.6], id: \.self) { fraction in
+                    GeometryReader { geo in
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(.secondary.opacity(0.14))
+                            .frame(width: geo.size.width * fraction, height: 12)
+                    }
+                    .frame(height: 12)
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .redacted(reason: .placeholder)
     }
 }

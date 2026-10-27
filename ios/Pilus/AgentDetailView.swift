@@ -13,6 +13,12 @@ struct AgentDetailView: View {
     /// (or for a kind whose transcripts are not read) the pane is shown.
     @State private var transcript: TranscriptReply?
     @State private var session: SessionSummary?
+    /// Until the first session lookup answers, a skeleton stands in rather
+    /// than flashing the pane before the transcript replaces it.
+    @State private var lookedUp = false
+    private var awaitingTranscript: Bool {
+        !lookedUp && ["claude", "pi"].contains(agent.kind) && store.hubAllows("hub.sessions", on: agent.machine)
+    }
     @State private var sessionLookups = 0
     @State private var reply = ""
     // Kept separate so a poll cannot erase a send error before it is read.
@@ -291,6 +297,8 @@ struct AgentDetailView: View {
                 Spacer(minLength: 0)
                 if let transcript {
                     TranscriptList(entries: transcript.entries, earlier: transcript.earlier ?? false)
+                } else if awaitingTranscript {
+                    TranscriptSkeleton()
                 } else {
                 Text(content.isEmpty
                      ? AttributedString("Reading pane")
@@ -331,11 +339,15 @@ struct AgentDetailView: View {
             sessionLookups += 1
             session = try? await store.session(for: agent, sessionID: sessionID, cwd: cwd)
         }
-        guard let session else { return }
+        guard let session else {
+            lookedUp = true
+            return
+        }
         if let reply = try? await store.transcript(path: session.path, machine: session.machine) {
             transcript = reply
             truncated = false
         }
+        lookedUp = true
     }
 
     /// Scrolled to the top with `truncated` still set: widen the capture

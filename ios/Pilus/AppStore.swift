@@ -762,13 +762,15 @@ final class AppStore {
         workspaceID: String? = nil,
         model: String? = nil,
         effort: String? = nil,
+        args: [String] = [],
         machine: String = "local"
     ) async throws -> HubRunResult {
         var params: [String: Any] = ["agent": agent, "path": path, "prompt": prompt]
         if let workspaceID { params["workspace_id"] = workspaceID }
         if let model { params["model"] = model }
         if let effort { params["effort"] = effort }
-        let signature = ["run", machine, agent, path, workspaceID ?? "", model ?? "", effort ?? "", prompt]
+        if !args.isEmpty { params["args"] = args }
+        let signature = (["run", machine, agent, path, workspaceID ?? "", model ?? "", effort ?? "", prompt] + args)
             .joined(separator: "\u{1f}")
         params["idempotency_key"] = replayKey(for: signature).key
         do {
@@ -832,6 +834,43 @@ final class AppStore {
         try await call(method: "hub.transcript",
                        params: ["path": path, "limit": limit],
                        machine: machine)
+    }
+
+    /// Whether `session` can be continued or forked from here: an Operate
+    /// device, a kind with resume flags, and a folder to start in.
+    func canReopen(_ session: SessionSummary) -> Bool {
+        canRunAgents && ["claude", "pi"].contains(session.kind) && !(session.cwd ?? "").isEmpty
+    }
+
+    /// Start the session's agent again in its folder on its own resume flag,
+    /// or on its fork flag for a new session that keeps the history (the
+    /// flags `pilus-index`'s `Agent::resume_flag`/`fork_args` name).
+    func reopen(_ session: SessionSummary, fork: Bool) async throws -> Agent? {
+        let id = session.session_id
+        let args: [String]
+        switch (session.kind, fork) {
+        case ("claude", false): args = ["--resume", id]
+        case ("claude", true): args = ["--resume", id, "--fork-session"]
+        case ("pi", false): args = ["--session", id]
+        default: args = ["--fork", id]
+        }
+        let cwd = session.cwd ?? "~"
+        let result = try await runAgent(
+            agent: session.kind, path: cwd, prompt: "", args: args, machine: session.machine)
+        await refresh()
+        guard let pane = result.pane else { return nil }
+        return agents.first { $0.pane == pane && $0.machine == session.machine } ?? Agent(
+            pane: pane,
+            agent: session.kind,
+            name: result.name,
+            agent_session_title: fork ? nil : session.title,
+            status: "running",
+            workspace_id: nil,
+            workspace_name: nil,
+            cwd: cwd,
+            branch: session.branch,
+            focused: true,
+            machine: session.machine)
     }
 
     func openWorkspace(path: String, machine: String) async throws {

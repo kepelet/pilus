@@ -2114,7 +2114,8 @@ impl Render for PaneGridView {
                 put(r, row, "│");
             }
         };
-        // A shell sits against its box's border, or the grid's own edge.
+        // A shell sits against its box's border, or, unsplit, a column in
+        // from the grid's edge, past the blank margin the daemon keeps there.
         let lead = if split {
             boxed(&mut put, 0, top, 29, bottom);
             boxed(&mut put, 30, top, 59, middle - 1);
@@ -2123,7 +2124,7 @@ impl Render for PaneGridView {
             put(31, middle + 1, "~/pilus $ tail -f log");
             (1, 1)
         } else {
-            (0, 0)
+            (1, 0)
         };
         put(lead.0, top + lead.1, "~/pilus $ cargo test");
         put(lead.0, top + lead.1 + 1, "   Compiling pilus v0.1.0");

@@ -38,9 +38,10 @@ pub(super) const GAP_PX: f32 = 8.0;
 /// sideways, and above and below an unsplit tab's card.
 const PAD_X_PX: f32 = 12.0;
 const PAD_Y_PX: f32 = 8.0;
-/// The room before an unsplit card's text, in logical pixels. It is the only
-/// card beside the sidebar, which already sets it apart, so it keeps the
-/// lead short.
+/// The room either side of an unsplit card's text, in logical pixels. The
+/// daemon keeps a blank column on each side of a lone pane, where a split
+/// draws its borders, so a short lead plus that column matches the room a
+/// split card's text has inside its border.
 const PAD_LEAD_PX: f32 = 4.0;
 
 /// How much of flush panes' blank top border row stays in view, in logical
@@ -69,6 +70,8 @@ pub(super) struct GridPad {
 /// is about as wide as the gap, which would otherwise leave a card's edge
 /// against its text. An unsplit tab has no border cells, so its padding holds
 /// the whole gap too, except at the top, where every card meets the tab strip.
+/// Its sides take the same short lead, as the daemon's blank margin columns
+/// already hold the rest.
 pub(super) fn grid_pad(gaps: bool, split: bool) -> GridPad {
     match (gaps, split) {
         (false, _) => GridPad::default(),
@@ -80,7 +83,7 @@ pub(super) fn grid_pad(gaps: bool, split: bool) -> GridPad {
         },
         (true, false) => GridPad {
             left: GAP_PX + PAD_LEAD_PX,
-            right: GAP_PX + PAD_X_PX,
+            right: GAP_PX + PAD_LEAD_PX,
             top: PAD_Y_PX,
             bottom: GAP_PX + PAD_Y_PX,
         },
@@ -1054,9 +1057,10 @@ mod tests {
         assert_eq!(-(card.left + BORDER_PX), PAD_LEAD_PX);
         // Less the stroke, which now sits inside the padding.
         assert_eq!(-(card.top + BORDER_PX), PAD_Y_PX - BORDER_PX);
-        // The far side keeps the full room past the last column.
+        // The far side keeps the same room past the last column.
         let right_inner = card.left + card.width - BORDER_PX;
         assert_eq!((40.0f32 * 8.4).round() + pad.right - right_inner, GAP_PX);
+        assert_eq!(right_inner - (40.0f32 * 8.4).round(), PAD_LEAD_PX);
     }
 
     #[test]

@@ -41,35 +41,70 @@ pub fn recent(
     Ok(sessions)
 }
 
-/// The session `agent` most likely runs on in `cwd`: the one with `session` as
-/// its id when that is known, else the newest one recorded in that folder.
+/// The session `agent` most likely runs on in `cwd`: the one with `session`
+/// as its id when the daemon knows it (and none when that id has no
+/// transcript, rather than a neighbour's), else the newest one in that folder
+/// whose title matches `title`, else, unless `strict`, the newest one there.
+/// `strict` is for a folder another live agent of the same kind shares, where
+/// "newest" may well be the other agent's.
 pub fn session_for(
     source: &Source<'_>,
     machine: &str,
     agent: Agent,
     cwd: &str,
     session: Option<&str>,
+    title: Option<&str>,
+    strict: bool,
 ) -> Result<Option<Session>> {
     let probes = newest(source, Some(agent))?;
     let session = session.filter(|id| !id.is_empty());
-    if let Some(id) = session
-        && let Some(probe) = probes.iter().find(|probe| stem(&probe.path).contains(id))
-    {
-        let found = read(source, machine, std::slice::from_ref(probe))?;
-        if let Some(found) = found.into_iter().next() {
-            return Ok(Some(found));
+    if let Some(id) = session {
+        if let Some(probe) = probes.iter().find(|probe| stem(&probe.path).contains(id)) {
+            let found = read(source, machine, std::slice::from_ref(probe))?;
+            if let Some(found) = found.into_iter().next() {
+                return Ok(Some(found));
+            }
         }
+        let picked: Vec<Probe> = probes.into_iter().take(MATCH_DEPTH).collect();
+        let sessions = read(source, machine, &picked)?;
+        return Ok(sessions.into_iter().find(|found| found.session_id == id));
     }
     let trim = |path: &str| path.trim_end_matches('/').to_string();
     let cwd = trim(cwd);
     let picked: Vec<Probe> = probes.into_iter().take(MATCH_DEPTH).collect();
-    let sessions = read(source, machine, &picked)?;
-    if let Some(id) = session
-        && let Some(found) = sessions.iter().find(|found| found.session_id == id)
+    let here: Vec<Session> = read(source, machine, &picked)?
+        .into_iter()
+        .filter(|found| trim(&found.cwd) == cwd)
+        .collect();
+    if let Some(title) = title.map(words).filter(|title| title.len() >= 4)
+        && let Some(found) = here.iter().find(|found| {
+            let own = words(&found.title);
+            own.len() >= 4 && (own.contains(&title) || title.contains(&own))
+        })
     {
         return Ok(Some(found.clone()));
     }
-    Ok(sessions.into_iter().find(|found| trim(&found.cwd) == cwd))
+    if strict {
+        return Ok(None);
+    }
+    Ok(here.into_iter().next())
+}
+
+/// `text` lowercased to its letters, digits and single spaces, so a terminal
+/// title (`✳ Fix the build`) and a transcript title compare.
+fn words(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The conversation in the last `window` bytes of the transcript at `path`,
@@ -219,14 +254,72 @@ mod tests {
                 .any(|session| session.title == "fix the build")
         );
 
-        let found = session_for(&source, "local", Agent::Claude, "/work/other/", None)
-            .expect("match")
-            .expect("found");
+        let found = session_for(
+            &source,
+            "local",
+            Agent::Claude,
+            "/work/other/",
+            None,
+            None,
+            false,
+        )
+        .expect("match")
+        .expect("found");
         assert_eq!(found.session_id, "bbb");
-        let by_id = session_for(&source, "local", Agent::Claude, "/nowhere", Some("aaa"))
-            .expect("match")
-            .expect("found");
+        let by_id = session_for(
+            &source,
+            "local",
+            Agent::Claude,
+            "/nowhere",
+            Some("aaa"),
+            None,
+            false,
+        )
+        .expect("match")
+        .expect("found");
         assert_eq!(by_id.cwd, "/work/app");
+        let unknown = session_for(
+            &source,
+            "local",
+            Agent::Claude,
+            "/work/app",
+            Some("zzz"),
+            None,
+            false,
+        )
+        .expect("match");
+        assert!(
+            unknown.is_none(),
+            "an unknown id never borrows the folder's newest"
+        );
+
+        write_claude(&home, "ccc", "/work/app", "write the changelog");
+        let titled = session_for(
+            &source,
+            "local",
+            Agent::Claude,
+            "/work/app",
+            None,
+            Some("✳ Fix the build"),
+            true,
+        )
+        .expect("match")
+        .expect("found");
+        assert_eq!(titled.session_id, "aaa");
+        let shared = session_for(
+            &source,
+            "local",
+            Agent::Claude,
+            "/work/app",
+            None,
+            Some("other thing"),
+            true,
+        )
+        .expect("match");
+        assert!(
+            shared.is_none(),
+            "a shared folder without a title match shows the pane"
+        );
 
         let read = transcript_at(&source, &by_id.path, 1 << 20).expect("transcript");
         assert!(matches!(&read.entries[0], Entry::User { text, .. } if text == "fix the build"));

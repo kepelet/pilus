@@ -815,15 +815,28 @@ final class AppStore {
         sessionsLoaded = true
     }
 
-    /// The session a live agent runs on, matched by kind and folder (and the
-    /// daemon's session id when `agent.get` reported one). `nil` for a kind
-    /// whose transcripts are not read, or when nothing matches yet.
-    func session(for agent: Agent, sessionID: String?, cwd: String?) async throws -> SessionSummary? {
+    /// The session a live agent runs on: the daemon's session id when
+    /// `agent.get` reported one, else the newest in its folder whose title
+    /// matches the pane's, else the folder's newest — unless another live agent
+    /// of the same kind shares the folder, where that guess could be the
+    /// other's, so it stays unmatched. `nil` for a kind whose transcripts are
+    /// not read; throws only when the hub could not be asked.
+    func session(
+        for agent: Agent, sessionID: String?, cwd: String?, title: String?
+    ) async throws -> SessionSummary? {
         guard hubAllows("hub.sessions", on: agent.machine),
               ["claude", "pi"].contains(agent.kind),
               let cwd = cwd ?? agent.cwd, !cwd.isEmpty else { return nil }
-        var params: [String: Any] = ["agent": agent.kind, "cwd": cwd]
+        let folder = { (path: String?) in
+            (path ?? "").hasSuffix("/") ? String((path ?? "").dropLast()) : (path ?? "")
+        }
+        let shared = agents.contains {
+            $0.machine == agent.machine && $0.pane != agent.pane &&
+            $0.kind == agent.kind && folder($0.cwd) == folder(cwd)
+        }
+        var params: [String: Any] = ["agent": agent.kind, "cwd": cwd, "strict": shared]
         if let sessionID, !sessionID.isEmpty { params["session"] = sessionID }
+        if let title, !title.isEmpty { params["title"] = title }
         let reply: SessionList = try await call(
             method: "hub.sessions", params: params, machine: agent.machine)
         return reply.sessions.first.map { var row = $0; row.machine = agent.machine; return row }
@@ -845,7 +858,7 @@ final class AppStore {
     /// Start the session's agent again in its folder on its own resume flag,
     /// or on its fork flag for a new session that keeps the history (the
     /// flags `pilus-index`'s `Agent::resume_flag`/`fork_args` name).
-    func reopen(_ session: SessionSummary, fork: Bool) async throws -> Agent? {
+    func reopen(_ session: SessionSummary, fork: Bool, prompt: String = "") async throws -> Agent? {
         let id = session.session_id
         let args: [String]
         switch (session.kind, fork) {
@@ -856,7 +869,7 @@ final class AppStore {
         }
         let cwd = session.cwd ?? "~"
         let result = try await runAgent(
-            agent: session.kind, path: cwd, prompt: "", args: args, machine: session.machine)
+            agent: session.kind, path: cwd, prompt: prompt, args: args, machine: session.machine)
         await refresh()
         guard let pane = result.pane else { return nil }
         return agents.first { $0.pane == pane && $0.machine == session.machine } ?? Agent(

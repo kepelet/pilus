@@ -1750,12 +1750,21 @@ fn sessions_reply(
         None => None,
     };
     let sessions = match (agent, text("cwd")) {
-        (Some(agent), Some(cwd)) => {
-            pilus_index::session_for_source(source, machine, agent, cwd, text("session"))
-                .map_err(|error| index_failure(&error))?
-                .into_iter()
-                .collect()
-        }
+        (Some(agent), Some(cwd)) => pilus_index::session_for_source(
+            source,
+            machine,
+            agent,
+            cwd,
+            text("session"),
+            text("title"),
+            params
+                .get("strict")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        )
+        .map_err(|error| index_failure(&error))?
+        .into_iter()
+        .collect(),
         _ => {
             let limit = params
                 .get("limit")

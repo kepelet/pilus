@@ -100,8 +100,7 @@ struct SessionTranscriptView: View {
     @Environment(AppStore.self) private var store
     @State private var reply: TranscriptReply?
     @State private var loadError: String?
-    @State private var starting = false
-    @State private var startError: String?
+    @State private var choosing = false
 
     var body: some View {
         ScrollView {
@@ -126,21 +125,34 @@ struct SessionTranscriptView: View {
         .defaultScrollAnchor(.bottom)
         .safeAreaInset(edge: .bottom) {
             if store.canReopen(session) {
-                VStack(spacing: 6) {
-                    if let startError {
-                        Text(startError)
-                            .font(.footnote)
-                            .foregroundStyle(.red)
+                Button { choosing = true } label: {
+                    HStack(spacing: 8) {
+                        Text("Continue or fork this session")
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 30, height: 30)
+                            .background(Color.accentColor, in: .circle)
                     }
-                    HStack(spacing: 10) {
-                        reopenButton("Continue", systemImage: "play.fill", fork: false)
-                        reopenButton("Fork", systemImage: "arrow.branch", fork: true)
-                    }
+                    .padding(.leading, 16)
+                    .padding(.trailing, 6)
+                    .padding(.vertical, 6)
+                    .contentShape(.rect)
+                    .modifier(GlassRounded(radius: 21))
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(.bar)
+                .buttonStyle(.plain)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
             }
+        }
+        .sheet(isPresented: $choosing) {
+            ReopenSheet(session: session) { agent in
+                choosing = false
+                onStarted(agent)
+            }
+            .presentationDetents([.medium])
         }
         .refreshable { await load() }
         .navigationTitle(session.title)
@@ -151,29 +163,6 @@ struct SessionTranscriptView: View {
                 try? await Task.sleep(for: .seconds(15))
             }
         }
-    }
-
-    private func reopenButton(_ title: String, systemImage: String, fork: Bool) -> some View {
-        Button {
-            Task {
-                starting = true
-                startError = nil
-                do {
-                    if let agent = try await store.reopen(session, fork: fork) {
-                        onStarted(agent)
-                    }
-                } catch {
-                    startError = error.localizedDescription
-                }
-                starting = false
-            }
-        } label: {
-            Label(title, systemImage: systemImage)
-                .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(.bordered)
-        .controlSize(.large)
-        .disabled(starting)
     }
 
     private func load() async {
@@ -210,5 +199,81 @@ struct TranscriptSkeleton: View {
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .redacted(reason: .placeholder)
+    }
+}
+
+/// Continue the session where it left off, or fork it into a new one, with an
+/// optional first message for the agent.
+struct ReopenSheet: View {
+    let session: SessionSummary
+    var onStarted: (Agent) -> Void
+
+    @Environment(AppStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+    @State private var prompt = ""
+    @State private var starting: Bool?
+    @State private var startError: String?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("First message (optional)", text: $prompt, axis: .vertical)
+                        .lineLimit(1...4)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                }
+                Section {
+                    choice(fork: false, title: "Continue", detail: "Pick up in this session",
+                           systemImage: "play.fill")
+                    choice(fork: true, title: "Fork", detail: "Start a new session from here",
+                           systemImage: "arrow.branch")
+                } footer: {
+                    if let startError {
+                        Text(startError).foregroundStyle(.red)
+                    }
+                }
+            }
+            .navigationTitle(session.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", systemImage: "xmark") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func choice(fork: Bool, title: String, detail: String, systemImage: String) -> some View {
+        Button {
+            Task {
+                starting = fork
+                startError = nil
+                do {
+                    if let agent = try await store.reopen(session, fork: fork, prompt: prompt) {
+                        onStarted(agent)
+                    } else {
+                        dismiss()
+                    }
+                } catch {
+                    startError = error.localizedDescription
+                }
+                starting = nil
+            }
+        } label: {
+            HStack {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title)
+                        Text(detail).font(.footnote).foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: systemImage)
+                }
+                Spacer()
+                if starting == fork { ProgressView() }
+            }
+        }
+        .disabled(starting != nil)
     }
 }

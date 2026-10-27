@@ -19,7 +19,7 @@ struct AgentDetailView: View {
     private var awaitingTranscript: Bool {
         !lookedUp && ["claude", "pi"].contains(agent.kind) && store.hubAllows("hub.sessions", on: agent.machine)
     }
-    @State private var sessionLookups = 0
+    @State private var refreshes = 0
     @State private var reply = ""
     // Kept separate so a poll cannot erase a send error before it is read.
     @State private var loadError: String?
@@ -30,7 +30,6 @@ struct AgentDetailView: View {
     @State private var showingLog = false
     @State private var showingGitHub = false
     /// The shortcut strip starts folded — it shares the composer row's width.
-    @State private var shortcutsExpanded = false
     /// Owned here so the keyboard-down shortcut can resign the field.
     @FocusState private var replyFocused: Bool
     /// Scroll-back pagination: the capture window grows ×4 each time the top
@@ -69,16 +68,6 @@ struct AgentDetailView: View {
             }
 
             VStack(spacing: 6) {
-                // The shortcut strip lives above the capsule, hugging the
-                // right edge — it grows leftward when opened.
-                HStack(spacing: 8) {
-                    Spacer()
-                    if shortcutsExpanded {
-                        shortcutBar
-                    }
-                    shortcutToggle
-                }
-                .padding(.horizontal, 2)
                 // Bottom-aligned so the send button stays at the corner as the
                 // field grows upward.
                 HStack(alignment: .bottom, spacing: 8) {
@@ -332,12 +321,21 @@ struct AgentDetailView: View {
         }
     }
 
-    /// Find the agent's session (a few tries — a fresh agent writes its
-    /// transcript only after the first turn) and re-read its newest entries.
+    /// Find the agent's session and re-read its newest entries. The match is
+    /// re-run when the daemon's session id changes, and every few polls
+    /// otherwise, so an agent that starts a new session is followed to it.
     private func refreshTranscript(sessionID: String?, cwd: String?) async {
-        if session == nil, sessionLookups < 5 {
-            sessionLookups += 1
-            session = try? await store.session(for: agent, sessionID: sessionID, cwd: cwd)
+        refreshes += 1
+        let id = sessionID ?? ""
+        let moved = !id.isEmpty && session?.session_id != id
+        if session == nil || moved || refreshes % 4 == 0 {
+            let title = detail?.agent_session_title ?? agent.agent_session_title
+            do {
+                let found = try await store.session(
+                    for: agent, sessionID: sessionID, cwd: cwd, title: title)
+                if found?.path != session?.path { transcript = nil }
+                session = found
+            } catch {}
         }
         guard let session else {
             lookedUp = true
@@ -408,7 +406,7 @@ struct AgentDetailView: View {
 /// Liquid Glass rounded rectangle where available, material + hairline
 /// elsewhere — the reply field's shape, which a capsule cannot hold once the
 /// text wraps.
-private struct GlassRounded: ViewModifier {
+struct GlassRounded: ViewModifier {
     var radius: CGFloat
 
     func body(content: Content) -> some View {
@@ -432,72 +430,6 @@ private struct GlassCapsule: ViewModifier {
                 .background(.regularMaterial, in: .capsule)
                 .overlay(Capsule().strokeBorder(.quaternary))
         }
-    }
-}
-
-// MARK: - Shortcut bar
-
-extension AgentDetailView {
-    /// The keyboard icon is the whole control: tap folds the strip in and
-    /// out, and closing it — or tapping with the keyboard up — also resigns
-    /// the reply field.
-    var shortcutToggle: some View {
-        Button {
-            withAnimation(.easeInOut(duration: 0.15)) {
-                shortcutsExpanded.toggle()
-            }
-            if !shortcutsExpanded {
-                replyFocused = false
-            }
-        } label: {
-            Image(systemName: "keyboard")
-                .font(.system(size: 13))
-                .foregroundStyle(.primary)
-                .padding(6)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Keyboard shortcuts")
-    }
-
-    /// Named keys the daemon understands (`agent.keys`) plus a local
-    /// keyboard-dismiss — the pane has no physical keyboard attached.
-    var shortcutBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                shortcutKey("esc", keys: ["escape"])
-                shortcutKey("⌃C", keys: ["ctrl+c"])
-                shortcutKey("⌃D", keys: ["ctrl+d"])
-                shortcutKey("tab", keys: ["tab"])
-                shortcutKey("←", keys: ["left"])
-                shortcutKey("↑", keys: ["up"])
-                shortcutKey("↓", keys: ["down"])
-                shortcutKey("→", keys: ["right"])
-                shortcutKey("⏎", keys: ["ENTER"])
-            }
-            .padding(.vertical, 2)
-        }
-    }
-
-    private func shortcutKey(_ label: String, keys: [String]) -> some View {
-        Button {
-            Task {
-                do {
-                    try await store.sendKeys(agent: agent, keys: keys)
-                    sendError = nil
-                } catch {
-                    sendError = error.localizedDescription
-                }
-            }
-        } label: {
-            Text(label)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .foregroundStyle(.primary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(.secondary.opacity(0.12), in: .rect(cornerRadius: 8))
-        }
-        .buttonStyle(.plain)
     }
 }
 

@@ -16609,6 +16609,10 @@ fn bottom_fill_spans(
         .cells
         .get(start..start.saturating_add(paint_w))
         .unwrap_or(&[]);
+    // The same cells `render_row` paints: a zoomed pane's header strip is
+    // the first row, and the lone card's top padding continues its colors.
+    let cleared = without_zoom_chrome(frame, row, skip, cells);
+    let cells = cleared.as_deref().unwrap_or(cells);
     let mut spans = Vec::new();
     let mut index = 0usize;
     while index < cells.len() {
@@ -17939,6 +17943,26 @@ mod tests {
         let header =
             without_zoom_chrome(&frame, ZOOM_BADGE_ROW, 2, row_slice(&frame, 1)).expect("header");
         assert_eq!(header[0].bg, 9);
+    }
+
+    #[test]
+    fn the_padding_over_a_zoom_header_takes_the_pane_background() {
+        // With gaps on, the lone card's top padding continues the first row,
+        // which in a zoomed pane is the daemon's header strip.
+        let theme = Theme::default();
+        let (strip, pane) = (0x0100_0001, 0x0100_0002);
+        let mut frame = zoomed_frame();
+        for cell in &mut frame.cells {
+            cell.bg = match cell.bg {
+                5 => strip,
+                9 => pane,
+                other => other,
+            };
+        }
+        let spans = bottom_fill_spans(&frame, ZOOM_BADGE_ROW, theme, None, 2, 10);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].1, 9);
+        assert_eq!(spans[0].2, theme::resolve(pane, theme.bg, &theme.ansi));
     }
 
     #[test]

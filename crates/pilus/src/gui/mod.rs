@@ -1276,7 +1276,8 @@ struct CardLayout {
     origin_y: f32,
     /// Padding the grid keeps clear before the first column (`pad_x`) and
     /// above the first row (`pad_y`); the far sides' are part of `slack_x`
-    /// and `slack_y`. Zero unless panes float as cards.
+    /// and `slack_y`. Zero unless panes float as cards, except that a
+    /// `pad_y` below zero tucks most of flush panes' top border row under the strip.
     pad_x: f32,
     pad_y: f32,
     /// Visible grid size in cells.
@@ -14999,7 +15000,7 @@ impl PilusView {
         };
         let (inner_w, inner_h) = (inner_w - page_w, inner_h - page_h);
         let floating = self.floating_cards();
-        let panes = if floating {
+        let panes = if self.settings.pane_ui {
             self.shown_panes()
         } else {
             pane_frames::PaneFrames::default()
@@ -15008,6 +15009,16 @@ impl PilusView {
         // Every seam a row crosses pushes the panes past it right by a step;
         // the room comes out of the grid's width.
         pad.right += f32::from(panes.max_depth()) * pane_chrome::seam_step(floating, cell_w);
+        // Flush panes draw their top edge as a line, which leaves the daemon's
+        // top border row blank above the text. Most of that row tucks under
+        // the tab strip, and the grid gains the room at the bottom.
+        if !floating
+            && panes
+                .bounds()
+                .is_some_and(|bounds| bounds.top == self.skipped_rows())
+        {
+            pad.top = pane_chrome::flush_top_tuck(cell_h);
+        }
         let (pad_x, pad_y) = (pad.left, pad.top);
         let (inner_w, inner_h) = (
             inner_w - pad.left - pad.right,

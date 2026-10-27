@@ -43,11 +43,22 @@ const PAD_Y_PX: f32 = 8.0;
 /// lead short.
 const PAD_LEAD_PX: f32 = 4.0;
 
+/// How much of flush panes' blank top border row stays in view, in logical
+/// pixels: a little room between the drawn top edge and the text.
+const FLUSH_TOP_KEEP_PX: f32 = 6.0;
+
+/// The top padding that tucks most of flush panes' blank top border row
+/// under the tab strip: below zero, leaving [`FLUSH_TOP_KEEP_PX`] showing.
+pub(super) fn flush_top_tuck(cell_height: f32) -> f32 {
+    -(cell_height - FLUSH_TOP_KEEP_PX).max(0.0)
+}
+
 /// The padding the grid keeps clear around itself, in logical pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct GridPad {
     pub left: f32,
     pub right: f32,
+    /// Below zero, rows tuck up under the tab strip instead.
     pub top: f32,
     pub bottom: f32,
 }
@@ -230,7 +241,7 @@ const TOOLBAR_INSET_PX: f32 = 6.0;
 /// Surface beyond the cell grid that the outermost cards grow over, in
 /// pixels: the padding before the first column and above the first row, and
 /// the padding plus the sub-cell remainder past the last column and below the
-/// last row.
+/// last row. A `top` below zero is a row hidden under the tab strip.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct Slack {
     pub left: f32,
@@ -393,10 +404,12 @@ pub(super) fn pane_chrome(
         )
     } else {
         let left = column_edge(pane.left) - slack.left;
+        // A top border row tucked under the tab strip (`slack.top` below
+        // zero) brings the top edge down to the first row shown.
         let top = if pane.top < skip_rows {
             0.0
         } else {
-            row_edge(pane.top)
+            row_edge(pane.top) - slack.top
         };
         let overlap = |outer: bool| if outer { 0.0 } else { BORDER_PX };
         (
@@ -908,6 +921,45 @@ mod tests {
         let upper = chrome_with(frame(0, 1, 39, 9), tiled, false);
         let lower = chrome_with(frame(0, 10, 39, 20), tiled, false);
         assert_eq!(upper.top + upper.height - BORDER_PX, lower.top);
+    }
+
+    #[test]
+    fn a_flush_top_edge_comes_down_past_the_tucked_row() {
+        let tiled = frame(0, 1, 39, 20);
+        let clear = Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+        let card = |pane| {
+            pane_chrome(
+                0,
+                &pane,
+                &tiled,
+                true,
+                false,
+                clear,
+                clear,
+                clear,
+                px(17.0),
+                8.4,
+                Slack {
+                    top: flush_top_tuck(17.0),
+                    ..Slack::default()
+                },
+                &ColumnShifts::default(),
+                0,
+                1,
+            )
+        };
+        // Most of the top row is under the strip; the edge sits at the top
+        // shown, a little above the first row of text.
+        let top = card(frame(0, 1, 39, 9)).top;
+        assert_eq!(top, -flush_top_tuck(17.0));
+        assert_eq!(17.0 - top, FLUSH_TOP_KEEP_PX);
+        // A pane lower down keeps its own top.
+        assert_eq!(card(frame(0, 10, 39, 20)).top, 9.0 * 17.0);
     }
 
     #[test]

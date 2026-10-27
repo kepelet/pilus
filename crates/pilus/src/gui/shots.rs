@@ -2143,6 +2143,11 @@ impl Render for PaneGridView {
         let mut pad = super::pane_chrome::grid_pad(gaps, split);
         // The room each seam's step takes, as `card_layout` reserves it.
         pad.right += f32::from(panes.max_depth()) * super::pane_chrome::seam_step(gaps, cell_width);
+        // Flush, most of the top border row tucks under the strip, as
+        // `card_layout` does it.
+        if !gaps && split {
+            pad.top = super::pane_chrome::flush_top_tuck(cell_height);
+        }
         // The window's own glass is opaque here: cards in the chrome fill on
         // the tinted surface.
         let card = theme.chrome_cell(1.0);

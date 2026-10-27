@@ -16177,8 +16177,21 @@ fn render_row(
     // instead of one per fallback glyph, so the device-snapped edges cannot
     // leave backdrop-colored hairlines between them.
     let tiled = tiled.filter(|tiled| (tiled.top..=tiled.bottom).contains(&row));
+    let floating = gaps && tiled.is_some();
+    // The last run reaches the frame's width, which a frame the daemon has
+    // not yet narrowed to the grid carries past the painted columns. Under a
+    // floating card that stretch is gutter, the surface's to paint; filled,
+    // it would cover the gap beside the card in the run's color.
+    let painted_end = skip_cols.saturating_add(paint_w as u16);
     let fills = collect_background_runs(frame.width, &rendered, theme, row, selection)
         .into_iter()
+        .filter_map(|(start, cells, bg)| {
+            if !floating {
+                return Some((start, cells, bg));
+            }
+            let end = start.saturating_add(cells).min(painted_end);
+            (end > start).then(|| (start, end - start, bg))
+        })
         .flat_map(|(start, cells, bg)| match tiled {
             // The cards under the grid are the base inside the tiled box.
             Some(tiled) if bg == theme.bg => outside_columns(start, cells, tiled.left, tiled.right)
@@ -16360,7 +16373,6 @@ fn render_row(
     // under them, so the fillers leave the base color to those and stop at
     // the card's edge, a gap short: a filler would otherwise cover the card.
     // Flush, the fillers run to the element's edge in every color.
-    let floating = gaps && tiled.is_some();
     let card_inset = if floating { pane_chrome::GAP_PX } else { 0.0 };
     let paints = |bg: gpui::Rgba| !(floating && bg == theme.bg);
     // The left padding continues the first cell's own background: never the

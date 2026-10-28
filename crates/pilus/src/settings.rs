@@ -76,9 +76,6 @@ pub const OPACITY: f32 = 1.0;
 /// Default blur strength over the desktop: none, which is what an opaque
 /// window wants.
 pub const BLUR: f32 = 0.0;
-/// The corner radius `rounded_md` drew before the radius became a setting.
-/// It stays the floor the tab strip never squares below.
-pub const CORNER_RADIUS: f32 = 6.0;
 /// Default corner radius in logical pixels: the Appearances "Rounded"
 /// material. Controls, cards, and overlays use it directly; the dense and
 /// large steps scale from it.

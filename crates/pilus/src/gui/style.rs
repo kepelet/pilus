@@ -19,7 +19,7 @@ use gpui::{
     Transformation, Window, canvas, div, font, point, prelude::*, px, svg,
 };
 
-use crate::settings::{CHROME_FONT, CORNER_RADIUS, DEFAULT_CORNER_RADIUS, Settings};
+use crate::settings::{CHROME_FONT, DEFAULT_CORNER_RADIUS, Settings};
 
 use super::theme::Theme;
 use super::toast::ToastKind;
@@ -68,9 +68,6 @@ pub(super) enum Radius {
     /// setting, since a square one stops reading as what it is. Energy mode
     /// leaves it round too.
     Full,
-    /// A tab: never squarer than the default radius, so zero corners and
-    /// energy mode leave the strip soft.
-    Soft,
 }
 
 /// The corner radius in logical pixels, as `f32` bits so any window can read
@@ -85,7 +82,7 @@ static ENERGY: AtomicBool = AtomicBool::new(false);
 /// Publish the radius being drawn, and whether energy mode is in effect, for
 /// [`Radius`] and [`energy`] to resolve against. Energy mode squares the
 /// corners here, so every window follows without a check of its own; the
-/// pill and the tab keep their shape, as they do at a zero radius.
+/// pill keeps its shape, as it does at a zero radius.
 pub(super) fn sync_corner_radius(settings: &Settings) {
     CORNER_RADIUS_PX.store(settings.drawn_radius().to_bits(), Ordering::Relaxed);
     ENERGY.store(settings.energy_saving(), Ordering::Relaxed);
@@ -113,7 +110,6 @@ impl Radius {
             Self::Md => px(base),
             Self::Lg => px(base * 4.0 / 3.0),
             Self::Full => px(9999.0),
-            Self::Soft => px(base.max(CORNER_RADIUS)),
         }
     }
 }
@@ -124,8 +120,6 @@ pub(super) const RADIUS_SM: Radius = Radius::Sm;
 pub(super) const RADIUS_MD: Radius = Radius::Md;
 /// `Radius::Full`, for a fill under a pill or round button.
 pub(super) const RADIUS_FULL: Radius = Radius::Full;
-/// `Radius::Soft`, for a fill under a tab.
-pub(super) const RADIUS_SOFT: Radius = Radius::Soft;
 
 /// The `rounded_*` family, resolved through [`Radius`] instead of GPUI's fixed
 /// rems. Chrome calls these so the corner-radius setting reaches it; a fixed
@@ -143,9 +137,6 @@ pub(super) trait RadiusExt: Styled + Sized {
         self.rounded(Radius::Lg.pixels())
     }
 
-    fn radius_soft(self) -> Self {
-        self.rounded(Radius::Soft.pixels())
-    }
 
     fn radius_full(self) -> Self {
         self.rounded(Radius::Full.pixels())
@@ -702,11 +693,11 @@ pub(super) fn pill(theme: Theme, hover: Option<Rgba>) -> Div {
         .flex()
         .flex_row()
         .items_center()
-        .radius_soft()
+        .radius_md()
         .border_1()
         .border_color(theme.border);
     match hover {
-        Some(hover) => pill.state_fill(gpui::transparent_black(), hover, Radius::Soft),
+        Some(hover) => pill.state_fill(gpui::transparent_black(), hover, Radius::Md),
         None => pill,
     }
 }
@@ -3732,13 +3723,13 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_radius_leaves_the_pill_and_the_tab_soft() {
+    fn a_zero_radius_leaves_the_pill_round_and_squares_the_tab() {
         assert_eq!(Radius::Full.resolve(0.0), px(9999.0));
-        assert_eq!(Radius::Soft.resolve(0.0), px(CORNER_RADIUS));
+        assert_eq!(Radius::Md.resolve(0.0), px(0.0));
     }
 
     #[test]
-    fn energy_mode_leaves_the_pill_and_the_tab_soft() {
+    fn energy_mode_leaves_only_the_pill_round() {
         let settings = Settings {
             energy_mode: true,
             ..Settings::default()
@@ -3748,6 +3739,5 @@ mod tests {
             assert_eq!(step.resolve(base), px(0.0), "{step:?}");
         }
         assert_eq!(Radius::Full.resolve(base), px(9999.0));
-        assert_eq!(Radius::Soft.resolve(base), px(CORNER_RADIUS));
     }
 }

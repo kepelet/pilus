@@ -75,8 +75,8 @@ Energy mode (`Settings::energy_mode`) is switched from the pilus menu, the menu
 bar item (`menubar::Pick::Energy`) or the command palette. It overrides the
 person's choices in what gets drawn without changing the choices themselves:
 
-- `Settings::drawn_radius` is square, except `Radius::Full` and `Soft` (the
-  pill and the tab), which stay round as they would at a zero radius.
+- `Settings::drawn_radius` is square, except `Radius::Full` (the
+  pill), which stays round as it would at a zero radius.
   `drawn_opacity` is solid, so the blur view is dropped. These two replace
   `radius` and `glass_opacity` everywhere they are used. The Appearances
   sliders keep reading the originals.

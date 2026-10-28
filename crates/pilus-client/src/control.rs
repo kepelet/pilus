@@ -78,6 +78,10 @@ pub struct Tab {
     /// How many panes the tab holds, from `session.snapshot`; 0 until the
     /// snapshot has enriched the tab.
     pub panes: u16,
+    /// The pane in the tab that holds focus, from `session.snapshot`; `None`
+    /// until the snapshot has enriched the tab. The glyph follows it, so a tab
+    /// with an agent pane and a terminal pane shows whichever is in front.
+    pub focused_pane: Option<String>,
 }
 
 impl Tab {
@@ -107,6 +111,7 @@ impl Tab {
             process: String::new(),
             title: String::new(),
             panes: 0,
+            focused_pane: None,
         })
     }
 
@@ -339,6 +344,15 @@ fn enrich_tab_runtime(tabs: &mut [Tab], snapshot: &Value, titles: &HashMap<Strin
         };
         let panes = runtime.get("panes").and_then(Value::as_array);
         tab.panes = panes.map_or(0, |panes| u16::try_from(panes.len()).unwrap_or(u16::MAX));
+        tab.focused_pane = panes
+            .and_then(|panes| {
+                panes
+                    .iter()
+                    .find(|pane| pane.get("focused").and_then(Value::as_bool) == Some(true))
+            })
+            .and_then(|pane| pane.get("pane_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let pane = panes.and_then(|panes| {
             panes
                 .iter()
@@ -2085,6 +2099,9 @@ mod tests {
         assert_eq!(tabs[0].cwd, "/repo/web");
         assert_eq!(tabs[0].process, "node");
         assert_eq!(tabs[0].title, "node server.js ~/r/web");
+        // The focused pane is recorded whatever its kind.
+        assert_eq!(tabs[0].focused_pane.as_deref(), Some("9"));
+        assert_eq!(tabs[1].focused_pane, None);
         // A pane the inventory does not list has no title.
         assert_eq!(tabs[1].title, "");
         // No focused pane falls back to the first terminal.

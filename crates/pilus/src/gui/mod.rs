@@ -11744,22 +11744,29 @@ impl PilusView {
         }
     }
 
-    /// The agent running on tab `index` in the active workspace, if any.
+    /// The agent whose pane is in front on `tab` in the active workspace, if
+    /// any.
     ///
     /// `agent.list` tab positions repeat across workspaces, so a match must
-    /// pin the workspace id too; a focused or working agent wins over another
-    /// agent on the same tab.
-    fn tab_agent(&self, index: u16) -> Option<&Agent> {
+    /// pin the workspace id too. When the snapshot says which pane holds the
+    /// tab's focus, that pane decides: a focused terminal beside two agents
+    /// is a terminal tab. Until it does, a focused or working agent wins over
+    /// another agent on the same tab.
+    fn tab_agent(&self, tab: &Tab) -> Option<&Agent> {
         let workspace_id = &self
             .surface
             .workspaces()
             .iter()
             .find(|workspace| workspace.active)?
             .id;
-        self.agents
+        let mut on_tab = self
+            .agents
             .iter()
-            .filter(|agent| agent.workspace_id == *workspace_id && agent.tab == index)
-            .max_by_key(|agent| (agent.focused, agent.status == "working"))
+            .filter(|agent| agent.workspace_id == *workspace_id && agent.tab == tab.index);
+        match tab.focused_pane.as_deref() {
+            Some(pane) => on_tab.find(|agent| agent.pane == pane),
+            None => on_tab.max_by_key(|agent| (agent.focused, agent.status == "working")),
+        }
     }
 
     /// Open a new tab in the active workspace.
@@ -12183,7 +12190,7 @@ impl PilusView {
         } else {
             self.shorten_cwd(&self.active.key(), &tab.cwd)
         };
-        let agent = self.tab_agent(index);
+        let agent = self.tab_agent(tab);
         let session_title = agent.and_then(|agent| agent.session_title.as_deref());
         let label = tab_label(&tab.name, session_title, &tab.process, &cwd, lone);
         let slide = if cx.reduce_motion() {

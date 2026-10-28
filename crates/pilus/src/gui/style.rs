@@ -424,14 +424,14 @@ pub(super) fn glyph_tile(
                 .flex_shrink_0()
                 .text_color(tint(theme.panel_fg, GLYPH_DIM)),
         );
-    // The badge hangs off the front card's lower right corner by no more
+    // The badge hangs off the front card's upper right corner by no more
     // than the deck's padding, so a tab's clip does not cut it.
     let badge = status.map(|color| {
         div()
             .id("pilus-state-badge")
             .absolute()
             .left(px(GLYPH_TILE - TILE_BADGE + STACK_PAD))
-            .top(px(GLYPH_TILE - TILE_BADGE + 2.0 * STACK_PAD))
+            .top_0()
             .w(px(TILE_BADGE))
             .h(px(TILE_BADGE))
             .status_fill(color, Radius::Full)
@@ -441,7 +441,7 @@ pub(super) fn glyph_tile(
 
 /// Diameter of the status badge on a [`glyph_tile`]: a size under
 /// [`STATUS_DOT`], since it marks a 20px tile rather than a row.
-const TILE_BADGE: f32 = 7.0;
+const TILE_BADGE: f32 = 5.0;
 
 /// How wide a [`glyph_tile`] for `panes` lays out: the front card, the
 /// peek of each card behind it, and the room their tilt needs.

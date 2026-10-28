@@ -13,8 +13,36 @@ struct TranscriptList: View {
 
     @State private var loading = false
 
+    /// An entry with an identity that survives older entries being read in
+    /// above it. Position would not: every row would take the next one's
+    /// place, and an expanded tool call would open on the wrong row.
+    private struct Row: Identifiable {
+        let id: Int
+        let entry: TranscriptEntry
+    }
+
+    private var rows: [Row] {
+        var seen: [Int: Int] = [:]
+        return entries.map { entry in
+            // Output is left out: it can be large, and the rest names the entry.
+            var hasher = Hasher()
+            hasher.combine(entry.type)
+            hasher.combine(entry.text)
+            hasher.combine(entry.name)
+            hasher.combine(entry.summary)
+            hasher.combine(entry.at)
+            let base = hasher.finalize()
+            // Identical entries (the same prompt sent twice) are told apart by
+            // how many of them came before.
+            let n = seen[base, default: 0]
+            seen[base] = n + 1
+            return Row(id: base &+ n, entry: entry)
+        }
+    }
+
     var body: some View {
         ScrollViewReader { proxy in
+        let list = rows
         LazyVStack(alignment: .leading, spacing: 14) {
             if earlier, let loadEarlier {
                 ProgressView()
@@ -23,17 +51,18 @@ struct TranscriptList: View {
                         guard !loading else { return }
                         loading = true
                         let first = entries.count
+                        let anchor = list.first?.id
                         Task {
                             let now = await loadEarlier()
                             // Keep the entry that was on top in place rather
                             // than jumping to the oldest one just read.
-                            if now > first { proxy.scrollTo(now - first, anchor: .top) }
+                            if now > first, let anchor { proxy.scrollTo(anchor, anchor: .top) }
                             loading = false
                         }
                     }
             }
-            ForEach(Array(entries.enumerated()), id: \.offset) { _, entry in
-                TranscriptRow(entry: entry)
+            ForEach(list) { row in
+                TranscriptRow(entry: row.entry)
             }
         }
         .padding()

@@ -29,6 +29,10 @@ struct AgentDetailView: View {
     @State private var transcriptError: String?
     /// Sent messages shown at the transcript's end until a re-read has them.
     @State private var pending: [TranscriptEntry] = []
+    /// How many times the transcript already held each pending text when its
+    /// first copy was sent, so a message sent twice is not taken as read
+    /// because its earlier twin is.
+    @State private var pendingBase: [String: Int] = [:]
     @State private var reply = ""
     // Kept separate so a poll cannot erase a send error before it is read.
     @State private var loadError: String?
@@ -81,10 +85,8 @@ struct AgentDetailView: View {
                 // it opens the same session sheet the ⋯ shows.
                 Button { showingInfo = true } label: {
                     HStack(spacing: 6) {
-                        if detail?.status != nil {
-                            Circle()
-                                .fill(.secondary)
-                                .frame(width: 6, height: 6)
+                        if liveStatus != nil {
+                            AgentStatusMark(status: liveStatus)
                         }
                         Text(detail?.agent_session_title ?? agent.title)
                             .font(.subheadline.weight(.semibold))
@@ -178,11 +180,37 @@ struct AgentDetailView: View {
     }
 
     private var composer: some View {
-        ReplyComposer(
-            placeholder: "Reply to \(agent.title)", text: $reply, focused: $replyFocused,
-            error: sendError ?? loadError, sending: sending
-        ) { sendButton }
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { composerHeight = $0 }
+        VStack(spacing: 0) {
+            statusPill
+            ReplyComposer(
+                placeholder: "Reply to \(agent.title)", text: $reply, focused: $replyFocused,
+                error: sendError ?? loadError, sending: sending
+            ) { sendButton }
+        }
+        .animation(.easeInOut(duration: 0.2), value: liveStatus)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { composerHeight = $0 }
+    }
+
+    /// The status as of the latest read, else the row the screen opened from.
+    private var liveStatus: String? { detail?.status ?? agent.status }
+
+    /// Sits above the reply box so it is in view at the moment of typing: a
+    /// reply sent while the agent works steers or interrupts it.
+    @ViewBuilder
+    private var statusPill: some View {
+        if let text = AgentStatusMark.caption(for: liveStatus) {
+            HStack(spacing: 6) {
+                AgentStatusMark(status: liveStatus)
+                Text(text)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .modifier(GlassCapsule())
+            .padding(.top, 6)
+            .transition(.opacity)
+        }
     }
 
     /// Output signals arrive for the paired host's panes while its watch is up.
@@ -315,8 +343,11 @@ struct AgentDetailView: View {
         do {
             let (detail, screen) = try await store.agentDetail(agent: agent, lines: captureLines)
             self.detail = detail
-            content = screen.text
-            truncated = screen.truncated
+            content = ANSIRenderer.trimmingTrailingBlankLines(screen.text)
+            // The pane's history window means nothing while the transcript is
+            // shown. Raised here and lowered again after the transcript read,
+            // it put the load-older sentinel on screen at the top of every poll.
+            truncated = screen.truncated && transcript == nil
             loadError = nil
             await refreshTranscript(sessionID: detail?.session, cwd: detail?.cwd)
             return true
@@ -347,6 +378,11 @@ struct AgentDetailView: View {
                     found = try await store.session(
                         for: agent, sessionID: sessionID, cwd: cwd, title: title)
                 }
+                // A lookup that comes back empty — the title it matches on
+                // changes when a turn ends — must not throw away the chat
+                // already on screen and fall back to the pane. The session
+                // shown stands until another one is found.
+                if found == nil, matched { found = session }
                 if found?.path != session?.path {
                     transcript = found.flatMap { store.cachedTranscript(path: $0.path, machine: $0.machine) }
                     pending = []
@@ -369,10 +405,18 @@ struct AgentDetailView: View {
             transcript = reply
             transcriptError = nil
             truncated = false
-            let said = reply.entries.suffix(20).filter { $0.type == "user" }
-                .compactMap { $0.text?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            let said = Self.userCounts(reply.entries)
             let stale = Int(Date().timeIntervalSince1970) - 120
-            pending.removeAll { said.contains($0.text ?? "") || ($0.at ?? 0) < stale }
+            // The k-th pending copy of a text is read once the transcript
+            // holds more copies than it did before the first was sent.
+            var seen: [String: Int] = [:]
+            pending.removeAll { echo in
+                let text = echo.text ?? ""
+                let k = seen[text, default: 0]
+                seen[text] = k + 1
+                let read = said[text, default: 0] >= (pendingBase[text] ?? 0) + k + 1
+                return read || (echo.at ?? 0) < stale
+            }
         } catch {
             if transcript == nil { transcriptError = error.localizedDescription }
         }
@@ -395,6 +439,15 @@ struct AgentDetailView: View {
         let now = transcript?.entries.count ?? 0
         if now <= had { exhausted = true }
         return now + pending.count
+    }
+
+    /// How often each prompt appears among the user's entries.
+    private static func userCounts(_ entries: [TranscriptEntry]) -> [String: Int] {
+        var counts: [String: Int] = [:]
+        for entry in entries where entry.type == "user" {
+            counts[(entry.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines), default: 0] += 1
+        }
+        return counts
     }
 
     private static func folder(_ path: String?) -> String {
@@ -435,6 +488,9 @@ struct AgentDetailView: View {
                               output: nil, failed: nil, at: Int(Date().timeIntervalSince1970))
             : nil
         if let echo {
+            if !pending.contains(where: { $0.text == text }) {
+                pendingBase[text] = Self.userCounts(transcript?.entries ?? [])[text, default: 0]
+            }
             pending.append(echo)
             reply = ""
         }
@@ -547,6 +603,39 @@ struct GlassRounded: ViewModifier {
                 .background(.regularMaterial, in: .rect(cornerRadius: radius))
                 .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(.quaternary))
         }
+    }
+}
+
+/// An agent's state at a glance, drawn as Home's rows draw it: a spinner while
+/// it works, an orange dot while it waits on the user, a faint dot otherwise.
+private struct AgentStatusMark: View {
+    let status: String?
+
+    static func isWorking(_ status: String?) -> Bool {
+        status == "working" || status == "running"
+    }
+
+    /// What the pill says; nil when the agent is idle and nothing needs saying.
+    static func caption(for status: String?) -> String? {
+        if isWorking(status) { return "Working — a reply now will steer it" }
+        if status == "blocked" || status == "waiting_permission" { return "Waiting for you" }
+        return nil
+    }
+
+    var body: some View {
+        // One 14pt frame for every state so switching never shifts the layout.
+        Group {
+            if Self.isWorking(status) {
+                ProgressView().controlSize(.mini)
+            } else {
+                Circle()
+                    .fill(status == "blocked" || status == "waiting_permission"
+                          ? Color.orange : Color.secondary.opacity(0.45))
+                    .frame(width: 7, height: 7)
+            }
+        }
+        .frame(width: 14, height: 14)
+        .accessibilityLabel(Self.caption(for: status) ?? "Idle")
     }
 }
 

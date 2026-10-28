@@ -9,6 +9,21 @@ import SwiftUI
 /// escape — cursor moves, OSC hyperlinks, charset switches — is skipped
 /// because a screen snapshot is already the post-layout text.
 enum ANSIRenderer {
+    /// `source` without the empty rows a terminal capture ends in. The pane is
+    /// anchored to its last row, so those rows read as a blank screen with the
+    /// text pushed off above it. A row of only escapes counts as empty.
+    static func trimmingTrailingBlankLines(_ source: String) -> String {
+        var lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+        while let last = lines.last,
+              last.replacingOccurrences(
+                of: "\u{1B}(\\[[0-9;?]*[ -/]*[@-~]|\\][^\u{07}\u{1B}]*(\u{07}|\u{1B}\\\\)?)",
+                with: "", options: .regularExpression)
+                .allSatisfy(\.isWhitespace) {
+            lines.removeLast()
+        }
+        return lines.joined(separator: "\n")
+    }
+
 
     /// The conventional xterm palette. These are the terminal's colors, not
     /// the app's theme — agent output assumes them whatever the chrome looks

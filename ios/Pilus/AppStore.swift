@@ -892,7 +892,20 @@ final class AppStore {
     }
 
     /// End an agent by closing its pane, then re-read the agent list.
+    ///
+    /// `pane.close` takes a bare pane id and a pane id outlives its terminal,
+    /// so the terminal the row described is checked against a fresh inventory
+    /// first: a pane that now holds another agent is refused, not closed.
     func stopAgent(_ agent: Agent) async throws {
+        if agent.terminal_id != nil, supports("terminal.backend.inventory", on: agent.machine) {
+            do {
+                _ = try await terminalIdentity(for: agent, refresh: true)
+            } catch let error as PilusError where error.code == "not_terminal" {
+                // The pane is already gone; there is nothing left to close.
+                await refresh(topics: ["agents"], machines: [agent.machine])
+                return
+            }
+        }
         let _: EmptyReply = try await call(
             method: "pane.close", params: ["pane": agent.pane], machine: agent.machine)
         await refresh(topics: ["agents"], machines: [agent.machine])
@@ -955,6 +968,9 @@ final class AppStore {
         var merged: [SessionSummary] = []
         var complete = true
         for id in machineOrder {
+            // The request itself cannot be recalled once sent, but a search
+            // the user has typed past should not go on to the next machine.
+            if Task.isCancelled { complete = false; break }
             var params: [String: Any] = ["limit": limit]
             if !words.isEmpty { params["query"] = query }
             let rows: [SessionSummary]
@@ -1194,6 +1210,15 @@ final class AppStore {
         pseudoKindsByMachine = [:]
         inventoryCache = [:]
         invalidateSearches()
+        // Another host's sessions and chats must not outlive this pairing,
+        // on screen or in the cache file.
+        sessions = []
+        sessionsLoaded = false
+        transcriptCache = [:]
+        transcriptOrder = []
+        agentSessions = [:]
+        sightedSessions = []
+        try? FileManager.default.removeItem(at: Self.sessionCacheURL)
         workspaces = []
         agents = []
         tasks = []

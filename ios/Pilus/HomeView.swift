@@ -464,7 +464,9 @@ struct HomeView: View {
     }
 
     private var canSendComposer: Bool {
+        // An empty draft would start an agent with nothing to do.
         !composerSending && composerKind != nil
+            && !composerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func collapseComposer() {
@@ -584,8 +586,11 @@ struct HomeView: View {
     /// there is nothing to say, so a fresh pairing shows no empty line.
     private var overviewSummary: String? {
         var parts: [String] = []
+        // A task nobody has touched in a week is abandoned, not open.
+        let recent = Date.now.timeIntervalSince1970 - 7 * 86_400
         let open = store.tasks.filter {
             !["done", "succeeded", "success", "failed"].contains($0.status ?? "")
+                && ($0.updated.map { Double($0) >= recent } ?? true)
         }
         let review = open.filter { $0.status == "review" }.count
         if review > 0 { parts.append("\(review) to review") }

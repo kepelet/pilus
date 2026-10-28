@@ -53,6 +53,8 @@ is the only implementation of it.
   Hover takes the same tint without the border, as do the header's toggle
   and session picker, and so does the active workspace while an agent row
   holds the selection.
+  A nested workspace row's pill starts past its elbow, so the tree rail stays
+  bare.
   The sidebar and tab strip grounds are opaque at any window opacity
   (`Theme::chrome_ground`), so the washes never take on the desktop.
   `Theme::card_raise` is the terminal card's own color, for raised fills

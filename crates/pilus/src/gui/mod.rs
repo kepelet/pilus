@@ -209,17 +209,22 @@ const SIDEBAR_ROW_PAD: f32 = 8.0;
 const SIDEBAR_NEST_INDENT: f32 = 4.0;
 
 /// How a workspace row joins the tree rail that links the elbows to their
-/// parent. Rows are flat siblings, so each one draws its own span of the line
-/// and the spans meet across the rows' gap.
+/// machine. Rows are flat siblings, so each one draws its own span of the
+/// one line, and the spans meet across the rows' gap. A worktree hangs off
+/// the same line as its workspace, with a longer elbow.
 #[derive(Clone, Copy, Default)]
 struct NestRail {
     /// A machine's row, which carries the chevron that folds the rows below.
     foldable: bool,
     /// Rows hang below this one: a stub runs down from its glyph.
     parent: bool,
-    /// A later row at this depth follows: the line runs through this row.
+    /// Another row follows below the machine: the line runs through this one.
     more: bool,
 }
+
+/// Where the tree rail runs, from the left of a row: the middle of the
+/// machine row's glyph, which a workspace's elbow also starts from.
+const RAIL_X: f32 = SIDEBAR_ROW_PAD + SIDEBAR_GLYPH / 2.0;
 
 /// Gap between sidebar rows, which a rail span bridges.
 const SIDEBAR_ROW_GAP: f32 = 4.0;
@@ -13453,6 +13458,7 @@ impl PilusView {
                     .flex_shrink_0()
                     .child(icon(bytes, size, color))
             };
+            let nest = SIDEBAR_NEST_INDENT * depth.saturating_sub(1) as f32;
             head = head.child(if depth > 0 {
                 // A row below its machine (or a worktree below its workspace)
                 // hangs off the row above it: an elbow ("|_") says so in place
@@ -13463,13 +13469,15 @@ impl PilusView {
                     .flex_shrink_0()
                     .child(
                         div()
-                            .ml(px(3.0))
+                            // A worktree's elbow reaches back to the rail its
+                            // workspace hangs from.
+                            .ml(px(3.0 - nest))
                             .mt(px(-2.5))
-                            .w(px(8.0))
+                            .w(px(8.0 + nest))
                             .h(px(13.0))
                             .border_l_1()
                             .border_b_1()
-                            .border_color(theme.muted.opacity(0.5))
+                            .border_color(self.rail_color())
                             .rounded_bl(style::Radius::Sm.pixels() * 0.75),
                     )
                     .into_any_element()
@@ -13530,6 +13538,21 @@ impl PilusView {
                     .child(branch),
             );
         }
+        // The selection and hover pills take this frame's bounds, not the
+        // row's: a nested row's starts past the elbow, so the pill marks the
+        // nested part and the rail stays bare.
+        let pill_frame = div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .left(px(if depth > 0 {
+                SIDEBAR_ROW_PAD + SIDEBAR_NEST_INDENT * depth as f32 + SIDEBAR_GLYPH
+            } else {
+                0.0
+            }))
+            .children(selected.then(|| style::glide_target(pill)))
+            .child(style::hover_target(&self.sidebar_hover));
         let mut row = div()
             .id(format!(
                 "pilus-workspace-{}-{}",
@@ -13546,9 +13569,8 @@ impl PilusView {
             .py_1()
             .radius_md()
             .cursor_pointer()
-            .children(selected.then(|| style::glide_target(pill)))
-            .child(style::hover_target(&self.sidebar_hover))
             .tooltip(tip)
+            .child(pill_frame)
             .child(head);
         // The path line follows the daemon's Show Path / Hide Path toggle.
         if self.sidebar_workspace_paths {
@@ -13560,14 +13582,16 @@ impl PilusView {
         }
         {
             // The head's line box is the font's; the 14px glyph centers in it.
-            let glyph_top = SIDEBAR_ROW_PY
-                + (self.chrome_font() * SIDEBAR_LINE_RATIO - SIDEBAR_GLYPH).max(0.0) / 2.0;
-            let rail_color = theme.muted.opacity(0.5);
+            // Whole pixels, so a span's end is a crisp edge, not a blur.
+            let glyph_top = (SIDEBAR_ROW_PY
+                + (self.chrome_font() * SIDEBAR_LINE_RATIO - SIDEBAR_GLYPH).max(0.0) / 2.0)
+                .round();
+            let rail_color = self.rail_color();
             let span = |left: f32| div().absolute().left(px(left)).w(px(1.0)).bg(rail_color);
             row = row.relative();
             if depth > 0 {
                 // Up to the previous row, and on through this one when more follow.
-                let line = span(row_pl + 3.0).top(px(-SIDEBAR_ROW_GAP));
+                let line = span(RAIL_X).top(px(-SIDEBAR_ROW_GAP));
                 row = row.child(if rail.more {
                     line.bottom(px(-SIDEBAR_ROW_GAP))
                 } else {
@@ -13575,12 +13599,9 @@ impl PilusView {
                 });
             }
             if rail.parent {
-                // The stub starts at the glyph's foot, or at the elbow's
-                // stroke when the parent is itself nested.
-                let foot = if depth > 0 { 10.5 } else { SIDEBAR_GLYPH };
                 row = row.child(
-                    span(row_pl + SIDEBAR_GLYPH / 2.0)
-                        .top(px(glyph_top + foot))
+                    span(RAIL_X)
+                        .top(px(glyph_top + SIDEBAR_GLYPH))
                         .bottom(px(-SIDEBAR_ROW_GAP)),
                 );
             }
@@ -14449,14 +14470,10 @@ impl PilusView {
                 .map(|(_, workspace)| (if workspace.nested { 2 } else { 1 }, workspace))
                 .collect();
             for (at, (depth, workspace)) in below.iter().enumerate() {
-                let rest = &below[at + 1..];
                 let rail = NestRail {
                     foldable: false,
-                    parent: rest.first().is_some_and(|(next, _)| next > depth),
-                    more: rest
-                        .iter()
-                        .take_while(|(next, _)| next >= depth)
-                        .any(|(next, _)| next == depth),
+                    parent: false,
+                    more: at + 1 < below.len(),
                 };
                 children = children.child(self.workspace_row(
                     &id,
@@ -14600,7 +14617,7 @@ impl PilusView {
                     .top(px((SIDEBAR_ROW_HEIGHT + SIDEBAR_GLYPH) / 2.0))
                     .bottom(px(-SIDEBAR_ROW_GAP))
                     .w(px(1.0))
-                    .bg(theme.muted.opacity(0.5))
+                    .bg(self.rail_color())
             }))
             .child(div().w(px(SIDEBAR_GLYPH)).flex_shrink_0().child(icon(
                 icon_bytes,
@@ -15017,6 +15034,13 @@ impl PilusView {
         } else {
             SIDEBAR_ROW_EDGE
         }
+    }
+
+    /// The tree rail's color: the muted text blended over the sidebar's
+    /// opaque ground. Opaque on purpose, since the rail is built of spans
+    /// that overlap, and translucent ones would darken where they do.
+    fn rail_color(&self) -> gpui::Rgba {
+        style::mix(self.sidebar_fill(), self.theme.muted, 0.5)
     }
 
     /// The sidebar's fill, opaque: the tab strip's while cards float, so the

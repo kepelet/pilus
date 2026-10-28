@@ -162,7 +162,7 @@ struct SessionTranscriptView: View {
                             Button("Fork") { start(fork: true) }
                             Button("Cancel", role: .cancel) {}
                         } message: {
-                            Text("A new session starts with this one's history. This one stays as it is.")
+                            Text("A new session (\(session.kind)) starts with this one's history. This one stays as it is.")
                         }
                 }
             }
@@ -192,7 +192,7 @@ struct SessionTranscriptView: View {
                     .padding(.horizontal)
             }
             HStack(alignment: .bottom, spacing: 8) {
-                TextField("Continue this session", text: $prompt, axis: .vertical)
+                TextField("Continue this session (\(session.kind))", text: $prompt, axis: .vertical)
                     .lineLimit(1...5)
                     .lineSpacing(AgentDetailView.lineSpacing)
                     .textFieldStyle(.plain)

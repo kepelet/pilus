@@ -24,7 +24,6 @@ struct HomeView: View {
 
     /// In-stack destinations that are not an `Agent`.
     private enum HomeRoute: Hashable {
-        case notifications
         case search
     }
     @AppStorage("home.agents.expanded") private var agentsExpanded = true
@@ -76,14 +75,9 @@ struct HomeView: View {
                 }
                 if #available(iOS 26.0, *) {
                     ToolbarItem(placement: .topBarTrailing) {
-                        HStack(spacing: 8) {
-                            if store.canReadSessions {
-                                glassButton("magnifyingglass", label: "Search Sessions") {
-                                    navPath.append(HomeRoute.search)
-                                }
-                            }
-                            glassButton("bell", label: "Notifications") {
-                                navPath.append(HomeRoute.notifications)
+                        if store.canReadSessions {
+                            glassButton("magnifyingglass", label: "Search Sessions") {
+                                navPath.append(HomeRoute.search)
                             }
                         }
                     }
@@ -96,10 +90,6 @@ struct HomeView: View {
                             }
                             .accessibilityLabel("Search Sessions")
                         }
-                        Button { navPath.append(HomeRoute.notifications) } label: {
-                            Image(systemName: "bell")
-                        }
-                        .accessibilityLabel("Notifications")
                     }
                 }
             }
@@ -114,7 +104,6 @@ struct HomeView: View {
             }
             .navigationDestination(for: HomeRoute.self) { route in
                 switch route {
-                case .notifications: NotificationsView()
                 case .search: SessionSearchView()
                 }
             }
@@ -559,7 +548,7 @@ struct HomeView: View {
                 Text(Self.greeting)
                     .font(.title.weight(.semibold))
                     .foregroundStyle(.white)
-                Text("Zero inbox for now")
+                Text(agentSummary)
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.75))
             }
@@ -571,6 +560,19 @@ struct HomeView: View {
     }
 
     @Environment(\.colorScheme) private var colorScheme
+
+    /// What the live agents are doing, busiest first.
+    private var agentSummary: String {
+        let statuses = store.agents.map(\.status)
+        let working = statuses.filter { $0 == "working" || $0 == "running" }.count
+        let waiting = statuses.filter { $0 == "blocked" || $0 == "waiting_permission" }.count
+        let idle = statuses.count - working - waiting
+        var parts: [String] = []
+        if working > 0 { parts.append("\(working) working") }
+        if waiting > 0 { parts.append("\(waiting) waiting for you") }
+        if idle > 0 { parts.append("\(idle) idle") }
+        return parts.isEmpty ? "No agents running" : parts.joined(separator: ", ")
+    }
 
     /// The hero's top scrim is dark in both appearances — the bar items
     /// (mark, wordmark, bell) draw in their light treatment on it.
@@ -948,24 +950,31 @@ struct SessionRowLabel: View {
     }
 }
 
-/// Every session the hosts keep but the live agents', narrowed by what is
-/// typed: each word must appear in the title, folder, branch or agent.
+/// Sessions the hosts keep, but the live agents', searched on each host:
+/// each word must appear in the title, folder, branch or agent.
 struct SessionSearchView: View {
     @Environment(AppStore.self) private var store
     @State private var query = ""
-    @State private var all: [SessionSummary]?
+    @State private var found: [SessionSummary]?
 
     var body: some View {
-        List(matches) { session in
-            NavigationLink(value: session) {
-                SessionRowLabel(session: session)
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(found ?? []) { session in
+                    NavigationLink(value: session) {
+                        SessionRowLabel(session: session)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 8)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
-        .listStyle(.plain)
         .overlay {
-            if all == nil && store.sessions.isEmpty {
+            if found == nil {
                 ProgressView()
-            } else if matches.isEmpty {
+            } else if found?.isEmpty == true {
                 if query.isEmpty {
                     ContentUnavailableView("No sessions", systemImage: "text.bubble")
                 } else {
@@ -977,19 +986,14 @@ struct SessionSearchView: View {
                     prompt: "Search sessions")
         .navigationTitle("Sessions")
         .navigationBarTitleDisplayMode(.inline)
-        .task { all = await store.fetchSessions(limit: 100, fallback: store.sessions) }
-    }
-
-    private var matches: [SessionSummary] {
-        let live = store.liveSessionIDs
-        let rows = (all ?? store.sessions).filter { !live.contains($0.id) }
-        let words = query.lowercased().split(whereSeparator: \.isWhitespace)
-        guard !words.isEmpty else { return rows }
-        return rows.filter { session in
-            let text = [session.title, session.cwd ?? "", session.branch ?? "", session.agent]
-                .joined(separator: " ")
-                .lowercased()
-            return words.allSatisfy { text.contains($0) }
+        .task(id: query) {
+            let query = query.trimmingCharacters(in: .whitespaces)
+            if !query.isEmpty {
+                try? await Task.sleep(for: .milliseconds(300))
+                if Task.isCancelled { return }
+            }
+            let rows = await store.searchSessions(query)
+            if !Task.isCancelled { found = rows }
         }
     }
 }

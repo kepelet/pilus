@@ -582,7 +582,7 @@ struct DiffFileView: View {
     }
 }
 
-private struct DiffLineRow: View {
+struct DiffLineRow: View {
     let row: DiffRow
     let selected: Bool
 

@@ -38,6 +38,8 @@ struct AgentDetailView: View {
     @State private var showingDiff = false
     @State private var showingLog = false
     @State private var showingGitHub = false
+    @State private var confirmingStop = false
+    @Environment(\.dismiss) private var dismiss
     /// The shortcut strip starts folded — it shares the composer row's width.
     /// Owned here so the keyboard-down shortcut can resign the field.
     @FocusState private var replyFocused: Bool
@@ -115,6 +117,11 @@ struct AgentDetailView: View {
                     if store.supports("git.log", on: agent.machine) {
                         Button("History", systemImage: "clock.arrow.circlepath") { showingLog = true }
                     }
+                    if store.supports("pane.close", on: agent.machine) {
+                        Button("Stop Agent", systemImage: "stop.circle", role: .destructive) {
+                            confirmingStop = true
+                        }
+                    }
                     // Issues and pull requests come from `gh` on the host, so
                     // they need the connector's `hub.gh.*` and a known checkout.
                     if store.supports("hub.gh.issues", on: agent.machine), agent.cwd?.isEmpty == false {
@@ -126,6 +133,14 @@ struct AgentDetailView: View {
                 .tint(.primary)
                 .accessibilityLabel("More")
             }
+        }
+        .confirmationDialog(
+            "Stop \(agent.title)?", isPresented: $confirmingStop, titleVisibility: .visible
+        ) {
+            Button("Stop Agent", role: .destructive) { Task { await stop() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Its pane closes and the agent ends. The session stays in Recent Sessions.")
         }
         .sheet(isPresented: $showingInfo) {
             AgentInfoSheet(agent: agent, detail: detail)
@@ -207,7 +222,10 @@ struct AgentDetailView: View {
                 .modifier(GlassRounded(radius: Self.sendSize / 2 + 6))
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.top, 8)
+            // At rest it sits down into the home indicator's margin; over the
+            // keyboard it keeps a gap.
+            .padding(.bottom, replyFocused ? 8 : -12)
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { composerHeight = $0 }
     }
@@ -365,7 +383,7 @@ struct AgentDetailView: View {
             do {
                 var found: SessionSummary?
                 if agent.kind == "pi", id.isEmpty, let folder = cwd ?? agent.cwd, !folder.isEmpty {
-                    found = try await store.piSession(for: agent, cwd: folder, screen: content)
+                    found = try? await store.piSession(for: agent, cwd: folder, screen: content)
                     // The opening prompt scrolls off a long session's pane; the
                     // session already shown stands until another one appears.
                     if found == nil, matched { found = session }
@@ -404,6 +422,15 @@ struct AgentDetailView: View {
             if transcript == nil { transcriptError = error.localizedDescription }
         }
         lookedUp = true
+    }
+
+    private func stop() async {
+        do {
+            try await store.stopAgent(agent)
+            dismiss()
+        } catch {
+            sendError = error.localizedDescription
+        }
     }
 
     private func loadEarlierTranscript() async -> Int {

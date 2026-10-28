@@ -817,6 +817,11 @@ final class AppStore {
     private func matchLiveAgents() async {
         for agent in agents where ["claude", "pi"].contains(agent.kind) {
             if sightedSessions.contains(Self.sessionKey(agent)) { continue }
+            if agent.kind == "pi", let cwd = agent.cwd, !cwd.isEmpty,
+               let read = try? await agentDetail(agent: agent, lines: 120),
+               (try? await piSession(for: agent, cwd: cwd, screen: read.1.text)) != nil {
+                continue
+            }
             _ = try? await session(
                 for: agent, sessionID: nil, cwd: nil, title: agent.agent_session_title)
         }
@@ -836,15 +841,72 @@ final class AppStore {
         guard !seen.isEmpty else { return nil }
         let reply: SessionList = try await call(
             method: "hub.sessions", params: ["agent": "pi", "limit": 40], machine: agent.machine)
-        guard var found = reply.sessions.first(where: { row in
-            let title = Self.squashed(row.title)
-            return Self.folder(row.cwd) == Self.folder(cwd)
-                && title.count >= 6 && seen.contains(title.prefix(80))
-        }) else { return nil }
-        found.machine = agent.machine
-        agentSessions[Self.sessionKey(agent)] = found
-        sightedSessions.insert(Self.sessionKey(agent))
+        let key = Self.sessionKey(agent)
+        let others = Set(agents.filter { Self.sessionKey($0) != key }
+            .compactMap { agentSessions[Self.sessionKey($0)]?.path })
+        let here = reply.sessions
+            .filter { Self.folder($0.cwd) == Self.folder(cwd) && !others.contains($0.path) }
+            .map { var row = $0; row.machine = agent.machine; return row }
+        // The opening prompt first, then, for a session long enough to have
+        // scrolled it off, the latest prompts of the folder's newest few.
+        var found = here.first { Self.shows(seen, Self.squashed($0.title)) }
+        if found == nil {
+            for row in here.prefix(4) {
+                guard let read = try? await transcript(
+                    path: row.path, machine: row.machine, depth: TranscriptDepth(limit: 40))
+                else { continue }
+                let asked = read.entries.filter { $0.type == "user" }.suffix(6).compactMap(\.text)
+                if asked.contains(where: { Self.shows(seen, Self.squashed($0)) }) {
+                    found = row
+                    break
+                }
+            }
+        }
+        guard let found else { return nil }
+        agentSessions[key] = found
+        sightedSessions.insert(key)
         return found
+    }
+
+    /// Whether a squashed screen shows a squashed prompt (its start, for one
+    /// too long to fit).
+    private static func shows(_ screen: String, _ said: String) -> Bool {
+        said.count >= 6 && screen.contains(said.prefix(80))
+    }
+
+    /// End an agent by closing its pane, then re-read the agent list.
+    func stopAgent(_ agent: Agent) async throws {
+        let _: EmptyReply = try await call(
+            method: "pane.close", params: ["pane": agent.pane], machine: agent.machine)
+        await refresh(topics: ["agents"], machines: [agent.machine])
+    }
+
+    /// Sessions on every machine matching `query`, searched on the host (the
+    /// desktop's index and the newest transcripts), merged newest first. An
+    /// empty query lists the newest.
+    func searchSessions(_ query: String, limit: Int = 100) async -> [SessionSummary] {
+        let words = query.lowercased().split(whereSeparator: \.isWhitespace)
+        var merged: [SessionSummary] = []
+        for id in machineOrder {
+            var params: [String: Any] = ["limit": limit]
+            if !words.isEmpty { params["query"] = query }
+            let rows: [SessionSummary]
+            do {
+                let reply: SessionList = try await call(
+                    method: "hub.sessions", params: params, machine: id)
+                rows = reply.sessions.map { var row = $0; row.machine = id; return row }
+            } catch {
+                rows = sessions.filter { $0.machine == id }
+            }
+            // A host from before `query` lists its newest instead.
+            merged += rows.filter { session in
+                let text = [session.title, session.cwd ?? "", session.branch ?? "", session.agent,
+                            session.session_id].joined(separator: " ").lowercased()
+                return words.allSatisfy { text.contains($0) }
+            }
+        }
+        let live = liveSessionIDs
+        return merged.filter { !live.contains($0.id) }.sorted { ($0.updated ?? 0) > ($1.updated ?? 0) }
     }
 
     /// Letters and digits only, lowercased, so a prompt wrapped and boxed on a

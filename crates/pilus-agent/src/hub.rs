@@ -73,8 +73,15 @@ const REFUSED: &[&str] = &[
 
 /// The methods only an `Operate` device may call. Each starts work that runs
 /// code (a task's agent and its gate command, an agent, a shell in a new
-/// workspace), which is why the gateway token does not carry them.
-const OPERATE: &[&str] = &["task.add", "task.start", "agent.start", "workspace.open"];
+/// workspace) or ends it (closing an agent's pane), which is why the gateway
+/// token does not carry them.
+const OPERATE: &[&str] = &[
+    "task.add",
+    "task.start",
+    "agent.start",
+    "workspace.open",
+    "pane.close",
+];
 
 /// The GitHub reads, run with `gh` in a checkout on the machine. A `Control`
 /// device may call them: they show what the host's own GitHub login can see in
@@ -92,6 +99,11 @@ const GH_READS: &[&str] = &[
 /// machine. A `Control` device may call them: a transcript says no more than the
 /// pane the agent ran in already showed it.
 const SESSION_READS: &[&str] = &["hub.sessions", "hub.transcript"];
+
+/// The Git reads the daemon has no call for, run with `git` in a checkout on
+/// the machine. A `Control` device may call them: a commit's patch says no
+/// more than the diff of the working tree it already reads.
+const GIT_READS: &[&str] = &["hub.git.show"];
 
 /// Sessions a `hub.sessions` listing returns unless asked for fewer.
 const SESSIONS_DEFAULT: u64 = 30;
@@ -193,8 +205,15 @@ pub fn effective_methods(level: Level, gateway: &[String]) -> Vec<String> {
     // they are listed so a device can tell which of them its level carries.
     let extras: &[&[&str]] = match level {
         Level::View => &[],
-        Level::Control => &[REVIEW, GH_READS, SESSION_READS],
-        Level::Operate => &[REVIEW, OPERATE, GH_READS, GH_WRITES, SESSION_READS],
+        Level::Control => &[REVIEW, GH_READS, SESSION_READS, GIT_READS],
+        Level::Operate => &[
+            REVIEW,
+            OPERATE,
+            GH_READS,
+            GH_WRITES,
+            SESSION_READS,
+            GIT_READS,
+        ],
     };
     for method in extras.iter().copied().flatten() {
         if !methods.iter().any(|name| name == method) {
@@ -355,6 +374,21 @@ impl Hub {
         }
         if method.starts_with("hub.gh.") {
             let outcome = self.gh_call(level, device, machine, method, &params).await;
+            return reply(&id, outcome);
+        }
+        if GIT_READS.contains(&method) {
+            let outcome = if level < Level::Control {
+                Err(failure(
+                    "forbidden",
+                    &format!("{method} is not allowed for a {} device", level.as_str()),
+                ))
+            } else {
+                tokio::time::timeout(CALL_TIMEOUT, self.git_show(machine, &params))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(failure("timeout", "the machine did not answer in time"))
+                    })
+            };
             return reply(&id, outcome);
         }
         if matches!(method, "hub.agents" | "hub.folders" | "hub.run") {
@@ -1013,6 +1047,44 @@ impl Hub {
         tokio::task::spawn_blocking(move || call.run(&repo))
             .await
             .map_err(|error| failure("internal", &error.to_string()))?
+    }
+
+    /// `hub.git.show`: what commit `sha` changed in the checkout at `path`.
+    async fn git_show(&self, machine: &str, params: &Value) -> Result<Value, Value> {
+        let text = |key: &str| {
+            params
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let path = text("path")
+            .ok_or_else(|| failure("bad_request", "`path` must be the checkout's directory"))?;
+        let sha = text("sha").ok_or_else(|| failure("bad_request", "`sha` must name a commit"))?;
+        let (target, _permit) = if machine == LOCAL {
+            (None, None)
+        } else {
+            let known = self.catalog().await;
+            let target = known
+                .into_iter()
+                .find(|info| info.id == machine && info.enabled)
+                .and_then(|info| info.ssh_target())
+                .ok_or_else(|| failure("not_found", &format!("no usable machine `{machine}`")))?;
+            let permit = self
+                .ssh
+                .acquire()
+                .await
+                .map_err(|_| failure("unavailable", "the hub is shutting down"))?;
+            (Some(target), Some(permit))
+        };
+        tokio::task::spawn_blocking(move || {
+            pilus_client::show_commit(target.as_ref(), &path, &sha)
+                .map(|detail| commit_json(&detail))
+                .map_err(|message| failure("git_failed", &message))
+        })
+        .await
+        .map_err(|error| failure("internal", &error.to_string()))?
     }
 
     /// `hub.sessions` and `hub.transcript`: the newest sessions on `machine`, the
@@ -1728,6 +1800,110 @@ fn session_json(session: &pilus_index::Session) -> Value {
     })
 }
 
+fn commit_json(detail: &pilus_client::CommitDetail) -> Value {
+    let files: Vec<Value> = detail
+        .files
+        .iter()
+        .map(|file| {
+            let hunks: Vec<Value> = file
+                .hunks
+                .iter()
+                .map(|hunk| {
+                    let lines: Vec<Value> = hunk
+                        .lines
+                        .iter()
+                        .map(|line| {
+                            json!({
+                                "kind": match line.kind {
+                                    pilus_client::DiffLineKind::Addition => "addition",
+                                    pilus_client::DiffLineKind::Deletion => "deletion",
+                                    pilus_client::DiffLineKind::Context => "context",
+                                },
+                                "old_line": line.old_line,
+                                "new_line": line.new_line,
+                                "text": line.text,
+                            })
+                        })
+                        .collect();
+                    json!({ "header": hunk.header, "lines": lines })
+                })
+                .collect();
+            json!({
+                "path": file.path,
+                "old_path": file.old_path,
+                "status": match file.status.as_str() {
+                    "A" => "added",
+                    "D" => "deleted",
+                    "R" => "renamed",
+                    _ => "modified",
+                },
+                "binary": file.binary,
+                "additions": file.additions,
+                "deletions": file.deletions,
+                "hunks": hunks,
+            })
+        })
+        .collect();
+    json!({
+        "sha": detail.sha,
+        "author": detail.author,
+        "date": detail.date,
+        "message": detail.message,
+        "truncated": detail.truncated,
+        "files": files,
+    })
+}
+
+/// Sessions on `machine` with every word of `query` in their title, folder,
+/// branch, agent or id, newest first: what the desktop's index has, joined
+/// by a scan of the newest transcripts for what it has not read yet.
+fn search_sessions(
+    source: &pilus_index::Source<'_>,
+    machine: &str,
+    agent: Option<pilus_index::Agent>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<pilus_index::Session>, Value> {
+    let mut found = std::env::var_os("HOME")
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".pilus")
+                .join("index.db")
+        })
+        .filter(|path| path.exists())
+        .and_then(|path| pilus_index::Index::open(&path).ok())
+        .and_then(|index| {
+            let filter = pilus_index::Filter {
+                machine: Some(machine.to_string()),
+                agent,
+            };
+            index.search(query, &filter, limit).ok()
+        })
+        .unwrap_or_default();
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let scanned = pilus_index::recent(source, machine, agent, SESSIONS_MAX as usize)
+        .map_err(|error| index_failure(&error))?;
+    for session in scanned {
+        let text = [
+            session.title.as_str(),
+            session.cwd.as_str(),
+            session.branch.as_str(),
+            session.agent.kind(),
+            session.session_id.as_str(),
+        ]
+        .join(" ")
+        .to_lowercase();
+        if words.iter().all(|word| text.contains(word.as_str()))
+            && !found.iter().any(|known| known.path == session.path)
+        {
+            found.push(session);
+        }
+    }
+    found.sort_by_key(|session| std::cmp::Reverse(session.updated));
+    found.truncate(limit);
+    Ok(found)
+}
+
 fn sessions_reply(
     source: &pilus_index::Source<'_>,
     machine: &str,
@@ -1749,8 +1925,15 @@ fn sessions_reply(
         })?),
         None => None,
     };
-    let sessions = match (agent, text("cwd")) {
-        (Some(agent), Some(cwd)) => pilus_index::session_for_source(
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(SESSIONS_DEFAULT)
+        .clamp(1, SESSIONS_MAX);
+    let limit = usize::try_from(limit).unwrap_or(30);
+    let sessions = match (agent, text("cwd"), text("query")) {
+        (_, None, Some(query)) => search_sessions(source, machine, agent, query, limit)?,
+        (Some(agent), Some(cwd), _) => pilus_index::session_for_source(
             source,
             machine,
             agent,
@@ -1765,15 +1948,8 @@ fn sessions_reply(
         .map_err(|error| index_failure(&error))?
         .into_iter()
         .collect(),
-        _ => {
-            let limit = params
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(SESSIONS_DEFAULT)
-                .clamp(1, SESSIONS_MAX);
-            pilus_index::recent(source, machine, agent, usize::try_from(limit).unwrap_or(30))
-                .map_err(|error| index_failure(&error))?
-        }
+        _ => pilus_index::recent(source, machine, agent, limit)
+            .map_err(|error| index_failure(&error))?,
     };
     Ok(json!({ "sessions": sessions.iter().map(session_json).collect::<Vec<_>>() }))
 }
@@ -2323,15 +2499,15 @@ mod tests {
         .collect();
         let view = effective_methods(Level::View, &gateway);
         assert_eq!(view, vec!["workspace.list", "agent.read"]);
-        // Control adds the review calls, the GitHub reads and the session
-        // reads, nothing else.
+        // Control adds the review calls, the GitHub reads, the session reads
+        // and the Git reads, nothing else.
         let control = effective_methods(Level::Control, &gateway);
         assert_eq!(control[..gateway.len()], gateway[..]);
         assert_eq!(
             control.len(),
-            gateway.len() + REVIEW.len() + GH_READS.len() + SESSION_READS.len()
+            gateway.len() + REVIEW.len() + GH_READS.len() + SESSION_READS.len() + GIT_READS.len()
         );
-        for method in SESSION_READS {
+        for method in SESSION_READS.iter().chain(GIT_READS) {
             assert!(control.iter().any(|name| name == method), "{method}");
             assert!(!view.iter().any(|name| name == method), "{method}");
         }
@@ -2350,7 +2526,12 @@ mod tests {
             assert!(!control.iter().any(|name| name == method), "{method}");
         }
         let operate = effective_methods(Level::Operate, &gateway);
-        for method in OPERATE.iter().chain(GH_READS).chain(GH_WRITES) {
+        for method in OPERATE
+            .iter()
+            .chain(GH_READS)
+            .chain(GH_WRITES)
+            .chain(GIT_READS)
+        {
             assert!(operate.iter().any(|name| name == method), "{method}");
         }
         assert!(operate.iter().any(|name| name == "agent.prompt"));

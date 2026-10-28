@@ -86,6 +86,17 @@ final class GitLogModel {
         changes = store.canViewDiff ? DiffReviewModel(store: store, machine: machine, agent: agent) : nil
     }
 
+    /// Whether a commit's patch can be read: the hub runs `git show` in the
+    /// agent's checkout.
+    var canShowCommit: Bool {
+        store.hubAllows("hub.git.show", on: machine) && agent?.cwd?.isEmpty == false
+    }
+
+    func commit(_ sha: String) async throws -> CommitReply {
+        try await store.call(
+            method: "hub.git.show", params: ["path": agent?.cwd ?? "", "sha": sha], machine: machine)
+    }
+
     /// A full page means older commits may exist.
     var mayHaveMore: Bool { commits.count >= limit }
 
@@ -151,9 +162,6 @@ struct GitLogView: View {
                     Text(error).font(.footnote).foregroundStyle(.red)
                 }
             }
-            if let branch = model.branch {
-                Section { branchRow(model.status, branch: branch) }
-            }
             if let changes = model.changes, !changes.files.isEmpty {
                 Section("Changes") {
                     ForEach(changes.files) { file in
@@ -168,7 +176,15 @@ struct GitLogView: View {
             }
             Section {
                 ForEach(model.commits) { commit in
-                    commitRow(commit)
+                    if model.canShowCommit {
+                        NavigationLink {
+                            CommitDiffView(model: model, commit: commit)
+                        } label: {
+                            commitRow(commit)
+                        }
+                    } else {
+                        commitRow(commit)
+                    }
                 }
                 if model.mayHaveMore {
                     Button {
@@ -187,7 +203,7 @@ struct GitLogView: View {
                     .disabled(loadingMore)
                 }
             } header: {
-                if model.changes?.files.isEmpty == false { Text("Commits") }
+                branchHeader
             } footer: {
                 Text(model.agent?.workspace_id == nil
                      ? "History of the workspace open on the host."
@@ -207,23 +223,22 @@ struct GitLogView: View {
         .task { await model.load() }
     }
 
-    private func branchRow(_ status: GitStatusReply?, branch: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+    /// The commits' branch, with how far it is from its upstream.
+    @ViewBuilder
+    private var branchHeader: some View {
+        if let branch = model.branch {
             HStack(spacing: 6) {
-                Text(branch).font(.body.weight(.semibold))
-                Spacer()
-                if let ahead = status?.ahead, ahead > 0 {
-                    Text("↑\(ahead)").font(.footnote.monospacedDigit())
+                Text(branch)
+                if let ahead = model.status?.ahead, ahead > 0 {
+                    Text("↑\(ahead)").monospacedDigit()
                 }
-                if let behind = status?.behind, behind > 0 {
-                    Text("↓\(behind)").font(.footnote.monospacedDigit())
+                if let behind = model.status?.behind, behind > 0 {
+                    Text("↓\(behind)").monospacedDigit()
                 }
             }
-            if let upstream = status?.upstream, !upstream.isEmpty {
-                Text("tracks \(upstream)")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
+            .textCase(nil)
+        } else if model.changes?.files.isEmpty == false {
+            Text("Commits")
         }
     }
 
@@ -325,5 +340,128 @@ private struct WrappingLayout: Layout {
             widest = max(widest, x - spacing)
         }
         return (CGSize(width: widest, height: y + lineHeight), origins)
+    }
+}
+
+struct CommitReply: Decodable {
+    let sha: String
+    let author: String?
+    let date: String?
+    let message: String?
+    let truncated: Bool?
+    let files: [CommitFileReply]
+}
+
+struct CommitFileReply: Decodable, Identifiable, Hashable {
+    let path: String
+    let old_path: String?
+    let status: String?
+    let binary: Bool?
+    let additions: Int?
+    let deletions: Int?
+    let hunks: [DiffHunk]
+
+    var id: String { path }
+
+    /// As a changed-file row, so it draws like the working tree's.
+    var row: DiffFileRow {
+        let glyph = switch status {
+        case "added": "A"
+        case "deleted": "D"
+        case "renamed": "R"
+        default: "M"
+        }
+        return DiffFileRow(
+            path: path, old_path: old_path, layer: "commit", status: glyph,
+            additions: additions, deletions: deletions, binary: binary,
+            notes: nil, viewed: nil, fingerprint: nil)
+    }
+}
+
+/// What one commit changed, read from Git on the host.
+struct CommitDiffView: View {
+    let model: GitLogModel
+    let commit: GitCommitRow
+
+    @State private var reply: CommitReply?
+    @State private var error: String?
+
+    var body: some View {
+        List {
+            Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(reply?.message ?? commit.subject ?? "")
+                        .font(.body)
+                    HStack(spacing: 6) {
+                        Text(commit.sha).font(.system(.caption, design: .monospaced))
+                        if let author = reply?.author ?? commit.author, !author.isEmpty {
+                            Text("· \(author)").lineLimit(1)
+                        }
+                        if let when = reply?.date ?? commit.when, !when.isEmpty {
+                            Text("· \(when)").lineLimit(1)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 2)
+            }
+            if let error {
+                Section { Text(error).font(.footnote).foregroundStyle(.red) }
+            }
+            if let reply, !reply.files.isEmpty {
+                Section {
+                    ForEach(reply.files) { file in
+                        NavigationLink {
+                            CommitFileView(file: file)
+                        } label: {
+                            DiffFileLabel(file: file.row)
+                                .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
+                        }
+                    }
+                } header: {
+                    Text(reply.files.count == 1 ? "1 file" : "\(reply.files.count) files")
+                } footer: {
+                    if reply.truncated == true {
+                        Text("Too large to show whole: the rest was left out.")
+                    }
+                }
+            }
+        }
+        .navigationTitle(commit.sha)
+        .navigationBarTitleDisplayMode(.inline)
+        .overlay {
+            if reply == nil && error == nil { ProgressView() }
+        }
+        .task {
+            do {
+                reply = try await model.commit(commit.sha)
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
+    }
+}
+
+/// One file of a commit, line by line.
+struct CommitFileView: View {
+    let file: CommitFileReply
+
+    var body: some View {
+        let rows = diffRows(from: file.hunks)
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                if rows.isEmpty {
+                    Text(file.binary == true ? "Binary file: no text diff" : "No textual changes")
+                        .foregroundStyle(.secondary)
+                        .padding()
+                }
+                ForEach(rows) { row in
+                    DiffLineRow(row: row, selected: false)
+                }
+            }
+        }
+        .navigationTitle(file.row.name)
+        .navigationBarTitleDisplayMode(.inline)
     }
 }

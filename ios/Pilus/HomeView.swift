@@ -25,6 +25,7 @@ struct HomeView: View {
     /// In-stack destinations that are not an `Agent`.
     private enum HomeRoute: Hashable {
         case notifications
+        case search
     }
     @AppStorage("home.agents.expanded") private var agentsExpanded = true
     @AppStorage("home.sessions.expanded") private var sessionsExpanded = true
@@ -75,20 +76,26 @@ struct HomeView: View {
                 }
                 if #available(iOS 26.0, *) {
                     ToolbarItem(placement: .topBarTrailing) {
-                        Button { navPath.append(HomeRoute.notifications) } label: {
-                            Image(systemName: "bell")
-                                .padding(8)
-                                // Liquid glass circle — the same treatment
-                                // the composer buttons get — while the
-                                // wordmark stays bare over the hero.
-                                .glassEffect(.regular.interactive(), in: .circle)
+                        HStack(spacing: 8) {
+                            if store.canReadSessions {
+                                glassButton("magnifyingglass", label: "Search Sessions") {
+                                    navPath.append(HomeRoute.search)
+                                }
+                            }
+                            glassButton("bell", label: "Notifications") {
+                                navPath.append(HomeRoute.notifications)
+                            }
                         }
-                        .environment(\.colorScheme, .dark)
-                        .accessibilityLabel("Notifications")
                     }
                     .sharedBackgroundVisibility(.hidden)
                 } else {
-                    ToolbarItem(placement: .topBarTrailing) {
+                    ToolbarItemGroup(placement: .topBarTrailing) {
+                        if store.canReadSessions {
+                            Button { navPath.append(HomeRoute.search) } label: {
+                                Image(systemName: "magnifyingglass")
+                            }
+                            .accessibilityLabel("Search Sessions")
+                        }
                         Button { navPath.append(HomeRoute.notifications) } label: {
                             Image(systemName: "bell")
                         }
@@ -108,6 +115,7 @@ struct HomeView: View {
             .navigationDestination(for: HomeRoute.self) { route in
                 switch route {
                 case .notifications: NotificationsView()
+                case .search: SessionSearchView()
                 }
             }
             .sheet(isPresented: $showingOpenWorkspace) {
@@ -181,7 +189,7 @@ struct HomeView: View {
                     if !store.agents.isEmpty {
                         agentsSection
                     }
-                    if !store.sessions.isEmpty || (store.canReadSessions && !store.sessionsLoaded) {
+                    if !store.recentSessions.isEmpty || (store.canReadSessions && !store.sessionsLoaded) {
                         sessionsSection
                     }
                 }
@@ -263,7 +271,25 @@ struct HomeView: View {
         .onChange(of: store.workspaces.count) { applyComposerDefaults() }
         .onChange(of: composerAgent) { composerModel = composerKind?.defaultModel }
         .padding(.horizontal, 16)
-        .padding(.bottom, 6)
+        // At rest it sits down into the home indicator's margin; over the
+        // keyboard it keeps a gap.
+        .padding(.bottom, composerFocused ? 6 : -12)
+    }
+
+    /// A toolbar button on a Liquid Glass circle, as the composer's, while
+    /// the wordmark stays bare over the hero.
+    @available(iOS 26.0, *)
+    private func glassButton(_ symbol: String, label: String,
+                             action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .frame(width: 20, height: 20)
+                .padding(8)
+                .glassEffect(.regular.interactive(), in: .circle)
+        }
+        .buttonStyle(.plain)
+        .environment(\.colorScheme, .dark)
+        .accessibilityLabel(label)
     }
 
     private var composerSendButton: some View {
@@ -638,7 +664,7 @@ struct HomeView: View {
 
     private var agentsSection: some View {
         VStack(alignment: .leading, spacing: 0) {
-            sectionHeading("Agents",
+            sectionHeading("Active Agents",
                            expanded: agentsExpanded) {
                 agentsExpanded.toggle()
             }
@@ -672,7 +698,7 @@ struct HomeView: View {
                         .padding(.vertical, 8)
                     }
                 }
-                ForEach(store.sessions) { session in
+                ForEach(store.recentSessions) { session in
                     sessionRow(session)
                 }
             }
@@ -683,22 +709,9 @@ struct HomeView: View {
         Button {
             navPath.append(session)
         } label: {
-            HStack(spacing: 12) {
-                AgentTile(kind: session.kind)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(session.title)
-                        .font(.body.weight(.medium))
-                        .lineLimit(1)
-                    Text(sessionSubtitle(session))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Spacer(minLength: 8)
-            }
-            .padding(.vertical, 8)
-            .contentShape(Rectangle())
+            SessionRowLabel(session: session)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .contextMenu {
@@ -721,21 +734,6 @@ struct HomeView: View {
         }
     }
 
-    private func sessionSubtitle(_ session: SessionSummary) -> String {
-        var parts: [String] = []
-        if let updated = session.updated, updated > 0 {
-            parts.append(Date(timeIntervalSince1970: TimeInterval(updated))
-                .formatted(.relative(presentation: .named)))
-        }
-        if let cwd = session.cwd, !cwd.isEmpty {
-            parts.append((cwd as NSString).lastPathComponent)
-        }
-        if store.machineOrder.count > 1 {
-            parts.append(store.machineTitle(session.machine))
-        }
-        return parts.joined(separator: " · ")
-    }
-
     private func agentRow(_ agent: Agent) -> some View {
         Button {
             navPath.append(agent)
@@ -756,12 +754,15 @@ struct HomeView: View {
                 // `style::spinner` convention — so the row says "busy"
                 // without waiting on a status push. Both states share one
                 // centered frame so switching never shifts the row.
-                if agent.status == "working" {
+                switch agent.status {
+                case "working":
                     ProgressView()
                         .controlSize(.mini)
                         .tint(statusColor(agent.status))
                         .frame(width: 14, height: 14)
-                } else {
+                case "idle", nil:
+                    EmptyView()
+                default:
                     Circle()
                         .fill(statusColor(agent.status))
                         .frame(width: 7, height: 7)
@@ -782,12 +783,14 @@ struct HomeView: View {
             .joined(separator: " · ")
     }
 
-    /// Monochrome status: a working agent reads as a filled dot, idle as a
-    /// mid-tone, everything else as a faint one.
+    /// Monochrome status but for an agent waiting on the user, which is
+    /// orange: working reads as a filled dot, done as a mid-tone, everything
+    /// else as a faint one. Idle draws nothing.
     private func statusColor(_ status: String?) -> Color {
         switch status {
-        case "running", "working", "waiting_permission": return .primary
-        case "idle", "done": return .secondary
+        case "blocked", "waiting_permission": return .orange
+        case "running", "working": return .primary
+        case "done": return .secondary
         default: return .secondary.opacity(0.45)
         }
     }
@@ -907,3 +910,86 @@ private struct SkeletonBar: View {
     }
 }
 
+/// A session's row: its agent, title, and when and where it ran.
+struct SessionRowLabel: View {
+    let session: SessionSummary
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        HStack(spacing: 12) {
+            AgentTile(kind: session.kind)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(session.title)
+                    .font(.body.weight(.medium))
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 8)
+        }
+    }
+
+    private var subtitle: String {
+        var parts: [String] = []
+        if let updated = session.updated, updated > 0 {
+            parts.append(Date(timeIntervalSince1970: TimeInterval(updated))
+                .formatted(.relative(presentation: .named)))
+        }
+        if let cwd = session.cwd, !cwd.isEmpty {
+            parts.append((cwd as NSString).lastPathComponent)
+        }
+        if store.machineOrder.count > 1 {
+            parts.append(store.machineTitle(session.machine))
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// Every session the hosts keep but the live agents', narrowed by what is
+/// typed: each word must appear in the title, folder, branch or agent.
+struct SessionSearchView: View {
+    @Environment(AppStore.self) private var store
+    @State private var query = ""
+    @State private var all: [SessionSummary]?
+
+    var body: some View {
+        List(matches) { session in
+            NavigationLink(value: session) {
+                SessionRowLabel(session: session)
+            }
+        }
+        .listStyle(.plain)
+        .overlay {
+            if all == nil && store.sessions.isEmpty {
+                ProgressView()
+            } else if matches.isEmpty {
+                if query.isEmpty {
+                    ContentUnavailableView("No sessions", systemImage: "text.bubble")
+                } else {
+                    ContentUnavailableView.search(text: query)
+                }
+            }
+        }
+        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always),
+                    prompt: "Search sessions")
+        .navigationTitle("Sessions")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { all = await store.fetchSessions(limit: 100, fallback: store.sessions) }
+    }
+
+    private var matches: [SessionSummary] {
+        let live = store.liveSessionIDs
+        let rows = (all ?? store.sessions).filter { !live.contains($0.id) }
+        let words = query.lowercased().split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty else { return rows }
+        return rows.filter { session in
+            let text = [session.title, session.cwd ?? "", session.branch ?? "", session.agent]
+                .joined(separator: " ")
+                .lowercased()
+            return words.allSatisfy { text.contains($0) }
+        }
+    }
+}

@@ -56,8 +56,9 @@ struct GitDecoration: Hashable {
     }
 }
 
-/// The history of the workspace the daemon has active on one machine. Read
-/// only: the phone never writes to a checkout.
+/// The history of an agent's workspace, with its uncommitted changes on top.
+/// The daemon answers for the workspace it has active, so the agent's is
+/// focused first. Read only: the phone never writes to a checkout.
 @MainActor
 @Observable
 final class GitLogModel {
@@ -65,29 +66,49 @@ final class GitLogModel {
     static let page = 50
 
     let machine: String
+    let agent: Agent?
+    /// The working tree's changed files, when this device may read a diff.
+    let changes: DiffReviewModel?
 
     var status: GitStatusReply?
     var commits: [GitCommitRow] = []
     var loaded = false
     var error: String?
     private var limit = GitLogModel.page
+    private var focused = false
 
     private let store: AppStore
 
-    init(store: AppStore, machine: String) {
+    init(store: AppStore, machine: String, agent: Agent? = nil) {
         self.store = store
         self.machine = machine
+        self.agent = agent
+        changes = store.canViewDiff ? DiffReviewModel(store: store, machine: machine, agent: agent) : nil
     }
 
     /// A full page means older commits may exist.
     var mayHaveMore: Bool { commits.count >= limit }
 
+    /// The checked-out branch: the daemon's word, else the agent's, else the
+    /// one the newest commit's HEAD points at.
+    var branch: String? {
+        let head = commits.first?.decorations.first { $0.kind == .head && $0.name != "HEAD" }?.name
+        return [status?.branch, agent?.branch, head].compactMap { $0 }.first { !$0.isEmpty }
+    }
+
     func load() async {
         error = nil
         defer { loaded = true }
+        if !focused, let id = agent?.workspace_id {
+            focused = true
+            let _: EmptyReply? = try? await store.call(
+                method: "workspace.focus", params: ["workspace_id": id], machine: machine)
+        }
+        await changes?.load(rescan: true)
         do {
+            // The daemon reads the count from `n`; `limit` is ignored.
             let log: GitLogReply = try await store.call(
-                method: "git.log", params: ["limit": limit], machine: machine)
+                method: "git.log", params: ["n": limit], machine: machine)
             commits = log.commits
             // The branch line is context; the history is worth showing
             // without it.
@@ -112,7 +133,7 @@ struct GitLogSheet: View {
 
     var body: some View {
         NavigationStack {
-            GitLogView(model: GitLogModel(store: store, machine: agent.machine))
+            GitLogView(model: GitLogModel(store: store, machine: agent.machine, agent: agent))
         }
     }
 }
@@ -130,8 +151,20 @@ struct GitLogView: View {
                     Text(error).font(.footnote).foregroundStyle(.red)
                 }
             }
-            if let status = model.status, let branch = status.branch, !branch.isEmpty {
-                Section { branchRow(status, branch: branch) }
+            if let branch = model.branch {
+                Section { branchRow(model.status, branch: branch) }
+            }
+            if let changes = model.changes, !changes.files.isEmpty {
+                Section("Changes") {
+                    ForEach(changes.files) { file in
+                        NavigationLink {
+                            DiffFileView(model: changes, file: file)
+                        } label: {
+                            DiffFileLabel(file: file)
+                                .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
+                        }
+                    }
+                }
             }
             Section {
                 ForEach(model.commits) { commit in
@@ -153,11 +186,15 @@ struct GitLogView: View {
                     }
                     .disabled(loadingMore)
                 }
+            } header: {
+                if model.changes?.files.isEmpty == false { Text("Commits") }
             } footer: {
-                Text("History of the workspace open on the host.")
+                Text(model.agent?.workspace_id == nil
+                     ? "History of the workspace open on the host."
+                     : "History of this agent's workspace.")
             }
         }
-        .navigationTitle("Log")
+        .navigationTitle("History")
         .navigationBarTitleDisplayMode(.inline)
         .overlay {
             if !model.loaded {
@@ -170,21 +207,19 @@ struct GitLogView: View {
         .task { await model.load() }
     }
 
-    private func branchRow(_ status: GitStatusReply, branch: String) -> some View {
+    private func branchRow(_ status: GitStatusReply?, branch: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
-                Image(systemName: "arrow.triangle.branch")
-                    .foregroundStyle(.secondary)
                 Text(branch).font(.body.weight(.semibold))
                 Spacer()
-                if let ahead = status.ahead, ahead > 0 {
+                if let ahead = status?.ahead, ahead > 0 {
                     Text("↑\(ahead)").font(.footnote.monospacedDigit())
                 }
-                if let behind = status.behind, behind > 0 {
+                if let behind = status?.behind, behind > 0 {
                     Text("↓\(behind)").font(.footnote.monospacedDigit())
                 }
             }
-            if let upstream = status.upstream, !upstream.isEmpty {
+            if let upstream = status?.upstream, !upstream.isEmpty {
                 Text("tracks \(upstream)")
                     .font(.footnote)
                     .foregroundStyle(.secondary)

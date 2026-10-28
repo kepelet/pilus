@@ -61,6 +61,7 @@ struct AgentDetailView: View {
     /// The send button's diameter, and the height of one line of the reply.
     private static let sendSize: CGFloat = 30
     private static let lineHeight: CGFloat = 22
+    static let lineSpacing: CGFloat = 5
 
     var body: some View {
         GeometryReader { geo in
@@ -178,6 +179,7 @@ struct AgentDetailView: View {
                 HStack(alignment: .bottom, spacing: 8) {
                     TextField("Reply to \(agent.title)", text: $reply, axis: .vertical)
                         .lineLimit(1...5)
+                        .lineSpacing(Self.lineSpacing)
                         .textFieldStyle(.plain)
                         .focused($replyFocused)
                         // Agents read this verbatim; autocorrection corrupts
@@ -361,8 +363,17 @@ struct AgentDetailView: View {
         if !matched || session == nil || moved || refreshes % 4 == 0 {
             let title = detail?.agent_session_title ?? agent.agent_session_title
             do {
-                let found = try await store.session(
-                    for: agent, sessionID: sessionID, cwd: cwd, title: title)
+                var found: SessionSummary?
+                if agent.kind == "pi", id.isEmpty, let folder = cwd ?? agent.cwd, !folder.isEmpty {
+                    found = try await store.piSession(for: agent, cwd: folder, screen: content)
+                    // The opening prompt scrolls off a long session's pane; the
+                    // session already shown stands until another one appears.
+                    if found == nil, matched { found = session }
+                }
+                if found == nil {
+                    found = try await store.session(
+                        for: agent, sessionID: sessionID, cwd: cwd, title: title)
+                }
                 if found?.path != session?.path {
                     transcript = found.flatMap { store.cachedTranscript(path: $0.path, machine: $0.machine) }
                     pending = []
@@ -511,10 +522,6 @@ private struct GlassCapsule: ViewModifier {
 private struct AgentInfoSheet: View {
     let agent: Agent
     let detail: AgentDetail?
-    @Environment(AppStore.self) private var store
-    @State private var alias = ""
-    @State private var savingAlias = false
-    @State private var aliasError: String?
 
     var body: some View {
         NavigationStack {
@@ -541,51 +548,11 @@ private struct AgentInfoSheet: View {
                 if let session = detail?.session {
                     LabeledContent("Session", value: session)
                 }
-                if store.supports("pane.rename", on: agent.machine) {
-                    aliasSection
-                }
             }
             .navigationTitle("Session")
             .navigationBarTitleDisplayMode(.inline)
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.hidden)
-        .onAppear { alias = detail?.name ?? agent.name ?? "" }
-    }
-
-    /// The host's operator alias for this pane — how a named agent is found
-    /// again from a script or another device. Whatever is typed is folded
-    /// into a name the daemon accepts, so there is no rule to explain.
-    private var aliasSection: some View {
-        Section("Alias") {
-            HStack(spacing: 12) {
-                TextField("e.g. reviewer", text: $alias)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .onChange(of: alias) { _, typed in
-                        let folded = AppStore.normalizedAlias(typed)
-                        if folded != typed { alias = folded }
-                    }
-                Button("Save") {
-                    Task { await saveAlias() }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(savingAlias)
-            }
-            if let aliasError {
-                Text(aliasError).font(.footnote).foregroundStyle(.red)
-            }
-        }
-    }
-
-    private func saveAlias() async {
-        savingAlias = true
-        defer { savingAlias = false }
-        do {
-            try await store.renameAgent(agent, to: alias)
-            aliasError = nil
-        } catch {
-            aliasError = error.localizedDescription
-        }
     }
 }

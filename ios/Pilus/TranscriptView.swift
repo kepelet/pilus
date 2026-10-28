@@ -122,7 +122,10 @@ struct SessionTranscriptView: View {
     @Environment(AppStore.self) private var store
     @State private var reply: TranscriptReply?
     @State private var loadError: String?
-    @State private var choosing = false
+    @State private var prompt = ""
+    @State private var starting = false
+    @State private var startError: String?
+    @State private var confirmingFork = false
     @State private var depth = TranscriptDepth()
     @State private var exhausted = false
 
@@ -145,35 +148,24 @@ struct SessionTranscriptView: View {
         }
         .defaultScrollAnchor(.bottom)
         .safeAreaInset(edge: .bottom) {
-            if store.canReopen(session) {
-                Button { choosing = true } label: {
-                    HStack(spacing: 8) {
-                        Text("Continue or fork this session")
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .frame(width: 30, height: 30)
-                            .background(Color.accentColor, in: .circle)
-                    }
-                    .padding(.leading, 16)
-                    .padding(.trailing, 6)
-                    .padding(.vertical, 6)
-                    .contentShape(.rect)
-                    .modifier(GlassRounded(radius: 21))
-                }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
-            }
+            if store.canReopen(session) { composer }
         }
-        .sheet(isPresented: $choosing) {
-            ReopenSheet(session: session) { agent in
-                choosing = false
-                onStarted(agent)
+        .toolbar {
+            if store.canReopen(session) {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Fork", systemImage: "arrow.branch") { confirmingFork = true }
+                        .disabled(starting)
+                        .confirmationDialog(
+                            "Fork this session?", isPresented: $confirmingFork,
+                            titleVisibility: .visible
+                        ) {
+                            Button("Fork") { start(fork: true) }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("A new session starts with this one's history. This one stays as it is.")
+                        }
+                }
             }
-            .presentationDetents([.height(150)])
         }
         .refreshable { await load() }
         .navigationTitle(session.title)
@@ -185,6 +177,62 @@ struct SessionTranscriptView: View {
             while !Task.isCancelled {
                 await load()
                 try? await Task.sleep(for: .seconds(15))
+            }
+        }
+    }
+
+    /// Typing continues the session where it left off; the typed text, if
+    /// any, is its next prompt.
+    private var composer: some View {
+        VStack(spacing: 4) {
+            if let startError {
+                Text(startError)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal)
+            }
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Continue this session", text: $prompt, axis: .vertical)
+                    .lineLimit(1...5)
+                    .lineSpacing(AgentDetailView.lineSpacing)
+                    .textFieldStyle(.plain)
+                    // Prompts reach the agent verbatim.
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .padding(.vertical, 4)
+                if starting {
+                    ProgressView()
+                        .frame(width: 30, height: 30)
+                } else {
+                    Button { start(fork: false) } label: {
+                        SendArrow(enabled: true, size: 30)
+                    }
+                    .accessibilityLabel("Continue")
+                }
+            }
+            .padding(.leading, 16)
+            .padding(.trailing, 6)
+            .padding(.vertical, 6)
+            .modifier(GlassRounded(radius: 21))
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+        }
+    }
+
+    private func start(fork: Bool) {
+        guard !starting else { return }
+        Task {
+            starting = true
+            startError = nil
+            defer { starting = false }
+            do {
+                let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let agent = try await store.reopen(session, fork: fork, prompt: text) {
+                    prompt = ""
+                    onStarted(agent)
+                }
+            } catch {
+                startError = error.localizedDescription
             }
         }
     }
@@ -234,74 +282,6 @@ struct TranscriptSkeleton: View {
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .redacted(reason: .placeholder)
-    }
-}
-
-/// Continue the session where it left off, or fork it into a new one.
-struct ReopenSheet: View {
-    let session: SessionSummary
-    var onStarted: (Agent) -> Void
-
-    @Environment(AppStore.self) private var store
-    @Environment(\.dismiss) private var dismiss
-    @State private var starting: Bool?
-    @State private var startError: String?
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 12) {
-                HStack(spacing: 12) {
-                    choice(fork: false, title: "Continue")
-                    choice(fork: true, title: "Fork")
-                }
-                if let startError {
-                    Text(startError)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(20)
-            .navigationTitle(session.title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel", systemImage: "xmark") { dismiss() }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func choice(fork: Bool, title: String) -> some View {
-        let button = Button {
-            Task {
-                starting = fork
-                startError = nil
-                do {
-                    if let agent = try await store.reopen(session, fork: fork) {
-                        onStarted(agent)
-                    } else {
-                        dismiss()
-                    }
-                } catch {
-                    startError = error.localizedDescription
-                }
-                starting = nil
-            }
-        } label: {
-            Group {
-                if starting == fork { ProgressView() } else { Text(title) }
-            }
-            .frame(maxWidth: .infinity)
-        }
-        .controlSize(.large)
-        .disabled(starting != nil)
-        if fork {
-            button.buttonStyle(.bordered)
-        } else {
-            button.buttonStyle(.borderedProminent)
-        }
     }
 }
 

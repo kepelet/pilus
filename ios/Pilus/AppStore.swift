@@ -18,6 +18,8 @@ final class AppStore {
     private(set) var transcriptCache: [String: TranscriptReply] = [:]
     private var transcriptOrder: [String] = []
     private(set) var agentSessions: [String: SessionSummary] = [:]
+    /// Agents (`sessionKey`) whose session was found by what their pane shows.
+    private var sightedSessions: Set<String> = []
     var machines: [Machine] = []
     var hostLabel: String?
     /// Agent-kind catalog per machine (`hub.agents` answers per machine).
@@ -666,38 +668,6 @@ final class AppStore {
         }
     }
 
-    /// Set or clear (empty) the alias the host shows for `agent`'s pane. The
-    /// daemon takes `[a-z][a-z0-9_-]{0,31}` and announces `pane.renamed`, which
-    /// the watch turns into an agent-list refresh.
-    func renameAgent(_ agent: Agent, to name: String) async throws {
-        do {
-            let _: EmptyReply = try await call(
-                method: "pane.rename", params: ["pane": agent.pane, "name": name], machine: agent.machine)
-        } catch let error as PilusError where error.isUnconfirmed {
-            await refresh(topics: ["agents"], machines: [agent.machine])
-            throw error
-        }
-        await refresh(topics: ["agents"], machines: [agent.machine])
-    }
-
-    /// `input` folded into the shape the daemon accepts: lowercase, spaces
-    /// and dashes as `-`, everything else outside `a-z 0-9 _ -` dropped, a
-    /// letter first, at most 32 characters. Empty stays empty, which clears
-    /// the alias.
-    static func normalizedAlias(_ input: String) -> String {
-        var folded = ""
-        for character in input.lowercased() {
-            if character.isWhitespace || character == "-" {
-                folded.append("-")
-            } else if character == "_" || (character.isASCII && (character.isLetter || character.isNumber)) {
-                folded.append(character)
-            }
-        }
-        // The first character must be a letter.
-        let start = folded.firstIndex(where: { $0.isLetter }) ?? folded.endIndex
-        return String(folded[start...].prefix(32))
-    }
-
     /// Whether `input` can be sent to `agent`'s machine.
     func canSend(_ input: TerminalInput, to agent: Agent) -> Bool {
         supports(input.method, on: agent.machine)
@@ -808,6 +778,15 @@ final class AppStore {
     /// that fails keeps what it last listed.
     func loadSessions(limit: Int = 20) async {
         guard canReadSessions else { return }
+        sessions = Array(await fetchSessions(limit: limit, fallback: sessions).prefix(limit))
+        sessionsLoaded = true
+        await matchLiveAgents()
+        saveSessionCache()
+    }
+
+    /// Every machine's newest `limit` sessions, merged newest first. A machine
+    /// that fails keeps its rows from `fallback`.
+    func fetchSessions(limit: Int, fallback: [SessionSummary] = []) async -> [SessionSummary] {
         var merged: [SessionSummary] = []
         for id in machineOrder {
             do {
@@ -815,12 +794,68 @@ final class AppStore {
                     method: "hub.sessions", params: ["limit": limit], machine: id)
                 merged += reply.sessions.map { var row = $0; row.machine = id; return row }
             } catch {
-                merged += sessions.filter { $0.machine == id }
+                merged += fallback.filter { $0.machine == id }
             }
         }
-        sessions = Array(merged.sorted { ($0.updated ?? 0) > ($1.updated ?? 0) }.prefix(limit))
-        sessionsLoaded = true
-        saveSessionCache()
+        return merged.sorted { ($0.updated ?? 0) > ($1.updated ?? 0) }
+    }
+
+    /// The sessions live agents are in (`SessionSummary.id`).
+    var liveSessionIDs: Set<String> {
+        Set(agents.compactMap { agentSessions[Self.sessionKey($0)]?.id })
+    }
+
+    /// Recent sessions nobody is in: a live agent's session is on its row.
+    var recentSessions: [SessionSummary] {
+        let live = liveSessionIDs
+        return sessions.filter { !live.contains($0.id) }
+    }
+
+    /// Match each live agent to its session so Home can leave those out of
+    /// Recent Sessions. A pi match seen on the agent's screen is kept: the hub
+    /// can only guess a pi agent's session from its folder.
+    private func matchLiveAgents() async {
+        for agent in agents where ["claude", "pi"].contains(agent.kind) {
+            if sightedSessions.contains(Self.sessionKey(agent)) { continue }
+            _ = try? await session(
+                for: agent, sessionID: nil, cwd: nil, title: agent.agent_session_title)
+        }
+    }
+
+    /// A live pi agent's session, found by its opening prompt on the pane.
+    /// Pi reports no session id and titles its terminal after the folder, so
+    /// the hub can only guess the folder's newest session: another agent's
+    /// when two share the folder, or an older one until pi writes its file
+    /// on the first reply.
+    func piSession(for agent: Agent, cwd: String, screen: String) async throws -> SessionSummary? {
+        guard hubAllows("hub.sessions", on: agent.machine) else { return nil }
+        let plain = screen.replacingOccurrences(
+            of: "\u{1B}(\\[[0-9;?]*[ -/]*[@-~]|\\][^\u{07}\u{1B}]*(\u{07}|\u{1B}\\\\)?)",
+            with: "", options: .regularExpression)
+        let seen = Self.squashed(plain)
+        guard !seen.isEmpty else { return nil }
+        let reply: SessionList = try await call(
+            method: "hub.sessions", params: ["agent": "pi", "limit": 40], machine: agent.machine)
+        guard var found = reply.sessions.first(where: { row in
+            let title = Self.squashed(row.title)
+            return Self.folder(row.cwd) == Self.folder(cwd)
+                && title.count >= 6 && seen.contains(title.prefix(80))
+        }) else { return nil }
+        found.machine = agent.machine
+        agentSessions[Self.sessionKey(agent)] = found
+        sightedSessions.insert(Self.sessionKey(agent))
+        return found
+    }
+
+    /// Letters and digits only, lowercased, so a prompt wrapped and boxed on a
+    /// terminal compares with the same prompt in a transcript.
+    static func squashed(_ text: String) -> String {
+        String(text.lowercased().filter { $0.isLetter || $0.isNumber })
+    }
+
+    static func folder(_ path: String?) -> String {
+        let path = path ?? ""
+        return path.hasSuffix("/") ? String(path.dropLast()) : path
     }
 
     /// The session a live agent runs on: the daemon's session id when

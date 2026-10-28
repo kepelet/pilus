@@ -338,7 +338,7 @@ struct DiffReviewView: View {
     }
 }
 
-private struct DiffFileLabel: View {
+struct DiffFileLabel: View {
     let file: DiffFileRow
 
     var body: some View {

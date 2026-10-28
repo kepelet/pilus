@@ -64,6 +64,13 @@ pub(super) enum Radius {
     Md,
     /// A large floating panel.
     Lg,
+    /// A tab: a fixed [`TAB_RADIUS`] whatever the setting, until the
+    /// setting squares the corners.
+    Tab,
+    /// The glyph tile inside a tab: [`Radius::Sm`]'s two-thirds of the tab's
+    /// radius, fixed the same way, so a 20px tile stays a rounded square
+    /// instead of clamping to a circle.
+    TabTile,
     /// A pill, status dot, or round button: fully round whatever the
     /// setting, since a square one stops reading as what it is. Energy mode
     /// leaves it round too.
@@ -109,15 +116,23 @@ impl Radius {
             Self::Sm => px(base * 2.0 / 3.0),
             Self::Md => px(base),
             Self::Lg => px(base * 4.0 / 3.0),
+            Self::Tab if base > 0.0 => px(TAB_RADIUS),
+            Self::TabTile if base > 0.0 => px(TAB_RADIUS * 2.0 / 3.0),
+            Self::Tab | Self::TabTile => px(0.0),
             Self::Full => px(9999.0),
         }
     }
 }
 
+/// The corner radius of a tab and its glyph tile, in logical pixels.
+pub(super) const TAB_RADIUS: f32 = 12.0;
+
 /// `Radius::Sm`, for a fill under a dense list row.
 pub(super) const RADIUS_SM: Radius = Radius::Sm;
 /// `Radius::Md`, for a fill under a control, row, or card.
 pub(super) const RADIUS_MD: Radius = Radius::Md;
+/// `Radius::Tab`, for a tab's pill and fills.
+pub(super) const RADIUS_TAB: Radius = Radius::Tab;
 /// `Radius::Full`, for a fill under a pill or round button.
 pub(super) const RADIUS_FULL: Radius = Radius::Full;
 
@@ -135,6 +150,14 @@ pub(super) trait RadiusExt: Styled + Sized {
 
     fn radius_lg(self) -> Self {
         self.rounded(Radius::Lg.pixels())
+    }
+
+    fn radius_tab(self) -> Self {
+        self.rounded(Radius::Tab.pixels())
+    }
+
+    fn radius_tab_tile(self) -> Self {
+        self.rounded(Radius::TabTile.pixels())
     }
 
     fn radius_full(self) -> Self {
@@ -345,7 +368,7 @@ pub(super) fn glyph_tile(
     // cannot be counted; the border role is too faint for that, the full
     // glyph color too loud.
     let edge = mix(face, look.glyph, TILE_EDGE_MIX);
-    let radius = Radius::Sm.pixels().as_f32();
+    let radius = Radius::TabTile.pixels().as_f32();
     let mut deck = div()
         .relative()
         .flex_shrink_0()
@@ -398,7 +421,7 @@ pub(super) fn glyph_tile(
         .justify_center()
         .w(px(GLYPH_TILE))
         .h(px(GLYPH_TILE))
-        .radius_sm()
+        .radius_tab_tile()
         .border_1()
         .border_color(edge)
         .bg(face)
@@ -3724,13 +3747,35 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_keeps_twelve_pixels_until_the_corners_go_square() {
+        assert_eq!(Radius::Tab.resolve(6.0), px(12.0));
+        assert_eq!(Radius::Tab.resolve(14.0), px(12.0));
+        assert_eq!(Radius::Tab.resolve(0.0), px(0.0));
+    }
+
+    #[test]
+    fn a_tab_tile_stays_a_rounded_square_and_squares_with_the_corners() {
+        let tile = Radius::TabTile.resolve(8.0);
+        assert_eq!(tile, px(TAB_RADIUS * 2.0 / 3.0));
+        assert!(tile.as_f32() < GLYPH_TILE / 2.0);
+        assert_eq!(Radius::TabTile.resolve(0.0), px(0.0));
+    }
+
+    #[test]
     fn energy_mode_leaves_only_the_pill_round() {
         let settings = Settings {
             energy_mode: true,
             ..Settings::default()
         };
         let base = settings.drawn_radius();
-        for step in [Radius::None, Radius::Sm, Radius::Md, Radius::Lg] {
+        for step in [
+            Radius::None,
+            Radius::Sm,
+            Radius::Md,
+            Radius::Lg,
+            Radius::Tab,
+            Radius::TabTile,
+        ] {
             assert_eq!(step.resolve(base), px(0.0), "{step:?}");
         }
         assert_eq!(Radius::Full.resolve(base), px(9999.0));

@@ -46,8 +46,12 @@ is the only implementation of it.
     rests bare and as wide as its label. An agent's status is a badge on the
     tab's glyph tile, not a tint of the glyph. The tile's colors are a
     preset per kind (`theme::tile_terminal`, `tile_claude`), not theme
-    roles; an agent with no preset keeps the terminal's with its own mark. While the first tab list
-    loads, the strip holds three skeleton tabs.
+    roles; an agent with no preset keeps the terminal's with its own mark.
+    The tab, its pill and the new-tab button are 12px (`Radius::Tab`) whatever the
+    corner setting; the glyph tile inside is two-thirds of that
+    (`Radius::TabTile`). Both go square only when the setting is zero or
+    energy mode squares the corners. While the first tab list loads, the strip holds
+    three skeleton tabs.
   - Accent means progress or focus. It is never a panel edge.
 - **Selection** in the sidebar (workspace, worktree, agent) is a pill in the
   same tint as a selected tab (`Theme::tint_fill`), with the

@@ -12004,7 +12004,7 @@ impl PilusView {
             "pilus-tab-glide",
             &selection,
             self.theme.tint_fill(1.0),
-            style::RADIUS_MD,
+            style::RADIUS_TAB,
             self.theme.border,
         ));
         for tab in &self.tabs {
@@ -12040,11 +12040,11 @@ impl PilusView {
             .flex_shrink_0()
             .h(px(TAB_HEIGHT))
             .w(px(28.0))
-            .radius_md()
+            .radius_tab()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.muted)
-            .hover_fill(theme.tint_fill(1.0), style::RADIUS_MD)
+            .hover_fill(theme.tint_fill(1.0), style::RADIUS_TAB)
             .hover(move |style| style.text_color(theme.panel_fg))
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
@@ -12278,7 +12278,7 @@ impl PilusView {
             .when(!lone, |tab| tab.w(px(TAB_WIDTH)))
             .pl(px(TAB_PAD_LEFT))
             .pr(px(TAB_PAD_RIGHT))
-            .radius_md()
+            .radius_tab()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             // The selected tab's edge is the strip's glide pill; hovering

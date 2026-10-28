@@ -15,6 +15,7 @@ struct HomeView: View {
     @State private var showingPairing = false
     @State private var showingSettings = false
     @State private var showingCompose = false
+    @State private var confirmingDisconnect = false
     /// Focus opens the composer; this state stays expanded when the keyboard
     /// dismisses so picker menus remain available.
     @State private var composerExpanded = false
@@ -107,6 +108,15 @@ struct HomeView: View {
                 case .search: SessionSearchView()
                 }
             }
+            .confirmationDialog(
+                "Disconnect from \(store.hostLabel ?? "this host")?",
+                isPresented: $confirmingDisconnect, titleVisibility: .visible
+            ) {
+                Button("Disconnect", role: .destructive) { store.disconnect() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This device forgets the host and clears its cached sessions. You'll need to pair again to reconnect.")
+            }
             .sheet(isPresented: $showingOpenWorkspace) {
                 OpenWorkspaceView { path, machine in
                     // The composer follows the workspace just opened.
@@ -128,6 +138,7 @@ struct HomeView: View {
                 ComposeSheetView(draft: $composerDraft,
                                  agent: $composerAgent,
                                  model: $composerModel,
+                                 effort: $composerEffort,
                                  workspaceID: $composerWorkspaceID) { launched in
                     showingCompose = false
                     navPath.append(launched)
@@ -206,7 +217,7 @@ struct HomeView: View {
             }
             VStack(alignment: .leading, spacing: composerExpanded ? 10 : 0) {
                 HStack(alignment: composerExpanded ? .top : .center, spacing: 8) {
-                    TextField("Plan, ask, build", text: $composerDraft, axis: .vertical)
+                    TextField("What should we build today?", text: $composerDraft, axis: .vertical)
                         .lineLimit(composerExpanded ? 2...6 : 1...1)
                         .textFieldStyle(.plain)
                         .focused($composerFocused)
@@ -217,14 +228,19 @@ struct HomeView: View {
                         composerSendButton
                     }
                 }
+                // Focus on a tap in the prompt row only: on the whole card it
+                // raced the pickers' menus and the keyboard rising under them.
+                .contentShape(Rectangle())
+                .onTapGesture { composerFocused = true }
                 if composerExpanded {
-                    HStack(spacing: 16) {
+                    HStack(spacing: 12) {
                         if composerKinds.isEmpty && !store.loaded {
                             pickerSkeleton
                             pickerSkeleton
                         } else {
                             composerAgentPicker
                             composerModelPicker
+                            composerEffortPicker
                         }
                         if store.workspaces.isEmpty && !store.loaded {
                             pickerSkeleton
@@ -246,19 +262,30 @@ struct HomeView: View {
         }
         // High priority so a flick over the text field is the composer's
         // swipe, not the field's own scroll/selection gesture.
-        .contentShape(Rectangle())
-        .onTapGesture { composerFocused = true }
         .highPriorityGesture(composerGesture)
         .animation(.easeInOut(duration: 0.2), value: composerExpanded)
-        .onAppear(perform: applyComposerDefaults)
+        .onAppear {
+            applyComposerDefaults()
+            reloadKindsIfMissing()
+        }
         .onChange(of: composerFocused) { _, focused in
             if focused {
                 composerExpanded = true
             }
         }
+        // A catalog that never arrived (or arrived empty) is asked for again
+        // as the pickers come up, rather than leaving their menus blank.
+        .onChange(of: composerExpanded) { _, expanded in
+            if expanded { reloadKindsIfMissing() }
+        }
+        .onChange(of: store.loaded) { reloadKindsIfMissing() }
         .onChange(of: composerKinds.map(\.kind)) { applyComposerDefaults() }
         .onChange(of: store.workspaces.count) { applyComposerDefaults() }
-        .onChange(of: composerAgent) { composerModel = composerKind?.defaultModel }
+        .onChange(of: composerAgent) {
+            composerModel = composerKind?.defaultModel
+            composerEffort = nil
+        }
+        .onChange(of: composerModel) { composerEffort = nil }
         .padding(.horizontal, 16)
         // At rest it sits down into the home indicator's margin; over the
         // keyboard it keeps a gap.
@@ -300,6 +327,8 @@ struct HomeView: View {
     /// sheets (first kind on the workspace's machine, active workspace).
     @State private var composerAgent = ""
     @State private var composerModel: String?
+    /// `nil` leaves the level to the agent's own default.
+    @State private var composerEffort: String?
     @State private var composerWorkspaceID: String?
 
     private var composerWorkspace: Workspace? {
@@ -322,6 +351,11 @@ struct HomeView: View {
 
     private var composerSpansMachines: Bool {
         Set(store.workspaces.map(\.machine)).count > 1
+    }
+
+    private func reloadKindsIfMissing() {
+        guard store.canRunAgents, composerKinds.isEmpty || store.missingAgentKinds else { return }
+        Task { await store.loadAgentKinds() }
     }
 
     private func applyComposerDefaults() {
@@ -380,6 +414,29 @@ struct HomeView: View {
         }
     }
 
+    /// Reasoning level for the chosen model, when the catalog lists any.
+    @ViewBuilder
+    private var composerEffortPicker: some View {
+        if let entry = composerKind?.entry(composerModel), let levels = entry.efforts, !levels.isEmpty {
+            Menu {
+                ForEach(["Default"] + levels, id: \.self) { level in
+                    Button { composerEffort = level == "Default" ? nil : level } label: {
+                        Label {
+                            Text(level)
+                        } icon: {
+                            if (composerEffort ?? "Default") == level {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                composerPickerLabel(composerEffort ?? entry.default_effort ?? "effort",
+                                    systemImage: "brain")
+            }
+        }
+    }
+
     private var composerWorkspacePicker: some View {
         Menu {
             ForEach(store.workspaces) { workspace in
@@ -407,11 +464,12 @@ struct HomeView: View {
             }
             if store.canRunAgents {
                 Divider()
-                Button("Open Workspace…") { showingOpenWorkspace = true }
+                Button("Open Workspace") { showingOpenWorkspace = true }
             }
         } label: {
             composerPickerLabel(composerWorkspace?.title ?? "workspace",
                                 asset: "lucide-server")
+                .frame(maxWidth: 120, alignment: .leading)
         }
     }
 
@@ -495,6 +553,7 @@ struct HomeView: View {
                 prompt: text,
                 workspaceID: workspace?.workspace_id,
                 model: composerModel ?? kind.defaultModel,
+                effort: composerEffort,
                 machine: machine
             )
             composerDraft = ""
@@ -550,13 +609,10 @@ struct HomeView: View {
                 Text(Self.greeting)
                     .font(.title.weight(.semibold))
                     .foregroundStyle(.white)
-                Text(agentSummary)
-                    .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.75))
-                if let overview = overviewSummary {
-                    Text(overview)
+                if let summary = summaryLine {
+                    Text(summary)
                         .font(.footnote)
-                        .foregroundStyle(.white.opacity(0.55))
+                        .foregroundStyle(.white.opacity(0.75))
                 }
             }
             .padding(.horizontal, 20)
@@ -568,24 +624,19 @@ struct HomeView: View {
 
     @Environment(\.colorScheme) private var colorScheme
 
-    /// What the live agents are doing, busiest first.
-    private var agentSummary: String {
+    /// One line under the greeting: what the live agents are doing, busiest
+    /// first, then the work waiting on the board and how many machines the
+    /// host reaches — "10 idle • 3 machines".
+    private var summaryLine: String? {
+        var parts: [String] = []
         let statuses = store.agents.map(\.status)
         let working = statuses.filter { $0 == "working" || $0 == "running" }.count
         let waiting = statuses.filter { $0 == "blocked" || $0 == "waiting_permission" }.count
         let idle = statuses.count - working - waiting
-        var parts: [String] = []
         if working > 0 { parts.append("\(working) working") }
         if waiting > 0 { parts.append("\(waiting) waiting for you") }
         if idle > 0 { parts.append("\(idle) idle") }
-        return parts.isEmpty ? "No agents running" : parts.joined(separator: ", ")
-    }
-
-    /// What else is going on beyond the agents' states: work waiting on the
-    /// board, sessions touched today, and how far the host reaches. Nil when
-    /// there is nothing to say, so a fresh pairing shows no empty line.
-    private var overviewSummary: String? {
-        var parts: [String] = []
+        if parts.isEmpty { parts.append("No agents running") }
         // A task nobody has touched in a week is abandoned, not open.
         let recent = Date.now.timeIntervalSince1970 - 7 * 86_400
         let open = store.tasks.filter {
@@ -595,15 +646,9 @@ struct HomeView: View {
         let review = open.filter { $0.status == "review" }.count
         if review > 0 { parts.append("\(review) to review") }
         if !open.isEmpty { parts.append(Self.count(open.count, "task") + " open") }
-        // Home lists the newest 20, so a full day of them reads "20+".
-        let start = Calendar.current.startOfDay(for: .now).timeIntervalSince1970
-        let today = store.sessions.filter { Double($0.updated ?? 0) >= start }.count
-        if today > 0 {
-            parts.append(Self.count(today, "session") + (today >= 20 ? "+" : "") + " today")
-        }
         let machines = store.machineOrder.count
         if machines > 1 { parts.append("\(machines) machines") }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        return parts.joined(separator: " • ")
     }
 
     private static func count(_ n: Int, _ noun: String) -> String {
@@ -632,7 +677,7 @@ struct HomeView: View {
             Button("Pairing") { showingPairing = true }
             Button("Settings") { showingSettings = true }
             Button("Disconnect", role: .destructive) {
-                store.disconnect()
+                confirmingDisconnect = true
             }
         } label: {
             HStack(spacing: 8) {
@@ -1003,17 +1048,31 @@ private struct SessionRowSkeleton: View {
     }
 }
 
-/// Sessions the hosts keep, but the live agents', searched on each host:
-/// each word must appear in the title, folder, branch or agent.
+/// Recent sessions, filtered as you type: each word must appear in the title,
+/// folder, branch or agent. The list is read from the hosts once (the newest
+/// 100, remembered between visits) and every keystroke only filters it on the
+/// phone — asking the hosts per query was the slow part.
 struct SessionSearchView: View {
     @Environment(AppStore.self) private var store
     @State private var query = ""
-    @State private var found: [SessionSummary]?
+    @State private var pool: [SessionSummary]?
+
+    private var found: [SessionSummary]? {
+        guard let pool else { return nil }
+        let words = query.lowercased().split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty else { return pool }
+        return pool.filter { session in
+            let text = [session.title, session.cwd ?? "", session.branch ?? "", session.agent,
+                        session.session_id].joined(separator: " ").lowercased()
+            return words.allSatisfy { text.contains($0) }
+        }
+    }
 
     var body: some View {
+        let rows = found
         ScrollView {
             LazyVStack(spacing: 0) {
-                ForEach(found ?? []) { session in
+                ForEach(rows ?? []) { session in
                     NavigationLink(value: session) {
                         SessionRowLabel(session: session)
                             .padding(.horizontal, 20)
@@ -1024,8 +1083,9 @@ struct SessionSearchView: View {
                 }
             }
         }
+        .scrollDismissesKeyboard(.interactively)
         .overlay {
-            if found == nil {
+            if rows == nil {
                 // Rows the shape of the real ones, rather than a spinner.
                 VStack(spacing: 0) {
                     ForEach(0..<8, id: \.self) { _ in SessionRowSkeleton() }
@@ -1034,7 +1094,7 @@ struct SessionSearchView: View {
                 .padding(.horizontal, 20)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .background(Color(uiColor: .systemBackground))
-            } else if found?.isEmpty == true {
+            } else if rows?.isEmpty == true {
                 if query.isEmpty {
                     ContentUnavailableView("No sessions", systemImage: "text.bubble")
                 } else {
@@ -1046,21 +1106,17 @@ struct SessionSearchView: View {
                     prompt: "Search sessions")
         .navigationTitle("Sessions")
         .navigationBarTitleDisplayMode(.inline)
-        .task(id: query) {
-            let query = query.trimmingCharacters(in: .whitespaces)
-            // What this query found last time shows at once; a recent one is
-            // not asked again, an older one is while it stays on screen.
-            let cached = store.cachedSearch(query)
+        .task {
+            // What Home already lists shows at once; the longer list replaces
+            // it as soon as it is read, or at once when it was read recently.
+            if pool == nil, !store.recentSessions.isEmpty { pool = store.recentSessions }
+            let cached = store.cachedSearch("")
             if let cached {
-                found = cached.rows
+                pool = cached.rows
                 if cached.fresh { return }
             }
-            if !query.isEmpty, cached == nil {
-                try? await Task.sleep(for: .milliseconds(300))
-                if Task.isCancelled { return }
-            }
-            let rows = await store.searchSessions(query)
-            if !Task.isCancelled { found = rows }
+            let rows = await store.searchSessions("")
+            if !Task.isCancelled { pool = rows }
         }
     }
 }

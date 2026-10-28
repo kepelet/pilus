@@ -34,7 +34,7 @@ final class AppStore {
     var hostLabel: String?
     /// Agent-kind catalog per machine (`hub.agents` answers per machine).
     var agentKindsByMachine: [String: [HubAgentKind]] = [:]
-    var pseudoKindsByMachine: [String: [String]] = [:]
+    private var loadingKinds = false
     /// Machines to merge lists over: `local` first, then usable SSH machines
     /// in `hub.machines` order.
     var machineOrder: [String] = ["local"]
@@ -264,19 +264,11 @@ final class AppStore {
     }
 
     /// Agent kinds installed on a machine; empty while `hub.agents` is still
-    /// loading or the connector predates the catalog. `terminal` is a
-    /// pseudo-kind the hub answers with a fresh shell tab — only offered when
-    /// the connector advertises it, since an older one forwards it to
-    /// `agent.start` and the daemon rejects the unknown kind.
+    /// loading or the connector predates the catalog. The hub's `terminal`
+    /// pseudo-kind is left out: the phone launches agents, not shells.
     func kinds(for machine: String) -> [HubAgentKind] {
-        let advertised = pseudoKindsByMachine[machine] ?? []
-        return (agentKindsByMachine[machine] ?? [])
-            + (advertised.contains("terminal") ? [Self.terminalKind] : [])
+        agentKindsByMachine[machine] ?? []
     }
-
-    private static let terminalKind =
-        HubAgentKind(kind: "terminal", label: "Terminal",
-                     default_model: nil, models: nil)
 
     private func loadMachines() async {
         guard let client else { return }
@@ -296,16 +288,25 @@ final class AppStore {
     }
 
     /// `hub.agents` answers per machine, so the picker catalog is fetched
-    /// once per reachable machine.
+    /// once per reachable machine. A machine that fails keeps what it last
+    /// listed, and one that never answered is asked again by the next call —
+    /// the composer calls this when its pickers come up empty.
     func loadAgentKinds() async {
-        guard let client else { return }
+        guard let client, !loadingKinds else { return }
+        loadingKinds = true
+        defer { loadingKinds = false }
         for id in machineOrder {
             let reply: HubAgents? = try? await Task.detached {
                 try client.hubRequest(method: "hub.agents", machine: id)
             }.value
-            agentKindsByMachine[id] = reply?.agents ?? []
-            pseudoKindsByMachine[id] = reply?.pseudo_kinds ?? []
+            if let reply { agentKindsByMachine[id] = reply.agents }
         }
+    }
+
+    /// Whether some reachable machine still has no catalog, so the composer
+    /// knows to ask again.
+    var missingAgentKinds: Bool {
+        usesHub && machineOrder.contains { agentKindsByMachine[$0] == nil }
     }
 
     /// `hub.watch` tells this device that something changed and which lists
@@ -1207,7 +1208,6 @@ final class AppStore {
         machines = []
         machineOrder = ["local"]
         agentKindsByMachine = [:]
-        pseudoKindsByMachine = [:]
         inventoryCache = [:]
         invalidateSearches()
         // Another host's sessions and chats must not outlive this pairing,

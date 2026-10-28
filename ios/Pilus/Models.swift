@@ -239,9 +239,6 @@ struct Machine: Decodable, Identifiable {
 /// model catalog a picker offers.
 struct HubAgents: Decodable {
     let agents: [HubAgentKind]
-    /// Kinds `hub.run` accepts beyond real agents (`terminal` opens a shell
-    /// tab); absent on connectors that predate pseudo-kinds.
-    let pseudo_kinds: [String]?
 }
 
 struct HubAgentKind: Decodable, Identifiable {
@@ -254,6 +251,13 @@ struct HubAgentKind: Decodable, Identifiable {
     var title: String { label ?? kind }
     var defaultModel: String? {
         default_model ?? models?.first(where: { $0.is_default == true })?.name
+    }
+}
+
+extension HubAgentKind {
+    /// The catalog entry for a model's display name.
+    func entry(_ name: String?) -> HubAgentModel? {
+        models?.first { $0.name == name }
     }
 }
 

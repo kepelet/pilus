@@ -106,30 +106,35 @@ impl AgentConfig {
     /// The flags that open a fresh session of this agent on `model` at
     /// `effort`, both display names from this catalog.
     ///
-    /// Only Pi's pair is forwarded: its catalog *is* its flag vocabulary, so a
-    /// fresh session starts on the model and thinking level the catalog
-    /// marks default. Every other agent spells its own, and a flag it does
+    /// Only Pi and Claude forward them: Pi's catalog *is* its flag
+    /// vocabulary, and Claude's is a fixed alias list its `--model` and
+    /// `--effort` accept. Every other agent spells its own, and a flag it does
     /// not know aborts the launch, so those keep the manifest defaults.
     #[must_use]
     pub fn launch_args(&self, model: &str, effort: &str) -> Vec<String> {
-        if self.kind != "pi" {
-            return Vec::new();
-        }
+        let (model_flag, effort_flag) = match self.kind.as_str() {
+            "pi" => ("--model", "--thinking"),
+            "claude" => ("--model", "--effort"),
+            _ => return Vec::new(),
+        };
         let Some(model) = self.model(model) else {
             return Vec::new();
         };
         let mut args = Vec::new();
-        if !model.provider.is_empty() {
-            args.push("--model".to_string());
+        if self.kind == "pi" && !model.provider.is_empty() {
+            args.push(model_flag.to_string());
             args.push(format!("{}/{}", model.provider, model.id));
+        } else if self.kind == "claude" && !model.id.is_empty() {
+            args.push(model_flag.to_string());
+            args.push(model.id.clone());
         }
-        // A level the model does not list is left to pi: the generic fallback
-        // set offers levels this model would reject.
+        // A level the model does not list is left to the agent: the generic
+        // fallback set offers levels this model would reject.
         if effort != "Default"
             && let Some(levels) = model.efforts.as_ref()
             && levels.iter().any(|level| level == effort)
         {
-            args.push("--thinking".to_string());
+            args.push(effort_flag.to_string());
             args.push(thinking_level(effort));
         }
         args
@@ -280,6 +285,7 @@ fn enrich_local(config: &mut AgentConfig, home: &Path) {
             let settings = read_json(home, ".pi/agent/settings.json");
             apply_pi(config, store.as_ref(), settings.as_ref());
         }
+        "claude" => apply_claude(config),
         "opencode" => {
             if let Some(stdout) = run_stdout(&["opencode", "models", "--verbose"]) {
                 config.models = parse_opencode_models(&stdout);
@@ -294,6 +300,37 @@ fn enrich_local(config: &mut AgentConfig, home: &Path) {
         }
         _ => {}
     }
+}
+
+// -- Claude --------------------------------------------------------------
+
+/// Claude has no model list to ask for, so the catalog is the aliases its
+/// `--model` takes (each resolves to the latest model of that family) behind
+/// a `Default` that adds no flag and leaves the choice to its own settings.
+fn apply_claude(config: &mut AgentConfig) {
+    let levels = || {
+        ["low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .map(|level| effort_label(level))
+            .collect::<Vec<_>>()
+    };
+    let entry = |id: &str, name: &str, efforts: Vec<String>, is_default: bool| AgentModel {
+        id: id.to_string(),
+        name: name.to_string(),
+        efforts: Some(efforts),
+        is_default,
+        ..AgentModel::default()
+    };
+    config.models = vec![
+        entry("", "Default", levels(), true),
+        entry("fable", "Fable", levels(), false),
+        entry("opus", "Opus", levels(), false),
+        entry("sonnet", "Sonnet", levels(), false),
+        // Haiku has no reasoning mode.
+        entry("haiku", "Haiku", Vec::new(), false),
+    ];
+    config.discovered = false;
+    mark_default(config);
 }
 
 // -- Pi ------------------------------------------------------------------
@@ -640,6 +677,8 @@ fn parse_remote(bytes: &[u8]) -> Vec<AgentConfig> {
             let mut config = base(spec, source);
             if spec.kind == "pi" {
                 apply_pi(&mut config, store.as_ref(), settings.as_ref());
+            } else if spec.kind == "claude" {
+                apply_claude(&mut config);
             } else if spec.kind == "opencode" && !opencode.trim().is_empty() {
                 config.models = parse_opencode_models(&opencode);
                 config.discovered = !config.models.is_empty();
@@ -839,7 +878,26 @@ mod tests {
     }
 
     #[test]
-    fn only_pi_forwards_launch_flags() {
+    fn claude_launches_on_an_alias_and_effort() {
+        let mut config = AgentConfig {
+            kind: "claude".to_string(),
+            ..AgentConfig::default()
+        };
+        apply_claude(&mut config);
+        assert_eq!(config.default_model.as_deref(), Some("Default"));
+        // `Default` adds no model flag; a listed level still goes through.
+        assert!(config.launch_args("Default", "Default").is_empty());
+        assert_eq!(config.launch_args("Default", "High"), ["--effort", "high"]);
+        assert_eq!(
+            config.launch_args("Opus", "Extra High"),
+            ["--model", "opus", "--effort", "xhigh"]
+        );
+        // Haiku has no reasoning mode, so no level is forwarded.
+        assert_eq!(config.launch_args("Haiku", "High"), ["--model", "haiku"]);
+    }
+
+    #[test]
+    fn only_pi_and_claude_forward_launch_flags() {
         let mut config = AgentConfig {
             kind: "codex".to_string(),
             ..AgentConfig::default()

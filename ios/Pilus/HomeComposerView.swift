@@ -39,7 +39,7 @@ struct HomeComposerView: View {
                     .padding(.bottom, 2)
             }
             VStack(alignment: .leading, spacing: 8) {
-                TextField("Plan, ask, build", text: draft, axis: .vertical)
+                TextField("What should we build today?", text: draft, axis: .vertical)
                     .lineLimit(3...5)
                     .textFieldStyle(.plain)
                     .focused(promptFocused)

@@ -194,8 +194,7 @@ struct AgentDetailView: View {
     /// The status as of the latest read, else the row the screen opened from.
     private var liveStatus: String? { detail?.status ?? agent.status }
 
-    /// Sits above the reply box so it is in view at the moment of typing: a
-    /// reply sent while the agent works steers or interrupts it.
+    /// Sits above the reply box so it is in view at the moment of typing.
     @ViewBuilder
     private var statusPill: some View {
         if let text = AgentStatusMark.caption(for: liveStatus) {
@@ -208,6 +207,9 @@ struct AgentDetailView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .modifier(GlassCapsule())
+            // Flush with the reply box's edge rather than centered above it.
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
             .padding(.top, 6)
             .transition(.opacity)
         }
@@ -336,6 +338,7 @@ struct AgentDetailView: View {
             // the last row and stays pinned there.
             .frame(minHeight: max(0, geo.size.height - composerHeight), alignment: .bottom)
         }
+        .scrollDismissesKeyboard(.interactively)
     }
 
     @discardableResult
@@ -586,6 +589,16 @@ struct ReplyComposer<Send: View>: View {
             // keyboard it keeps a gap.
             .padding(.bottom, focused.wrappedValue ? 8 : -12)
         }
+        // A flick down over the box drops the keyboard. Simultaneous, so the
+        // field keeps its own scrolling and selection.
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 20).onEnded { drag in
+                if drag.translation.height > 28,
+                   drag.translation.height > abs(drag.translation.width) {
+                    focused.wrappedValue = false
+                }
+            }
+        )
     }
 }
 
@@ -617,7 +630,7 @@ private struct AgentStatusMark: View {
 
     /// What the pill says; nil when the agent is idle and nothing needs saying.
     static func caption(for status: String?) -> String? {
-        if isWorking(status) { return "Working — a reply now will steer it" }
+        if isWorking(status) { return "Working..." }
         if status == "blocked" || status == "waiting_permission" { return "Waiting for you" }
         return nil
     }

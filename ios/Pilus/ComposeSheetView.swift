@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// The toolbar compose sheet — a roomier take on the home composer. Header:
-/// close on the left, agent + workspace pickers centered, send on the right;
-/// the prompt gets the whole body.
+/// just close on the left; the prompt gets the body; the agent, model, effort
+/// and workspace pickers sit in a bar above the keyboard with send beside them.
 struct ComposeSheetView: View {
     @Environment(AppStore.self) private var store
     @Environment(\.dismiss) private var dismiss
@@ -12,6 +12,8 @@ struct ComposeSheetView: View {
     /// mini composer is what the expanded sheet opens with.
     var agent: Binding<String>
     var model: Binding<String?>
+    /// `nil` leaves the reasoning level to the agent's own default.
+    var effort: Binding<String?>
     var workspaceID: Binding<String?>
     /// Called with the agent `hub.run` started so the parent can push detail.
     var onLaunched: (Agent) -> Void
@@ -23,7 +25,7 @@ struct ComposeSheetView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 18) {
+            HStack {
                 Button { dismiss() } label: {
                     Image(systemName: "xmark")
                         .font(.body.weight(.medium))
@@ -35,17 +37,9 @@ struct ComposeSheetView: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Close")
                 Spacer()
-                agentPicker
-                modelPicker
-                workspacePicker
-                Spacer()
-                sendButton
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
-            // Menus inherit the accent tint inside a toolbar row; pin the
-            // pickers to monochrome like the rest of the UI.
-            .tint(.primary)
 
             if let sendError {
                 Text(sendError)
@@ -66,13 +60,33 @@ struct ComposeSheetView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .overlay(alignment: .topLeading) {
                     if draft.wrappedValue.isEmpty {
-                        Text("Plan, ask, build")
+                        Text("What should we build today?")
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 19)
                             .padding(.vertical, 8)
                             .allowsHitTesting(false)
                     }
                 }
+
+            HStack(spacing: 10) {
+                // Four chips can outrun a phone's width; they scroll while
+                // send stays put at the corner.
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        agentPicker
+                        modelPicker
+                        effortPicker
+                        workspacePicker
+                    }
+                    .padding(.vertical, 2)
+                }
+                sendButton
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            // Menus inherit the accent tint inside a toolbar row; pin the
+            // pickers to monochrome like the rest of the UI.
+            .tint(.primary)
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.hidden)
@@ -88,11 +102,18 @@ struct ComposeSheetView: View {
         }
         .onAppear {
             applyDefaults()
+            if availableKinds.isEmpty || store.missingAgentKinds {
+                Task { await store.loadAgentKinds() }
+            }
             Task { editorFocused = true }
         }
         .onChange(of: availableKinds.map(\.kind)) { applyDefaults() }
         .onChange(of: store.workspaces.count) { applyDefaults() }
-        .onChange(of: agent.wrappedValue) { model.wrappedValue = currentKind?.defaultModel }
+        .onChange(of: agent.wrappedValue) {
+            model.wrappedValue = currentKind?.defaultModel
+            effort.wrappedValue = nil
+        }
+        .onChange(of: model.wrappedValue) { effort.wrappedValue = nil }
         .onChange(of: workspaceID.wrappedValue) {
             if !availableKinds.isEmpty, !availableKinds.contains(where: { $0.kind == agent.wrappedValue }) {
                 if let first = availableKinds.first {
@@ -179,6 +200,29 @@ struct ComposeSheetView: View {
         }
     }
 
+    /// Reasoning level for the chosen model, when the catalog lists any.
+    @ViewBuilder
+    private var effortPicker: some View {
+        if let entry = currentKind?.entry(model.wrappedValue), let levels = entry.efforts, !levels.isEmpty {
+            Menu {
+                ForEach(["Default"] + levels, id: \.self) { level in
+                    Button { effort.wrappedValue = level == "Default" ? nil : level } label: {
+                        Label {
+                            Text(level)
+                        } icon: {
+                            if (effort.wrappedValue ?? "Default") == level {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                pickerLabel(effort.wrappedValue ?? entry.default_effort ?? "effort",
+                            systemImage: "brain")
+            }
+        }
+    }
+
     private var workspacePicker: some View {
         Menu {
             ForEach(store.workspaces) { workspace in
@@ -196,7 +240,7 @@ struct ComposeSheetView: View {
             }
             if store.canRunAgents {
                 Divider()
-                Button("Open Workspace…") { showingOpenWorkspace = true }
+                Button("Open Workspace") { showingOpenWorkspace = true }
             }
         } label: {
             pickerLabel(currentWorkspace?.title ?? "workspace", asset: "lucide-server")
@@ -262,6 +306,7 @@ struct ComposeSheetView: View {
                     prompt: text,
                     workspaceID: workspace?.workspace_id,
                     model: model.wrappedValue,
+                    effort: effort.wrappedValue,
                     machine: currentMachine
                 )
                 draft.wrappedValue = ""

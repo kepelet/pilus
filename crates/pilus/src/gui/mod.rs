@@ -12331,19 +12331,20 @@ impl PilusView {
             .gap(px(TAB_GAP))
             .overflow_hidden()
             .whitespace_nowrap();
-        let (glyph, status) = match agent {
+        let (look, glyph, status) = match agent {
             Some(agent) => {
                 // An idle agent keeps the plain tile, so the tab reads the
                 // same as one with no agent.
                 let wash = (agent.status != "idle").then(|| status_color(&agent.status, theme));
-                (agent_icon(&agent.agent), wash)
+                (tile_look(&agent.agent), agent_icon(&agent.agent), wash)
             }
             None => (
+                theme::tile_terminal(),
                 include_bytes!("../../assets/icons/terminal.svg").as_slice(),
                 None,
             ),
         };
-        content = content.child(style::glyph_tile(theme, glyph, panes, status));
+        content = content.child(style::glyph_tile(look, glyph, panes, status));
         // With company the label fades out where the close button begins;
         // a lone tab is as wide as its label, so nothing fades.
         let label = if lone {
@@ -17310,6 +17311,17 @@ fn linked_worktree_by_tail(worktrees: &[WorktreeInfo], tail: &str) -> Option<Str
         })
         .max_by_key(|(len, _)| *len)
         .map(|(_, path)| path)
+}
+
+/// The tile look a tab wears for an agent kind. Only kinds with a look of
+/// their own get one; the rest (pi among them) keep the terminal's, with their
+/// own mark on it.
+fn tile_look(kind: &str) -> theme::TileLook {
+    if kind.trim().to_ascii_lowercase().contains("claude") {
+        theme::tile_claude()
+    } else {
+        theme::tile_terminal()
+    }
 }
 
 /// Vendored brand mark for the daemon's agent kind.

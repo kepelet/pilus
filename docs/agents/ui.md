@@ -44,7 +44,9 @@ is the only implementation of it.
     included, shows its close button only on hover. Its label keeps the same
     weight as the others, so switching tabs never resizes one. A lone tab
     rests bare and as wide as its label. An agent's status is a badge on the
-    tab's glyph tile, not a tint of the glyph. While the first tab list
+    tab's glyph tile, not a tint of the glyph. The tile's colors are a
+    preset per kind (`theme::tile_terminal`, `tile_claude`), not theme
+    roles; an agent with no preset keeps the terminal's with its own mark. While the first tab list
     loads, the strip holds three skeleton tabs.
   - Accent means progress or focus. It is never a panel edge.
 - **Selection** in the sidebar (workspace, worktree, agent) is a pill in the

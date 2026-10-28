@@ -1261,18 +1261,26 @@ impl UiPlaygroundView {
 
     /// The tab glyph tile: one card for a lone pane, a deck for several,
     /// capped at three cards; then the badge an agent's status puts on its
-    /// corner (working, blocked, done).
+    /// corner (working, blocked, done); then the claude look beside the
+    /// terminal's.
     fn glyph_tiles(&self) -> Div {
         let theme = self.theme;
         let terminal = include_bytes!("../../assets/icons/terminal.svg").as_slice();
+        let claude = include_bytes!("../../assets/icons/agents/claude-code.svg").as_slice();
+        let look = super::theme::tile_terminal();
         let mut row = div().flex().flex_row().items_center().gap_6();
         for panes in [1, 2, 3, 5] {
-            row = row.child(style::glyph_tile(theme, terminal, panes, None));
+            row = row.child(style::glyph_tile(look, terminal, panes, None));
         }
         for status in [theme.accent, theme.alert, theme.ok] {
-            row = row.child(style::glyph_tile(theme, terminal, 1, Some(status)));
+            row = row.child(style::glyph_tile(look, terminal, 1, Some(status)));
         }
-        row
+        row.child(style::glyph_tile(
+            super::theme::tile_claude(),
+            claude,
+            3,
+            None,
+        ))
     }
 
     /// The task status glyphs, each tinted by its role, beside the chip that

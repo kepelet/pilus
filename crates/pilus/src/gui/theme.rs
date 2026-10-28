@@ -39,6 +39,32 @@ pub fn status_done() -> Rgba {
     rgb(0x32d74b)
 }
 
+/// The look of a tab's glyph tile for one kind of tab. No theme changes it:
+/// like an agent's state colors, the tile is a mark that stays recognizable
+/// whatever the scheme around it.
+#[derive(Clone, Copy)]
+pub struct TileLook {
+    pub face: Rgba,
+    pub glyph: Rgba,
+}
+
+/// A plain terminal: a near-black card with a phosphor-green mark. Every
+/// agent without a look of its own falls back to this one.
+pub fn tile_terminal() -> TileLook {
+    TileLook {
+        face: rgb(0x0f1210),
+        glyph: rgb(0x4ade80),
+    }
+}
+
+/// Claude Code: its orange, with the mark in cream.
+pub fn tile_claude() -> TileLook {
+    TileLook {
+        face: rgb(0xd97757),
+        glyph: rgb(0xfaf9f5),
+    }
+}
+
 /// How far translucent chrome darkens `window_bg` toward black.
 const CHROME_SHADE: f32 = 0.35;
 /// How much of the remaining transparency translucent chrome fills in, so it

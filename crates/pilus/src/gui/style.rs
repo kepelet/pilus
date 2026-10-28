@@ -21,7 +21,7 @@ use gpui::{
 
 use crate::settings::{CHROME_FONT, DEFAULT_CORNER_RADIUS, Settings};
 
-use super::theme::Theme;
+use super::theme::{Theme, TileLook};
 use super::toast::ToastKind;
 
 /// How long a skeleton takes to fade from dim to lit and back. Long enough to
@@ -136,7 +136,6 @@ pub(super) trait RadiusExt: Styled + Sized {
     fn radius_lg(self) -> Self {
         self.rounded(Radius::Lg.pixels())
     }
-
 
     fn radius_full(self) -> Self {
         self.rounded(Radius::Full.pixels())
@@ -318,14 +317,14 @@ const STACK_PAD: f32 = 2.0;
 /// They alternate so the deck looks handled rather than machined.
 const STACK_TILT: [f32; STACK_MAX as usize - 1] = [7.0, -6.0];
 
-/// How much of the foreground a tile's glyph keeps: dimmed so the mark sits
-/// quietly in the strip, yet clear of the fill on a light theme, where the
-/// border role is too faint to read as a glyph.
-const GLYPH_DIM: f32 = 0.6;
+/// How much of a preset's edge is its glyph color: enough that the card reads
+/// as one piece with its mark, without a ring louder than the mark.
+const TILE_EDGE_MIX: f32 = 0.35;
 
-/// A bordered tile holding a glyph on the theme's panel fill, so the glyph
-/// reads on a surface rather than on the bare strip: a tab's terminal or agent
-/// mark. With `panes` above one it becomes a deck, one card more behind it per
+/// A bordered tile holding a glyph on a preset's face, so the glyph reads on a
+/// surface rather than on the bare strip: a tab's terminal or agent mark. The
+/// `look` is the tab kind's own colors, not the theme's, so a terminal and an
+/// agent tell apart at a glance. With `panes` above one it becomes a deck, one card more behind it per
 /// pane up to [`STACK_MAX`], each turned a little. `status` is a badge on
 /// the front card's corner, as a browser tab marks its favicon, so the glyph
 /// and the fills stay neutral and the deck still counts.
@@ -335,17 +334,17 @@ const GLYPH_DIM: f32 = 0.6;
 /// behind are painted as paths on a canvas and only the front one is an
 /// element.
 pub(super) fn glyph_tile(
-    theme: Theme,
+    look: TileLook,
     glyph: &'static [u8],
     panes: u16,
     status: Option<Rgba>,
 ) -> Div {
     let cards = panes.clamp(1, STACK_MAX);
-    let face = theme.panel;
+    let face = look.face;
     // Each card needs an edge that stands clear of its neighbor, or the deck
     // cannot be counted; the border role is too faint for that, the full
-    // foreground too loud.
-    let edge = tint(theme.panel_fg, 0.2);
+    // glyph color too loud.
+    let edge = mix(face, look.glyph, TILE_EDGE_MIX);
     let radius = Radius::Sm.pixels().as_f32();
     let mut deck = div()
         .relative()
@@ -373,7 +372,7 @@ pub(super) fn glyph_tile(
                         let mut fill = PathBuilder::fill();
                         fill.add_polygon(&outline, true);
                         if let Ok(path) = fill.build() {
-                            let shade = mix(face, theme.panel_fg, f32::from(depth) * 0.1);
+                            let shade = mix(face, look.glyph, f32::from(depth) * 0.1);
                             window.paint_path(path, Hsla::from(shade));
                         }
                         let mut line = PathBuilder::stroke(px(1.0));
@@ -409,7 +408,7 @@ pub(super) fn glyph_tile(
                 .w(px(GLYPH_TILE * 0.6))
                 .h(px(GLYPH_TILE * 0.6))
                 .flex_shrink_0()
-                .text_color(tint(theme.panel_fg, GLYPH_DIM)),
+                .text_color(look.glyph),
         );
     // The badge hangs off the front card's upper right corner by no more
     // than the deck's padding, so a tab's clip does not cut it.

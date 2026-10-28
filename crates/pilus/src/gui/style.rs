@@ -441,7 +441,7 @@ pub(super) fn glyph_tile(
 
 /// Diameter of the status badge on a [`glyph_tile`]: a size under
 /// [`STATUS_DOT`], since it marks a 20px tile rather than a row.
-const TILE_BADGE: f32 = 5.0;
+const TILE_BADGE: f32 = 6.0;
 
 /// How wide a [`glyph_tile`] for `panes` lays out: the front card, the
 /// peek of each card behind it, and the room their tilt needs.

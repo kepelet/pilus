@@ -892,7 +892,7 @@ impl PilusView {
         for (index, agent) in agents.iter().take(shown).enumerate() {
             let target = agent.target.clone();
             let tint = super::status_color(&agent.status, theme);
-            let lead = style::status_dot(tint);
+            let lead = style::state_dot(tint);
             // The dot is only a color, so every state is spelled out too.
             let detail = if agent.detail.is_empty() {
                 super::status_label(&agent.status)

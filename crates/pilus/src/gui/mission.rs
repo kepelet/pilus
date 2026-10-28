@@ -1412,8 +1412,9 @@ impl PilusView {
                 .radius_full()
                 .border_1()
                 .border_color(state_color)
+                .into_any_element()
         } else {
-            style::status_dot(state_color)
+            style::state_dot(state_color).into_any_element()
         };
         let key_owned = key.to_string();
         let square = style::Radius::None;

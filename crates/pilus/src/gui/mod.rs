@@ -14738,7 +14738,7 @@ impl PilusView {
                             .items_center()
                             .justify_center()
                             // Every state, working included, is its color.
-                            .child(style::status_dot(status)),
+                            .child(style::state_dot(status)),
                     )
                     .child(
                         div()
@@ -17536,12 +17536,13 @@ impl Render for SipilDrag {
     }
 }
 
-/// A color for an agent status dot.
+/// A color for an agent status dot. Blocked, working and done keep one color
+/// each whatever the theme, so a state reads the same everywhere.
 fn status_color(status: &str, theme: Theme) -> gpui::Rgba {
     match status {
-        "working" => theme.accent,
-        "blocked" => theme.alert,
-        "done" => theme.ok,
+        "working" => theme::status_working(),
+        "blocked" => theme::status_blocked(),
+        "done" => theme::status_done(),
         _ => theme.muted,
     }
 }
@@ -18086,7 +18087,7 @@ mod tests {
             "~/work/api".to_string(),
             Theme::default(),
         );
-        let alert = Theme::default().alert;
+        let alert = theme::status_blocked();
         assert_eq!(
             row.color,
             [alert.r, alert.g, alert.b].map(|c| (c * 255.0).round() as u8)

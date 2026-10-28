@@ -71,6 +71,9 @@ State changes ease, with the two exceptions listed after these rules:
   `state_fill`, never `.hover(|s| s.bg(..))` or a `.bg(..)` that depends on
   selection. Call them before adding children so the fill sits beneath.
 - Use `style::chevron` for disclosure and `style::toggle` for switches.
+- An agent's state has one color whatever the theme (`theme::status_*`):
+  blocked red, working orange, done green. `style::state_dot` and the tab's
+  badge ease between them over 350 ms (`FillExt::status_fill`).
 - Status is a still dot in its color: `style::status_dot`, or
   `style::busy_dot` in place of a glyph while something works or loads.
   Nothing turns or pulses for as long as a state lasts, because every frame

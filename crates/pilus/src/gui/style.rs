@@ -40,6 +40,9 @@ const ENTER: Duration = Duration::from_millis(140);
 /// How long a background fill takes to ease into a new hover or selection
 /// state. Short enough that a pointer sweeping down a list never trails.
 const FILL_EASE: Duration = Duration::from_millis(120);
+/// How long a status color takes to cross to the next one: slower than a
+/// hover, so a blocked agent turning green reads as a change of state.
+const STATUS_EASE: Duration = Duration::from_millis(350);
 /// How much of the accent a hovered primary button keeps.
 const PRIMARY_HOVER_ALPHA: f32 = 0.82;
 /// How long a meter's fill takes to slide to a new reading: slow enough to
@@ -425,13 +428,13 @@ pub(super) fn glyph_tile(
     // than the deck's padding, so a tab's clip does not cut it.
     let badge = status.map(|color| {
         div()
+            .id("pilus-state-badge")
             .absolute()
             .left(px(GLYPH_TILE - TILE_BADGE + STACK_PAD))
             .top(px(GLYPH_TILE - TILE_BADGE + 2.0 * STACK_PAD))
             .w(px(TILE_BADGE))
             .h(px(TILE_BADGE))
-            .radius_full()
-            .bg(color)
+            .status_fill(color, Radius::Full)
     });
     deck.child(front).children(badge)
 }
@@ -2247,6 +2250,20 @@ pub(super) trait FillExt: ParentElement + Styled + Sized {
             rest: rest.into(),
             hover: hover.into(),
             radius,
+            ease: FILL_EASE,
+        })
+    }
+
+    /// Paint `color` over the element's whole box and ease to the next one
+    /// when it changes. The element needs an id unique among its siblings,
+    /// since the transition is kept under it.
+    fn status_fill(self, color: impl Into<Hsla>, radius: Radius) -> Self {
+        let color = color.into();
+        self.relative().child(Fill {
+            rest: color,
+            hover: color,
+            radius,
+            ease: STATUS_EASE,
         })
     }
 }
@@ -2258,6 +2275,7 @@ struct Fill {
     rest: Hsla,
     hover: Hsla,
     radius: Radius,
+    ease: Duration,
 }
 
 /// A fill's transition, kept across frames under the layer's element id.
@@ -2265,11 +2283,12 @@ struct FillState {
     from: Rgba,
     to: Rgba,
     started: Instant,
+    ease: Duration,
 }
 
 impl FillState {
     fn at(&self, now: Instant) -> Rgba {
-        match ease_step(self.started, now, FILL_EASE) {
+        match ease_step(self.started, now, self.ease) {
             Some(step) => mix(self.from, self.to, step),
             None => self.to,
         }
@@ -2389,6 +2408,7 @@ impl Element for Fill {
                     from: target,
                     to: target,
                     started: now,
+                    ease: self.ease,
                 });
                 if state.to != target {
                     state.from = state.at(now);
@@ -3209,6 +3229,17 @@ pub(super) fn status_dot(color: impl Into<Hsla>) -> Div {
         .bg(color.into())
 }
 
+/// A [`status_dot`] that eases between colors, for an agent's state. Its row
+/// supplies the id the transition hangs from, so each row has at most one.
+pub(super) fn state_dot(color: impl Into<Hsla>) -> Stateful<Div> {
+    div()
+        .id("pilus-state-dot")
+        .w(px(STATUS_DOT))
+        .h(px(STATUS_DOT))
+        .flex_shrink_0()
+        .status_fill(color, Radius::Full)
+}
+
 /// The busy indicator: a [`status_dot`] centered in a `size` box, so it sits
 /// where a glyph of that size would.
 ///
@@ -3654,6 +3685,7 @@ mod tests {
             from: hover,
             to: rest,
             started,
+            ease: FILL_EASE,
         };
         assert_ne!(state.at(started + FILL_EASE / 2), rest);
         assert_eq!(state.at(started + FILL_EASE), rest);

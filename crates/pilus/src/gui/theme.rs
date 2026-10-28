@@ -25,6 +25,20 @@ pub fn qr_light() -> Rgba {
     rgb(0xffffff)
 }
 
+/// An agent's states, in colors no theme changes: blocked is red, working
+/// orange, done green.
+pub fn status_blocked() -> Rgba {
+    rgb(0xff5f56)
+}
+
+pub fn status_working() -> Rgba {
+    rgb(0xff9f0a)
+}
+
+pub fn status_done() -> Rgba {
+    rgb(0x32d74b)
+}
+
 /// How far translucent chrome darkens `window_bg` toward black.
 const CHROME_SHADE: f32 = 0.35;
 /// How much of the remaining transparency translucent chrome fills in, so it

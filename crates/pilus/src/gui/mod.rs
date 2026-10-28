@@ -14949,13 +14949,20 @@ impl PilusView {
         } else {
             pane_frames::PaneFrames::default()
         };
-        let mut pad = pane_chrome::grid_pad(floating, !panes.panes().is_empty());
+        // The grid's size in cells must not follow the shown layout, or
+        // switching between a split tab and an unsplit one resizes the
+        // daemon and reflows its panes (`pane_chrome::grid_pad`).
+        let mut pad = pane_chrome::grid_pad(floating);
         // Every seam a row crosses pushes the panes past it right by a step;
         // the room comes out of the grid's width.
-        pad.right += f32::from(panes.max_depth()) * pane_chrome::seam_step(floating, cell_w);
+        pad.right += pane_chrome::seam_reserve(floating, cell_w, panes.max_depth());
+        let (inner_w, inner_h) = (inner_w - pad.left - pad.right, inner_h);
+        let cols = (inner_w / cell_w).clamp(20.0, 500.0) as u16;
+        let rows = ((inner_h - pad.top - pad.bottom) / cell_h).clamp(5.0, 300.0) as u16;
         // Flush panes draw their top edge as a line, which leaves the daemon's
         // top border row blank above the text. Most of that row tucks under
-        // the tab strip, and the grid gains the room at the bottom.
+        // the tab strip, and the room it frees pools at the bottom. Only the
+        // drawing moves: the rows are counted without it, as above.
         if !floating
             && panes
                 .bounds()
@@ -14964,12 +14971,7 @@ impl PilusView {
             pad.top = pane_chrome::flush_top_tuck(cell_h);
         }
         let (pad_x, pad_y) = (pad.left, pad.top);
-        let (inner_w, inner_h) = (
-            inner_w - pad.left - pad.right,
-            inner_h - pad.top - pad.bottom,
-        );
-        let cols = (inner_w / cell_w).clamp(20.0, 500.0) as u16;
-        let rows = (inner_h / cell_h).clamp(5.0, 300.0) as u16;
+        let inner_h = inner_h - pad.top - pad.bottom;
         // The grid pins to the top-left so the terminal truly reaches the
         // edges; the leftover fraction pools at the far edges, where the grid
         // extends its edge colors over it.

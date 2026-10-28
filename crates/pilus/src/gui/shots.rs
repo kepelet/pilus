@@ -2001,9 +2001,9 @@ impl Render for PaneGridView {
                 .height
                 .saturating_sub(super::SKIPPED_DAEMON_BOTTOM_ROWS),
         );
-        let mut pad = super::pane_chrome::grid_pad(gaps, split);
-        // The room each seam's step takes, as `card_layout` reserves it.
-        pad.right += f32::from(panes.max_depth()) * super::pane_chrome::seam_step(gaps, cell_width);
+        let mut pad = super::pane_chrome::grid_pad(gaps);
+        // The room the seams' steps take, as `card_layout` reserves it.
+        pad.right += super::pane_chrome::seam_reserve(gaps, cell_width, panes.max_depth());
         // Flush, most of the top border row tucks under the strip, as
         // `card_layout` does it.
         if !gaps && split {

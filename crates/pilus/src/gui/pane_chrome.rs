@@ -36,7 +36,7 @@ pub(super) const BORDER_PX: f32 = 1.0;
 /// that fell out of the cell grid would differ by axis.
 pub(super) const GAP_PX: f32 = 8.0;
 /// The room between a floating card's edge and its text, in logical pixels:
-/// sideways, and above and below an unsplit tab's card.
+/// sideways, and above and below the grid.
 const PAD_X_PX: f32 = 12.0;
 const PAD_Y_PX: f32 = 8.0;
 /// The room either side of an unsplit card's text, in logical pixels. The
@@ -66,29 +66,35 @@ pub(super) struct GridPad {
 }
 
 /// The grid's padding. Flush panes keep none: the grid spends every pixel on
-/// cells. In a split the daemon's border cells already hold each card's gap
-/// and its rows above and below, so only the sides need room: a border column
-/// is about as wide as the gap, which would otherwise leave a card's edge
-/// against its text. An unsplit tab has no border cells, so its padding holds
-/// the whole gap too, except at the top, where every card meets the tab strip.
-/// Its sides take the same short lead, as the daemon's blank margin columns
-/// already hold the rest.
-pub(super) fn grid_pad(gaps: bool, split: bool) -> GridPad {
-    match (gaps, split) {
-        (false, _) => GridPad::default(),
-        (true, true) => GridPad {
-            left: PAD_X_PX,
-            right: PAD_X_PX,
-            top: 0.0,
-            bottom: 0.0,
-        },
-        (true, false) => GridPad {
-            left: GAP_PX + PAD_LEAD_PX,
-            right: GAP_PX + PAD_LEAD_PX,
-            top: PAD_Y_PX,
-            bottom: GAP_PX + PAD_Y_PX,
-        },
+/// cells. Floating cards keep the same padding whether the tab is split or
+/// not, because the grid's size in cells comes from it: a padding that
+/// followed the layout would resize the daemon on every switch between a
+/// split tab and an unsplit one, and reflow every pane for a frame.
+///
+/// The padding is what an unsplit tab needs, as it has no border cells: the
+/// whole gap below, and a short lead at the sides, where the daemon's blank
+/// margin columns hold the rest. The top has no gap, as every card meets the
+/// tab strip. A split's border cells already hold its gaps, so there the
+/// padding is extra room inside the outer cards, about the lone card's.
+pub(super) fn grid_pad(gaps: bool) -> GridPad {
+    if !gaps {
+        return GridPad::default();
     }
+    GridPad {
+        left: GAP_PX + PAD_LEAD_PX,
+        right: GAP_PX + PAD_LEAD_PX,
+        top: PAD_Y_PX,
+        bottom: GAP_PX + PAD_Y_PX,
+    }
+}
+
+/// The width the grid sets aside for the seams' steps, in pixels: a
+/// [`seam_step`] for each seam a row crosses, and one even when none does. An
+/// unsplit tab and a tab split once side by side then ask the daemon for the
+/// same columns, so switching between them never resizes; the unused step
+/// pools at an unsplit tab's right edge.
+pub(super) fn seam_reserve(gaps: bool, cell_width: f32, depth: u16) -> f32 {
+    f32::from(depth.max(1)) * seam_step(gaps, cell_width)
 }
 /// How far each seam between side-by-side floating cards pushes the panes
 /// right of it, in whole logical pixels (and even, so each card takes half).
@@ -1027,7 +1033,7 @@ mod tests {
     fn an_unsplit_card_sits_a_gap_inside_its_padding() {
         // One pane spanning the whole grid, with the unsplit padding.
         let whole = frame(0, 1, 39, 20);
-        let pad = grid_pad(true, false);
+        let pad = grid_pad(true);
         let clear = Rgba {
             r: 0.0,
             g: 0.0,
@@ -1096,6 +1102,16 @@ mod tests {
             chrome(frame(0, 1, 19, 20), tiled).round,
             RoundedCorners::ALL
         );
+    }
+
+    #[test]
+    fn one_seam_reserves_no_more_width_than_an_unsplit_tab() {
+        // The daemon's size must not change when switching between an
+        // unsplit tab and one split side by side, or every pane reflows.
+        let cell = 8.4;
+        assert!(seam_step(true, cell) > 0.0);
+        assert_eq!(seam_reserve(true, cell, 0), seam_reserve(true, cell, 1));
+        assert_eq!(seam_reserve(false, cell, 0), 0.0);
     }
 
     #[test]

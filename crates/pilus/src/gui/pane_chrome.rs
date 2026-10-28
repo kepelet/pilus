@@ -30,7 +30,7 @@ use super::pane_frames::{self, PaneFrame, PaneFrames};
 use super::style::{self, RADIUS_MD, ease_step, mix};
 
 /// Thickness of a pane's frame in logical pixels.
-const BORDER_PX: f32 = 1.0;
+pub(super) const BORDER_PX: f32 = 1.0;
 /// The space between two cards, and between a card and the edge of the
 /// surface, in logical pixels. Cells are wider than they are tall, so a gap
 /// that fell out of the cell grid would differ by axis.

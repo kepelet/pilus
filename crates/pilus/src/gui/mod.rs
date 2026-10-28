@@ -11592,6 +11592,7 @@ impl PilusView {
             return div();
         };
         let panel_w = f32::from(dock.width) * cell_width;
+        let reach = self.sidebar_reach();
 
         // The scroll container stays a plain block. Making it a flex column
         // lets its children shrink to fit, which squeezes the nav rows; the
@@ -11604,7 +11605,7 @@ impl PilusView {
             .flex()
             .flex_col()
             .gap_1()
-            .w(px(panel_w))
+            .w(px(panel_w + reach))
             .pl(px(SIDEBAR_ROW_EDGE))
             .pr(px(self.sidebar_row_edge_right()))
             .pb(px(SIDEBAR_LIST_PAD));
@@ -11668,7 +11669,7 @@ impl PilusView {
             .absolute()
             .left(px(f32::from(dock.x) * cell_width))
             .top(px(0.0))
-            .w(px(panel_w * self.sidebar_open))
+            .w(px((panel_w + reach) * self.sidebar_open))
             .h(px(bottom))
             .flex()
             .flex_col()
@@ -11687,7 +11688,7 @@ impl PilusView {
                     .items_center()
                     .justify_end()
                     .gap(px(HEAD_CONTROLS_GAP))
-                    .pr(px(SIDEBAR_HEAD_INSET))
+                    .pr(px(SIDEBAR_HEAD_INSET + reach))
                     .child(self.session_picker("pilus-session-button", cx))
                     .child(self.sidebar_toggle("pilus-sidebar-toggle", cx)),
             )
@@ -15033,6 +15034,20 @@ impl PilusView {
             0.0
         } else {
             SIDEBAR_ROW_EDGE
+        }
+    }
+
+    /// How far the sidebar's rows run past its cells into the cards' gap.
+    /// Floating cards sit a gap away from the sidebar; with square corners
+    /// there is no rounded pill to leave that gap around, so the rows reach
+    /// the card's edge instead, stopping short of the card's own border so
+    /// the sidebar never paints over it. Rounded pills keep the gap as
+    /// breathing room.
+    fn sidebar_reach(&self) -> f32 {
+        if self.floating_cards() && self.settings.drawn_radius() <= 0.0 {
+            pane_chrome::GAP_PX - pane_chrome::BORDER_PX
+        } else {
+            0.0
         }
     }
 

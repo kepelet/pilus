@@ -55,6 +55,9 @@ is the only implementation of it.
   holds the selection.
   A nested workspace row's pill starts past its elbow, so the tree rail stays
   bare.
+  With floating cards and square corners the sidebar's rows run on into the
+  gap beside the card (`sidebar_reach`), so the pills meet the card's edge;
+  rounded pills keep that gap.
   The sidebar and tab strip grounds are opaque at any window opacity
   (`Theme::chrome_ground`), so the washes never take on the desktop.
   `Theme::card_raise` is the terminal card's own color, for raised fills

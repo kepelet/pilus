@@ -41,6 +41,8 @@ const SURFACE_TINT_DARK: f32 = 0.05;
 /// The opacity every border and hairline is drawn at. The schemes' border
 /// roles are tuned as solid fills, which read heavier than a 1px line wants.
 const BORDER_ALPHA: f32 = 0.55;
+/// How much of the foreground a [`Theme::tint_fill`] takes at weight 1.
+const TINT_FILL: f32 = 0.08;
 
 /// `border` at the shared line opacity. Sets the alpha rather than scaling it,
 /// so a color that passes through twice (a projected theme falling back to the
@@ -213,9 +215,8 @@ impl Theme {
         .chrome_cell(glass)
     }
 
-    /// The raised fill under a selected or hovered sidebar row or tab: the
-    /// terminal card's own color, so the selection reads as one piece with
-    /// the card it opens. `weight` thins it out for hover.
+    /// The terminal card's own color at `weight`: a raised fill that must
+    /// stay opaque, such as a menu row's, rather than wash over the chrome.
     ///
     /// It stays opaque however translucent the window is, so the selection
     /// never takes on the desktop behind it.
@@ -223,6 +224,19 @@ impl Theme {
         Rgba {
             a: weight.clamp(0.0, 1.0),
             ..self.bg
+        }
+    }
+
+    /// The fill of a selected tab, a sidebar row under selection or hover,
+    /// and the chrome's small buttons on hover: the foreground thinned to
+    /// [`TINT_FILL`] times `weight`, laid over the chrome's opaque ground.
+    /// A light scheme darkens and a dark one lightens, so it shows on any
+    /// ground, even one as pale as the terminal card itself. A selection is
+    /// set apart by its border, not by a heavier fill.
+    pub fn tint_fill(self, weight: f32) -> Rgba {
+        Rgba {
+            a: (TINT_FILL * weight).clamp(0.0, 1.0),
+            ..self.panel_fg
         }
     }
 

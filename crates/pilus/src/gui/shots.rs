@@ -1736,6 +1736,28 @@ pub fn run_main() -> Result<()> {
     cx.run_until_parked();
     capture(&mut cx, window.into(), "main-latte")?;
 
+    // A dark scheme under a translucent window: the tab and row washes on
+    // the chrome's ground, which stays opaque.
+    let opacity = cx.update(|app| view.read(app).settings.opacity);
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.appearance.active = "catppuccin-mocha".to_string();
+            view.apply_appearance();
+            view.settings.opacity = 0.7;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    capture(&mut cx, window.into(), "main-mocha-glass")?;
+    cx.update(|app| {
+        view.update(app, |view, cx| {
+            view.appearance.active = "catppuccin-latte".to_string();
+            view.apply_appearance();
+            view.settings.opacity = opacity;
+            cx.notify();
+        });
+    });
+
     // The tab strip before the daemon's first tab list: three skeleton tabs.
     cx.update(|app| {
         view.update(app, |view, cx| {

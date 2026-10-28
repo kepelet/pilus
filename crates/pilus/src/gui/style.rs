@@ -332,8 +332,9 @@ const GLYPH_DIM: f32 = 0.6;
 /// A bordered tile holding a glyph on the theme's panel fill, so the glyph
 /// reads on a surface rather than on the bare strip: a tab's terminal or agent
 /// mark. With `panes` above one it becomes a deck, one card more behind it per
-/// pane up to [`STACK_MAX`], each turned a little. `status` colors the glyph
-/// itself, so the fills stay neutral and the deck still counts.
+/// pane up to [`STACK_MAX`], each turned a little. `status` is a badge on
+/// the front card's corner, as a browser tab marks its favicon, so the glyph
+/// and the fills stay neutral and the deck still counts.
 ///
 /// The cards are opaque, since a translucent one would show the edge of the
 /// card behind it through the front. GPUI turns SVGs but not divs, so the cards
@@ -346,7 +347,6 @@ pub(super) fn glyph_tile(
     status: Option<Rgba>,
 ) -> Div {
     let cards = panes.clamp(1, STACK_MAX);
-    let behind = f32::from(cards - 1);
     let face = theme.panel;
     // Each card needs an edge that stands clear of its neighbor, or the deck
     // cannot be counted; the border role is too faint for that, the full
@@ -359,7 +359,7 @@ pub(super) fn glyph_tile(
     let mut deck = div()
         .relative()
         .flex_shrink_0()
-        .w(px(GLYPH_TILE + behind * STACK_STEP + STACK_PAD))
+        .w(px(glyph_tile_width(panes)))
         .h(px(GLYPH_TILE + 2.0 * STACK_PAD));
     if cards > 1 {
         deck = deck.child(
@@ -419,9 +419,88 @@ pub(super) fn glyph_tile(
                 .w(px(GLYPH_TILE * 0.6))
                 .h(px(GLYPH_TILE * 0.6))
                 .flex_shrink_0()
-                .text_color(status.unwrap_or_else(|| tint(theme.panel_fg, GLYPH_DIM))),
+                .text_color(tint(theme.panel_fg, GLYPH_DIM)),
         );
-    deck.child(front)
+    // The badge hangs off the front card's lower right corner by no more
+    // than the deck's padding, so a tab's clip does not cut it.
+    let badge = status.map(|color| {
+        div()
+            .absolute()
+            .left(px(GLYPH_TILE - TILE_BADGE + STACK_PAD))
+            .top(px(GLYPH_TILE - TILE_BADGE + 2.0 * STACK_PAD))
+            .w(px(TILE_BADGE))
+            .h(px(TILE_BADGE))
+            .radius_full()
+            .bg(color)
+    });
+    deck.child(front).children(badge)
+}
+
+/// Diameter of the status badge on a [`glyph_tile`]: a size under
+/// [`STATUS_DOT`], since it marks a 20px tile rather than a row.
+const TILE_BADGE: f32 = 7.0;
+
+/// How wide a [`glyph_tile`] for `panes` lays out: the front card, the
+/// peek of each card behind it, and the room their tilt needs.
+pub(super) fn glyph_tile_width(panes: u16) -> f32 {
+    let behind = f32::from(panes.clamp(1, STACK_MAX) - 1);
+    GLYPH_TILE + behind * STACK_STEP + STACK_PAD
+}
+
+/// How far before its clip edge a [`fade_text`] line starts to fade.
+const TEXT_FADE: f32 = 32.0;
+
+/// One line of chrome text that fades out over its last [`TEXT_FADE`] pixels
+/// before `room` instead of ending in an ellipsis, as a browser tab's title
+/// does. The caller clips it at `room`.
+///
+/// The glyphs fade, rather than a gradient laid over them, so the fade holds
+/// on any fill beneath (a hover, the selection pill mid-flight) and keeps
+/// the inherited text color. A line that fits is left alone.
+pub(super) fn fade_text(
+    window: &Window,
+    text: SharedString,
+    font: Font,
+    size: f32,
+    room: f32,
+) -> gpui::StyledText {
+    let run = gpui::TextRun {
+        len: text.len(),
+        font,
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let line = window
+        .text_system()
+        .shape_line(text.clone(), px(size), &[run], None);
+    if line.width.as_f32() <= room {
+        return gpui::StyledText::new(text);
+    }
+    let start = room - TEXT_FADE;
+    let mut highlights = Vec::new();
+    for (index, ch) in text.char_indices() {
+        let end = index + ch.len_utf8();
+        let middle = (line.x_for_index(index).as_f32() + line.x_for_index(end).as_f32()) / 2.0;
+        let fade = ((middle - start) / TEXT_FADE).clamp(0.0, 1.0);
+        if fade >= 1.0 {
+            // Everything from here on is past the edge.
+            highlights.push((index..text.len(), faded(1.0)));
+            break;
+        }
+        if fade > 0.0 {
+            highlights.push((index..end, faded(fade)));
+        }
+    }
+    gpui::StyledText::new(text).with_highlights(highlights)
+}
+
+fn faded(fade: f32) -> gpui::HighlightStyle {
+    gpui::HighlightStyle {
+        fade_out: Some(fade),
+        ..Default::default()
+    }
 }
 
 /// The outline of a square of side `2 * half` with its corners rounded to
@@ -2517,6 +2596,7 @@ pub(super) fn glide(
         radius,
         bleed,
         edge: None,
+        outset: false,
     }
 }
 
@@ -2537,6 +2617,29 @@ pub(super) fn glide_bordered(
         radius,
         bleed: 0.0,
         edge: Some(edge),
+        outset: true,
+    }
+}
+
+/// [`glide`] with a one-pixel `edge` drawn on the pill's own outline, for
+/// targets with no border of their own (sidebar rows): the edge stays inside
+/// the row, as inset from the panel's sides as a hover fill.
+pub(super) fn glide_outlined(
+    id: impl Into<ElementId>,
+    slot: &GlideSlot,
+    color: Rgba,
+    radius: Radius,
+    bleed: f32,
+    edge: Rgba,
+) -> impl IntoElement {
+    Glide {
+        id: id.into(),
+        slot: slot.clone(),
+        color,
+        radius,
+        bleed,
+        edge: Some(edge),
+        outset: false,
     }
 }
 
@@ -2887,6 +2990,8 @@ struct Glide {
     radius: Radius,
     bleed: f32,
     edge: Option<Rgba>,
+    /// Whether the pill grows a pixel to cover a target's own 1px border.
+    outset: bool,
 }
 
 /// A glide's flight, in coordinates relative to the pill layer's origin so
@@ -3021,7 +3126,7 @@ impl Element for Glide {
         // The target marker fills its parent's padding box, which sits inside
         // the parent's own 1px border; a bordered pill goes back out onto
         // that border so its edge lines up with the one a hovered item draws.
-        let pill = if self.edge.is_some() {
+        let pill = if self.outset {
             pill.dilate(px(1.0))
         } else {
             pill

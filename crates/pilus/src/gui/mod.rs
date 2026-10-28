@@ -210,9 +210,6 @@ const SIDEBAR_NEST_INDENT: f32 = 4.0;
 /// Share of the selected pill's strength a hover fill carries, so hovering a
 /// row hints at the selection without matching it.
 const SIDEBAR_HOVER_WEIGHT: f32 = 0.6;
-/// How much of the selection pill the active workspace keeps while an agent
-/// is the focused row: enough to read as "still here", less than the agent.
-const SIDEBAR_CONTEXT_WEIGHT: f32 = 0.4;
 /// Box every leading sidebar glyph sits in, so labels share one column
 /// whatever the glyph is: chevron, folder, brand mark, or status dot.
 const SIDEBAR_GLYPH: f32 = 14.0;
@@ -292,9 +289,18 @@ const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
 /// card keeps from the sidebar, so the first tab's edge lines up with the
 /// card's edge below it, as the strip's right padding does on the far side.
 const TAB_STRIP_EDGE: f32 = pane_chrome::GAP_PX;
-/// The narrowest a tab goes while the strip holds company, and the width of a
-/// placeholder tab.
-const TAB_MIN_WIDTH: f32 = 180.0;
+/// The width of every tab while the strip holds company, and of a placeholder
+/// tab. One width for all, as in a browser, so a long title fades out at the
+/// tab's edge rather than widening it.
+const TAB_WIDTH: f32 = 220.0;
+/// Side of the close button's square at a tab's right end.
+const TAB_CLOSE: f32 = 18.0;
+/// Padding between a tab's border and its tile on the left, its close button
+/// on the right.
+const TAB_PAD_LEFT: f32 = 2.0;
+const TAB_PAD_RIGHT: f32 = 3.0;
+/// The gap between a tab's tile, label, and close button.
+const TAB_GAP: f32 = 8.0;
 /// How many placeholder tabs a loading strip shows.
 const TAB_SKELETONS: usize = 3;
 /// Section label size (SIPIL / WORKSPACES).
@@ -11582,27 +11588,29 @@ impl PilusView {
         content = content.child(style::hover_glide(
             "pilus-sidebar-hover",
             &self.sidebar_hover,
-            self.theme.card_raise(SIDEBAR_HOVER_WEIGHT),
+            self.theme.tint_fill(1.0),
             style::RADIUS_MD,
             SIDEBAR_ROW_EDGE,
         ));
         // The selected row's raised fill is a second pill under the rows, so
-        // changing the selection reads as motion, like the tab strip's.
-        // Beneath the main pill: the active workspace's softer mark while an
-        // agent row owns the selection.
+        // changing the selection reads as motion, like the tab strip's. Both
+        // wear the selected tab's tint, and the selection its border too.
+        // Beneath the main pill: the active workspace's mark while an agent
+        // row owns the selection, the same tint with no border.
         content = content.child(style::glide(
             "pilus-sidebar-context",
             &self.sidebar_context,
-            self.theme.card_raise(SIDEBAR_CONTEXT_WEIGHT),
+            self.theme.tint_fill(1.0),
             style::RADIUS_MD,
             SIDEBAR_ROW_EDGE,
         ));
-        content = content.child(style::glide(
+        content = content.child(style::glide_outlined(
             "pilus-sidebar-selection",
             &self.sidebar_selection,
-            self.theme.card_raise(1.0),
+            self.theme.tint_fill(1.0),
             style::RADIUS_MD,
             SIDEBAR_ROW_EDGE,
+            self.theme.border,
         ));
         content = content.child(self.open_workspace_row(cx));
         content = content.child(self.overview_nav_row(cx));
@@ -11830,7 +11838,7 @@ impl PilusView {
             .w(px(SIDEBAR_TOGGLE_W))
             .radius_md()
             .cursor_pointer()
-            .hover_fill(theme.card_raise(SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
+            .hover_fill(theme.tint_fill(1.0), style::RADIUS_MD)
             .child(icon(
                 include_bytes!("../../assets/icons/panel-left.svg"),
                 14.0,
@@ -11924,6 +11932,7 @@ impl PilusView {
 
     fn top_chrome(
         &self,
+        window: &Window,
         cx: &mut Context<Self>,
         cell_width: f32,
         right: f32,
@@ -11954,19 +11963,18 @@ impl PilusView {
             .overflow_x_scroll()
             .overflow_y_hidden()
             .track_scroll(&self.tab_scroll);
-        // The selected tab's card-colored fill and border are one pill that
-        // slides to it, so a switch reads as motion from the old tab to the
-        // new one.
+        // The selected tab's faint wash and border are one pill that slides
+        // to it, so a switch reads as motion from the old tab to the new one.
         let selection = style::GlideSlot::default();
         tabs = tabs.child(style::glide_bordered(
             "pilus-tab-glide",
             &selection,
-            self.tab_raise(1.0),
+            self.theme.tint_fill(1.0),
             style::RADIUS_SOFT,
             self.theme.border,
         ));
         for tab in &self.tabs {
-            tabs = tabs.child(self.tab_item(tab, &selection, cx));
+            tabs = tabs.child(self.tab_item(tab, &selection, window, cx));
         }
         if self
             .tab_slide
@@ -12002,7 +12010,7 @@ impl PilusView {
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.muted)
-            .hover_fill(self.tab_raise(SIDEBAR_HOVER_WEIGHT), style::RADIUS_SOFT)
+            .hover_fill(theme.tint_fill(1.0), style::RADIUS_SOFT)
             .hover(move |style| style.text_color(theme.panel_fg))
             .child(icon(
                 include_bytes!("../../assets/icons/plus.svg"),
@@ -12099,7 +12107,7 @@ impl PilusView {
                     .items_center()
                     .gap_2()
                     .h(px(TAB_HEIGHT))
-                    .w(px(TAB_MIN_WIDTH))
+                    .w(px(TAB_WIDTH))
                     .pl(px(5.0))
                     .child(style::skeleton(
                         format!("pilus-tab-skeleton-tile-{nth}"),
@@ -12122,6 +12130,7 @@ impl PilusView {
         &self,
         tab: &Tab,
         selection: &style::GlideSlot,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
@@ -12190,19 +12199,27 @@ impl PilusView {
         ));
         let tip = row_tooltip(format!("Tab {index}"), fg, tip_lines, theme);
         let group = format!("pilus-tab-{index}");
-        let drop_fill = self.tab_raise(0.6);
+        let drop_fill = theme.tint_fill(1.0);
+        // A square button at the tab's end, shown only while the tab is
+        // hovered. Hidden, it keeps its room, so the label fades at the same
+        // place either way.
         let close = div()
             .id(format!("pilus-tab-close-{index}"))
             .flex()
+            .flex_shrink_0()
             .items_center()
+            .justify_center()
+            .w(px(TAB_CLOSE))
+            .h(px(TAB_CLOSE))
+            .radius_sm()
             .cursor_pointer()
-            .text_color(theme.muted)
+            // Twice the tab's tint, so it shows on a selected tab too.
+            .hover_fill(theme.tint_fill(2.0), style::RADIUS_SM)
             .opacity(0.0)
             .group_hover(group.clone(), |style| style.opacity(1.0))
-            .hover(|style| style.text_color(theme.panel_fg))
             .child(icon(
                 include_bytes!("../../assets/icons/x.svg"),
-                10.0,
+                11.0,
                 theme.muted,
             ))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -12218,16 +12235,15 @@ impl PilusView {
             .flex()
             .flex_row()
             .items_center()
-            .gap_2()
+            .gap(px(TAB_GAP))
             .h(px(TAB_HEIGHT))
             .flex_shrink_0()
-            // A lone tab is as wide as its label; with company each keeps a
-            // width of its own.
-            .when(!lone, |tab| tab.min_w(px(TAB_MIN_WIDTH)).max_w(px(280.0)))
-            // The tile sits near the tab's edge; the right side keeps room for
-            // the close button.
-            .pl(px(2.0))
-            .pr_3()
+            // A lone tab is as wide as its label. With company every tab
+            // keeps one width and rests bare on the strip; only the selected
+            // one wears the pill.
+            .when(!lone, |tab| tab.w(px(TAB_WIDTH)))
+            .pl(px(TAB_PAD_LEFT))
+            .pr(px(TAB_PAD_RIGHT))
             .radius_soft()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
@@ -12278,7 +12294,7 @@ impl PilusView {
             .flex()
             .flex_row()
             .items_center()
-            .gap_2()
+            .gap(px(TAB_GAP))
             .overflow_hidden()
             .whitespace_nowrap();
         let (glyph, status) = match agent {
@@ -12294,6 +12310,26 @@ impl PilusView {
             ),
         };
         content = content.child(style::glyph_tile(theme, glyph, panes, status));
+        // With company the label fades out where the close button begins;
+        // a lone tab is as wide as its label, so nothing fades.
+        let label = if lone {
+            gpui::StyledText::new(label)
+        } else {
+            let room = TAB_WIDTH
+                - 2.0
+                - TAB_PAD_LEFT
+                - TAB_PAD_RIGHT
+                - TAB_CLOSE
+                - style::glyph_tile_width(panes)
+                - 2.0 * TAB_GAP;
+            style::fade_text(
+                window,
+                label.into(),
+                style::chrome_font(&self.shared_settings),
+                self.footer_font(),
+                room,
+            )
+        };
         content = content.child(div().text_size(px(self.footer_font())).child(label));
         let tab = if active {
             tab.child(style::glide_target_shifted(selection, slide))
@@ -12424,11 +12460,11 @@ impl PilusView {
             .cursor_pointer()
             .state_fill(
                 if self.session_menu_open {
-                    theme.card_raise(SIDEBAR_HOVER_WEIGHT)
+                    theme.tint_fill(1.0)
                 } else {
                     gpui::Rgba::default()
                 },
-                theme.card_raise(SIDEBAR_HOVER_WEIGHT),
+                theme.tint_fill(1.0),
                 style::RADIUS_MD,
             )
             .child(icon(
@@ -13356,7 +13392,7 @@ impl PilusView {
         let remote = endpoint.machine_id().is_some();
         let selected = active;
         // A focused agent row takes the full pill; the workspace keeps a
-        // subtler one rather than going unmarked.
+        // borderless one rather than going unmarked.
         let pill = if self.agent_pill_shown() {
             &self.sidebar_context
         } else {
@@ -14870,18 +14906,6 @@ impl PilusView {
             .chrome_ground(self.floating_cards() && !alone_page)
     }
 
-    /// The fill of the selected (`weight` 1) and hovered tab: the terminal
-    /// card's color, which reads as the tab opening into the card below it.
-    /// With floating cards a hovered tab takes it whole; flush, it is thinned
-    /// by `weight` like a sidebar row.
-    fn tab_raise(&self, weight: f32) -> gpui::Rgba {
-        if self.floating_cards() {
-            self.theme.card_raise(weight.min(1.0).ceil())
-        } else {
-            self.theme.card_raise(weight)
-        }
-    }
-
     /// Whether panes float as cards, an unsplit tab included as one card:
     /// then the terminal sits on the tinted surface the tab strip and the
     /// sidebar match. Flush panes cover that surface, so they keep the
@@ -15532,7 +15556,7 @@ impl Render for PilusView {
             // Chrome layers live at the root so they paint above the content
             // and the sidebar: the menu overlay must never slide beneath it.
             .child(sidebar)
-            .child(self.top_chrome(cx, cell_width, layout.card_right, fullscreen))
+            .child(self.top_chrome(window, cx, cell_width, layout.card_right, fullscreen))
             .children(
                 (!luvus_missing && self.right.openness() > 0.0)
                     .then(|| self.right_sidebar_view(layout.card_right, fullscreen, cx)),
@@ -17390,15 +17414,6 @@ fn shorten_home(path: &str) -> String {
     }
 }
 
-/// Cap a tab label at `max` chars so one long name cannot crowd the strip.
-fn truncate_label(label: &str, max: usize) -> String {
-    if label.chars().count() <= max {
-        return label.to_string();
-    }
-    let kept: String = label.chars().take(max.saturating_sub(1)).collect();
-    format!("{kept}…")
-}
-
 /// Collapse every directory but the last to its initial (`.s` for a dotted
 /// one), so `~/.superset/projects/l3s` reads `~/.s/p/l3s` in a narrow tab.
 fn abbreviate_path(path: &str) -> String {
@@ -17424,8 +17439,8 @@ fn abbreviate_path(path: &str) -> String {
 /// them. The process leads so two tabs in one directory still tell apart; a
 /// native view reports none and keeps the bare cwd.
 ///
-/// A `lone` tab is as wide as its label, so it needs none of that: the cwd
-/// stays whole and nothing is capped.
+/// A `lone` tab is as wide as its label, so its cwd stays whole. Nothing is
+/// capped: a tab with company fades a long label out at its edge.
 fn tab_label(
     name: &str,
     session_title: Option<&str>,
@@ -17435,7 +17450,7 @@ fn tab_label(
 ) -> String {
     let name = name.trim();
     let title = session_title.map(str::trim).unwrap_or_default();
-    let text = if !name.is_empty() {
+    if !name.is_empty() {
         name.to_string()
     } else if !title.is_empty() {
         title.to_string()
@@ -17449,11 +17464,6 @@ fn tab_label(
             "" => path,
             process => format!("{process}  {path}"),
         }
-    };
-    if lone {
-        text
-    } else {
-        truncate_label(&text, 24)
     }
 }
 
@@ -18089,6 +18099,7 @@ mod tests {
     fn tab_label_falls_back_to_cwd() {
         assert_eq!(tab_label("", None, "", "~/work/pilus", false), "~/w/pilus");
         assert_eq!(tab_label("  ", Some(" "), "", "~", false), "~");
+        // The tab fades a long label out at its edge, so it is never cut.
         let long = tab_label(
             "",
             None,
@@ -18096,7 +18107,7 @@ mod tests {
             "~/work/a-directory-name-that-will-not-fit",
             false,
         );
-        assert!(long.ends_with('…'));
+        assert_eq!(long, "~/w/a-directory-name-that-will-not-fit");
     }
 
     #[test]
@@ -18184,7 +18195,7 @@ mod tests {
             "api"
         );
         let long = tab_label(&"n".repeat(40), None, "", "~/work/pilus", false);
-        assert!(long.ends_with('…'));
+        assert_eq!(long, "n".repeat(40));
     }
 
     #[test]

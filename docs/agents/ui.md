@@ -36,16 +36,27 @@ is the only implementation of it.
     frame color.
   - The exception is focus: the edge of a focused field, panel or card is
     `theme.border_focus`.
-  - The selected tab is raised by the card-colored fill and the same border a
-    hovered tab draws. Its label keeps the same weight as the others, so
-    switching tabs never resizes one. While the first tab list loads, the strip
-    holds three skeleton tabs.
+  - With company, every tab keeps one width (`TAB_WIDTH`) and rests bare on
+    the strip, and a long label fades out at the close button rather than
+    ending in an ellipsis (`style::fade_text`). The selected tab is a thin
+    wash of the foreground (`Theme::tint_fill`), which shows on any ground,
+    with the same border a hovered tab draws. Any tab, the selected one
+    included, shows its close button only on hover. Its label keeps the same
+    weight as the others, so switching tabs never resizes one. A lone tab
+    rests bare and as wide as its label. An agent's status is a badge on the
+    tab's glyph tile, not a tint of the glyph. While the first tab list
+    loads, the strip holds three skeleton tabs.
   - Accent means progress or focus. It is never a panel edge.
 - **Selection** in the sidebar (workspace, worktree, agent) is a pill in the
-  terminal card's color (`Theme::card_raise`) with `panel_fg`/`muted` text and
-  a bold name. The selected tab takes the same fill. Both are opaque at any
-  window opacity, and so are the sidebar and tab strip grounds
-  (`Theme::chrome_ground`).
+  same tint as a selected tab (`Theme::tint_fill`), with the
+  same `theme.border` hairline, `panel_fg`/`muted` text and a bold name.
+  Hover takes the same tint without the border, as do the header's toggle
+  and session picker, and so does the active workspace while an agent row
+  holds the selection.
+  The sidebar and tab strip grounds are opaque at any window opacity
+  (`Theme::chrome_ground`), so the washes never take on the desktop.
+  `Theme::card_raise` is the terminal card's own color, for raised fills
+  that are not tints.
   `selection_bg`/`selection_fg` are for text selection and list highlighting,
   not sidebar rows.
 

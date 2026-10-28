@@ -848,14 +848,25 @@ final class AppStore {
         let reply: SessionList = try await call(
             method: "hub.sessions", params: params, machine: agent.machine)
         let found = reply.sessions.first.map { var row = $0; row.machine = agent.machine; return row }
-        agentSessions[agent.id] = found
+        agentSessions[Self.sessionKey(agent)] = found
         return found
     }
 
-    /// The newest entries of a session's transcript.
-    func transcript(path: String, machine: String, limit: Int = 200) async throws -> TranscriptReply {
+    /// A pane id outlives the agent in it, so a remembered match is keyed by
+    /// the terminal too: a new agent in the same pane starts unmatched.
+    static func sessionKey(_ agent: Agent) -> String {
+        "\(agent.id):\(agent.terminal_id ?? "")"
+    }
+
+    /// The newest `depth.limit` entries of a session's transcript, read from
+    /// the last `depth.window` bytes.
+    func transcript(
+        path: String, machine: String, depth: TranscriptDepth = TranscriptDepth()
+    ) async throws -> TranscriptReply {
         let reply: TranscriptReply = try await call(
-            method: "hub.transcript", params: ["path": path, "limit": limit], machine: machine)
+            method: "hub.transcript",
+            params: ["path": path, "limit": depth.limit, "window": depth.window],
+            machine: machine)
         let key = "\(machine):\(path)"
         transcriptCache[key] = reply
         transcriptOrder.removeAll { $0 == key }

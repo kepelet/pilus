@@ -360,3 +360,20 @@ struct TranscriptReply: Codable {
     let entries: [TranscriptEntry]
     let earlier: Bool?
 }
+
+/// How far back a transcript is read. Scrolling to the top deepens it, so
+/// older history loads on its own instead of stopping at a window.
+struct TranscriptDepth: Equatable {
+    var limit = 200
+    var window = 1024 * 1024
+
+    static let maxLimit = 5000
+    static let maxWindow = 128 * 1024 * 1024
+
+    var canDeepen: Bool { limit < Self.maxLimit || window < Self.maxWindow }
+
+    func deeper() -> TranscriptDepth {
+        TranscriptDepth(limit: min(limit * 2, Self.maxLimit),
+                        window: min(window * 4, Self.maxWindow))
+    }
+}

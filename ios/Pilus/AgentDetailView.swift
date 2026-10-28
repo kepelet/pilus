@@ -20,6 +20,12 @@ struct AgentDetailView: View {
         !lookedUp && ["claude", "pi"].contains(agent.kind) && store.hubAllows("hub.sessions", on: agent.machine)
     }
     @State private var refreshes = 0
+    /// Set once this screen has asked the hub which session is the agent's;
+    /// a remembered match is only shown until then, never trusted.
+    @State private var matched = false
+    @State private var depth = TranscriptDepth()
+    @State private var exhausted = false
+    @State private var composerHeight: CGFloat = 0
     @State private var transcriptError: String?
     /// Sent messages shown at the transcript's end until a re-read has them.
     @State private var pending: [TranscriptEntry] = []
@@ -57,54 +63,13 @@ struct AgentDetailView: View {
     private static let lineHeight: CGFloat = 22
 
     var body: some View {
-        VStack(spacing: 0) {
-            GeometryReader { geo in
-                paneScroll(geo: geo)
-            }
-            .refreshable { await refresh() }
-
-            if let shown = sendError ?? loadError {
-                Text(shown)
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-                    .padding(.horizontal)
-            }
-
-            VStack(spacing: 6) {
-                // Bottom-aligned so the send button stays at the corner as the
-                // field grows upward.
-                HStack(alignment: .bottom, spacing: 8) {
-                    TextField("Reply to \(agent.title)", text: $reply, axis: .vertical)
-                        .lineLimit(1...5)
-                        .textFieldStyle(.plain)
-                        .focused($replyFocused)
-                        // Agents read this verbatim; autocorrection corrupts
-                        // commands and flags.
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        // Centers one line on the send button; more lines grow
-                        // the field from there.
-                        .padding(.vertical, (Self.sendSize - Self.lineHeight) / 2)
-                    if sending {
-                        // The send button's footprint, held so the field
-                        // does not collapse while the spinner swaps in.
-                        ProgressView()
-                            .frame(width: Self.sendSize, height: Self.sendSize)
-                    } else {
-                        sendButton
-                    }
-                }
-                .padding(.leading, 16)
-                .padding(.trailing, 6)
-                .padding(.vertical, 6)
-                // A capsule's radius is half its height, so a tall field
-                // balloons into an oval. One fixed radius is a capsule at one
-                // line and a rounded rectangle after.
-                .modifier(GlassRounded(radius: Self.sendSize / 2 + 6))
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+        GeometryReader { geo in
+            paneScroll(geo: geo)
+                // The composer floats on glass over the transcript, as the
+                // session screen's does, rather than below it.
+                .safeAreaInset(edge: .bottom, spacing: 0) { composer }
         }
+        .refreshable { await refresh() }
         .navigationTitle(detail?.agent_session_title ?? agent.title)
         .navigationBarTitleDisplayMode(.inline)
         // Status + working directory ride in the nav bar center, under the
@@ -181,7 +146,9 @@ struct AgentDetailView: View {
         // watch is up; without it (no hub, or a saved SSH machine, which has no
         // event feed) it is the way the screen stays current.
         .task {
-            if session == nil, let known = store.agentSessions[agent.id] {
+            if session == nil, let known = store.agentSessions[AppStore.sessionKey(agent)],
+               known.kind == agent.kind,
+               known.cwd == nil || agent.cwd == nil || Self.folder(known.cwd) == Self.folder(agent.cwd) {
                 session = known
                 transcript = store.cachedTranscript(path: known.path, machine: known.machine)
             }
@@ -194,6 +161,53 @@ struct AgentDetailView: View {
         .onChange(of: store.outputSignals[agent.id]) {
             Task { await refreshOnOutput() }
         }
+    }
+
+    private var composer: some View {
+        VStack(spacing: 0) {
+            if let shown = sendError ?? loadError {
+                Text(shown)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal)
+            }
+
+            VStack(spacing: 6) {
+                // Bottom-aligned so the send button stays at the corner as the
+                // field grows upward.
+                HStack(alignment: .bottom, spacing: 8) {
+                    TextField("Reply to \(agent.title)", text: $reply, axis: .vertical)
+                        .lineLimit(1...5)
+                        .textFieldStyle(.plain)
+                        .focused($replyFocused)
+                        // Agents read this verbatim; autocorrection corrupts
+                        // commands and flags.
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        // Centers one line on the send button; more lines grow
+                        // the field from there.
+                        .padding(.vertical, (Self.sendSize - Self.lineHeight) / 2)
+                    if sending {
+                        // The send button's footprint, held so the field
+                        // does not collapse while the spinner swaps in.
+                        ProgressView()
+                            .frame(width: Self.sendSize, height: Self.sendSize)
+                    } else {
+                        sendButton
+                    }
+                }
+                .padding(.leading, 16)
+                .padding(.trailing, 6)
+                .padding(.vertical, 6)
+                // A capsule's radius is half its height, so a tall field
+                // balloons into an oval. One fixed radius is a capsule at one
+                // line and a rounded rectangle after.
+                .modifier(GlassRounded(radius: Self.sendSize / 2 + 6))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { composerHeight = $0 }
     }
 
     /// Output signals arrive for the paired host's panes while its watch is up.
@@ -295,7 +309,10 @@ struct AgentDetailView: View {
                     if transcript.entries.isEmpty && pending.isEmpty {
                         TranscriptNotice(title: "Nothing said yet")
                     } else {
-                        TranscriptList(entries: transcript.entries + pending, earlier: transcript.earlier ?? false)
+                        TranscriptList(
+                            entries: transcript.entries + pending,
+                            earlier: (transcript.earlier ?? false) && depth.canDeepen && !exhausted,
+                            loadEarlier: loadEarlierTranscript)
                     }
                 } else if let transcriptError {
                     TranscriptNotice(title: "Couldn't read this chat", detail: transcriptError)
@@ -314,7 +331,7 @@ struct AgentDetailView: View {
             // The pane fills the viewport like a terminal would: short
             // output hugs the bottom edge, long output opens scrolled to
             // the last row and stays pinned there.
-            .frame(minHeight: geo.size.height, alignment: .bottom)
+            .frame(minHeight: max(0, geo.size.height - composerHeight), alignment: .bottom)
         }
     }
 
@@ -341,13 +358,19 @@ struct AgentDetailView: View {
         refreshes += 1
         let id = sessionID ?? ""
         let moved = !id.isEmpty && session?.session_id != id
-        if session == nil || moved || refreshes % 4 == 0 {
+        if !matched || session == nil || moved || refreshes % 4 == 0 {
             let title = detail?.agent_session_title ?? agent.agent_session_title
             do {
                 let found = try await store.session(
                     for: agent, sessionID: sessionID, cwd: cwd, title: title)
-                if found?.path != session?.path { transcript = nil; pending = [] }
+                if found?.path != session?.path {
+                    transcript = found.flatMap { store.cachedTranscript(path: $0.path, machine: $0.machine) }
+                    pending = []
+                    depth = TranscriptDepth()
+                    exhausted = false
+                }
                 session = found
+                matched = true
             } catch {}
         }
         guard let session else {
@@ -355,7 +378,10 @@ struct AgentDetailView: View {
             return
         }
         do {
-            let reply = try await store.transcript(path: session.path, machine: session.machine)
+            let reply = try await store.transcript(
+                path: session.path, machine: session.machine, depth: depth)
+            // A read that raced a re-match belongs to the old session.
+            guard self.session?.path == session.path else { return }
             transcript = reply
             transcriptError = nil
             truncated = false
@@ -367,6 +393,20 @@ struct AgentDetailView: View {
             if transcript == nil { transcriptError = error.localizedDescription }
         }
         lookedUp = true
+    }
+
+    private func loadEarlierTranscript() async -> Int {
+        let had = transcript?.entries.count ?? 0
+        depth = depth.deeper()
+        await refreshTranscript(sessionID: detail?.session, cwd: detail?.cwd)
+        let now = transcript?.entries.count ?? 0
+        if now <= had { exhausted = true }
+        return now + pending.count
+    }
+
+    private static func folder(_ path: String?) -> String {
+        let path = path ?? ""
+        return path.hasSuffix("/") ? String(path.dropLast()) : path
     }
 
     /// Scrolled to the top with `truncated` still set: widen the capture

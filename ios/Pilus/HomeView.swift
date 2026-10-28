@@ -684,7 +684,7 @@ struct HomeView: View {
             navPath.append(session)
         } label: {
             HStack(spacing: 12) {
-                AgentIconView(kind: session.kind, size: 20)
+                AgentTile(kind: session.kind)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(session.title)
                         .font(.body.weight(.medium))
@@ -741,7 +741,7 @@ struct HomeView: View {
             navPath.append(agent)
         } label: {
             HStack(spacing: 12) {
-                AgentIconView(kind: agent.kind, size: 20)
+                AgentTile(kind: agent.kind)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(agent.title)
                         .font(.body.weight(.medium))
@@ -790,6 +790,44 @@ struct HomeView: View {
         case "idle", "done": return .secondary
         default: return .secondary.opacity(0.45)
         }
+    }
+}
+
+/// An agent's icon on a square card in its kind's colors, as the desktop's
+/// tab glyph tiles: Claude's orange with a cream mark, any other agent the
+/// terminal's near-black with a green mark.
+struct AgentTile: View {
+    let kind: String
+    var size: CGFloat = 30
+
+    private var colors: (face: Color, glyph: Color) {
+        switch kind {
+        case "claude", "claude-code":
+            (Color(red: 0xd9 / 255, green: 0x77 / 255, blue: 0x57 / 255),
+             Color(red: 0xfa / 255, green: 0xf9 / 255, blue: 0xf5 / 255))
+        default:
+            (Color(red: 0x0f / 255, green: 0x12 / 255, blue: 0x10 / 255),
+             Color(red: 0x4a / 255, green: 0xde / 255, blue: 0x80 / 255))
+        }
+    }
+
+    var body: some View {
+        let colors = colors
+        RoundedRectangle(cornerRadius: size * 0.27, style: .continuous)
+            .fill(colors.face)
+            .overlay {
+                RoundedRectangle(cornerRadius: size * 0.27, style: .continuous)
+                    .strokeBorder(colors.glyph.opacity(0.35), lineWidth: 1)
+            }
+            .overlay {
+                Image(AgentIconView.asset(for: kind))
+                    .resizable()
+                    .renderingMode(.template)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: size * 0.56, height: size * 0.56)
+                    .foregroundStyle(colors.glyph)
+            }
+            .frame(width: size, height: size)
     }
 }
 

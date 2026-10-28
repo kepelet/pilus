@@ -102,7 +102,7 @@ const TRANSCRIPT_WINDOW: u64 = 1024 * 1024;
 /// Newest entries a transcript reply carries unless asked for fewer.
 const TRANSCRIPT_ENTRIES: u64 = 200;
 /// Most entries a transcript reply carries.
-const TRANSCRIPT_ENTRIES_MAX: u64 = 600;
+const TRANSCRIPT_ENTRIES_MAX: u64 = 5000;
 
 /// The GitHub writes. They act as the host's GitHub account (a comment, or a
 /// pull request after pushing the branch), which is more than the gateway

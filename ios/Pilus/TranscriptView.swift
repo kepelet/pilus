@@ -6,14 +6,31 @@ import SwiftUI
 struct TranscriptList: View {
     let entries: [TranscriptEntry]
     var earlier = false
+    /// Reads further back; called when the top of the list comes into view
+    /// while older entries remain.
+    /// Returns how many entries there are once it has read.
+    var loadEarlier: (() async -> Int)?
+
+    @State private var loading = false
 
     var body: some View {
+        ScrollViewReader { proxy in
         LazyVStack(alignment: .leading, spacing: 14) {
-            if earlier {
-                Text("Earlier messages are on the desktop")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            if earlier, let loadEarlier {
+                ProgressView()
                     .frame(maxWidth: .infinity)
+                    .onAppear {
+                        guard !loading else { return }
+                        loading = true
+                        let first = entries.count
+                        Task {
+                            let now = await loadEarlier()
+                            // Keep the entry that was on top in place rather
+                            // than jumping to the oldest one just read.
+                            if now > first { proxy.scrollTo(now - first, anchor: .top) }
+                            loading = false
+                        }
+                    }
             }
             ForEach(Array(entries.enumerated()), id: \.offset) { _, entry in
                 TranscriptRow(entry: entry)
@@ -21,6 +38,7 @@ struct TranscriptList: View {
         }
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 
@@ -105,6 +123,8 @@ struct SessionTranscriptView: View {
     @State private var reply: TranscriptReply?
     @State private var loadError: String?
     @State private var choosing = false
+    @State private var depth = TranscriptDepth()
+    @State private var exhausted = false
 
     var body: some View {
         ScrollView {
@@ -112,7 +132,10 @@ struct SessionTranscriptView: View {
                 if reply.entries.isEmpty {
                     TranscriptNotice(title: "Nothing said yet")
                 } else {
-                    TranscriptList(entries: reply.entries, earlier: reply.earlier ?? false)
+                    TranscriptList(
+                        entries: reply.entries,
+                        earlier: (reply.earlier ?? false) && depth.canDeepen && !exhausted,
+                        loadEarlier: loadEarlier)
                 }
             } else if let loadError {
                 TranscriptNotice(title: "Couldn't read this chat", detail: loadError)
@@ -150,7 +173,7 @@ struct SessionTranscriptView: View {
                 choosing = false
                 onStarted(agent)
             }
-            .presentationDetents([.height(200)])
+            .presentationDetents([.height(150)])
         }
         .refreshable { await load() }
         .navigationTitle(session.title)
@@ -168,11 +191,22 @@ struct SessionTranscriptView: View {
 
     private func load() async {
         do {
-            reply = try await store.transcript(path: session.path, machine: session.machine)
+            reply = try await store.transcript(path: session.path, machine: session.machine, depth: depth)
             loadError = nil
         } catch {
             if reply == nil { loadError = error.localizedDescription }
         }
+    }
+
+    private func loadEarlier() async -> Int {
+        let had = reply?.entries.count ?? 0
+        depth = depth.deeper()
+        await load()
+        let now = reply?.entries.count ?? 0
+        // An older pilus-agent caps the entries it sends, so a read that
+        // brings nothing new ends the reaching back.
+        if now <= had { exhausted = true }
+        return now
     }
 }
 
@@ -216,8 +250,10 @@ struct ReopenSheet: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 12) {
-                choice(fork: false, title: "Continue")
-                choice(fork: true, title: "Fork")
+                HStack(spacing: 12) {
+                    choice(fork: false, title: "Continue")
+                    choice(fork: true, title: "Fork")
+                }
                 if let startError {
                     Text(startError)
                         .font(.footnote)

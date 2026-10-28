@@ -1483,7 +1483,7 @@ struct SipilRow<'a> {
     error: Option<&'a str>,
     /// Indented under the agent above it.
     nested: bool,
-    /// Bold at rest, for the primary agent.
+    /// Bold at rest, for a row that asks for something (a knock, unread lines).
     strong: bool,
     /// The conversation a click opens.
     open: sipil::Watch,
@@ -13864,7 +13864,7 @@ impl PilusView {
                                 name: if single { &given } else { &agent.name },
                                 error: agent.error.as_deref(),
                                 nested: false,
-                                strong: true,
+                                strong: false,
                                 open: sipil::Watch::On(daemon.id.clone(), agent.id.clone()),
                                 badge: 0,
                                 dot: Some(if daemon.connected() {

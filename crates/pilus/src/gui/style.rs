@@ -347,9 +347,6 @@ pub(super) fn glyph_tile(
     // foreground too loud.
     let edge = tint(theme.panel_fg, 0.2);
     let radius = Radius::Sm.pixels().as_f32();
-    // Square corners are the flat look; an outline on them would put a frame
-    // back, so the cards then tell apart by their fills alone.
-    let outlined = radius > 0.0;
     let mut deck = div()
         .relative()
         .flex_shrink_0()
@@ -379,12 +376,10 @@ pub(super) fn glyph_tile(
                             let shade = mix(face, theme.panel_fg, f32::from(depth) * 0.1);
                             window.paint_path(path, Hsla::from(shade));
                         }
-                        if outlined {
-                            let mut line = PathBuilder::stroke(px(1.0));
-                            line.add_polygon(&outline, true);
-                            if let Ok(path) = line.build() {
-                                window.paint_path(path, Hsla::from(edge));
-                            }
+                        let mut line = PathBuilder::stroke(px(1.0));
+                        line.add_polygon(&outline, true);
+                        if let Ok(path) = line.build() {
+                            window.paint_path(path, Hsla::from(edge));
                         }
                     }
                 },
@@ -405,7 +400,8 @@ pub(super) fn glyph_tile(
         .w(px(GLYPH_TILE))
         .h(px(GLYPH_TILE))
         .radius_sm()
-        .when(outlined, |front| front.border_1().border_color(edge))
+        .border_1()
+        .border_color(edge)
         .bg(face)
         .child(
             svg()

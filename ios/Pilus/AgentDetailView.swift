@@ -60,10 +60,6 @@ struct AgentDetailView: View {
     @State private var readingOutput = false
     @State private var outputPending = false
     private static let maxCaptureLines = 16384
-    /// The send button's diameter, and the height of one line of the reply.
-    private static let sendSize: CGFloat = 30
-    private static let lineHeight: CGFloat = 22
-    static let lineSpacing: CGFloat = 5
 
     var body: some View {
         GeometryReader { geo in
@@ -118,7 +114,9 @@ struct AgentDetailView: View {
                         Button("History", systemImage: "clock.arrow.circlepath") { showingLog = true }
                     }
                     if store.supports("pane.close", on: agent.machine) {
-                        Button("Stop Agent", systemImage: "stop.circle", role: .destructive) {
+                        // No destructive role: that tints the row red. The
+                        // confirmation below is what guards the action.
+                        Button("Stop Agent", systemImage: "stop.circle") {
                             confirmingStop = true
                         }
                     }
@@ -180,54 +178,11 @@ struct AgentDetailView: View {
     }
 
     private var composer: some View {
-        VStack(spacing: 0) {
-            if let shown = sendError ?? loadError {
-                Text(shown)
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-                    .padding(.horizontal)
-            }
-
-            VStack(spacing: 6) {
-                // Bottom-aligned so the send button stays at the corner as the
-                // field grows upward.
-                HStack(alignment: .bottom, spacing: 8) {
-                    TextField("Reply to \(agent.title)", text: $reply, axis: .vertical)
-                        .lineLimit(1...5)
-                        .lineSpacing(Self.lineSpacing)
-                        .textFieldStyle(.plain)
-                        .focused($replyFocused)
-                        // Agents read this verbatim; autocorrection corrupts
-                        // commands and flags.
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        // Centers one line on the send button; more lines grow
-                        // the field from there.
-                        .padding(.vertical, (Self.sendSize - Self.lineHeight) / 2)
-                    if sending {
-                        // The send button's footprint, held so the field
-                        // does not collapse while the spinner swaps in.
-                        ProgressView()
-                            .frame(width: Self.sendSize, height: Self.sendSize)
-                    } else {
-                        sendButton
-                    }
-                }
-                .padding(.leading, 16)
-                .padding(.trailing, 6)
-                .padding(.vertical, 6)
-                // A capsule's radius is half its height, so a tall field
-                // balloons into an oval. One fixed radius is a capsule at one
-                // line and a rounded rectangle after.
-                .modifier(GlassRounded(radius: Self.sendSize / 2 + 6))
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 8)
-            // At rest it sits down into the home indicator's margin; over the
-            // keyboard it keeps a gap.
-            .padding(.bottom, replyFocused ? 8 : -12)
-        }
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { composerHeight = $0 }
+        ReplyComposer(
+            placeholder: "Reply to \(agent.title)", text: $reply, focused: $replyFocused,
+            error: sendError ?? loadError, sending: sending
+        ) { sendButton }
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { composerHeight = $0 }
     }
 
     /// Output signals arrive for the paired host's panes while its watch is up.
@@ -267,7 +222,7 @@ struct AgentDetailView: View {
             }
             .disabled(!store.canSend(.pasteText(""), to: agent))
         } label: {
-            SendArrow(enabled: canSend, size: Self.sendSize)
+            SendArrow(enabled: canSend, size: ReplyComposer<EmptyView>.sendSize)
         } primaryAction: {
             log.info("send tapped")
             Task { await send() }
@@ -510,6 +465,70 @@ struct AgentDetailView: View {
                 if reply.isEmpty { reply = text }
             }
             if (error as? PilusError)?.isUnconfirmed == true { await refresh(silent: true) }
+        }
+    }
+}
+
+/// The reply box that floats on glass over a transcript. The live agent page
+/// and the saved session page both use it, so the two cannot drift apart.
+struct ReplyComposer<Send: View>: View {
+    let placeholder: String
+    @Binding var text: String
+    var focused: FocusState<Bool>.Binding
+    var error: String?
+    var sending: Bool
+    @ViewBuilder var send: () -> Send
+
+    /// The send button's diameter, and the height of one line of the reply.
+    static var sendSize: CGFloat { 30 }
+    private static var lineHeight: CGFloat { 22 }
+    private static var lineSpacing: CGFloat { 5 }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let error {
+                Text(error)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal)
+            }
+
+            // Bottom-aligned so the send button stays at the corner as the
+            // field grows upward.
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField(placeholder, text: $text, axis: .vertical)
+                    .lineLimit(1...5)
+                    .lineSpacing(Self.lineSpacing)
+                    .textFieldStyle(.plain)
+                    .focused(focused)
+                    // Agents read this verbatim; autocorrection corrupts
+                    // commands and flags.
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    // Centers one line on the send button; more lines grow
+                    // the field from there.
+                    .padding(.vertical, (Self.sendSize - Self.lineHeight) / 2)
+                if sending {
+                    // The send button's footprint, held so the field
+                    // does not collapse while the spinner swaps in.
+                    ProgressView()
+                        .frame(width: Self.sendSize, height: Self.sendSize)
+                } else {
+                    send()
+                }
+            }
+            .padding(.leading, 16)
+            .padding(.trailing, 6)
+            .padding(.vertical, 6)
+            // A capsule's radius is half its height, so a tall field
+            // balloons into an oval. One fixed radius is a capsule at one
+            // line and a rounded rectangle after.
+            .modifier(GlassRounded(radius: Self.sendSize / 2 + 6))
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+            // At rest it sits down into the home indicator's margin; over the
+            // keyboard it keeps a gap.
+            .padding(.bottom, focused.wrappedValue ? 8 : -12)
         }
     }
 }

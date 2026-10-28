@@ -247,7 +247,8 @@ struct GitLogView: View {
             Text(commit.subject ?? "")
                 .font(.body)
                 .lineLimit(3)
-            let decorations = commit.decorations
+            // Tags are left off: the branch chips are the context worth the room.
+            let decorations = commit.decorations.filter { $0.kind != .tag }
             if !decorations.isEmpty {
                 // Wraps rather than scrolls: a commit with many refs stays
                 // readable without a nested scroll view in a list row.
@@ -270,32 +271,21 @@ struct GitLogView: View {
     }
 }
 
-/// Branch and tag labels for one commit, wrapped onto as many lines as they
-/// need.
+/// Branch labels for one commit, wrapped onto as many lines as they need.
 private struct FlowRefs: View {
     let decorations: [GitDecoration]
 
     var body: some View {
         WrappingLayout(spacing: 4) {
             ForEach(decorations, id: \.self) { decoration in
-                Label {
-                    Text(decoration.name).lineLimit(1)
-                } icon: {
-                    Image(systemName: symbol(decoration.kind))
-                }
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(color(decoration.kind))
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(color(decoration.kind).opacity(0.14), in: .capsule)
+                Text(decoration.name)
+                    .lineLimit(1)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(color(decoration.kind))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(color(decoration.kind).opacity(0.14), in: .capsule)
             }
-        }
-    }
-
-    private func symbol(_ kind: GitDecoration.Kind) -> String {
-        switch kind {
-        case .head, .branch: "arrow.triangle.branch"
-        case .tag: "tag"
         }
     }
 

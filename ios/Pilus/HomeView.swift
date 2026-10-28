@@ -551,6 +551,11 @@ struct HomeView: View {
                 Text(agentSummary)
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.75))
+                if let overview = overviewSummary {
+                    Text(overview)
+                        .font(.footnote)
+                        .foregroundStyle(.white.opacity(0.55))
+                }
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 28)
@@ -572,6 +577,32 @@ struct HomeView: View {
         if waiting > 0 { parts.append("\(waiting) waiting for you") }
         if idle > 0 { parts.append("\(idle) idle") }
         return parts.isEmpty ? "No agents running" : parts.joined(separator: ", ")
+    }
+
+    /// What else is going on beyond the agents' states: work waiting on the
+    /// board, sessions touched today, and how far the host reaches. Nil when
+    /// there is nothing to say, so a fresh pairing shows no empty line.
+    private var overviewSummary: String? {
+        var parts: [String] = []
+        let open = store.tasks.filter {
+            !["done", "succeeded", "success", "failed"].contains($0.status ?? "")
+        }
+        let review = open.filter { $0.status == "review" }.count
+        if review > 0 { parts.append("\(review) to review") }
+        if !open.isEmpty { parts.append(Self.count(open.count, "task") + " open") }
+        // Home lists the newest 20, so a full day of them reads "20+".
+        let start = Calendar.current.startOfDay(for: .now).timeIntervalSince1970
+        let today = store.sessions.filter { Double($0.updated ?? 0) >= start }.count
+        if today > 0 {
+            parts.append(Self.count(today, "session") + (today >= 20 ? "+" : "") + " today")
+        }
+        let machines = store.machineOrder.count
+        if machines > 1 { parts.append("\(machines) machines") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private static func count(_ n: Int, _ noun: String) -> String {
+        "\(n) \(noun)\(n == 1 ? "" : "s")"
     }
 
     /// The hero's top scrim is dark in both appearances — the bar items
@@ -950,6 +981,23 @@ struct SessionRowLabel: View {
     }
 }
 
+/// A session row's stand-in while a search is still out.
+private struct SessionRowSkeleton: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.secondary.opacity(0.15))
+                .frame(width: 30, height: 30)
+            VStack(alignment: .leading, spacing: 6) {
+                SkeletonBar(height: 14)
+                SkeletonBar(height: 10)
+                    .frame(width: 140)
+            }
+        }
+        .padding(.vertical, 8)
+    }
+}
+
 /// Sessions the hosts keep, but the live agents', searched on each host:
 /// each word must appear in the title, folder, branch or agent.
 struct SessionSearchView: View {
@@ -973,7 +1021,14 @@ struct SessionSearchView: View {
         }
         .overlay {
             if found == nil {
-                ProgressView()
+                // Rows the shape of the real ones, rather than a spinner.
+                VStack(spacing: 0) {
+                    ForEach(0..<8, id: \.self) { _ in SessionRowSkeleton() }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 20)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .background(Color(uiColor: .systemBackground))
             } else if found?.isEmpty == true {
                 if query.isEmpty {
                     ContentUnavailableView("No sessions", systemImage: "text.bubble")
@@ -988,7 +1043,14 @@ struct SessionSearchView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task(id: query) {
             let query = query.trimmingCharacters(in: .whitespaces)
-            if !query.isEmpty {
+            // What this query found last time shows at once; a recent one is
+            // not asked again, an older one is while it stays on screen.
+            let cached = store.cachedSearch(query)
+            if let cached {
+                found = cached.rows
+                if cached.fresh { return }
+            }
+            if !query.isEmpty, cached == nil {
                 try? await Task.sleep(for: .milliseconds(300))
                 if Task.isCancelled { return }
             }

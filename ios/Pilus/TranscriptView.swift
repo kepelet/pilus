@@ -123,6 +123,7 @@ struct SessionTranscriptView: View {
     @State private var reply: TranscriptReply?
     @State private var loadError: String?
     @State private var prompt = ""
+    @FocusState private var promptFocused: Bool
     @State private var starting = false
     @State private var startError: String?
     @State private var confirmingFork = false
@@ -147,7 +148,7 @@ struct SessionTranscriptView: View {
             }
         }
         .defaultScrollAnchor(.bottom)
-        .safeAreaInset(edge: .bottom) {
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             if store.canReopen(session) { composer }
         }
         .toolbar {
@@ -184,38 +185,14 @@ struct SessionTranscriptView: View {
     /// Typing continues the session where it left off; the typed text, if
     /// any, is its next prompt.
     private var composer: some View {
-        VStack(spacing: 4) {
-            if let startError {
-                Text(startError)
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-                    .padding(.horizontal)
+        ReplyComposer(
+            placeholder: "Continue this session (\(session.kind))", text: $prompt,
+            focused: $promptFocused, error: startError, sending: starting
+        ) {
+            Button { start(fork: false) } label: {
+                SendArrow(enabled: true, size: ReplyComposer<EmptyView>.sendSize)
             }
-            HStack(alignment: .bottom, spacing: 8) {
-                TextField("Continue this session (\(session.kind))", text: $prompt, axis: .vertical)
-                    .lineLimit(1...5)
-                    .lineSpacing(AgentDetailView.lineSpacing)
-                    .textFieldStyle(.plain)
-                    // Prompts reach the agent verbatim.
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .padding(.vertical, 4)
-                if starting {
-                    ProgressView()
-                        .frame(width: 30, height: 30)
-                } else {
-                    Button { start(fork: false) } label: {
-                        SendArrow(enabled: true, size: 30)
-                    }
-                    .accessibilityLabel("Continue")
-                }
-            }
-            .padding(.leading, 16)
-            .padding(.trailing, 6)
-            .padding(.vertical, 6)
-            .modifier(GlassRounded(radius: 21))
-            .padding(.horizontal, 12)
-            .padding(.bottom, 8)
+            .accessibilityLabel("Continue")
         }
     }
 

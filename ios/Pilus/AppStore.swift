@@ -17,6 +17,16 @@ final class AppStore {
     /// what was seen before while the hub is re-asked. Kept on disk.
     private(set) var transcriptCache: [String: TranscriptReply] = [:]
     private var transcriptOrder: [String] = []
+    /// Search results per query (`searchKey`), oldest first in `searchOrder`.
+    /// In memory only: a search is cheap to ask again, and a result kept across
+    /// launches would outlive the sessions it names. `searchEpoch` moves on
+    /// every invalidation so a search already out cannot refill the cache.
+    private var searchCache: [String: (rows: [SessionSummary], at: Date)] = [:]
+    private var searchOrder: [String] = []
+    private var searchEpoch = 0
+    private static let cachedSearches = 20
+    /// How long a remembered search is served without asking the hosts again.
+    private static let searchFresh: TimeInterval = 30
     private(set) var agentSessions: [String: SessionSummary] = [:]
     /// Agents (`sessionKey`) whose session was found by what their pane shows.
     private var sightedSessions: Set<String> = []
@@ -280,6 +290,7 @@ final class AppStore {
             for machine in reply.machines where machine.usable && !order.contains(machine.id) {
                 order.append(machine.id)
             }
+            if order != machineOrder { invalidateSearches() }
             machineOrder = order
         }
     }
@@ -753,6 +764,8 @@ final class AppStore {
         do {
             let result: HubRunResult = try await call(method: "hub.run", params: params, machine: machine)
             pendingKeys[signature] = nil
+            // A new or resumed agent writes a session of its own.
+            invalidateSearches()
             return result
         } catch let error as PilusError {
             if !error.isUnconfirmed { pendingKeys[signature] = nil }
@@ -778,8 +791,12 @@ final class AppStore {
     /// that fails keeps what it last listed.
     func loadSessions(limit: Int = 20) async {
         guard canReadSessions else { return }
+        let before = sessions.first.map { "\($0.id):\($0.updated ?? 0)" }
         sessions = Array(await fetchSessions(limit: limit, fallback: sessions).prefix(limit))
         sessionsLoaded = true
+        // The newest session moved or a new one appeared, so what searches
+        // found before may be missing it.
+        if sessions.first.map({ "\($0.id):\($0.updated ?? 0)" }) != before { invalidateSearches() }
         await matchLiveAgents()
         saveSessionCache()
     }
@@ -885,8 +902,58 @@ final class AppStore {
     /// desktop's index and the newest transcripts), merged newest first. An
     /// empty query lists the newest.
     func searchSessions(_ query: String, limit: Int = 100) async -> [SessionSummary] {
+        let epoch = searchEpoch
+        let (rows, complete) = await fetchSearch(query, limit: limit)
+        // Only a complete answer is remembered, and not one that an
+        // invalidation overtook while it was in flight.
+        if complete, epoch == searchEpoch { rememberSearch(rows, for: query) }
+        return withoutLive(rows)
+    }
+
+    /// What `query` found last time, for the page to show while it asks again.
+    /// `fresh` says the answer is recent enough to skip asking.
+    func cachedSearch(_ query: String) -> (rows: [SessionSummary], fresh: Bool)? {
+        guard let hit = searchCache[Self.searchKey(query)] else { return nil }
+        return (withoutLive(hit.rows), Date().timeIntervalSince(hit.at) < Self.searchFresh)
+    }
+
+    /// Forget every remembered search: the sessions on the hosts changed, or
+    /// the hosts themselves did.
+    private func invalidateSearches() {
+        searchCache = [:]
+        searchOrder = []
+        searchEpoch += 1
+    }
+
+    private func rememberSearch(_ rows: [SessionSummary], for query: String) {
+        let key = Self.searchKey(query)
+        searchCache[key] = (rows, Date())
+        searchOrder.removeAll { $0 == key }
+        searchOrder.append(key)
+        while searchOrder.count > Self.cachedSearches {
+            searchCache[searchOrder.removeFirst()] = nil
+        }
+    }
+
+    /// Live agents' sessions are on their rows, so search leaves them out. Done
+    /// on the way out, not when remembering, so an agent that starts or ends
+    /// moves its session in or out without a new search.
+    private func withoutLive(_ rows: [SessionSummary]) -> [SessionSummary] {
+        let live = liveSessionIDs
+        return rows.filter { !live.contains($0.id) }
+    }
+
+    /// Case and spacing do not change what a search finds.
+    private static func searchKey(_ query: String) -> String {
+        query.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    /// `complete` is false when a machine could not be asked and its rows are
+    /// the home list's instead.
+    private func fetchSearch(_ query: String, limit: Int) async -> (rows: [SessionSummary], complete: Bool) {
         let words = query.lowercased().split(whereSeparator: \.isWhitespace)
         var merged: [SessionSummary] = []
+        var complete = true
         for id in machineOrder {
             var params: [String: Any] = ["limit": limit]
             if !words.isEmpty { params["query"] = query }
@@ -896,6 +963,7 @@ final class AppStore {
                     method: "hub.sessions", params: params, machine: id)
                 rows = reply.sessions.map { var row = $0; row.machine = id; return row }
             } catch {
+                complete = false
                 rows = sessions.filter { $0.machine == id }
             }
             // A host from before `query` lists its newest instead.
@@ -905,8 +973,7 @@ final class AppStore {
                 return words.allSatisfy { text.contains($0) }
             }
         }
-        let live = liveSessionIDs
-        return merged.filter { !live.contains($0.id) }.sorted { ($0.updated ?? 0) > ($1.updated ?? 0) }
+        return (merged.sorted { ($0.updated ?? 0) > ($1.updated ?? 0) }, complete)
     }
 
     /// Letters and digits only, lowercased, so a prompt wrapped and boxed on a
@@ -1126,6 +1193,7 @@ final class AppStore {
         agentKindsByMachine = [:]
         pseudoKindsByMachine = [:]
         inventoryCache = [:]
+        invalidateSearches()
         workspaces = []
         agents = []
         tasks = []

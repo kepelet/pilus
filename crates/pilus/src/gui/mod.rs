@@ -207,6 +207,27 @@ const SIDEBAR_ROW_PAD: f32 = 8.0;
 /// Extra inset for a row nested under another row. Small, because the elbow
 /// connector carries the hierarchy and the indent only has to clear it.
 const SIDEBAR_NEST_INDENT: f32 = 4.0;
+
+/// How a workspace row joins the tree rail that links the elbows to their
+/// parent. Rows are flat siblings, so each one draws its own span of the line
+/// and the spans meet across the rows' gap.
+#[derive(Clone, Copy, Default)]
+struct NestRail {
+    /// A machine's row, which carries the chevron that folds the rows below.
+    foldable: bool,
+    /// Rows hang below this one: a stub runs down from its glyph.
+    parent: bool,
+    /// A later row at this depth follows: the line runs through this row.
+    more: bool,
+}
+
+/// Gap between sidebar rows, which a rail span bridges.
+const SIDEBAR_ROW_GAP: f32 = 4.0;
+/// A two-line row's vertical padding (`py_1`), above its head.
+const SIDEBAR_ROW_PY: f32 = 4.0;
+/// GPUI's default line height as a multiple of the font size; the rail needs
+/// the head's height to find the glyph's foot.
+const SIDEBAR_LINE_RATIO: f32 = 1.618;
 /// Share of the selected pill's strength a hover fill carries, so hovering a
 /// row hints at the selection without matching it.
 const SIDEBAR_HOVER_WEIGHT: f32 = 0.6;
@@ -13368,7 +13389,7 @@ impl PilusView {
     /// the leading server glyph; the row itself stays unlabelled. `depth` is
     /// how far the row hangs below its machine: 0 is the machine's own row, 1 a
     /// workspace under it and 2 a worktree under that workspace. Anything
-    /// deeper than the machine row swaps its icon for the elbow. `foldable`
+    /// deeper than the machine row swaps its icon for the elbow. `rail.foldable`
     /// gives a machine's row the chevron that folds the workspaces below it.
     fn workspace_row(
         &self,
@@ -13376,10 +13397,11 @@ impl PilusView {
         workspace: &ShellWorkspace,
         host: Option<&str>,
         depth: usize,
-        foldable: bool,
+        rail: NestRail,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
+        let foldable = rail.foldable;
         // A folded machine keeps the pill when the workspace hidden below it
         // is the active one, so the selection never disappears.
         let hidden_active = foldable
@@ -13441,7 +13463,7 @@ impl PilusView {
                     .flex_shrink_0()
                     .child(
                         div()
-                            .ml(px(2.0))
+                            .ml(px(3.0))
                             .mt(px(-2.5))
                             .w(px(8.0))
                             .h(px(13.0))
@@ -13532,8 +13554,36 @@ impl PilusView {
         if self.sidebar_workspace_paths {
             row = row.child(sub);
         }
+        let row_pl = SIDEBAR_ROW_PAD + SIDEBAR_NEST_INDENT * depth as f32;
         if depth > 0 {
-            row = row.pl(px(SIDEBAR_ROW_PAD + SIDEBAR_NEST_INDENT * depth as f32));
+            row = row.pl(px(row_pl));
+        }
+        {
+            // The head's line box is the font's; the 14px glyph centers in it.
+            let glyph_top = SIDEBAR_ROW_PY
+                + (self.chrome_font() * SIDEBAR_LINE_RATIO - SIDEBAR_GLYPH).max(0.0) / 2.0;
+            let rail_color = theme.muted.opacity(0.5);
+            let span = |left: f32| div().absolute().left(px(left)).w(px(1.0)).bg(rail_color);
+            row = row.relative();
+            if depth > 0 {
+                // Up to the previous row, and on through this one when more follow.
+                let line = span(row_pl + 3.0).top(px(-SIDEBAR_ROW_GAP));
+                row = row.child(if rail.more {
+                    line.bottom(px(-SIDEBAR_ROW_GAP))
+                } else {
+                    line.h(px(SIDEBAR_ROW_GAP + glyph_top + SIDEBAR_GLYPH / 2.0))
+                });
+            }
+            if rail.parent {
+                // The stub starts at the glyph's foot, or at the elbow's
+                // stroke when the parent is itself nested.
+                let foot = if depth > 0 { 10.5 } else { SIDEBAR_GLYPH };
+                row = row.child(
+                    span(row_pl + SIDEBAR_GLYPH / 2.0)
+                        .top(px(glyph_top + foot))
+                        .bottom(px(-SIDEBAR_ROW_GAP)),
+                );
+            }
         }
         let workspace_id = workspace.id.clone();
         let workspace_name = workspace.name.clone();
@@ -14375,25 +14425,45 @@ impl PilusView {
                     &workspaces[index],
                     host.as_deref(),
                     0,
-                    foldable,
+                    NestRail {
+                        foldable,
+                        parent: foldable && !self.machine_folded(&id),
+                        more: false,
+                    },
                     cx,
                 )),
-                None => children.child(self.machine_row(&id, host.as_deref(), cx)),
+                None => children.child(self.machine_row(
+                    &id,
+                    host.as_deref(),
+                    !self.machine_folded(&id),
+                    cx,
+                )),
             };
             if self.machine_folded(&id) {
                 continue;
             }
-            for (index, workspace) in workspaces.iter().enumerate() {
-                if Some(index) == home {
-                    continue;
-                }
-                let depth = if workspace.nested { 2 } else { 1 };
+            let below: Vec<(usize, &ShellWorkspace)> = workspaces
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != home)
+                .map(|(_, workspace)| (if workspace.nested { 2 } else { 1 }, workspace))
+                .collect();
+            for (at, (depth, workspace)) in below.iter().enumerate() {
+                let rest = &below[at + 1..];
+                let rail = NestRail {
+                    foldable: false,
+                    parent: rest.first().is_some_and(|(next, _)| next > depth),
+                    more: rest
+                        .iter()
+                        .take_while(|(next, _)| next >= depth)
+                        .any(|(next, _)| next == depth),
+                };
                 children = children.child(self.workspace_row(
                     &id,
                     workspace,
                     host.as_deref(),
-                    depth,
-                    false,
+                    *depth,
+                    rail,
                     cx,
                 ));
             }
@@ -14479,6 +14549,7 @@ impl PilusView {
         &self,
         endpoint: &EndpointId,
         host: Option<&str>,
+        parent: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
@@ -14517,9 +14588,20 @@ impl PilusView {
             .radius_md()
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
+            .relative()
             .children(selected.then(|| style::glide_target(pill)))
             .child(style::hover_target(&self.sidebar_hover))
             .tooltip(tip)
+            // The rail's stub, from the glyph's foot to the first row below.
+            .children(parent.then(|| {
+                div()
+                    .absolute()
+                    .left(px(SIDEBAR_ROW_PAD + SIDEBAR_GLYPH / 2.0))
+                    .top(px((SIDEBAR_ROW_HEIGHT + SIDEBAR_GLYPH) / 2.0))
+                    .bottom(px(-SIDEBAR_ROW_GAP))
+                    .w(px(1.0))
+                    .bg(theme.muted.opacity(0.5))
+            }))
             .child(div().w(px(SIDEBAR_GLYPH)).flex_shrink_0().child(icon(
                 icon_bytes,
                 SIDEBAR_GLYPH,

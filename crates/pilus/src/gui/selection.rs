@@ -105,6 +105,26 @@ impl Selection {
         after_start && before_end
     }
 
+    /// The columns selected on `row`, ends inclusive, in a grid `width` wide.
+    /// A row holds one unbroken span, so the painter can draw it as a single
+    /// rounded shape and compare it with its neighbors' spans.
+    pub fn columns(&self, row: u16, width: u16) -> Option<(u16, u16)> {
+        let (start, end) = self.ordered();
+        if width == 0 || row < start.row || row > end.row {
+            return None;
+        }
+        let (left, right) = match self.bounds {
+            Some(bounds) if !(bounds.top..=bounds.bottom).contains(&row) => return None,
+            Some(bounds) => (bounds.left, bounds.right),
+            None => (0, width - 1),
+        };
+        let first = if row == start.row { start.column } else { left }.max(left);
+        let last = if row == end.row { end.column } else { right }
+            .min(right)
+            .min(width - 1);
+        (first <= last).then_some((first, last))
+    }
+
     /// The selected text in a frame, with trailing blanks trimmed per line.
     pub fn text(&self, frame: &FrameData) -> String {
         if frame.width == 0 || frame.height == 0 {
@@ -201,6 +221,33 @@ mod tests {
         assert!(selection.contains(1, 1));
         assert!(!selection.contains(1, 0));
         assert!(!selection.contains(2, 1));
+    }
+
+    #[test]
+    fn columns_agree_with_contains() {
+        let bounded = Selection {
+            anchor: Cell { column: 5, row: 1 },
+            cursor: Cell { column: 3, row: 3 },
+            bounds: Some(CellRect {
+                left: 2,
+                top: 1,
+                right: 6,
+                bottom: 3,
+            }),
+        };
+        let free = Selection {
+            bounds: None,
+            ..bounded
+        };
+        for selection in [bounded, free] {
+            for row in 0..5 {
+                let expected: Vec<u16> = (0..10).filter(|c| selection.contains(*c, row)).collect();
+                let got: Vec<u16> = selection
+                    .columns(row, 10)
+                    .map_or_else(Vec::new, |(a, b)| (a..=b).collect());
+                assert_eq!(got, expected, "row {row}");
+            }
+        }
     }
 
     #[test]

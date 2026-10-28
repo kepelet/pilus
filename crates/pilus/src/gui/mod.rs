@@ -11582,8 +11582,7 @@ impl PilusView {
         content = content.child(style::hover_glide(
             "pilus-sidebar-hover",
             &self.sidebar_hover,
-            self.theme
-                .card_raise(SIDEBAR_HOVER_WEIGHT),
+            self.theme.card_raise(SIDEBAR_HOVER_WEIGHT),
             style::RADIUS_MD,
             SIDEBAR_ROW_EDGE,
         ));
@@ -11594,8 +11593,7 @@ impl PilusView {
         content = content.child(style::glide(
             "pilus-sidebar-context",
             &self.sidebar_context,
-            self.theme
-                .card_raise(SIDEBAR_CONTEXT_WEIGHT),
+            self.theme.card_raise(SIDEBAR_CONTEXT_WEIGHT),
             style::RADIUS_MD,
             SIDEBAR_ROW_EDGE,
         ));
@@ -11832,10 +11830,7 @@ impl PilusView {
             .w(px(SIDEBAR_TOGGLE_W))
             .radius_md()
             .cursor_pointer()
-            .hover_fill(
-                theme.card_raise(SIDEBAR_HOVER_WEIGHT),
-                style::RADIUS_MD,
-            )
+            .hover_fill(theme.card_raise(SIDEBAR_HOVER_WEIGHT), style::RADIUS_MD)
             .child(icon(
                 include_bytes!("../../assets/icons/panel-left.svg"),
                 14.0,
@@ -15747,8 +15742,8 @@ fn render_grid(
     // up to the card's top, which meets the tab strip.
     if lone.is_some() && pad_y > 0.0 {
         column = column.child(div().absolute().left_0().top(px(-pad_y)).child(bottom_fill(
-            frame, skip_rows, theme, selection, cell_width, skip_cols, max_cols, pad_x, slack_x,
-            pad_y, true, glass, tiled, pane_gaps, &shifts,
+            frame, skip_rows, theme, cell_width, skip_cols, max_cols, pad_x, slack_x, pad_y, true,
+            glass, tiled, pane_gaps, &shifts,
         )));
     }
     let grid_end = skip_cols.saturating_add(max_cols);
@@ -15809,7 +15804,6 @@ fn render_grid(
             frame,
             end_row - 1,
             theme,
-            selection,
             cell_width,
             skip_cols,
             max_cols,
@@ -16009,7 +16003,9 @@ fn render_row(
     // floating card that stretch is gutter, the surface's to paint; filled,
     // it would cover the gap beside the card in the run's color.
     let painted_end = skip_cols.saturating_add(paint_w as u16);
-    let fills = collect_background_runs(frame.width, &rendered, theme, row, selection)
+    // The selection is not a background: it paints on top as its own rounded
+    // shape below, so its cut corners show the cells' own colors.
+    let fills = collect_background_runs(frame.width, &rendered, theme)
         .into_iter()
         .filter_map(|(start, cells, bg)| {
             if !floating {
@@ -16042,6 +16038,47 @@ fn render_row(
                     ) * cell_width))
                 .h(line_height)
                 .bg(bg.opacity(glass)),
+        );
+    }
+
+    // One shape per row, rounded by the corner setting only where no
+    // neighboring row's span continues it, so a multi-line selection reads
+    // as one outline instead of a stack of pills.
+    let clip_end = if floating { painted_end } else { frame.width };
+    let span_at = |row: u16, extend_wide: bool| {
+        let (first, last) = selection?.columns(row, frame.width)?;
+        let wide = extend_wide
+            && frame
+                .cell(last, row)
+                .is_some_and(|cell| pilus_protocol::symbol_width(symbol(cell)) >= 2);
+        let end = last.saturating_add(if wide { 2 } else { 1 });
+        let (start, end) = (first.max(skip_cols), end.min(clip_end));
+        (end > start).then_some((start, end))
+    };
+    if let Some(span) = span_at(row, true) {
+        let above = row.checked_sub(1).and_then(|row| span_at(row, false));
+        let below = row.checked_add(1).and_then(|row| span_at(row, false));
+        let corners = selection_corners(span, above, below);
+        let (start, end) = span;
+        let width = f32::from(end - start) * cell_width;
+        let radius = px(f32::from(style::RADIUS_SM.pixels())
+            .min(width / 2.0)
+            .min(f32::from(line_height) / 2.0));
+        let round = |exposed: bool| if exposed { radius } else { px(0.0) };
+        element = element.child(
+            div()
+                .absolute()
+                .left(px(f32::from(start.saturating_sub(skip_cols)) * cell_width))
+                .top(px(0.0))
+                .right(px(
+                    row_width - f32::from(end.saturating_sub(skip_cols)) * cell_width
+                ))
+                .h(line_height)
+                .rounded_tl(round(corners[0]))
+                .rounded_tr(round(corners[1]))
+                .rounded_br(round(corners[2]))
+                .rounded_bl(round(corners[3]))
+                .bg(theme.selection_bg.opacity(glass)),
         );
     }
 
@@ -16229,10 +16266,8 @@ fn render_row(
     let trail = (f32::from(max_cols) - paint_w as f32).max(0.0) * cell_width + slack_x;
     if slack_x > 0.5 || paint_w < usize::from(max_cols) {
         let edge_bg = match rendered.last() {
-            Some((column, cell, cursor)) => {
-                let selected = selection.is_some_and(|s| s.contains(*column, row));
-                style_of(cell, theme, *cursor, selected).1
-            }
+            // Never the selection, whose rounded end stops at the grid.
+            Some((_, cell, cursor)) => style_of(cell, theme, *cursor, false).1,
             None => theme::resolve(0, theme.bg, &theme.ansi),
         };
         if paints(edge_bg) && trail > card_inset {
@@ -16262,7 +16297,6 @@ fn bottom_fill(
     frame: &FrameData,
     row: u16,
     theme: Theme,
-    selection: Option<Selection>,
     cell_width: f32,
     skip_cols: u16,
     max_cols: u16,
@@ -16275,7 +16309,7 @@ fn bottom_fill(
     gaps: bool,
     shifts: &pane_chrome::ColumnShifts,
 ) -> Div {
-    let spans = bottom_fill_spans(frame, row, theme, selection, skip_cols, max_cols);
+    let spans = bottom_fill_spans(frame, row, theme, skip_cols, max_cols);
     // A span sits where its first cell's pane is drawn, and ends where its
     // last cell's pane puts that cell's far edge.
     let shift = |offset: u16| shifts.at(skip_cols.saturating_add(offset), row);
@@ -16350,7 +16384,6 @@ fn bottom_fill_spans(
     frame: &FrameData,
     row: u16,
     theme: Theme,
-    selection: Option<Selection>,
     skip_cols: u16,
     max_cols: u16,
 ) -> Vec<(u16, u16, gpui::Rgba)> {
@@ -16369,17 +16402,14 @@ fn bottom_fill_spans(
     let mut spans = Vec::new();
     let mut index = 0usize;
     while index < cells.len() {
-        let column = skip_cols.saturating_add(index as u16);
-        let selected = selection.is_some_and(|s| s.contains(column, row));
-        // The filler continues the row's *backgrounds*, never the caret: a
-        // cursor cell's swapped color would otherwise stretch down the slack
-        // below the last row and read as an oversized block cursor.
-        let bg = style_of(&cells[index], theme, false, selected).1;
+        // The filler continues the row's *backgrounds*, never the caret or
+        // the selection: a cursor cell's swapped color would stretch down the
+        // slack below the last row and read as an oversized block cursor, and
+        // the selection's rounded ends would leak a square band past the grid.
+        let bg = style_of(&cells[index], theme, false, false).1;
         let mut next = index + 1;
         while next < cells.len() {
-            let column = skip_cols.saturating_add(next as u16);
-            let selected = selection.is_some_and(|s| s.contains(column, row));
-            if style_of(&cells[next], theme, false, selected).1 != bg {
+            if style_of(&cells[next], theme, false, false).1 != bg {
                 break;
             }
             next += 1;
@@ -16630,29 +16660,19 @@ fn collect_background_runs(
     frame_width: u16,
     rendered: &[(u16, &CellData, bool)],
     theme: Theme,
-    row: u16,
-    selection: Option<Selection>,
 ) -> Vec<(u16, u16, gpui::Rgba)> {
-    // The cursor is not a run: it paints on top as its own rounded block
-    // (`cursor_block`), so the cell under its corners keeps the row's fill.
-    let bg_at = |column: u16, cell: &CellData| {
-        style_of(
-            cell,
-            theme,
-            false,
-            selection.is_some_and(|s| s.contains(column, row)),
-        )
-        .1
-    };
+    // Neither the cursor nor the selection is a run: each paints on top as
+    // its own rounded shape, so the cells under their corners keep the row's
+    // fill.
+    let bg_at = |cell: &CellData| style_of(cell, theme, false, false).1;
     let mut runs = Vec::new();
     let mut index = 0usize;
     while index < rendered.len() {
         let (start_column, cell, _) = rendered[index];
-        let bg = bg_at(start_column, cell);
+        let bg = bg_at(cell);
         let mut next = index + 1;
         while next < rendered.len() {
-            let (column, cell, _) = rendered[next];
-            if bg_at(column, cell) != bg {
+            if bg_at(rendered[next].1) != bg {
                 break;
             }
             next += 1;
@@ -16670,6 +16690,26 @@ fn collect_background_runs(
         index = next;
     }
     runs
+}
+
+/// Which corners of a row's selection `span` (start, exclusive end) round,
+/// as top-left, top-right, bottom-right, bottom-left. A corner stays square
+/// where the row above or below covers it, so the edge runs on into that
+/// row's span instead of pinching in at every line.
+fn selection_corners(
+    span: (u16, u16),
+    above: Option<(u16, u16)>,
+    below: Option<(u16, u16)>,
+) -> [bool; 4] {
+    let (start, end) = span;
+    let covers_left = |side: Option<(u16, u16)>| side.is_some_and(|(a, b)| a <= start && start < b);
+    let covers_right = |side: Option<(u16, u16)>| side.is_some_and(|(a, b)| a < end && end <= b);
+    [
+        !covers_left(above),
+        !covers_right(above),
+        !covers_right(below),
+        !covers_left(below),
+    ]
 }
 
 /// How far (as an RGB distance, 0..=sqrt(3)) from the daemon's base surface a
@@ -17686,7 +17726,7 @@ mod tests {
                 other => other,
             };
         }
-        let spans = bottom_fill_spans(&frame, ZOOM_BADGE_ROW, theme, None, 2, 10);
+        let spans = bottom_fill_spans(&frame, ZOOM_BADGE_ROW, theme, 2, 10);
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].1, 9);
         assert_eq!(spans[0].2, theme::resolve(pane, theme.bg, &theme.ansi));
@@ -17871,7 +17911,7 @@ mod tests {
         // First visible row: two default cells, then two red ones.
         frame.cells[2 * 4 + 2].bg = 0x0100_0001;
         frame.cells[2 * 4 + 3].bg = 0x0100_0001;
-        let spans = bottom_fill_spans(&frame, 2, theme, None, 0, 4);
+        let spans = bottom_fill_spans(&frame, 2, theme, 0, 4);
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].0, 0);
         assert_eq!(spans[0].1, 2);
@@ -17885,6 +17925,33 @@ mod tests {
     }
 
     #[test]
+    fn selection_rounds_only_its_outer_corners() {
+        // One line: every corner rounds.
+        assert_eq!(selection_corners((2, 6), None, None), [true; 4]);
+        // A stream over three lines of a 10-wide grid: the first line opens
+        // at column 4, the middle runs edge to edge, the last stops at 3.
+        // The inner corners where a line meets a wider one stay square.
+        let (first, middle, last) = ((4, 10), (0, 10), (0, 3));
+        assert_eq!(
+            selection_corners(first, None, Some(middle)),
+            [true, true, false, false]
+        );
+        assert_eq!(
+            selection_corners(middle, Some(first), Some(last)),
+            [true, false, true, false]
+        );
+        assert_eq!(
+            selection_corners(last, Some(middle), None),
+            [false, false, true, true]
+        );
+        // Two lines that do not overlap only touch at a point: both stay round.
+        assert_eq!(
+            selection_corners((5, 10), None, Some((0, 5))),
+            [true, true, true, true]
+        );
+    }
+
+    #[test]
     fn bottom_fill_spans_never_extend_the_caret() {
         let theme = Theme::default();
         let mut frame = FrameData::blank(4, 4, 0, 0);
@@ -17893,7 +17960,7 @@ mod tests {
         frame.cells[2 * 4 + 1].fg = 0x0100_0001;
         frame.cursor = Some((1, 2));
         frame.cursor_visible = true;
-        let spans = bottom_fill_spans(&frame, 2, theme, None, 0, 4);
+        let spans = bottom_fill_spans(&frame, 2, theme, 0, 4);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].2, theme.bg);
     }
@@ -17918,7 +17985,7 @@ mod tests {
             collect_runs(frame.width, &rendered, theme, 0, None, 1.0).len(),
             4
         );
-        let background = collect_background_runs(frame.width, &rendered, theme, 0, None);
+        let background = collect_background_runs(frame.width, &rendered, theme);
         assert_eq!(background.len(), 1);
         assert_eq!(background[0], (0, 4, theme.bg));
     }
@@ -18022,7 +18089,13 @@ mod tests {
     fn tab_label_falls_back_to_cwd() {
         assert_eq!(tab_label("", None, "", "~/work/pilus", false), "~/w/pilus");
         assert_eq!(tab_label("  ", Some(" "), "", "~", false), "~");
-        let long = tab_label("", None, "", "~/work/a-directory-name-that-will-not-fit", false);
+        let long = tab_label(
+            "",
+            None,
+            "",
+            "~/work/a-directory-name-that-will-not-fit",
+            false,
+        );
         assert!(long.ends_with('…'));
     }
 

@@ -746,6 +746,36 @@ pub fn run_main() -> Result<()> {
     // task only sees them when the clock advances and tasks are drained.
     settle(&mut cx, 80);
     capture(&mut cx, window.into(), "main")?;
+    // A drag over a few lines: one outline, rounded only at its outer corners.
+    {
+        use super::selection::{Cell, Selection};
+        cx.update_window(window.into(), |_, window, app| {
+            view.update(app, |view, cx| {
+                // Measured from the visible grid: the dock columns under the
+                // sidebar would clip a fixed cell to whole lines.
+                let visible = view.visible_bounds(window);
+                let at = |column: u16, row: u16| Cell {
+                    column: visible.left + column,
+                    row: visible.top + row,
+                };
+                let mut selection = Selection::within(at(12, 2), Some(visible));
+                selection.move_cursor(at(8, 5));
+                view.selection = Some(selection);
+                view.selection_panes = view.shown_panes().panes().to_vec();
+                cx.notify();
+            });
+        })
+        .ok();
+        settle(&mut cx, 4);
+        capture(&mut cx, window.into(), "main-terminal-selection")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.selection = None;
+                cx.notify();
+            });
+        });
+        settle(&mut cx, 2);
+    }
     // A screenshot dragged in from outside, held over the terminal: a ring
     // traces the grid, since a release pastes the image's path into the pane.
     {

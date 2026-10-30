@@ -4,11 +4,17 @@
 # the "build NN" commits do): App Store Connect rejects a build number it has
 # already seen, so a push that doesn't bump it fails at the upload step.
 #
-# Signing is Xcode's cloud-managed signing, driven by an App Store Connect API
-# key, so no certificate or profile lives in the repo or in secrets. Secrets:
-#   ASC_KEY_ID      key id of an API key with the App Manager (or Admin) role
-#   ASC_ISSUER_ID   issuer id shown above the key list
-#   ASC_KEY_P8      the full contents of the downloaded AuthKey_<id>.p8
+# Signing is Xcode's automatic signing, driven by an App Store Connect API key.
+# A runner starts with an empty keychain, so without a certificate of our own
+# Xcode would mint a new Apple Development one every run and hit Apple's cap.
+# We import one fixed Development certificate into a throwaway keychain so it
+# is reused; the App Store export is cloud-managed and needs no local key.
+# Secrets:
+#   ASC_KEY_ID          key id of an API key with the App Manager (or Admin) role
+#   ASC_ISSUER_ID       issuer id shown above the key list
+#   ASC_KEY_P8          the full contents of the downloaded AuthKey_<id>.p8
+#   DEV_CERT_P12_BASE64 base64 of the Apple Development certificate exported as .p12
+#   DEV_CERT_P12_PASSWORD the password chosen at export
 
 name: TestFlight
 
@@ -40,15 +46,38 @@ jobs:
       ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
       ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
       ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      DEV_CERT_P12_BASE64: ${{ secrets.DEV_CERT_P12_BASE64 }}
+      DEV_CERT_P12_PASSWORD: ${{ secrets.DEV_CERT_P12_PASSWORD }}
       BUILD_NUMBER: ${{ inputs.build_number }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Check secrets
         run: |
-          for v in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+          for v in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 DEV_CERT_P12_BASE64 DEV_CERT_P12_PASSWORD; do
             [ -n "${!v}" ] || { echo "::error::secret $v is not set"; exit 1; }
           done
+
+      - name: Import the signing certificate
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_pw=$(uuidgen)
+          p12="$RUNNER_TEMP/dev-cert.p12"
+          printf '%s' "$DEV_CERT_P12_BASE64" | base64 --decode > "$p12"
+          security create-keychain -p "$keychain_pw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_pw" "$keychain"
+          security import "$p12" -P "$DEV_CERT_P12_PASSWORD" -f pkcs12 \
+            -T /usr/bin/codesign -T /usr/bin/security -k "$keychain"
+          # Lets codesign use the key without a GUI prompt, which would hang CI.
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_pw" "$keychain"
+          # Put it first in the search list, keeping the existing keychains.
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+          rm -f "$p12"
+          security find-identity -v -p codesigning "$keychain"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         run: |
@@ -116,6 +145,10 @@ jobs:
           path: ${{ runner.temp }}/Pilus.xcarchive
           retention-days: 3
 
-      - name: Remove the API key
+      - name: Remove the API key and signing keychain
         if: always()
-        run: rm -rf "$RUNNER_TEMP/asc"
+        run: |
+          rm -rf "$RUNNER_TEMP/asc"
+          if [ -n "${SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$SIGNING_KEYCHAIN" || true
+          fi

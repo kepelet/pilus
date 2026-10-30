@@ -5,7 +5,15 @@
 
 set -eu
 
-export PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# Use the rustup proxy with the toolchain pinned in .mise.toml. Calling a
+# toolchain's own cargo directly (or whatever `stable` a CI image preinstalls)
+# skips the proxy and the iOS targets installed for the pinned version.
+RUST_VERSION=$(sed -n 's/^rust = "\(.*\)"/\1/p' "$PROJECT_DIR/../.mise.toml")
+if [ -n "$RUST_VERSION" ]; then
+    export RUSTUP_TOOLCHAIN="$RUST_VERSION"
+fi
 
 case "$PLATFORM_NAME" in
     iphoneos)
@@ -29,6 +37,10 @@ PROFILE=""
 if [ "${CONFIGURATION:-Debug}" = "Release" ]; then
     PROFILE="--release"
 fi
+
+# No-op when the target is already installed; saves a "can't find crate for
+# `core`" failure on a fresh machine.
+rustup target add "$TARGET"
 
 cargo build --manifest-path "$PROJECT_DIR/../Cargo.toml" \
     -p pilus-mobile --target "$TARGET" $PROFILE

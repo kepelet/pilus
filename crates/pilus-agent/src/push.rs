@@ -368,9 +368,19 @@ impl AttentionWatch {
             if self.seeded {
                 let was = self.seen.get(&pane).map(String::as_str);
                 if status == "blocked" && was != Some("blocked") {
-                    fresh.push(Alert::from_agent(Kind::Blocked, &self.machine, &pane, agent));
+                    fresh.push(Alert::from_agent(
+                        Kind::Blocked,
+                        &self.machine,
+                        &pane,
+                        agent,
+                    ));
                 } else if status == "done" && was == Some("working") {
-                    fresh.push(Alert::from_agent(Kind::Finished, &self.machine, &pane, agent));
+                    fresh.push(Alert::from_agent(
+                        Kind::Finished,
+                        &self.machine,
+                        &pane,
+                        agent,
+                    ));
                 }
             }
             now.insert(pane, status);
@@ -756,9 +766,15 @@ mod tests {
     fn the_body_falls_back_from_session_title_to_alias_to_workspace() {
         let mut bare = agent("1", "blocked");
         bare["agent_session_title"] = json!("");
-        assert_eq!(Alert::from_agent(Kind::Blocked, "local", "1", &bare).body, "fixer");
+        assert_eq!(
+            Alert::from_agent(Kind::Blocked, "local", "1", &bare).body,
+            "fixer"
+        );
         bare["name"] = Value::Null;
-        assert_eq!(Alert::from_agent(Kind::Blocked, "local", "1", &bare).body, "pilus");
+        assert_eq!(
+            Alert::from_agent(Kind::Blocked, "local", "1", &bare).body,
+            "pilus"
+        );
     }
 
     #[test]
@@ -824,15 +840,25 @@ mod tests {
         // Two machines may use the same pane id without sharing an alert.
         let mut other = AttentionWatch::new("studio");
         other.observe(&list(&[agent("4", "working")]));
-        assert_ne!(other.observe(&list(&[agent("4", "blocked")]))[0].tag, fresh[0].tag);
+        assert_ne!(
+            other.observe(&list(&[agent("4", "blocked")]))[0].tag,
+            fresh[0].tag
+        );
     }
 
     #[test]
     fn a_long_or_non_ascii_tag_is_cut_on_a_character_boundary() {
-        let tag = tag_for(Kind::Blocked, "ünïcödé-machine-with-a-long-name-ünïcödé", "pane-12345678");
+        let tag = tag_for(
+            Kind::Blocked,
+            "ünïcödé-machine-with-a-long-name-ünïcödé",
+            "pane-12345678",
+        );
         assert!(tag.len() <= 64);
         assert!(tag.starts_with("pilus-blocked-ünïcödé"));
-        assert_eq!(tag_for(Kind::Blocked, "mac-mini", "7"), "pilus-blocked-mac-mini-7");
+        assert_eq!(
+            tag_for(Kind::Blocked, "mac-mini", "7"),
+            "pilus-blocked-mac-mini-7"
+        );
     }
 
     #[test]

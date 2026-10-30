@@ -9,6 +9,11 @@
  *
  * The relay stores nothing and logs no title or body: the text is the user's
  * session name, so it only passes through on its way to Apple.
+ *
+ * It takes no credential. Sending an alert needs the phone's device token,
+ * which only the phone, Apple and the user's own host hold, and a key baked
+ * into the open daemon would stop no one. Rate limits per caller and per token
+ * bound the rest (see `docs/agents/push.md`).
  */
 
 export interface Env {
@@ -18,6 +23,15 @@ export interface Env {
   APNS_TEAM_ID: string;
   /** The app's bundle id, which APNs calls the topic. */
   APNS_TOPIC: string;
+  /** Requests per caller IP: caps what a stranger can cost us or the APNs key. */
+  IP_LIMIT?: Limiter;
+  /** Alerts per device token: caps how hard one phone can be spammed. */
+  TOKEN_LIMIT?: Limiter;
+}
+
+/** The part of Cloudflare's rate-limit binding the relay uses. */
+export interface Limiter {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
 }
 
 /** What the host sends. */
@@ -125,10 +139,19 @@ export function createRelay(fetcher: Fetcher = fetch, now: () => number = Date.n
     if (url.pathname !== "/v1/push") return json({ error: "not_found" }, 404);
     if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 
+    // Counted before the body is read, so a flood of junk is refused cheaply.
+    const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
+    if (!(await allowed(env.IP_LIMIT, `ip:${caller}`))) {
+      return json({ error: "rate_limited" }, 429);
+    }
+
     const raw = await request.text();
     if (raw.length > BODY_LIMIT) return json({ error: "too_large" }, 413);
     const push = parse(raw);
     if (!push) return json({ error: "bad_request" }, 400);
+    if (!(await allowed(env.TOKEN_LIMIT, `token:${push.token}`))) {
+      return json({ error: "rate_limited" }, 429);
+    }
 
     let response: Response;
     try {
@@ -172,6 +195,20 @@ function parse(raw: string): PushRequest | null {
   }
   if (sandbox !== undefined && typeof sandbox !== "boolean") return null;
   return { token, sandbox: sandbox === true, title, body, collapseId: collapse_id };
+}
+
+/**
+ * Whether `limiter` lets `key` through. No binding (tests, local dev) or a
+ * limiter that errors lets it through: a missed alert costs the user more
+ * than a few extra requests cost us.
+ */
+async function allowed(limiter: Limiter | undefined, key: string): Promise<boolean> {
+  if (!limiter) return true;
+  try {
+    return (await limiter.limit({ key })).success;
+  } catch {
+    return true;
+  }
 }
 
 async function reasonOf(response: Response): Promise<string | null> {

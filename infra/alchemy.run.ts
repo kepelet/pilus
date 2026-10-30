@@ -47,6 +47,17 @@ export default Alchemy.Stack(
         APNS_KEY_ID: Config.Redacted("PILUS_APNS_KEY_ID"),
         APNS_TEAM_ID: Config.Redacted("PILUS_APNS_TEAM_ID"),
         APNS_TOPIC: "com.kepelet.pilus",
+        // The relay takes no credential, so these bound abuse. A host sends a
+        // handful of alerts a minute; both limits leave it room. Cloudflare
+        // counts per location, so they are approximate.
+        IP_LIMIT: Cloudflare.RateLimit("IP_LIMIT", {
+          namespaceId: 1001,
+          simple: { limit: 30, period: 60 },
+        }),
+        TOKEN_LIMIT: Cloudflare.RateLimit("TOKEN_LIMIT", {
+          namespaceId: 1002,
+          simple: { limit: 20, period: 60 },
+        }),
       },
     });
 

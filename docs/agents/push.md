@@ -65,5 +65,13 @@ step; APNs caps the id at 64 bytes.
 - `devices.json` stays the only authority. A registration is dropped when its
   device is revoked (checked before every send).
 - Never log a token, a title or a body. The relay logs none either.
+- The relay takes no credential, by decision. Sending needs the device token,
+  which only the phone, Apple and the user's host hold; a shared secret in the
+  daemon would ship in every copy and stop no one. Two Cloudflare rate limits
+  in `infra/alchemy.run.ts` bound the rest: 30 requests a minute per caller IP
+  (cost, and the APNs key's standing) and 20 a minute per token (spam to one
+  phone). A limiter that errors lets the alert through. The host treats a 429
+  as a failed send, not a gone phone. If abuse shows up, the next step is a
+  per-host credential the relay issues and verifies, not a shared key.
 - `push.json` is disposable: phones register again on connect, so a file that
   does not decode starts empty rather than blocking the daemon.

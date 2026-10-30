@@ -173,4 +173,54 @@ describe("push relay", () => {
     expect((await relay(new Request("https://push.test/v1/push"), env)).status).toBe(405);
     expect((await relay(new Request("https://push.test/"), env)).status).toBe(404);
   });
+
+  /** A limiter that allows `budget` calls per key and records the keys. */
+  function limiter(budget: number) {
+    const seen = new Map<string, number>();
+    return {
+      seen,
+      limit: async ({ key }: { key: string }) => {
+        seen.set(key, (seen.get(key) ?? 0) + 1);
+        return { success: (seen.get(key) ?? 0) <= budget };
+      },
+    };
+  }
+
+  test("a caller over its budget is refused before APNs is called", async () => {
+    const ip = limiter(1);
+    const env = { ...(await testEnv()), IP_LIMIT: ip };
+    const { calls, fetcher } = recorder([]);
+    const relay = createRelay(fetcher);
+    const from = (address: string) => {
+      const request = push();
+      request.headers.set("cf-connecting-ip", address);
+      return request;
+    };
+    expect((await relay(from("192.0.2.1"), env)).status).toBe(200);
+    expect((await relay(from("192.0.2.1"), env)).status).toBe(429);
+    expect((await relay(from("192.0.2.2"), env)).status).toBe(200);
+    expect(calls.length).toBe(2);
+    expect([...ip.seen.keys()]).toEqual(["ip:192.0.2.1", "ip:192.0.2.2"]);
+  });
+
+  test("one token over its budget is refused whoever sends it", async () => {
+    const env = { ...(await testEnv()), TOKEN_LIMIT: limiter(1) };
+    const { calls, fetcher } = recorder([]);
+    const relay = createRelay(fetcher);
+    expect((await relay(push(), env)).status).toBe(200);
+    expect((await relay(push(), env)).status).toBe(429);
+    expect((await relay(push({ token: "cd".repeat(32) }), env)).status).toBe(200);
+    expect(calls.length).toBe(2);
+  });
+
+  test("a limiter that fails lets the alert through", async () => {
+    const broken = {
+      limit: async () => {
+        throw new Error("down");
+      },
+    };
+    const env = { ...(await testEnv()), IP_LIMIT: broken, TOKEN_LIMIT: broken };
+    const relay = createRelay(recorder([]).fetcher);
+    expect((await relay(push(), env)).status).toBe(200);
+  });
 });

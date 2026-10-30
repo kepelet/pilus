@@ -372,7 +372,15 @@ struct ResizeOwed {
     last: Instant,
     /// Whether the active bridge is owed it too (a remote one is).
     active: bool,
+    /// The size the hidden bridges held when the first change happened.
+    from: GridSize,
+    /// The size the active bridge holds: `from`, unless it was sent one
+    /// since (a switch or a resync).
+    active_from: GridSize,
 }
+
+/// Columns, rows, and cell pixels: everything a `Resize` carries.
+type GridSize = (u16, u16, (u16, u16));
 
 gpui::actions!([
     /// Open the native Appearances window.
@@ -3013,6 +3021,12 @@ impl PilusView {
         }
     }
 
+    /// The window's current grid size, for telling a real change from one
+    /// that came back.
+    fn grid_size(&self) -> GridSize {
+        (self.cols, self.rows, self.sent_cell)
+    }
+
     /// The window's current grid size, as the daemon takes it.
     fn size_message(&self) -> ClientMessage {
         ClientMessage::Resize {
@@ -3026,8 +3040,10 @@ impl PilusView {
     /// Send the current size to the active bridge, settling any batched size
     /// still owed to it so the batch does not send it twice.
     fn send_active_size(&mut self) {
+        let size = self.grid_size();
         if let Some(owed) = self.resize_owed.as_mut() {
             owed.active = false;
+            owed.active_from = size;
         }
         self.send_active(self.size_message());
     }
@@ -3045,9 +3061,28 @@ impl PilusView {
             return;
         }
         self.resize_owed = None;
+        // A size that wandered and came back is one the bridge already has,
+        // and any resize, even to the same size, costs it a reflow and a
+        // full frame down the link.
+        let size = self.grid_size();
+        let active = owed.active && owed.active_from != size;
+        let hidden = owed.from != size;
+        if !active && !hidden {
+            return;
+        }
+        tracing::debug!(
+            cols = self.cols,
+            rows = self.rows,
+            active,
+            hidden,
+            "batched resize sent"
+        );
         let resize = self.size_message();
-        if owed.active {
+        if active {
             self.send_active(resize.clone());
+        }
+        if !hidden {
+            return;
         }
         // Suspended endpoints keep their panes and PTY sizes, so a window
         // resized while they are hidden would leave them reflowing content
@@ -12510,20 +12545,24 @@ impl PilusView {
         }
     }
 
-    /// Daemon columns the dock will hold once the toggle has landed. While
-    /// the snapshot is held `skipped_cols` still reads the pre-toggle dock,
-    /// so a size computed from it is off by the dock's width and the daemon
-    /// reflows to it, then again when the live frame releases the freeze.
+    /// Daemon columns the size sent to the daemon counts for its dock: the
+    /// same dock the card is offset by (`sidebar_px`), so the two cancel and
+    /// the daemon's width follows the window alone.
+    ///
+    /// Not the frame's dock (`skipped_cols`). The server sends `ShellDock`
+    /// before the frame drawn with it, so after a dock change the card has
+    /// moved by the new width while the frame still holds the old one. Mixing
+    /// the two asked for a width off by the difference; on a slow link that
+    /// outlived the resize batch, the daemon reflowed to it, and reflowed back
+    /// once the frame landed. The same held during a sidebar freeze, when the
+    /// snapshot keeps the pre-toggle dock.
     fn settled_skip_cols(&self) -> u16 {
-        if self.sidebar_freeze.is_none() {
-            return self.skipped_cols();
-        }
-        if !self.sidebar_visible {
+        if self.luvus_missing() {
             return 0;
         }
         match self.sidebar_dock() {
-            Some(dock) if dock.x == 0 => dock.width,
-            _ => self.skipped_cols(),
+            Some(dock) if dock.x == 0 => (f32::from(dock.width) * self.sidebar_open).round() as u16,
+            _ => 0,
         }
     }
 
@@ -15235,6 +15274,7 @@ impl PilusView {
         if cols == self.cols && rows == self.rows && cell == self.sent_cell {
             return;
         }
+        let from = self.grid_size();
         self.cols = cols;
         self.rows = rows;
         self.sent_cell = cell;
@@ -15252,6 +15292,8 @@ impl PilusView {
             first: now,
             last: now,
             active: false,
+            from,
+            active_from: from,
         });
         owed.last = now;
         owed.active |= remote;

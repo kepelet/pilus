@@ -333,6 +333,9 @@ impl Stream {
     /// [`Error::NotFound`].
     pub fn connect_tcp(address: &str) -> Result<Self> {
         let stream = std::net::TcpStream::connect(address)?;
+        // Keys and resizes are small writes; Nagle would hold each one back
+        // until the previous is acknowledged, a full round trip on a slow link.
+        stream.set_nodelay(true)?;
         Ok(Self {
             inner: Inner::Tcp(stream),
         })

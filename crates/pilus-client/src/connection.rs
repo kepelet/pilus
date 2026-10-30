@@ -8,12 +8,13 @@
 //! 4. if `Ready::probe_terminal` is set, the client replies with
 //!    [`ClientMessage::TerminalColors`] before the server will stream frames.
 
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use pilus_protocol::{
     ClientMessage, FALLBACK_PROTOCOL_VERSION, PROTOCOL_VERSION, ServerMessage, ShellDockLayout,
     SurfaceInterest, set_decode_version,
@@ -61,6 +62,11 @@ const BURST_SETTLE: Duration = Duration::from_millis(3);
 /// Longest a burst is held, so continuous output still streams at display
 /// rate instead of waiting for a quiet gap that never comes.
 const BURST_HOLD: Duration = Duration::from_millis(12);
+/// Longest a burst waits on a message that is part-way off the wire. A local
+/// socket finishes a message in microseconds and never reaches this; a slow
+/// link can spend tens of milliseconds on one large repaint, and painting the
+/// clear before it is the flicker.
+const BURST_HOLD_RECEIVING: Duration = Duration::from_millis(50);
 /// Read-side buffer, so a frame costs one syscall rather than two per
 /// message (length prefix, then body).
 const READ_BUFFER: usize = 64 * 1024;
@@ -157,8 +163,9 @@ impl Connection {
 
         spawn_writer(Arc::clone(&stream), outbound_rx);
         let (raw_tx, raw_rx) = unbounded::<ClientEvent>();
-        spawn_reader(Arc::clone(&stream), raw_tx, version);
-        spawn_coalescer(raw_rx, inbound_tx.clone(), Arc::clone(&gate));
+        let receiving = Arc::new(AtomicBool::new(false));
+        spawn_reader(Arc::clone(&stream), raw_tx, version, Arc::clone(&receiving));
+        spawn_coalescer(raw_rx, inbound_tx.clone(), Arc::clone(&gate), receiving);
 
         inbound_tx
             .send(ClientEvent::Ready {
@@ -349,7 +356,12 @@ fn spawn_writer(stream: Arc<Stream>, outbound: Receiver<ClientMessage>) {
         .ok();
 }
 
-fn spawn_reader(stream: Arc<Stream>, inbound: Sender<ClientEvent>, version: u32) {
+fn spawn_reader(
+    stream: Arc<Stream>,
+    inbound: Sender<ClientEvent>,
+    version: u32,
+    receiving: Arc<AtomicBool>,
+) {
     thread::Builder::new()
         .name("pilus-reader".into())
         .spawn(move || {
@@ -358,8 +370,19 @@ fn spawn_reader(stream: Arc<Stream>, inbound: Sender<ClientEvent>, version: u32)
             set_decode_version(version);
             let mut reader = BufReader::with_capacity(READ_BUFFER, &*stream);
             loop {
+                // Wait for the next message's first bytes, then mark it as on
+                // the wire until it decodes. An error here resurfaces from
+                // `read_message`, which reports the disconnect.
+                if reader.buffer().is_empty() {
+                    let _ = reader.fill_buf();
+                }
+                receiving.store(true, Ordering::Release);
                 match pilus_protocol::read_message::<_, ServerMessage>(&mut reader) {
                     Ok(message) => {
+                        // Bytes left over belong to a message already arriving.
+                        // Publish that before the hand-off, so the coalescer
+                        // reads the flag that matches the event it just got.
+                        receiving.store(!reader.buffer().is_empty(), Ordering::Release);
                         if inbound.send(ClientEvent::Message(message)).is_err() {
                             break;
                         }
@@ -381,20 +404,47 @@ fn spawn_reader(stream: Arc<Stream>, inbound: Sender<ClientEvent>, version: u32)
 /// Forward the reader's events in bursts: everything that arrives within
 /// [`BURST_SETTLE`] of the previous event, up to [`BURST_HOLD`] in all,
 /// goes out together under `gate`. A disconnect flushes at once.
-fn spawn_coalescer(raw: Receiver<ClientEvent>, inbound: Sender<ClientEvent>, gate: Arc<Mutex<()>>) {
+///
+/// While `receiving` says a message is part-way off the wire, the link is not
+/// quiet, whatever the settle timer says: a slow link can take tens of
+/// milliseconds to deliver the repaint that follows a clear. The burst waits
+/// for that message, up to [`BURST_HOLD_RECEIVING`], and past [`BURST_HOLD`]
+/// it takes only that one, so steady output still streams.
+fn spawn_coalescer(
+    raw: Receiver<ClientEvent>,
+    inbound: Sender<ClientEvent>,
+    gate: Arc<Mutex<()>>,
+    receiving: Arc<AtomicBool>,
+) {
     thread::Builder::new()
         .name("pilus-coalesce".into())
         .spawn(move || {
             while let Ok(first) = raw.recv() {
                 let mut burst = vec![first];
-                let deadline = Instant::now() + BURST_HOLD;
+                let start = Instant::now();
+                let hold = start + BURST_HOLD;
+                let stretch = start + BURST_HOLD_RECEIVING;
                 while !matches!(burst.last(), Some(ClientEvent::Disconnected { .. })) {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
+                    let now = Instant::now();
+                    let mid_message = receiving.load(Ordering::Acquire);
+                    let held = now >= hold;
+                    let wait = match (held, mid_message) {
+                        (false, false) => (hold - now).min(BURST_SETTLE),
+                        (false, true) => hold - now,
+                        (true, true) => stretch.saturating_duration_since(now),
+                        (true, false) => break,
+                    };
+                    if wait.is_zero() {
                         break;
                     }
-                    match raw.recv_timeout(left.min(BURST_SETTLE)) {
-                        Ok(event) => burst.push(event),
+                    match raw.recv_timeout(wait) {
+                        Ok(event) => {
+                            burst.push(event);
+                            if held {
+                                break;
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) if receiving.load(Ordering::Acquire) => {}
                         Err(_) => break,
                     }
                 }
@@ -420,13 +470,70 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    #[test]
-    fn a_burst_is_forwarded_whole() {
+    fn notify(text: &str) -> ClientEvent {
+        ClientEvent::Message(ServerMessage::Notify(text.to_string()))
+    }
+
+    /// A coalescer fed by hand: the raw sender, the window's queue, the gate
+    /// and the reader's mid-message flag.
+    fn coalescer() -> (
+        Sender<ClientEvent>,
+        Receiver<ClientEvent>,
+        Arc<Mutex<()>>,
+        Arc<AtomicBool>,
+    ) {
         let (raw_tx, raw_rx) = unbounded();
         let (inbound_tx, inbound_rx) = unbounded();
         let gate = Arc::new(Mutex::new(()));
-        spawn_coalescer(raw_rx, inbound_tx, Arc::clone(&gate));
-        let notify = |text: &str| ClientEvent::Message(ServerMessage::Notify(text.to_string()));
+        let receiving = Arc::new(AtomicBool::new(false));
+        spawn_coalescer(
+            raw_rx,
+            inbound_tx,
+            Arc::clone(&gate),
+            Arc::clone(&receiving),
+        );
+        (raw_tx, inbound_rx, gate, receiving)
+    }
+
+    #[test]
+    fn a_slow_repaint_lands_with_its_clear() {
+        let (raw_tx, inbound_rx, _gate, receiving) = coalescer();
+        raw_tx.send(notify("clear")).expect("send");
+        // The repaint is on the wire for longer than a quiet link's hold.
+        receiving.store(true, Ordering::Release);
+        thread::sleep(BURST_HOLD * 2);
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "the clear waits for the message still arriving"
+        );
+        receiving.store(false, Ordering::Release);
+        raw_tx.send(notify("repaint")).expect("send");
+        let first = inbound_rx
+            .recv_timeout(BURST_HOLD_RECEIVING)
+            .expect("burst");
+        let second = inbound_rx.recv_timeout(BURST_HOLD).expect("burst");
+        assert!(
+            matches!(first, ClientEvent::Message(ServerMessage::Notify(text)) if text == "clear")
+        );
+        assert!(
+            matches!(second, ClientEvent::Message(ServerMessage::Notify(text)) if text == "repaint")
+        );
+    }
+
+    #[test]
+    fn a_stalled_message_does_not_hold_the_screen_forever() {
+        let (raw_tx, inbound_rx, _gate, receiving) = coalescer();
+        receiving.store(true, Ordering::Release);
+        raw_tx.send(notify("clear")).expect("send");
+        let landed = inbound_rx
+            .recv_timeout(BURST_HOLD_RECEIVING * 3)
+            .expect("the burst flushes at the stretched hold");
+        assert!(matches!(landed, ClientEvent::Message(_)));
+    }
+
+    #[test]
+    fn a_burst_is_forwarded_whole() {
+        let (raw_tx, inbound_rx, gate, _receiving) = coalescer();
         raw_tx.send(notify("clear")).expect("send");
         thread::sleep(Duration::from_millis(1));
         raw_tx.send(notify("repaint")).expect("send");

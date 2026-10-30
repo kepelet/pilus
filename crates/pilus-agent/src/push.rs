@@ -8,23 +8,24 @@
 //!    [`crate::hub`]); [`PushStore`] keeps it, per enrolled device, in
 //!    `push.json` beside `devices.json`.
 //! 2. [`run`] follows this machine's Luvus event feed, but only while a token
-//!    is registered, and reads `agent.list` after agent activity. A
-//!    [`BlockedWatch`] folds each list into the agents that just started
-//!    waiting, the host-side twin of the phone's `AttentionWatch`.
+//!    is registered, and reads `agent.list` after agent activity. An
+//!    [`AttentionWatch`] folds each list into the agents that just started
+//!    waiting or finished a turn, the host-side twin of the phone's
+//!    `AttentionWatch`.
 //! 3. Each such agent becomes one POST to the push relay (the Worker in
 //!    `infra/push`), which holds the Apple key and talks to APNs.
 //!
 //! A saved SSH machine has no event feed (`luvus uhp proxy` carries one request
 //! per SSH call), so [`run_remotes`] asks each one for `agent.list` on a slow
 //! timer instead, as the desktop app does for a machine it is not showing. The
-//! same [`BlockedWatch`] folds the replies, one per machine.
+//! same [`AttentionWatch`] folds the replies, one per machine.
 //!
 //! The alert carries the agent's name and the session's title, nothing else.
 //! A relay that answers 410 means the phone dropped its token, so the
 //! registration goes too. Registrations also go when their device is revoked:
 //! `devices.json` stays the only authority on who may be reached.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -254,24 +255,33 @@ fn parse(bytes: &[u8]) -> Option<BTreeMap<String, Registration>> {
     )
 }
 
-/// An agent that has just started waiting on the user.
+/// What an alert is about.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Kind {
+    /// The agent started waiting on the user.
+    Blocked,
+    /// The agent finished a turn it was running.
+    Finished,
+}
+
+/// An agent that has just started waiting on the user, or just finished.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Blocked {
-    /// Stable per pane. The phone uses it to replace an older alert and to
-    /// take the alert down once the agent is unblocked, so it must match the
-    /// tag in `AttentionWatch.swift`.
+pub struct Alert {
+    /// Stable per pane and kind. The phone uses it to replace an older alert
+    /// and to take the alert down once the agent moves on, so it must match
+    /// the tag in `AttentionWatch.swift`.
     pub tag: String,
     pub title: String,
     pub body: String,
 }
 
-impl Blocked {
-    fn from_agent(machine: &str, pane: &str, agent: &Value) -> Self {
-        let kind = text(agent, "agent");
-        let who = if kind.is_empty() {
+impl Alert {
+    fn from_agent(kind: Kind, machine: &str, pane: &str, agent: &Value) -> Self {
+        let agent_kind = text(agent, "agent");
+        let who = if agent_kind.is_empty() {
             "An agent".to_string()
         } else {
-            pilus_client::kind_label(&kind)
+            pilus_client::kind_label(&agent_kind)
         };
         // The session's own title when the agent reports one, then the pane's
         // alias, then the workspace: the same order the phone lists them in.
@@ -280,17 +290,26 @@ impl Blocked {
             .map(|key| text(agent, key))
             .find(|value| !value.is_empty())
             .unwrap_or_default();
+        let title = match kind {
+            Kind::Blocked => format!("{who} is waiting your input"),
+            Kind::Finished => format!("{who} finished"),
+        };
         Self {
-            tag: tag_for(machine, pane),
-            title: format!("{who} is waiting your input"),
+            tag: tag_for(kind, machine, pane),
+            title,
             body: session,
         }
     }
 }
 
 /// The collapse id for one pane, the tag `AttentionWatch.swift` builds too.
-fn tag_for(machine: &str, pane: &str) -> String {
-    let mut tag = format!("pilus-blocked-{machine}-{pane}");
+/// Blocked and finished alerts have their own, so one never replaces the other.
+fn tag_for(kind: Kind, machine: &str, pane: &str) -> String {
+    let word = match kind {
+        Kind::Blocked => "blocked",
+        Kind::Finished => "done",
+    };
+    let mut tag = format!("pilus-{word}-{machine}-{pane}");
     // `apns-collapse-id` allows 64 bytes. A machine id is the user's to name,
     // so cut on a character boundary rather than panic in the middle of one.
     let mut end = tag.len().min(64);
@@ -301,52 +320,62 @@ fn tag_for(machine: &str, pane: &str) -> String {
     tag
 }
 
-/// Spots the moment an agent starts waiting, from successive `agent.list`
-/// replies. It touches no network, so the rules are testable on their own.
+/// Spots the moment an agent starts waiting or finishes, from successive
+/// `agent.list` replies. It touches no network, so the rules are testable on
+/// their own.
 #[derive(Debug)]
-pub struct BlockedWatch {
+pub struct AttentionWatch {
     /// The machine the lists come from; it names the alert's tag.
     machine: String,
-    /// An agent already blocked when the first list arrives is old news, not
-    /// an alert.
+    /// An agent already blocked or done when the first list arrives is old
+    /// news, not an alert.
     seeded: bool,
-    blocked: BTreeSet<String>,
+    /// Last seen status per pane.
+    seen: BTreeMap<String, String>,
 }
 
-impl Default for BlockedWatch {
+impl Default for AttentionWatch {
     fn default() -> Self {
         Self::new(LOCAL)
     }
 }
 
-impl BlockedWatch {
+impl AttentionWatch {
     pub fn new(machine: impl Into<String>) -> Self {
         Self {
             machine: machine.into(),
             seeded: false,
-            blocked: BTreeSet::new(),
+            seen: BTreeMap::new(),
         }
     }
 
-    /// Fold one `agent.list` reply and return the agents that newly block.
-    pub fn observe(&mut self, list: &Value) -> Vec<Blocked> {
+    /// Fold one `agent.list` reply and return the agents that newly block or
+    /// finish. Only a turn that was running counts as finishing: an agent that
+    /// first shows up `done` is history.
+    pub fn observe(&mut self, list: &Value) -> Vec<Alert> {
         let agents = list
             .get("agents")
             .and_then(Value::as_array)
             .map_or(&[][..], Vec::as_slice);
-        let mut now = BTreeSet::new();
+        let mut now = BTreeMap::new();
         let mut fresh = Vec::new();
         for agent in agents {
             let pane = text(agent, "pane");
-            if pane.is_empty() || text(agent, "status") != "blocked" {
+            if pane.is_empty() {
                 continue;
             }
-            if self.seeded && !self.blocked.contains(&pane) {
-                fresh.push(Blocked::from_agent(&self.machine, &pane, agent));
+            let status = text(agent, "status");
+            if self.seeded {
+                let was = self.seen.get(&pane).map(String::as_str);
+                if status == "blocked" && was != Some("blocked") {
+                    fresh.push(Alert::from_agent(Kind::Blocked, &self.machine, &pane, agent));
+                } else if status == "done" && was == Some("working") {
+                    fresh.push(Alert::from_agent(Kind::Finished, &self.machine, &pane, agent));
+                }
             }
-            now.insert(pane);
+            now.insert(pane, status);
         }
-        self.blocked = now;
+        self.seen = now;
         self.seeded = true;
         fresh
     }
@@ -354,7 +383,7 @@ impl BlockedWatch {
     /// Forget everything, so the next list is old news again.
     pub fn reset(&mut self) {
         self.seeded = false;
-        self.blocked.clear();
+        self.seen.clear();
     }
 }
 
@@ -377,7 +406,7 @@ enum Delivery {
 }
 
 /// POST one alert to the relay. Blocking: callers run it off the reactor.
-fn post(relay: &str, registration: &Registration, blocked: &Blocked) -> Delivery {
+fn post(relay: &str, registration: &Registration, alert: &Alert) -> Delivery {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(SEND_TIMEOUT))
         .http_status_as_error(false)
@@ -386,9 +415,9 @@ fn post(relay: &str, registration: &Registration, blocked: &Blocked) -> Delivery
     let body = json!({
         "token": registration.token,
         "sandbox": registration.sandbox,
-        "title": blocked.title,
-        "body": blocked.body,
-        "collapse_id": blocked.tag,
+        "title": alert.title,
+        "body": alert.body,
+        "collapse_id": alert.tag,
     });
     match agent.post(relay).send_json(&body) {
         Ok(response) => match response.status().as_u16() {
@@ -400,12 +429,12 @@ fn post(relay: &str, registration: &Registration, blocked: &Blocked) -> Delivery
     }
 }
 
-/// Send `blocked` to every registered device that is still paired.
-async fn notify(store: &Arc<PushStore>, auth: &AuthState, relay: &str, blocked: &Blocked) {
+/// Send `alert` to every registered device that is still paired.
+async fn notify(store: &Arc<PushStore>, auth: &AuthState, relay: &str, alert: &Alert) {
     store.retain(|device| auth.level_of(device).is_some());
     for (device, registration) in store.snapshot() {
-        let (relay, blocked) = (relay.to_string(), blocked.clone());
-        let outcome = tokio::task::spawn_blocking(move || post(&relay, &registration, &blocked))
+        let (relay, alert) = (relay.to_string(), alert.clone());
+        let outcome = tokio::task::spawn_blocking(move || post(&relay, &registration, &alert))
             .await
             .unwrap_or_else(|error| Delivery::Failed(error.to_string()));
         match outcome {
@@ -437,7 +466,7 @@ pub async fn run(
     store: Arc<PushStore>,
     relay: String,
 ) {
-    let mut watch = BlockedWatch::default();
+    let mut watch = AttentionWatch::default();
     let mut delay = RETRY_MIN;
     loop {
         if store.is_empty() {
@@ -462,7 +491,7 @@ async fn follow(
     auth: &Arc<AuthState>,
     store: &Arc<PushStore>,
     relay: &str,
-    watch: &mut BlockedWatch,
+    watch: &mut AttentionWatch,
 ) -> Ended {
     let mut feed = match subscribe_feed(link, auth).await {
         Ok(feed) => feed,
@@ -500,19 +529,19 @@ async fn follow(
     }
 }
 
-/// Read `agent.list` and push whatever newly blocked.
+/// Read `agent.list` and push whatever newly blocked or finished.
 async fn look(
     link: &GatewayLink,
     auth: &Arc<AuthState>,
     store: &Arc<PushStore>,
     relay: &str,
-    watch: &mut BlockedWatch,
+    watch: &mut AttentionWatch,
 ) {
     let Ok(list) = gateway_request(link, auth, "agent.list", json!({})).await else {
         return;
     };
-    for blocked in watch.observe(&list) {
-        notify(store, auth, relay, &blocked).await;
+    for alert in watch.observe(&list) {
+        notify(store, auth, relay, &alert).await;
     }
 }
 
@@ -614,7 +643,7 @@ async fn poll_machine(
     store: Arc<PushStore>,
     relay: String,
 ) {
-    let mut watch = BlockedWatch::new(machine.clone());
+    let mut watch = AttentionWatch::new(machine.clone());
     let mut delay = REMOTE_POLL;
     let mut unreachable = false;
     while !store.is_empty() {
@@ -627,8 +656,8 @@ async fn poll_machine(
             Ok(Ok(list)) => {
                 unreachable = false;
                 delay = next_poll(&list);
-                for blocked in watch.observe(&list) {
-                    notify(&store, &auth, &relay, &blocked).await;
+                for alert in watch.observe(&list) {
+                    notify(&store, &auth, &relay, &alert).await;
                 }
             }
             failed => {
@@ -681,19 +710,19 @@ mod tests {
 
     #[test]
     fn an_agent_blocked_at_the_first_look_is_old_news() {
-        let mut watch = BlockedWatch::default();
+        let mut watch = AttentionWatch::default();
         assert!(watch.observe(&list(&[agent("1", "blocked")])).is_empty());
         assert!(watch.observe(&list(&[agent("1", "blocked")])).is_empty());
     }
 
     #[test]
     fn a_newly_blocked_agent_is_one_alert_with_the_agreed_text() {
-        let mut watch = BlockedWatch::default();
+        let mut watch = AttentionWatch::default();
         watch.observe(&list(&[agent("1", "working")]));
         let fresh = watch.observe(&list(&[agent("1", "blocked")]));
         assert_eq!(
             fresh,
-            [Blocked {
+            [Alert {
                 tag: "pilus-blocked-local-1".to_string(),
                 title: "Claude is waiting your input".to_string(),
                 body: "fix the flaky test".to_string(),
@@ -707,7 +736,7 @@ mod tests {
 
     #[test]
     fn unblocking_then_blocking_again_alerts_again() {
-        let mut watch = BlockedWatch::default();
+        let mut watch = AttentionWatch::default();
         watch.observe(&list(&[]));
         assert_eq!(watch.observe(&list(&[agent("1", "blocked")])).len(), 1);
         assert!(watch.observe(&list(&[agent("1", "working")])).is_empty());
@@ -716,7 +745,7 @@ mod tests {
 
     #[test]
     fn a_pane_that_vanished_while_blocked_is_forgotten() {
-        let mut watch = BlockedWatch::default();
+        let mut watch = AttentionWatch::default();
         watch.observe(&list(&[]));
         watch.observe(&list(&[agent("1", "blocked")]));
         watch.observe(&list(&[]));
@@ -727,14 +756,14 @@ mod tests {
     fn the_body_falls_back_from_session_title_to_alias_to_workspace() {
         let mut bare = agent("1", "blocked");
         bare["agent_session_title"] = json!("");
-        assert_eq!(Blocked::from_agent("local", "1", &bare).body, "fixer");
+        assert_eq!(Alert::from_agent(Kind::Blocked, "local", "1", &bare).body, "fixer");
         bare["name"] = Value::Null;
-        assert_eq!(Blocked::from_agent("local", "1", &bare).body, "pilus");
+        assert_eq!(Alert::from_agent(Kind::Blocked, "local", "1", &bare).body, "pilus");
     }
 
     #[test]
     fn numeric_pane_ids_and_unknown_kinds_still_read_well() {
-        let mut watch = BlockedWatch::default();
+        let mut watch = AttentionWatch::default();
         watch.observe(&list(&[]));
         let mut odd = agent("", "blocked");
         odd["pane"] = json!(7);
@@ -745,23 +774,65 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_that_was_running_and_is_done_is_one_finished_alert() {
+        let mut watch = AttentionWatch::default();
+        watch.observe(&list(&[agent("1", "working")]));
+        let fresh = watch.observe(&list(&[agent("1", "done")]));
+        assert_eq!(
+            fresh,
+            [Alert {
+                tag: "pilus-done-local-1".to_string(),
+                title: "Claude finished".to_string(),
+                body: "fix the flaky test".to_string(),
+            }]
+        );
+        assert!(
+            watch.observe(&list(&[agent("1", "done")])).is_empty(),
+            "still done is not a second alert"
+        );
+        // The next turn finishing alerts again.
+        watch.observe(&list(&[agent("1", "working")]));
+        assert_eq!(watch.observe(&list(&[agent("1", "done")])).len(), 1);
+    }
+
+    #[test]
+    fn an_agent_first_seen_done_or_idle_then_done_is_not_a_finish() {
+        let mut watch = AttentionWatch::default();
+        assert!(watch.observe(&list(&[agent("1", "done")])).is_empty());
+        assert!(watch.observe(&list(&[agent("2", "done")])).is_empty());
+        watch.observe(&list(&[agent("3", "idle")]));
+        assert!(watch.observe(&list(&[agent("3", "done")])).is_empty());
+        // A pane that appears already done after the first look is history too.
+        assert!(watch.observe(&list(&[agent("4", "done")])).is_empty());
+    }
+
+    #[test]
+    fn blocked_and_finished_alerts_never_share_a_tag() {
+        let blocked = tag_for(Kind::Blocked, "local", "1");
+        let finished = tag_for(Kind::Finished, "local", "1");
+        assert_eq!(blocked, "pilus-blocked-local-1");
+        assert_eq!(finished, "pilus-done-local-1");
+        assert_ne!(blocked, finished);
+    }
+
+    #[test]
     fn a_remote_machine_names_its_own_tag() {
-        let mut watch = BlockedWatch::new("mac-mini");
+        let mut watch = AttentionWatch::new("mac-mini");
         assert!(watch.observe(&list(&[agent("4", "working")])).is_empty());
         let fresh = watch.observe(&list(&[agent("4", "blocked")]));
         assert_eq!(fresh[0].tag, "pilus-blocked-mac-mini-4");
         // Two machines may use the same pane id without sharing an alert.
-        let mut other = BlockedWatch::new("studio");
+        let mut other = AttentionWatch::new("studio");
         other.observe(&list(&[agent("4", "working")]));
         assert_ne!(other.observe(&list(&[agent("4", "blocked")]))[0].tag, fresh[0].tag);
     }
 
     #[test]
     fn a_long_or_non_ascii_tag_is_cut_on_a_character_boundary() {
-        let tag = tag_for("ünïcödé-machine-with-a-long-name-ünïcödé", "pane-12345678");
+        let tag = tag_for(Kind::Blocked, "ünïcödé-machine-with-a-long-name-ünïcödé", "pane-12345678");
         assert!(tag.len() <= 64);
         assert!(tag.starts_with("pilus-blocked-ünïcödé"));
-        assert_eq!(tag_for("mac-mini", "7"), "pilus-blocked-mac-mini-7");
+        assert_eq!(tag_for(Kind::Blocked, "mac-mini", "7"), "pilus-blocked-mac-mini-7");
     }
 
     #[test]
@@ -914,8 +985,8 @@ mod tests {
             token: TOKEN.to_string(),
             sandbox: false,
         };
-        let blocked = Blocked::from_agent("local", "3", &agent("3", "blocked"));
-        assert_eq!(post(&url, &registration, &blocked), Delivery::Sent);
+        let alert = Alert::from_agent(Kind::Blocked, "local", "3", &agent("3", "blocked"));
+        assert_eq!(post(&url, &registration, &alert), Delivery::Sent);
         let request = server.join().expect("server");
         let body: Value =
             serde_json::from_str(request.split_once("\r\n\r\n").expect("body").1).expect("json");
@@ -931,13 +1002,13 @@ mod tests {
             token: TOKEN.to_string(),
             sandbox: false,
         };
-        let blocked = Blocked::from_agent("local", "3", &agent("3", "blocked"));
+        let alert = Alert::from_agent(Kind::Blocked, "local", "3", &agent("3", "blocked"));
         let (url, server) = fake_relay(410);
-        assert_eq!(post(&url, &registration, &blocked), Delivery::Gone);
+        assert_eq!(post(&url, &registration, &alert), Delivery::Gone);
         server.join().expect("server");
         let (url, server) = fake_relay(502);
         assert!(matches!(
-            post(&url, &registration, &blocked),
+            post(&url, &registration, &alert),
             Delivery::Failed(_)
         ));
         server.join().expect("server");

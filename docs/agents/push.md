@@ -28,12 +28,14 @@ agent blocks → Luvus event → pilus-agent (push.rs) → relay Worker → APNs
 - **Host** (`push.rs`). `PushStore` keeps tokens per enrolled device in
   `~/.pilus/push.json`, owner-only and written atomically. `run` holds the
   event feed **only while a token is registered**, reads `agent.list` after
-  `agent`/`pane` events (400 ms settle), and `BlockedWatch` picks out agents that
-  just became `blocked`. An agent already blocked at the first look is old news.
+  `agent`/`pane` events (400 ms settle), and `AttentionWatch` picks out agents that
+  just became `blocked` and agents that went from `working` to `done`. An agent
+  already blocked or done at the first look is old news, and so is one that shows
+  up `done` without having been seen `working`.
   A saved SSH machine has no event feed (`luvus uhp proxy` is one request per
   SSH call), so `run_remotes` polls it instead: one `agent.list` per enabled
   machine with a verified remote binary (the hub's own `ready` test), each with
-  its own `BlockedWatch`. The gap is 10 s while one of the machine's agents is
+  its own `AttentionWatch`. The gap is 10 s while one of the machine's agents is
   `working` or `blocked` and 30 s otherwise (`next_poll`). The catalog is re-read every minute. An
   unreachable machine backs off to five minutes and is logged once per outage.
   With no token registered, nothing is listed and no SSH call is made.
@@ -45,12 +47,14 @@ agent blocks → Luvus event → pilus-agent (push.rs) → relay Worker → APNs
 
 ## The alert
 
-Title `<Agent> is waiting your input`, body the session's title (else the
-pane's alias, else the workspace). The collapse id is
-`pilus-blocked-<machine>-<pane>`, with `local` or the saved machine's id, the
-same tag the app uses locally (`AttentionWatch.swift`), so a newer alert
-replaces an older one and the app can take a delivered one down once the agent
-is unblocked. Keep the two tags in step; APNs caps the id at 64 bytes, and
+Title `<Agent> is waiting your input` when an agent blocks and `<Agent> finished`
+when a running turn ends. The body is the session's title (else the pane's
+alias, else the workspace). The collapse id is `pilus-blocked-<machine>-<pane>`
+or `pilus-done-<machine>-<pane>`, with `local` or the saved machine's id, the
+same tags the app uses locally (`AttentionWatch.swift`), so a newer alert
+replaces an older one of its kind, the two kinds never replace each other, and
+the app can take a delivered one down once the agent is unblocked or starts a
+new turn. Keep the two tags in step; APNs caps the id at 64 bytes, and
 `tag_for` cuts on a character boundary because a machine id is user-named.
 
 ## Setup

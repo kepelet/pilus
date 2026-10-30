@@ -76,6 +76,14 @@ enum Notifier {
                 // Reusing the tag as the identifier makes a newer alert for
                 // the same pane replace the older one.
                 center.add(UNNotificationRequest(identifier: blocked.tag, content: content, trigger: nil))
+            case .finished(let finished):
+                guard enabled, UIApplication.shared.applicationState != .active else { continue }
+                if hostPushes { continue }
+                let content = UNMutableNotificationContent()
+                content.title = "\(finished.agent) finished"
+                content.body = finished.session
+                content.sound = .default
+                center.add(UNNotificationRequest(identifier: finished.tag, content: content, trigger: nil))
             }
         }
     }

@@ -5996,11 +5996,7 @@ impl PilusView {
                 Some(SplitAxis::Right) => layout.page_w,
                 _ => layout.content_w,
             };
-            let page_w = if self.settings.pane_ui {
-                page_w - 2.0 * pane_chrome::GAP_PX
-            } else {
-                page_w
-            };
+            let page_w = page_w - 2.0 * pane_chrome::GAP_PX;
             let page = div()
                 .flex_1()
                 .min_h(px(0.0))
@@ -6109,9 +6105,6 @@ impl PilusView {
     /// half and the terminal half keeps the grid's.
     fn inset_page(&self, page: Div) -> Div {
         let glass = self.glass_opacity();
-        if !self.settings.pane_ui {
-            return div().size_full().bg(self.chrome_fill()).child(page);
-        }
         div()
             .size_full()
             .p(px(pane_chrome::GAP_PX))
@@ -15085,11 +15078,7 @@ impl PilusView {
         };
         let (inner_w, inner_h) = (inner_w - page_w, inner_h - page_h);
         let floating = self.floating_cards();
-        let panes = if self.settings.pane_ui {
-            self.shown_panes()
-        } else {
-            pane_frames::PaneFrames::default()
-        };
+        let panes = self.shown_panes();
         // The grid's size in cells must not follow the shown layout, or
         // switching between a split tab and an unsplit one resizes the
         // daemon and reflows its panes (`pane_chrome::grid_pad`).
@@ -15161,7 +15150,7 @@ impl PilusView {
     /// sidebar match. Flush panes cover that surface, so they keep the
     /// chrome's own fill.
     fn floating_cards(&self) -> bool {
-        self.settings.pane_ui && self.settings.pane_gaps
+        self.settings.pane_gaps
     }
 
     /// The panes the daemon boxes in the shown frame; none when unsplit.
@@ -15379,15 +15368,10 @@ impl Render for PilusView {
         // With pane frames the grid takes the chrome's own fill for the cards
         // inside each pane's border, and `render_grid` lays a tinted surface
         // under them, so the gutters and margin read as pilus's container.
-        let pane_ui = self.settings.pane_ui;
-        let terminal_bg = if pane_ui {
-            theme.chrome_cell(glass)
-        } else {
-            theme.window_bg
-        };
+        let terminal_bg = theme.chrome_cell(glass);
         let grid_theme = Theme {
             bg: terminal_bg,
-            remap_bg: pane_ui.then_some(theme.bg),
+            remap_bg: Some(theme.bg),
             ..theme
         };
         // One glass layer exactly: the grid has no padding and its edge
@@ -15425,20 +15409,19 @@ impl Render for PilusView {
         } else {
             terminal_fill
         };
-        let pane_toolbar = (pane_ui && self.settings.pane_toolbar && self.toolbar_fade.shown())
-            .then(|| {
-                // The wrapper carries the fade; the bar inside keeps its
-                // own `occlude`.
-                div()
-                    .opacity(self.toolbar_fade.alpha())
-                    .child(self.pane_toolbar(cx))
-            });
+        let pane_toolbar = (self.settings.pane_toolbar && self.toolbar_fade.shown()).then(|| {
+            // The wrapper carries the fade; the bar inside keeps its
+            // own `occlude`.
+            div()
+                .opacity(self.toolbar_fade.alpha())
+                .child(self.pane_toolbar(cx))
+        });
         let panes = match self.shown_frame() {
-            Some(frame) if pane_ui => pane_frames::PaneFrames::find(
+            Some(frame) => pane_frames::PaneFrames::find(
                 frame,
                 frame.height.saturating_sub(SKIPPED_DAEMON_BOTTOM_ROWS),
             ),
-            _ => pane_frames::PaneFrames::default(),
+            None => pane_frames::PaneFrames::default(),
         };
         self.dividers = panes.dividers();
         self.column_shifts = pane_chrome::ColumnShifts::new(

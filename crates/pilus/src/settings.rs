@@ -304,19 +304,16 @@ pub struct Settings {
     /// there; turn it off for an older Luvus or one with `show_title`
     /// enabled.
     pub terminal_top_spacing: bool,
-    /// The same choice for the local daemon. Off by default, unlike remote
-    /// machines; turn it on for a Luvus that no longer draws a title row.
+    /// The same choice for the local daemon. On by default, like remote
+    /// machines; turn it off for a Luvus that still draws a title row.
     pub local_terminal_top_spacing: bool,
-    /// Draw split panes with pilus's own rounded frames in place of
-    /// the daemon's square box-drawing borders. Off keeps the daemon's.
-    pub pane_ui: bool,
-    /// Float each pane as a card with a gap between them. Off (the default),
-    /// panes sit flush and pilus draws a border around each one. Only applies with
-    /// `pane_ui`, which owns the frames.
+    /// Pane style. On is Comfortable: each pane floats as a card with a gap
+    /// between them. Off (the default) is Compact: panes sit flush and pilus
+    /// draws a border around each one. pilus always draws the frames, so this
+    /// only picks how they are spaced.
     pub pane_gaps: bool,
     /// Draw the focused pane's corner toolbar (split, zoom, close).
-    /// Off by default; only shows with `pane_ui`, which owns the frames it
-    /// sits on.
+    /// Off by default.
     pub pane_toolbar: bool,
     /// Whether the terminal cursor fades in and out. Off by default: a steady
     /// cursor needs no repaints while the window is idle.
@@ -432,8 +429,7 @@ impl Default for Settings {
             sidebar_workspace_paths: false,
             sidebar_agent_paths: false,
             terminal_top_spacing: true,
-            local_terminal_top_spacing: false,
-            pane_ui: true,
+            local_terminal_top_spacing: true,
             pane_gaps: false,
             pane_toolbar: false,
             cursor_blink: false,
@@ -974,13 +970,12 @@ mod tests {
 
     #[test]
     fn missing_top_spacing_defaults() {
-        // Files written before the toggle existed follow newer Luvus for
-        // remote machines; the local terminal stays flush with the tab strip.
+        // Files written before the toggle existed follow newer Luvus, which
+        // no longer draws a title row, for remote machines and the local one.
         let back: Settings =
             serde_json::from_str(r#"{"terminal_font":"Menlo"}"#).expect("deserialize");
         assert!(back.terminal_top_spacing);
-        assert!(!back.local_terminal_top_spacing);
-        assert!(back.pane_ui);
+        assert!(back.local_terminal_top_spacing);
         assert!(!back.pane_gaps);
         assert!(!back.pane_toolbar);
         assert!(!back.cursor_blink);
@@ -1196,8 +1191,7 @@ mod tests {
             sidebar_workspace_paths: true,
             sidebar_agent_paths: true,
             terminal_top_spacing: false,
-            local_terminal_top_spacing: true,
-            pane_ui: false,
+            local_terminal_top_spacing: false,
             pane_gaps: true,
             pane_toolbar: false,
             cursor_blink: true,

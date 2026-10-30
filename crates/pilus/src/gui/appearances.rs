@@ -1058,28 +1058,25 @@ impl AppearancesView {
             this.settings.local_terminal_top_spacing = !this.settings.local_terminal_top_spacing;
             this.publish(cx);
         }));
-        let pane_ui = style::checkbox(
-            "pilus-pane-ui",
-            self.settings.pane_ui,
-            "Use pilus pane UI",
-            self.theme,
-            size,
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.settings.pane_ui = !this.settings.pane_ui;
-            this.publish(cx);
-        }));
-        let pane_gaps = style::checkbox(
-            "pilus-pane-gaps",
-            self.settings.pane_gaps,
-            "Space panes apart",
-            self.theme,
-            size,
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.settings.pane_gaps = !this.settings.pane_gaps;
-            this.publish(cx);
-        }));
+        let pane_style = |name: &'static str, gaps: bool| -> (&'static str, bool, ModeHandler) {
+            (
+                name,
+                self.settings.pane_gaps == gaps,
+                Box::new(move |this, cx| {
+                    this.settings.pane_gaps = gaps;
+                    this.publish(cx);
+                }),
+            )
+        };
+        let pane_style = self.preset_row(
+            "Pane style",
+            "pane-style",
+            vec![
+                pane_style("Comfortable", true),
+                pane_style("Compact", false),
+            ],
+            cx,
+        );
         let cursor_blink = style::checkbox(
             "pilus-cursor-blink",
             self.settings.cursor_blink,
@@ -1091,44 +1088,41 @@ impl AppearancesView {
             this.settings.cursor_blink = !this.settings.cursor_blink;
             this.publish(cx);
         }));
-        let mut rows = div()
+        div()
             .flex()
             .flex_col()
-            .gap_2()
-            .px_3()
-            .py_1()
-            .child(pane_ui)
+            .child(pane_style)
             .child(
                 div()
+                    .px_3()
+                    .pb_1()
                     .text_size(px(self.fonts().label))
                     .text_color(self.theme.muted)
                     .child(
-                        "Draw split panes with rounded frames instead of \
-                         the daemon's square borders",
+                        "Comfortable floats each pane as a card. Compact sits \
+                         them flush with a border around each one",
                     ),
-            );
-        // The gaps are part of the frames pilus draws, so they mean nothing
-        // while the daemon's own borders are showing.
-        if self.settings.pane_ui {
-            rows = rows.child(pane_gaps).child(
+            )
+            .child(
                 div()
-                    .text_size(px(self.fonts().label))
-                    .text_color(self.theme.muted)
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .child(cursor_blink)
+                    .child(remote)
+                    .child(local)
                     .child(
-                        "Float each pane as a card. Off, panes sit flush and \
-                         pilus draws a border around each one",
+                        div()
+                            .text_size(px(self.fonts().label))
+                            .text_color(self.theme.muted)
+                            .child(
+                                "For newer Luvus without show_title. Turn off for older \
+                                 Luvus or when show_title is enabled",
+                            ),
                     ),
-            );
-        }
-        rows.child(cursor_blink).child(remote).child(local).child(
-            div()
-                .text_size(px(self.fonts().label))
-                .text_color(self.theme.muted)
-                .child(
-                    "For newer Luvus without show_title. Turn off for older Luvus \
-                         or when show_title is enabled",
-                ),
-        )
+            )
     }
 
     /// A section title, matching the weight of the list headings below.

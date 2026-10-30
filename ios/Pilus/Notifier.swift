@@ -1,13 +1,22 @@
 import UIKit
 import UserNotifications
 
-/// Local notifications for agents that start waiting on the user.
+/// Alerts for agents that start waiting on the user.
 ///
-/// iOS suspends the app soon after it leaves the foreground, and the
-/// connection to the host is peer-to-peer with no push relay, so an alert can
-/// only fire while the app is still running: in front it would duplicate the
-/// blocked dot on the list (so it is skipped), and shortly after backgrounding
-/// `BackgroundGrace` keeps the watch alive long enough to deliver one.
+/// Two paths, one text ("Claude is waiting your input", the session's name):
+///
+/// - Push. The paired host watches its agents and, through the push relay,
+///   reaches the phone even when iOS has suspended the app. The app's part is
+///   to hand the host its APNs token (`AppStore.syncPush`).
+/// - Local. The app's own watch posts the alert while it is still running. This
+///   covers a host that does not push (an older one, or one with push turned
+///   off), and machines the host only reaches over SSH. In front it would
+///   duplicate the blocked dot on the list, so it is skipped, and shortly after
+///   backgrounding `BackgroundGrace` keeps the watch alive long enough to
+///   deliver one.
+///
+/// When the host pushes for the machine, the local alert steps aside rather
+/// than doubling it.
 @MainActor
 enum Notifier {
     static let enabledKey = "notifyBlocked"
@@ -17,12 +26,35 @@ enum Notifier {
         UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
     }
 
+    /// This install's APNs device token, lowercase hex, once iOS has issued it.
+    static var token: String? {
+        didSet { if token != oldValue { onToken?() } }
+    }
+    /// Told when `token` changes, so the store can pass it to the host.
+    static var onToken: (() -> Void)?
+
+    /// Whether the paired host accepted this phone's token and will push for
+    /// its own machine. Set from the host's `hub.push.register` reply.
+    static var hostPushes = false
+
+    /// Whether this build's token comes from the APNs sandbox. Only a hint:
+    /// the relay tries the other environment when it is wrong.
+    static var sandbox: Bool {
+        #if DEBUG
+        true
+        #else
+        false
+        #endif
+    }
+
     /// Ask for permission once the app is in front, where the prompt can be
-    /// seen. A later call after the user answered is a no-op.
+    /// seen. A later call after the user answered is a no-op. Granted, it also
+    /// asks iOS for a push token, which arrives in `PushDelegate`.
     static func requestAuthorization() async {
         guard enabled else { return }
-        _ = try? await UNUserNotificationCenter.current()
-            .requestAuthorization(options: [.alert, .sound])
+        let granted = (try? await UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound])) ?? false
+        if granted { UIApplication.shared.registerForRemoteNotifications() }
     }
 
     static func handle(_ events: [AttentionWatch.Event]) {
@@ -34,9 +66,11 @@ enum Notifier {
                 center.removeDeliveredNotifications(withIdentifiers: [tag])
             case .blocked(let blocked):
                 guard enabled, UIApplication.shared.applicationState != .active else { continue }
+                // The host's push already covers its own machine.
+                if blocked.machine == "local" && hostPushes { continue }
                 let content = UNMutableNotificationContent()
-                content.title = blocked.workspace.isEmpty ? "pilus" : "pilus · \(blocked.workspace)"
-                content.body = "\(blocked.agent) is waiting on you"
+                content.title = "\(blocked.agent) is waiting your input"
+                content.body = blocked.session
                 content.sound = .default
                 // Reusing the tag as the identifier makes a newer alert for
                 // the same pane replace the older one.
@@ -68,5 +102,25 @@ enum BackgroundGrace {
         guard task != .invalid else { return }
         UIApplication.shared.endBackgroundTask(task)
         task = .invalid
+    }
+}
+
+/// Receives the APNs token. SwiftUI's `App` has no hook for it, so the app
+/// installs this through `UIApplicationDelegateAdaptor`.
+final class PushDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        let token = deviceToken.map { String(format: "%02x", $0) }.joined()
+        Task { @MainActor in Notifier.token = token }
+    }
+
+    func application(
+        _ application: UIApplication,
+        didFailToRegisterForRemoteNotificationsWithError error: Error
+    ) {
+        // No token means no push; the local alerts keep working.
+        Task { @MainActor in Notifier.token = nil }
     }
 }

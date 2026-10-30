@@ -23,5 +23,12 @@ case "$PLATFORM_NAME" in
         ;;
 esac
 
+# Release (archive, TestFlight) links the optimized library; project.yml points
+# LIBRARY_SEARCH_PATHS at the matching target subdirectory.
+PROFILE=""
+if [ "${CONFIGURATION:-Debug}" = "Release" ]; then
+    PROFILE="--release"
+fi
+
 cargo build --manifest-path "$PROJECT_DIR/../Cargo.toml" \
-    -p pilus-mobile --target "$TARGET"
+    -p pilus-mobile --target "$TARGET" $PROFILE

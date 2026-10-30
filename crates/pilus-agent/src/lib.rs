@@ -29,6 +29,7 @@ pub mod enroll;
 pub mod hub;
 pub mod p2p;
 pub mod proxy;
+pub mod push;
 pub mod service;
 pub mod supervisor;
 pub mod watch;

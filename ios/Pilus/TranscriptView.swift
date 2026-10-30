@@ -1,3 +1,4 @@
+import MarkdownUI
 import SwiftUI
 
 /// A session read from the agent's own transcript: what was asked, what was
@@ -87,7 +88,10 @@ private struct TranscriptRow: View {
                     .textSelection(.enabled)
             }
         case "assistant":
-            Text(markdown(entry.text ?? ""))
+            // Block syntax is the assistant's: a prompt is typed text, and the
+            // inline parser keeps its line breaks where this would fold them.
+            Markdown(entry.text ?? "")
+                .markdownTheme(.basic)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
         default:

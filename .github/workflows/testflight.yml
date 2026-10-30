@@ -1,0 +1,121 @@
+# Archives the iOS app and uploads it to TestFlight. Runs on every push to main
+# that touches ios/**, on an `ios-*` tag, or by hand. It uploads the
+# CURRENT_PROJECT_VERSION committed in ios/project.yml (bump it per build, as
+# the "build NN" commits do): App Store Connect rejects a build number it has
+# already seen, so a push that doesn't bump it fails at the upload step.
+#
+# Signing is Xcode's cloud-managed signing, driven by an App Store Connect API
+# key, so no certificate or profile lives in the repo or in secrets. Secrets:
+#   ASC_KEY_ID      key id of an API key with the App Manager (or Admin) role
+#   ASC_ISSUER_ID   issuer id shown above the key list
+#   ASC_KEY_P8      the full contents of the downloaded AuthKey_<id>.p8
+
+name: TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "Override CURRENT_PROJECT_VERSION (default is the value in ios/project.yml)"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths: ["ios/**"]
+    tags: ["ios-*"]
+
+# One upload at a time; never cancel one that has begun uploading.
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      BUILD_NUMBER: ${{ inputs.build_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secrets
+        run: |
+          for v in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            [ -n "${!v}" ] || { echo "::error::secret $v is not set"; exit 1; }
+          done
+
+      - name: Install Rust toolchain
+        run: |
+          version=$(sed -n 's/^rust = "\(.*\)"/\1/p' .mise.toml)
+          rustup toolchain install "$version" --profile minimal \
+            --target aarch64-apple-ios --target aarch64-apple-ios-sim
+          rustup default "$version"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # build-rust.sh runs cargo from the repo root, so the workspace is `.`.
+          cache-targets: true
+
+      - name: Generate the Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate --spec ios/project.yml
+
+      - name: Write the API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/asc"
+          printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8"
+          echo "ASC_KEY_PATH=$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8" >> "$GITHUB_ENV"
+
+      - name: Archive
+        working-directory: ios
+        run: |
+          xcodebuild -version
+          override=()
+          if [ -n "$BUILD_NUMBER" ]; then
+            override+=("CURRENT_PROJECT_VERSION=$BUILD_NUMBER")
+          fi
+          xcodebuild archive \
+            -project Pilus.xcodeproj \
+            -scheme Pilus \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Pilus.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            "${override[@]}"
+
+      # ExportOptions.plist sets destination=upload, so this signs for the App
+      # Store (aps-environment becomes production) and sends the build to
+      # App Store Connect in one step.
+      - name: Export and upload to TestFlight
+        working-directory: ios
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Pilus.xcarchive" \
+            -exportOptionsPlist ExportOptions.plist \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: Keep the archive on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pilus.xcarchive
+          path: ${{ runner.temp }}/Pilus.xcarchive
+          retention-days: 3
+
+      - name: Remove the API key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc"

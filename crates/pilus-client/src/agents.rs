@@ -791,6 +791,15 @@ pub fn effort_label(level: &str) -> String {
     }
 }
 
+/// The name an agent kind goes by in a notification: the catalog's own label
+/// (`opencode` to `OpenCode`), else the kind with a capital.
+pub fn kind_label(kind: &str) -> String {
+    SPECS
+        .iter()
+        .find(|spec| spec.kind == kind)
+        .map_or_else(|| title_case(kind), |spec| spec.label.to_string())
+}
+
 fn title_case(value: &str) -> String {
     let mut chars = value.chars();
     match chars.next() {

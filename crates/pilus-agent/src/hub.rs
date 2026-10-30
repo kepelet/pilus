@@ -34,6 +34,11 @@
 //! `hub.run` takes an optional `idempotency_key`. A phone whose reply was lost
 //! cannot tell whether the agent started, and resending would start a second
 //! one; the same key within [`REPLAY_TTL`] returns the first outcome instead.
+//!
+//! `hub.push.register` and `hub.push.unregister` are the other two methods a
+//! device answers for itself: they keep its APNs token for [`crate::push`],
+//! which sends an alert when an agent starts waiting. Any enrolled device may
+//! call them, whatever its level, because a token only ever names the caller.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -50,6 +55,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, OwnedMutexGuard, Semaphore, mpsc};
 
 use crate::enroll::{AuthState, Level};
+use crate::push::PushStore;
 use crate::supervisor::GatewayLink;
 use crate::watch::{self, Slots};
 
@@ -303,6 +309,8 @@ pub struct Hub {
     ssh: Arc<Semaphore>,
     watchers: Arc<Slots>,
     replays: Arc<Replays>,
+    /// Where phones leave their push tokens; `None` when push is turned off.
+    push: Option<Arc<PushStore>>,
     /// One launch at a time per machine (see [`Hub::launch_turn`]).
     launches: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
@@ -336,8 +344,59 @@ impl Hub {
             ssh: Arc::new(Semaphore::new(SSH_PARALLELISM)),
             watchers: Arc::default(),
             replays: Arc::default(),
+            push: None,
             launches: Arc::default(),
         }
+    }
+
+    /// Accept push registrations into `store`.
+    #[must_use]
+    pub fn with_push(mut self, store: Arc<PushStore>) -> Self {
+        self.push = Some(store);
+        self
+    }
+
+    /// Answer `hub.push.register` or `hub.push.unregister` for the device at
+    /// `peer`. These need the caller's endpoint id, which [`Hub::handle`] is not
+    /// given, so [`serve_stream`] routes them here.
+    ///
+    /// `registered` in the reply tells the phone whether this host will push
+    /// for it. When it will not (push is off), the phone keeps its own local
+    /// alerts instead of waiting for ones that never come.
+    pub fn handle_push(&self, request: &Value, peer: &str, device: &str) -> Value {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+        let Some(store) = &self.push else {
+            return reply(&id, Ok(json!({ "registered": false })));
+        };
+        let outcome = match method {
+            "hub.push.register" => {
+                let token = params
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let sandbox = params.get("sandbox").and_then(Value::as_bool) == Some(true);
+                store
+                    .register(peer, token, sandbox)
+                    .map(|()| json!({ "registered": true }))
+                    .map_err(|why| failure("bad_request", why))
+            }
+            "hub.push.unregister" => {
+                store.unregister(peer);
+                Ok(json!({ "registered": false }))
+            }
+            other => Err(failure("unknown_method", &format!("no method `{other}`"))),
+        };
+        // The token itself is never logged: it is the address an alert goes to.
+        eprintln!(
+            "pilus-agent: {device} {method} {}",
+            if outcome.is_ok() { "ok" } else { "refused" }
+        );
+        reply(&id, outcome)
     }
 
     /// Answer one request line with one reply value, for a device at `level`.
@@ -543,26 +602,7 @@ impl Hub {
     }
 
     async fn local(&self, method: &str, params: Value) -> Result<Value, Value> {
-        let Some(address) = self.link.address() else {
-            let why = self
-                .link
-                .error()
-                .unwrap_or_else(|| "the Luvus gateway is not running".to_string());
-            return Err(failure("unavailable", &why));
-        };
-        let request = json!({
-            "id": "1",
-            "method": method,
-            "params": params,
-            "auth": self.auth.token(),
-        });
-        let reply = gateway_call(&address, &request)
-            .await
-            .map_err(|error| failure("unavailable", &format!("gateway: {error}")))?;
-        match reply.get("error") {
-            Some(error) => Err(error.clone()),
-            None => Ok(reply.get("result").cloned().unwrap_or(Value::Null)),
-        }
+        gateway_request(&self.link, &self.auth, method, params).await
     }
 
     /// Run an `Operate` or [`REVIEW`] method as this user, through Luvus's
@@ -695,69 +735,8 @@ impl Hub {
         Ok(())
     }
 
-    /// Open the gateway's event feed and hand back its lines.
-    ///
-    /// The first line is the subscription's own reply; an error there (a token
-    /// that may not subscribe, a gateway at its connection limit) is returned
-    /// as the failure rather than relayed as if it were an event.
     async fn subscribe(&self) -> Result<mpsc::Receiver<String>, Value> {
-        let Some(address) = self.link.address() else {
-            let why = self
-                .link
-                .error()
-                .unwrap_or_else(|| "the Luvus gateway is not running".to_string());
-            return Err(failure("unavailable", &why));
-        };
-        let unavailable =
-            |error: std::io::Error| failure("unavailable", &format!("gateway: {error}"));
-        let stream = tokio::net::TcpStream::connect(&address)
-            .await
-            .map_err(unavailable)?;
-        let (read, mut write) = stream.into_split();
-        let request = json!({
-            "id": "1",
-            "method": "events.subscribe",
-            "params": {},
-            "auth": self.auth.token(),
-        });
-        write
-            .write_all(format!("{request}\n").as_bytes())
-            .await
-            .map_err(unavailable)?;
-        let mut lines = BufReader::new(read);
-        let mut first = String::new();
-        let started = tokio::time::timeout(Duration::from_secs(10), lines.read_line(&mut first))
-            .await
-            .map_err(|_| failure("timeout", "the gateway did not start the event feed"))?
-            .map_err(unavailable)?;
-        let answer: Value = serde_json::from_str(first.trim()).unwrap_or(Value::Null);
-        if started == 0 || answer.get("result").is_none() {
-            return Err(answer
-                .get("error")
-                .cloned()
-                .unwrap_or_else(|| failure("unavailable", "the gateway refused the event feed")));
-        }
-        let (tx, rx) = mpsc::channel(256);
-        tokio::spawn(async move {
-            // The write half stays open for as long as the feed is read:
-            // closing it would end the subscription.
-            let _keep_open = write;
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match lines.read_line(&mut line).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        // A full queue means this device cannot keep up; ending
-                        // the feed makes it resync instead of seeing stale signals.
-                        if tx.try_send(std::mem::take(&mut line)).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-        Ok(rx)
+        subscribe_feed(&self.link, &self.auth).await
     }
 
     /// [`Hub::run`], once per `idempotency_key` for this device and machine.
@@ -1252,6 +1231,14 @@ async fn serve_stream(
                     if request.get("method").and_then(Value::as_str) == Some("hub.watch") =>
                 {
                     return hub.serve_watch(send, &request, peer, device).await;
+                }
+                Ok(request)
+                    if request
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .is_some_and(|method| method.starts_with("hub.push.")) =>
+                {
+                    hub.handle_push(&request, peer, device)
                 }
                 Ok(request) => hub.handle(&request, level, device).await,
                 Err(error) => reply(
@@ -2039,6 +2026,101 @@ fn client_failure(error: &ClientError, method: &str) -> Value {
     }
 }
 
+/// One request to the local gateway with the current delegated token, answered
+/// with the reply's `result` or its `error`.
+pub(crate) async fn gateway_request(
+    link: &GatewayLink,
+    auth: &AuthState,
+    method: &str,
+    params: Value,
+) -> Result<Value, Value> {
+    let Some(address) = link.address() else {
+        let why = link
+            .error()
+            .unwrap_or_else(|| "the Luvus gateway is not running".to_string());
+        return Err(failure("unavailable", &why));
+    };
+    let request = json!({
+        "id": "1",
+        "method": method,
+        "params": params,
+        "auth": auth.token(),
+    });
+    let reply = gateway_call(&address, &request)
+        .await
+        .map_err(|error| failure("unavailable", &format!("gateway: {error}")))?;
+    match reply.get("error") {
+        Some(error) => Err(error.clone()),
+        None => Ok(reply.get("result").cloned().unwrap_or(Value::Null)),
+    }
+}
+
+/// Open the gateway's event feed and hand back its lines.
+///
+/// The first line is the subscription's own reply; an error there (a token
+/// that may not subscribe, a gateway at its connection limit) is returned
+/// as the failure rather than relayed as if it were an event.
+pub(crate) async fn subscribe_feed(
+    link: &GatewayLink,
+    auth: &AuthState,
+) -> Result<mpsc::Receiver<String>, Value> {
+    let Some(address) = link.address() else {
+        let why = link
+            .error()
+            .unwrap_or_else(|| "the Luvus gateway is not running".to_string());
+        return Err(failure("unavailable", &why));
+    };
+    let unavailable = |error: std::io::Error| failure("unavailable", &format!("gateway: {error}"));
+    let stream = tokio::net::TcpStream::connect(&address)
+        .await
+        .map_err(unavailable)?;
+    let (read, mut write) = stream.into_split();
+    let request = json!({
+        "id": "1",
+        "method": "events.subscribe",
+        "params": {},
+        "auth": auth.token(),
+    });
+    write
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .map_err(unavailable)?;
+    let mut lines = BufReader::new(read);
+    let mut first = String::new();
+    let started = tokio::time::timeout(Duration::from_secs(10), lines.read_line(&mut first))
+        .await
+        .map_err(|_| failure("timeout", "the gateway did not start the event feed"))?
+        .map_err(unavailable)?;
+    let answer: Value = serde_json::from_str(first.trim()).unwrap_or(Value::Null);
+    if started == 0 || answer.get("result").is_none() {
+        return Err(answer
+            .get("error")
+            .cloned()
+            .unwrap_or_else(|| failure("unavailable", "the gateway refused the event feed")));
+    }
+    let (tx, rx) = mpsc::channel(256);
+    tokio::spawn(async move {
+        // The write half stays open for as long as the feed is read:
+        // closing it would end the subscription.
+        let _keep_open = write;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match lines.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    // A full queue means this device cannot keep up; ending
+                    // the feed makes it resync instead of seeing stale signals.
+                    if tx.try_send(std::mem::take(&mut line)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Ok(rx)
+}
+
 /// One request to the gateway on a fresh connection, as UHP requires.
 async fn gateway_call(address: &str, request: &Value) -> std::io::Result<Value> {
     let stream = tokio::net::TcpStream::connect(address).await?;
@@ -2088,6 +2170,39 @@ mod tests {
     }
 
     const CONTROL: Level = Level::Control;
+
+    #[test]
+    fn push_registration_names_the_caller_and_says_whether_the_host_will_push() {
+        let token = "cd".repeat(32);
+        let register =
+            json!({ "id": "p", "method": "hub.push.register", "params": { "token": token } });
+        // Push off: the phone must keep its own alerts.
+        let off = hub_allowing("127.0.0.1:1", &[]).handle_push(&register, "phone", "phone");
+        assert_eq!(off["result"]["registered"], false);
+
+        let path = std::env::temp_dir().join(format!("pilus-hub-push-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(PushStore::load(path));
+        let hub = hub_allowing("127.0.0.1:1", &[]).with_push(Arc::clone(&store));
+        assert_eq!(
+            hub.handle_push(&register, "phone", "phone")["result"]["registered"],
+            true
+        );
+        // The caller is the one registered, whatever the params claim.
+        assert_eq!(store.snapshot()[0].0, "phone");
+        let bad =
+            json!({ "id": "q", "method": "hub.push.register", "params": { "token": "nope" } });
+        assert_eq!(
+            hub.handle_push(&bad, "phone", "phone")["error"]["code"],
+            "bad_request"
+        );
+        let gone = json!({ "id": "r", "method": "hub.push.unregister" });
+        assert_eq!(
+            hub.handle_push(&gone, "phone", "phone")["result"]["registered"],
+            false
+        );
+        assert!(store.is_empty());
+    }
 
     #[tokio::test]
     async fn refuses_what_the_gateway_does_not_allow() {

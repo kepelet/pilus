@@ -48,6 +48,7 @@ pub use agents::AgentConfig;
 pub use agents::AgentModel;
 /// Display labels for pi thinking levels (`high` to `High`).
 pub use agents::effort_label;
+pub use agents::kind_label;
 /// Raw pi thinking levels for display labels (`High` to `high`).
 pub use agents::thinking_level;
 pub use arrival::Arrival;

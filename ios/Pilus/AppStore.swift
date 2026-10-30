@@ -117,6 +117,9 @@ final class AppStore {
 
     init() {
         restoreSessionCache()
+        Notifier.onToken = { [weak self] in
+            Task { await self?.syncPush() }
+        }
         deviceId = try? PilusClient.deviceId()
         if let client = PilusClient.resume() {
             self.client = client
@@ -185,6 +188,26 @@ final class AppStore {
             await loadAgentKinds()
             startWatch()
             startRemotePolling()
+            await syncPush()
+        }
+    }
+
+    /// Tell the paired host where to push alerts, or take the address back
+    /// when notifications are off.
+    ///
+    /// The host answers whether it will push. When it will not (an older host,
+    /// or one with push turned off) the local alerts stay on, so a refusal here
+    /// is the normal fallback and not an error.
+    func syncPush() async {
+        guard usesHub, client != nil else { return }
+        if Notifier.enabled, let token = Notifier.token {
+            let reply: PushReply? = try? await call(
+                method: "hub.push.register",
+                params: ["token": token, "sandbox": Notifier.sandbox])
+            Notifier.hostPushes = reply?.registered ?? false
+        } else {
+            let _: PushReply? = try? await call(method: "hub.push.unregister")
+            Notifier.hostPushes = false
         }
     }
 
@@ -1189,6 +1212,15 @@ final class AppStore {
     /// repeat after a lost reply therefore gets the original automation and its
     /// original run.
     func disconnect() {
+        // Best effort, and sent before the identity is forgotten: a host that
+        // keeps this phone's token would keep pushing to it. The host also drops
+        // the token when the device is revoked or the relay reports it gone.
+        if let client, usesHub {
+            Task.detached {
+                let _: PushReply? = try? client.hubRequest(method: "hub.push.unregister")
+            }
+        }
+        Notifier.hostPushes = false
         watchTask?.cancel()
         watchTask = nil
         remoteTask?.cancel()

@@ -6592,6 +6592,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "ureq",
 ]
 
 [[package]]

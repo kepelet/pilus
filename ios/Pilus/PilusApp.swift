@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct PilusApp: App {
+    @UIApplicationDelegateAdaptor(PushDelegate.self) private var pushDelegate
     @State private var store = AppStore()
     @Environment(\.scenePhase) private var scenePhase
 

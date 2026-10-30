@@ -31,6 +31,11 @@
 #                             file. Written to a 0600 temp file for the
 #                             signing step and removed after. Wins over the
 #                             path when both are set.
+#   MINISIGN_PASSWORD         password that unlocks the secret key. Handed to
+#                             `minisign` on stdin so an unattended run (CI,
+#                             `just release-stable`) does not stop at its
+#                             prompt. Unset, it is read from the
+#                             dotenvx-encrypted `.env` when that file exists.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -104,9 +109,24 @@ if [ -n "${MINISIGN_SECRET_KEY:-}" ]; then
         echo "a minisign key is set but \`minisign\` is not installed" >&2
         exit 1
     fi
+    # `.env` is dotenvx-encrypted, so a plain read returns ciphertext: only
+    # dotenvx hands back the password. Reading it here (rather than demanding
+    # a `dotenvx run --` wrapper) is what lets `just package-dmg` sign on its
+    # own. Looked up only when a key is actually being used.
+    if [ -z "${MINISIGN_PASSWORD:-}" ] && [ -f .env ] && command -v dotenvx >/dev/null 2>&1; then
+        MINISIGN_PASSWORD="$(dotenvx get MINISIGN_PASSWORD 2>/dev/null || true)"
+    fi
     # Detached signature per asset: the client resolves `<asset>.minisig`
-    # from the same release for signature verification.
-    minisign -S -s "$MINISIGN_SECRET_KEY" -m "$dmg"
+    # from the same release for signature verification. An encrypted key makes
+    # `minisign` prompt on the tty, which hangs an unattended release, so the
+    # password goes in on stdin; a wrong one exits non-zero and `pipefail`
+    # stops the build instead of shipping a DMG with no sidecar.
+    if [ -n "${MINISIGN_PASSWORD:-}" ]; then
+        printf '%s\n' "$MINISIGN_PASSWORD" |
+            minisign -S -s "$MINISIGN_SECRET_KEY" -m "$dmg"
+    else
+        minisign -S -s "$MINISIGN_SECRET_KEY" -m "$dmg"
+    fi
 fi
 
 echo "packaged $dmg"

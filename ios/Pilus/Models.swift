@@ -216,6 +216,12 @@ struct AutomationCreated: Decodable {
     }
 }
 
+/// `hub.push.register` / `hub.push.unregister` reply — whether the host will
+/// push alerts to this phone.
+struct PushReply: Decodable {
+    let registered: Bool
+}
+
 /// `hub.machines` reply — the paired host plus its saved SSH machines.
 struct HubMachines: Decodable {
     let host: String?

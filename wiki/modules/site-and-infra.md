@@ -33,7 +33,8 @@ The site's docs are written in Indonesian; the architectural prose in this wiki 
 
 ### Infra
 
-- [infra/alchemy.run.ts](../../infra/alchemy.run.ts) — an assets-only Worker for `usepilus.dev` reading `../site/dist`, and an R2 bucket observed by name (`PILUS_RELEASES_BUCKET`) with the `releases.kepelet.com` domain. State lives in a Cloudflare state-store Worker bootstrapped on first deploy.
+- [infra/alchemy.run.ts](../../infra/alchemy.run.ts) — a Worker for `usepilus.dev` serving `../site/dist` with a `/` redirect fallback, and an R2 bucket observed by name (`PILUS_RELEASES_BUCKET`) with the `releases.kepelet.com` domain. State lives in a Cloudflare state-store Worker bootstrapped on first deploy.
+- [infra/site/worker.ts](../../infra/site/worker.ts) — the site's only server-side code: every path outside `PUBLIC` (the landing page and its assets) answers 404.
 - [docs/infra.md](../../docs/infra.md) — first-deploy steps, including the hostname conflict to clear before attaching `usepilus.dev`.
 
 ### Scripts
@@ -58,7 +59,7 @@ Preview DMGs live under `preview/` in the bucket because the filename carries on
 ## Design decisions
 
 - **The bucket is observed, not created.** It predates the stack and holds live release objects, so Alchemy declares it under its real name and leaves its contents alone.
-- **The site is static.** An assets-only Worker keeps the docs cheap and cacheable; `just infra-plan`/`infra-deploy` build it first.
+- **The site is static.** Assets-first routing keeps the docs cheap and cacheable; the Worker only answers paths the asset layer cannot or should not serve: a 404 for every path outside `PUBLIC`, i.e. everything except the landing page and its assets. `just infra-plan`/`infra-deploy` build it first.
 - **Manifests are written late.** `package-macos-dmg.sh` stays manifest-free because it cannot know the final host; `write-manifest.sh` bakes the known URL.
 - **Publish the manifest last.** A client never sees a manifest pointing at a DMG that is not there yet.
 

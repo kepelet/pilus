@@ -188,7 +188,11 @@ Three layers, weakest first:
    verification is `Signature` and an unsigned download is rejected. The secret
    key stays out of the repo (`~/.minisign/pilus.key`); package with
    `MINISIGN_SECRET_KEY=<path to it>` and each DMG gets a `.minisig`, which the
-   manifest references as `signature_url`. Packaging skips signing silently when
+   manifest references as `signature_url`. An encrypted key also needs
+   `MINISIGN_PASSWORD`: packaging pipes it to `minisign` on stdin, so an
+   unattended run never stops at a prompt, and reads it from the
+   dotenvx-encrypted `.env` when the variable is unset. A wrong password fails
+   the build there. Packaging skips signing silently when
    the key or `minisign` is missing, so `publish-release.sh` refuses to upload a
    DMG without one. Builds before this key was set accept unsigned updates. Back the key up: losing it strands every
    client that has the public key.

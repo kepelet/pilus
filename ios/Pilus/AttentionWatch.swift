@@ -15,9 +15,14 @@ struct AttentionWatch {
 
     struct Blocked: Equatable {
         /// Stable per pane, so a repeat replaces the earlier notification.
+        /// The host's push alerts use the same id (`push.rs`), which is how a
+        /// delivered push is found again to take it down.
         let tag: String
+        let machine: String
+        /// The agent kind's display name, such as `Claude`.
         let agent: String
-        let workspace: String
+        /// The session's own title, else the pane's alias, else the workspace.
+        let session: String
     }
 
     /// Last seen status per pane, per machine.
@@ -38,8 +43,11 @@ struct AttentionWatch {
             if isSeeded && isBlocked && !wasBlocked {
                 events.append(.blocked(Blocked(
                     tag: tag,
-                    agent: agent.title,
-                    workspace: agent.workspace_name ?? ""
+                    machine: machine,
+                    agent: Self.label(agent.kind),
+                    session: [agent.agent_session_title, agent.name, agent.workspace_name]
+                        .compactMap { $0 }
+                        .first { !$0.isEmpty } ?? ""
                 )))
             } else if wasBlocked && !isBlocked {
                 events.append(.cleared(tag: tag))
@@ -61,7 +69,17 @@ struct AttentionWatch {
         seeded = []
     }
 
+    /// APNs caps a collapse id at 64 bytes, and the host truncates the same way.
     private static func tag(machine: String, pane: String) -> String {
-        "pilus-blocked-\(machine)-\(pane)"
+        String("pilus-blocked-\(machine)-\(pane)".prefix(64))
+    }
+
+    /// How an agent kind reads in an alert; mirrors `kind_label` on the host.
+    static func label(_ kind: String) -> String {
+        switch kind {
+        case "": return "An agent"
+        case "opencode": return "OpenCode"
+        default: return kind.prefix(1).uppercased() + kind.dropFirst()
+        }
     }
 }

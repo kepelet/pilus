@@ -27,6 +27,7 @@ use tokio::io::AsyncWriteExt;
 use crate::admin::{self, Admin};
 use crate::enroll::{AuthState, CONTROL_ALPN, Control, ENROLLMENT_TTL};
 use crate::hub::{HUB_ALPN, Hub};
+use crate::push::{self, PushStore};
 use crate::supervisor::{self, GatewayLink};
 use crate::{AccessOptions, Error, Result};
 
@@ -226,12 +227,23 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
     };
 
     let label = machine_label();
-    let hub = Hub::new(
+    let mut hub = Hub::new(
         Arc::clone(&link),
         label.clone(),
         Arc::clone(&auth),
         config.access.session.clone(),
     );
+    // Push alerts for a phone that is not looking; `PILUS_PUSH_URL=` turns them off.
+    let push_task = push::relay_url().map(|relay| {
+        let store = Arc::new(PushStore::load(config.key_path.with_file_name("push.json")));
+        hub = hub.clone().with_push(Arc::clone(&store));
+        tokio::spawn(push::run(
+            Arc::clone(&link),
+            Arc::clone(&auth),
+            store,
+            relay,
+        ))
+    });
     let router = Router::builder(endpoint.clone())
         .accept(
             ALPN,
@@ -268,6 +280,9 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
 
     wait_for_shutdown().await?;
     admin_task.abort();
+    if let Some(task) = push_task {
+        task.abort();
+    }
     let _ = std::fs::remove_file(&admin_path);
     let _ = router.shutdown().await;
     // The supervisor owns the gateway child; letting it exit drops (kills) it.

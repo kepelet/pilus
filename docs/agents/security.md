@@ -21,6 +21,14 @@ from reaching past what it was given.
 - Treat a sipil daemon's allow-list like SSH keys. An allowed device can run
   that daemon's agents' shell tools (see [sipil/network.md](sipil/network.md)).
 
+## Push alerts
+
+An alert carries the agent's name and the session's title, and it passes
+through the push relay and Apple on the way to the phone. Do not add more to it
+(prompts, file paths, transcript text) without a decision from the owner. The
+relay holds the APNs key and nothing else; never log a token, title or body
+there or on the host. Details in [push.md](push.md).
+
 ## Remote commands
 
 A remote command reaches the host's login shell, which may be fish.

@@ -32,6 +32,8 @@
 #                         scripts/package-macos-dmg.sh first.
 #   MINISIGN_SECRET_KEY   Forwarded to the packaging script; a `.minisig`
 #                         sidecar is copied and referenced when present.
+#   MINISIGN_PASSWORD     Forwarded too, so a key stored in the encrypted
+#                         `.env` signs without a prompt.
 #   LOCAL=true            Developer waiver for a quick test on another machine:
 #                         packaging skips notarization (slow, rate limited).
 #                         The DMG is still Developer ID and minisign signed, so

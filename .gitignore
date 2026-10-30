@@ -7,3 +7,5 @@
 
 # dotenvx private keys; the encrypted .env beside them is committed
 .env.keys
+
+.wrangler

@@ -207,13 +207,9 @@ impl DeviceStore {
     }
 }
 
-/// Write `devices` to `path` atomically: a same-directory temporary file,
-/// fsynced and renamed over the destination, so a crash mid-write can never
-/// leave a truncated store that would re-open enrollment.
+/// Write `devices` to `path` atomically (see [`write_atomic`]), so a crash
+/// mid-write can never leave a truncated store that would re-open enrollment.
 fn save(path: &std::path::Path, devices: &[Device]) -> Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
     let entries: Vec<Value> = devices
         .iter()
         .map(|device| {
@@ -226,6 +222,15 @@ fn save(path: &std::path::Path, devices: &[Device]) -> Result<()> {
         })
         .collect();
     let payload = json!({ "devices": entries }).to_string();
+    write_atomic(path, payload.as_bytes())
+}
+
+/// Replace `path` with `payload`: a same-directory temporary file, owner-only,
+/// fsynced and renamed over the destination.
+pub(crate) fn write_atomic(path: &std::path::Path, payload: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     std::fs::create_dir_all(parent)?;
     let name = path
@@ -246,7 +251,7 @@ fn save(path: &std::path::Path, devices: &[Device]) -> Result<()> {
             options.mode(0o600);
         }
         let mut file = options.open(&temp)?;
-        file.write_all(payload.as_bytes())?;
+        file.write_all(payload)?;
         file.sync_all()?;
         std::fs::rename(&temp, path)?;
         Ok(())

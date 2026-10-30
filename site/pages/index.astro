@@ -18,14 +18,20 @@
 <style is:inline>
   *, *::before, *::after { box-sizing: border-box; }
 
+  /* The page is one screen: the hero fills the viewport and nothing scrolls.
+     The shot bleeds off the bottom edge instead of pushing the page taller. */
   html {
     scroll-behavior: smooth;
-    overflow-x: clip;
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
   }
 
   body {
     margin: 0;
-    overflow-x: clip;
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
     background: var(--paper);
     color: var(--ink);
     font-family: var(--font-sans);
@@ -216,12 +222,18 @@
   .hero {
     position: relative;
     z-index: 1;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
     background: var(--white);
   }
 
   .hero-atmosphere {
     position: relative;
-    padding: 132px 0 72px;
+    flex: none;
+    padding: clamp(100px, 14vh, 132px) 0 clamp(28px, 5vh, 72px);
     overflow: hidden;
     background-image:
       linear-gradient(to bottom, var(--hero-copy-wash), var(--hero-copy-wash) 58%, var(--hero-copy-fade) 83%, var(--white) 100%),
@@ -252,7 +264,7 @@
     font-family: var(--font-mono);
     max-width: 980px;
     margin: 0 auto;
-    font-size: clamp(3.8rem, 7vw, 6.25rem);
+    font-size: clamp(2.8rem, min(7vw, 9.5vh), 6.25rem);
     font-weight: 600;
     line-height: 0.93;
     letter-spacing: -0.0666em;
@@ -302,7 +314,7 @@
 
   .hero-lede {
     max-width: 720px;
-    margin: 27px auto 0;
+    margin: clamp(16px, 3vh, 27px) auto 0;
     color: var(--muted);
     font-size: clamp(1.04rem, 1.55vw, 1.22rem);
     line-height: 1.5;
@@ -317,7 +329,7 @@
   }
 
   .hero-actions {
-    margin-top: 29px;
+    margin-top: clamp(18px, 3vh, 29px);
     display: flex;
     justify-content: center;
     gap: 11px;
@@ -326,8 +338,10 @@
 
   .hero-scene {
     position: relative;
-    min-height: 710px;
-    padding: 64px 20px 0;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    padding: clamp(16px, 3vh, 64px) 20px 0;
     display: flex;
     justify-content: center;
     align-items: flex-start;
@@ -339,7 +353,6 @@
      scroll the page on touch screens while a horizontal drag moves the divider. */
   .hero-compare {
     width: min(1180px, calc(100vw - 40px));
-    margin-bottom: calc(var(--shot-float) * -1);
   }
 
   .hero-shot {
@@ -384,6 +397,146 @@
     font-size: 12px;
     font-weight: 500;
     letter-spacing: 0.02em;
+  }
+
+  /* The captions are buttons: each opens its screenshot at full size. */
+  .shot-label {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    letter-spacing: inherit;
+    cursor: zoom-in;
+    text-decoration: underline transparent;
+    text-underline-offset: 3px;
+    transition: color 120ms ease, text-decoration-color 120ms ease;
+  }
+
+  .shot-label:hover {
+    color: var(--ink);
+    text-decoration-color: currentColor;
+  }
+
+  /* The shot hangs off the bottom of the one-screen hero, so the zoom shows
+     the whole screenshot, fitted to the viewport. */
+  .shot-zoom {
+    width: 100vw;
+    max-width: none;
+    height: 100vh;
+    height: 100dvh;
+    max-height: none;
+    margin: 0;
+    padding: clamp(14px, 3vmin, 40px);
+    border: 0;
+    background: transparent;
+    overflow: hidden;
+    cursor: zoom-out;
+  }
+
+  .shot-zoom[open] {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+  }
+
+  .shot-zoom::backdrop {
+    background: rgba(16, 16, 15, 0.78);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
+
+  .shot-zoom img {
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    /* Leave room under the shot for the caption and the gap. */
+    max-height: calc(100% - 36px);
+    border-radius: 12px;
+    box-shadow: 0 30px 80px -20px rgba(0, 0, 0, 0.6);
+  }
+
+  .shot-zoom-caption {
+    margin: 0;
+    color: rgba(255, 255, 255, 0.86);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    text-align: center;
+  }
+
+  .shot-zoom-caption span {
+    margin-left: 10px;
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  /* Previous/next sit over the backdrop; the ends of the pair hide their arrow. */
+  .shot-zoom-nav {
+    position: absolute;
+    top: 50%;
+    z-index: 1;
+    width: 44px;
+    height: 44px;
+    margin-top: -22px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    border-radius: 50%;
+    background: rgba(16, 16, 15, 0.55);
+    color: #fff;
+    cursor: pointer;
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+    transition: background 120ms ease;
+  }
+
+  .shot-zoom-nav:hover {
+    background: rgba(16, 16, 15, 0.8);
+  }
+
+  .shot-zoom-nav[hidden] {
+    display: none;
+  }
+
+  .shot-zoom-prev {
+    left: clamp(10px, 2vmin, 24px);
+  }
+
+  .shot-zoom-next {
+    right: clamp(10px, 2vmin, 24px);
+  }
+
+  .shot-zoom-nav svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .shot-zoom[open] img {
+      animation: shot-zoom-in 260ms cubic-bezier(.16, 1, .3, 1) both;
+    }
+
+    .shot-zoom[open]::backdrop {
+      animation: shot-zoom-fade 200ms ease both;
+    }
+  }
+
+  @keyframes shot-zoom-in {
+    from {
+      opacity: 0;
+      transform: scale(0.96);
+    }
+  }
+
+  @keyframes shot-zoom-fade {
+    from {
+      opacity: 0;
+    }
   }
 
   .shot-handle {
@@ -1597,6 +1750,13 @@
     animation: shot-arrive 980ms cubic-bezier(.16, 1, .3, 1) 120ms both;
   }
 
+  /* Short desktop windows: drop the aside so the shot keeps some room. */
+  @media (max-height: 720px) and (min-width: 681px) {
+    .hero-lede-note {
+      display: none;
+    }
+  }
+
   @media (max-width: 900px) {
     .hero-atmosphere {
       min-height: auto;
@@ -1701,7 +1861,6 @@
     }
 
     .hero-scene {
-      min-height: 0;
       padding: 42px 14px 0;
     }
 
@@ -1989,9 +2148,9 @@
 
     <div class="hero-scene">
       <div class="hero-compare">
-      <div class="shot-labels" aria-hidden="true">
-        <span>Luvus TUI in Terminal.app</span>
-        <span>pilus in macOS</span>
+      <div class="shot-labels">
+        <button class="shot-label" type="button" data-zoom="shot-before" aria-haspopup="dialog">Luvus TUI in Terminal.app</button>
+        <button class="shot-label" type="button" data-zoom="shot-after" aria-haspopup="dialog">pilus in macOS</button>
       </div>
       <div class="hero-shot" id="hero-shot" role="group" aria-label="Comparison of the pilus terminal UI and the pilus app showing the same Claude Code session">
         <img class="shot-before" src="assets/hero-tui.webp" alt="The pilus terminal UI: the same Claude Code session with a text sidebar" width="2400" height="1448" fetchpriority="high" draggable="false">
@@ -2157,6 +2316,7 @@
   </section>
   -->
 
+  <!-- Explainer, inventory and FAQ sections, parked while the page is just the header and hero CTA. Uncomment to restore.
   <section class="explainer" id="how-it-works" aria-labelledby="explainer-title">
     <div class="wrap">
       <div class="explainer-head">
@@ -2493,8 +2653,10 @@
       </div>
     </div>
   </section>
+  -->
 </main>
 
+<!-- Footer, parked with the other sections. Uncomment to restore.
 <footer>
   <div class="footer-marquee">
     <div class="footer-marquee-track">
@@ -2514,6 +2676,7 @@
     </a>
   </div>
 </footer>
+-->
 
 <script is:inline>
   (() => {
@@ -2727,6 +2890,91 @@
       link.addEventListener('blur', hide);
     });
     menu.addEventListener('pointerleave', hide);
+  })();
+</script>
+
+<dialog class="shot-zoom" id="shot-zoom" aria-label="Screenshot, full size">
+  <button class="shot-zoom-nav shot-zoom-prev" type="button" aria-label="Previous screenshot">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
+  </button>
+  <img alt="" draggable="false">
+  <p class="shot-zoom-caption"></p>
+  <button class="shot-zoom-nav shot-zoom-next" type="button" aria-label="Next screenshot">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+  </button>
+</dialog>
+
+<script is:inline>
+  (() => {
+    const dialog = document.getElementById('shot-zoom');
+    if (!dialog || typeof dialog.showModal !== 'function') return;
+    const big = dialog.querySelector('img');
+    const caption = dialog.querySelector('.shot-zoom-caption');
+    const prev = dialog.querySelector('.shot-zoom-prev');
+    const next = dialog.querySelector('.shot-zoom-next');
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    // The captions are the deck: left caption first, right caption second.
+    const labels = [...document.querySelectorAll('.shot-label')];
+    let index = 0;
+
+    // dir is -1 or 1 when sliding between shots, 0 when first opened.
+    const show = (to, dir) => {
+      const source = document.querySelector('.' + labels[to].dataset.zoom);
+      if (!source) return;
+      index = to;
+      big.src = source.currentSrc || source.src;
+      big.alt = source.alt;
+      const name = labels[to].textContent.trim();
+      dialog.setAttribute('aria-label', name + ', full size');
+      caption.textContent = name;
+      const count = document.createElement('span');
+      count.textContent = to + 1 + ' / ' + labels.length;
+      caption.append(count);
+      prev.hidden = to === 0;
+      next.hidden = to === labels.length - 1;
+      if (dir && !reduce) {
+        big.animate(
+          [{ opacity: 0, transform: 'translateX(' + dir * 48 + 'px)' }, { opacity: 1, transform: 'none' }],
+          { duration: 280, easing: 'cubic-bezier(.16, 1, .3, 1)' },
+        );
+        caption.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 280, easing: 'ease' });
+      }
+    };
+    const step = (dir) => {
+      const to = index + dir;
+      if (to >= 0 && to < labels.length) show(to, dir);
+    };
+
+    labels.forEach((label, i) => {
+      label.addEventListener('click', () => {
+        show(i, 0);
+        dialog.showModal();
+      });
+    });
+
+    // A click on the backdrop or image closes it; the arrows only slide.
+    dialog.addEventListener('click', (e) => {
+      if (!e.target.closest('.shot-zoom-nav')) dialog.close();
+    });
+    prev.addEventListener('click', () => step(-1));
+    next.addEventListener('click', () => step(1));
+    // On the document, not the dialog: hiding the focused arrow drops focus
+    // out of the dialog, and the keys must keep working after that.
+    document.addEventListener('keydown', (e) => {
+      if (!dialog.open) return;
+      if (e.key === 'ArrowLeft') step(-1);
+      else if (e.key === 'ArrowRight') step(1);
+    });
+
+    // Swipe on touch screens.
+    let startX = null;
+    dialog.addEventListener('pointerdown', (e) => { startX = e.pointerType === 'touch' ? e.clientX : null; });
+    dialog.addEventListener('pointerup', (e) => {
+      if (startX === null) return;
+      const dx = e.clientX - startX;
+      startX = null;
+      if (Math.abs(dx) > 50) step(dx < 0 ? 1 : -1);
+    });
   })();
 </script>
 

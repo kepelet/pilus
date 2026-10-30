@@ -237,12 +237,16 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
     let push_task = push::relay_url().map(|relay| {
         let store = Arc::new(PushStore::load(config.key_path.with_file_name("push.json")));
         hub = hub.clone().with_push(Arc::clone(&store));
-        tokio::spawn(push::run(
-            Arc::clone(&link),
-            Arc::clone(&auth),
-            store,
-            relay,
-        ))
+        let session = config.access.session.clone();
+        let (link, auth) = (Arc::clone(&link), Arc::clone(&auth));
+        // One task so that aborting it stops both watches; the remote pollers
+        // it starts are dropped with it.
+        tokio::spawn(async move {
+            tokio::join!(
+                push::run(link, Arc::clone(&auth), Arc::clone(&store), relay.clone()),
+                push::run_remotes(auth, store, relay, session),
+            );
+        })
     });
     let router = Router::builder(endpoint.clone())
         .accept(

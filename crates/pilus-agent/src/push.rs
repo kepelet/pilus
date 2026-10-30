@@ -14,6 +14,11 @@
 //! 3. Each such agent becomes one POST to the push relay (the Worker in
 //!    `infra/push`), which holds the Apple key and talks to APNs.
 //!
+//! A saved SSH machine has no event feed (`luvus uhp proxy` carries one request
+//! per SSH call), so [`run_remotes`] asks each one for `agent.list` on a slow
+//! timer instead, as the desktop app does for a machine it is not showing. The
+//! same [`BlockedWatch`] folds the replies, one per machine.
+//!
 //! The alert carries the agent's name and the session's title, nothing else.
 //! A relay that answers 410 means the phone dropped its token, so the
 //! registration goes too. Registrations also go when their device is revoked:
@@ -24,11 +29,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use pilus_client::{ControlClient, SshTarget};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use crate::enroll::{AuthState, write_atomic};
-use crate::hub::{gateway_request, subscribe_feed};
+use crate::hub::{LOCAL, gateway_request, subscribe_feed};
 use crate::supervisor::GatewayLink;
 use crate::watch::topics_for;
 
@@ -45,6 +52,26 @@ const SETTLE: Duration = Duration::from_millis(400);
 /// Backoff between attempts to open the event feed.
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(120);
+
+/// How often a saved SSH machine is asked who is waiting while one of its
+/// agents works or waits. Each ask is one SSH call, so this is slower than the
+/// desktop app's 5 s; an alert that is ten seconds late still reaches a locked
+/// phone.
+const REMOTE_POLL: Duration = Duration::from_secs(10);
+
+/// The same, while none of its agents works or waits. A block can only follow a
+/// start, and a start is seen on the next ask, so this costs a late alert at
+/// worst and keeps an idle machine, and a laptop host, from waking every ten
+/// seconds all day.
+const REMOTE_IDLE_POLL: Duration = Duration::from_secs(30);
+
+/// The slowest an unreachable machine is asked. A machine that is asleep or
+/// off the network is normal, so it backs off instead of giving up.
+const REMOTE_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// How often the saved machines are listed again, to follow one being added,
+/// disabled or repointed.
+const CATALOG_EVERY: Duration = Duration::from_secs(60);
 
 /// A relay that does not answer in this long has failed. An alert that late is
 /// not worth holding the next one up for.
@@ -88,7 +115,7 @@ pub struct Registration {
 pub struct PushStore {
     path: PathBuf,
     entries: Mutex<BTreeMap<String, Registration>>,
-    /// Wakes [`run`] when the first registration arrives.
+    /// Wakes whoever waits in [`PushStore::registered`] when a registration arrives.
     wake: Notify,
 }
 
@@ -126,7 +153,7 @@ impl PushStore {
             .map_err(|_| "could not save the registration")?;
         *entries = candidate;
         drop(entries);
-        self.wake.notify_one();
+        self.wake.notify_waiters();
         Ok(())
     }
 
@@ -169,12 +196,19 @@ impl PushStore {
         lock(&self.entries).is_empty()
     }
 
-    /// Resolve once at least one device is registered.
+    /// Resolve once at least one device is registered. [`run`] and
+    /// [`run_remotes`] both wait here, so the registration wakes every waiter.
     async fn registered(&self) {
-        // `notify_one` keeps a permit when nobody waits, so a registration
-        // landing between the check and the await is not lost.
-        while self.is_empty() {
-            self.wake.notified().await;
+        loop {
+            // Enabled before the check, so a registration landing between the
+            // check and the await is not lost: `notify_waiters` keeps no permit.
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.is_empty() {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -232,7 +266,7 @@ pub struct Blocked {
 }
 
 impl Blocked {
-    fn from_agent(pane: &str, agent: &Value) -> Self {
+    fn from_agent(machine: &str, pane: &str, agent: &Value) -> Self {
         let kind = text(agent, "agent");
         let who = if kind.is_empty() {
             "An agent".to_string()
@@ -246,28 +280,54 @@ impl Blocked {
             .map(|key| text(agent, key))
             .find(|value| !value.is_empty())
             .unwrap_or_default();
-        let mut tag = format!("pilus-blocked-local-{pane}");
-        // `apns-collapse-id` allows 64 bytes.
-        tag.truncate(64);
         Self {
-            tag,
+            tag: tag_for(machine, pane),
             title: format!("{who} is waiting your input"),
             body: session,
         }
     }
 }
 
+/// The collapse id for one pane, the tag `AttentionWatch.swift` builds too.
+fn tag_for(machine: &str, pane: &str) -> String {
+    let mut tag = format!("pilus-blocked-{machine}-{pane}");
+    // `apns-collapse-id` allows 64 bytes. A machine id is the user's to name,
+    // so cut on a character boundary rather than panic in the middle of one.
+    let mut end = tag.len().min(64);
+    while !tag.is_char_boundary(end) {
+        end -= 1;
+    }
+    tag.truncate(end);
+    tag
+}
+
 /// Spots the moment an agent starts waiting, from successive `agent.list`
 /// replies. It touches no network, so the rules are testable on their own.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BlockedWatch {
+    /// The machine the lists come from; it names the alert's tag.
+    machine: String,
     /// An agent already blocked when the first list arrives is old news, not
     /// an alert.
     seeded: bool,
     blocked: BTreeSet<String>,
 }
 
+impl Default for BlockedWatch {
+    fn default() -> Self {
+        Self::new(LOCAL)
+    }
+}
+
 impl BlockedWatch {
+    pub fn new(machine: impl Into<String>) -> Self {
+        Self {
+            machine: machine.into(),
+            seeded: false,
+            blocked: BTreeSet::new(),
+        }
+    }
+
     /// Fold one `agent.list` reply and return the agents that newly block.
     pub fn observe(&mut self, list: &Value) -> Vec<Blocked> {
         let agents = list
@@ -282,7 +342,7 @@ impl BlockedWatch {
                 continue;
             }
             if self.seeded && !self.blocked.contains(&pane) {
-                fresh.push(Blocked::from_agent(&pane, agent));
+                fresh.push(Blocked::from_agent(&self.machine, &pane, agent));
             }
             now.insert(pane);
         }
@@ -293,7 +353,8 @@ impl BlockedWatch {
 
     /// Forget everything, so the next list is old news again.
     pub fn reset(&mut self) {
-        *self = Self::default();
+        self.seeded = false;
+        self.blocked.clear();
     }
 }
 
@@ -467,6 +528,127 @@ fn concerns_agents(line: &str) -> bool {
     name.ends_with("resync_required") || topics_for(name).contains(&"agents")
 }
 
+/// How long to wait before asking a machine again, given its last `agent.list`.
+fn next_poll(list: &Value) -> Duration {
+    let active = list
+        .get("agents")
+        .and_then(Value::as_array)
+        .is_some_and(|agents| {
+            agents
+                .iter()
+                .any(|agent| matches!(text(agent, "status").as_str(), "working" | "blocked"))
+        });
+    if active {
+        REMOTE_POLL
+    } else {
+        REMOTE_IDLE_POLL
+    }
+}
+
+/// A machine's poll task, stopped when it is dropped so that dropping
+/// [`run_remotes`] stops them all.
+struct Poller(JoinHandle<()>);
+
+impl Drop for Poller {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Watch every saved SSH machine for agents that start waiting, for as long as
+/// the daemon runs. Like [`run`], it costs nothing until a device registers:
+/// no catalog read, no SSH call. The catalog is read again every
+/// [`CATALOG_EVERY`], and only machines the hub itself would reach (enabled,
+/// with a verified remote binary) are polled.
+pub async fn run_remotes(
+    auth: Arc<AuthState>,
+    store: Arc<PushStore>,
+    relay: String,
+    session: Option<String>,
+) {
+    let mut pollers: BTreeMap<String, (SshTarget, Poller)> = BTreeMap::new();
+    loop {
+        if store.is_empty() {
+            pollers.clear();
+            store.registered().await;
+        }
+        let catalog = {
+            let session = session.clone();
+            tokio::task::spawn_blocking(move || {
+                pilus_client::list_machines(&pilus_client::config_dir(), session.as_deref())
+            })
+            .await
+            .unwrap_or_default()
+        };
+        let wanted: BTreeMap<String, SshTarget> = catalog
+            .into_iter()
+            .filter(|machine| machine.id != LOCAL && machine.enabled)
+            .filter_map(|machine| Some((machine.id.clone(), machine.ssh_target()?)))
+            .collect();
+        // A poller that returned (nobody was registered) is started afresh.
+        pollers.retain(|id, (target, poller)| {
+            !poller.0.is_finished() && wanted.get(id) == Some(target)
+        });
+        for (id, target) in wanted {
+            pollers.entry(id.clone()).or_insert_with(|| {
+                let task = tokio::spawn(poll_machine(
+                    id,
+                    target.clone(),
+                    Arc::clone(&auth),
+                    Arc::clone(&store),
+                    relay.clone(),
+                ));
+                (target, Poller(task))
+            });
+        }
+        tokio::time::sleep(CATALOG_EVERY).await;
+    }
+}
+
+/// Ask one machine for `agent.list` until nobody is registered, and push what
+/// newly blocks. The first reply only seeds the watch.
+async fn poll_machine(
+    machine: String,
+    target: SshTarget,
+    auth: Arc<AuthState>,
+    store: Arc<PushStore>,
+    relay: String,
+) {
+    let mut watch = BlockedWatch::new(machine.clone());
+    let mut delay = REMOTE_POLL;
+    let mut unreachable = false;
+    while !store.is_empty() {
+        let probe = target.clone();
+        let asked = tokio::task::spawn_blocking(move || {
+            ControlClient::connect_ssh(probe)?.request("agent.list", json!({}))
+        })
+        .await;
+        match asked {
+            Ok(Ok(list)) => {
+                unreachable = false;
+                delay = next_poll(&list);
+                for blocked in watch.observe(&list) {
+                    notify(&store, &auth, &relay, &blocked).await;
+                }
+            }
+            failed => {
+                // Said once per outage, not once per try.
+                if !unreachable {
+                    let why = match failed {
+                        Ok(Err(error)) => error.to_string(),
+                        Err(error) => error.to_string(),
+                        Ok(Ok(_)) => String::new(),
+                    };
+                    eprintln!("pilus-agent: push cannot reach machine {machine}: {why}");
+                }
+                unreachable = true;
+                delay = (delay * 2).min(REMOTE_RETRY_MAX);
+            }
+        }
+        tokio::time::sleep(delay).await;
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -545,9 +727,9 @@ mod tests {
     fn the_body_falls_back_from_session_title_to_alias_to_workspace() {
         let mut bare = agent("1", "blocked");
         bare["agent_session_title"] = json!("");
-        assert_eq!(Blocked::from_agent("1", &bare).body, "fixer");
+        assert_eq!(Blocked::from_agent("local", "1", &bare).body, "fixer");
         bare["name"] = Value::Null;
-        assert_eq!(Blocked::from_agent("1", &bare).body, "pilus");
+        assert_eq!(Blocked::from_agent("local", "1", &bare).body, "pilus");
     }
 
     #[test]
@@ -560,6 +742,38 @@ mod tests {
         let fresh = watch.observe(&list(&[odd]));
         assert_eq!(fresh[0].tag, "pilus-blocked-local-7");
         assert_eq!(fresh[0].title, "OpenCode is waiting your input");
+    }
+
+    #[test]
+    fn a_remote_machine_names_its_own_tag() {
+        let mut watch = BlockedWatch::new("mac-mini");
+        assert!(watch.observe(&list(&[agent("4", "working")])).is_empty());
+        let fresh = watch.observe(&list(&[agent("4", "blocked")]));
+        assert_eq!(fresh[0].tag, "pilus-blocked-mac-mini-4");
+        // Two machines may use the same pane id without sharing an alert.
+        let mut other = BlockedWatch::new("studio");
+        other.observe(&list(&[agent("4", "working")]));
+        assert_ne!(other.observe(&list(&[agent("4", "blocked")]))[0].tag, fresh[0].tag);
+    }
+
+    #[test]
+    fn a_long_or_non_ascii_tag_is_cut_on_a_character_boundary() {
+        let tag = tag_for("ünïcödé-machine-with-a-long-name-ünïcödé", "pane-12345678");
+        assert!(tag.len() <= 64);
+        assert!(tag.starts_with("pilus-blocked-ünïcödé"));
+        assert_eq!(tag_for("mac-mini", "7"), "pilus-blocked-mac-mini-7");
+    }
+
+    #[test]
+    fn a_machine_is_asked_often_only_while_an_agent_works_or_waits() {
+        assert_eq!(next_poll(&list(&[agent("1", "working")])), REMOTE_POLL);
+        assert_eq!(
+            next_poll(&list(&[agent("1", "done"), agent("2", "blocked")])),
+            REMOTE_POLL
+        );
+        assert_eq!(next_poll(&list(&[agent("1", "done")])), REMOTE_IDLE_POLL);
+        assert_eq!(next_poll(&list(&[])), REMOTE_IDLE_POLL);
+        assert_eq!(next_poll(&json!({})), REMOTE_IDLE_POLL);
     }
 
     #[test]
@@ -608,6 +822,26 @@ mod tests {
         assert!(again.unregister("phone"));
         assert!(!again.unregister("phone"));
         assert!(PushStore::load(path).is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_registration_wakes_every_waiter() {
+        let store = Arc::new(PushStore::load(scratch("waiters")));
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move { store.registered().await })
+            })
+            .collect();
+        // Let both reach the wait before the registration lands.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        store.register("phone", TOKEN, false).expect("register");
+        for waiter in waiters {
+            tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .expect("woken")
+                .expect("joined");
+        }
     }
 
     #[test]
@@ -680,7 +914,7 @@ mod tests {
             token: TOKEN.to_string(),
             sandbox: false,
         };
-        let blocked = Blocked::from_agent("3", &agent("3", "blocked"));
+        let blocked = Blocked::from_agent("local", "3", &agent("3", "blocked"));
         assert_eq!(post(&url, &registration, &blocked), Delivery::Sent);
         let request = server.join().expect("server");
         let body: Value =
@@ -697,7 +931,7 @@ mod tests {
             token: TOKEN.to_string(),
             sandbox: false,
         };
-        let blocked = Blocked::from_agent("3", &agent("3", "blocked"));
+        let blocked = Blocked::from_agent("local", "3", &agent("3", "blocked"));
         let (url, server) = fake_relay(410);
         assert_eq!(post(&url, &registration, &blocked), Delivery::Gone);
         server.join().expect("server");

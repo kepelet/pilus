@@ -10,13 +10,13 @@ import UserNotifications
 ///   to hand the host its APNs token (`AppStore.syncPush`).
 /// - Local. The app's own watch posts the alert while it is still running. This
 ///   covers a host that does not push (an older one, or one with push turned
-///   off), and machines the host only reaches over SSH. In front it would
+///   off). In front it would
 ///   duplicate the blocked dot on the list, so it is skipped, and shortly after
 ///   backgrounding `BackgroundGrace` keeps the watch alive long enough to
 ///   deliver one.
 ///
-/// When the host pushes for the machine, the local alert steps aside rather
-/// than doubling it.
+/// When the host pushes, the local alert steps aside rather than doubling it.
+/// The host polls its saved SSH machines too, so that covers them as well.
 @MainActor
 enum Notifier {
     static let enabledKey = "notifyBlocked"
@@ -34,7 +34,7 @@ enum Notifier {
     static var onToken: (() -> Void)?
 
     /// Whether the paired host accepted this phone's token and will push for
-    /// its own machine. Set from the host's `hub.push.register` reply.
+    /// its machines. Set from the host's `hub.push.register` reply.
     static var hostPushes = false
 
     /// Whether this build's token comes from the APNs sandbox. Only a hint:
@@ -66,8 +66,9 @@ enum Notifier {
                 center.removeDeliveredNotifications(withIdentifiers: [tag])
             case .blocked(let blocked):
                 guard enabled, UIApplication.shared.applicationState != .active else { continue }
-                // The host's push already covers its own machine.
-                if blocked.machine == "local" && hostPushes { continue }
+                // The host's push covers its own machine and every saved SSH
+                // machine it can reach, which is every machine the app lists.
+                if hostPushes { continue }
                 let content = UNMutableNotificationContent()
                 content.title = "\(blocked.agent) is waiting your input"
                 content.body = blocked.session

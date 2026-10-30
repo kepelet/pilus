@@ -30,8 +30,13 @@ agent blocks → Luvus event → pilus-agent (push.rs) → relay Worker → APNs
   event feed **only while a token is registered**, reads `agent.list` after
   `agent`/`pane` events (400 ms settle), and `BlockedWatch` picks out agents that
   just became `blocked`. An agent already blocked at the first look is old news.
-  Only the paired machine is covered: an SSH machine has no event feed, so the
-  phone's local alert still serves it.
+  A saved SSH machine has no event feed (`luvus uhp proxy` is one request per
+  SSH call), so `run_remotes` polls it instead: one `agent.list` per enabled
+  machine with a verified remote binary (the hub's own `ready` test), each with
+  its own `BlockedWatch`. The gap is 10 s while one of the machine's agents is
+  `working` or `blocked` and 30 s otherwise (`next_poll`). The catalog is re-read every minute. An
+  unreachable machine backs off to five minutes and is logged once per outage.
+  With no token registered, nothing is listed and no SSH call is made.
 - **Relay** (`infra/push`). Validates the body, signs an ES256 provider token
   (cached 40 minutes), and calls APNs. The phone's `sandbox` flag is a hint:
   on `BadDeviceToken` it tries the other environment, so a Debug/TestFlight mix-up
@@ -42,10 +47,11 @@ agent blocks → Luvus event → pilus-agent (push.rs) → relay Worker → APNs
 
 Title `<Agent> is waiting your input`, body the session's title (else the
 pane's alias, else the workspace). The collapse id is
-`pilus-blocked-<machine>-<pane>`, the same tag the app uses locally
-(`AttentionWatch.swift`), so a newer alert replaces an older one and the app
-can take a delivered one down once the agent is unblocked. Keep the two tags in
-step; APNs caps the id at 64 bytes.
+`pilus-blocked-<machine>-<pane>`, with `local` or the saved machine's id, the
+same tag the app uses locally (`AttentionWatch.swift`), so a newer alert
+replaces an older one and the app can take a delivered one down once the agent
+is unblocked. Keep the two tags in step; APNs caps the id at 64 bytes, and
+`tag_for` cuts on a character boundary because a machine id is user-named.
 
 ## Setup
 
@@ -62,6 +68,9 @@ step; APNs caps the id at 64 bytes.
 - `hub.push.*` is answered by `Hub::handle_push`, not `Hub::handle`: it needs the
   caller's endpoint id, and the token is stored under that id whatever the
   params claim. Any enrolled level may call it.
+- The host's SSH calls run with `BatchMode=yes`, so a machine whose key needs a
+  passphrase or a Touch ID tap fails quietly, as a service has nobody to ask.
+  Check with `env -i HOME=$HOME PATH=/usr/bin:/bin ssh -o BatchMode=yes <dest> true`.
 - `devices.json` stays the only authority. A registration is dropped when its
   device is revoked (checked before every send).
 - Never log a token, a title or a body. The relay logs none either.

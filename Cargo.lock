@@ -6601,6 +6601,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "crossterm",
  "interprocess",
  "iroh",
  "iroh-tickets",

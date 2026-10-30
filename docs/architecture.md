@@ -404,6 +404,21 @@ Each enabled machine becomes one endpoint:
   (`transport::SshTarget`, `machines::connect_machine`). Stderr is drained on a
   helper thread and folded into handshake errors, and the last `Connection`
   clone kills the SSH child so a reader parked in `read` unblocks.
+- **Slow links.** Three things borrowed from mosh keep a remote machine
+  usable over a slow link. The SSH options turn on `Compression=yes`, because
+  full frames (attach, resize, switch) are grids of repeated colors and blanks.
+  A size change goes to the local daemon at once, but a remote active bridge
+  and every hidden one get it only after the window has held still for
+  120 ms, or every 500 ms through a long drag. A live drag would otherwise
+  queue a reflow and a full frame per step. Typed text is echoed locally
+  (`pilus_client::Predictor`): printable keys are drawn at the caret before
+  the daemon echoes them, and the daemon's frames confirm each guess (the
+  caret passes it and the cell matches) or refute it (the caret passes and the
+  cell differs). Any other input (Enter, arrows, a chord, a paste, a click, a
+  resize) starts a new epoch, whose guesses stay hidden until one is
+  confirmed, so a prompt that never echoes, like a password prompt, shows
+  nothing. Guesses are drawn only while the measured echo time is above
+  50 ms, and underlined above 100 ms. A local endpoint never predicts.
 - **Auto-connect.** Every enabled profile is bridged at startup and whenever
   the catalog gains or re-enables one. Each bridge is its own thread, so the
   whole catalog comes up in parallel; an attempt is recorded, so the slow

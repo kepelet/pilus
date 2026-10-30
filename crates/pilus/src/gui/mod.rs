@@ -357,6 +357,23 @@ const M_ITALIC: u16 = 1 << 2;
 const M_UNDERLINED: u16 = 1 << 3;
 const M_REVERSED: u16 = 1 << 6;
 
+/// How long the window must hold its size before a batched resize goes out.
+const RESIZE_SETTLE: Duration = Duration::from_millis(120);
+/// The longest a batched resize waits through a drag that keeps going, so a
+/// slow drag still reflows the remote panes a couple of times a second.
+const RESIZE_HOLD: Duration = Duration::from_millis(500);
+
+/// A window size not yet sent to the bridges that batch resizes.
+#[derive(Clone, Copy, Debug)]
+struct ResizeOwed {
+    /// When the first unsent change happened.
+    first: Instant,
+    /// When the latest one happened.
+    last: Instant,
+    /// Whether the active bridge is owed it too (a remote one is).
+    active: bool,
+}
+
 gpui::actions!([
     /// Open the native Appearances window.
     OpenAppearances,
@@ -2161,6 +2178,14 @@ struct PilusView {
     active: EndpointId,
     /// The active machine's profile, when a machine owns the surface.
     active_machine: Option<MachineInfo>,
+    /// Local echo for the active endpoint over a slow link. Replaced when
+    /// the active endpoint changes, since its timing belongs to one link.
+    predictor: pilus_client::Predictor,
+    /// Set when input other than a plain key went out, so the predictor
+    /// starts a new epoch. `send_active` takes `&self`, hence the cell.
+    echo_interrupted: std::cell::Cell<bool>,
+    /// A size change not yet sent to the bridges that batch them.
+    resize_owed: Option<ResizeOwed>,
     /// Connected endpoints that are not currently active.
     endpoints: HashMap<EndpointId, Endpoint>,
     /// Endpoint ids with a background connection in flight.
@@ -2800,6 +2825,9 @@ impl PilusView {
             sidebar_scroll: ScrollHandle::new(),
             active: EndpointId::Local,
             active_machine: None,
+            predictor: pilus_client::Predictor::new(),
+            echo_interrupted: std::cell::Cell::new(false),
+            resize_owed: None,
             endpoints: HashMap::new(),
             connecting: HashSet::new(),
             wanted: None,
@@ -2977,9 +3005,76 @@ impl PilusView {
     /// is a no-op: the reconnect loop owns recovery, and every caller already
     /// ignores send failures.
     fn send_active(&self, message: ClientMessage) {
+        if pilus_client::interrupts_echo(&message) {
+            self.echo_interrupted.set(true);
+        }
         if let Some(connection) = self.connection.as_ref() {
             let _ = connection.send(message);
         }
+    }
+
+    /// The window's current grid size, as the daemon takes it.
+    fn size_message(&self) -> ClientMessage {
+        ClientMessage::Resize {
+            cols: self.cols,
+            rows: self.rows,
+            cell_width_px: self.sent_cell.0,
+            cell_height_px: self.sent_cell.1,
+        }
+    }
+
+    /// Send the current size to the active bridge, settling any batched size
+    /// still owed to it so the batch does not send it twice.
+    fn send_active_size(&mut self) {
+        if let Some(owed) = self.resize_owed.as_mut() {
+            owed.active = false;
+        }
+        self.send_active(self.size_message());
+    }
+
+    /// Send a batched size once the window has held still for
+    /// [`RESIZE_SETTLE`], or every [`RESIZE_HOLD`] through a long drag.
+    fn flush_resize(&mut self) {
+        let Some(owed) = self.resize_owed else {
+            return;
+        };
+        let now = Instant::now();
+        if now.duration_since(owed.last) < RESIZE_SETTLE
+            && now.duration_since(owed.first) < RESIZE_HOLD
+        {
+            return;
+        }
+        self.resize_owed = None;
+        let resize = self.size_message();
+        if owed.active {
+            self.send_active(resize.clone());
+        }
+        // Suspended endpoints keep their panes and PTY sizes, so a window
+        // resized while they are hidden would leave them reflowing content
+        // the moment they are switched to. The prepare handoff then renders
+        // a candidate that already matches, and committing it never visibly
+        // resizes the terminal.
+        for endpoint in self.endpoints.values() {
+            if let Some(connection) = endpoint.connection.as_ref() {
+                let _ = connection.send(resize.clone());
+            }
+        }
+    }
+
+    /// Hand input the predictor has not seen to it as an epoch boundary.
+    /// Returns whether the drawn guesses changed.
+    fn take_echo_interrupt(&mut self) -> bool {
+        self.echo_interrupted.take()
+            && self
+                .predictor
+                .interrupt(self.surface.frame(), Instant::now())
+    }
+
+    /// Start the active endpoint's local echo afresh: a new link has its own
+    /// timing, and guesses made against the old grid mean nothing on it.
+    fn reset_predictor(&mut self) {
+        self.predictor = pilus_client::Predictor::new();
+        self.echo_interrupted.set(false);
     }
 
     /// Whether the window has no daemon to show because Luvus is not
@@ -3200,6 +3295,7 @@ impl PilusView {
             }
         }
         changed |= self.poll_active(cx);
+        self.flush_resize();
         changed |= self
             .toasts
             .tick(Instant::now(), self.window_active, cx.reduce_motion());
@@ -3727,12 +3823,7 @@ impl PilusView {
                     // a resize with a full frame, which is the only recovery
                     // the protocol offers.
                     if self.surface.take_resync() {
-                        self.send_active(ClientMessage::Resize {
-                            cols: self.cols,
-                            rows: self.rows,
-                            cell_width_px: self.sent_cell.0,
-                            cell_height_px: self.sent_cell.1,
-                        });
+                        self.send_active_size();
                     }
                     if let Some(text) = self.surface.take_notify() {
                         self.notify_daemon(text);
@@ -3759,6 +3850,7 @@ impl PilusView {
                 ClientEvent::Disconnected { reason } => {
                     self.status = format!("disconnected · {reason}");
                     self.active_live = false;
+                    self.reset_predictor();
                     // The remote feed is its own SSH bridge; stop it while the
                     // render bridge is down, and queue a backoff reconnect.
                     // Local reconnects restart the daemon; a machine reconnects
@@ -3778,6 +3870,16 @@ impl PilusView {
             }
         }
         self.catalog_dirty |= catalog;
+        // Judge the guessed echo against what the daemon has now drawn, and
+        // give up on any it has left unanswered too long.
+        if self.active_machine.is_some() {
+            let now = Instant::now();
+            changed |= self.take_echo_interrupt();
+            if let Some(frame) = self.surface.frame() {
+                changed |= self.predictor.observe(Some(frame), now);
+            }
+            changed |= self.predictor.expire(self.surface.frame(), now);
+        }
         changed
     }
 
@@ -4356,14 +4458,10 @@ impl PilusView {
         };
         self.endpoints.insert(outgoing_id, outgoing);
         self.active_machine = machine;
+        self.reset_predictor();
 
         self.set_active_interest(SurfaceInterest::Active);
-        self.send_active(ClientMessage::Resize {
-            cols: self.cols,
-            rows: self.rows,
-            cell_width_px: self.sent_cell.0,
-            cell_height_px: self.sent_cell.1,
-        });
+        self.send_active_size();
         self.agent_feed = Some(self.spawn_feed_for_active());
         self.selection = None;
         self.hover_cell = None;
@@ -4651,15 +4749,11 @@ impl PilusView {
         self.connection = Some(connection);
         self.active_live = true;
         self.active_machine = Some(machine);
+        self.reset_predictor();
         self.endpoints
             .remove(&EndpointId::Machine(machine_id.clone()));
         self.set_active_interest(SurfaceInterest::Active);
-        self.send_active(ClientMessage::Resize {
-            cols: self.cols,
-            rows: self.rows,
-            cell_width_px: self.sent_cell.0,
-            cell_height_px: self.sent_cell.1,
-        });
+        self.send_active_size();
         self.push_sidebar_layout();
         self.agent_feed = Some(self.spawn_feed_for_active());
         self.toast(ToastKind::Success, "reconnected");
@@ -4714,15 +4808,11 @@ impl PilusView {
         self.connection = Some(connection);
         self.active = EndpointId::Local;
         self.active_machine = None;
+        self.reset_predictor();
         self.active_live = true;
         self.endpoints.remove(&EndpointId::Local);
         self.set_active_interest(SurfaceInterest::Active);
-        self.send_active(ClientMessage::Resize {
-            cols: self.cols,
-            rows: self.rows,
-            cell_width_px: self.sent_cell.0,
-            cell_height_px: self.sent_cell.1,
-        });
+        self.send_active_size();
         self.push_sidebar_layout();
         self.agent_feed = Some(self.spawn_feed_for_active());
         self.toast(ToastKind::Success, "reconnected");
@@ -5180,6 +5270,17 @@ impl PilusView {
             return;
         }
         if let Some(key) = keys::to_wire(keystroke, KeyEventKind::Press) {
+            // Guess the echo only where a round trip can be felt: a machine
+            // reached over SSH. The local daemon echoes within a frame.
+            if self.active_machine.is_some() {
+                let interrupted = self.take_echo_interrupt();
+                let guessed = self
+                    .predictor
+                    .key(&key, self.surface.frame(), Instant::now());
+                if interrupted || guessed {
+                    cx.notify();
+                }
+            }
             self.send_active(ClientMessage::Key(key));
         }
     }
@@ -15137,23 +15238,23 @@ impl PilusView {
         self.cols = cols;
         self.rows = rows;
         self.sent_cell = cell;
-        let resize = ClientMessage::Resize {
-            cols,
-            rows,
-            cell_width_px: cell.0,
-            cell_height_px: cell.1,
-        };
-        self.send_active(resize.clone());
-        // Suspended endpoints keep their panes and PTY sizes, so a window
-        // resized while they are hidden would leave them reflowing content
-        // the moment they are switched to. Push the new size down every
-        // bridge; the prepare handoff then renders a candidate that already
-        // matches, and committing it never visibly resizes the terminal.
-        for endpoint in self.endpoints.values() {
-            if let Some(connection) = endpoint.connection.as_ref() {
-                let _ = connection.send(resize.clone());
-            }
+        // A local daemon is a socket away, so its grid follows the window at
+        // once. Over SSH every size costs the daemon a reflow and a full
+        // frame down a slow pipe, so a live drag would queue one per step;
+        // a remote active bridge, and every hidden one, gets the size once
+        // the window stops changing (`flush_resize`, on the tick).
+        let now = Instant::now();
+        let remote = self.active_machine.is_some();
+        if !remote {
+            self.send_active_size();
         }
+        let owed = self.resize_owed.get_or_insert(ResizeOwed {
+            first: now,
+            last: now,
+            active: false,
+        });
+        owed.last = now;
+        owed.active |= remote;
     }
 }
 
@@ -15304,7 +15405,13 @@ impl Render for PilusView {
             layout.cell_w,
             self.skipped_cols(),
         );
-        let grid = match self.shown_frame() {
+        // Guessed keys go over the live grid only; the snapshot held while
+        // the sidebar slides is painted as it was taken.
+        let predicted = match (&self.sidebar_freeze, self.surface.frame()) {
+            (None, Some(frame)) if self.active_machine.is_some() => self.predictor.overlay(frame),
+            _ => None,
+        };
+        let grid = match predicted.as_ref().or(self.shown_frame()) {
             Some(frame) => perf::grid_build(|| {
                 render_grid(
                     frame,

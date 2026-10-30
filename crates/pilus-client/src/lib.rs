@@ -32,6 +32,7 @@ mod mission;
 pub mod netlog;
 mod paste;
 mod ports;
+mod predict;
 pub mod process;
 mod read;
 mod relay;
@@ -97,6 +98,7 @@ pub use mission::{
 pub use paste::{MAX_PASTED_BYTES, PastedImage, is_image_file, shell_word, stash_image};
 pub use pilus_protocol as protocol;
 pub use ports::{ListeningPort, PortForward, free_local_port, kill_process, list_ports};
+pub use predict::{Predictor, interrupts_echo};
 pub use read::{
     MAX_IMAGE_BYTES, MAX_TEXT_BYTES, TextFile, Version, is_file, read_bytes, read_text,
 };

@@ -66,7 +66,13 @@ impl SshTarget {
             .arg("-o")
             .arg("ServerAliveInterval=15")
             .arg("-o")
-            .arg("ServerAliveCountMax=3");
+            .arg("ServerAliveCountMax=3")
+            // The render bridge carries whole cell grids: a full frame is
+            // sent on attach, on every resize and on every endpoint switch,
+            // and grids of repeated colors and blanks shrink several times
+            // over. On a slow link that is the wait before the screen shows.
+            .arg("-o")
+            .arg("Compression=yes");
         if let Some(control_path) = control_path {
             command
                 .arg("-o")
@@ -546,6 +552,7 @@ mod tests {
         assert_eq!(args[0], "-T");
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert!(args.contains(&"ConnectTimeout=10".to_string()));
+        assert!(args.contains(&"Compression=yes".to_string()));
         assert_eq!(args[args.len() - 1], "remote-client-bridge");
         // Destination and binary precede the remote subcommand.
         assert_eq!(args[args.len() - 3], "dev@buildbox");

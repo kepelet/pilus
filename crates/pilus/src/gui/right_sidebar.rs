@@ -985,7 +985,7 @@ impl PilusView {
             .child(strip);
         // Comfortable insets the body the way the left sidebar's list is: a
         // gap from the window's right and bottom edges, the terminal card's
-        // own gap on its left, the same rounded corner and faint ring. Only
+        // own gap on its left, the same rounded corner and a full hairline. Only
         // when the column fills the window is there no terminal card to
         // leave that gap, so the card takes it itself as the column spreads.
         let column = if floating {
@@ -999,10 +999,7 @@ impl PilusView {
                     .mr(px(super::pane_chrome::GAP_PX))
                     .mb(px(super::pane_chrome::GAP_PX))
                     .border(px(super::pane_chrome::BORDER_PX))
-                    .border_color(gpui::Rgba {
-                        a: theme.border.a * super::pane_chrome::REST_RING,
-                        ..theme.border
-                    })
+                    .border_color(theme.border)
                     .rounded(style::RADIUS_MD.pixels())
                     .overflow_hidden()
                     .bg(self.chrome_fill())

@@ -70,7 +70,7 @@ is the only implementation of it.
   gap beside the card (`sidebar_reach`), so the pills meet the card's edge;
   rounded pills keep that gap.
   The right column is inset under floating cards: its body is a card with the
-  terminal card's ring and corner, a `GAP_PX` margin from the window's right
+  terminal card's corner and a full `theme.border` hairline, a `GAP_PX` margin from the window's right
   and bottom edges, and a left gap of its own once the column expands over the
   terminal. Its tab bar stays on the ground above, and its tabs
   (`style::strip_tab`) dress like the window's own: the selected one wears the

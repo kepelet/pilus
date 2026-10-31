@@ -70,13 +70,16 @@ is the only implementation of it.
   gap beside the card (`sidebar_reach`), so the pills meet the card's edge;
   rounded pills keep that gap.
   The right column is inset under floating cards: its body is a card with the
-  terminal card's corner and a full `theme.border` hairline, a `GAP_PX` margin from the window's right
+  terminal card's corner, its fill (`theme.bg` at the window's opacity, so it
+  is as translucent as the terminal) and a full `theme.border` hairline, a `GAP_PX` margin from the window's right
   and bottom edges, and a left gap of its own once the column expands over the
   terminal. Its tab bar stays on the ground above, and its tabs
   (`style::strip_tab`) dress like the window's own: the selected one wears the
   glide pill, a hover draws the same hairline. Its icon buttons
   (`style::strip_button`) are tab-high squares in the same dress, with no
   padding around them; one that is on wears the wash and hairline.
+  Flush, the whole right column, tab bar included, takes the terminal's fill
+  (`theme.bg` at the window's opacity), so it is as translucent as the grid.
   The sidebar and tab strip take their ground (`Theme::chrome_ground`) only
   when the window is opaque; translucent, both are bare and the frosted
   backdrop shows through. The exception is a translucent sidebar beside

@@ -946,15 +946,15 @@ impl PilusView {
             .flex()
             .flex_col()
             .overflow_hidden()
-            // Flush, the column is chrome with a hairline on its leading
-            // edge. Floating, it is the cards' ground (the tab strip's, or
-            // under translucency the tinted surface below the strip) with the
-            // body inset as a card, so the terminal's surface meets the column
-            // without a seam. Focus draws no edge: only Changes takes keys, so
-            // it would mark one tab.
+            // Flush, the column wears the terminal's fill, tab bar included,
+            // with a hairline on its leading edge. Floating, it is the cards'
+            // ground (the tab strip's, or under translucency the tinted
+            // surface below the strip) with the body inset as a card, so the
+            // terminal's surface meets the column without a seam. Focus draws
+            // no edge: only Changes takes keys, so it would mark one tab.
             .when(!floating, |column| {
                 column
-                    .bg(self.chrome_fill())
+                    .bg(theme.bg.opacity(self.glass_opacity()))
                     .border_l_1()
                     .border_color(theme.border)
             })
@@ -1002,7 +1002,7 @@ impl PilusView {
                     .border_color(theme.border)
                     .rounded(style::RADIUS_MD.pixels())
                     .overflow_hidden()
-                    .bg(self.chrome_fill())
+                    .bg(theme.bg.opacity(self.glass_opacity()))
                     .child(body)
                     .children(footer),
             )

@@ -439,14 +439,20 @@ pub(super) fn glyph_tile(
                 .flex_shrink_0()
                 .text_color(look.glyph),
         );
-    // The badge hangs off the front card's upper right corner by no more
-    // than the deck's padding, so a tab's clip does not cut it.
+    // The badge is centered on the front card's upper right corner as it is
+    // drawn: the corner is rounded (a stadium at the default radius), so the
+    // box's own corner would leave the badge floating off the shape. It stays
+    // inside the deck, so a tab's clip does not cut it.
+    let corner = radius.min(GLYPH_TILE / 2.0);
+    let on_arc = corner * std::f32::consts::FRAC_1_SQRT_2;
+    let badge_x = GLYPH_TILE_W - corner + on_arc - TILE_BADGE / 2.0;
+    let badge_y = (STACK_PAD + corner - on_arc - TILE_BADGE / 2.0).max(0.0);
     let badge = status.map(|color| {
         div()
             .id("pilus-state-badge")
             .absolute()
-            .left(px(GLYPH_TILE_W - TILE_BADGE + STACK_PAD))
-            .top_0()
+            .left(px(badge_x))
+            .top(px(badge_y))
             .w(px(TILE_BADGE))
             .h(px(TILE_BADGE))
             .status_fill(color, Radius::Full)

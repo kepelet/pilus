@@ -44,6 +44,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::editor_ops;
 use super::highlight::{self, Span};
 use super::line_diff::{self, LineChanges};
 use super::style;
@@ -460,6 +461,21 @@ impl Buffer {
         start..end
     }
 
+    /// Apply an editor operation's change as one undo step, then put the
+    /// selection where it says. A change that edits nothing only selects.
+    fn apply(&mut self, change: editor_ops::Change) {
+        let range = self.clamp(self.text.floor_char_boundary(change.range.start))
+            ..self.clamp(self.text.ceil_char_boundary(change.range.end));
+        if !range.is_empty() || !change.insert.is_empty() {
+            self.snapshot();
+            self.text.replace_range(range, &change.insert);
+            self.revision = next_revision();
+            self.redo.clear();
+        }
+        self.anchor = self.clamp(self.text.floor_char_boundary(change.anchor));
+        self.head = self.clamp(self.text.floor_char_boundary(change.head));
+    }
+
     fn snapshot(&mut self) {
         self.undo.push(Snapshot {
             text: self.text.clone(),
@@ -607,6 +623,16 @@ fn line_end(text: &str, byte: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+/// Whether `key` with `modifiers` would change a field's text, which a
+/// read-only field refuses.
+fn edits_text(key: &str, modifiers: gpui::Modifiers) -> bool {
+    match key {
+        "backspace" | "delete" | "del" | "enter" | "tab" => true,
+        "x" | "v" | "z" => modifiers.platform,
+        _ => false,
+    }
+}
+
 /// `text` with every character drawn as asterisks, one per byte.
 ///
 /// Matching the byte length is what lets the caret, the selection and a click
@@ -715,6 +741,11 @@ pub(super) struct TextInput {
     /// platform delivers an unclaimed chord's glyph a moment later as text,
     /// by which time the modifier state can already be stale.
     command_chord_at: Option<Instant>,
+    /// The text can be read, selected and copied, but not changed: a file
+    /// shown, not edited.
+    read_only: bool,
+    /// Enter carries the line's indent onto the new line, as a code editor's.
+    auto_indent: bool,
 }
 
 impl Focusable for TextInput {
@@ -759,6 +790,8 @@ impl TextInput {
             buffer,
             marked: None,
             command_chord_at: None,
+            read_only: false,
+            auto_indent: false,
             syntax: None,
             line_numbers: false,
             highlighted: None,
@@ -816,6 +849,41 @@ impl TextInput {
         if self.current_line != on {
             self.current_line = on;
             cx.notify();
+        }
+    }
+
+    /// Let the text be read and selected but not changed, or edited again.
+    pub(super) fn set_read_only(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.read_only != on {
+            self.read_only = on;
+            self.marked = None;
+            cx.notify();
+        }
+    }
+
+    /// Carry each line's indent onto the line Enter starts.
+    pub(super) fn set_auto_indent(&mut self, on: bool) {
+        self.auto_indent = on;
+    }
+
+    /// Run one of the editor's line operations (see `editor_ops`). A
+    /// read-only field takes only those that leave the text alone.
+    pub(super) fn run_op(&mut self, op: editor_ops::Op, cx: &mut Context<Self>) {
+        if !self.multiline || (self.read_only && op.edits()) {
+            return;
+        }
+        let change = {
+            let buffer = self.buffer.borrow();
+            let unit = editor_ops::indent_unit(&buffer.text);
+            let style = editor_ops::Style {
+                unit: &unit,
+                comment: self.syntax.as_deref().and_then(highlight::line_comment),
+            };
+            editor_ops::apply(op, &buffer.text, buffer.anchor, buffer.head, &style)
+        };
+        if let Some(change) = change {
+            self.buffer.borrow_mut().apply(change);
+            self.changed(cx);
         }
     }
 
@@ -978,6 +1046,11 @@ impl TextInput {
         let extend = modifiers.shift;
         let key = keystroke.key.as_str();
 
+        // A read-only field keeps its keys for moving and selecting; what
+        // would change the text is swallowed, so it reaches nothing else.
+        if self.read_only && edits_text(key, modifiers) {
+            return true;
+        }
         if modifiers.platform {
             self.command_chord_at = Some(Instant::now());
             match key {
@@ -1024,6 +1097,19 @@ impl TextInput {
                 }
                 "backspace" => {
                     let range = self.buffer.borrow_mut().backspace(true);
+                    self.delete_range(range, cx);
+                    return true;
+                }
+                // Fn+Cmd+Backspace: the rest of the line.
+                "delete" if self.multiline => {
+                    let range = {
+                        let buffer = self.buffer.borrow();
+                        if buffer.has_selection() {
+                            buffer.range()
+                        } else {
+                            buffer.head..line_end(&buffer.text, buffer.head)
+                        }
+                    };
                     self.delete_range(range, cx);
                     return true;
                 }
@@ -1107,7 +1193,12 @@ impl TextInput {
                 {
                     let mut buffer = self.buffer.borrow_mut();
                     let range = buffer.range();
-                    buffer.replace(range, "\n", true);
+                    let break_line = if self.auto_indent {
+                        editor_ops::newline(&buffer.text, range.start)
+                    } else {
+                        "\n".to_string()
+                    };
+                    buffer.replace(range, &break_line, true);
                 }
                 self.changed(cx);
                 true
@@ -1288,7 +1379,7 @@ impl EntityInputHandler for TextInput {
         let chord_pending = self
             .command_chord_at
             .is_some_and(|at| at.elapsed() < COMMAND_CHORD_WINDOW);
-        if window.modifiers().platform || chord_pending {
+        if window.modifiers().platform || chord_pending || self.read_only {
             return;
         }
         let range = self.resolve_range(range_utf16);
@@ -1307,6 +1398,9 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let range = self.resolve_range(range_utf16);
         let inserted = self
             .buffer

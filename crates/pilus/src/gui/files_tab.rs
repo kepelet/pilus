@@ -42,9 +42,9 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyModifiers, MouseButton as TerminalMouseButton, MouseEventKind};
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, DragMoveEvent, ExternalPaths, Focusable, KeyDownEvent,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, PathPromptOptions, Pixels, ScrollHandle,
-    SharedString, Window, div, list, point, prelude::*, px, relative,
+    AnyElement, ClickEvent, Context, Div, DragMoveEvent, ExternalPaths, FocusHandle, Focusable,
+    KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent, PathPromptOptions, Pixels,
+    ScrollHandle, SharedString, Window, div, list, point, prelude::*, px, relative,
 };
 use pilus_client::{
     ControlClient, Error, FileChanges, FileRow, FileTree, OpenTarget, SshTarget, TextFile, Version,
@@ -55,6 +55,7 @@ use pilus_client::{
 use crate::settings::FilesFolded;
 
 use super::diff::status_glyph;
+use super::editor_ops::{self, Op};
 use super::highlight;
 use super::image_view::{self, Picture};
 use super::md_view::{self, MdDoc, Page};
@@ -81,6 +82,10 @@ const TREE_BESIDE_MIN_PAGE: f32 = 640.0;
 const SPLIT_MIN_DOC: f32 = 600.0;
 /// The tree's width beside a document, at the default interface size.
 const TREE_BESIDE_WIDTH: f32 = 240.0;
+/// How wide an editor widens the column: past [`TREE_BESIDE_MIN_PAGE`], so
+/// the tree stays beside the file, with room left for a line of code. The
+/// window still keeps its terminal (see `right_sidebar::clamp_width`).
+const EDIT_PAGE_WIDTH: f32 = 760.0;
 
 /// Space above the editor's first line, which the caret's offset in the field
 /// does not include.
@@ -294,12 +299,23 @@ struct FileDoc {
     /// `None` means it has not been asked for yet; the inner one, that Git
     /// listed no change.
     base_asked: Option<Option<String>>,
+    /// How a reload finds the file again once the new read lands.
+    resume: Option<Resume>,
+}
+
+/// What a reload keeps of the view it replaces: the mode, where the caret
+/// was and how far the editor was scrolled.
+struct Resume {
+    mode: EditMode,
+    caret: usize,
+    scroll: ScrollHandle,
 }
 
 /// How an edited document is shown.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum EditMode {
     Source,
+    /// Read-only: markdown rendered, any other file's source unchangeable.
     Preview,
     /// The source and the rendered text side by side, the preview following
     /// each keystroke.
@@ -430,9 +446,17 @@ pub(super) struct FilesPanel {
     /// The document column is wide enough to hold the source beside its
     /// preview, as of the last frame.
     split_ok: bool,
-    /// Opening an editor stretched the right column, which closing the
+    /// The page is wide enough for the tree beside the open document, as of
+    /// the last frame, so the header offers to hide or show it.
+    tree_fits: bool,
+    /// The user put the tree away to give the document the whole page.
+    pub(super) tree_hidden: bool,
+    /// Opening an editor widened the right column, which closing the
     /// document lets back.
-    auto_expanded: bool,
+    auto_widened: bool,
+    /// The open document's page, which holds the keyboard while it is shown
+    /// read-only so its shortcuts reach it. Made with the page's first frame.
+    doc_focus: Option<FocusHandle>,
     /// Where the loading folder sits in `visible`, when it shows.
     loading_at: Option<usize>,
     list: ListState,
@@ -478,7 +502,10 @@ impl FilesPanel {
             doc_reads: 0,
             tree_beside: false,
             split_ok: false,
-            auto_expanded: false,
+            tree_fits: false,
+            tree_hidden: false,
+            auto_widened: false,
+            doc_focus: None,
             loading_at: None,
             list: ListState::new(0, ListAlignment::Top, px(600.0)),
             error: None,
@@ -529,6 +556,24 @@ impl FilesPanel {
 
     pub(super) fn doc_path(&self) -> Option<&str> {
         self.doc.as_ref().map(|doc| doc.path.as_str())
+    }
+
+    /// The open document page's focus, once it has been drawn.
+    pub(super) fn doc_focus(&self) -> Option<FocusHandle> {
+        self.doc_focus.clone()
+    }
+
+    /// Whether the open file shows its source read-only: a file with no
+    /// rendered form, out of the editor.
+    fn source_read_only(&self) -> bool {
+        self.doc.as_ref().is_some_and(|doc| {
+            !md_view::is_markdown(&doc.path)
+                && matches!(doc.state, DocState::Ready(_))
+                && doc
+                    .edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.mode == EditMode::Preview)
+        })
     }
 
     /// Whether the open document is a file the editor is the only view of.
@@ -801,18 +846,18 @@ enum Slot<'a> {
 }
 
 impl PilusView {
-    /// Let the right column back once the document that stretched it is gone,
-    /// or the user has put the column back themselves.
+    /// Let the right column back to its own width once the document that
+    /// widened it is gone.
     fn files_release_width(&mut self, cx: &mut Context<Self>) -> bool {
         let panel = &mut self.files_panel;
-        if !panel.auto_expanded || (self.right.expanded() && panel.doc.is_some()) {
+        if !panel.auto_widened || panel.doc.is_some() {
             return false;
         }
-        panel.auto_expanded = false;
-        if !self.right.expanded() {
-            return false;
+        panel.auto_widened = false;
+        self.right.widen(None);
+        if cx.reduce_motion() {
+            self.right.settle();
         }
-        self.toggle_right_expanded(cx);
         true
     }
 
@@ -872,10 +917,11 @@ impl PilusView {
                     if current.is_some_and(|current| current != endpoint) {
                         continue;
                     }
-                    changed |= self.files_panel.apply_doc(seq, result);
-                    // A source file has no preview to start from.
-                    if self.files_panel.doc_is_source() {
-                        self.files_begin_edit(cx);
+                    let applied = self.files_panel.apply_doc(seq, result);
+                    changed |= applied;
+                    // A stale answer leaves the document as it was.
+                    if applied {
+                        self.files_doc_landed(cx);
                     }
                 }
                 FilesMsg::Picture {
@@ -1197,6 +1243,7 @@ impl PilusView {
                     edit: None,
                     git_base: None,
                     base_asked: None,
+                    resume: None,
                 });
                 return;
             }
@@ -1226,6 +1273,7 @@ impl PilusView {
             edit: None,
             git_base,
             base_asked: None,
+            resume: None,
         });
         let tx = panel.tx.clone();
         std::thread::spawn(move || {
@@ -1278,9 +1326,7 @@ impl PilusView {
     /// keyboard back to the editor on the next frame, so the terminal could
     /// never be typed in while a file was open.
     pub(super) fn md_editing(&self) -> bool {
-        self.files_visible()
-            && self.right.focused
-            && self.input_layer() == InputLayer::Terminal
+        self.files_doc_keys()
             && self
                 .files_panel
                 .doc
@@ -1289,8 +1335,24 @@ impl PilusView {
                 .is_some_and(|edit| edit.mode.edits())
     }
 
-    /// Keys the editor's field leaves to the window: the find bar's, then
-    /// Escape, which steps back to the preview.
+    /// Whether the file open in the Files tab holds the keyboard, edited or
+    /// read-only, so its shortcuts (`FilesDoc`) reach it. The same rule as
+    /// [`Self::md_editing`]: only while the column does.
+    pub(super) fn files_doc_keys(&self) -> bool {
+        self.files_visible()
+            && self.right.focused
+            && self.input_layer() == InputLayer::Terminal
+            && self.files_panel.doc.is_some()
+    }
+
+    /// Whether the open file's read-only source is on screen, in the
+    /// editor's field.
+    pub(super) fn files_source_shown(&self) -> bool {
+        self.files_panel.source_read_only()
+    }
+
+    /// Keys the open file leaves to the window: the find bar's, then
+    /// Escape, which stops editing.
     pub(super) fn md_edit_key(
         &mut self,
         event: &KeyDownEvent,
@@ -1300,17 +1362,59 @@ impl PilusView {
         if self.find_key(event, window, cx) {
             return;
         }
-        if event.keystroke.key == "escape" && self.files_doc_previewable() {
+        if event.keystroke.key == "escape" && self.md_editing() {
             self.files_preview_doc(cx);
         }
     }
 
-    /// Whether the open document has a rendered form.
-    fn files_doc_previewable(&self) -> bool {
-        self.files_panel
+    /// Cmd+W, and the header's close button: a file being edited goes
+    /// read-only, and a read-only one closes.
+    pub(super) fn files_step_out(&mut self, cx: &mut Context<Self>) {
+        let editing = self.files_panel.edit_mode().is_some_and(EditMode::edits);
+        if editing {
+            self.files_preview_doc(cx);
+        } else {
+            self.files_close_doc(cx);
+        }
+    }
+
+    /// A read landed for the open document: a file with no rendered form
+    /// opens in the editor, and a reload finds the view it left.
+    fn files_doc_landed(&mut self, cx: &mut Context<Self>) {
+        let resume = self
+            .files_panel
             .doc
-            .as_ref()
-            .is_some_and(|doc| md_view::is_markdown(&doc.path))
+            .as_mut()
+            .and_then(|doc| doc.resume.take());
+        if resume.is_none() && !self.files_panel.doc_is_source() {
+            return;
+        }
+        self.files_begin_edit(cx);
+        let Some(resume) = resume else {
+            return;
+        };
+        let Some(edit) = self
+            .files_panel
+            .doc
+            .as_mut()
+            .and_then(|doc| doc.edit.as_mut())
+        else {
+            return;
+        };
+        edit.mode = resume.mode;
+        edit.scroll = resume.scroll;
+        // The caret goes back without the view chasing it: the scroll is
+        // already where it was.
+        let caret = self.md_editor_input.update(cx, |input, cx| {
+            let caret =
+                input.with_text(|text| text.floor_char_boundary(resume.caret.min(text.len())));
+            input.select_range(caret..caret, cx);
+            caret
+        });
+        edit.caret_seen = Some(caret);
+        if resume.mode == EditMode::Preview {
+            self.files_sync_preview(cx);
+        }
     }
 
     /// Show the open document's source in the editor.
@@ -1359,17 +1463,21 @@ impl PilusView {
                 });
             }
         }
-        // An editor wants room: the column opens out to fill the window, with
-        // the tree beside the file, and settles back when the file closes.
+        // An editor wants room: the column widens until the tree fits beside
+        // the file, short of the whole window, and settles back when the file
+        // closes.
         if started && !self.right.expanded() {
-            self.files_panel.auto_expanded = true;
-            self.toggle_right_expanded(cx);
+            self.files_panel.auto_widened = true;
+            self.right.widen(Some(EDIT_PAGE_WIDTH));
+            if cx.reduce_motion() {
+                self.right.settle();
+            }
         }
         cx.notify();
     }
 
     /// Show the open document rendered, from the editor's text.
-    fn files_preview_doc(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn files_preview_doc(&mut self, cx: &mut Context<Self>) {
         let Some(doc) = self.files_panel.doc.as_mut() else {
             return;
         };
@@ -1377,6 +1485,12 @@ impl PilusView {
             return;
         };
         edit.mode = EditMode::Preview;
+        // The bar searches the editor, which is no longer being edited.
+        if self.file_find.is_open() {
+            self.file_find.reset();
+            self.md_editor_input
+                .update(cx, |input, cx| input.set_marks(Vec::new(), cx));
+        }
         self.files_sync_preview(cx);
         cx.notify();
     }
@@ -1625,15 +1739,24 @@ impl PilusView {
         self.right_navigate(cx, |this, _| this.files_panel.close_doc());
     }
 
-    fn files_reload_doc(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn files_reload_doc(&mut self, cx: &mut Context<Self>) {
         if self.files_doc_unsaved("reload it", cx) {
             return;
         }
-        if let Some(doc) = self.files_panel.doc.as_ref() {
-            let (path, as_text) = (doc.path.clone(), doc.as_text);
-            self.files_read_doc_as(path, as_text);
-            cx.notify();
+        let Some(doc) = self.files_panel.doc.as_ref() else {
+            return;
+        };
+        let (path, as_text) = (doc.path.clone(), doc.as_text);
+        let resume = doc.edit.as_ref().map(|edit| Resume {
+            mode: edit.mode,
+            caret: self.md_editor_input.read(cx).caret_byte(),
+            scroll: edit.scroll.clone(),
+        });
+        self.files_read_doc_as(path, as_text);
+        if let Some(doc) = self.files_panel.doc.as_mut() {
+            doc.resume = resume;
         }
+        cx.notify();
     }
 
     /// Switch an SVG between its picture and its source.
@@ -1646,25 +1769,6 @@ impl PilusView {
             self.files_read_doc_as(path, as_text);
             cx.notify();
         }
-    }
-
-    /// Hand the open document to the daemon, which shows it in a pane.
-    fn files_doc_in_pane(&mut self) {
-        let Some(path) = self.files_panel.doc_path().map(str::to_string) else {
-            return;
-        };
-        let endpoint = self.active.clone();
-        let tx = self.files_panel.tx.clone();
-        let client = self.control_client_for_endpoint(&endpoint);
-        std::thread::spawn(move || {
-            let result = match client {
-                None => Err("Could not reach the daemon".to_string()),
-                Some(mut client) => client
-                    .files_open(&path, OpenTarget::Pane)
-                    .map_err(|error| error.to_string()),
-            };
-            tx.send(FilesMsg::Opened { endpoint, result }).ok();
-        });
     }
 
     /// Ask for files with the system picker and upload them to `into`, or the
@@ -2003,7 +2107,9 @@ impl PilusView {
     /// on it uploaded to the root. Wide enough, the tree stays beside the
     /// document so another file is one click away.
     pub(super) fn files_page(&mut self, page_w: f32, cx: &mut Context<Self>) -> Div {
-        let beside = self.files_panel.doc.is_some() && page_w >= TREE_BESIDE_MIN_PAGE;
+        let fits = self.files_panel.doc.is_some() && page_w >= TREE_BESIDE_MIN_PAGE;
+        let beside = fits && !self.files_panel.tree_hidden;
+        self.files_panel.tree_fits = fits;
         self.files_panel.tree_beside = beside;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let tree_w = if beside {
@@ -2058,11 +2164,16 @@ impl PilusView {
                 cx.notify();
             }
         });
+        let clear = self.theme.panel.opacity(0.0);
         div().size_full().min_h(px(0.0)).child(
             div()
                 .id("pilus-files-doc-drop")
                 .size_full()
                 .min_h(px(0.0))
+                // The tree's drop ring is a hairline it always reserves; the
+                // same clear one here keeps the two headers' rules level.
+                .border_1()
+                .border_color(clear)
                 .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(hint))
                 .on_drag_move(on_move)
                 .on_drop(on_drop)
@@ -2228,11 +2339,10 @@ impl PilusView {
             return div();
         };
         let mut edit_buttons: Vec<AnyElement> = Vec::new();
-        // An SVG is a picture that is also text: the pencil swaps one for the
-        // other, as it swaps a markdown file's preview for its source.
-        if image_view::kind(&doc.path) == Some(image_view::Kind::Svg)
-            && (doc.as_text || matches!(doc.state, DocState::Picture(_)))
-        {
+        // An SVG is a picture that is also text: its own pencil swaps one for
+        // the other.
+        let svg = image_view::kind(&doc.path) == Some(image_view::Kind::Svg);
+        if svg && (doc.as_text || matches!(doc.state, DocState::Picture(_))) {
             let source = doc.as_text;
             edit_buttons.push(
                 self.diff_icon_button(
@@ -2241,7 +2351,7 @@ impl PilusView {
                     if source {
                         "Show the image"
                     } else {
-                        "Edit the source"
+                        "Show the source"
                     }
                     .to_string(),
                     source,
@@ -2251,12 +2361,21 @@ impl PilusView {
                 .into_any_element(),
             );
         }
-        if editable && previewable {
+        // The pencil goes in and out of the editor. Out of it, markdown is
+        // rendered and any other file's source is read-only. An SVG's source
+        // being edited already has its own pencil lit.
+        let svg_editing = svg && doc.as_text && editing;
+        if editable && (previewable || mode.is_some()) && !svg_editing {
             edit_buttons.push(
                 self.diff_icon_button(
                     "pilus-files-doc-edit",
                     include_bytes!("../../assets/icons/pencil.svg"),
-                    if editing { "Preview" } else { "Edit" }.to_string(),
+                    match (editing, previewable) {
+                        (true, true) => "Preview",
+                        (true, false) => "Read-only",
+                        (false, _) => "Edit",
+                    }
+                    .to_string(),
                     editing,
                     false,
                 )
@@ -2312,6 +2431,35 @@ impl PilusView {
                 .into_any_element(),
             );
         }
+        // With room for the tree beside the file, the header can put it away
+        // and bring it back.
+        let tree_toggle = self.files_panel.tree_fits.then(|| {
+            let shown = !self.files_panel.tree_hidden;
+            self.diff_icon_button(
+                "pilus-files-doc-tree",
+                include_bytes!("../../assets/icons/panel-left.svg"),
+                if shown {
+                    "Hide the file tree"
+                } else {
+                    "Show the file tree"
+                }
+                .to_string(),
+                shown,
+                false,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.files_panel.tree_hidden = !this.files_panel.tree_hidden;
+                cx.notify();
+            }))
+        });
+        // Close steps out one level: an edited file goes read-only first.
+        let close_tip = if editing {
+            "Stop editing (⌘W)"
+        } else if self.files_panel.tree_fits {
+            "Close (⌘W)"
+        } else {
+            "Back to the file tree (⌘W)"
+        };
         let header = div()
             .flex()
             .flex_row()
@@ -2322,6 +2470,7 @@ impl PilusView {
             .py_2()
             .border_b_1()
             .border_color(theme.border)
+            .children(tree_toggle)
             .child(icon(
                 include_bytes!("../../assets/icons/file.svg"),
                 fonts.body,
@@ -2364,22 +2513,9 @@ impl PilusView {
             .children(edit_buttons)
             .child(
                 self.diff_icon_button(
-                    "pilus-files-doc-pane",
-                    include_bytes!("../../assets/icons/terminal.svg"),
-                    "Open in a pane".to_string(),
-                    false,
-                    false,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.files_doc_in_pane();
-                    cx.notify();
-                })),
-            )
-            .child(
-                self.diff_icon_button(
                     "pilus-files-doc-reload",
                     include_bytes!("../../assets/icons/refresh-cw.svg"),
-                    "Reload".to_string(),
+                    "Reload (⌘R)".to_string(),
                     false,
                     false,
                 )
@@ -2389,15 +2525,11 @@ impl PilusView {
                 self.diff_icon_button(
                     "pilus-files-doc-close",
                     include_bytes!("../../assets/icons/x.svg"),
-                    if self.files_panel.tree_beside {
-                        "Close".to_string()
-                    } else {
-                        "Back to the file tree".to_string()
-                    },
+                    close_tip.to_string(),
                     false,
                     false,
                 )
-                .on_click(cx.listener(|this, _, _, cx| this.files_close_doc(cx))),
+                .on_click(cx.listener(|this, _, _, cx| this.files_step_out(cx))),
             );
         let truncated = self
             .files_panel
@@ -2414,7 +2546,7 @@ impl PilusView {
             });
         let body = if split && editable {
             self.files_split_body(cx)
-        } else if editing && editable {
+        } else if (editing || self.files_panel.source_read_only()) && editable {
             self.files_editor_body(cx)
         } else {
             match &self.files_panel.doc.as_ref().map(|doc| &doc.state) {
@@ -2437,7 +2569,16 @@ impl PilusView {
             }
         };
         let find_bar = self.find_bar(cx);
+        // The page takes the file's shortcuts (`FilesDoc`) while it, or the
+        // editor inside it, has the keyboard.
+        let focus = self
+            .files_panel
+            .doc_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
         div()
+            .key_context("FilesDoc")
+            .track_focus(&focus)
             .relative()
             .flex()
             .flex_col()
@@ -2474,15 +2615,19 @@ impl PilusView {
 
     /// The open document's source in the editor field, scrolled to follow the
     /// caret. The field is as tall as its text, so the scrolling is the
-    /// wrapper's.
+    /// wrapper's. Out of the editor, the same field shows the source
+    /// read-only, and the line chords (`MdEditor`) stand down.
     fn files_editor_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let mono = gpui::font(style::mono_family(&self.shared_settings));
+        let read_only = !self.files_panel.edit_mode().is_some_and(EditMode::edits);
         self.md_editor_input.update(cx, |input, cx| {
             input.set_style(theme, mono, px(fonts.body));
             input.set_line_numbers(true, cx);
             input.set_current_line(true, cx);
+            input.set_auto_indent(true);
+            input.set_read_only(read_only, cx);
         });
         let (caret, row) = {
             let input = self.md_editor_input.read(cx);
@@ -2500,7 +2645,40 @@ impl PilusView {
         follow_caret(&scroll, row, caret, &mut edit.caret_seen);
         div()
             .id("pilus-files-editor")
-            .key_context("MdEditor")
+            .when(!read_only, |editor| editor.key_context("MdEditor"))
+            .on_action(cx.listener(|this, _: &editor_ops::Indent, _, cx| {
+                this.files_editor_op(Op::Indent, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_ops::Outdent, _, cx| {
+                this.files_editor_op(Op::Outdent, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_ops::ToggleComment, _, cx| {
+                this.files_editor_op(Op::ToggleComment, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_ops::SelectLine, _, cx| {
+                this.files_editor_op(Op::SelectLine, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_ops::DeleteLine, _, cx| {
+                this.files_editor_op(Op::DeleteLine, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_ops::MoveLineUp, _, cx| {
+                this.files_editor_op(Op::MoveUp, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_ops::MoveLineDown, _, cx| {
+                this.files_editor_op(Op::MoveDown, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_ops::CopyLineUp, _, cx| {
+                this.files_editor_op(Op::CopyUp, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_ops::CopyLineDown, _, cx| {
+                this.files_editor_op(Op::CopyDown, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_ops::NewLineBelow, _, cx| {
+                this.files_editor_op(Op::NewLineBelow, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_ops::NewLineAbove, _, cx| {
+                this.files_editor_op(Op::NewLineAbove, cx);
+            }))
             .size_full()
             .min_w(px(0.0))
             .overflow_y_scroll()
@@ -2513,6 +2691,13 @@ impl PilusView {
                     .child(self.md_editor_input.clone()),
             )
             .into_any_element()
+    }
+
+    /// Run a line chord on the editor's field.
+    fn files_editor_op(&mut self, op: Op, cx: &mut Context<Self>) {
+        self.md_editor_input
+            .update(cx, |input, cx| input.run_op(op, cx));
+        cx.notify();
     }
 
     /// Two rows: the machine with the tab's controls, then the root.
@@ -2613,17 +2798,15 @@ impl PilusView {
                     })
                     .child(dropping.unwrap_or(root)),
             );
+        // The hairline runs under the machine's row, not the root's, so beside
+        // an open document it meets the document header's own: both rows are
+        // the same height.
         div()
             .flex()
             .flex_col()
-            .gap_1()
             .flex_shrink_0()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(host)
-            .child(directory)
+            .child(host.px_3().py_2().border_b_1().border_color(theme.border))
+            .child(directory.px_3().pt_2())
     }
 
     /// One virtualized row of the tree.
@@ -2913,6 +3096,7 @@ impl PilusView {
             edit: None,
             git_base: None,
             base_asked: None,
+            resume: None,
         });
         cx.notify();
     }
@@ -2940,6 +3124,7 @@ impl PilusView {
             edit: None,
             git_base: None,
             base_asked: None,
+            resume: None,
         });
         cx.notify();
     }

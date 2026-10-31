@@ -22,6 +22,7 @@ mod database;
 mod diff;
 mod diff_model;
 mod dock;
+mod editor_ops;
 mod file_find;
 mod files_tab;
 mod fonts;
@@ -426,8 +427,13 @@ gpui::actions!([
     ToggleSidebar,
     /// Turn energy mode on or off.
     ToggleEnergyMode,
-    /// Save the markdown file being edited in the Files tab.
+    /// Save the file being edited in the Files tab.
     SaveDoc,
+    /// Step out of the Files tab's open file: stop editing it, and once it is
+    /// read-only, close it.
+    CloseDoc,
+    /// Read the Files tab's open file from disk again.
+    ReloadDoc,
     /// Find in the file open in the Files tab.
     FindInFile,
     /// Jump to a file in the active workspace by fuzzy name.
@@ -1055,22 +1061,43 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-t", OpenLocalTerminal, None),
         KeyBinding::new("cmd-d", SplitVertical, None),
         KeyBinding::new("cmd-shift-d", SplitHorizontal, None),
-        KeyBinding::new("cmd-w", CloseTab, None),
+        // An open file in the Files tab takes Cmd+W, Cmd+S and Cmd+R while it
+        // holds the keyboard (`FilesDoc`). A binding with no context matches
+        // as deep as any, so the window's own must stand down by name.
+        KeyBinding::new("cmd-w", CloseTab, Some("!FilesDoc")),
+        KeyBinding::new("cmd-w", CloseDoc, Some("FilesDoc")),
         KeyBinding::new("cmd-shift-w", CloseWindow, None),
         KeyBinding::new("cmd-alt-w", CloseAllWindows, None),
         KeyBinding::new("cmd-=", IncreaseFontSize, None),
         KeyBinding::new("cmd-+", IncreaseFontSize, None),
         KeyBinding::new("cmd--", DecreaseFontSize, None),
         KeyBinding::new("cmd-0", ResetFontSize, None),
-        KeyBinding::new("cmd-s", ToggleSidebar, None),
-        // The markdown editor takes Cmd+S from the sidebar toggle while it
-        // holds the keyboard.
-        KeyBinding::new("cmd-s", SaveDoc, Some("MdEditor")),
+        KeyBinding::new("cmd-s", ToggleSidebar, Some("!FilesDoc")),
+        KeyBinding::new("cmd-s", SaveDoc, Some("FilesDoc")),
+        KeyBinding::new("cmd-r", ReloadDoc, Some("FilesDoc")),
         KeyBinding::new("cmd-f", FindInFile, None),
         KeyBinding::new("cmd-p", OpenQuickOpen, None),
         KeyBinding::new("cmd-b", ToggleRightSidebar, None),
-        KeyBinding::new("cmd-[", RightSidebarBack, None),
-        KeyBinding::new("cmd-]", RightSidebarForward, None),
+        KeyBinding::new("cmd-[", RightSidebarBack, Some("!MdEditor")),
+        KeyBinding::new("cmd-]", RightSidebarForward, Some("!MdEditor")),
+        // The editor's line chords, only while its field has the keyboard.
+        KeyBinding::new("tab", editor_ops::Indent, Some("MdEditor")),
+        KeyBinding::new("shift-tab", editor_ops::Outdent, Some("MdEditor")),
+        KeyBinding::new("cmd-]", editor_ops::Indent, Some("MdEditor")),
+        KeyBinding::new("cmd-[", editor_ops::Outdent, Some("MdEditor")),
+        KeyBinding::new("cmd-/", editor_ops::ToggleComment, Some("MdEditor")),
+        KeyBinding::new("cmd-l", editor_ops::SelectLine, Some("MdEditor")),
+        KeyBinding::new("cmd-shift-k", editor_ops::DeleteLine, Some("MdEditor")),
+        KeyBinding::new("alt-up", editor_ops::MoveLineUp, Some("MdEditor")),
+        KeyBinding::new("alt-down", editor_ops::MoveLineDown, Some("MdEditor")),
+        KeyBinding::new("alt-shift-up", editor_ops::CopyLineUp, Some("MdEditor")),
+        KeyBinding::new("alt-shift-down", editor_ops::CopyLineDown, Some("MdEditor")),
+        KeyBinding::new("cmd-enter", editor_ops::NewLineBelow, Some("MdEditor")),
+        KeyBinding::new(
+            "cmd-shift-enter",
+            editor_ops::NewLineAbove,
+            Some("MdEditor"),
+        ),
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
         KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, None),
         KeyBinding::new("cmd-shift-s", OpenSessionMenu, None),
@@ -5179,8 +5206,9 @@ impl PilusView {
             self.md_note_key(event, cx);
             return;
         }
-        // So does the markdown editor, whose field reads the typing itself.
-        if self.md_editing() {
+        // So does a file open in the Files tab: the editor's field reads the
+        // typing itself, and a read-only file takes none.
+        if self.files_doc_keys() {
             self.md_edit_key(event, window, cx);
             return;
         }
@@ -6869,6 +6897,22 @@ impl PilusView {
             let finding = self.file_find.is_open() && self.find_input.read(cx).is_focused(window);
             if !finding && !editor.is_focused(window) {
                 window.focus(&editor, cx);
+            }
+            return;
+        }
+        // A file shown read-only keeps the keyboard too, so its shortcuts
+        // reach it: its source's field when it shows one, else the page.
+        if self.files_doc_keys() {
+            // The page's handle is made with its first frame.
+            let handle = if self.files_source_shown() {
+                Some(self.md_editor_input.focus_handle(cx))
+            } else {
+                self.files_panel.doc_focus()
+            };
+            if let Some(handle) = handle
+                && !handle.contains_focused(window, cx)
+            {
+                window.focus(&handle, cx);
             }
             return;
         }
@@ -15444,8 +15488,9 @@ impl Render for PilusView {
         // What an expanded right column fills: the window beside the left
         // sidebar.
         let cell_width = self.cell_width(window);
-        let beside = f32::from(window.viewport_size().width) - self.sidebar_px(cell_width);
-        self.right.set_full(beside);
+        let window_w = f32::from(window.viewport_size().width);
+        let beside = window_w - self.sidebar_px(cell_width);
+        self.right.set_full(beside, window_w);
         self.sync_metrics(window);
         self.sync_home();
         self.browser_sync(window, cx);
@@ -15796,6 +15841,12 @@ impl Render for PilusView {
                 }))
                 .on_action(cx.listener(|this, _: &SaveDoc, _window, cx| {
                     this.files_save_doc(cx);
+                }))
+                .on_action(cx.listener(|this, _: &CloseDoc, _window, cx| {
+                    this.files_step_out(cx);
+                }))
+                .on_action(cx.listener(|this, _: &ReloadDoc, _window, cx| {
+                    this.files_reload_doc(cx);
                 }))
                 .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
                     this.toggle_right_sidebar(cx);

@@ -314,6 +314,80 @@ pub(super) fn is_text(path: &str) -> bool {
     named(path.extension()) || named(path.file_name())
 }
 
+/// Line comment marks by extension, or by whole file name for files that have
+/// none. The bundled grammars do not carry their comment settings, so the
+/// editor's Cmd+/ reads them here.
+const LINE_COMMENTS: [(&str, &[&str]); 5] = [
+    (
+        "//",
+        &[
+            "rs", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "c", "h", "cc", "cpp",
+            "cxx", "hpp", "hh", "m", "mm", "java", "kt", "kts", "swift", "go", "cs", "scala",
+            "dart", "zig", "php", "groovy", "gradle", "proto", "jsonc", "json5", "scss", "less",
+            "sol", "fs", "glsl", "wgsl",
+        ],
+    ),
+    (
+        "#",
+        &[
+            "py",
+            "rb",
+            "sh",
+            "bash",
+            "zsh",
+            "fish",
+            "pl",
+            "pm",
+            "r",
+            "yaml",
+            "yml",
+            "toml",
+            "conf",
+            "cfg",
+            "env",
+            "mk",
+            "cmake",
+            "nix",
+            "ex",
+            "exs",
+            "jl",
+            "ps1",
+            "tf",
+            "hcl",
+            "gitignore",
+            "gitattributes",
+            "editorconfig",
+            "dockerignore",
+            "properties",
+            "Dockerfile",
+            "Makefile",
+            "justfile",
+            "Gemfile",
+            "Rakefile",
+        ],
+    ),
+    ("--", &["sql", "lua", "hs", "elm"]),
+    (
+        ";",
+        &["ini", "lisp", "el", "clj", "cljs", "scm", "asm", "s"],
+    ),
+    ("%", &["tex", "erl"]),
+];
+
+/// The mark that comments out a line of the file at `path`. `None` for a file
+/// with only block comments, such as markdown, HTML or CSS.
+pub(super) fn line_comment(path: &str) -> Option<&'static str> {
+    let path = Path::new(path);
+    let known = |part: Option<&std::ffi::OsStr>| {
+        let part = part.and_then(|part| part.to_str())?.trim_start_matches('.');
+        LINE_COMMENTS
+            .iter()
+            .find(|(_, names)| names.iter().any(|name| name.eq_ignore_ascii_case(part)))
+            .map(|(mark, _)| *mark)
+    };
+    known(path.extension()).or_else(|| known(path.file_name()))
+}
+
 /// The grammar for `path`, by extension and then by whole file name
 /// (`Makefile`, `Dockerfile`). `None` for a file with no known grammar.
 fn syntax_for(path: &str) -> Option<&'static SyntaxReference> {
@@ -668,6 +742,17 @@ mod tests {
             &"let name = \"pilus\"; // note"[string.range.clone()],
             "\"pilus\""
         );
+    }
+
+    #[test]
+    fn line_comments_follow_the_extension_or_the_name() {
+        assert_eq!(line_comment("/src/main.rs"), Some("//"));
+        assert_eq!(line_comment("/app/Main.TSX"), Some("//"));
+        assert_eq!(line_comment("/ci/build.yml"), Some("#"));
+        assert_eq!(line_comment("/repo/Makefile"), Some("#"));
+        assert_eq!(line_comment("/repo/.gitignore"), Some("#"));
+        assert_eq!(line_comment("/db/schema.sql"), Some("--"));
+        assert_eq!(line_comment("/docs/README.md"), None);
     }
 
     #[test]

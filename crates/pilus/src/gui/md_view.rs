@@ -1079,6 +1079,19 @@ impl PilusView {
         cx.notify();
     }
 
+    /// The same Rust file out of the editor: its source read-only.
+    pub(super) fn files_read_only_code_sample(&mut self, cx: &mut Context<Self>) {
+        self.files_edit_code_sample(cx);
+        self.files_preview_doc(cx);
+    }
+
+    /// The read-only Rust file with the tree put away.
+    pub(super) fn files_code_without_tree_sample(&mut self, cx: &mut Context<Self>) {
+        self.files_read_only_code_sample(cx);
+        self.files_panel.tree_hidden = true;
+        cx.notify();
+    }
+
     /// An MDX page with its source beside it.
     pub(super) fn files_split_mdx_sample(&mut self, cx: &mut Context<Self>) {
         self.files_show_doc("/work/pilus/site/docs/launch.mdx", MDX_SAMPLE, cx);

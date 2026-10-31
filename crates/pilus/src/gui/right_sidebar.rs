@@ -99,7 +99,7 @@ impl SidebarTab {
     /// Whether the tab reads the keyboard. The Diff has shortcuts, Sipil has
     /// fields and Files has the editor, so only the keys of a column showing
     /// Git, Ports or the Browser stay with the terminal. Files gives them back
-    /// while no file is being edited (see `md_editing`).
+    /// while no file is open (see `files_doc_keys`).
     fn takes_keys(self) -> bool {
         matches!(self, Self::Diff | Self::Sipil | Self::Files)
     }
@@ -227,6 +227,13 @@ pub(super) struct RightSidebar {
     /// The width the column fills when expanded, kept current by the
     /// window each frame.
     full: f32,
+    /// The window's width, kept current by the window each frame, so a
+    /// widen leaves the terminal its share.
+    window: f32,
+    /// A width the column takes for a while without the user's own moving:
+    /// an editor wants room, and closing it gives the room back.
+    floor: Option<f32>,
+    floor_tween: Option<Tween>,
 }
 
 impl RightSidebar {
@@ -246,6 +253,9 @@ impl RightSidebar {
             expanded: false,
             spread_tween: None,
             full: 0.0,
+            window: 0.0,
+            floor: None,
+            floor_tween: None,
         }
     }
 
@@ -274,9 +284,15 @@ impl RightSidebar {
         )
     }
 
+    /// The column's own width, widened or not, before any stretch.
+    fn own_width(&self) -> f32 {
+        let floor = Self::eased(self.floor_tween.as_ref(), self.floor.unwrap_or(0.0));
+        self.width.max(floor)
+    }
+
     /// The column's width at its current stretch.
     pub(super) fn shown_width(&self) -> f32 {
-        let own = self.width + WIDTH_BONUS;
+        let own = self.own_width() + WIDTH_BONUS;
         let full = self.full.max(own);
         own + (full - own) * self.spread().min(1.0)
     }
@@ -291,9 +307,29 @@ impl RightSidebar {
         self.expanded
     }
 
-    /// Record the width the column fills when expanded.
-    pub(super) fn set_full(&mut self, width: f32) {
+    /// Record the width the column fills when expanded, and the window's.
+    pub(super) fn set_full(&mut self, width: f32, window: f32) {
         self.full = width.max(0.0);
+        self.window = window.max(0.0);
+    }
+
+    /// Widen the column to at least `to` for a while, or with `None` let it
+    /// back to the user's width. The user's width is not touched, so nothing
+    /// is saved. The widen keeps within the window's share for the column.
+    pub(super) fn widen(&mut self, to: Option<f32>) {
+        let to = to
+            .map(|to| clamp_width(to, self.window).min(self.full.max(self.width)))
+            .filter(|&to| to > self.width + 0.5);
+        if to == self.floor {
+            return;
+        }
+        let from = self.own_width();
+        self.floor = to;
+        self.floor_tween = Some(Tween {
+            started: Instant::now(),
+            from,
+            to: to.unwrap_or(self.width),
+        });
     }
 
     /// Stretch the column to the full width, or let it back to its own.
@@ -317,12 +353,12 @@ impl RightSidebar {
     /// Whether an open, close, or stretch tween is in flight. A drag is not
     /// one: it follows the pointer, so the card may snap to cells beneath it.
     pub(super) fn tweening(&self) -> bool {
-        self.tween.is_some() || self.spread_tween.is_some()
+        self.tween.is_some() || self.spread_tween.is_some() || self.floor_tween.is_some()
     }
 
     /// Whether the daemon should hold its viewport: the column is moving.
     pub(super) fn moving(&self) -> bool {
-        self.tween.is_some() || self.spread_tween.is_some() || self.drag.is_some()
+        self.tweening() || self.drag.is_some()
     }
 
     /// Land the column at its target now, dropping any tween in flight: what
@@ -330,6 +366,7 @@ impl RightSidebar {
     pub(super) fn settle(&mut self) {
         self.tween = None;
         self.spread_tween = None;
+        self.floor_tween = None;
     }
 
     /// Advance the tweens; true once nothing is in flight.
@@ -347,7 +384,11 @@ impl RightSidebar {
         if spread {
             self.spread_tween = None;
         }
-        opened && spread
+        let floor = finished(&self.floor_tween);
+        if floor {
+            self.floor_tween = None;
+        }
+        opened && spread && floor
     }
 
     /// Show or hide the column. Showing takes the keyboard when the open tab
@@ -375,6 +416,13 @@ impl RightSidebar {
     }
 
     fn begin_drag(&mut self, pointer_x: f32) {
+        // A drag on a widened column starts from what is on screen, and the
+        // width it settles on is the user's own.
+        if self.floor.is_some() {
+            self.width = self.own_width();
+            self.floor = None;
+            self.floor_tween = None;
+        }
         self.drag = Some(Drag {
             pointer_x,
             width: self.width,
@@ -1090,7 +1138,7 @@ mod tests {
     #[test]
     fn expanding_fills_the_window_and_hiding_lets_go() {
         let mut side = RightSidebar::new(true, 400.0, SidebarTab::Diff);
-        side.set_full(1000.0);
+        side.set_full(1000.0, 1200.0);
         assert_eq!(side.px(), 400.0 + WIDTH_BONUS);
         side.toggle_expanded();
         assert!(side.expanded() && side.moving());
@@ -1099,14 +1147,38 @@ mod tests {
         assert_eq!(side.shown_width(), 1000.0);
         assert_eq!(side.px(), 1000.0);
         // A window narrower than the column never shrinks it.
-        side.set_full(200.0);
+        side.set_full(200.0, 400.0);
         assert_eq!(side.shown_width(), 400.0 + WIDTH_BONUS);
-        side.set_full(1000.0);
+        side.set_full(1000.0, 1200.0);
         side.toggle();
         assert!(
             !side.expanded(),
             "a hidden column comes back at its own width"
         );
+    }
+
+    #[test]
+    fn a_widen_lends_room_and_gives_it_back_without_touching_the_width() {
+        let mut side = RightSidebar::new(true, 400.0, SidebarTab::Files);
+        side.set_full(1000.0, 1200.0);
+        side.widen(Some(700.0));
+        assert!(side.moving());
+        side.settle();
+        assert_eq!(side.shown_width(), 700.0 + WIDTH_BONUS);
+        assert_eq!(side.width, 400.0, "the user's width is not the widen's");
+        side.widen(None);
+        side.settle();
+        assert_eq!(side.shown_width(), 400.0 + WIDTH_BONUS);
+        // The widen keeps the terminal its share of the window.
+        side.set_full(700.0, 800.0);
+        side.widen(Some(760.0));
+        side.settle();
+        assert!((side.shown_width() - (480.0 + WIDTH_BONUS)).abs() < 0.01);
+        // A column already that wide is left alone.
+        let mut wide = RightSidebar::new(true, 800.0, SidebarTab::Files);
+        wide.set_full(1000.0, 1400.0);
+        wide.widen(Some(700.0));
+        assert!(!wide.moving());
     }
 
     fn diff_place(path: &str) -> Place {

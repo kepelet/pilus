@@ -33,6 +33,20 @@ The Files tab edits text files in place. Saves go through
   opens as a document with Source, Preview and side-by-side modes.
 - Any other text file opens straight into the source editor, with no preview,
   and its `MdDoc` holds the text unparsed.
+- Out of the editor (`EditMode::Preview`) a file is read-only: markdown is
+  rendered, and any other file shows its source in the same field with
+  `TextInput::set_read_only`, which still selects and copies. The buffer is
+  kept, so unsaved changes survive the switch.
+- Escape, Cmd+W and the header's close button step out one level: an edited
+  file goes read-only, and a read-only one closes (`files_step_out`). Cmd+R
+  reloads, keeping the mode, the caret and the scroll (`Resume`).
+- Starting an edit widens the column to `EDIT_PAGE_WIDTH` (`RightSidebar::widen`),
+  enough for the tree beside the file, never the whole window. The user's own
+  width is not touched or saved, and closing the file gives the room back. A
+  drag on a widened column adopts its width.
+- With room for it, the header's panel button hides or shows the tree beside
+  the file (`FilesPanel::tree_hidden`). The tree header's hairline sits under
+  its machine row so it meets the document header's.
 - A truncated read, or a file larger than `md_view::EDIT_LIMIT`, is not opened
   for editing.
 
@@ -131,11 +145,16 @@ marks are in, so the full file never flashes up first.
 
 ## Who has the keyboard
 
-The editor holds the keyboard only while the right column does
-(`right.focused`, which `md_editing` checks). A press on the terminal clears
-it. A press in the column, opening a file and ⌘F set it. Without that check
-`sync_focus` would give the keyboard back to the editor every frame, and the
-terminal could not be typed in while a file was open.
+An open file holds the keyboard only while the right column does
+(`right.focused`, which `files_doc_keys` and `md_editing` check). A press on
+the terminal clears it. A press in the column, opening a file and ⌘F set it.
+Without that check `sync_focus` would give the keyboard back to the file every
+frame, and the terminal could not be typed in while a file was open.
+
+A read-only file keeps the keyboard too, so Cmd+W and Cmd+R reach it: the
+editor's field for a source file, the page's own focus handle
+(`FilesPanel::doc_focus`) for rendered markdown or a picture. Keys it does not
+use go nowhere, not to the terminal.
 
 ## Mermaid diagrams
 
@@ -178,9 +197,17 @@ Both belong to the Files tab.
 ## Editor key bindings
 
 Editor chords are scoped by key context, never by a check in the handler. The
-editor div carries the `MdEditor` context, so Cmd+S saves instead of toggling
-the sidebar. A deeper context wins over a global binding, so a new editor chord
-is just another `KeyBinding` in that context.
+document page carries `FilesDoc` (Cmd+S save, Cmd+W step out, Cmd+R reload),
+and the editor div carries `MdEditor` only while editing (the line chords in
+`editor_ops`: Tab and Shift+Tab, Cmd+] and Cmd+[, Cmd+/, Cmd+L, Cmd+Shift+K,
+Option+Up/Down, Option+Shift+Up/Down, Cmd+Enter, Cmd+Shift+Enter). Enter keeps
+the line's indent.
+
+A binding with no context does not lose to a contextual one: GPUI ranks it as
+deep as the focused element. So a window chord the file takes over is scoped
+`!FilesDoc` or `!MdEditor` (Cmd+S, Cmd+W, Cmd+[, Cmd+]). A new editor chord
+is a `KeyBinding` in `MdEditor` plus, if the window already uses it, a `!`
+scope on the window's.
 
 ## Notes on markdown excerpts (`gui/md_notes.rs`)
 

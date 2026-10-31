@@ -1324,12 +1324,22 @@ impl PilusView {
     }
 
     fn diff_toggle_viewed(&mut self, cx: &mut Context<Self>) {
-        let panel = &mut self.diff_panel;
-        let Some(fingerprint) = panel.selected_file().map(|file| file.fingerprint.clone()) else {
+        let Some(fingerprint) = self
+            .diff_panel
+            .selected_file()
+            .map(|file| file.fingerprint.clone())
+        else {
             return;
         };
-        if !panel.viewed.remove(&fingerprint) {
-            panel.viewed.insert(fingerprint);
+        self.diff_toggle_viewed_version(fingerprint, cx);
+    }
+
+    /// Flip one version's viewed mark. The list rows carry it by fingerprint
+    /// because the file they sit on need not be the open one.
+    fn diff_toggle_viewed_version(&mut self, fingerprint: String, cx: &mut Context<Self>) {
+        let viewed = &mut self.diff_panel.viewed;
+        if !viewed.remove(&fingerprint) {
+            viewed.insert(fingerprint);
         }
         cx.notify();
     }
@@ -2601,13 +2611,30 @@ impl PilusView {
                     .child(format!("−{deletions}")),
             );
         }
-        if viewed {
-            meta = meta.child(icon(
-                include_bytes!("../../assets/icons/check.svg"),
+        let mark = {
+            let fingerprint = file.fingerprint.clone();
+            // No label: the tooltip names it, so a narrow list keeps the
+            // file's name. The helper's label gap would only pad the box.
+            style::checkbox(
+                format!("pilus-diff-viewed-{}-{}", file.layer.wire(), file.path),
+                viewed,
+                div(),
+                theme,
                 fonts.label,
-                theme.muted,
-            ));
-        }
+            )
+            .gap_0()
+            .tooltip(super::row_tooltip(
+                "Viewed".to_string(),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
+            // The row beneath opens the file; this only marks it.
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.diff_toggle_viewed_version(fingerprint.clone(), cx);
+            }))
+        };
         let stage = match file.layer {
             DiffLayer::Staged => Some((
                 StageAction::Unstage,
@@ -2723,6 +2750,7 @@ impl PilusView {
                     ),
             )
             .child(meta)
+            .child(mark)
             .children(discard)
             .children(stage)
             .on_click(cx.listener(move |this, _, _, cx| this.diff_pick(key.clone(), cx)))

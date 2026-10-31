@@ -12297,7 +12297,9 @@ impl PilusView {
             .flex()
             .flex_col()
             .justify_center()
-            .bg(self.tab_strip_fill())
+            // Translucent, the strip is bare so the frosted backdrop shows;
+            // solid, it takes the sidebar's ground.
+            .when(self.opaque(), |strip| strip.bg(self.sidebar_fill()))
             .border_color(theme.border)
             .child(tab_strip)
     }
@@ -15429,7 +15431,7 @@ impl Render for PilusView {
         // backdrop, which would otherwise leak the desktop through the inset
         // card's margins. Only the translucent window leans on the coat; an
         // opaque one paints its flat base.
-        let coat = glass_coat(theme, blur, opaque);
+        let coat = glass_coat(theme, blur, opaque, HEADER_HEIGHT);
         let cell_height = self.cell_height();
         let cell_width = self.cell_width(window);
         let layout = self.card_layout(window);
@@ -17153,8 +17155,9 @@ fn coat_tint(blur: f32) -> f32 {
 /// The window's glass coat, painted behind every surface: a tint gradient
 /// deepening toward the bottom plus a sheen band under the top edge, which
 /// is what turns the frosted backdrop into a lit pane. The opaque window
-/// only needs its flat base.
-fn glass_coat(theme: Theme, blur: f32, opaque: bool) -> Div {
+/// only needs its flat base. The translucent coat starts `top` px down, so
+/// the header strip shows the bare backdrop.
+fn glass_coat(theme: Theme, blur: f32, opaque: bool, top: f32) -> Div {
     if opaque {
         return div().absolute().inset_0().bg(theme.window_bg);
     }
@@ -17162,6 +17165,7 @@ fn glass_coat(theme: Theme, blur: f32, opaque: bool) -> Div {
     div()
         .absolute()
         .inset_0()
+        .top(px(top))
         .child(div().absolute().inset_0().bg(linear_gradient(
             180.0,
             linear_color_stop(theme.window_bg.opacity(tint * TINT_TOP), 0.0),

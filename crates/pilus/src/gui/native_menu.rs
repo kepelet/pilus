@@ -24,7 +24,8 @@ mod imp {
     use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
     use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
-        NSAppearance, NSAppearanceCustomization, NSEvent, NSImage, NSMenu, NSMenuItem,
+        NSAppearance, NSAppearanceCustomization, NSControlStateValueOn, NSEvent, NSImage, NSMenu,
+        NSMenuItem,
     };
     use objc2_foundation::NSString;
 
@@ -201,7 +202,10 @@ mod imp {
             )
         };
         match entry {
-            Entry::Action { item, .. } => {
+            Entry::Action { item, checked, .. } => {
+                if *checked {
+                    row.setState(NSControlStateValueOn);
+                }
                 let receiver: &AnyObject = target;
                 unsafe { row.setTarget(Some(receiver)) };
                 row.setTag(isize::try_from(items.len()).unwrap_or(isize::MAX));

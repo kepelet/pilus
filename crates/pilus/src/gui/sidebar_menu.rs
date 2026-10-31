@@ -285,6 +285,9 @@ pub enum Entry {
         item: Item,
         title: String,
         symbol: &'static str,
+        /// Drawn with the menu's own check mark, not an icon, so the tick
+        /// sits where macOS puts it on every other menu.
+        checked: bool,
     },
     /// A row that opens `entries` beside it.
     Submenu {
@@ -383,11 +386,8 @@ fn action(item: Item, labels: Labels) -> Entry {
     Entry::Action {
         item,
         title,
-        symbol: if ticked {
-            "checkmark"
-        } else {
-            item.symbol(labels.paths_visible)
-        },
+        symbol: item.symbol(labels.paths_visible),
+        checked: ticked,
     }
 }
 
@@ -745,7 +745,7 @@ mod tests {
                 .filter_map(|entry| match entry {
                     Entry::Action {
                         item,
-                        symbol: "checkmark",
+                        checked: true,
                         ..
                     } => Some(item),
                     _ => None,

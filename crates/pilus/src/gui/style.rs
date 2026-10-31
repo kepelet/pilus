@@ -1016,18 +1016,22 @@ pub(super) fn tree_row(
         mark,
         selected,
     } = entry;
-    let disclosure = match folder {
-        Some(open) => chevron(
+    let disclosure = folder.map(|open| {
+        chevron(
             format!("pilus-tree-chevron-{depth}-{name}"),
             open,
             animate,
             TREE_DISCLOSURE,
             theme.muted,
-        ),
-        None => div()
-            .w(px(TREE_DISCLOSURE))
-            .flex_shrink_0()
-            .into_any_element(),
+        )
+    });
+    // A file has no chevron, so the slot it would fill becomes margin: the
+    // glyph stays under its folder's, but the hover pill starts at the glyph
+    // instead of reaching left over empty space.
+    let slot = if folder.is_some() {
+        0.0
+    } else {
+        TREE_DISCLOSURE + TREE_GAP
     };
     let glyph = if folder.is_some() {
         include_bytes!("../../assets/icons/folder.svg").as_slice()
@@ -1059,7 +1063,7 @@ pub(super) fn tree_row(
         // The indent is margin, so the hover fill covers the row and not the
         // empty space left of it. That leaves the width to the parent: it
         // must be a flex column, which stretches the row to what remains.
-        .ml(px(f32::from(depth) * TREE_INDENT))
+        .ml(px(f32::from(depth) * TREE_INDENT + slot))
         .pl(px(TREE_EDGE))
         .pr_2()
         .radius_md()
@@ -1077,7 +1081,7 @@ pub(super) fn tree_row(
             },
             RADIUS_MD,
         )
-        .child(disclosure)
+        .children(disclosure)
         .child(super::icon(glyph, TREE_GLYPH, theme.muted))
         .child(
             div()

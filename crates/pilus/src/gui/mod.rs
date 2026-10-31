@@ -5648,8 +5648,9 @@ impl PilusView {
     }
 
     /// The agents the AGENTS section lists, in its order: blocked first, for
-    /// it waits on a person, then done, working and idle. Across machines the
-    /// feed's own order breaks a tie. The scope and status filters apply.
+    /// it waits on a person, then done, working and idle. Within a status the
+    /// agent that changed most recently leads; the feed's own order breaks a
+    /// tie. The scope and status filters apply.
     fn listed_agents(&self) -> Vec<(EndpointId, &Agent)> {
         // The AGENTS-scope menu row narrows the dock to the visible surface's
         // active workspace, mirroring the daemon's own scope filter.
@@ -5678,7 +5679,14 @@ impl PilusView {
                         .is_none_or(|status| agent.status == status)
             })
             .collect();
-        listed.sort_by_key(|(_, agent)| agent_status_rank(&agent.status));
+        // A stable sort, so agents stamped alike (all first seen in one
+        // poll) keep the feed's order.
+        listed.sort_by_key(|(id, agent)| {
+            (
+                agent_status_rank(&agent.status),
+                std::cmp::Reverse(self.attention.changed_at(&id.key(), &agent.pane)),
+            )
+        });
         listed
     }
 

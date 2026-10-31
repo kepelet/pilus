@@ -10,6 +10,7 @@
 //! touches GPUI, so the transition rules are unit-testable on their own.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use pilus_client::Agent;
 
@@ -74,10 +75,13 @@ fn finished_tag(endpoint: &str, pane: &str) -> String {
     format!("pilus-done-{endpoint}-{pane}")
 }
 
-/// Last seen status per pane, per endpoint.
+/// Last seen status per pane, per endpoint, with when the pane took it.
+///
+/// The daemon's `agent.list` carries no timestamp, so the moment a status
+/// changed is the only recency pilus can order the AGENTS section by.
 #[derive(Default)]
 pub(super) struct Watch {
-    seen: HashMap<String, HashMap<String, String>>,
+    seen: HashMap<String, HashMap<String, (String, Instant)>>,
     /// Endpoints that have reported once. An agent already blocked when pilus
     /// starts, or when a machine first connects, is old news, not an alert.
     seeded: HashSet<String>,
@@ -89,9 +93,10 @@ impl Watch {
     pub(super) fn observe(&mut self, endpoint: &str, agents: &[Agent]) {
         let seeded = !self.seeded.insert(endpoint.to_string());
         let previous = self.seen.remove(endpoint).unwrap_or_default();
+        let now = Instant::now();
         let mut current = HashMap::with_capacity(agents.len());
         for agent in agents {
-            let was = previous.get(&agent.pane).map(String::as_str);
+            let was = previous.get(&agent.pane).map(|(status, _)| status.as_str());
             let is = agent.status.as_str();
             if seeded && is == "blocked" && was != Some("blocked") {
                 self.events.push(Event::Blocked(Blocked {
@@ -119,11 +124,17 @@ impl Watch {
                 self.events
                     .push(Event::Cleared(finished_tag(endpoint, &agent.pane)));
             }
-            current.insert(agent.pane.clone(), agent.status.clone());
+            // A pane keeps its stamp for as long as its status holds, so a
+            // poll that changes nothing never reshuffles the list.
+            let since = match previous.get(&agent.pane) {
+                Some((status, since)) if *status == agent.status => *since,
+                _ => now,
+            };
+            current.insert(agent.pane.clone(), (agent.status.clone(), since));
         }
         // A pane that vanished while blocked (the agent exited) leaves its
         // banner behind unless it is cleared too.
-        for (pane, status) in previous {
+        for (pane, (status, _)) in previous {
             if current.contains_key(&pane) {
                 continue;
             }
@@ -140,6 +151,14 @@ impl Watch {
         self.seen.insert(endpoint.to_string(), current);
     }
 
+    /// When a pane last changed status, as far as this window has watched.
+    pub(super) fn changed_at(&self, endpoint: &str, pane: &str) -> Option<Instant> {
+        self.seen
+            .get(endpoint)
+            .and_then(|panes| panes.get(pane))
+            .map(|(_, since)| *since)
+    }
+
     /// Forget every endpoint, as when the window moves to another session.
     ///
     /// Pane ids restart in every daemon, so the old statuses would answer for
@@ -148,7 +167,7 @@ impl Watch {
     pub(super) fn forget_all(&mut self) {
         self.seeded.clear();
         for (endpoint, panes) in std::mem::take(&mut self.seen) {
-            for (pane, status) in panes {
+            for (pane, (status, _)) in panes {
                 match status.as_str() {
                     "blocked" => self
                         .events
@@ -193,6 +212,20 @@ mod tests {
         assert_eq!(banner_title(&agent), "reviewer on pilus");
         agent.workspace_name.clear();
         assert_eq!(banner_title(&agent), "reviewer");
+    }
+
+    #[test]
+    fn a_pane_keeps_its_stamp_until_its_status_changes() {
+        let mut watch = Watch::default();
+        watch.observe("local", &[agent("1", "working")]);
+        let first = watch.changed_at("local", "1");
+        assert!(first.is_some());
+        watch.observe("local", &[agent("1", "working")]);
+        assert_eq!(watch.changed_at("local", "1"), first);
+        watch.observe("local", &[agent("1", "done")]);
+        assert!(watch.changed_at("local", "1") > first);
+        assert_eq!(watch.changed_at("local", "2"), None);
+        assert_eq!(watch.changed_at("other", "1"), None);
     }
 
     #[test]

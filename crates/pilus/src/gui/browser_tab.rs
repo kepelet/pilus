@@ -942,29 +942,23 @@ impl PilusView {
     /// The Browser button beside the Ports button, lit while the tab is open.
     pub(super) fn right_browser_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
-        div()
-            .id("pilus-right-browser-toggle")
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .flex_shrink_0()
-            .h(px(super::PILL_BUTTON_H))
-            .w(px(super::PILL_BUTTON_W))
-            .radius_sm()
-            .cursor_pointer()
-            .hover_fill(
-                theme.card_raise(super::SIDEBAR_HOVER_WEIGHT),
-                style::RADIUS_SM,
-            )
-            .tooltip(super::row_tooltip(
-                "Browser".to_string(),
-                theme.panel_fg,
-                Vec::new(),
-                theme,
-            ))
-            .child(self.browser_glyph(self.browser_visible()))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_browser(cx)))
+        // The same dress as the open column's icon buttons, so hover and the
+        // lit state read alike whether the column is away or open.
+        style::strip_button(
+            "pilus-right-browser-toggle",
+            self.browser_visible(),
+            true,
+            theme,
+        )
+        .occlude()
+        .tooltip(super::row_tooltip(
+            "Browser".to_string(),
+            theme.panel_fg,
+            Vec::new(),
+            theme,
+        ))
+        .child(self.browser_glyph(self.browser_visible()))
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_browser(cx)))
     }
 
     /// The same button for the column's own strip, once the column is open.

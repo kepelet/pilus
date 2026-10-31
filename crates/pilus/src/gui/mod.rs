@@ -233,9 +233,6 @@ const SIDEBAR_ROW_PY: f32 = 4.0;
 /// GPUI's default line height as a multiple of the font size; the rail needs
 /// the head's height to find the glyph's foot.
 const SIDEBAR_LINE_RATIO: f32 = 1.618;
-/// Share of the selected pill's strength a hover fill carries, so hovering a
-/// row hints at the selection without matching it.
-const SIDEBAR_HOVER_WEIGHT: f32 = 0.6;
 /// Box every leading sidebar glyph sits in, so labels share one column
 /// whatever the glyph is: chevron, folder, brand mark, or status dot.
 const SIDEBAR_GLYPH: f32 = 14.0;
@@ -299,11 +296,6 @@ const HEAD_CONTROLS_W: f32 = SIDEBAR_TOGGLE_W + HEAD_CONTROLS_GAP + SIDEBAR_TOGG
 const SESSION_MENU_GAP: f32 = 4.0;
 /// Height of a tab pill in the top chrome.
 const TAB_HEIGHT: f32 = 26.0;
-/// Padding inside a pill, between its border and the buttons it holds.
-const PILL_PAD: f32 = 2.0;
-/// A button inside a pill: the tab height less the pill's border and padding.
-const PILL_BUTTON_H: f32 = TAB_HEIGHT - 2.0 - 2.0 * PILL_PAD;
-const PILL_BUTTON_W: f32 = SIDEBAR_TOGGLE_W - 4.0;
 /// Top-left of the traffic lights: their left edge shares the sidebar glyph
 /// column (row edge + row padding) and their 12px discs centre on the 20px
 /// midline of the sidebar header and tab strip.

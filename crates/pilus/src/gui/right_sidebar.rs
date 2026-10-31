@@ -22,7 +22,7 @@ use std::time::Instant;
 use gpui::{Context, Div, MouseButton, MouseDownEvent, Stateful, div, prelude::*, px};
 use pilus_client::DiffLayer;
 
-use super::style::{self, FillExt, RadiusExt};
+use super::style;
 use super::{HEADER_HEIGHT, PilusView, SIDEBAR_ANIM_DURATION, icon};
 
 /// Narrowest the column drags to: the Diff header still fits.
@@ -701,49 +701,24 @@ impl PilusView {
     /// The Ports button beside the sidebar toggle, lit while Ports is open.
     pub(super) fn right_ports_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
-        div()
-            .id("pilus-right-ports-toggle")
+        let lit = self.right.visible && self.right.tab == SidebarTab::Ports;
+        style::strip_button("pilus-right-ports-toggle", lit, true, theme)
             .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .flex_shrink_0()
-            .h(px(super::PILL_BUTTON_H))
-            .w(px(super::PILL_BUTTON_W))
-            .radius_sm()
-            .cursor_pointer()
-            .hover_fill(
-                theme.card_raise(super::SIDEBAR_HOVER_WEIGHT),
-                style::RADIUS_SM,
-            )
             .tooltip(super::row_tooltip(
                 self.ports_tip(),
                 theme.panel_fg,
                 Vec::new(),
                 theme,
             ))
-            .child(self.ports_glyph(self.right.visible && self.right.tab == SidebarTab::Ports))
+            .child(self.ports_glyph(lit))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_ports(cx)))
     }
 
     /// The toggle for the tab strip's trailing edge.
     pub(super) fn right_sidebar_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
-        div()
-            .id("pilus-right-sidebar-toggle")
+        style::strip_button("pilus-right-sidebar-toggle", false, true, theme)
             .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .flex_shrink_0()
-            .h(px(super::PILL_BUTTON_H))
-            .w(px(super::PILL_BUTTON_W))
-            .radius_sm()
-            .cursor_pointer()
-            .hover_fill(
-                theme.card_raise(super::SIDEBAR_HOVER_WEIGHT),
-                style::RADIUS_SM,
-            )
             .child(icon(
                 include_bytes!("../../assets/icons/panel-right.svg"),
                 14.0,
@@ -756,12 +731,12 @@ impl PilusView {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx)))
     }
 
-    /// Browser, Ports, and the sidebar toggle as one unframed group at the strip's
-    /// far edge, each button raising its own fill on hover.
+    /// Browser, Ports, and the sidebar toggle at the strip's far edge, dressed
+    /// and spaced like the open column's icon buttons.
     pub(super) fn right_toolbar(&self, cx: &mut Context<Self>) -> Div {
         style::button_group()
             .occlude()
-            .p(px(super::PILL_PAD))
+            .gap_1()
             .flex_shrink_0()
             .child(self.right_browser_toggle(cx))
             .child(self.right_ports_toggle(cx))
@@ -812,9 +787,12 @@ impl PilusView {
             .when(!floating, |strip| {
                 strip.border_b_1().border_color(theme.border)
             })
-            // No side padding: the pills carry their own room, and `lights`
-            // only clears the traffic lights when the left sidebar is away.
+            // No leading padding: `lights` only clears the traffic lights when
+            // the left sidebar is away. The trailing gap is the window strip's
+            // own, so the close button lands where the toolbar's toggle did and
+            // lines up with the body card's right edge.
             .pl(px(lights))
+            .pr(px(super::pane_chrome::GAP_PX))
             .child(
                 self.right_step_button(
                     "pilus-right-back",

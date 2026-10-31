@@ -970,28 +970,20 @@ impl PilusView {
     /// The same button for the column's own strip, once the column is open.
     pub(super) fn strip_browser_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
-        div()
-            .id("pilus-right-sidebar-browser")
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(super::PILL_BUTTON_W))
-            .h(px(super::PILL_BUTTON_H))
-            .radius_sm()
-            .cursor_pointer()
-            .hover_fill(
-                theme.card_raise(super::SIDEBAR_HOVER_WEIGHT),
-                style::RADIUS_SM,
-            )
-            .flex_shrink_0()
-            .tooltip(super::row_tooltip(
-                "Browser".to_string(),
-                theme.panel_fg,
-                Vec::new(),
-                theme,
-            ))
-            .child(self.browser_glyph(self.browser_visible()))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_browser(cx)))
+        style::strip_button(
+            "pilus-right-sidebar-browser",
+            self.right.tab == super::right_sidebar::SidebarTab::Browser,
+            true,
+            theme,
+        )
+        .tooltip(super::row_tooltip(
+            "Browser".to_string(),
+            theme.panel_fg,
+            Vec::new(),
+            theme,
+        ))
+        .child(self.browser_glyph(self.browser_visible()))
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_browser(cx)))
     }
 }
 

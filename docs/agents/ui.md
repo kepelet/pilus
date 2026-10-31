@@ -69,6 +69,14 @@ is the only implementation of it.
   With floating cards and square corners the sidebar's rows run on into the
   gap beside the card (`sidebar_reach`), so the pills meet the card's edge;
   rounded pills keep that gap.
+  The right column is inset under floating cards: its body is a card with the
+  terminal card's ring and corner, a `GAP_PX` margin from the window's right
+  and bottom edges, and a left gap of its own once the column expands over the
+  terminal. Its tab bar stays on the ground above, and its tabs
+  (`style::strip_tab`) dress like the window's own: the selected one wears the
+  glide pill, a hover draws the same hairline. Its icon buttons
+  (`style::strip_button`) are tab-high squares in the same dress, with no
+  padding around them; one that is on wears the wash and hairline.
   The sidebar and tab strip take their ground (`Theme::chrome_ground`) only
   when the window is opaque; translucent, both are bare and the frosted
   backdrop shows through. The exception is a translucent sidebar beside

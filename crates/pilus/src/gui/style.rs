@@ -846,6 +846,92 @@ pub(super) fn tab(
         .child(label)
 }
 
+/// One tab of a strip that dresses like the window's own tab strip: the
+/// selected tab wears the strip's glide pill (a thin wash of the foreground
+/// and a hairline, see [`glide_bordered`] and [`strip_glide`]), and hovering
+/// an unselected one draws the same hairline. Every tab keeps a transparent
+/// 1px border, so the edge appearing shifts nothing. Callers attach their own
+/// handler.
+pub(super) fn strip_tab(
+    id: impl Into<ElementId>,
+    label: impl IntoElement,
+    active: bool,
+    slot: &GlideSlot,
+    theme: Theme,
+    text_size: f32,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .h(px(super::TAB_HEIGHT))
+        .px_3()
+        .radius_tab()
+        .border_1()
+        .border_color(gpui::transparent_black())
+        .text_color(if active { theme.panel_fg } else { theme.muted })
+        .text_size(px(text_size))
+        .cursor_pointer()
+        // The glide pill may still be flying in to the selected tab, so a
+        // hover edge on it would show before the pill lands.
+        .hover(move |style| {
+            let style = style.text_color(theme.panel_fg);
+            if active {
+                style
+            } else {
+                style.border_color(theme.border)
+            }
+        })
+        .children(active.then(|| glide_target(slot)))
+        .child(label)
+}
+
+/// The pill [`strip_tab`]s share: place it as the first child of the strip.
+pub(super) fn strip_glide(
+    id: impl Into<ElementId>,
+    slot: &GlideSlot,
+    theme: Theme,
+) -> impl IntoElement {
+    glide_bordered(id, slot, theme.tint_fill(1.0), RADIUS_TAB, theme.border)
+}
+
+/// A square icon button for a strip of [`strip_tab`]s, dressed the same: the
+/// selected one wears the wash and hairline of a selected tab, and hovering
+/// another draws the hairline. It is as tall as a tab and as wide as it is
+/// tall, so it carries no padding of its own. A disabled one dims and takes no
+/// hover. Callers add the glyph and the handler.
+pub(super) fn strip_button(
+    id: impl Into<ElementId>,
+    active: bool,
+    enabled: bool,
+    theme: Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .w(px(super::TAB_HEIGHT))
+        .h(px(super::TAB_HEIGHT))
+        .radius_tab()
+        .border_1()
+        .border_color(if active {
+            theme.border.into()
+        } else {
+            gpui::transparent_black()
+        })
+        .when(active, |button| button.bg(theme.tint_fill(1.0)))
+        // A button with nowhere to go dims and ignores the pointer.
+        .when(!enabled, |button| button.opacity(0.35))
+        .when(enabled, |button| button.cursor_pointer())
+        .when(enabled && !active, |button| {
+            button.hover(move |style| style.border_color(theme.border))
+        })
+}
+
 /// A tab that cannot be opened: dimmed, and deaf to the pointer.
 pub(super) fn tab_disabled(
     id: impl Into<ElementId>,

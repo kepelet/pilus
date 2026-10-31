@@ -596,29 +596,17 @@ impl PilusView {
         enabled: bool,
     ) -> Stateful<Div> {
         let theme = self.theme;
-        let size = style::scaled(&self.shared_settings, 24.0);
-        let button = div()
-            .id(id)
-            .flex()
-            .items_center()
-            .justify_center()
-            .flex_shrink_0()
-            .w(px(size))
-            .h(px(size))
-            .radius_md()
-            .child(icon(glyph, 14.0, theme.muted));
+        let button =
+            style::strip_button(id, false, enabled, theme).child(icon(glyph, 14.0, theme.muted));
         if !enabled {
-            return button.opacity(0.35);
+            return button;
         }
-        button
-            .cursor_pointer()
-            .hover_fill(theme.panel_dim, style::RADIUS_MD)
-            .tooltip(super::row_tooltip(
-                tip.to_string(),
-                theme.panel_fg,
-                Vec::new(),
-                theme,
-            ))
+        button.tooltip(super::row_tooltip(
+            tip.to_string(),
+            theme.panel_fg,
+            Vec::new(),
+            theme,
+        ))
     }
 
     /// A tab that was off screen has gone without polls, so what it holds is
@@ -792,7 +780,6 @@ impl PilusView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = self.theme;
-        let raise = theme.card_raise(super::SIDEBAR_HOVER_WEIGHT);
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let floating = self.floating_cards();
         let expanded = self.right.expanded();
@@ -808,6 +795,8 @@ impl PilusView {
                 * self.right.spread()
         };
 
+        // The selected tab's pill glides to it, as in the window's tab strip.
+        let tab_glide = style::GlideSlot::default();
         let strip = div()
             .flex()
             .flex_row()
@@ -816,12 +805,16 @@ impl PilusView {
             // The window's top bar ends at HEADER_HEIGHT and the card's own
             // edge is drawn just below it, so the strip's hairline takes the
             // pixel after the bar to meet that edge.
-            .h(px(HEADER_HEIGHT + 1.0))
+            .h(px(HEADER_HEIGHT + if floating { 0.0 } else { 1.0 }))
             .flex_shrink_0()
-            .border_b_1()
-            .border_color(theme.border)
-            .px_3()
-            .pl(px(12.0 + lights))
+            // Floating, the body below is a card of its own and the strip
+            // rests on the ground above it, so there is no edge to meet.
+            .when(!floating, |strip| {
+                strip.border_b_1().border_color(theme.border)
+            })
+            // No side padding: the pills carry their own room, and `lights`
+            // only clears the traffic lights when the left sidebar is away.
+            .pl(px(lights))
             .child(
                 self.right_step_button(
                     "pilus-right-back",
@@ -853,6 +846,11 @@ impl PilusView {
                     .min_w_0()
                     .overflow_x_scroll()
                     .overflow_y_hidden()
+                    .child(style::strip_glide(
+                        "pilus-right-tab-glide",
+                        &tab_glide,
+                        theme,
+                    ))
                     .children(SidebarTab::STRIP.map(|tab| {
                         if tab.needs_repo() && !is_repo {
                             return style::tab_disabled(
@@ -863,10 +861,11 @@ impl PilusView {
                             )
                             .flex_shrink_0();
                         }
-                        style::tab(
+                        style::strip_tab(
                             format!("pilus-right-tab-{}", tab.wire()),
                             tab.label(),
                             shown == tab,
+                            &tab_glide,
                             theme,
                             fonts.body,
                         )
@@ -874,44 +873,31 @@ impl PilusView {
                         .on_click(cx.listener(move |this, _, _, cx| this.select_right_tab(tab, cx)))
                     })),
             )
+            // The icons are tab-sized pills in the tabs' own dress, side by
+            // side with no padding around them.
             .child(
                 style::button_group()
-                    .p(px(super::PILL_PAD))
+                    .gap_1()
                     .flex_shrink_0()
                     .child(self.strip_browser_toggle(cx))
                     .child(
-                        div()
-                            .id("pilus-right-sidebar-ports")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(super::PILL_BUTTON_W))
-                            .h(px(super::PILL_BUTTON_H))
-                            .radius_sm()
-                            .cursor_pointer()
-                            .hover_fill(raise, style::RADIUS_SM)
-                            .flex_shrink_0()
-                            .tooltip(super::row_tooltip(
-                                self.ports_tip(),
-                                theme.panel_fg,
-                                Vec::new(),
-                                theme,
-                            ))
-                            .child(self.ports_glyph(self.right.tab == SidebarTab::Ports))
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_ports(cx))),
+                        style::strip_button(
+                            "pilus-right-sidebar-ports",
+                            self.right.tab == SidebarTab::Ports,
+                            true,
+                            theme,
+                        )
+                        .tooltip(super::row_tooltip(
+                            self.ports_tip(),
+                            theme.panel_fg,
+                            Vec::new(),
+                            theme,
+                        ))
+                        .child(self.ports_glyph(self.right.tab == SidebarTab::Ports))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_ports(cx))),
                     )
                     .child(
-                        div()
-                            .id("pilus-right-sidebar-expand")
-                            .flex()
-                            .flex_shrink_0()
-                            .items_center()
-                            .justify_center()
-                            .w(px(super::PILL_BUTTON_W))
-                            .h(px(super::PILL_BUTTON_H))
-                            .radius_sm()
-                            .cursor_pointer()
-                            .hover_fill(raise, style::RADIUS_SM)
+                        style::strip_button("pilus-right-sidebar-expand", false, true, theme)
                             .child(icon(
                                 if expanded {
                                     include_bytes!("../../assets/icons/minimize.svg")
@@ -924,17 +910,7 @@ impl PilusView {
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_right_expanded(cx))),
                     )
                     .child(
-                        div()
-                            .id("pilus-right-sidebar-close")
-                            .flex()
-                            .flex_shrink_0()
-                            .items_center()
-                            .justify_center()
-                            .w(px(super::PILL_BUTTON_W))
-                            .h(px(super::PILL_BUTTON_H))
-                            .radius_sm()
-                            .cursor_pointer()
-                            .hover_fill(raise, style::RADIUS_SM)
+                        style::strip_button("pilus-right-sidebar-close", false, true, theme)
                             .child(icon(
                                 include_bytes!("../../assets/icons/x.svg"),
                                 12.0,
@@ -981,7 +957,7 @@ impl PilusView {
                 }),
             );
 
-        div()
+        let column = div()
             .id("pilus-right-sidebar")
             .occlude()
             .absolute()
@@ -992,18 +968,32 @@ impl PilusView {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(self.chrome_fill())
-            .border_l_1()
-            // Floating cards' tinted surface runs up to the column, so the edge
-            // takes that surface's color and the terminal's surface meets the
-            // column without a seam; the edge keeps its pixel so the content
-            // box does not shift. Focus draws no edge: only Changes takes
-            // keys, so it would mark one tab.
-            .border_color(if floating {
+            // Flush, the column is chrome with a hairline on its leading
+            // edge. Floating, it is the cards' ground (the tab strip's, or
+            // under translucency the tinted surface below the strip) with the
+            // body inset as a card, so the terminal's surface meets the column
+            // without a seam. Focus draws no edge: only Changes takes keys, so
+            // it would mark one tab.
+            .when(!floating, |column| {
+                column
+                    .bg(self.chrome_fill())
+                    .border_l_1()
+                    .border_color(theme.border)
+            })
+            .when(floating && self.opaque(), |column| {
+                column.bg(self.tab_strip_fill())
+            })
+            .when(floating && !self.opaque(), |column| {
                 let glass = self.glass_opacity();
-                theme.pane_surface(glass).opacity(glass)
-            } else {
-                theme.border
+                column.child(
+                    div()
+                        .absolute()
+                        .top(px(HEADER_HEIGHT))
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .bg(theme.pane_surface(glass).opacity(glass)),
+                )
             })
             .on_mouse_down(
                 MouseButton::Left,
@@ -1014,10 +1004,37 @@ impl PilusView {
                     }
                 }),
             )
-            .child(strip)
-            .child(body)
-            .children(footer)
-            .children((!expanded).then_some(handle))
+            .child(strip);
+        // Comfortable insets the body the way the left sidebar's list is: a
+        // gap from the window's right and bottom edges, the terminal card's
+        // own gap on its left, the same rounded corner and faint ring. Only
+        // when the column fills the window is there no terminal card to
+        // leave that gap, so the card takes it itself as the column spreads.
+        let column = if floating {
+            column.child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .ml(px(super::pane_chrome::GAP_PX * self.right.spread()))
+                    .mr(px(super::pane_chrome::GAP_PX))
+                    .mb(px(super::pane_chrome::GAP_PX))
+                    .border(px(super::pane_chrome::BORDER_PX))
+                    .border_color(gpui::Rgba {
+                        a: theme.border.a * super::pane_chrome::REST_RING,
+                        ..theme.border
+                    })
+                    .rounded(style::RADIUS_MD.pixels())
+                    .overflow_hidden()
+                    .bg(self.chrome_fill())
+                    .child(body)
+                    .children(footer),
+            )
+        } else {
+            column.child(body).children(footer)
+        };
+        column.children((!expanded).then_some(handle))
     }
 
     /// Track an edge drag across the whole window.

@@ -2338,6 +2338,66 @@ impl Render for UiPlaygroundView {
                     ),
                 ),
             )
+            .child(self.section(
+                "STRIP TABS",
+                self.tray({
+                    // The right column's tabs: the window tab strip's
+                    // glide pill and hover edge.
+                    let glide = style::GlideSlot::default();
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        // Icon buttons of the same dress: one selected, one
+                        // resting, one disabled.
+                        .child(
+                            style::strip_button("pg-strip-icon-on", true, true, self.theme).child(
+                                icon(
+                                    include_bytes!("../../assets/icons/chevron-left.svg"),
+                                    14.0,
+                                    self.theme.muted,
+                                ),
+                            ),
+                        )
+                        .child(
+                            style::strip_button("pg-strip-icon", false, true, self.theme).child(
+                                icon(
+                                    include_bytes!("../../assets/icons/chevron-right.svg"),
+                                    14.0,
+                                    self.theme.muted,
+                                ),
+                            ),
+                        )
+                        .child(
+                            style::strip_button("pg-strip-icon-off", false, false, self.theme)
+                                .child(icon(
+                                    include_bytes!("../../assets/icons/x.svg"),
+                                    12.0,
+                                    self.theme.muted,
+                                )),
+                        )
+                        .child(style::strip_glide("pg-strip-glide", &glide, self.theme))
+                        .children(["Changes", "History", "Files"].into_iter().enumerate().map(
+                            |(index, label)| {
+                                style::strip_tab(
+                                    format!("pg-strip-tab-{index}"),
+                                    label,
+                                    self.tab == index,
+                                    &glide,
+                                    self.theme,
+                                    self.fonts().body,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.tab = index;
+                                        this.note(format!("{label} tab selected"), cx);
+                                    },
+                                ))
+                            },
+                        ))
+                }),
+            ))
             .child(
                 self.section(
                     "TOGGLES",

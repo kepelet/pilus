@@ -147,6 +147,8 @@ pub struct UiPlaygroundView {
     multi: Entity<TextInput>,
     secret: Entity<TextInput>,
     search: Entity<TextInput>,
+    /// The label-less, icon-less field, as the find bar's replacement.
+    bare: Entity<TextInput>,
     pickers: Vec<Picker>,
     open_picker: Option<usize>,
     /// The picker an outside press just dismissed, so the chip's own click can
@@ -218,6 +220,17 @@ impl UiPlaygroundView {
                 cx,
             )
         });
+        let bare = cx.new(|cx| {
+            TextInput::new(
+                String::new(),
+                "Replace",
+                font.clone(),
+                px(fonts.body),
+                false,
+                theme,
+                cx,
+            )
+        });
         let input_handle = single.focus_handle(cx);
         window.focus(&input_handle, cx);
         Self {
@@ -228,6 +241,7 @@ impl UiPlaygroundView {
             multi,
             secret,
             search,
+            bare,
             pickers: vec![
                 Picker {
                     icon: include_bytes!("../../assets/icons/cpu.svg"),
@@ -508,6 +522,26 @@ impl UiPlaygroundView {
             theme,
             style::scaled(&self.settings, style::CONTROL_HEIGHT),
             fonts.body,
+            entity,
+        )
+        .w(px(240.0))
+        .text_size(px(fonts.body))
+    }
+
+    /// The bare field the find bar's replacement sits in.
+    fn bare_box(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let fonts = self.fonts();
+        let entity = self.bare.clone();
+        entity.update(cx, |input, _| {
+            input.set_style(theme, style::chrome_font(&self.settings), px(fonts.body));
+        });
+        let focused = entity.read(cx).is_focused(window);
+        style::bare_field(
+            "pg-input-bare",
+            focused,
+            theme,
+            style::scaled(&self.settings, style::CONTROL_HEIGHT),
             entity,
         )
         .w(px(240.0))
@@ -2248,7 +2282,8 @@ impl Render for UiPlaygroundView {
                             .child(self.input_box(InputId::Single, "Single line", window, cx))
                             .child(self.input_box(InputId::Multi, "Multi line", window, cx))
                             .child(self.input_box(InputId::Secret, "Secret", window, cx))
-                            .child(self.search_box(window, cx)),
+                            .child(self.search_box(window, cx))
+                            .child(self.bare_box(window, cx)),
                     ),
                 ),
             )

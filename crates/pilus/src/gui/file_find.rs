@@ -1,6 +1,9 @@
-//! Find in the file the Files tab has open for editing (⌘F).
+//! Find in the file the Files tab has open for editing (⌘F), and replace
+//! (⌘⌥F).
 //!
-//! The bar sits above the editor and owns one single-line field. Matches are
+//! The bar sits above the editor and owns a single-line field, and a second
+//! one for the replacement once replacing is asked for. A replacement is an
+//! edit of the editor's own buffer, one undo step for one match or for all. Matches are
 //! byte ranges into the editor's text, found again whenever the query or the
 //! text changes (the field's `revision` says which) and painted under the text
 //! by the editor itself; the current match is the editor's selection, so the
@@ -14,7 +17,9 @@ use std::ops::Range;
 
 use gpui::{Context, Div, Focusable as _, KeyDownEvent, Window, div, prelude::*, px};
 
+use super::editor_ops::Change;
 use super::style;
+use super::toast::ToastKind;
 use super::{PilusView, files_tab::EditMode};
 
 /// Most matches kept, so a one-letter query over a large file stays cheap to
@@ -38,6 +43,8 @@ pub(super) struct FileFind {
     seen: Option<(u64, String)>,
     /// The query changed: select its first match at or after the caret.
     jump: bool,
+    /// The replace field shows under the query.
+    replacing: bool,
 }
 
 impl FileFind {
@@ -91,6 +98,27 @@ fn find_all(text: &str, query: &str) -> (Vec<Range<usize>>, bool) {
     let capped = found.len() > MAX_MATCHES;
     found.truncate(MAX_MATCHES);
     (found, capped)
+}
+
+/// One edit that puts `with` over every match in `text`, from the first
+/// match's start to the last one's end, so Replace All undoes in one step.
+/// The caret lands after the last replacement.
+fn replace_all(text: &str, matches: &[Range<usize>], with: &str) -> Option<Change> {
+    let (first, last) = (matches.first()?, matches.last()?);
+    let mut insert = String::with_capacity(last.end - first.start);
+    let mut at = first.start;
+    for hit in matches {
+        insert.push_str(&text[at..hit.start]);
+        insert.push_str(with);
+        at = hit.end;
+    }
+    let caret = first.start + insert.len();
+    Some(Change {
+        range: first.start..last.end,
+        insert,
+        anchor: caret,
+        head: caret,
+    })
 }
 
 /// The first match that starts at or after `caret`, wrapping to the first.
@@ -156,9 +184,83 @@ impl PilusView {
         cx.notify();
     }
 
+    /// Open the bar with its replace field: on the query when there is none
+    /// yet, else on the replacement.
+    pub(super) fn replace_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_open(window, cx);
+        if !self.file_find.open {
+            return;
+        }
+        self.file_find.replacing = true;
+        if !self.find_input.read(cx).value().is_empty() {
+            self.replace_input
+                .update(cx, |input, cx| input.select_all(cx));
+            window.focus(&self.replace_input.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    /// Replace the selected match and go to the next. With no match selected
+    /// yet, select one first, so nothing is replaced unseen.
+    fn replace_one(&mut self, cx: &mut Context<Self>) {
+        self.find_refresh(cx);
+        let Some(range) = self
+            .file_find
+            .current
+            .and_then(|at| self.file_find.matches.get(at).cloned())
+        else {
+            self.find_step(true, cx);
+            return;
+        };
+        let with = self.replace_input.read(cx).value();
+        let caret = range.start + with.len();
+        self.md_editor_input.update(cx, |input, cx| {
+            input.apply_change(
+                Change {
+                    range,
+                    insert: with,
+                    anchor: caret,
+                    head: caret,
+                },
+                cx,
+            );
+        });
+        self.file_find.current = None;
+        self.find_step(true, cx);
+        cx.notify();
+    }
+
+    /// Replace every match, as one undo step.
+    fn replace_every(&mut self, cx: &mut Context<Self>) {
+        self.find_refresh(cx);
+        let with = self.replace_input.read(cx).value();
+        let matches = self.file_find.matches.clone();
+        let change = self
+            .md_editor_input
+            .read(cx)
+            .with_text(|text| replace_all(text, &matches, &with));
+        let Some(change) = change else {
+            return;
+        };
+        self.md_editor_input
+            .update(cx, |input, cx| input.apply_change(change, cx));
+        let more = if self.file_find.capped {
+            ", and more remain"
+        } else {
+            ""
+        };
+        self.toast(
+            ToastKind::Success,
+            format!("Replaced {}{more}", matches.len()),
+        );
+        self.find_refresh(cx);
+        cx.notify();
+    }
+
     /// Close the bar, drop the highlights and hand the keyboard to the editor.
     pub(super) fn find_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.file_find.open = false;
+        self.file_find.replacing = false;
         self.file_find.matches.clear();
         self.file_find.current = None;
         self.file_find.seen = None;
@@ -237,11 +339,14 @@ impl PilusView {
         }
         let keystroke = &event.keystroke;
         let shift = keystroke.modifiers.shift;
+        let in_replace = self.replace_input.read(cx).is_focused(window);
         match keystroke.key.as_str() {
             "escape" => self.find_close(window, cx),
             "enter" if self.find_input.read(cx).is_focused(window) => {
                 self.find_step(!shift, cx);
             }
+            "enter" if in_replace && keystroke.modifiers.platform => self.replace_every(cx),
+            "enter" if in_replace => self.replace_one(cx),
             "g" if keystroke.modifiers.platform => self.find_step(!shift, cx),
             _ => return false,
         }
@@ -284,49 +389,132 @@ impl PilusView {
                 },
             )
             .child(self.file_find.count_label());
-        Some(
+        let replacing = self.file_find.replacing;
+        // The chevron shows or hides the replace row, as an editor's does.
+        let toggle = div()
+            .id("pilus-files-find-replace-toggle")
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .w(px(height))
+            .h(px(height))
+            .cursor_pointer()
+            .child(style::chevron(
+                "pilus-files-find-replace-chevron",
+                replacing,
+                true,
+                fonts.secondary,
+                theme.muted,
+            ))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.file_find.replacing = !this.file_find.replacing;
+                if this.file_find.replacing {
+                    window.focus(&this.replace_input.focus_handle(cx), cx);
+                } else {
+                    window.focus(&this.find_input.focus_handle(cx), cx);
+                }
+                cx.notify();
+            }));
+        let replace_row = replacing.then(|| {
+            let focused = self.replace_input.read(cx).was_focused();
+            let found = !self.file_find.matches.is_empty();
             div()
                 .flex()
                 .flex_row()
                 .items_center()
+                .gap_1()
+                // Lined up under the query, past the chevron.
+                .pl(px(height + 4.0))
+                .child(
+                    style::bare_field(
+                        "pilus-files-replace",
+                        focused,
+                        theme,
+                        height,
+                        self.replace_input.clone(),
+                    )
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(fonts.body)),
+                )
+                .child(
+                    style::small_button(
+                        "pilus-files-replace-one",
+                        "Replace",
+                        style::ButtonKind::Secondary,
+                        theme,
+                        fonts.secondary,
+                    )
+                    .when(found, |button| {
+                        button.on_click(cx.listener(|this, _, _, cx| this.replace_one(cx)))
+                    })
+                    .when(!found, |button| button.opacity(0.5)),
+                )
+                .child(
+                    style::small_button(
+                        "pilus-files-replace-all",
+                        "All",
+                        style::ButtonKind::Secondary,
+                        theme,
+                        fonts.secondary,
+                    )
+                    .when(found, |button| {
+                        button.on_click(cx.listener(|this, _, _, cx| this.replace_every(cx)))
+                    })
+                    .when(!found, |button| button.opacity(0.5)),
+                )
+        });
+        let query_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(toggle)
+            .child(field)
+            .child(count)
+            .child(
+                self.diff_icon_button(
+                    "pilus-files-find-prev",
+                    include_bytes!("../../assets/icons/arrow-up.svg"),
+                    "Previous match (⇧⌘G)".to_string(),
+                    false,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.find_step(false, cx))),
+            )
+            .child(
+                self.diff_icon_button(
+                    "pilus-files-find-next",
+                    include_bytes!("../../assets/icons/arrow-down.svg"),
+                    "Next match (⌘G)".to_string(),
+                    false,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.find_step(true, cx))),
+            )
+            .child(
+                self.diff_icon_button(
+                    "pilus-files-find-close",
+                    include_bytes!("../../assets/icons/x.svg"),
+                    "Close (Esc)".to_string(),
+                    false,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.find_close(window, cx))),
+            );
+        Some(
+            div()
+                .flex()
+                .flex_col()
                 .gap_1()
                 .flex_shrink_0()
                 .px_3()
                 .py_2()
                 .border_b_1()
                 .border_color(theme.border)
-                .child(field)
-                .child(count)
-                .child(
-                    self.diff_icon_button(
-                        "pilus-files-find-prev",
-                        include_bytes!("../../assets/icons/arrow-up.svg"),
-                        "Previous match (⇧⌘G)".to_string(),
-                        false,
-                        false,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.find_step(false, cx))),
-                )
-                .child(
-                    self.diff_icon_button(
-                        "pilus-files-find-next",
-                        include_bytes!("../../assets/icons/arrow-down.svg"),
-                        "Next match (⌘G)".to_string(),
-                        false,
-                        false,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.find_step(true, cx))),
-                )
-                .child(
-                    self.diff_icon_button(
-                        "pilus-files-find-close",
-                        include_bytes!("../../assets/icons/x.svg"),
-                        "Close (Esc)".to_string(),
-                        false,
-                        false,
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| this.find_close(window, cx))),
-                ),
+                .child(query_row)
+                .children(replace_row),
         )
     }
 }
@@ -342,6 +530,14 @@ impl PilusView {
         self.find_refresh(cx);
         cx.notify();
     }
+
+    /// The bar with its replace row, `with` typed in it.
+    pub(super) fn replace_show_sample(&mut self, with: &str, cx: &mut Context<Self>) {
+        self.file_find.replacing = true;
+        self.replace_input
+            .update(cx, |input, cx| input.set_value(with.to_string(), cx));
+        cx.notify();
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +550,22 @@ mod tests {
             .into_iter()
             .map(|hit| (hit.start, hit.end))
             .collect()
+    }
+
+    #[test]
+    fn replace_all_is_one_edit_over_every_match() {
+        let text = "let a = a + a;";
+        let (found, _) = find_all(text, "a");
+        let change = replace_all(text, &found, "bb");
+        let Some(change) = change else {
+            panic!("there are matches to replace");
+        };
+        let mut out = text.to_string();
+        out.replace_range(change.range.clone(), &change.insert);
+        assert_eq!(out, "let bb = bb + bb;");
+        assert_eq!(change.range, 4..13);
+        assert_eq!(change.head, 16, "the caret lands after the last one");
+        assert_eq!(replace_all(text, &[], "x"), None);
     }
 
     #[test]

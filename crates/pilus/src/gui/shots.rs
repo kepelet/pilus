@@ -535,7 +535,7 @@ pub fn run() -> Result<()> {
         capture(&mut cx, window.into(), "files-tab-doc-code-no-tree")?;
         cx.update(|app| {
             view.update(app, |view, _| {
-                view.files_panel.tree_hidden = false;
+                view.files_set_tree_hidden(false, false);
             })
         });
         // Diagrams draw on a worker thread, so the clock the shots advance
@@ -557,10 +557,30 @@ pub fn run() -> Result<()> {
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "files-tab-quick-open")?;
         cx.update(|app| view.update(app, |view, cx| view.quick_open_close(cx)));
-        // ⌘F over that file: every match tinted, the first one selected.
+        // ⌘F over an edited file: every match tinted, the first one selected.
+        cx.update(|app| view.update(app, |view, cx| view.files_edit_doc_sample(cx)));
+        settle(&mut cx, 12);
         cx.update(|app| view.update(app, |view, cx| view.find_show_sample("text", cx)));
         settle(&mut cx, 12);
         capture(&mut cx, window.into(), "files-tab-doc-find")?;
+        // ⌘⌥F: the replace row under the query.
+        cx.update(|app| view.update(app, |view, cx| view.replace_show_sample("txt", cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-replace")?;
+        // The file changed on disk under unsaved edits, then a close asks.
+        cx.update(|app| view.update(app, |view, cx| view.files_disk_changed_sample(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-disk-changed")?;
+        cx.update(|app| view.update(app, |view, cx| view.files_step_out(cx)));
+        cx.update(|app| view.update(app, |view, cx| view.files_step_out(cx)));
+        settle(&mut cx, 12);
+        capture(&mut cx, window.into(), "files-tab-doc-unsaved")?;
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.menu_prompt = None;
+                cx.notify();
+            })
+        });
         cx.update(|app| view.update(app, |view, cx| view.files_show_doc_sample(cx)));
         settle(&mut cx, 12);
         cx.update(|app| view.update(app, |view, cx| view.files_show_doc_selection(cx)));

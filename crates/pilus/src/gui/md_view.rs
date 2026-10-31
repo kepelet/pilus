@@ -1088,7 +1088,14 @@ impl PilusView {
     /// The read-only Rust file with the tree put away.
     pub(super) fn files_code_without_tree_sample(&mut self, cx: &mut Context<Self>) {
         self.files_read_only_code_sample(cx);
-        self.files_panel.tree_hidden = true;
+        self.files_set_tree_hidden(true, false);
+        cx.notify();
+    }
+
+    /// The edited sample document, changed on disk under its unsaved edits.
+    pub(super) fn files_disk_changed_sample(&mut self, cx: &mut Context<Self>) {
+        self.files_edit_doc_sample(cx);
+        self.files_mark_changed_on_disk();
         cx.notify();
     }
 

@@ -110,13 +110,194 @@ pub(super) fn apply(
     }
 }
 
-/// What Enter inserts at `at`: a newline and the indent of the line it breaks,
-/// so the new line starts where the old one did.
-pub(super) fn newline(text: &str, at: usize) -> String {
+/// What Enter does at the selection: break the line and carry its indent
+/// onto the new one. In markdown (`prose`) a list item carries its marker
+/// too, numbered on and with an empty checkbox, and Enter on an item with
+/// nothing after its marker ends the list instead, taking the marker away.
+pub(super) fn enter(text: &str, anchor: usize, head: usize, prose: bool) -> Change {
+    let (anchor, head) = (floor(text, anchor), floor(text, head));
+    let sel = anchor.min(head)..anchor.max(head);
+    let start = line_start(text, sel.start);
+    let end = line_end(text, sel.start);
+    let line = &text[start..end];
+    let column = sel.start - start;
+    let item = list_item(line).filter(|item| prose && column >= item.body_at);
+    if let Some(item) = item {
+        if line[item.body_at..].trim().is_empty() && sel.end <= end {
+            return Change {
+                range: start..end,
+                insert: String::new(),
+                anchor: start,
+                head: start,
+            };
+        }
+        let insert = format!("\n{}{}", &line[..item.indent], item.next);
+        let caret = sel.start + insert.len();
+        return Change {
+            range: sel,
+            insert,
+            anchor: caret,
+            head: caret,
+        };
+    }
+    let indent = leading(line).min(column);
+    let insert = format!("\n{}", &line[..indent]);
+    let caret = sel.start + insert.len();
+    Change {
+        range: sel,
+        insert,
+        anchor: caret,
+        head: caret,
+    }
+}
+
+/// A markdown list item's shape: where its marker starts and its text
+/// begins, and the marker the next item takes.
+struct ListItem {
+    indent: usize,
+    body_at: usize,
+    next: String,
+}
+
+/// The list item `line` opens with: `-`, `*` or `+`, or a number with `.`
+/// or `)`, then spaces, then perhaps a checkbox.
+fn list_item(line: &str) -> Option<ListItem> {
+    let indent = leading(line);
+    let rest = &line[indent..];
+    let (marker_len, next_marker) = match rest.chars().next()? {
+        bullet @ ('-' | '*' | '+') => (1, bullet.to_string()),
+        _ => {
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 || digits > 9 {
+                return None;
+            }
+            let delimiter = rest[digits..].chars().next()?;
+            if !matches!(delimiter, '.' | ')') {
+                return None;
+            }
+            let number: u64 = rest[..digits].parse().ok()?;
+            (digits + 1, format!("{}{delimiter}", number + 1))
+        }
+    };
+    let after = &rest[marker_len..];
+    let spaces = after.len() - after.trim_start_matches(' ').len();
+    // A marker needs a space after it: `--flag`, `**bold**`, `3.14` and a
+    // bare `-` are not lists.
+    if spaces == 0 {
+        return None;
+    }
+    let mut body_at = indent + marker_len + spaces;
+    let mut check = "";
+    let body = &line[body_at..];
+    for done in ["[ ]", "[x]", "[X]"] {
+        if body == done || body.starts_with(&format!("{done} ")) {
+            check = "[ ] ";
+            body_at = (body_at + done.len() + 1).min(line.len());
+            break;
+        }
+    }
+    Some(ListItem {
+        indent,
+        body_at,
+        next: format!("{next_marker}{}{check}", " ".repeat(spaces)),
+    })
+}
+
+/// Brackets and quotes typing closes as it opens.
+const PAIRS: [(char, char); 6] = [
+    ('(', ')'),
+    ('[', ']'),
+    ('{', '}'),
+    ('"', '"'),
+    ('\'', '\''),
+    ('`', '`'),
+];
+
+fn is_quote(ch: char) -> bool {
+    matches!(ch, '"' | '\'' | '`')
+}
+
+/// What typing `typed` does when it is a bracket or a quote: an opener
+/// brings its closer along (or wraps the selection in the pair), and a
+/// closer typed before the same closer steps over it. `None` leaves the
+/// character to be typed as it is. Prose pairs no quotes, which are
+/// apostrophes and code spans there.
+pub(super) fn type_pair(
+    text: &str,
+    anchor: usize,
+    head: usize,
+    typed: &str,
+    prose: bool,
+) -> Option<Change> {
+    let mut chars = typed.chars();
+    let (Some(ch), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    if prose && is_quote(ch) {
+        return None;
+    }
+    let (anchor, head) = (floor(text, anchor), floor(text, head));
+    let sel = anchor.min(head)..anchor.max(head);
+    let next = text[sel.end..].chars().next();
+    let prev = text[..sel.start].chars().next_back();
+    let closes = PAIRS.iter().any(|&(_, close)| close == ch);
+    if sel.is_empty() && closes && next == Some(ch) {
+        let at = sel.start + ch.len_utf8();
+        return Some(Change {
+            range: sel.start..sel.start,
+            insert: String::new(),
+            anchor: at,
+            head: at,
+        });
+    }
+    let &(open, close) = PAIRS.iter().find(|&&(open, _)| open == ch)?;
+    if !sel.is_empty() {
+        let inner = &text[sel.clone()];
+        let shift = open.len_utf8();
+        let (inner_start, inner_end) = (sel.start + shift, sel.end + shift);
+        return Some(Change {
+            insert: format!("{open}{inner}{close}"),
+            range: sel,
+            anchor: if anchor <= head {
+                inner_start
+            } else {
+                inner_end
+            },
+            head: if anchor <= head {
+                inner_end
+            } else {
+                inner_start
+            },
+        });
+    }
+    // Not in front of a word or a quote, so typing there does not wrap it in
+    // an empty pair.
+    let free = next.is_none_or(|next| !next.is_alphanumeric() && next != '_' && !is_quote(next));
+    // A quote after a letter is an apostrophe, or closes a string; after `<`
+    // or `&` it is a Rust lifetime.
+    let word_before = prev.is_some_and(|prev| prev.is_alphanumeric() || prev == '_');
+    let lifetime = ch == '\'' && matches!(prev, Some('<' | '&'));
+    if !free || (is_quote(ch) && word_before) || lifetime {
+        return None;
+    }
+    let at = sel.start + open.len_utf8();
+    Some(Change {
+        range: sel,
+        insert: format!("{open}{close}"),
+        anchor: at,
+        head: at,
+    })
+}
+
+/// The range Backspace takes at `at` between an empty pair, `(|)`: both
+/// halves, so an opener typed by mistake goes with its closer.
+pub(super) fn backspace_pair(text: &str, at: usize) -> Option<Range<usize>> {
     let at = floor(text, at);
-    let start = line_start(text, at);
-    let indent = leading(&text[start..]).min(at - start);
-    format!("\n{}", &text[start..start + indent])
+    let prev = text[..at].chars().next_back()?;
+    let next = text[at..].chars().next()?;
+    PAIRS
+        .contains(&(prev, next))
+        .then(|| at - prev.len_utf8()..at + next.len_utf8())
 }
 
 /// How `text` indents: a tab when more lines open with tabs than spaces, and
@@ -586,9 +767,77 @@ mod tests {
     fn new_lines_keep_the_indent() {
         assert_eq!(run(Op::NewLineBelow, "  a|b\nc"), "  ab\n  |\nc");
         assert_eq!(run(Op::NewLineAbove, "x\n  a|b"), "x\n  |\n  ab");
-        assert_eq!(newline("    let a", 9), "\n    ");
+    }
+
+    /// Enter at the marked caret, in code or in prose.
+    fn enter_at(marked: &str, prose: bool) -> String {
+        let (text, anchor, head) = unmark(marked);
+        let change = enter(&text, anchor, head, prose);
+        let mut out = text.clone();
+        out.replace_range(change.range, &change.insert);
+        mark(&out, change.anchor, change.head)
+    }
+
+    #[test]
+    fn enter_keeps_the_indent() {
+        assert_eq!(enter_at("    let a|", false), "    let a\n    |");
         // A break inside the indent keeps only what is before it.
-        assert_eq!(newline("    a", 2), "\n  ");
+        assert_eq!(enter_at("  |  a", false), "  \n  |  a");
+        // Code has no lists.
+        assert_eq!(enter_at("- a|", false), "- a\n|");
+    }
+
+    #[test]
+    fn enter_carries_a_list_on_and_an_empty_item_ends_it() {
+        assert_eq!(enter_at("  - one|", true), "  - one\n  - |");
+        assert_eq!(enter_at("9. nine|", true), "9. nine\n10. |");
+        assert_eq!(enter_at("1) a|", true), "1) a\n2) |");
+        assert_eq!(enter_at("a\n- |", true), "a\n|");
+        // Checkboxes, by offset: `[` marks a selection in `enter_at`.
+        let done = "- [x] done";
+        let change = enter(done, done.len(), done.len(), true);
+        assert_eq!(change.insert, "\n- [ ] ");
+        let empty = "- [ ] ";
+        let change = enter(empty, empty.len(), empty.len(), true);
+        assert_eq!((change.range, change.insert.as_str()), (0..6, ""));
+        // Not lists: a flag, bold, a number.
+        assert_eq!(enter_at("--flag|", true), "--flag\n|");
+        assert_eq!(enter_at("**b**|", true), "**b**\n|");
+        assert_eq!(enter_at("3.14|", true), "3.14\n|");
+    }
+
+    /// Type `typed` at the marked selection, pairing as the editor does.
+    fn type_at(marked: &str, typed: &str, prose: bool) -> String {
+        let (text, anchor, head) = unmark(marked);
+        match type_pair(&text, anchor, head, typed, prose) {
+            Some(change) => {
+                let mut out = text.clone();
+                out.replace_range(change.range, &change.insert);
+                mark(&out, change.anchor, change.head)
+            }
+            None => "plain".to_string(),
+        }
+    }
+
+    #[test]
+    fn openers_bring_their_closers_and_closers_step_over() {
+        assert_eq!(type_at("f|", "(", false), "f(|)");
+        assert_eq!(type_at("f(|)", ")", false), "f()|");
+        assert_eq!(type_at("let s = |;", "\"", false), "let s = \"|\";");
+        assert_eq!(type_at("[ab|", "{", false), "{[ab|}");
+        assert_eq!(type_at("fn f<|", "'", false), "plain");
+        // In front of a word, after a letter, or a quote in prose: plain.
+        assert_eq!(type_at("|word", "(", false), "plain");
+        assert_eq!(type_at("don|", "'", false), "plain");
+        assert_eq!(type_at("say |", "\"", true), "plain");
+        assert_eq!(type_at("x|", "ab", false), "plain");
+    }
+
+    #[test]
+    fn backspace_takes_an_empty_pair_whole() {
+        assert_eq!(backspace_pair("f()", 2), Some(1..3));
+        assert_eq!(backspace_pair("f(x)", 2), None);
+        assert_eq!(backspace_pair("", 0), None);
     }
 
     #[test]

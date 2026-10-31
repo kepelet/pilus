@@ -434,8 +434,12 @@ gpui::actions!([
     CloseDoc,
     /// Read the Files tab's open file from disk again.
     ReloadDoc,
+    /// Ask for a line to put the Files tab editor's caret on.
+    GoToLine,
     /// Find in the file open in the Files tab.
     FindInFile,
+    /// Find and replace in the file open in the Files tab.
+    ReplaceInFile,
     /// Jump to a file in the active workspace by fuzzy name.
     OpenQuickOpen,
     /// Show or hide the right sidebar (Changes and History).
@@ -1075,7 +1079,9 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-s", ToggleSidebar, Some("!FilesDoc")),
         KeyBinding::new("cmd-s", SaveDoc, Some("FilesDoc")),
         KeyBinding::new("cmd-r", ReloadDoc, Some("FilesDoc")),
+        KeyBinding::new("ctrl-g", GoToLine, Some("FilesDoc")),
         KeyBinding::new("cmd-f", FindInFile, None),
+        KeyBinding::new("cmd-alt-f", ReplaceInFile, None),
         KeyBinding::new("cmd-p", OpenQuickOpen, None),
         KeyBinding::new("cmd-b", ToggleRightSidebar, None),
         KeyBinding::new("cmd-[", RightSidebarBack, Some("!MdEditor")),
@@ -1670,6 +1676,14 @@ enum PromptAction {
     },
     /// Rename a Files-tab entry within its folder.
     RenameEntry { endpoint: EndpointId, path: String },
+    /// Put the Files tab editor's caret on the line the field names.
+    GoToLine,
+    /// The Files tab's open file has unsaved changes and `next` would lose
+    /// them: Enter saves first, D drops them, Escape keeps the file open.
+    UnsavedDoc {
+        path: String,
+        next: files_tab::DocNext,
+    },
     /// Delete a Files-tab entry after the confirm prompt.
     DeleteEntry {
         endpoint: EndpointId,
@@ -1734,6 +1748,7 @@ impl PromptAction {
                 | Self::DeleteEntry { .. }
                 | Self::KillProcess { .. }
                 | Self::DiscardChanges { .. }
+                | Self::UnsavedDoc { .. }
         )
     }
 }
@@ -2356,6 +2371,8 @@ struct PilusView {
     /// Find in the file being edited, and its query field.
     file_find: file_find::FileFind,
     find_input: Entity<TextInput>,
+    /// The find bar's replace field, shown once replacing is asked for.
+    replace_input: Entity<TextInput>,
     /// The ⌘P file picker, and its query field.
     quick_open: quick_open::QuickOpen,
     quick_open_input: Entity<TextInput>,
@@ -2561,6 +2578,17 @@ impl PilusView {
                 style::chrome_font(&shared_settings),
                 px(initial_fonts.body),
                 true,
+                initial_theme,
+                cx,
+            )
+        });
+        let replace_input = cx.new(|cx| {
+            TextInput::new(
+                String::new(),
+                "Replace",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
                 initial_theme,
                 cx,
             )
@@ -2942,6 +2970,7 @@ impl PilusView {
             md_editor_input,
             file_find: file_find::FileFind::default(),
             find_input,
+            replace_input,
             quick_open,
             quick_open_input,
             ports_panel: PortsPanel::new(),
@@ -6872,10 +6901,14 @@ impl PilusView {
         // the layer routing would hand focus back to the window root. A
         // destructive confirm has no field — keys stay on the root, which
         // already routes Enter and Escape to it.
-        if let Some(prompt) = self.menu_prompt.as_ref()
-            && !prompt.action.is_confirm()
-        {
-            let handle = self.menu_prompt_input.focus_handle(cx);
+        if let Some(prompt) = self.menu_prompt.as_ref() {
+            // A confirm's keys go to the root, so a field behind it (the
+            // Files editor) must not take them back.
+            let handle = if prompt.action.is_confirm() {
+                self.focus_handle.clone()
+            } else {
+                self.menu_prompt_input.focus_handle(cx)
+            };
             if !handle.is_focused(window) {
                 window.focus(&handle, cx);
             }
@@ -6894,7 +6927,9 @@ impl PilusView {
             // The find bar's field keeps the keyboard while the person types
             // in it; anywhere else it is the editor's.
             let editor = self.md_editor_input.focus_handle(cx);
-            let finding = self.file_find.is_open() && self.find_input.read(cx).is_focused(window);
+            let finding = self.file_find.is_open()
+                && (self.find_input.read(cx).is_focused(window)
+                    || self.replace_input.read(cx).is_focused(window));
             if !finding && !editor.is_focused(window) {
                 window.focus(&editor, cx);
             }
@@ -11423,6 +11458,22 @@ impl PilusView {
                 cx.notify();
             }
             "enter" => self.submit_menu_prompt(cx),
+            // Don't Save, the unsaved prompt's other way out.
+            "d" if !event.keystroke.modifiers.modified()
+                && matches!(
+                    self.menu_prompt.as_ref().map(|prompt| &prompt.action),
+                    Some(PromptAction::UnsavedDoc { .. })
+                ) =>
+            {
+                if let Some(MenuPrompt {
+                    action: PromptAction::UnsavedDoc { next, .. },
+                    ..
+                }) = self.menu_prompt.take()
+                {
+                    self.files_discard_then(next, cx);
+                }
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -11434,6 +11485,8 @@ impl PilusView {
         };
         let trimmed = self.menu_prompt_field.value().trim().to_string();
         match prompt.action {
+            PromptAction::GoToLine => self.files_go_to_line(&trimmed, cx),
+            PromptAction::UnsavedDoc { next, .. } => self.files_save_then(next, cx),
             PromptAction::RenameTab { tab_id } => {
                 if trimmed.chars().count() > TAB_NAME_MAX {
                     self.toast(
@@ -13325,6 +13378,7 @@ impl PilusView {
             PromptAction::DiscardChanges { .. } => {
                 Some("Reverts the file to its staged state. Your edits are lost for good.")
             }
+            PromptAction::UnsavedDoc { .. } => Some("Your changes to this file are not saved."),
             _ => None,
         };
         let confirm_escalated = prompt.action.escalated();
@@ -13342,6 +13396,7 @@ impl PilusView {
             }
             PromptAction::KillProcess { label, .. }
             | PromptAction::DiscardChanges { label, .. } => Some(label.clone()),
+            PromptAction::UnsavedDoc { path, .. } => Some(path.clone()),
             _ => None,
         };
         let input = self.menu_prompt_input.clone();
@@ -13415,6 +13470,9 @@ impl PilusView {
                         .child(match (&prompt.action, confirm_escalated) {
                             (PromptAction::KillProcess { .. }, _) => "⏎ Kill · Esc Cancel",
                             (PromptAction::DiscardChanges { .. }, _) => "⏎ Discard · Esc Cancel",
+                            (PromptAction::UnsavedDoc { .. }, _) => {
+                                "⏎ Save · D Don't Save · Esc Cancel"
+                            }
                             (_, true) => "⏎ Delete anyway · Esc Cancel",
                             (_, false) => "⏎ Delete · Esc Cancel",
                         }),
@@ -15848,6 +15906,9 @@ impl Render for PilusView {
                 .on_action(cx.listener(|this, _: &ReloadDoc, _window, cx| {
                     this.files_reload_doc(cx);
                 }))
+                .on_action(cx.listener(|this, _: &GoToLine, _window, cx| {
+                    this.files_ask_line(cx);
+                }))
                 .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
                     this.toggle_right_sidebar(cx);
                 }))
@@ -15881,6 +15942,9 @@ impl Render for PilusView {
                 }))
                 .on_action(cx.listener(|this, _: &FindInFile, window, cx| {
                     this.find_open(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &ReplaceInFile, window, cx| {
+                    this.replace_open(window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &OpenWorkspacePicker, _window, cx| {
                     this.leave_settings_page();

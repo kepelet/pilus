@@ -3497,6 +3497,22 @@ pub(super) fn search_field(
     )
 }
 
+/// A field with neither label nor icon, for a row that says what it is by
+/// where it sits: the find bar's replacement under its query.
+pub(super) fn bare_field(
+    id: impl Into<ElementId>,
+    focused: bool,
+    theme: Theme,
+    height: f32,
+    body: impl IntoElement,
+) -> Stateful<Div> {
+    div().id(id).child(
+        field_box(focused, theme, height)
+            .items_center()
+            .child(div().flex_1().min_w(px(0.0)).child(body)),
+    )
+}
+
 /// How long a folding card takes to reach its new height.
 pub(super) const FOLD: Duration = Duration::from_millis(220);
 

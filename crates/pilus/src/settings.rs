@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 const STATE_DOC: &str = "ui_state";
 
 /// The `Settings` fields that live in `pilus.db`, not in `settings.json`.
-const STATE_KEYS: [&str; 16] = [
+const STATE_KEYS: [&str; 17] = [
     "window",
     "session_labels",
     "session_icons",
@@ -42,6 +42,7 @@ const STATE_KEYS: [&str; 16] = [
     "pinned_workspaces",
     "recent_workspaces",
     "files_folded",
+    "files_tree_hidden",
 ];
 
 /// How many opened folders the Home page and the sidebar remember.
@@ -227,6 +228,7 @@ struct Layout {
     diff_list_height: f32,
     diff_list_width: f32,
     git_list_height: f32,
+    files_tree_hidden: bool,
 }
 
 impl UiState {
@@ -249,6 +251,7 @@ impl UiState {
                 diff_list_height: settings.diff_list_height,
                 diff_list_width: settings.diff_list_width,
                 git_list_height: settings.git_list_height,
+                files_tree_hidden: settings.files_tree_hidden,
             }),
         }
     }
@@ -271,6 +274,7 @@ impl UiState {
             settings.diff_list_height = layout.diff_list_height;
             settings.diff_list_width = layout.diff_list_width;
             settings.git_list_height = layout.git_list_height;
+            settings.files_tree_hidden = layout.files_tree_hidden;
         }
     }
 }
@@ -386,6 +390,9 @@ pub struct Settings {
     /// keeps every folder open and has no way to close one, so without this a
     /// relaunch shows the whole tree open again. Kept in `pilus.db` (`UiState`).
     pub files_folded: FilesFolded,
+    /// The Files tab's tree was put away beside an open document. Kept in
+    /// `pilus.db` (`UiState`).
+    pub files_tree_hidden: bool,
     /// Whether the right sidebar (Changes and History tabs) is open. This and the
     /// other pane layout fields below are kept in `pilus.db` (`UiState`).
     pub right_sidebar_visible: bool,
@@ -473,6 +480,7 @@ impl Default for Settings {
             pinned_workspaces: Vec::new(),
             recent_workspaces: Vec::new(),
             files_folded: BTreeMap::new(),
+            files_tree_hidden: false,
             right_sidebar_visible: false,
             right_sidebar_width: 0.0,
             right_sidebar_tab: String::new(),
@@ -1273,6 +1281,7 @@ mod tests {
             diff_list_height: 200.0,
             diff_list_width: 320.0,
             git_list_height: 260.0,
+            files_tree_hidden: true,
             relay: pilus_client::RelaySettings {
                 secret: Some("project-secret".to_string()),
                 url: vec!["https://relay.example".to_string()],

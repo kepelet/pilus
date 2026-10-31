@@ -48,8 +48,8 @@ use gpui::{
 };
 use pilus_client::{
     ControlClient, Error, FileChanges, FileRow, FileTree, OpenTarget, SshTarget, TextFile, Version,
-    archive_name, create_entry, delete_entry, download_path, is_file, parent_of, read_text,
-    rename_entry, upload_path, visible_rows, write_text,
+    archive_name, create_entry, delete_entry, download_path, file_stamp, is_file, parent_of,
+    read_text, rename_entry, upload_path, visible_rows, write_text,
 };
 
 use crate::settings::FilesFolded;
@@ -72,6 +72,9 @@ const POLL: Duration = Duration::from_millis(2000);
 /// How often it asks while a folder is still opening: the daemon answers an
 /// expand before it has read the folder, so its children land a beat later.
 const LOADING_POLL: Duration = Duration::from_millis(120);
+/// How often an open file is checked for a change on disk. A remote check
+/// is an SSH call that reads the file there, so it is no tighter than this.
+const WATCH: Duration = Duration::from_secs(3);
 /// How long a folder may show placeholders before it counts as empty.
 const LOADING_LIMIT: Duration = Duration::from_secs(3);
 
@@ -157,6 +160,15 @@ pub(super) enum FilesMsg {
         endpoint: EndpointId,
         seq: u32,
         result: Result<TextFile, String>,
+        /// The file's stamp, taken just before the read.
+        stamp: Option<String>,
+    },
+    /// The open file's stamp now, for the watch that asked under `generation`.
+    Stamp {
+        endpoint: EndpointId,
+        path: String,
+        generation: u32,
+        result: Result<String, String>,
     },
     /// A word a modified click landed on was checked as a file. The click
     /// went to neither the daemon nor the tab until now, so a miss replays it
@@ -191,6 +203,9 @@ pub(super) enum FilesMsg {
         path: String,
         text: String,
         result: Result<(), String>,
+        /// The file's stamp once written, so the watch does not take the
+        /// save for someone else's change.
+        stamp: Option<String>,
     },
     /// The index's copy of the edited file, which the editor's gutter marks
     /// compare against, or why there is none (most often: not tracked).
@@ -301,6 +316,32 @@ struct FileDoc {
     base_asked: Option<Option<String>>,
     /// How a reload finds the file again once the new read lands.
     resume: Option<Resume>,
+    /// The file's stamp on disk as of the last read or save, which the watch
+    /// compares against. `None` until known.
+    stamp: Option<String>,
+    watch: Watch,
+    /// The file changed on disk under unsaved changes: its new stamp, until
+    /// the user reloads or keeps theirs.
+    changed_on_disk: Option<String>,
+}
+
+/// The on-disk watch of the open file.
+#[derive(Default)]
+struct Watch {
+    /// Moves on every read and save, so a check sent before one is dropped.
+    generation: u32,
+    asked: Option<Instant>,
+    in_flight: bool,
+}
+
+/// What a refused step does once the unsaved changes are saved or dropped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum DocNext {
+    Close,
+    Reload,
+    Open(String),
+    /// Go from an SVG's source back to its picture.
+    LeaveSource,
 }
 
 /// What a reload keeps of the view it replaces: the mode, where the caret
@@ -449,14 +490,14 @@ pub(super) struct FilesPanel {
     /// The page is wide enough for the tree beside the open document, as of
     /// the last frame, so the header offers to hide or show it.
     tree_fits: bool,
-    /// The user put the tree away to give the document the whole page.
-    pub(super) tree_hidden: bool,
     /// Opening an editor widened the right column, which closing the
     /// document lets back.
     auto_widened: bool,
     /// The open document's page, which holds the keyboard while it is shown
     /// read-only so its shortcuts reach it. Made with the page's first frame.
     doc_focus: Option<FocusHandle>,
+    /// What to do once the save in flight lands, from the unsaved prompt.
+    after_save: Option<DocNext>,
     /// Where the loading folder sits in `visible`, when it shows.
     loading_at: Option<usize>,
     list: ListState,
@@ -503,9 +544,9 @@ impl FilesPanel {
             tree_beside: false,
             split_ok: false,
             tree_fits: false,
-            tree_hidden: false,
             auto_widened: false,
             doc_focus: None,
+            after_save: None,
             loading_at: None,
             list: ListState::new(0, ListAlignment::Top, px(600.0)),
             error: None,
@@ -913,6 +954,7 @@ impl PilusView {
                     endpoint,
                     seq,
                     result,
+                    stamp,
                 } => {
                     if current.is_some_and(|current| current != endpoint) {
                         continue;
@@ -921,7 +963,43 @@ impl PilusView {
                     changed |= applied;
                     // A stale answer leaves the document as it was.
                     if applied {
+                        if let Some(doc) = self.files_panel.doc.as_mut() {
+                            doc.stamp = stamp;
+                            doc.watch.generation += 1;
+                            doc.changed_on_disk = None;
+                        }
                         self.files_doc_landed(cx);
+                    }
+                }
+                FilesMsg::Stamp {
+                    endpoint,
+                    path,
+                    generation,
+                    result,
+                } => {
+                    let Some(doc) = self.files_panel.doc.as_mut().filter(|doc| doc.path == path)
+                    else {
+                        continue;
+                    };
+                    doc.watch.in_flight = false;
+                    if current.is_some_and(|current| current != endpoint)
+                        || doc.watch.generation != generation
+                    {
+                        continue;
+                    }
+                    let stamp = match result {
+                        Ok(stamp) => stamp,
+                        // Gone or unreachable: a save will say so.
+                        Err(error) => {
+                            tracing::debug!(%path, %error, "cannot check the open file");
+                            continue;
+                        }
+                    };
+                    let known = doc.stamp.as_ref() == Some(&stamp)
+                        || doc.changed_on_disk.as_ref() == Some(&stamp);
+                    if !known {
+                        self.files_disk_changed(stamp, cx);
+                        changed = true;
                     }
                 }
                 FilesMsg::Picture {
@@ -939,12 +1017,13 @@ impl PilusView {
                     path,
                     text,
                     result,
+                    stamp,
                 } => {
                     changed = true;
                     if current.is_some_and(|current| current != endpoint) {
                         continue;
                     }
-                    self.files_saved(&path, text, result);
+                    self.files_saved(&path, text, result, stamp, cx);
                 }
                 FilesMsg::Base {
                     endpoint,
@@ -1026,6 +1105,7 @@ impl PilusView {
             return changed;
         }
         changed |= self.files_follow_endpoint();
+        self.files_watch_doc();
         let panel = &self.files_panel;
         let every = if panel.loading.is_some() {
             LOADING_POLL
@@ -1108,6 +1188,17 @@ impl PilusView {
         }
     }
 
+    /// Put the tree beside an open document away, or bring it back, and
+    /// remember that for the next launch when `save`.
+    pub(super) fn files_set_tree_hidden(&mut self, hidden: bool, save: bool) {
+        self.settings.files_tree_hidden = hidden;
+        // `sync_settings` copies the shared copy over this one each tick.
+        self.shared_settings.borrow_mut().files_tree_hidden = hidden;
+        if save {
+            self.settings.save(&self.pilus_root);
+        }
+    }
+
     /// Run `prelude` on the daemon, then read the tree back.
     fn files_request(&mut self, prelude: Prelude) {
         let panel = &mut self.files_panel;
@@ -1137,7 +1228,7 @@ impl PilusView {
     /// Show the markdown file at `path` in place of the tree, reading it off
     /// the GUI thread.
     pub(super) fn files_open_doc(&mut self, path: &str, cx: &mut Context<Self>) {
-        if self.files_doc_unsaved("open another file", cx) {
+        if self.files_doc_unsaved(DocNext::Open(path.to_string()), cx) {
             return;
         }
         self.files_follow_endpoint();
@@ -1244,6 +1335,9 @@ impl PilusView {
                     git_base: None,
                     base_asked: None,
                     resume: None,
+                    stamp: None,
+                    watch: Watch::default(),
+                    changed_on_disk: None,
                 });
                 return;
             }
@@ -1274,6 +1368,9 @@ impl PilusView {
             git_base,
             base_asked: None,
             resume: None,
+            stamp: None,
+            watch: Watch::default(),
+            changed_on_disk: None,
         });
         let tx = panel.tx.clone();
         std::thread::spawn(move || {
@@ -1287,11 +1384,14 @@ impl PilusView {
                 .ok();
                 return;
             }
+            // Stamped first: a change during the read then shows as a change.
+            let stamp = file_stamp(target.as_ref(), &path).ok();
             let result = read_text(target.as_ref(), Version::Disk(&path));
             tx.send(FilesMsg::Doc {
                 endpoint,
                 seq,
                 result,
+                stamp,
             })
             .ok();
         });
@@ -1306,15 +1406,22 @@ impl PilusView {
             .is_some_and(|edit| !self.md_editor_input.read(cx).holds(&edit.base))
     }
 
-    /// Refuse `what` and say why when the open document has unsaved changes:
-    /// closing, reloading or replacing it would throw them away silently.
-    fn files_doc_unsaved(&mut self, what: &str, cx: &mut Context<Self>) -> bool {
+    /// Hold `next` back and ask Save, Don't Save or Cancel when the open
+    /// document has unsaved changes: closing, reloading or replacing it would
+    /// throw them away silently. True when it was held back.
+    fn files_doc_unsaved(&mut self, next: DocNext, cx: &mut Context<Self>) -> bool {
         if !self.files_doc_dirty(cx) {
             return false;
         }
-        self.toast(
-            ToastKind::Error,
-            format!("Save or revert your changes before you {what}"),
+        let Some(path) = self.files_panel.doc_path().map(str::to_string) else {
+            return false;
+        };
+        self.open_menu_prompt(
+            PromptAction::UnsavedDoc { path, next },
+            "Save Changes?",
+            "",
+            "",
+            cx,
         );
         true
     }
@@ -1362,9 +1469,61 @@ impl PilusView {
         if self.find_key(event, window, cx) {
             return;
         }
-        if event.keystroke.key == "escape" && self.md_editing() {
-            self.files_preview_doc(cx);
+        if event.keystroke.key != "escape" {
+            return;
         }
+        // Escape steps back: out of the editor first, then from a read-only
+        // file to the terminal, which takes the keyboard again.
+        if self.md_editing() {
+            self.files_preview_doc(cx);
+        } else {
+            self.right.focused = false;
+            cx.notify();
+        }
+    }
+
+    /// Ask for a line to go to in the open file, with the window's prompt.
+    pub(super) fn files_ask_line(&mut self, cx: &mut Context<Self>) {
+        let editable = self.files_panel.doc_view().is_some_and(MdDoc::editable);
+        if !editable {
+            return;
+        }
+        self.open_menu_prompt(
+            PromptAction::GoToLine,
+            "Go to Line",
+            "A line, or line:column",
+            "",
+            cx,
+        );
+    }
+
+    /// Put the editor's caret on `answer`'s line (`12`, or `12:5`). A
+    /// rendered markdown file switches to its source to show the caret.
+    pub(super) fn files_go_to_line(&mut self, answer: &str, cx: &mut Context<Self>) {
+        let mut parts = answer.split(':').map(str::trim);
+        let line = parts.next().and_then(|line| line.parse::<usize>().ok());
+        let column = parts
+            .next()
+            .and_then(|column| column.parse::<usize>().ok())
+            .unwrap_or(1);
+        let Some(line) = line.filter(|&line| line > 0) else {
+            self.toast(ToastKind::Error, "Type a line number, such as 12 or 12:5");
+            return;
+        };
+        if self
+            .files_panel
+            .edit_mode()
+            .is_none_or(|mode| !mode.edits())
+            && md_view::is_markdown(self.files_panel.doc_path().unwrap_or_default())
+        {
+            self.files_begin_edit(cx);
+        }
+        // The keyboard comes back to the file the prompt was asked from.
+        self.right.focused = true;
+        self.md_editor_input.update(cx, |input, cx| {
+            input.go_to_line(line, column.saturating_sub(1), cx);
+        });
+        cx.notify();
     }
 
     /// Cmd+W, and the header's close button: a file being edited goes
@@ -1521,6 +1680,14 @@ impl PilusView {
         }
     }
 
+    /// Mark the open document as changed on disk, without a disk.
+    #[cfg(feature = "visual-test")]
+    pub(super) fn files_mark_changed_on_disk(&mut self) {
+        if let Some(doc) = self.files_panel.doc.as_mut() {
+            doc.changed_on_disk = Some("sample".to_string());
+        }
+    }
+
     /// Put the open document in side-by-side mode, without the window.
     #[cfg(feature = "visual-test")]
     pub(super) fn files_set_split(&mut self) {
@@ -1630,22 +1797,26 @@ impl PilusView {
         };
         let path = doc.path.clone();
         let text = self.md_editor_input.read(cx).value();
-        if let Some(edit) = self
-            .files_panel
-            .doc
-            .as_mut()
-            .and_then(|doc| doc.edit.as_mut())
-        {
-            edit.saving = true;
+        if let Some(doc) = self.files_panel.doc.as_mut() {
+            // A check already on its way would see the save as a change.
+            doc.watch.generation += 1;
+            if let Some(edit) = doc.edit.as_mut() {
+                edit.saving = true;
+            }
         }
         let tx = self.files_panel.tx.clone();
         std::thread::spawn(move || {
             let result = write_text(target.as_ref(), &path, &text);
+            let stamp = result
+                .is_ok()
+                .then(|| file_stamp(target.as_ref(), &path).ok())
+                .flatten();
             tx.send(FilesMsg::Saved {
                 endpoint,
                 path,
                 text,
                 result,
+                stamp,
             })
             .ok();
         });
@@ -1707,40 +1878,157 @@ impl PilusView {
     }
 
     /// Settle a finished save: what was written is now the text on disk.
-    fn files_saved(&mut self, path: &str, text: String, result: Result<(), String>) {
+    fn files_saved(
+        &mut self,
+        path: &str,
+        text: String,
+        result: Result<(), String>,
+        stamp: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let name = super::diff::split_path(path).1.to_string();
-        let edit = self
-            .files_panel
-            .doc
-            .as_mut()
-            .filter(|doc| doc.path == path)
-            .and_then(|doc| doc.edit.as_mut());
-        if let Some(edit) = edit {
-            edit.saving = false;
+        if let Some(doc) = self.files_panel.doc.as_mut().filter(|doc| doc.path == path) {
             if result.is_ok() {
-                edit.base = text;
+                doc.stamp = stamp;
+                doc.watch.generation += 1;
+                doc.changed_on_disk = None;
+            }
+            if let Some(edit) = doc.edit.as_mut() {
+                edit.saving = false;
+                if result.is_ok() {
+                    edit.base = text;
+                }
             }
         }
+        let next = self.files_panel.after_save.take();
         match result {
             Ok(()) => {
                 self.toast(ToastKind::Success, format!("Saved {name}"));
                 // The file may now differ from Git's copy.
                 self.files_panel.mark_stale();
+                // A step the unsaved prompt held back goes ahead, unless the
+                // buffer moved on while the write ran.
+                if let Some(next) = next
+                    && !self.files_doc_dirty(cx)
+                {
+                    self.files_doc_next(next, cx);
+                }
             }
             Err(error) => self.toast(ToastKind::Error, format!("Could not save {name}: {error}")),
         }
     }
 
+    /// Ask on a worker, every [`WATCH`], whether the open file changed on
+    /// disk since it was read or saved.
+    fn files_watch_doc(&mut self) {
+        let endpoint = self.active.clone();
+        let every = super::activity::scaled(WATCH);
+        let due = self.files_panel.doc.as_ref().is_some_and(|doc| {
+            matches!(doc.state, DocState::Ready(_))
+                && doc.stamp.is_some()
+                && !doc.watch.in_flight
+                && !doc.edit.as_ref().is_some_and(|edit| edit.saving)
+                && doc.watch.asked.is_none_or(|at| at.elapsed() >= every)
+        });
+        if !due {
+            return;
+        }
+        let Ok(target) = self.read_target(&endpoint) else {
+            return;
+        };
+        let Some(doc) = self.files_panel.doc.as_mut() else {
+            return;
+        };
+        doc.watch.asked = Some(Instant::now());
+        doc.watch.in_flight = true;
+        let (path, generation) = (doc.path.clone(), doc.watch.generation);
+        let tx = self.files_panel.tx.clone();
+        std::thread::spawn(move || {
+            let result = file_stamp(target.as_ref(), &path);
+            tx.send(FilesMsg::Stamp {
+                endpoint,
+                path,
+                generation,
+                result,
+            })
+            .ok();
+        });
+    }
+
+    /// The open file changed on disk: read it again when nothing here is
+    /// unsaved, and otherwise ask, so neither side's work is lost unseen.
+    fn files_disk_changed(&mut self, stamp: String, cx: &mut Context<Self>) {
+        if self.files_doc_dirty(cx) {
+            if let Some(doc) = self.files_panel.doc.as_mut() {
+                doc.changed_on_disk = Some(stamp);
+            }
+            cx.notify();
+            return;
+        }
+        let name = self
+            .files_panel
+            .doc_path()
+            .map(|path| super::diff::split_path(path).1.to_string())
+            .unwrap_or_default();
+        self.files_reload_doc(cx);
+        self.toast(
+            ToastKind::Info,
+            format!("Reloaded {name}: it changed on disk"),
+        );
+    }
+
+    /// Keep the edits over a file that changed on disk; the next save
+    /// writes them over it.
+    fn files_keep_mine(&mut self, cx: &mut Context<Self>) {
+        if let Some(doc) = self.files_panel.doc.as_mut()
+            && let Some(stamp) = doc.changed_on_disk.take()
+        {
+            doc.stamp = Some(stamp);
+        }
+        cx.notify();
+    }
+
+    /// Run a step the unsaved prompt held back.
+    fn files_doc_next(&mut self, next: DocNext, cx: &mut Context<Self>) {
+        match next {
+            DocNext::Close => self.files_close_doc(cx),
+            DocNext::Reload => self.files_reload_doc(cx),
+            DocNext::Open(path) => self.files_open_doc(&path, cx),
+            DocNext::LeaveSource => self.files_toggle_svg_source(cx),
+        }
+    }
+
+    /// The unsaved prompt's Save: write the file, then take the step.
+    pub(super) fn files_save_then(&mut self, next: DocNext, cx: &mut Context<Self>) {
+        self.files_panel.after_save = Some(next);
+        self.files_save_doc(cx);
+        let saving = self
+            .files_panel
+            .doc
+            .as_ref()
+            .and_then(|doc| doc.edit.as_ref())
+            .is_some_and(|edit| edit.saving);
+        if !saving {
+            self.files_panel.after_save = None;
+        }
+    }
+
+    /// The unsaved prompt's Don't Save: drop the edits, then take the step.
+    pub(super) fn files_discard_then(&mut self, next: DocNext, cx: &mut Context<Self>) {
+        self.files_revert_doc(cx);
+        self.files_doc_next(next, cx);
+    }
+
     /// Put the tree back where the open document was.
     pub(super) fn files_close_doc(&mut self, cx: &mut Context<Self>) {
-        if self.files_doc_unsaved("close it", cx) {
+        if self.files_doc_unsaved(DocNext::Close, cx) {
             return;
         }
         self.right_navigate(cx, |this, _| this.files_panel.close_doc());
     }
 
     pub(super) fn files_reload_doc(&mut self, cx: &mut Context<Self>) {
-        if self.files_doc_unsaved("reload it", cx) {
+        if self.files_doc_unsaved(DocNext::Reload, cx) {
             return;
         }
         let Some(doc) = self.files_panel.doc.as_ref() else {
@@ -1761,7 +2049,7 @@ impl PilusView {
 
     /// Switch an SVG between its picture and its source.
     fn files_toggle_svg_source(&mut self, cx: &mut Context<Self>) {
-        if self.files_doc_unsaved("leave the source", cx) {
+        if self.files_doc_unsaved(DocNext::LeaveSource, cx) {
             return;
         }
         if let Some(doc) = self.files_panel.doc.as_ref() {
@@ -2108,7 +2396,7 @@ impl PilusView {
     /// document so another file is one click away.
     pub(super) fn files_page(&mut self, page_w: f32, cx: &mut Context<Self>) -> Div {
         let fits = self.files_panel.doc.is_some() && page_w >= TREE_BESIDE_MIN_PAGE;
-        let beside = fits && !self.files_panel.tree_hidden;
+        let beside = fits && !self.settings.files_tree_hidden;
         self.files_panel.tree_fits = fits;
         self.files_panel.tree_beside = beside;
         let fonts = style::Fonts::resolve(&self.shared_settings);
@@ -2434,7 +2722,7 @@ impl PilusView {
         // With room for the tree beside the file, the header can put it away
         // and bring it back.
         let tree_toggle = self.files_panel.tree_fits.then(|| {
-            let shown = !self.files_panel.tree_hidden;
+            let shown = !self.settings.files_tree_hidden;
             self.diff_icon_button(
                 "pilus-files-doc-tree",
                 include_bytes!("../../assets/icons/panel-left.svg"),
@@ -2448,7 +2736,7 @@ impl PilusView {
                 false,
             )
             .on_click(cx.listener(|this, _, _, cx| {
-                this.files_panel.tree_hidden = !this.files_panel.tree_hidden;
+                this.files_set_tree_hidden(!this.settings.files_tree_hidden, true);
                 cx.notify();
             }))
         });
@@ -2569,6 +2857,12 @@ impl PilusView {
             }
         };
         let find_bar = self.find_bar(cx);
+        let disk_bar = self
+            .files_panel
+            .doc
+            .as_ref()
+            .is_some_and(|doc| doc.changed_on_disk.is_some())
+            .then(|| self.files_disk_bar(cx));
         // The page takes the file's shortcuts (`FilesDoc`) while it, or the
         // editor inside it, has the keyboard.
         let focus = self
@@ -2586,8 +2880,57 @@ impl PilusView {
             .min_h(px(0.0))
             .child(header)
             .children(truncated)
+            .children(disk_bar)
             .children(find_bar)
             .child(div().flex_1().min_h(px(0.0)).child(body))
+    }
+
+    /// The line under the header when the file changed on disk under unsaved
+    /// changes: take the disk's copy, or keep these edits.
+    fn files_disk_bar(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(fonts.secondary))
+                    .text_color(theme.alert)
+                    .child("Changed on disk since you opened it"),
+            )
+            .child(
+                style::small_button(
+                    "pilus-files-disk-reload",
+                    "Reload",
+                    style::ButtonKind::Danger,
+                    theme,
+                    fonts.secondary,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.files_discard_then(DocNext::Reload, cx);
+                })),
+            )
+            .child(
+                style::small_button(
+                    "pilus-files-disk-keep",
+                    "Keep Mine",
+                    style::ButtonKind::Secondary,
+                    theme,
+                    fonts.secondary,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.files_keep_mine(cx))),
+            )
     }
 
     /// The editor beside the rendered document, which follows its text.
@@ -2626,7 +2969,7 @@ impl PilusView {
             input.set_style(theme, mono, px(fonts.body));
             input.set_line_numbers(true, cx);
             input.set_current_line(true, cx);
-            input.set_auto_indent(true);
+            input.set_code_editor(true);
             input.set_read_only(read_only, cx);
         });
         let (caret, row) = {
@@ -2643,6 +2986,10 @@ impl PilusView {
         };
         let scroll = edit.scroll.clone();
         follow_caret(&scroll, row, caret, &mut edit.caret_seen);
+        // Page Up and Page Down move a view's height, as last laid out.
+        let page = scroll.bounds().size.height;
+        self.md_editor_input
+            .update(cx, |input, _| input.set_page_height(page));
         div()
             .id("pilus-files-editor")
             .when(!read_only, |editor| editor.key_context("MdEditor"))
@@ -3097,6 +3444,9 @@ impl PilusView {
             git_base: None,
             base_asked: None,
             resume: None,
+            stamp: None,
+            watch: Watch::default(),
+            changed_on_disk: None,
         });
         cx.notify();
     }
@@ -3125,6 +3475,9 @@ impl PilusView {
             git_base: None,
             base_asked: None,
             resume: None,
+            stamp: None,
+            watch: Watch::default(),
+            changed_on_disk: None,
         });
         cx.notify();
     }

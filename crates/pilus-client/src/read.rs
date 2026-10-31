@@ -102,6 +102,38 @@ pub fn is_file(target: Option<&SshTarget>, path: &str) -> bool {
     }
 }
 
+/// A token that changes whenever the file at `path` does, so an open
+/// document can tell it was changed under it. Here it is the size and the
+/// modification time; on `target`'s host it is `cksum`'s checksum and size,
+/// since `stat` is spelled differently on macOS and Linux and `cksum` is
+/// POSIX. It blocks on a `stat`, or remotely an SSH round trip and a read of
+/// the file there: call it from a worker thread.
+pub fn file_stamp(target: Option<&SshTarget>, path: &str) -> Result<String, String> {
+    match target {
+        None => {
+            let meta = std::fs::metadata(path).map_err(|error| error.to_string())?;
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_nanos());
+            Ok(format!("{}:{modified}", meta.len()))
+        }
+        Some(target) => {
+            let out = run(
+                target.shell(&format!("cksum -- {}", sh_quote(path))),
+                "check the file",
+            )?;
+            let out = String::from_utf8_lossy(&out);
+            let stamp: Vec<&str> = out.split_whitespace().take(2).collect();
+            if stamp.len() < 2 {
+                return Err("couldn't check the file".to_string());
+            }
+            Ok(stamp.join(":"))
+        }
+    }
+}
+
 fn read_disk(path: &str, limit: usize) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let mut bytes = Vec::new();
@@ -144,6 +176,20 @@ fn decode(mut bytes: Vec<u8>) -> Result<TextFile, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stamp_moves_when_the_file_does() {
+        let path = std::env::temp_dir().join(format!("pilus-stamp-{}", std::process::id()));
+        let path_text = path.to_string_lossy().to_string();
+        std::fs::write(&path, "one").ok();
+        let first = file_stamp(None, &path_text);
+        assert!(first.is_ok());
+        assert_eq!(file_stamp(None, &path_text), first, "no change, same stamp");
+        std::fs::write(&path, "three").ok();
+        assert_ne!(file_stamp(None, &path_text), first);
+        std::fs::remove_file(&path).ok();
+        assert!(file_stamp(None, &path_text).is_err());
+    }
 
     #[test]
     fn text_decodes_and_marks_a_cut() {

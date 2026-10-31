@@ -45,8 +45,28 @@ The Files tab edits text files in place. Saves go through
   width is not touched or saved, and closing the file gives the room back. A
   drag on a widened column adopts its width.
 - With room for it, the header's panel button hides or shows the tree beside
-  the file (`FilesPanel::tree_hidden`). The tree header's hairline sits under
-  its machine row so it meets the document header's.
+  the file. The choice is kept in `Settings::files_tree_hidden` (`ui_state`),
+  written to `shared_settings` too, as the folds are. The tree header's
+  hairline sits under its machine row so it meets the document header's.
+- Closing, reloading or opening another file over unsaved changes asks Save,
+  Don't Save or Cancel (`PromptAction::UnsavedDoc`, Enter / D / Escape). Save
+  runs the held-back step (`DocNext`) once the write lands, and only if the
+  buffer did not move meanwhile. The prompt is a confirm, so `sync_focus`
+  keeps the keyboard on the root, not on the editor behind it.
+
+## Changes on disk
+
+The open file is checked every `WATCH` (through `activity::scaled`) with
+`pilus_client::file_stamp` on a worker: size and mtime locally, `cksum` over
+SSH, since `stat` differs between macOS and Linux.
+
+- A read stamps the file just before it reads, and a save just after it
+  writes, so the watch never mistakes its own save for a change.
+- `Watch::generation` moves with every read and save, and a check sent before
+  one is dropped.
+- A change with nothing unsaved reloads at once, keeping the caret and the
+  scroll. Under unsaved edits a bar asks Reload (drops them) or Keep Mine (the
+  next save writes over the disk's copy).
 - A truncated read, or a file larger than `md_view::EDIT_LIMIT`, is not opened
   for editing.
 
@@ -177,7 +197,7 @@ is drawn as a diagram by `gui/mermaid.rs`.
   renderer, and the SVG is read with `about::untrusted_svg_options` (see
   [security.md](../security.md)).
 
-## Quick open (⌘P) and find (⌘F)
+## Quick open (⌘P), find (⌘F) and replace (⌘⌥F)
 
 Both belong to the Files tab.
 
@@ -193,6 +213,10 @@ Both belong to the Files tab.
   - It paints its matches through `TextInput::set_marks` and shows the current
     match as the editor's selection.
   - On a markdown preview, ⌘F switches to the source first.
+  - ⌘⌥F, or the bar's chevron, shows the replace field (`style::bare_field`).
+    Enter in it replaces the selected match and moves to the next; with none
+    selected it selects one first. ⌘Enter replaces every match as one edit,
+    so one undo puts them back.
 
 ## Editor key bindings
 
@@ -201,7 +225,19 @@ document page carries `FilesDoc` (Cmd+S save, Cmd+W step out, Cmd+R reload),
 and the editor div carries `MdEditor` only while editing (the line chords in
 `editor_ops`: Tab and Shift+Tab, Cmd+] and Cmd+[, Cmd+/, Cmd+L, Cmd+Shift+K,
 Option+Up/Down, Option+Shift+Up/Down, Cmd+Enter, Cmd+Shift+Enter). Enter keeps
-the line's indent.
+the line's indent; in markdown it carries a list item's marker on (numbered on,
+with an empty checkbox) and ends the list on an empty item. Brackets, and
+outside markdown quotes, close themselves, a closer steps over its twin, and
+Backspace between an empty pair takes both (`editor_ops::type_pair`). Page Up
+and Page Down move a view's height. Ctrl+G goes to a line (`12` or `12:5`)
+through the window's prompt.
+
+Escape steps back one level: out of the editor, then from a read-only file to
+the terminal.
+
+Undo keeps only what each edit changed, never a copy of the buffer, and joins
+a run of typing or of deletes into one step, broken at each new word, by a
+caret move or after a second (`text_input::Step`).
 
 A binding with no context does not lose to a contextual one: GPUI ranks it as
 deep as the focused element. So a window chord the file takes over is scoped

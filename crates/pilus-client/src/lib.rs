@@ -100,7 +100,7 @@ pub use pilus_protocol as protocol;
 pub use ports::{ListeningPort, PortForward, free_local_port, kill_process, list_ports};
 pub use predict::{Predictor, interrupts_echo};
 pub use read::{
-    MAX_IMAGE_BYTES, MAX_TEXT_BYTES, TextFile, Version, is_file, read_bytes, read_text,
+    MAX_IMAGE_BYTES, MAX_TEXT_BYTES, TextFile, Version, file_stamp, is_file, read_bytes, read_text,
 };
 pub use relay::RelaySettings;
 pub use stage::{Discard, StageAction, discard, set_staged};

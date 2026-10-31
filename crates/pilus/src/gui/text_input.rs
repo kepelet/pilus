@@ -287,8 +287,8 @@ pub(super) struct Buffer {
     anchor: usize,
     /// The caret. The selection runs from `anchor` to `head`.
     head: usize,
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     /// Changes whenever `text` does, and never repeats across buffers, so a
     /// reader can tell whether what it computed from the text is still current
     /// without comparing a long document.
@@ -302,12 +302,78 @@ fn next_revision() -> u64 {
     REVISIONS.fetch_add(1, Ordering::Relaxed)
 }
 
-/// One undo step.
+/// The most undo steps a buffer keeps.
+const UNDO_LIMIT: usize = 1000;
+/// How long after a keystroke the next one may still join its undo step.
+const UNDO_JOIN: Duration = Duration::from_secs(1);
+
+/// One undo step: what an edit replaced at `at`, and the selection either
+/// side of it. Only the changed text is kept, never a copy of the whole
+/// buffer, so a long file's history stays small.
 #[derive(Clone, Debug)]
-struct Snapshot {
-    text: String,
-    anchor: usize,
-    head: usize,
+struct Step {
+    at: usize,
+    removed: String,
+    inserted: String,
+    before: (usize, usize),
+    after: (usize, usize),
+    kind: StepKind,
+    /// When the step last grew.
+    when: Instant,
+}
+
+/// What made a step, so a run of keystrokes undoes as a word rather than a
+/// character at a time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StepKind {
+    /// One character typed.
+    Typing,
+    /// One character deleted.
+    Deleting,
+    /// Anything else: a paste, a newline, a line operation.
+    Other,
+}
+
+impl StepKind {
+    fn of(removed: &str, inserted: &str) -> Self {
+        let one = |text: &str| text.graphemes(true).count() == 1 && !text.contains('\n');
+        if removed.is_empty() && one(inserted) {
+            Self::Typing
+        } else if inserted.is_empty() && one(removed) {
+            Self::Deleting
+        } else {
+            Self::Other
+        }
+    }
+}
+
+impl Step {
+    /// Whether an edit of `kind` at `at`, made with the selection at
+    /// `before`, carries on this step: the same kind of keystroke, soon
+    /// after, where the last one left the caret. Typing breaks before each
+    /// new word.
+    fn takes(
+        &self,
+        kind: StepKind,
+        at: usize,
+        removed: &str,
+        inserted: &str,
+        before: (usize, usize),
+    ) -> bool {
+        if kind != self.kind || self.after != before || self.when.elapsed() > UNDO_JOIN {
+            return false;
+        }
+        match kind {
+            StepKind::Typing => {
+                let word_starts =
+                    !inserted.trim().is_empty() && self.inserted.ends_with(char::is_whitespace);
+                at == self.at + self.inserted.len() && !word_starts
+            }
+            // Backspace walks left, forward delete stays put.
+            StepKind::Deleting => at + removed.len() == self.at || at == self.at,
+            StepKind::Other => false,
+        }
+    }
 }
 
 impl Buffer {
@@ -424,13 +490,14 @@ impl Buffer {
         let end = self
             .clamp(self.text.ceil_char_boundary(range.end))
             .max(start);
-        self.snapshot();
+        let before = (self.anchor, self.head);
+        let removed = self.text[start..end].to_string();
         self.text.replace_range(start..end, &inserted);
         self.revision = next_revision();
         let caret = start + inserted.len();
         self.head = caret;
         self.anchor = caret;
-        self.redo.clear();
+        self.record(start, removed, &inserted, before);
         start..caret
     }
 
@@ -466,62 +533,99 @@ impl Buffer {
     fn apply(&mut self, change: editor_ops::Change) {
         let range = self.clamp(self.text.floor_char_boundary(change.range.start))
             ..self.clamp(self.text.ceil_char_boundary(change.range.end));
-        if !range.is_empty() || !change.insert.is_empty() {
-            self.snapshot();
-            self.text.replace_range(range, &change.insert);
+        let before = (self.anchor, self.head);
+        let edits = !range.is_empty() || !change.insert.is_empty();
+        let removed = self.text[range.clone()].to_string();
+        if edits {
+            self.text.replace_range(range.clone(), &change.insert);
             self.revision = next_revision();
-            self.redo.clear();
         }
         self.anchor = self.clamp(self.text.floor_char_boundary(change.anchor));
         self.head = self.clamp(self.text.floor_char_boundary(change.head));
+        if edits {
+            // A line operation is one step of its own, never part of a word.
+            self.push_step(Step {
+                at: range.start,
+                removed,
+                inserted: change.insert,
+                before,
+                after: (self.anchor, self.head),
+                kind: StepKind::Other,
+                when: Instant::now(),
+            });
+        }
     }
 
-    fn snapshot(&mut self) {
-        self.undo.push(Snapshot {
-            text: self.text.clone(),
-            anchor: self.anchor,
-            head: self.head,
+    /// Remember an edit that replaced `removed` at `at` with `inserted`, the
+    /// selection having been `before` it and now where it is. A keystroke
+    /// that carries on the last step grows it instead of starting another.
+    fn record(&mut self, at: usize, removed: String, inserted: &str, before: (usize, usize)) {
+        let after = (self.anchor, self.head);
+        let kind = StepKind::of(&removed, inserted);
+        if let Some(last) = self.undo.last_mut()
+            && last.takes(kind, at, &removed, inserted, before)
+        {
+            match kind {
+                StepKind::Typing => last.inserted.push_str(inserted),
+                StepKind::Deleting if at < last.at => {
+                    last.removed.insert_str(0, &removed);
+                    last.at = at;
+                }
+                _ => last.removed.push_str(&removed),
+            }
+            last.after = after;
+            last.when = Instant::now();
+            self.redo.clear();
+            return;
+        }
+        self.push_step(Step {
+            at,
+            removed,
+            inserted: inserted.to_string(),
+            before,
+            after,
+            kind,
+            when: Instant::now(),
         });
-        if self.undo.len() > 256 {
+    }
+
+    fn push_step(&mut self, step: Step) {
+        self.redo.clear();
+        self.undo.push(step);
+        if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
         }
     }
 
     fn undo(&mut self) -> bool {
-        match self.undo.pop() {
-            Some(snapshot) => {
-                self.redo.push(self.current());
-                self.restore(snapshot);
-                true
-            }
-            None => false,
-        }
+        let Some(mut step) = self.undo.pop() else {
+            return false;
+        };
+        self.swap(step.at, step.inserted.len(), &step.removed, step.before);
+        // Nothing typed after an undo may join the step it brought back.
+        step.kind = StepKind::Other;
+        self.redo.push(step);
+        true
     }
 
     fn redo(&mut self) -> bool {
-        match self.redo.pop() {
-            Some(snapshot) => {
-                self.undo.push(self.current());
-                self.restore(snapshot);
-                true
-            }
-            None => false,
-        }
+        let Some(step) = self.redo.pop() else {
+            return false;
+        };
+        self.swap(step.at, step.removed.len(), &step.inserted, step.after);
+        self.undo.push(step);
+        true
     }
 
-    fn current(&self) -> Snapshot {
-        Snapshot {
-            text: self.text.clone(),
-            anchor: self.anchor,
-            head: self.head,
-        }
-    }
-
-    fn restore(&mut self, snapshot: Snapshot) {
-        self.text = snapshot.text;
+    /// Put `text` over the `len` bytes at `at` and the selection at `select`:
+    /// one half of an undo or a redo.
+    fn swap(&mut self, at: usize, len: usize, text: &str, select: (usize, usize)) {
+        let start = self.clamp(at);
+        let end = self.clamp(start + len);
+        self.text.replace_range(start..end, text);
         self.revision = next_revision();
-        self.anchor = self.clamp(snapshot.anchor);
-        self.head = self.clamp(snapshot.head);
+        self.anchor = self.clamp(self.text.floor_char_boundary(select.0));
+        self.head = self.clamp(self.text.floor_char_boundary(select.1));
     }
 
     fn clamp(&self, byte: usize) -> usize {
@@ -744,8 +848,12 @@ pub(super) struct TextInput {
     /// The text can be read, selected and copied, but not changed: a file
     /// shown, not edited.
     read_only: bool,
-    /// Enter carries the line's indent onto the new line, as a code editor's.
-    auto_indent: bool,
+    /// Typing helps as a code editor's does: Enter keeps the indent (and in
+    /// markdown, the list), brackets and quotes close themselves.
+    code: bool,
+    /// How tall the view scrolling this field is, so Page Up and Page Down
+    /// move the caret a screen at a time.
+    page_height: Pixels,
 }
 
 impl Focusable for TextInput {
@@ -791,7 +899,8 @@ impl TextInput {
             marked: None,
             command_chord_at: None,
             read_only: false,
-            auto_indent: false,
+            code: false,
+            page_height: px(0.0),
             syntax: None,
             line_numbers: false,
             highlighted: None,
@@ -861,9 +970,45 @@ impl TextInput {
         }
     }
 
-    /// Carry each line's indent onto the line Enter starts.
-    pub(super) fn set_auto_indent(&mut self, on: bool) {
-        self.auto_indent = on;
+    /// Type as a code editor does: Enter keeps the indent and a markdown
+    /// list, and brackets and quotes close themselves.
+    pub(super) fn set_code_editor(&mut self, on: bool) {
+        self.code = on;
+    }
+
+    /// Tell the field how tall the view scrolling it is, for Page Up and
+    /// Page Down.
+    pub(super) fn set_page_height(&mut self, height: Pixels) {
+        self.page_height = height;
+    }
+
+    /// Whether the field holds markdown, which pairs no quotes and continues
+    /// lists.
+    fn prose(&self) -> bool {
+        self.syntax
+            .as_deref()
+            .is_some_and(super::md_view::is_markdown)
+    }
+
+    /// Put the caret at the start of `line` (1-based), `column` characters
+    /// in, both held to the text.
+    pub(super) fn go_to_line(&mut self, line: usize, column: usize, cx: &mut Context<Self>) {
+        {
+            let mut buffer = self.buffer.borrow_mut();
+            let start = buffer
+                .text
+                .split_inclusive('\n')
+                .take(line.saturating_sub(1))
+                .map(str::len)
+                .sum::<usize>();
+            let end = line_end(&buffer.text, start);
+            let at = buffer.text[start..end]
+                .char_indices()
+                .nth(column)
+                .map_or(end, |(offset, _)| start + offset);
+            buffer.move_to(at, false);
+        }
+        self.changed(cx);
     }
 
     /// Run one of the editor's line operations (see `editor_ops`). A
@@ -885,6 +1030,16 @@ impl TextInput {
             self.buffer.borrow_mut().apply(change);
             self.changed(cx);
         }
+    }
+
+    /// Apply an edit worked out elsewhere (find and replace) as one undo
+    /// step. A read-only field refuses it.
+    pub(super) fn apply_change(&mut self, change: editor_ops::Change, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        self.buffer.borrow_mut().apply(change);
+        self.changed(cx);
     }
 
     /// Mark the gutter where the text differs from `base`, Git's copy of the
@@ -1177,7 +1332,17 @@ impl TextInput {
                 true
             }
             "backspace" => {
-                let range = self.buffer.borrow_mut().backspace(word);
+                // Between an empty pair, both halves go.
+                let pair = {
+                    let buffer = self.buffer.borrow();
+                    (self.code && !word && !buffer.has_selection())
+                        .then(|| editor_ops::backspace_pair(&buffer.text, buffer.head))
+                        .flatten()
+                };
+                let range = match pair {
+                    Some(range) => range,
+                    None => self.buffer.borrow_mut().backspace(word),
+                };
                 self.delete_range(range, cx);
                 true
             }
@@ -1190,15 +1355,30 @@ impl TextInput {
                 if self.enter_submits && !modifiers.shift {
                     return false;
                 }
-                {
+                if self.code {
+                    let prose = self.prose();
+                    let change = {
+                        let buffer = self.buffer.borrow();
+                        editor_ops::enter(&buffer.text, buffer.anchor, buffer.head, prose)
+                    };
+                    self.buffer.borrow_mut().apply(change);
+                } else {
                     let mut buffer = self.buffer.borrow_mut();
                     let range = buffer.range();
-                    let break_line = if self.auto_indent {
-                        editor_ops::newline(&buffer.text, range.start)
-                    } else {
-                        "\n".to_string()
-                    };
-                    buffer.replace(range, &break_line, true);
+                    buffer.replace(range, "\n", true);
+                }
+                self.changed(cx);
+                true
+            }
+            "pageup" | "pagedown" if self.multiline => {
+                let rows = (self.page_height / self.line_height).floor() as usize;
+                // A screen less a line, so the line at the edge stays in view.
+                let rows = rows.saturating_sub(1).max(1);
+                {
+                    let mut buffer = self.buffer.borrow_mut();
+                    for _ in 0..rows {
+                        buffer.move_vertical(key == "pagedown", extend);
+                    }
                 }
                 self.changed(cx);
                 true
@@ -1383,9 +1563,32 @@ impl EntityInputHandler for TextInput {
             return;
         }
         let range = self.resolve_range(range_utf16);
-        self.buffer
-            .borrow_mut()
-            .replace(range, text, self.multiline);
+        // A bracket or quote typed over the selection, outside a composition,
+        // may close itself or step over its closer.
+        let pair = (self.code && self.marked.is_none())
+            .then(|| {
+                let buffer = self.buffer.borrow();
+                (range == buffer.range())
+                    .then(|| {
+                        editor_ops::type_pair(
+                            &buffer.text,
+                            buffer.anchor,
+                            buffer.head,
+                            text,
+                            self.prose(),
+                        )
+                    })
+                    .flatten()
+            })
+            .flatten();
+        match pair {
+            Some(change) => self.buffer.borrow_mut().apply(change),
+            None => {
+                self.buffer
+                    .borrow_mut()
+                    .replace(range, text, self.multiline);
+            }
+        }
         self.marked = None;
         cx.notify();
     }
@@ -2188,6 +2391,42 @@ mod tests {
         assert!(buffer.undo());
         assert_ne!(buffer.revision, edited);
         assert_ne!(Buffer::new("ab".to_string()).revision, first);
+    }
+
+    #[test]
+    fn typing_undoes_a_word_at_a_time() {
+        let mut buffer = Buffer::new(String::new());
+        for ch in ["a", "b", " ", "c", "d"] {
+            let at = buffer.head;
+            buffer.replace(at..at, ch, false);
+        }
+        assert_eq!(buffer.text, "ab cd");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text, "ab ");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text, "");
+        assert!(!buffer.undo());
+        assert!(buffer.redo());
+        assert!(buffer.redo());
+        assert_eq!(buffer.text, "ab cd");
+        assert_eq!(buffer.head, 5);
+    }
+
+    #[test]
+    fn backspaces_undo_together_and_a_caret_move_splits_the_run() {
+        let mut buffer = Buffer::new("hello".to_string());
+        for _ in 0..3 {
+            let range = buffer.backspace(false);
+            buffer.replace(range, "", false);
+        }
+        assert_eq!(buffer.text, "he");
+        buffer.move_to(0, false);
+        buffer.replace(0..0, "x", false);
+        assert!(buffer.undo());
+        assert_eq!(buffer.text, "he");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text, "hello");
+        assert_eq!(buffer.head, 5);
     }
 
     #[test]

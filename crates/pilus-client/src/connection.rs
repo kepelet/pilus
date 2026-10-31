@@ -62,11 +62,6 @@ const BURST_SETTLE: Duration = Duration::from_millis(3);
 /// Longest a burst is held, so continuous output still streams at display
 /// rate instead of waiting for a quiet gap that never comes.
 const BURST_HOLD: Duration = Duration::from_millis(12);
-/// Longest a burst waits on a message that is part-way off the wire. A local
-/// socket finishes a message in microseconds and never reaches this; a slow
-/// link can spend tens of milliseconds on one large repaint, and painting the
-/// clear before it is the flicker.
-const BURST_HOLD_RECEIVING: Duration = Duration::from_millis(50);
 /// Read-side buffer, so a frame costs one syscall rather than two per
 /// message (length prefix, then body).
 const READ_BUFFER: usize = 64 * 1024;
@@ -407,9 +402,11 @@ fn spawn_reader(
 ///
 /// While `receiving` says a message is part-way off the wire, the link is not
 /// quiet, whatever the settle timer says: a slow link can take tens of
-/// milliseconds to deliver the repaint that follows a clear. The burst waits
-/// for that message, up to [`BURST_HOLD_RECEIVING`], and past [`BURST_HOLD`]
-/// it takes only that one, so steady output still streams.
+/// milliseconds to deliver the repaint that follows a clear. Past
+/// [`BURST_HOLD`] the burst waits for that one message, then goes out, so
+/// steady output still streams. There is no timeout here: painting the clear
+/// just because its repaint is slow is the flicker, and a stalled link should
+/// keep the last complete screen. A disconnect wakes the wait and flushes.
 fn spawn_coalescer(
     raw: Receiver<ClientEvent>,
     inbound: Sender<ClientEvent>,
@@ -423,27 +420,32 @@ fn spawn_coalescer(
                 let mut burst = vec![first];
                 let start = Instant::now();
                 let hold = start + BURST_HOLD;
-                let stretch = start + BURST_HOLD_RECEIVING;
                 while !matches!(burst.last(), Some(ClientEvent::Disconnected { .. })) {
                     let now = Instant::now();
                     let mid_message = receiving.load(Ordering::Acquire);
-                    let held = now >= hold;
-                    let wait = match (held, mid_message) {
-                        (false, false) => (hold - now).min(BURST_SETTLE),
-                        (false, true) => hold - now,
-                        (true, true) => stretch.saturating_duration_since(now),
-                        (true, false) => break,
-                    };
-                    if wait.is_zero() {
-                        break;
-                    }
-                    match raw.recv_timeout(wait) {
-                        Ok(event) => {
-                            burst.push(event);
-                            if held {
-                                break;
+                    if now >= hold {
+                        if mid_message {
+                            // The next decoded message finishes this burst. Do
+                            // not cut between a clear and its repaint merely
+                            // because the link is slow. The reader always ends
+                            // a message with an event, a `Disconnected` on
+                            // error, so this cannot wait on nothing; SSH
+                            // keepalives turn a dead link into that disconnect.
+                            // It takes only that one message, so a repaint
+                            // that is itself followed by another is not chased.
+                            if let Ok(event) = raw.recv() {
+                                burst.push(event);
                             }
                         }
+                        break;
+                    }
+                    let wait = if mid_message {
+                        hold - now
+                    } else {
+                        (hold - now).min(BURST_SETTLE)
+                    };
+                    match raw.recv_timeout(wait) {
+                        Ok(event) => burst.push(event),
                         Err(RecvTimeoutError::Timeout) if receiving.load(Ordering::Acquire) => {}
                         Err(_) => break,
                     }
@@ -499,18 +501,16 @@ mod tests {
     fn a_slow_repaint_lands_with_its_clear() {
         let (raw_tx, inbound_rx, _gate, receiving) = coalescer();
         raw_tx.send(notify("clear")).expect("send");
-        // The repaint is on the wire for longer than a quiet link's hold.
+        // Well past the old 50 ms cap, which forwarded this clear on its own.
         receiving.store(true, Ordering::Release);
-        thread::sleep(BURST_HOLD * 2);
+        thread::sleep(Duration::from_millis(80));
         assert!(
             inbound_rx.try_recv().is_err(),
             "the clear waits for the message still arriving"
         );
         receiving.store(false, Ordering::Release);
         raw_tx.send(notify("repaint")).expect("send");
-        let first = inbound_rx
-            .recv_timeout(BURST_HOLD_RECEIVING)
-            .expect("burst");
+        let first = inbound_rx.recv_timeout(BURST_HOLD).expect("burst");
         let second = inbound_rx.recv_timeout(BURST_HOLD).expect("burst");
         assert!(
             matches!(first, ClientEvent::Message(ServerMessage::Notify(text)) if text == "clear")
@@ -521,14 +521,27 @@ mod tests {
     }
 
     #[test]
-    fn a_stalled_message_does_not_hold_the_screen_forever() {
+    fn a_stalled_message_keeps_the_last_complete_screen_until_disconnect() {
         let (raw_tx, inbound_rx, _gate, receiving) = coalescer();
         receiving.store(true, Ordering::Release);
         raw_tx.send(notify("clear")).expect("send");
-        let landed = inbound_rx
-            .recv_timeout(BURST_HOLD_RECEIVING * 3)
-            .expect("the burst flushes at the stretched hold");
-        assert!(matches!(landed, ClientEvent::Message(_)));
+        assert!(
+            inbound_rx.recv_timeout(Duration::from_millis(80)).is_err(),
+            "a partial repaint must not expose the clear before it"
+        );
+        raw_tx
+            .send(ClientEvent::Disconnected {
+                reason: "link lost".into(),
+            })
+            .expect("disconnect");
+        assert!(matches!(
+            inbound_rx.recv_timeout(BURST_HOLD),
+            Ok(ClientEvent::Message(_))
+        ));
+        assert!(matches!(
+            inbound_rx.recv_timeout(BURST_HOLD),
+            Ok(ClientEvent::Disconnected { .. })
+        ));
     }
 
     #[test]

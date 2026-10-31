@@ -1,5 +1,6 @@
-//! The native Appearances window: pick a Luvus theme (or one per device
-//! appearance), the fonts, and how translucent and rounded the window is.
+//! The native Appearances window: pick a color scheme mode (device, light or
+//! dark) and a Luvus theme for it, the fonts, and how translucent and rounded
+//! the window is.
 //!
 //! It is a thin view over the daemon's theme registry (`theme.list` /
 //! `theme.use`, both on a background thread) plus the client-owned font and
@@ -23,7 +24,7 @@ use pilus_client::{Appearance, ControlClient, ControlTransport, ThemeInfo};
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::theme::Theme;
 use super::{CloseTab, CloseWindow, scheme};
-use crate::settings::{CORNER_RADIUS_MAX, DEFAULT_CORNER_RADIUS, Settings};
+use crate::settings::{CORNER_RADIUS_MAX, ColorScheme, DEFAULT_CORNER_RADIUS, Settings};
 
 /// Width and height of the appearances window.
 const WINDOW_SIZE: (f32, f32) = (640.0, 600.0);
@@ -273,14 +274,24 @@ impl AppearancesView {
         self.select_tx.send(id).ok();
     }
 
-    /// A click on a scheme. While following the device appearance it fills
-    /// the light or dark slot the scheme belongs to, leaving the other slot's
-    /// pick standing. Only a pick for the mode the device is in goes to the
+    /// The light/dark sides the Theme list is choosing for under the current
+    /// color scheme: both while following the device, one when pinned.
+    fn theme_slots(&self) -> &'static [(bool, &'static str)] {
+        match self.settings.color_scheme {
+            ColorScheme::Device => &[(false, "Light"), (true, "Dark")],
+            ColorScheme::Light => &[(false, "Light")],
+            ColorScheme::Dark => &[(true, "Dark")],
+        }
+    }
+
+    /// A click on a theme. It fills the light or dark slot the theme belongs
+    /// to (the pinned one, when the color scheme is pinned), leaving the other
+    /// slot's pick standing. Only a pick for the mode in force now goes to the
     /// daemon now; the other waits for the device to flip.
     fn pick_theme(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.settings.auto_theme {
-            let current = device_is_dark(cx);
-            let dark = match self
+        let current = self.settings.color_scheme.is_dark(device_is_dark(cx));
+        let dark = match self.settings.color_scheme {
+            ColorScheme::Device => match self
                 .appearance
                 .themes
                 .iter()
@@ -290,54 +301,85 @@ impl AppearancesView {
                 Some("light") => false,
                 Some("dark") => true,
                 // A terminal theme follows the terminal, not the chrome, so
-                // it takes whichever mode the device is in.
+                // it takes whichever mode is in force.
                 _ => current,
-            };
-            self.settings.set_device_theme(dark, &id);
-            self.publish(cx);
-            if dark != current {
-                cx.notify();
-                return;
-            }
+            },
+            pinned => pinned == ColorScheme::Dark,
+        };
+        self.settings.set_device_theme(dark, &id);
+        self.publish(cx);
+        if dark != current {
+            cx.notify();
+            return;
         }
         self.select(id);
         cx.notify();
     }
 
-    /// The checkbox that hands the color scheme to the device appearance,
-    /// with a note on how picks then behave.
-    fn auto_theme_rows(&self, cx: &mut Context<Self>) -> Div {
-        let toggle = style::checkbox(
-            "pilus-auto-theme",
-            self.settings.auto_theme,
-            "Match device appearance",
-            self.theme,
-            self.fonts().secondary,
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.settings.auto_theme = !this.settings.auto_theme;
-            this.publish(cx);
-        }));
-        let note = if self.settings.auto_theme {
-            "Pick a light scheme and a dark one. The one matching the device is \
-             applied, remote machines included"
-        } else {
-            "Switch between a light and a dark scheme with the device, \
-             overriding the Luvus daemon's, remote machines included"
+    /// Switch the color scheme mode and bring the daemon to the theme that
+    /// now applies.
+    fn pick_color_scheme(&mut self, mode: ColorScheme, cx: &mut Context<Self>) {
+        if self.settings.color_scheme == mode {
+            return;
+        }
+        self.settings.color_scheme = mode;
+        self.publish(cx);
+    }
+
+    /// The Device / Light / Dark switch, with a note on how theme picks then
+    /// behave.
+    fn color_scheme_rows(&self, cx: &mut Context<Self>) -> Div {
+        let mode = self.settings.color_scheme;
+        let choice =
+            |name: &'static str, target: ColorScheme| -> (&'static str, bool, ModeHandler) {
+                (
+                    name,
+                    mode == target,
+                    Box::new(move |this, cx| this.pick_color_scheme(target, cx)),
+                )
+            };
+        let note = match mode {
+            ColorScheme::Device => {
+                "Follows the device. Pick a light theme and a dark one; the one \
+                 matching the device is applied, remote machines included"
+            }
+            ColorScheme::Light => {
+                "Always light, whatever the device is. Pick the light theme below"
+            }
+            ColorScheme::Dark => "Always dark, whatever the device is. Pick the dark theme below",
         };
         div()
             .flex()
             .flex_col()
-            .gap_2()
-            .px_3()
-            .py_1()
-            .child(toggle)
+            .child(self.preset_row(
+                "Mode",
+                "color-scheme",
+                vec![
+                    choice("Device", ColorScheme::Device),
+                    choice("Light", ColorScheme::Light),
+                    choice("Dark", ColorScheme::Dark),
+                ],
+                cx,
+            ))
             .child(
                 div()
+                    .px_3()
+                    .pb_1()
                     .text_size(px(self.fonts().label))
                     .text_color(self.theme.muted)
                     .child(note),
             )
+    }
+
+    /// Whether the Theme list offers `info` under the current color scheme.
+    /// A pinned mode hides the other mode's themes; terminal themes follow
+    /// the terminal and suit either.
+    fn offers_theme(&self, info: &ThemeInfo) -> bool {
+        match self.settings.color_scheme {
+            ColorScheme::Device => true,
+            ColorScheme::Light => info.appearance != "dark",
+            ColorScheme::Dark => info.appearance != "light",
+        }
     }
 
     /// Publish a font change to the main window and to disk.
@@ -498,22 +540,15 @@ impl AppearancesView {
 
     fn theme_row(&self, info: &ThemeInfo, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        // Following the device, a light and a dark scheme are both chosen,
-        // and the daemon's own selection is only whichever one applies now.
-        let slots: Vec<&str> = if self.settings.auto_theme {
-            [(false, "Light"), (true, "Dark")]
-                .into_iter()
-                .filter(|(dark, _)| self.settings.device_theme(*dark) == info.id)
-                .map(|(_, label)| label)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let active = if self.settings.auto_theme {
-            !slots.is_empty()
-        } else {
-            info.active
-        };
+        // A light and a dark theme are chosen per side, and the daemon's own
+        // selection is only whichever one applies now.
+        let slots: Vec<&str> = self
+            .theme_slots()
+            .iter()
+            .filter(|(dark, _)| self.settings.device_theme(*dark) == info.id)
+            .map(|(_, label)| *label)
+            .collect();
+        let active = !slots.is_empty();
         let id = info.id.clone();
         let palette = scheme::builtin(&info.id);
         let bg = if active { theme.panel } else { theme.window_bg };
@@ -578,7 +613,8 @@ impl AppearancesView {
             )
             .child(badge);
 
-        if !slots.is_empty() {
+        // Pinned to one mode there is only one slot, so naming it adds nothing.
+        if self.settings.color_scheme == ColorScheme::Device && !slots.is_empty() {
             row = row.child(
                 div()
                     .text_size(px(self.fonts().label))
@@ -1302,7 +1338,8 @@ impl Render for AppearancesView {
 
         list = list
             .child(self.section_heading("COLOR SCHEME"))
-            .child(self.auto_theme_rows(cx));
+            .child(self.color_scheme_rows(cx))
+            .child(self.section_heading("THEME"));
         if self.appearance.themes.is_empty() {
             list = list.child(
                 div()
@@ -1313,6 +1350,9 @@ impl Render for AppearancesView {
             );
         }
         for info in self.appearance.themes.clone() {
+            if !self.offers_theme(&info) {
+                continue;
+            }
             list = list.child(self.theme_row(&info, cx));
         }
 
@@ -1355,7 +1395,7 @@ impl Render for AppearancesView {
     }
 }
 
-/// Whether the device is in dark mode, which `auto_theme` follows.
+/// Whether the device is in dark mode, which the Device color scheme follows.
 pub(super) fn device_is_dark(cx: &App) -> bool {
     matches!(
         cx.window_appearance(),

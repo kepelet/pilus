@@ -4965,26 +4965,23 @@ impl PilusView {
         }
     }
 
-    /// With `auto_theme` on, select the color scheme that matches the device
-    /// appearance on the daemon the window shows, a remote machine's included.
+    /// Select the theme the color scheme resolves to (the device's light or
+    /// dark, or the pinned one) on the daemon the window shows, a remote
+    /// machine's included.
     ///
-    /// Each endpoint is switched once per device appearance, when its registry
-    /// has been polled; a scheme chosen by hand afterwards is left alone until
-    /// the device flips again. A scheme the daemon does not register is
+    /// Each endpoint is switched once per resolved theme, when its registry
+    /// has been polled; a theme chosen by hand afterwards is left alone until
+    /// the mode flips again. A theme the daemon does not register is
     /// skipped rather than retried every poll.
     fn follow_device_appearance(&mut self, cx: &mut Context<Self>) {
-        if !self.settings.auto_theme {
-            // Turning it back on must reapply, even to the same scheme.
-            self.auto_theme_applied = None;
-            return;
-        }
         if self.theme_refreshing || self.appearance_for.as_ref() != Some(&self.active) {
             return;
         }
-        let wanted = self
+        let dark = self
             .settings
-            .device_theme(appearances::device_is_dark(cx))
-            .to_string();
+            .color_scheme
+            .is_dark(appearances::device_is_dark(cx));
+        let wanted = self.settings.device_theme(dark).to_string();
         let key = (self.active.clone(), wanted.clone());
         if self.auto_theme_applied.as_ref() == Some(&key) {
             return;

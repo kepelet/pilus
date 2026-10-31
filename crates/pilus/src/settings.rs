@@ -88,6 +88,34 @@ pub const DEFAULT_LIGHT_THEME: &str = "rose-pine-dawn";
 /// The color scheme a dark device takes until the user picks another.
 pub const DEFAULT_DARK_THEME: &str = "noir";
 
+/// Which color scheme mode the chrome is in: the device's, or pinned to one.
+///
+/// The mode only decides *which* of `theme_light` / `theme_dark` applies;
+/// the theme itself is chosen separately.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorScheme {
+    /// Follow the system: light when the Mac is light, dark when it is dark.
+    #[default]
+    Device,
+    /// Always the light theme.
+    Light,
+    /// Always the dark theme.
+    Dark,
+}
+
+impl ColorScheme {
+    /// Whether this mode resolves to the dark theme on a device that is, or
+    /// is not, currently dark.
+    pub fn is_dark(self, device_dark: bool) -> bool {
+        match self {
+            Self::Device => device_dark,
+            Self::Light => false,
+            Self::Dark => true,
+        }
+    }
+}
+
 /// The main window's frame when it was last seen, so the next launch reopens
 /// it where the user left it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -395,10 +423,12 @@ pub struct Settings {
     /// Relay the host connector dials out through. Owned by the agent too, so
     /// it is kept here to survive the window rewriting this file.
     pub relay: pilus_client::RelaySettings,
-    /// Follow the device appearance: the color scheme switches between
-    /// `theme_light` and `theme_dark` with the system, and replaces the one
-    /// the attached Luvus daemon had selected, remote machines included.
-    pub auto_theme: bool,
+    /// Whether the theme follows the device appearance or is pinned to light
+    /// or dark. Whichever it resolves to, `theme_light` or `theme_dark` is
+    /// applied and replaces the one the attached Luvus daemon had selected,
+    /// remote machines included. (Files written before this existed carry an
+    /// `auto_theme` bool, which is ignored.)
+    pub color_scheme: ColorScheme,
     /// Color scheme id for a light device; `None` takes `DEFAULT_LIGHT_THEME`.
     pub theme_light: Option<String>,
     /// Color scheme id for a dark device; `None` takes `DEFAULT_DARK_THEME`.
@@ -454,7 +484,7 @@ impl Default for Settings {
             diff_list_width: 0.0,
             git_list_height: 0.0,
             relay: pilus_client::RelaySettings::default(),
-            auto_theme: false,
+            color_scheme: ColorScheme::Device,
             theme_light: None,
             theme_dark: None,
             init: Some(false),
@@ -551,7 +581,7 @@ impl Settings {
         }
     }
 
-    /// The color scheme id `auto_theme` selects on a light or dark device.
+    /// The theme id applied when the color scheme resolves to light or dark.
     pub fn device_theme(&self, dark: bool) -> &str {
         let (chosen, fallback) = if dark {
             (&self.theme_dark, DEFAULT_DARK_THEME)
@@ -561,7 +591,7 @@ impl Settings {
         chosen.as_deref().unwrap_or(fallback)
     }
 
-    /// Choose the color scheme for a light or dark device.
+    /// Choose the theme for the light or the dark side.
     pub fn set_device_theme(&mut self, dark: bool, id: &str) {
         let slot = if dark {
             &mut self.theme_dark
@@ -870,12 +900,27 @@ mod tests {
     #[test]
     fn device_themes_fall_back_until_chosen() {
         let mut settings = Settings::default();
-        assert!(!settings.auto_theme);
+        assert_eq!(settings.color_scheme, ColorScheme::Device);
         assert_eq!(settings.device_theme(false), DEFAULT_LIGHT_THEME);
         assert_eq!(settings.device_theme(true), DEFAULT_DARK_THEME);
         settings.set_device_theme(true, "noir");
         assert_eq!(settings.device_theme(true), "noir");
         assert_eq!(settings.device_theme(false), DEFAULT_LIGHT_THEME);
+    }
+
+    #[test]
+    fn a_pinned_color_scheme_ignores_the_device() {
+        assert!(ColorScheme::Device.is_dark(true));
+        assert!(!ColorScheme::Device.is_dark(false));
+        assert!(!ColorScheme::Light.is_dark(true));
+        assert!(ColorScheme::Dark.is_dark(false));
+    }
+
+    #[test]
+    fn a_retired_auto_theme_key_is_ignored() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"auto_theme": false}"#).expect("deserialize");
+        assert_eq!(settings.color_scheme, ColorScheme::Device);
     }
 
     #[test]
@@ -1232,7 +1277,7 @@ mod tests {
                 secret: Some("project-secret".to_string()),
                 url: vec!["https://relay.example".to_string()],
             },
-            auto_theme: true,
+            color_scheme: ColorScheme::Dark,
             theme_light: Some("catppuccin-latte".to_string()),
             theme_dark: Some("noir".to_string()),
             init: Some(true),

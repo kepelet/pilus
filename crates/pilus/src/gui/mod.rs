@@ -245,8 +245,8 @@ const SIDEBAR_LOGO: f32 = 22.0;
 const SIDEBAR_GLYPH_GAP: f32 = 8.0;
 /// Height of a single-line sidebar row (nav, open workspace, section header).
 const SIDEBAR_ROW_HEIGHT: f32 = 28.0;
-/// Inset of the sidebar's head from the panel edge: the collapse toggle's
-/// right edge sits on it.
+/// Inset of the sidebar's head from the panel edge: the session picker's
+/// left edge sits on it when fullscreen hides the traffic lights.
 const SIDEBAR_HEAD_INSET: f32 = 8.0;
 /// Height of a one-line band that carries no control: a section header, an
 /// endpoint group label, or an empty-state placeholder.
@@ -309,9 +309,10 @@ const PILL_BUTTON_W: f32 = SIDEBAR_TOGGLE_W - 4.0;
 /// midline of the sidebar header and tab strip.
 const TRAFFIC_LIGHT_POSITION: Point<Pixels> =
     point(px(SIDEBAR_ROW_EDGE + SIDEBAR_ROW_PAD), px(14.0));
-/// Left inset for the collapsed tab strip: clears the floating traffic lights
-/// (the third light ends near 64px) with a comfortable gap before the toggle.
-const TRAFFIC_LIGHT_CLEARANCE: f32 = 92.0;
+/// Left inset for the header controls (and the collapsed tab strip): clears
+/// the floating traffic lights, whose third light ends near 64px, with a
+/// small gap before the first button.
+const TRAFFIC_LIGHT_CLEARANCE: f32 = 82.0;
 /// Inset for the tab strip when nothing floats over its left edge: the sidebar
 /// is open, or fullscreen hides the traffic lights. It is the gap a terminal
 /// card keeps from the sidebar, so the first tab's edge lines up with the
@@ -10040,6 +10041,16 @@ impl PilusView {
         f32::from(self.sidebar_cells()) * cell_width * self.sidebar_open
     }
 
+    /// Left inset of the sidebar header's session picker and toggle: past the
+    /// traffic lights, or at the panel's edge when fullscreen hides them.
+    fn head_controls_left(fullscreen: bool) -> f32 {
+        if fullscreen {
+            SIDEBAR_HEAD_INSET
+        } else {
+            TRAFFIC_LIGHT_CLEARANCE
+        }
+    }
+
     /// Left inset of the tab strip and its menus: clears the traffic lights
     /// when the sidebar is gone, hugs the edge otherwise, gliding between
     /// the two while the panel tweens.
@@ -11772,7 +11783,13 @@ impl PilusView {
     /// in `ShellDock`; this paints the same region from the `ShellWorkspaces`
     /// catalog, so the panel is native while staying column-aligned with the
     /// terminal grid behind it.
-    fn sidebar(&self, cx: &mut Context<Self>, cell_width: f32, bottom: f32) -> Div {
+    fn sidebar(
+        &self,
+        cx: &mut Context<Self>,
+        cell_width: f32,
+        bottom: f32,
+        fullscreen: bool,
+    ) -> Div {
         if !self.sidebar_visible && self.sidebar_anim.is_none() {
             return div();
         }
@@ -11884,8 +11901,8 @@ impl PilusView {
             .overflow_hidden()
             // Fixed clearance for the floating traffic lights; the sections
             // scroll under it instead of disappearing beneath the titlebar.
-            // The session picker and collapse toggle pin to its right edge,
-            // clear of the lights.
+            // The session picker and collapse toggle follow the lights, or
+            // take the left edge where fullscreen hides them.
             .child(
                 div()
                     .h(px(40.0))
@@ -11893,9 +11910,9 @@ impl PilusView {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .justify_end()
+                    .justify_start()
                     .gap(px(HEAD_CONTROLS_GAP))
-                    .pr(px(SIDEBAR_HEAD_INSET + reach))
+                    .pl(px(Self::head_controls_left(fullscreen)))
                     .child(self.session_picker("pilus-session-button", cx))
                     .child(self.sidebar_toggle("pilus-sidebar-toggle", cx)),
             )
@@ -13017,9 +13034,7 @@ impl PilusView {
             let sidebar_left = self
                 .sidebar_dock()
                 .map_or(0.0, |dock| f32::from(dock.x) * cell_width);
-            sidebar_left + f32::from(self.sidebar_cells()) * cell_width
-                - SIDEBAR_HEAD_INSET
-                - HEAD_CONTROLS_W
+            sidebar_left + Self::head_controls_left(fullscreen)
         } else {
             self.strip_pad(fullscreen)
         };
@@ -15711,7 +15726,12 @@ impl Render for PilusView {
         let sidebar = if luvus_missing {
             div()
         } else {
-            self.sidebar(cx, cell_width, f32::from(window.viewport_size().height))
+            self.sidebar(
+                cx,
+                cell_width,
+                f32::from(window.viewport_size().height),
+                fullscreen,
+            )
         };
 
         // A bare spacer: the sidebar, tab strip, and card each paint their

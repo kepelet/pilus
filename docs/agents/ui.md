@@ -40,7 +40,8 @@ is the only implementation of it.
     the strip, and a long label fades out at the close button rather than
     ending in an ellipsis (`style::fade_text`). The selected tab is a thin
     wash of the foreground (`Theme::tint_fill`), which shows on any ground,
-    with the same border a hovered tab draws. Any tab, the selected one
+    with the same border a hovered tab draws. A hovered tab wears the
+    selected tab's wash and border too, with no change of weight. Any tab, the selected one
     included, shows its close button only on hover. Its label keeps the same
     weight as the others, so switching tabs never resizes one. A lone tab
     rests bare and as wide as its label. An agent's status is a badge on the

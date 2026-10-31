@@ -881,7 +881,7 @@ pub(super) fn strip_tab(
             if active {
                 style
             } else {
-                style.border_color(theme.border)
+                style.bg(theme.tint_fill(1.0)).border_color(theme.border)
             }
         })
         .children(active.then(|| glide_target(slot)))
@@ -928,7 +928,7 @@ pub(super) fn strip_button(
         .when(!enabled, |button| button.opacity(0.35))
         .when(enabled, |button| button.cursor_pointer())
         .when(enabled && !active, |button| {
-            button.hover(move |style| style.border_color(theme.border))
+            button.hover(move |style| style.bg(theme.tint_fill(1.0)).border_color(theme.border))
         })
 }
 

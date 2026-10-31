@@ -12505,14 +12505,16 @@ impl PilusView {
             .border_1()
             .border_color(gpui::transparent_black())
             .text_color(fg)
-            // The selected tab already wears the glide's fill, which may
-            // still be flying in; a hover edge would show before it lands.
+            // Hovering an unselected tab dresses it like the selected one:
+            // the same wash and edge, with the label's weight unchanged. The
+            // selected tab already wears the glide's fill, which may still be
+            // flying in; a hover edge would show before it lands.
             .hover(move |style| {
                 let style = style.text_color(theme.panel_fg);
                 if active {
                     style
                 } else {
-                    style.border_color(theme.border)
+                    style.bg(theme.tint_fill(1.0)).border_color(theme.border)
                 }
             })
             .tooltip(tip)

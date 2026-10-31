@@ -69,8 +69,9 @@ is the only implementation of it.
   With floating cards and square corners the sidebar's rows run on into the
   gap beside the card (`sidebar_reach`), so the pills meet the card's edge;
   rounded pills keep that gap.
-  The sidebar and tab strip grounds are opaque at any window opacity
-  (`Theme::chrome_ground`), so the washes never take on the desktop.
+  The sidebar and tab strip take their ground (`Theme::chrome_ground`) only
+  when the window is opaque; translucent, both are bare and the frosted
+  backdrop shows through.
   `Theme::card_raise` is the terminal card's own color, for raised fills
   that are not tints.
   `selection_bg`/`selection_fg` are for text selection and list highlighting,

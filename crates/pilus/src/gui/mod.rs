@@ -11853,7 +11853,10 @@ impl PilusView {
             .h(px(bottom))
             .flex()
             .flex_col()
-            .bg(self.sidebar_fill())
+            // Translucent, the panel is bare like the tab strip, so the
+            // frosted backdrop and the glass coat show through; solid, it
+            // takes its own ground.
+            .when(self.opaque(), |panel| panel.bg(self.sidebar_fill()))
             .overflow_hidden()
             // Fixed clearance for the floating traffic lights; the sections
             // scroll under it instead of disappearing beneath the titlebar.
@@ -15280,8 +15283,9 @@ impl PilusView {
         style::mix(self.sidebar_fill(), self.theme.muted, 0.5)
     }
 
-    /// The sidebar's fill, opaque: the tab strip's while cards float, so the
-    /// card sits on one continuous ground, else the plain chrome ground.
+    /// The sidebar's ground: the tab strip's while cards float, so the card
+    /// sits on one continuous ground, else the plain chrome ground. Painted
+    /// only by an opaque window; a translucent one leaves the sidebar bare.
     fn sidebar_fill(&self) -> gpui::Rgba {
         if self.floating_cards() {
             self.tab_strip_fill()

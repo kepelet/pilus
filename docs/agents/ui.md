@@ -71,7 +71,9 @@ is the only implementation of it.
   rounded pills keep that gap.
   The sidebar and tab strip take their ground (`Theme::chrome_ground`) only
   when the window is opaque; translucent, both are bare and the frosted
-  backdrop shows through.
+  backdrop shows through. The exception is a translucent sidebar beside
+  floating cards: it wears the cards' `pane_surface`, the same fill the gutter
+  next to it gets, so its edge is not a step.
   `Theme::card_raise` is the terminal card's own color, for raised fills
   that are not tints.
   `selection_bg`/`selection_fg` are for text selection and list highlighting,

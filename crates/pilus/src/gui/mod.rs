@@ -11855,8 +11855,24 @@ impl PilusView {
             .flex_col()
             // Translucent, the panel is bare like the tab strip, so the
             // frosted backdrop and the glass coat show through; solid, it
-            // takes its own ground.
+            // takes its own ground. Floating cards lay a tinted surface under
+            // the gutter beside the panel, so a translucent panel wears that
+            // same surface or its edge shows as a step.
             .when(self.opaque(), |panel| panel.bg(self.sidebar_fill()))
+            .when(!self.opaque() && self.floating_cards(), |panel| {
+                let glass = self.glass_opacity();
+                // It starts where the gutter's does, under the header strip,
+                // which stays bare like the tab strip beside it.
+                panel.child(
+                    div()
+                        .absolute()
+                        .top(px(HEADER_HEIGHT))
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .bg(self.theme.pane_surface(glass).opacity(glass)),
+                )
+            })
             .overflow_hidden()
             // Fixed clearance for the floating traffic lights; the sections
             // scroll under it instead of disappearing beneath the titlebar.

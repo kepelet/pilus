@@ -6546,7 +6546,7 @@ checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 
 [[package]]
 name = "pilus"
-version = "0.3.0"
+version = "2026.11.1"
 dependencies = [
  "anyhow",
  "bezel-mermaid",
@@ -6581,7 +6581,7 @@ dependencies = [
 
 [[package]]
 name = "pilus-agent"
-version = "0.3.0"
+version = "2026.11.1"
 dependencies = [
  "anyhow",
  "iroh",
@@ -6597,7 +6597,7 @@ dependencies = [
 
 [[package]]
 name = "pilus-client"
-version = "0.3.0"
+version = "2026.11.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -6617,7 +6617,7 @@ dependencies = [
 
 [[package]]
 name = "pilus-db"
-version = "0.3.0"
+version = "2026.11.1"
 dependencies = [
  "rusqlite",
  "serde",
@@ -6628,7 +6628,7 @@ dependencies = [
 
 [[package]]
 name = "pilus-index"
-version = "0.3.0"
+version = "2026.11.1"
 dependencies = [
  "pilus-client",
  "pilus-db",
@@ -6640,7 +6640,7 @@ dependencies = [
 
 [[package]]
 name = "pilus-mobile"
-version = "0.3.0"
+version = "2026.11.1"
 dependencies = [
  "iroh",
  "iroh-tickets",
@@ -6653,7 +6653,7 @@ dependencies = [
 
 [[package]]
 name = "pilus-protocol"
-version = "0.3.0"
+version = "2026.11.1"
 dependencies = [
  "bincode 2.0.1",
  "crossterm",

@@ -410,8 +410,8 @@ impl UiPlaygroundView {
             ))
     }
 
-    /// Bordered pills: one that is itself a button (the sidebar's session
-    /// picker) and one holding icon buttons (the top chrome's right toolbar).
+    /// A bordered pill that is itself a button (the sidebar's session picker)
+    /// and an unframed group of icon buttons (the top chrome's right toolbar).
     fn pill_demo(&self) -> Div {
         let theme = self.theme;
         let fonts = self.fonts();
@@ -456,7 +456,7 @@ impl UiPlaygroundView {
                     )),
             )
             .child(
-                style::pill(theme, None)
+                style::button_group()
                     .p(px(2.0))
                     .child(button(
                         "pg-pill-browser",

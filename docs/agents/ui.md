@@ -48,11 +48,16 @@ is the only implementation of it.
     preset per kind (`theme::tile_terminal`, `tile_claude`), not theme
     roles; an agent with no preset keeps the terminal's with its own mark.
     The tab, its pill and the new-tab button are 12px (`Radius::Tab`) whatever the
-    corner setting; the glyph tile inside is two-thirds of that
-    (`Radius::TabTile`). Both go square only when the setting is zero or
+    corner setting; the glyph tile inside takes the same corner
+    (`Radius::TabTile`), which its 20px height clamps to a stadium. Both go square only when the setting is zero or
     energy mode squares the corners. While the first tab list loads, the strip holds
     three skeleton tabs.
   - Accent means progress or focus. It is never a panel edge.
+- **Section headers** in the sidebar may end their hairline in a small icon
+  button (`HeaderButton`): a plus on WORKSPACES opens the folder picker, and a
+  clock on AGENTS opens the status filter. The clock reads in the foreground
+  while a filter is in force. The right toolbar group is unframed
+  (`style::button_group`), unlike a pill that is itself a button.
 - **Selection** in the sidebar (workspace, worktree, agent) is a pill in the
   same tint as a selected tab (`Theme::tint_fill`), with the
   same `theme.border` hairline, `panel_fg`/`muted` text and a bold name.

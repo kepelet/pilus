@@ -67,9 +67,8 @@ pub(super) enum Radius {
     /// A tab: a fixed [`TAB_RADIUS`] whatever the setting, until the
     /// setting squares the corners.
     Tab,
-    /// The glyph tile inside a tab: [`Radius::Sm`]'s two-thirds of the tab's
-    /// radius, fixed the same way, so a 20px tile stays a rounded square
-    /// instead of clamping to a circle.
+    /// The glyph tile inside a tab: the tab's own corner, fixed the same way.
+    /// The tile is only 20px tall, so the corner clamps to a stadium.
     TabTile,
     /// A pill, status dot, or round button: fully round whatever the
     /// setting, since a square one stops reading as what it is. Energy mode
@@ -117,7 +116,7 @@ impl Radius {
             Self::Md => px(base),
             Self::Lg => px(base * 4.0 / 3.0),
             Self::Tab if base > 0.0 => px(TAB_RADIUS),
-            Self::TabTile if base > 0.0 => px(TAB_RADIUS * 2.0 / 3.0),
+            Self::TabTile if base > 0.0 => px(TAB_RADIUS),
             Self::Tab | Self::TabTile => px(0.0),
             Self::Full => px(9999.0),
         }
@@ -326,8 +325,13 @@ pub(super) fn chip(theme: Theme, text: impl IntoElement, size: f32) -> Div {
         .child(text)
 }
 
-/// Side of a [`glyph_tile`].
+/// Height of a [`glyph_tile`], and the box its glyph is sized against.
 pub(super) const GLYPH_TILE: f32 = 20.0;
+/// Room added to each side of a [`glyph_tile`]'s glyph, so the card reads as a
+/// wide key cap rather than a square and a terminal prompt has room to breathe.
+const TILE_PAD_X: f32 = 2.0;
+/// Width of a [`glyph_tile`]'s front card.
+const GLYPH_TILE_W: f32 = GLYPH_TILE + 2.0 * TILE_PAD_X;
 /// The most cards a [`glyph_tile`] stacks; past this the deck would only get
 /// wider.
 pub(super) const STACK_MAX: u16 = 3;
@@ -381,13 +385,15 @@ pub(super) fn glyph_tile(
                 move |bounds, (), window, _cx| {
                     for depth in (1..cards).rev() {
                         let center = point(
-                            bounds.origin.x + px(f32::from(depth) * STACK_STEP + GLYPH_TILE / 2.0),
+                            bounds.origin.x
+                                + px(f32::from(depth) * STACK_STEP + GLYPH_TILE_W / 2.0),
                             bounds.origin.y + px(STACK_PAD + GLYPH_TILE / 2.0),
                         );
                         // Inset by half the stroke so the line lies inside the
                         // tile's footprint, as a border does.
-                        let outline = tilted_square(
+                        let outline = tilted_rect(
                             center,
+                            GLYPH_TILE_W / 2.0 - 0.5,
                             GLYPH_TILE / 2.0 - 0.5,
                             radius,
                             STACK_TILT[usize::from(depth) - 1].to_radians(),
@@ -419,7 +425,7 @@ pub(super) fn glyph_tile(
         .flex()
         .items_center()
         .justify_center()
-        .w(px(GLYPH_TILE))
+        .w(px(GLYPH_TILE_W))
         .h(px(GLYPH_TILE))
         .radius_tab_tile()
         .border_1()
@@ -439,7 +445,7 @@ pub(super) fn glyph_tile(
         div()
             .id("pilus-state-badge")
             .absolute()
-            .left(px(GLYPH_TILE - TILE_BADGE + STACK_PAD))
+            .left(px(GLYPH_TILE_W - TILE_BADGE + STACK_PAD))
             .top_0()
             .w(px(TILE_BADGE))
             .h(px(TILE_BADGE))
@@ -456,7 +462,7 @@ const TILE_BADGE: f32 = 6.0;
 /// peek of each card behind it, and the room their tilt needs.
 pub(super) fn glyph_tile_width(panes: u16) -> f32 {
     let behind = f32::from(panes.clamp(1, STACK_MAX) - 1);
-    GLYPH_TILE + behind * STACK_STEP + STACK_PAD
+    GLYPH_TILE_W + behind * STACK_STEP + STACK_PAD
 }
 
 /// How far before its clip edge a [`fade_text`] line starts to fade.
@@ -515,9 +521,15 @@ fn faded(fade: f32) -> gpui::HighlightStyle {
     }
 }
 
-/// The outline of a square of side `2 * half` with its corners rounded to
-/// `radius`, turned `tilt` radians clockwise about `center`.
-fn tilted_square(center: Point<Pixels>, half: f32, radius: f32, tilt: f32) -> Vec<Point<Pixels>> {
+/// The outline of a rectangle `2 * half_w` wide and `2 * half_h` tall with its
+/// corners rounded to `radius`, turned `tilt` radians clockwise about `center`.
+fn tilted_rect(
+    center: Point<Pixels>,
+    half_w: f32,
+    half_h: f32,
+    radius: f32,
+    tilt: f32,
+) -> Vec<Point<Pixels>> {
     use std::f32::consts::FRAC_PI_2;
     const SEGMENTS: usize = 4;
     let (sin, cos) = tilt.sin_cos();
@@ -527,18 +539,18 @@ fn tilted_square(center: Point<Pixels>, half: f32, radius: f32, tilt: f32) -> Ve
             center.y + px(x * sin + y * cos),
         )
     };
-    let radius = radius.clamp(0.0, half);
+    let radius = radius.clamp(0.0, half_w.min(half_h));
     // A zero radius (energy mode) would repeat each corner, which a stroke
     // tessellates badly.
     if radius < 0.5 {
         return vec![
-            at(-half, -half),
-            at(half, -half),
-            at(half, half),
-            at(-half, half),
+            at(-half_w, -half_h),
+            at(half_w, -half_h),
+            at(half_w, half_h),
+            at(-half_w, half_h),
         ];
     }
-    let inner = half - radius;
+    let (inner_w, inner_h) = (half_w - radius, half_h - radius);
     let mut outline = Vec::with_capacity(4 * (SEGMENTS + 1));
     // Clockwise from the top right corner, each arc a quarter turn.
     for (corner, (side_x, side_y)) in [(1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0)]
@@ -549,8 +561,8 @@ fn tilted_square(center: Point<Pixels>, half: f32, radius: f32, tilt: f32) -> Ve
         for step in 0..=SEGMENTS {
             let angle = start + FRAC_PI_2 * step as f32 / SEGMENTS as f32;
             outline.push(at(
-                side_x * inner + radius * angle.cos(),
-                side_y * inner + radius * angle.sin(),
+                side_x * inner_w + radius * angle.cos(),
+                side_y * inner_h + radius * angle.sin(),
             ));
         }
     }
@@ -676,12 +688,15 @@ pub(super) fn icon_button(
         .child(
             svg()
                 .data(glyph)
-                .w(px(size * 0.58))
-                .h(px(size * 0.58))
+                .w(px(size * ICON_BUTTON_GLYPH))
+                .h(px(size * ICON_BUTTON_GLYPH))
                 .flex_shrink_0()
                 .text_color(fg),
         )
 }
+
+/// The share of an [`icon_button`]'s side its glyph takes.
+pub(super) const ICON_BUTTON_GLYPH: f32 = 0.58;
 
 /// Side of a pane toolbar button. Smaller than a regular compact control: the
 /// strip floats over terminal text, so it should stay out of the way.
@@ -718,6 +733,14 @@ pub(super) fn pill(theme: Theme, hover: Option<Rgba>) -> Div {
         Some(hover) => pill.state_fill(gpui::transparent_black(), hover, Radius::Md),
         None => pill,
     }
+}
+
+/// A group of icon buttons in the top chrome with no frame, for the strip's
+/// trailing edge, where a border would add a fourth line beside the tabs'
+/// own. It keeps a [`pill`]'s corner radius so the buttons' hover fills sit
+/// the same inside it. Fill it with buttons that raise their own fill.
+pub(super) fn button_group() -> Div {
+    div().flex().flex_row().items_center().radius_md()
 }
 
 /// The frame of a segmented control: a short row of mutually exclusive
@@ -3727,17 +3750,17 @@ mod tests {
     }
 
     #[test]
-    fn a_tilted_square_stays_within_its_turned_extent() {
+    fn a_tilted_rect_stays_within_its_turned_extent() {
         let center = point(px(10.0), px(10.0));
         let tilt = 7.0_f32.to_radians();
-        let reach = 10.0 * (tilt.cos() + tilt.sin());
-        let rounded = tilted_square(center, 10.0, 3.0, tilt);
+        let reach = 14.0 * tilt.sin() + 10.0 * tilt.cos();
+        let rounded = tilted_rect(center, 14.0, 10.0, 3.0, tilt);
         assert_eq!(rounded.len(), 20);
         for corner in &rounded {
             assert!((corner.y.as_f32() - 10.0).abs() <= reach + 1e-3);
         }
         // Without a radius the outline is the four corners, not repeats.
-        assert_eq!(tilted_square(center, 10.0, 0.0, tilt).len(), 4);
+        assert_eq!(tilted_rect(center, 14.0, 10.0, 0.0, tilt).len(), 4);
     }
 
     #[test]
@@ -3754,10 +3777,8 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_tile_stays_a_rounded_square_and_squares_with_the_corners() {
-        let tile = Radius::TabTile.resolve(8.0);
-        assert_eq!(tile, px(TAB_RADIUS * 2.0 / 3.0));
-        assert!(tile.as_f32() < GLYPH_TILE / 2.0);
+    fn a_tab_tile_takes_the_tabs_corner_and_squares_with_the_corners() {
+        assert_eq!(Radius::TabTile.resolve(8.0), Radius::Tab.resolve(8.0));
         assert_eq!(Radius::TabTile.resolve(0.0), px(0.0));
     }
 

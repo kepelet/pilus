@@ -53,6 +53,8 @@ pub enum MenuTarget {
         /// Whether it is pinned now, which turns Pin into Unpin.
         pinned: bool,
     },
+    /// The AGENTS header's clock: which statuses the list shows.
+    AgentFilter,
     /// A live AGENTS row, addressed by its pane id.
     Agent {
         /// Endpoint key (`local` or a machine id).
@@ -112,6 +114,13 @@ pub enum Item {
     DeleteWorktree,
     /// Show only the active workspace's agents in the AGENTS dock.
     ToggleScope,
+    /// List agents of every status.
+    FilterAll,
+    /// List only agents of one status (see [`Item::status`]).
+    FilterBlocked,
+    FilterDone,
+    FilterWorking,
+    FilterIdle,
     /// Copy the terminal's highlighted text.
     CopySelection,
     /// Create an empty file in the folder the menu is on.
@@ -181,6 +190,11 @@ impl Item {
                     "Show Workspace Only"
                 }
             }
+            Self::FilterAll => "All Statuses",
+            Self::FilterBlocked => "Blocked",
+            Self::FilterDone => "Done",
+            Self::FilterWorking => "Working",
+            Self::FilterIdle => "Idle",
             Self::NewFile => "New File",
             Self::NewFolder => "New Folder",
             Self::Upload => "Upload Files…",
@@ -224,6 +238,11 @@ impl Item {
             Self::NewWorktree => "arrow.triangle.branch",
             Self::DeleteWorktree | Self::Delete => "trash",
             Self::ToggleScope => "macwindow",
+            Self::FilterAll
+            | Self::FilterBlocked
+            | Self::FilterDone
+            | Self::FilterWorking
+            | Self::FilterIdle => "",
             Self::NewFile => "doc.badge.plus",
             Self::NewFolder => "folder.badge.plus",
             Self::Upload => "square.and.arrow.up",
@@ -240,6 +259,20 @@ impl Item {
             Self::GithubHideSection => "eye.slash",
             Self::GithubDisable => "power",
             Self::Divider => "",
+        }
+    }
+}
+
+impl Item {
+    /// The daemon's status a filter row stands for; `None` for every other
+    /// row, and for [`Item::FilterAll`], which stands for no status at all.
+    pub fn status(self) -> Option<&'static str> {
+        match self {
+            Self::FilterBlocked => Some("blocked"),
+            Self::FilterDone => Some("done"),
+            Self::FilterWorking => Some("working"),
+            Self::FilterIdle => Some("idle"),
+            _ => None,
         }
     }
 }
@@ -271,6 +304,9 @@ pub struct Labels {
     pub scoped: bool,
     /// How many repositories the GitHub section knows, shown on its first row.
     pub repos: usize,
+    /// The one status the AGENTS list is narrowed to, which its filter menu
+    /// ticks; `None` when it lists them all.
+    pub status: Option<&'static str>,
 }
 
 impl MenuTarget {
@@ -287,6 +323,7 @@ impl MenuTarget {
             }
             Self::Saved { pinned, .. } => saved_rows(*pinned),
             Self::Agent { .. } => agent_rows(),
+            Self::AgentFilter => agent_filter_rows(),
             Self::Terminal { selection, agent } => terminal_rows(*selection, *agent),
             Self::Tab { .. } => tab_rows(),
             Self::Github => github_rows(),
@@ -334,10 +371,23 @@ fn action(item: Item, labels: Labels) -> Entry {
     if item == Item::GithubAll {
         title.push_str(&format!(" · {}", labels.repos));
     }
+    // A filter row is ticked when it is the one in force.
+    let ticked = matches!(
+        item,
+        Item::FilterAll
+            | Item::FilterBlocked
+            | Item::FilterDone
+            | Item::FilterWorking
+            | Item::FilterIdle
+    ) && item.status() == labels.status;
     Entry::Action {
         item,
         title,
-        symbol: item.symbol(labels.paths_visible),
+        symbol: if ticked {
+            "checkmark"
+        } else {
+            item.symbol(labels.paths_visible)
+        },
     }
 }
 
@@ -408,6 +458,19 @@ fn agent_rows() -> Vec<Item> {
         Item::TogglePaths,
         Item::Divider,
         Item::ToggleScope,
+    ]
+}
+
+/// The AGENTS header's clock: every status, then one row per status in the
+/// order the list sorts them.
+fn agent_filter_rows() -> Vec<Item> {
+    vec![
+        Item::FilterAll,
+        Item::Divider,
+        Item::FilterBlocked,
+        Item::FilterDone,
+        Item::FilterWorking,
+        Item::FilterIdle,
     ]
 }
 
@@ -668,6 +731,32 @@ mod tests {
     }
 
     #[test]
+    fn the_filter_menu_ticks_the_status_in_force() {
+        let ticked = |status| -> Vec<Item> {
+            MenuTarget::AgentFilter
+                .entries(
+                    false,
+                    Labels {
+                        status,
+                        ..Labels::default()
+                    },
+                )
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    Entry::Action {
+                        item,
+                        symbol: "checkmark",
+                        ..
+                    } => Some(item),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(ticked(None), [Item::FilterAll]);
+        assert_eq!(ticked(Some("done")), [Item::FilterDone]);
+    }
+
+    #[test]
     fn entries_take_their_wording_from_the_window() {
         let agent = MenuTarget::Agent {
             endpoint: "local".into(),
@@ -678,6 +767,7 @@ mod tests {
             paths_visible: true,
             scoped: true,
             repos: 0,
+            status: None,
         };
         let titles: Vec<String> = agent
             .entries(false, labels)

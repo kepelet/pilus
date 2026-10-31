@@ -494,6 +494,7 @@ impl PilusView {
                         cx.notify();
                     }),
                     menu: true,
+                    button: None,
                 },
                 cx,
             ))

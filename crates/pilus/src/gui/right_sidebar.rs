@@ -448,18 +448,8 @@ impl PilusView {
         self.select_right_tab(SidebarTab::Ports, cx);
     }
 
-    /// The pilus mark: open the column on Sipil, or close it when Sipil is
-    /// already showing. The panel is made on the first open, so a person who
-    /// never opens sipil never gets an identity key.
-    pub(super) fn toggle_sipil(&mut self, cx: &mut Context<Self>) {
-        if self.right.visible && self.right.tab == SidebarTab::Sipil {
-            self.toggle_right_sidebar(cx);
-            return;
-        }
-        self.show_sipil(cx);
-    }
-
-    /// Open the column on Sipil and leave it there if it already is.
+    /// Open the column on Sipil (palette: Show Sipil). The panel is made on the
+    /// first open, so a person who never opens sipil never gets an identity key.
     pub(super) fn show_sipil(&mut self, cx: &mut Context<Self>) {
         // Opening it is a reason to ask the daemons that gave up whether they
         // are back.
@@ -720,48 +710,6 @@ impl PilusView {
         }
     }
 
-    /// The way into the Sipil tab, drawn as the pilus mark in outline. It leads the pill,
-    /// before the Browser, and lights while the tab is open. Whether a sipil is
-    /// up is on its own sidebar row.
-    pub(super) fn right_sipil_toggle(
-        &self,
-        id: &'static str,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let theme = self.theme;
-        div()
-            .id(id)
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .flex_shrink_0()
-            .h(px(super::PILL_BUTTON_H))
-            .w(px(super::PILL_BUTTON_W))
-            .radius_sm()
-            .cursor_pointer()
-            .hover_fill(
-                theme.card_raise(super::SIDEBAR_HOVER_WEIGHT),
-                style::RADIUS_SM,
-            )
-            .tooltip(super::row_tooltip(
-                "Sipil".to_string(),
-                theme.panel_fg,
-                Vec::new(),
-                theme,
-            ))
-            .child(icon(
-                include_bytes!("../../assets/icons/pilus-mark-outline.svg"),
-                14.0,
-                if self.right.visible && self.right.tab == SidebarTab::Sipil {
-                    theme.panel_fg
-                } else {
-                    theme.muted
-                },
-            ))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_sipil(cx)))
-    }
-
     /// The Ports button beside the sidebar toggle, lit while Ports is open.
     pub(super) fn right_ports_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
@@ -820,14 +768,13 @@ impl PilusView {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx)))
     }
 
-    /// Sipil, Browser, Ports, and the sidebar toggle as one bordered pill at the strip's
+    /// Browser, Ports, and the sidebar toggle as one unframed group at the strip's
     /// far edge, each button raising its own fill on hover.
     pub(super) fn right_toolbar(&self, cx: &mut Context<Self>) -> Div {
-        style::pill(self.theme, None)
+        style::button_group()
             .occlude()
             .p(px(super::PILL_PAD))
             .flex_shrink_0()
-            .child(self.right_sipil_toggle("pilus-right-sipil-toggle", cx))
             .child(self.right_browser_toggle(cx))
             .child(self.right_ports_toggle(cx))
             .child(self.right_sidebar_toggle(cx))
@@ -928,10 +875,9 @@ impl PilusView {
                     })),
             )
             .child(
-                style::pill(theme, None)
+                style::button_group()
                     .p(px(super::PILL_PAD))
                     .flex_shrink_0()
-                    .child(self.right_sipil_toggle("pilus-right-sidebar-sipil", cx))
                     .child(self.strip_browser_toggle(cx))
                     .child(
                         div()

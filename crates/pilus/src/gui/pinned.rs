@@ -207,6 +207,7 @@ impl PilusView {
                         cx.notify();
                     }),
                     menu: false,
+                    button: None,
                 },
                 cx,
             ));

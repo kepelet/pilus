@@ -251,6 +251,8 @@ const SIDEBAR_HEAD_INSET: f32 = 8.0;
 /// Height of a one-line band that carries no control: a section header, an
 /// endpoint group label, or an empty-state placeholder.
 const SIDEBAR_BAND_HEIGHT: f32 = 24.0;
+/// Side of the icon button ending a section header's hairline.
+const HEADER_BUTTON: f32 = 20.0;
 /// How long after a sidebar section header is clicked its chevron may still
 /// turn: past the turn itself, so a late frame still catches it.
 const SECTION_TURN_WINDOW: Duration = Duration::from_millis(400);
@@ -1521,6 +1523,18 @@ struct SectionHeader {
     toggle: SectionAction,
     /// Whether a right-click on the header opens the GitHub section's menu.
     menu: bool,
+    /// A button at the hairline's end, if the section has one.
+    button: Option<HeaderButton>,
+}
+
+/// A small icon button at the end of a section header's hairline.
+struct HeaderButton {
+    id: &'static str,
+    glyph: &'static [u8],
+    tip: &'static str,
+    /// Drawn in the foreground rather than muted: a filter is in force.
+    lit: bool,
+    on_click: SectionAction,
 }
 
 /// One row of the SIPIL section.
@@ -2132,6 +2146,9 @@ struct PilusView {
     sidebar_agent_paths: bool,
     /// Whether AGENTS shows only the active workspace's agents.
     agents_this_workspace: bool,
+    /// The one status AGENTS is narrowed to (`blocked`, `done`, `working` or
+    /// `idle`), or `None` for all of them.
+    agent_status: Option<&'static str>,
     /// The last right-click menu shown and the row it is on, so a worktree
     /// probe that lands while it is up can add its row in place.
     open_menu: Option<(SidebarMenuTarget, native_menu::Menu)>,
@@ -2810,6 +2827,7 @@ impl PilusView {
             sidebar_workspace_paths,
             sidebar_agent_paths,
             agents_this_workspace: false,
+            agent_status: None,
             open_menu: None,
             menu_prompt: None,
             menu_prompt_field,
@@ -5397,6 +5415,7 @@ impl PilusView {
                 "View",
                 Some("⌘B"),
             ),
+            entry(Command::ShowSipil, "Show Sipil", "View", None),
             entry(
                 Command::ToggleEnergyMode,
                 if self.settings.energy_mode {
@@ -5529,6 +5548,7 @@ impl PilusView {
             Command::CloseWindow => window.dispatch_action(CloseWindow.boxed_clone(), cx),
             Command::CloseAllWindows => window.dispatch_action(CloseAllWindows.boxed_clone(), cx),
             Command::ToggleSidebar => window.dispatch_action(ToggleSidebar.boxed_clone(), cx),
+            Command::ShowSipil => self.show_sipil(cx),
             Command::ToggleRightSidebar => {
                 window.dispatch_action(ToggleRightSidebar.boxed_clone(), cx)
             }
@@ -5622,6 +5642,17 @@ impl PilusView {
         if self.agents_collapsed {
             return false;
         }
+        self.listed_agents()
+            .iter()
+            .any(|(id, agent)| self.agent_focused(id, agent))
+    }
+
+    /// The agents the AGENTS section lists, in its order: blocked first, for
+    /// it waits on a person, then done, working and idle. Across machines the
+    /// feed's own order breaks a tie. The scope and status filters apply.
+    fn listed_agents(&self) -> Vec<(EndpointId, &Agent)> {
+        // The AGENTS-scope menu row narrows the dock to the visible surface's
+        // active workspace, mirroring the daemon's own scope filter.
         let scoped_workspace = if self.agents_this_workspace {
             self.endpoint_workspaces(&self.active)
                 .iter()
@@ -5630,14 +5661,25 @@ impl PilusView {
         } else {
             None
         };
-        self.connected_endpoints().iter().any(|id| {
-            self.endpoint_agents(id).iter().any(|agent| {
+        let mut listed: Vec<(EndpointId, &Agent)> = self
+            .connected_endpoints()
+            .into_iter()
+            .flat_map(|id| {
+                self.endpoint_agents(&id)
+                    .iter()
+                    .map(move |agent| (id.clone(), agent))
+            })
+            .filter(|(_, agent)| {
                 scoped_workspace
                     .as_ref()
                     .is_none_or(|workspace| agent.workspace_id == *workspace)
-                    && self.agent_focused(id, agent)
+                    && self
+                        .agent_status
+                        .is_none_or(|status| agent.status == status)
             })
-        })
+            .collect();
+        listed.sort_by_key(|(_, agent)| agent_status_rank(&agent.status));
+        listed
     }
 
     /// Focus a workspace by id, switching the daemon's active workspace.
@@ -10689,6 +10731,7 @@ impl PilusView {
             | SidebarMenuTarget::Terminal { .. }
             | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
+            | SidebarMenuTarget::AgentFilter
             | SidebarMenuTarget::File { .. } => None,
         };
         if let Some((endpoint, workspace_id, index, target)) = workspace_probe {
@@ -10772,6 +10815,7 @@ impl PilusView {
             | SidebarMenuTarget::Terminal { .. }
             | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
+            | SidebarMenuTarget::AgentFilter
             | SidebarMenuTarget::File { .. } => return,
         };
         let workspace_id = workspace_id.to_string();
@@ -10813,6 +10857,7 @@ impl PilusView {
             | SidebarMenuTarget::Terminal { .. }
             | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
+            | SidebarMenuTarget::AgentFilter
             | SidebarMenuTarget::File { .. } => false,
         }
     }
@@ -10828,9 +10873,11 @@ impl PilusView {
             | SidebarMenuTarget::Terminal { .. }
             | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
+            | SidebarMenuTarget::AgentFilter
             | SidebarMenuTarget::File { .. } => (false, false),
         };
         MenuLabels {
+            status: self.agent_status,
             paths_visible,
             scoped,
             repos: self.github.repos.items.len(),
@@ -10949,6 +10996,10 @@ impl PilusView {
             }
             (SidebarMenuTarget::Agent { .. }, SidebarItem::ToggleScope) => {
                 self.agents_this_workspace = !self.agents_this_workspace;
+                cx.notify();
+            }
+            (SidebarMenuTarget::AgentFilter, item) => {
+                self.agent_status = item.status();
                 cx.notify();
             }
             (SidebarMenuTarget::Terminal { .. }, item) => {
@@ -13986,7 +14037,7 @@ impl PilusView {
     fn sipil_sections(&self, cx: &mut Context<Self>) -> Vec<Div> {
         // Shown only for a pilus that is switched on and has something to list;
         // the Sipil tab, where a first agent or contact is added, opens from
-        // the pilus mark in the right toolbar.
+        // the command palette (Show Sipil).
         if !self.sipil_listed() {
             return Vec::new();
         }
@@ -14020,6 +14071,7 @@ impl PilusView {
                         cx.notify();
                     }),
                     menu: false,
+                    button: None,
                 },
                 cx,
             ));
@@ -14376,6 +14428,7 @@ impl PilusView {
             collapsed,
             toggle,
             menu,
+            button,
         } = spec;
         let theme = self.theme;
 
@@ -14434,6 +14487,34 @@ impl PilusView {
                         )
                     }),
             )
+            .children(button.map(|button| {
+                let HeaderButton {
+                    id,
+                    glyph,
+                    tip,
+                    lit,
+                    on_click,
+                } = button;
+                // Past the hairline, with its glyph over the agent rows'
+                // trailing brand mark: the header breaks out of the row inset,
+                // so the button gives it back less the glyph's own margin.
+                let margin = (HEADER_BUTTON - HEADER_BUTTON * style::ICON_BUTTON_GLYPH) / 2.0;
+                let kind = if lit {
+                    style::ButtonKind::Secondary
+                } else {
+                    style::ButtonKind::Ghost
+                };
+                style::icon_button(id, glyph, kind, theme, HEADER_BUTTON)
+                    .ml_1()
+                    .mr(px(self.sidebar_row_edge_right() + SIDEBAR_ROW_PAD - margin))
+                    .tooltip(row_tooltip(
+                        tip.to_string(),
+                        theme.panel_fg,
+                        Vec::new(),
+                        theme,
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)))
+            }))
     }
 
     /// Expand the daemon's `~`-shorthand dirs against the owning machine.
@@ -14560,6 +14641,13 @@ impl PilusView {
                         cx.notify();
                     }),
                     menu: false,
+                    button: Some(HeaderButton {
+                        id: "pilus-workspaces-open",
+                        glyph: include_bytes!("../../assets/icons/plus.svg"),
+                        tip: "Open Workspace",
+                        lit: false,
+                        on_click: Box::new(|this, cx| this.open_picker(cx)),
+                    }),
                 },
                 cx,
             ));
@@ -14851,6 +14939,15 @@ impl PilusView {
                         cx.notify();
                     }),
                     menu: false,
+                    button: Some(HeaderButton {
+                        id: "pilus-agents-filter",
+                        glyph: include_bytes!("../../assets/icons/clock.svg"),
+                        tip: "Filter by status",
+                        lit: self.agent_status.is_some(),
+                        on_click: Box::new(|this, cx| {
+                            this.open_context_menu(SidebarMenuTarget::AgentFilter, cx);
+                        }),
+                    }),
                 },
                 cx,
             ));
@@ -14858,31 +14955,11 @@ impl PilusView {
             return section;
         }
         let mut children = div().flex().flex_col().gap_1();
-        let mut any = false;
-        // The AGENTS-scope menu row narrows the dock to the visible surface's
-        // active workspace, mirroring the daemon's own scope filter.
-        let scoped_workspace = if self.agents_this_workspace {
-            self.endpoint_workspaces(&self.active)
-                .iter()
-                .find(|workspace| workspace.active)
-                .map(|workspace| workspace.id.clone())
-        } else {
-            None
-        };
-        for id in self.connected_endpoints() {
-            let mut agents: Vec<&Agent> = self.endpoint_agents(&id).iter().collect();
-            if let Some(workspace_id) = &scoped_workspace {
-                agents.retain(|agent| agent.workspace_id == *workspace_id);
-            }
-            if agents.is_empty() {
-                continue;
-            }
-            any = true;
-            for agent in agents {
-                children = children.child(self.agent_row(&id, agent, cx));
-            }
+        let listed = self.listed_agents();
+        for (id, agent) in &listed {
+            children = children.child(self.agent_row(id, agent, cx));
         }
-        if !any {
+        if listed.is_empty() {
             let loading = self
                 .connected_endpoints()
                 .iter()
@@ -14897,7 +14974,11 @@ impl PilusView {
                     .pl(px(SIDEBAR_ROW_PAD))
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
-                    .child("No agents")
+                    .child(if self.agent_status.is_some() {
+                        "No matching agents"
+                    } else {
+                        "No agents"
+                    })
             });
         }
         section.child(style::enter("pilus-agents-rows", children))
@@ -17810,6 +17891,18 @@ impl Render for SipilDrag {
     }
 }
 
+/// Where an agent's status sits in the AGENTS list: what waits on a person
+/// first, then what finished, what runs, and what idles.
+fn agent_status_rank(status: &str) -> u8 {
+    match status {
+        "blocked" => 0,
+        "done" => 1,
+        "working" => 2,
+        "idle" => 3,
+        _ => 4,
+    }
+}
+
 /// A color for an agent status dot. Blocked, working and done keep one color
 /// each whatever the theme, so a state reads the same everywhere.
 fn status_color(status: &str, theme: Theme) -> gpui::Rgba {
@@ -17917,6 +18010,13 @@ fn launch_home_agent(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agents_sort_blocked_then_done_then_working_then_idle() {
+        let mut statuses = ["idle", "working", "done", "blocked", "other"];
+        statuses.sort_by_key(|status| agent_status_rank(status));
+        assert_eq!(statuses, ["blocked", "done", "working", "idle", "other"]);
+    }
+
     #[test]
     fn the_tick_loop_runs_at_the_frame_rate_only_while_something_moves() {
         assert_eq!(next_tick(true, true, false), FRAME);

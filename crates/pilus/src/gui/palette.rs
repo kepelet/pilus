@@ -26,6 +26,7 @@ pub enum Command {
     CloseAllWindows,
     ToggleSidebar,
     ToggleRightSidebar,
+    ShowSipil,
     TogglePaneToolbar,
     ToggleEnergyMode,
     IncreaseFontSize,

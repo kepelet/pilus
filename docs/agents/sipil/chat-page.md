@@ -42,9 +42,9 @@ The section is always there.
 
 There is no separate sipil window.
 
-- The way in is the outlined pilus mark at the head of the right toolbar pill,
-  before Browser (`right_sipil_toggle`). It opens the right sidebar's Sipil tab
-  (`SidebarTab::Sipil`, the `SipilPanel` in `sipil_panel.rs`).
+- The way in is the command palette's Show Sipil (`Command::ShowSipil`), which
+  opens the right sidebar's Sipil tab (`SidebarTab::Sipil`, the `SipilPanel` in
+  `sipil_panel.rs`). The right toolbar has no button for it.
 - The panel is made the first time it opens, and that is when the identity key
   is written (see [network.md](network.md#the-node-and-identity)).
 - It takes the keyboard as `InputLayer::SipilPanel` while the column has focus.

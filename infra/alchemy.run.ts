@@ -22,15 +22,15 @@ export default Alchemy.Stack(
     });
 
     // `site/` is a Blume project; `bun run build` there writes the static site
-    // to `site/dist`. Only the landing page and the files it loads are public:
-    // `runWorkerFirst` sends every other path to the Worker, which answers 404
-    // (see `site/worker.ts`), so the built docs and blog stay unpublished.
+    // to `site/dist`, all of which is public. `runWorkerFirst` sends only the
+    // short links (`/ios`) to the Worker (see `site/worker.ts`); unknown paths
+    // get Blume's `404.html` from the asset layer.
     const site = yield* Cloudflare.Worker("Site", {
       main: "./site/worker.ts",
       assets: {
         directory: "../site/dist",
         htmlHandling: "auto-trailing-slash",
-        notFoundHandling: "none",
+        notFoundHandling: "404-page",
         runWorkerFirst: workerFirstGlobs(),
       },
       domain: "usepilus.dev",

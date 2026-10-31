@@ -41,15 +41,11 @@ page at `/`, `docs/*.md` are the docs under `/docs`, and `public/` holds the sta
 `just site-build` writes `site/dist`, which is what the Worker uploads; `infra-plan` and
 `infra-deploy` run it first. `just site-dev` serves the site locally.
 
-Only the landing page is public. `PUBLIC` in `site/worker.ts` lists the paths the
-asset layer still serves: `/` and the stylesheet, scripts, fonts and images it
-loads. `workerFirstGlobs()` feeds `runWorkerFirst` as `/*` minus those paths, so
-every other request, built docs and blog included, reaches the Worker first and
-gets a bare 404 that names no other page (not Blume's `404.html`, which links to
-them). Add a prefix to `PUBLIC` to publish a section again, and update the
-links in `site/pages/index.astro` and the `blume.config.ts` sidebar with it. A
-catch-all in `_redirects` would not work: the asset router applies redirect
-rules before the manifest.
+The whole built site is public, and unknown paths get Blume's `404.html` from the asset
+layer. `REDIRECTS` in `site/worker.ts` maps short links to external URLs (today `/ios`,
+the TestFlight invite, as a 302). `workerFirstGlobs()` feeds `runWorkerFirst` with
+just those paths, so only they reach the Worker. `/download` is the exception to a static map: the Worker reads `pilus/stable.json` and redirects (302) to the macOS DMG it names, so `publish-release.sh stable` is the only step that moves the download button. They cannot live in `_redirects`,
+which is meant for on-site rules.
 
 State lives in a state-store Worker in the Cloudflare account (`Cloudflare.state()`),
 which Alchemy bootstraps on the first deploy. `just infra-plan` and

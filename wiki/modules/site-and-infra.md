@@ -34,7 +34,7 @@ The site's docs are written in Indonesian; the architectural prose in this wiki 
 ### Infra
 
 - [infra/alchemy.run.ts](../../infra/alchemy.run.ts) — a Worker for `usepilus.dev` serving `../site/dist` with a `/` redirect fallback, and an R2 bucket observed by name (`PILUS_RELEASES_BUCKET`) with the `releases.kepelet.com` domain. State lives in a Cloudflare state-store Worker bootstrapped on first deploy.
-- [infra/site/worker.ts](../../infra/site/worker.ts) — the site's only server-side code: every path outside `PUBLIC` (the landing page and its assets) answers 404.
+- [infra/site/worker.ts](../../infra/site/worker.ts) — the site's only server-side code: `REDIRECTS` short links (today `/ios` → TestFlight) and `/download`, which redirects to the DMG in the stable manifest. Every other path is served by the asset layer.
 - [docs/infra.md](../../docs/infra.md) — first-deploy steps, including the hostname conflict to clear before attaching `usepilus.dev`.
 
 ### Scripts

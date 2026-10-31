@@ -1,52 +1,71 @@
 /**
- * usepilus.dev's only server-side behaviour: the landing page is the whole
- * published site, and every other path answers 404. The docs, blog and
- * changelog are built but not announced, and a page that is not ready should
- * look like it does not exist rather than like a half-finished page.
+ * usepilus.dev's only server-side behaviour: short links that leave the site,
+ * and `/download`, which follows the latest stable DMG.
+ * Everything else, the landing page, docs, blog and changelog included, is
+ * served straight from the asset layer, with Blume's own `404.html` for
+ * unknown paths.
  *
- * The asset layer serves everything in `PUBLIC`: the landing page and the files
- * it loads. `alchemy.run.ts` routes every other path to this Worker first (see
- * `workerFirstGlobs`), so a built page, its markdown twin, `sitemap.xml` and
- * the rest never reach the asset layer. Publishing a section again means adding
- * its prefix to `PUBLIC`; update the landing page's links at the same time.
+ * `alchemy.run.ts` runs this Worker first only for the paths in
+ * {@link REDIRECTS} and {@link DOWNLOAD_PATH} (see `workerFirstGlobs`), so no other request reaches it.
  *
- * This cannot live in `_redirects`: a 404 is not a redirect, and the asset
- * router matches redirect rules ahead of the manifest.
+ * This cannot live in `_redirects`: the asset router would need a rule that
+ * points off-site, and keeping every redirect in one typed map next to its
+ * test is easier to review than a second file format.
  */
 
-/**
- * Paths the asset layer still serves: the landing page (`/`, which the
- * `auto-trailing-slash` handling resolves to `index.html`) and the stylesheet,
- * scripts, fonts and images it loads. `/*` entries cover a whole directory.
- */
-export const PUBLIC = ["/", "/index.html", "/tokens.css", "/_astro/*", "/assets/*", "/fonts/*"];
+/** Short links and where they go. */
+export const REDIRECTS: Readonly<Record<string, string>> = {
+  "/ios": "https://testflight.apple.com/join/cdZPNhVS",
+};
 
 /**
- * `runWorkerFirst` rules for `alchemy.run.ts`: everything runs the Worker
- * first except {@link PUBLIC}. A negated rule wins over `/*`.
+ * `/download` follows the stable channel's manifest, the same file the app's
+ * updater reads, so publishing a release (`publish-release.sh stable`) moves
+ * the download button with no site deploy and no second copy of the DMG.
  */
-export function workerFirstGlobs(allowed: readonly string[] = PUBLIC): string[] {
-  return ["/*", ...allowed.map((path) => `!${path}`)];
+export const DOWNLOAD_PATH = "/download";
+export const STABLE_MANIFEST = "https://releases.kepelet.com/pilus/stable.json";
+const RELEASES_ORIGIN = "https://releases.kepelet.com";
+
+/**
+ * `runWorkerFirst` rules for `alchemy.run.ts`: each redirect path, with and
+ * without the trailing slash.
+ */
+export function workerFirstGlobs(paths: readonly string[] = [...Object.keys(REDIRECTS), DOWNLOAD_PATH]): string[] {
+  return paths.flatMap((path) => [path, `${path}/`]);
 }
 
-/**
- * A bare 404, not Blume's `404.html`: that page links to the blog, the
- * changelog and the sitemap, which would advertise the pages this Worker is
- * hiding. Nothing here mentions them.
- */
-const NOT_FOUND_HTML = `<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>404 — pilus</title>
-<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0e0e10;color:#f5f2ec;font:400 16px/1.6 Arimo,system-ui,sans-serif}main{text-align:center;padding:2rem}a{color:#e99a24}</style></head>
-<body><main><h1>404</h1><p>This page does not exist.</p><p><a href="/">Back to home</a></p></main></body></html>
-`;
+type Fetcher = (input: string) => Promise<Response>;
 
-function notFound(): Response {
-  return new Response(NOT_FOUND_HTML, {
-    status: 404,
-    headers: { "content-type": "text/html; charset=utf-8" },
-  });
+/** The macOS DMG URL the stable manifest advertises, or `undefined` when it cannot be trusted. */
+export async function latestDmgUrl(fetcher: Fetcher = fetch): Promise<string | undefined> {
+  try {
+    const response = await fetcher(STABLE_MANIFEST);
+    if (!response.ok) return undefined;
+    const manifest = (await response.json()) as { assets?: { os?: string; format?: string; url?: string }[] };
+    const url = manifest.assets?.find((asset) => asset.os === "macos" && asset.format === "dmg")?.url;
+    // The manifest is data, not a place to send visitors: only our own bucket.
+    return url?.startsWith(`${RELEASES_ORIGIN}/`) ? url : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function handle(request: Request, fetcher: Fetcher = fetch): Promise<Response> {
+  const path = new URL(request.url).pathname.replace(/\/+$/, "");
+
+  if (path === DOWNLOAD_PATH) {
+    const url = await latestDmgUrl(fetcher);
+    // 302: the target changes with every release, so it must not be cached.
+    return url ? Response.redirect(url, 302) : new Response("The download is unavailable right now.", { status: 502 });
+  }
+
+  const target = Object.hasOwn(REDIRECTS, path) ? REDIRECTS[path] : undefined;
+  // 302, not 301: the invite link is rotated by TestFlight, and a browser
+  // must not cache the old one for good.
+  return target ? Response.redirect(target, 302) : new Response(null, { status: 404 });
 }
 
 export default {
-  fetch: (): Response => notFound(),
+  fetch: (request: Request): Promise<Response> => handle(request),
 };

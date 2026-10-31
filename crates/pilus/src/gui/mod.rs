@@ -17556,6 +17556,9 @@ fn linked_worktree_by_tail(worktrees: &[WorktreeInfo], tail: &str) -> Option<Str
 fn tile_look(kind: &str) -> theme::TileLook {
     if kind.trim().to_ascii_lowercase().contains("claude") {
         theme::tile_claude()
+    } else if agent_icon(kind) == include_bytes!("../../assets/icons/agents/pi.svg") {
+        // Through `agent_icon`, so `copilot` (which contains `pi`) stays out.
+        theme::tile_pi()
     } else {
         theme::tile_terminal()
     }

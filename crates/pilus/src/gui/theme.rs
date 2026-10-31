@@ -65,6 +65,14 @@ pub fn tile_claude() -> TileLook {
     }
 }
 
+/// Pi: black card, white mark, to match its own monochrome logo.
+pub fn tile_pi() -> TileLook {
+    TileLook {
+        face: rgb(0x0a0a0a),
+        glyph: rgb(0xffffff),
+    }
+}
+
 /// How far translucent chrome darkens `window_bg` toward black.
 const CHROME_SHADE: f32 = 0.35;
 /// How much of the remaining transparency translucent chrome fills in, so it

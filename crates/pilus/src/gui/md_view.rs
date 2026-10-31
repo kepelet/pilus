@@ -678,10 +678,10 @@ impl PilusView {
         match row {
             Row::Block(block) => self.md_block_row(page, doc, ix, block, cx),
             Row::Note(index) => match self.diff_panel.file_note(index) {
-                Some(note) => self.diff_note_card(note, 0.0, cx),
+                Some(note) => self.diff_note_card(note, cx),
                 None => div().into_any_element(),
             },
-            Row::Composer => self.diff_composer(0.0, cx),
+            Row::Composer => self.diff_composer(cx),
             Row::Gap(count) => div()
                 .px_3()
                 .py_2()

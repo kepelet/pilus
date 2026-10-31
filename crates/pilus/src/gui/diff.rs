@@ -3052,16 +3052,10 @@ impl PilusView {
             Row::Stack(src) => self.diff_stack_row(ix, src, cx),
             Row::Split { left, right } => self.diff_split_row(ix, left, right, cx),
             Row::Note(index) => match panel.file_notes.get(index) {
-                Some(note) => self.diff_note_card(
-                    note,
-                    style::scaled(&self.shared_settings, GUTTER) * 2.0,
-                    cx,
-                ),
+                Some(note) => self.diff_note_card(note, cx),
                 None => div().into_any_element(),
             },
-            Row::Composer => {
-                self.diff_composer(style::scaled(&self.shared_settings, GUTTER) * 2.0, cx)
-            }
+            Row::Composer => self.diff_composer(cx),
         }
     }
 
@@ -3366,12 +3360,11 @@ impl PilusView {
             .into_any_element()
     }
 
-    /// A note's card, set in by `indent` so it lines up under the code of a
-    /// patch; a document has no gutter and passes 0.
+    /// A note's card, running the full width of the row: a narrow sidebar
+    /// has no room to spare for a gutter-sized indent.
     pub(super) fn diff_note_card(
         &self,
         note: &DiffNote,
-        indent: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = self.theme;
@@ -3470,14 +3463,14 @@ impl PilusView {
             );
         div()
             .w_full()
-            .px_4()
+            .px_2()
             .py_1()
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .ml(px(indent))
+                    .w_full()
                     .p_2()
                     .radius_md()
                     .border_1()
@@ -3497,7 +3490,7 @@ impl PilusView {
             .into_any_element()
     }
 
-    pub(super) fn diff_composer(&self, indent: f32, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn diff_composer(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let Some(composer) = &self.diff_panel.composer else {
@@ -3536,14 +3529,14 @@ impl PilusView {
         };
         div()
             .w_full()
-            .px_4()
+            .px_2()
             .py_1()
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .ml(px(indent))
+                    .w_full()
                     .p_2()
                     .radius_md()
                     .border_1()

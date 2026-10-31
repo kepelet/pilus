@@ -787,11 +787,11 @@ impl PilusView {
             .when(!floating, |strip| {
                 strip.border_b_1().border_color(theme.border)
             })
-            // No leading padding: `lights` only clears the traffic lights when
-            // the left sidebar is away. The trailing gap is the window strip's
-            // own, so the close button lands where the toolbar's toggle did and
-            // lines up with the body card's right edge.
-            .pl(px(lights))
+            // `lights` clears the traffic lights when the left sidebar is away.
+            // Both gaps are the window strip's own, so the close button lands
+            // where the toolbar's toggle did and the back chevron mirrors it,
+            // each lined up with the body card's edge.
+            .pl(px(lights + super::pane_chrome::GAP_PX))
             .pr(px(super::pane_chrome::GAP_PX))
             .child(
                 self.right_step_button(

@@ -85,6 +85,10 @@ is the only implementation of it.
   backdrop shows through. The exception is a translucent sidebar beside
   floating cards: it wears the cards' `pane_surface`, the same fill the gutter
   next to it gets, so its edge is not a step.
+  The glass coat and, beside floating cards, the `pane_surface` run up
+  through the header band too, so the tab strip is the same glass as the
+  rest of the window; a bare band reads as a lighter strip, most of all over
+  fullscreen's dark backdrop.
   `Theme::card_raise` is the terminal card's own color, for raised fills
   that are not tints.
   `selection_bg`/`selection_fg` are for text selection and list highlighting,

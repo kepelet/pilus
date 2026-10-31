@@ -11878,8 +11878,8 @@ impl PilusView {
             .when(self.opaque(), |panel| panel.bg(self.sidebar_fill()))
             .when(!self.opaque() && self.floating_cards(), |panel| {
                 let glass = self.glass_opacity();
-                // It starts where the gutter's does, under the header strip,
-                // which stays bare like the tab strip beside it.
+                // It starts where the gutter's does, under the header strip;
+                // the root's header band paints the same surface above it.
                 panel.child(
                     div()
                         .absolute()
@@ -15466,7 +15466,21 @@ impl Render for PilusView {
         // backdrop, which would otherwise leak the desktop through the inset
         // card's margins. Only the translucent window leans on the coat; an
         // opaque one paints its flat base.
-        let coat = glass_coat(theme, blur, opaque, HEADER_HEIGHT);
+        let coat = glass_coat(theme, blur, opaque);
+        let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
+        // Floating cards lay a tinted surface under the gutters and the
+        // sidebar from the header down; this carries it up through the
+        // header band, so the tab strip reads as the same glass as the rest
+        // rather than a lighter strip of bare backdrop.
+        let header_surface = (!opaque && self.floating_cards()).then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(HEADER_HEIGHT))
+                .bg(theme.pane_surface(glass).opacity(glass))
+        });
         let cell_height = self.cell_height();
         let cell_width = self.cell_width(window);
         let layout = self.card_layout(window);
@@ -15714,7 +15728,6 @@ impl Render for PilusView {
                     }),
             );
         let luvus_missing = self.luvus_missing();
-        let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
         let sidebar = if luvus_missing {
             div()
         } else {
@@ -15916,6 +15929,7 @@ impl Render for PilusView {
         .size_0();
 
         root.child(coat)
+            .children(header_surface)
             .child(drag_tracker)
             .child(header_drag)
             .child(header)
@@ -17195,9 +17209,8 @@ fn coat_tint(blur: f32) -> f32 {
 /// The window's glass coat, painted behind every surface: a tint gradient
 /// deepening toward the bottom plus a sheen band under the top edge, which
 /// is what turns the frosted backdrop into a lit pane. The opaque window
-/// only needs its flat base. The translucent coat starts `top` px down, so
-/// the header strip shows the bare backdrop.
-fn glass_coat(theme: Theme, blur: f32, opaque: bool, top: f32) -> Div {
+/// only needs its flat base.
+fn glass_coat(theme: Theme, blur: f32, opaque: bool) -> Div {
     if opaque {
         return div().absolute().inset_0().bg(theme.window_bg);
     }
@@ -17205,7 +17218,6 @@ fn glass_coat(theme: Theme, blur: f32, opaque: bool, top: f32) -> Div {
     div()
         .absolute()
         .inset_0()
-        .top(px(top))
         .child(div().absolute().inset_0().bg(linear_gradient(
             180.0,
             linear_color_stop(theme.window_bg.opacity(tint * TINT_TOP), 0.0),

@@ -4,54 +4,61 @@ type: blog
 date: 2026-11-01
 ---
 
-Saat mengembangkan pilus, pertanyaan "kapan pilus akan dirilis?" selalu menghantui saya karena pada dasarnya saya sudah menggunakan
-pilus dikeseharian dan saya rasa sudah cukup oke untuk bisa digunakan oleh publik. 
+Saat mengembangkan pilus, pertanyaan "kapan pilus akan dirilis?" selalu menghantui saya karena pada dasarnya saya sudah menggunakan pilus di keseharian dan saya rasa sudah cukup oke untuk bisa digunakan oleh publik.
 
-Hari ini (30 Oktober 2026), herdr [mengumumkan](https://x.com/herdrdev/status/2115841099575222765) aplikasi GUI nya,dan  yang sebenarnya,
-sudah saya ehm "prediksi" setelah mendapatkan pendanaan sebesar $6M dari YCombinator untuk kemana herdr akan berjalan.
+Hari ini (30 Oktober 2026), [herdr](https://herdr.dev) [mengumumkan](https://x.com/herdrdev/status/2115841099575222765) aplikasi GUI-nya. Ini sebenarnya sudah saya, ehm, "prediksi" sejak herdr mendapat [pendanaan seed sebesar $6M](https://herdr.dev/blog/herdr-raised-a-seed/): ke mana pengembangan herdr akan berjalan, dan khususnya ke mana uang tersebut akan "dibakar".
 
-100 milyar rupiah.
+Catat: 100+ miliar rupiah.
 
-Setelah melihat pengumuman tersebut, saya menjadi lebih yakin bila membuat GUI client untuk luvus adalah langkah yang tepat.
+Itu pun dengan asumsi kurs 17.000, my fellow Indonesian!
+
+Setelah melihat pengumuman tersebut, saya menjadi lebih yakin bahwa membuat GUI client untuk [luvus](https://luvus.dev/) adalah langkah yang tepat.
 
 Setidaknya untuk saya.
 
-## Berlomba menjadi yang tercepat
+Alasannya? Entahlah, mungkin pilus juga akan mendapatkan pendanaan 100 miliar rupiah?
 
-Membuat dan mengembangkan *software*, hari ini menjadi lebih mudah. Hampir semua orang dapat mengembangkan dan menjalankan software
-untuk dirinya sendiri ataupun orang lain.
+HAHA.
 
-Sebagian orang, berlomba dalam membuat software yang cepat. Yang lain, ada yang berlomba dalam harga.
+## Karena semuanya berlomba menjadi yang tercepat
+
+Membuat dan mengembangkan software hari ini menjadi lebih mudah. Hampir semua orang dengan komputer dan akses internet dapat mengembangkan dan menjalankan software untuk dirinya sendiri ataupun orang lain.
+
+Sebagian orang berlomba dalam membuat software yang cepat.
+
+Yang lain berlomba dalam harga.
 
 Saya memilih langkah yang berbeda untuk pilus: saya ingin membuat software yang sangat efisien.
 
-Software yang dapat diandalkan di hardware medioker ataupun di jaringan Indihome.
+Software yang dapat diandalkan di hardware medioker ataupun di jaringan IndiHome.
+
+Di MacBook Neo citrus tercinta saya ataupun di Steam Deck yang jarang sekali digunakan untuk game.
 
 ## Bukan terminal emulator
 
-pilus tidak mengemulasi terminal karena pekerjaan itu sudah dilakukan oleh luvus. Jika dianalogikan, bayangkan seperti bagaimana
-peramban menerima HTML, mem-parsing, dan pada akhirnya menampilkan dokumen web. pilus ada di lapisan seperti peramban tersebut. 
+pilus tidak mengemulasi terminal karena pekerjaan itu sudah dilakukan oleh luvus. Jika dianalogikan, bayangkan sebuah
+peramban yang menerima DOM yang sudah jadi, lalu tugasnya hanya menggambar dokumen web ke layar. pilus ada di lapisan seperti peramban tersebut.
 
 Jika pilus dirasa cepat, pada dasarnya itu adalah hasil karya luvus.
 
-Luvus adalah program TUI komplit yang berjalan di terminal dan pilus menggambarkannya dengan GPUI menggunakan Metal sebagai
-backend nya di macOS.
+luvus adalah program TUI lengkap yang berjalan di terminal dan pilus merendernya dengan [GPUI](https://www.gpui.rs) menggunakan [Metal](https://developer.apple.com/metal/) sebagai
+backend-nya di macOS.
 
-Di platform selain macOS seperti GNU/Linux, backend yang digunakan bisa OpenGL ataupun Vulkan berkat wgpu. Yang, sekali lagi,
-bukanlah karya yang dibuat oleh pilus.
+Di platform selain macOS seperti GNU/Linux, backend yang digunakan bisa OpenGL ataupun Vulkan berkat [wgpu](https://wgpu.rs). Yang, sekali lagi,
+bukanlah karya yang dibuat oleh pilus juga.
 
-Yang berarti, kemungkinan, ironisnya pilus tidak bisa berjalan di komputer tanpa GPU.
+Yang berarti, kemungkinan, ironisnya, pilus tidak bisa berjalan di komputer tanpa GPU, padahal di sisi lain pilus menjual "lightweight" sebagai fitur utamanya.
 
 ## Pain points
 
-Versi alpha dari pilus adalah untuk menghadapi masalah yang biasa saya temukan di terminal client pada umumnya dan khususnya kapabilitas
-dari IDE.
+Versi alpha pilus dibuat untuk menjawab masalah yang biasa saya temukan di terminal client pada umumnya, dan khususnya keterbatasan
+kapabilitas IDE.
 
-Setelah sebagian besar masalah tersebut teratasi, maka pilus akan dipromosikan ke versi beta.
+Setelah sebagian besar masalah tersebut teratasi, mungkin pilus akan dipromosikan ke versi beta.
 
 ### Terminal multiplexer
 
-Masalah utama yang akan dihadapi oleh awam dalan menggunakan terminal multiplexer, yang saya yakin ada 3:
+Masalah utama yang akan dihadapi oleh awam dalam menggunakan terminal multiplexer, kemungkinan, ada tiga:
 
 - Scrollback
 - Clipboard
@@ -63,21 +70,22 @@ Scrollback dapat dilakukan via mouse scroll.
 
 Copy-paste teks yang ada di layar seharusnya dapat bekerja.
 
-Dan, uh, yang paling sulit: text rendering, pewarnaan, unicode/glyph dan screen flickering/redraw.
+Dan, uh, yang paling sulit: text rendering, pewarnaan, Unicode/glyph dan screen flickering/redraw.
 
-Beberapa masalah sudah coba dihandle oleh pilus dengan cara yang agak kotor, dan beberapa masalah mungkin masih ada,
-yang mengharuskan perubahan di lapisan daemon atau luvus.
+Beberapa masalah sudah coba di-handle oleh pilus, dengan cara yang mungkin benar ataupun cara yang agak kotor. Beberapa masalah mungkin masih ada, termasuk yang mengharuskan perubahan di lapisan daemon alias luvus.
 
-Namun bagaimanapun, pilus akan selalu melakukan optimasi sampai mendapatkan pengalaman pengguna yang terbaik.
+Bagaimanapun, pilus akan selalu melakukan optimasi sampai mendapatkan pengalaman pengguna yang terbaik.
+
+Dan versi alpha diharapkan dapat mengumpulkan isu-isu tersebut.
 
 ### File management
 
 Berdasarkan riwayat dari [atuin](https://atuin.sh) di salah satu komputer yang sering saya gunakan, ada ratusan
-kali (366) saya menjalankan scp, dan sebagai perbandingkan: top command saya adalah `ls` sebanyak 4939, `ssh`
-sebanyak 3252x, `cd` 2319, `ping` 1969x, dan seterusnya.
+kali (366) saya menjalankan scp, dan sebagai perbandingan: top command saya adalah `ls` sebanyak 4.939 kali, `ssh`
+sebanyak 3.252 kali, `cd` 2.319 kali, `ping` 1.969 kali, dan seterusnya.
 
 ```bash
-docs/05-blog on  main[$!?⇡] atuin stats; echo
+docs/05-blog on  main[$!?⇡] atuin stats; echo
 [▮▮▮▮▮▮▮▮▮▮] 4939 ls
 [▮▮▮▮▮▮    ] 3252 ssh
 [▮▮▮▮      ] 2319 cd
@@ -91,53 +99,68 @@ docs/05-blog on  main[$!?⇡] atuin stats; echo
 Total commands:   46484
 Unique commands:  14505
 
-docs/05-blog on  main[$!?⇡] atuin search --cmd-only --search-mode prefix scp | wc -l
+docs/05-blog on  main[$!?⇡] atuin search --cmd-only --search-mode prefix scp | wc -l
       366
 ```
 
-Yang bisa dikatakan, saya cukup sering memindahkan berkas antar komputer, atau setidaknya sehari sekali! 
+Yang bisa dikatakan, saya cukup sering memindahkan berkas antar komputer!
 
-Meskipun terkadang saya menggunakan Airdrop dan Taildrop sebelum menggunakan pilus ataupun ke komputer yang tidak
+Di luar itu, terkadang saya masih menggunakan AirDrop dan [Taildrop](https://tailscale.com/kb/1106/taildrop), khususnya untuk komputer yang tidak
 bisa dijangkau melalui pilus.
 
 pilus menawarkan manajemen file sederhana: upload, download, rename, hapus dan semacamnya untuk alasan kenyamanan. Juga, mendukung
-upload via clipboard untuk kenyamanan bekerja dengan coding agent di remote machine sekalipun :))
+upload via clipboard, jadi bekerja dengan coding agent di remote machine sekalipun tetap nyaman :))
 
-Beberapa operasi dilakukan melalui luvus UHP dan beberapa melakukan, ehm, RCE (SSH), untuk operasi yang belum/tidak didukung oleh luvus. 
+Beberapa operasi dilakukan melalui luvus UHP dan beberapa lainnya melakukan, ehm, RCE (SSH), untuk operasi yang belum/tidak didukung oleh luvus.
 
-## Yang sudah jalan
+pilus juga menawarkan fitur penyunting file sederhana. Jangan menganggapnya selevel editor kelas dunia (setidaknya untuk sekarang lol) seperti [vim](https://www.vim.org), [nano](https://www.nano-editor.org), [Zed](https://zed.dev), [Helix](https://helix-editor.com) dan semacamnya.
 
-Versi terbaru adalah [v0.3.0](/changelog/v0-3-0). Sehari-hari saya memakainya untuk:
+Tapi setidaknya, saya menulis postingan blog ini di editor pilus!
 
-- menjalankan banyak coding agent di Mac sendiri dan di mesin SSH, dalam satu daftar
-- membaca diff, memberi catatan per baris, lalu mengirim catatannya ke agent
-- membuka `localhost:3000` di browser kecil di sebelah agent, tanpa pindah aplikasi
-- menerima notifikasi saat agent menunggu jawaban atau selesai, bahkan ketika jendela sudah ditutup
-- mengintip dan menjawab agent dari iPhone lewat [aplikasi iOS](/features/ios)
+### Code review
 
-## Yang belum
+Saya masih melakukan sedikit code review. Setidaknya untuk memberikan komentar kepada agent. luvus memiliki fitur untuk membuat catatan dan mengirimkannya kepada agent dan pilus membuatnya menjadi sedikit lebih *friendly*.
 
-- Hanya macOS di Apple Silicon. Linux belum ditentukan.
-- Luvus harus sudah terpasang dan CLI `luvus` ada di `PATH`. pilus tidak membawanya.
-- Tab bar dan status line dari Luvus belum bisa diambil alih klien, jadi pilus menutupinya dengan versi
-  native. Alasannya ada di [Why a native client](/blog/why-a-native-client).
-- Aplikasi iOS baru tersedia lewat TestFlight, di iOS 17 ke atas.
+Terkadang saya berpikir bahwa code review sudah tidak relevan. Tapi terkadang saya mempelajari hal baru dari solusi (ataupun "hack") yang dilakukan oleh si agent, dan terkadang pun, agent mempelajari sesuatu berdasarkan catatan yang saya buat.
 
-## Artinya alpha
+Hitung ada berapa kata 'terkadang' di bagian ini?
 
-Ada yang bisa rusak, dan sebagian akan rusak. Saya memakai pilus setiap hari untuk membangun pilus,
-jadi masalah yang menghalangi saya biasanya cepat diperbaiki. Masalah yang tidak saya temui sendiri
-baru saya tahu kalau kamu memberi kabar.
+## Fitur lain
 
-Pembaruan berjalan otomatis. Di **Settings → UPDATES** kamu bisa memilih channel `stable` untuk rilis
-bertag, atau `preview` untuk build nightly yang lebih cepat sampai tapi lebih kasar. Setiap unduhan
-harus punya tanda tangan minisign yang valid sebelum dipasang.
+Ada beberapa fitur tambahan yang cukup membantu (setidaknya bagi saya!) membuat proses pengembangan (khususnya web development) menjadi lebih mudah:
 
-## Mulai dari mana
+- Port Forwarder
+- In-app browser
+- Integrasi GitHub
 
-1. [Unduh pilus](https://usepilus.dev/download), lalu ikuti [Instalasi](/installation).
-2. Lanjut ke [Memulai](/quickstart) untuk menghubungkan pilus ke Luvus.
-3. Kalau ingin memantau dari ponsel, pasang aplikasi iOS dan pasangkan lewat
-   **Settings → Remote Access**.
+Fitur ini masih cukup basic, bahkan untuk in-app browser masih belum bisa digunakan bila mengakses situs menggunakan protokol non-HTTPS.
 
-Kalau ada yang rusak atau terasa aneh, saya ingin tahu. Alpha berguna kalau ada yang melaporkannya.
+Jujur saja, fitur in-app browser saya gunakan untuk membuka YouTube dan menonton video sambil menunggu si agent bekerja. Kadang juga untuk membuka [Hacker News](https://news.ycombinator.com).
+
+Untuk integrasi dengan GitHub? Entahlah, saya rasa saya hanya impulsif ketika memulainya.
+
+## Roadmap
+
+Ada beberapa hal yang sudah ada di backlog dan pada dasarnya "one prompt away" untuk dilakukan, seperti:
+
+- Swap file saat mengedit berkas
+- Conflict-free editor untuk berkolaborasi dengan agent
+- Aplikasi iOS (masih internal TestFlight dengan nama "pilus mobile connect")
+- Integrasi dengan sipil ("si pilus" alias bot pribadi)
+- Dukungan di OS lain seperti GNU/Linux (saya sudah mencobanya di X11/Wayland dan berjalan dengan baik), atau Windows dan \*BSD (belum ada kapasitas untuk memeliharanya)
+
+Namun fokus untuk sekarang (sampai ke Beta) adalah stabilitas. Performa tetap menjadi prioritas dalam pengembangan pilus, tetapi tujuan utamanya adalah membuat pilus sangat berguna. Patokan pribadi saya dalam menggunakan tools adalah seberapa *capable* tools tersebut dapat men-deliver kode ke pengguna akhir.
+
+Termasuk untuk si aplikasi pilus ini.
+
+## Penutup
+
+Sebagai catatan, beberapa module yang ada di luvus mungkin tidak akan ~~berjalan~~ ditampilkan di pilus, dan ini by design. Untuk saat ini, saya tidak berencana untuk membuat sistem module/plugin sampai pilus dianggap cukup stabil.
+
+Karena masih alpha, beberapa fitur mungkin broken, atau ada UX yang kurang baik. Saya tidak menjalankan pelacak apa pun di sini, bahkan saat pilus crash. Jadi, jika menemukan bug, apalagi crash, feel free untuk [membuat issue](https://github.com/kepelet/pilus/issues) di GitHub.
+
+Sebagai penutup, pembaruan aplikasi dilakukan secara Over The Air (OTA). Pemeriksaan versi terbaru secara otomatis nonaktif by default (opt-in) dan silakan aktifkan opsi tersebut jika memang perlu. Paket pembaruan ditandatangani dengan [minisign](https://jedisct1.github.io/minisign/) agar yang dimodifikasi bisa terdeteksi dan ditolak, sedangkan aplikasinya ditandatangani dengan [Developer ID](https://developer.apple.com/developer-id/) dan [di-notarize](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution) oleh Apple agar [Gatekeeper](https://developer.apple.com/support/gatekeeper/) tidak cerewet.
+
+Jadi, jika sudah menggunakan luvus, pertimbangkan untuk install dan menggunakan pilus! Download [di sini](https://usepilus.dev/download).
+
+Dan jika belum, install luvus [sekarang](https://luvus.dev/) dan jangan lupa untuk mencoba pilus juga!

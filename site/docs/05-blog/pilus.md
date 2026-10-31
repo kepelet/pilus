@@ -1,6 +1,7 @@
 ---
 title: pilus
 type: blog
+draft: true
 date: 2026-10-17
 description: "Pi, Iroh, dan Luvus: tumpukan teknologi di balik pilus."
 ---

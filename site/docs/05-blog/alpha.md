@@ -123,7 +123,7 @@ Saya masih melakukan sedikit code review. Setidaknya untuk memberikan komentar k
 
 Terkadang saya berpikir bahwa code review sudah tidak relevan. Tapi terkadang saya mempelajari hal baru dari solusi (ataupun "hack") yang dilakukan oleh si agent, dan terkadang pun, agent mempelajari sesuatu berdasarkan catatan yang saya buat.
 
-Hitung ada berapa kata 'terkadang' di bagian ini?
+Btw coba hitung ada berapa kata 'terkadang' di bagian ini?
 
 ## Fitur lain
 
@@ -135,9 +135,21 @@ Ada beberapa fitur tambahan yang cukup membantu (setidaknya bagi saya!) membuat 
 
 Fitur ini masih cukup basic, bahkan untuk in-app browser masih belum bisa digunakan bila mengakses situs menggunakan protokol non-HTTPS.
 
-Jujur saja, fitur in-app browser saya gunakan untuk membuka YouTube dan menonton video sambil menunggu si agent bekerja. Kadang juga untuk membuka [Hacker News](https://news.ycombinator.com).
+Jujur, fitur in-app browser saya gunakan untuk membuka YouTube dan menonton video sambil menunggu si agent bekerja. Kadang juga untuk membuka [Hacker News](https://news.ycombinator.com).
 
 Untuk integrasi dengan GitHub? Entahlah, saya rasa saya hanya impulsif ketika memulainya.
+
+## Masalah yang sudah diketahui
+
+- Rendering terminal belum sempurna: pewarnaan, Unicode/glyph, dan screen flickering masih bisa bermasalah, dan sebagian mungkin butuh perubahan di luvus
+- In-app browser belum bisa membuka situs non-HTTPS (`localhost` dan IP tidak terpengaruh)
+- Editor belum punya swap file. Kalau kamu dan agent menyunting file yang sama, pilus hanya memberi tahu setelah file berubah di disk, tidak menggabungkannya
+- Mesin SSH yang butuh kata sandi atau passphrase saat login tidak akan tersambung, dan versi luvus di sana harus cocok dengan yang di Mac kamu
+- Search dan Insights baru mengenali sesi Claude dan Pi
+- Hanya macOS di Apple Silicon, dan tanpa GPU pilus kemungkinan tidak bisa berjalan
+- Aplikasi iOS masih lewat TestFlight
+
+Daftar yang lebih rinci, lengkap dengan cara mengakalinya, ada di [FAQ](/faq#masalah-yang-sudah-diketahui).
 
 ## Roadmap
 

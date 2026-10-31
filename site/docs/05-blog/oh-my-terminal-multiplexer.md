@@ -1,6 +1,7 @@
 ---
 title: Oh My Terminal Multiplexer!
 type: blog
+draft: true
 date: 2026-10-17
 description: Kenapa terminal multiplexer, dan perjalanan dari SSH sampai tmux.
 ---

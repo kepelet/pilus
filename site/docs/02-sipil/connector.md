@@ -14,7 +14,7 @@ sama bagusnya.
 
 ## Memasangkan
 
-1. Di pilus: **Settings → Remote Access → Add Device**.
+1. Di pilus: **Settings -> Remote Access -> Add Device**.
 2. Centang **Allow this device to start work**, lalu salin tautan yang muncul.
 3. Di mesin sipil, saat sipil sedang berjalan:
 

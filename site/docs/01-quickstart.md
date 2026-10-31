@@ -7,40 +7,53 @@ sidebar:
 
 ## 1. Buka pilus
 
-Saat pertama dibuka, pilus mencari socket klien Luvus. Kalau daemon belum berjalan, pilus
-menyalakannya. Di peluncuran pertama pilus juga menyesuaikan beberapa kunci konfigurasi daemon
-(pane tanpa jarak, tanpa baris judul, tema `noir`) supaya tampilannya sesuai rancangan.
+Saat pertama kali dibuka, pilus mencari socket klien Luvus. Kalau Luvus belum terpasang, pilus memasangnya. Kalau daemon belum berjalan, pilus menyalakannya. pilus juga menyesuaikan beberapa konfigurasi daemon agar tampilannya cocok dengan aplikasi.
 
 ## 2. Buka workspace
 
-Tekan `cmd + shift + o` (atau tombol `+` di sidebar) untuk memilih folder. Dropdown host di atas dialog
-memilih mesin yang dijelajahi: Local atau mesin SSH. **Open with new worktree** membuat
-Git worktree baru dengan nama branch otomatis.
+Tekan `cmd+shift+o` untuk memilih folder. Dropdown host di atas dialog menentukan mesin yang kamu jelajahi: Mac lokal atau mesin SSH. Kalau folder berada di repo Git, **Open with new worktree** akan membuat worktree dengan nama branch otomatis.
+
+Folder yang sering kamu buka bisa di-pin lewat klik kanan. Setelah itu, folder muncul di Pinned Workspaces.
 
 ## 3. Jalankan agent
 
-`cmd + shift + n` membuka composer Home: tulis prompt, pilih agent dan tempat menjalankannya.
-Agent yang berjalan muncul di dock **AGENTS**, dikelompokkan per mesin. Klik satu untuk
-memfokuskan pane-nya.
+Buka terminal, jalankan agent pilihanmu, lalu kirim prompt. Agent yang berjalan muncul di bagian **AGENTS** di sidebar, dikelompokkan berdasarkan mesin.
 
-## 4. Pantau dan tinggalkan
+Pilih agent untuk memfokuskan pane-nya. Titik pada tab menunjukkan statusnya:
 
-Tutup jendela kapan saja: Luvus tetap berjalan. Saat agent berhenti menunggu jawabanmu atau
-selesai, pilus mengirim notifikasi dengan suara dan lencana. Buka lagi dan semuanya masih di tempatnya.
+- Merah: agent menunggu konfirmasi atau jawabanmu.
+- Oranye: agent sedang bekerja.
+- Hijau: giliran agent selesai.
+- Warna netral: agent sedang idle.
 
-## Jalan pintas
+## 4. Tinggalkan pilus
+
+Kamu bisa menutup jendelanya kapan saja. Luvus dan agent tetap berjalan. pilus memberi notifikasi dengan suara dan lencana saat agent menunggu jawabanmu atau menyelesaikan gilirannya. Buka pilus lagi dan workspace-mu masih ada.
+
+## 5. Tinjau hasilnya
+
+Tekan `cmd+b` untuk membuka panel kanan. Tab **Diff** menampilkan perubahan agent. Tambahkan catatan pada baris yang perlu diperbaiki, lalu kirimkan ke agent. Penjelasan lengkapnya ada di [Git](/features/git).
+
+## Pintasan
 
 | Tombol | Aksi |
 | --- | --- |
-| `⌘⇧P` | Command palette |
-| `⌘⇧O` | Buka workspace |
-| `⌘⇧N` | Composer Home (agent baru) |
-| `⌘B` | Tampilkan/sembunyikan sidebar kanan |
-| `⌘1`–`⌘9` | Pilih tab ke-N |
-| `⌘⇧.` | Settings |
+| `cmd+shift+p` | Buka command palette |
+| `cmd+shift+o` | Buka workspace |
+| `cmd+t` | Buka tab baru |
+| `cmd+d` / `cmd+shift+d` | Split vertikal / horizontal |
+| `cmd+b` | Tampilkan/sembunyikan panel kanan |
+| `cmd+s` | Tampilkan/sembunyikan sidebar kiri (kecuali saat mengedit file) |
+| `cmd+p` | Quick open file |
+| `cmd+f` / `cmd+alt+f` | Cari/ganti di file yang terbuka |
+| `cmd+1` sampai `cmd+9` | Pilih tab ke-N |
+| `cmd+plus` / `cmd+minus` / `cmd+0` | Perbesar/perkecil/reset ukuran font |
+| `cmd+,` | Buka Appearances |
+| `cmd+shift+.` | Buka Settings |
 
 ## Selanjutnya
 
 - [Hubungkan ke mesin remote](/guides/connect-remote)
 - [Antarmuka](/features/ui)
+- [Editor](/features/editor)
 - [Aplikasi iOS](/features/ios)

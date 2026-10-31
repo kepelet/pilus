@@ -5,27 +5,26 @@ sidebar:
   icon: github
 ---
 
-Bagian **Repositories** di atas WORKSPACES menampilkan tiga repositori: yang kamu pin di Settings
-lebih dulu, lalu yang paling baru di-push.
+Bagian **Repositories** di atas WORKSPACES menampilkan tiga repo. Repo yang kamu pin di Settings muncul lebih dulu, lalu repo yang paling baru di-push.
 
 ## Syarat
 
-CLI [`gh`](https://cli.github.com) sudah login di Mac. Akun yang dipakai adalah akun Mac ini,
-bukan akun mesin remote, dan tidak lewat daemon atau SSH.
+CLI [gh](https://cli.github.com) harus sudah masuk ke akun GitHub di Mac kamu. pilus memakai akun Mac ini, bukan akun di mesin remote. Permintaan tidak lewat daemon atau SSH.
 
 ## Isi
 
-Klik baris untuk membuka halaman repositori dengan tab **Issues**, **Pull Requests**, dan
-**Actions**. Dari sana kamu bisa membuka satu issue atau PR beserta komentarnya. **All Repositories**
-di menu klik-kanan header membuka daftar lengkap dengan jumlah bintang dan yang masih terbuka.
-Back kembali selangkah ke belakang.
+Pilih repo untuk membuka halaman dengan tab **Issues**, **Pull Requests**, dan **Actions**. Dari sana, kamu bisa membuka issue atau PR dan membaca komentarnya. **All Repositories** di menu konteks header menampilkan semua repo, jumlah bintang, dan jumlah issue atau PR yang masih terbuka. Tombol Back kembali ke halaman sebelumnya.
 
 ## Cache dan batas
 
-Semua permintaan lewat satu cache: daftar yang masih segar tidak meminta ulang, daftar REST
-divalidasi dengan `ETag`, dan rate limit ditunggu lalu disimpan di `github-cache.json`. Hanya tab
-yang sedang terlihat yang dibaca.
+Permintaan GitHub melewati satu cache. Daftar yang masih baru dipakai lagi tanpa permintaan tambahan, sementara daftar REST divalidasi dengan `ETag`. Kalau GitHub membatasi permintaan, pilus menunggu dan menyimpan informasi rate limit di `pilus.db`, jadi statusnya tidak hilang saat aplikasi dibuka ulang. pilus hanya memuat data untuk tab yang sedang terlihat.
+
+## Di tempat lain
+
+- [Aplikasi iOS](/features/ios) membaca issue dan pull request lewat `gh` di mesin yang menyimpan checkout. Jadi ponsel tidak perlu login ke GitHub sendiri, dan hanya bisa melihat apa yang bisa diakses akun di mesin itu.
+
+Kalau jujur, saya mulai mengerjakan integrasi ini hampir impulsif.
 
 ## Mematikan
 
-Matikan **GitHub** atau **Repositories** di Settings dan tidak ada permintaan sama sekali.
+Matikan **GitHub** atau **Repositories** di Settings. Setelah itu pilus tidak mengirim permintaan GitHub.

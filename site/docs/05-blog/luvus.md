@@ -1,6 +1,7 @@
 ---
 title: Luvus
 type: blog
+draft: true
 date: 2026-10-17
 description: Kenapa Luvus jadi fondasi pilus.
 ---

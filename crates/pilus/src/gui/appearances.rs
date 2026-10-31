@@ -300,8 +300,8 @@ impl AppearancesView {
             {
                 Some("light") => false,
                 Some("dark") => true,
-                // A terminal theme follows the terminal, not the chrome, so
-                // it takes whichever mode is in force.
+                // The daemon may report a mode this client does not know;
+                // take whichever mode is in force.
                 _ => current,
             },
             pinned => pinned == ColorScheme::Dark,
@@ -372,9 +372,12 @@ impl AppearancesView {
     }
 
     /// Whether the Theme list offers `info` under the current color scheme.
-    /// A pinned mode hides the other mode's themes; terminal themes follow
-    /// the terminal and suit either.
+    /// A pinned mode hides the other mode's themes. Terminal themes follow
+    /// the terminal rather than the chrome, so no scheme offers them.
     fn offers_theme(&self, info: &ThemeInfo) -> bool {
+        if info.appearance == "terminal" {
+            return false;
+        }
         match self.settings.color_scheme {
             ColorScheme::Device => true,
             ColorScheme::Light => info.appearance != "dark",

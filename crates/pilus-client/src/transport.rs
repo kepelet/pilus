@@ -190,6 +190,48 @@ impl SshTarget {
         command
     }
 
+    /// The `ssh -N -R` invocation that publishes `local_socket` on the host as
+    /// the unix socket `remote_socket`.
+    ///
+    /// Like [`Self::forward_command`] it is a process of its own
+    /// (`ControlPath=none`) so killing it ends the forward, and
+    /// `ExitOnForwardFailure` makes a host that refuses socket forwarding end
+    /// it with a reason on stderr. The `-R` spec splits on `:`, with no way to
+    /// quote one, so a path holding a colon is refused.
+    pub(crate) fn ctl_tunnel_command(
+        &self,
+        remote_socket: &str,
+        local_socket: &Path,
+    ) -> std::result::Result<Command, String> {
+        let local = local_socket.to_string_lossy();
+        if remote_socket.contains(':') || local.contains(':') {
+            return Err(format!(
+                "a socket path with a colon cannot be forwarded: {remote_socket} / {local}"
+            ));
+        }
+        self.noted("ctl tunnel");
+        let mut command = Command::new(ssh_binary());
+        command
+            .arg("-N")
+            .arg("-T")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-o")
+            .arg("ServerAliveInterval=15")
+            .arg("-o")
+            .arg("ServerAliveCountMax=3")
+            .arg("-o")
+            .arg("ExitOnForwardFailure=yes")
+            .arg("-o")
+            .arg("ControlPath=none")
+            .arg("-R")
+            .arg(format!("{remote_socket}:{local}"))
+            .arg(&self.destination);
+        Ok(command)
+    }
+
     /// Ask OpenSSH to close the shared master without blocking the caller.
     pub fn release_control_master(&self) {
         let destination = self.destination.clone();

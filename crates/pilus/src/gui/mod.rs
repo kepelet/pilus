@@ -14,10 +14,13 @@ mod attention;
 mod automations;
 mod background;
 mod box_drawing;
+mod browser_control;
 mod browser_data;
+mod browser_inspect;
 mod browser_tab;
 mod connector;
 mod ctl;
+mod ctl_tunnel;
 mod cursor_blink;
 mod database;
 mod diff;
@@ -2463,6 +2466,7 @@ impl PilusView {
             view.remember_location();
             view.settings.save(&view.pilus_root);
             view.ports_stop_all();
+            ctl_tunnel::stop_all();
             async {}
         })
         .detach();
@@ -4096,6 +4100,7 @@ impl PilusView {
             .collect();
         self.auto_connected.retain(|id| enabled.contains(id));
         self.reconnects.retain(|id, _| enabled.contains(id));
+        self.sync_ctl_tunnels();
         // A host that answers its probe again can retry at once instead of
         // waiting out the backoff its last failure earned.
         for machine in self.machines.iter().filter(|m| m.online == Some(true)) {

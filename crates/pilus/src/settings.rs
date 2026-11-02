@@ -375,6 +375,12 @@ pub struct Settings {
     /// The machines the index reads while `index_agents` is on: `local`, and the
     /// ids of saved SSH profiles. A remote one is never read unless named here.
     pub index_machines: Vec<String>,
+    /// The SSH machines (ids of saved profiles) whose agents may drive this
+    /// window with `pilus ctl`. For each, pilus holds a reverse tunnel that
+    /// publishes the control socket on that machine. Empty until the person
+    /// ticks the box in the Ports tab; nothing is published for a machine not
+    /// named here.
+    pub ctl_tunnels: Vec<String>,
     /// The SIPIL sidebar rows (`daemon:<id>`, `channel:<id>`, `person:<id>`) in
     /// the order the person dragged them into. A row not named here comes after
     /// the ones that are, in the order the section would list it. Kept in
@@ -480,6 +486,7 @@ impl Default for Settings {
             sipil_online: false,
             index_agents: false,
             index_machines: Vec::new(),
+            ctl_tunnels: Vec::new(),
             sipil_order: Vec::new(),
             pinned_workspaces: Vec::new(),
             recent_workspaces: Vec::new(),
@@ -1292,6 +1299,7 @@ mod tests {
             sipil_online: true,
             index_agents: true,
             index_machines: vec!["local".to_string(), "build-box".to_string()],
+            ctl_tunnels: vec!["build-box".to_string()],
             sipil_order: vec!["person:b".to_string(), "daemon:a".to_string()],
             pinned_workspaces: vec![SavedWorkspace {
                 session: Some("kind-voyager".to_string()),

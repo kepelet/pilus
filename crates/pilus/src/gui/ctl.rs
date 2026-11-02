@@ -6,6 +6,11 @@
 //! it up here, finds the window and runs it on the GUI thread, so no view is
 //! ever touched from the listener. Each verb calls the same method as the
 //! button or key that does it by hand.
+//!
+//! A verb answers in one of two ways. Most return their [`Reply`] at once. One
+//! that finishes later (a page loading, a script running in the page, an SSH
+//! forward coming up) returns `None` and keeps a clone of the call's
+//! [`Replier`] for whoever will know. Nothing on this side waits for it.
 
 use std::path::Path;
 
@@ -14,7 +19,7 @@ use gpui::{App, Context, Window};
 
 use super::right_sidebar::SidebarTab;
 use super::{PilusView, tab_exists};
-use crate::ctl::{self, Reply, Request, Tab};
+use crate::ctl::{self, Replier, Reply, Request, Tab};
 
 /// Start the control socket and serve it for as long as the app runs. A socket
 /// that cannot be opened is logged and skipped: the window works without it.
@@ -29,17 +34,20 @@ pub(super) fn start(pilus_root: &Path, cx: &mut App) {
     };
     cx.spawn(async move |cx| {
         while let Some(call) = calls.next().await {
-            let reply = cx.update(|cx| apply(&call.request, cx));
-            call.respond(reply);
+            let replier = call.replier();
+            if let Some(reply) = cx.update(|cx| apply(&call.request, &replier, cx)) {
+                call.respond(reply);
+            }
         }
     })
     .detach();
 }
 
-/// Run `request` on the window the person is using.
-fn apply(request: &Request, cx: &mut App) -> Reply {
+/// Run `request` on the window the person is using. `None` means `replier`
+/// was kept to answer later.
+fn apply(request: &Request, replier: &Replier, cx: &mut App) -> Option<Reply> {
     if matches!(request, Request::Ping) {
-        return Reply::ok();
+        return Some(Reply::ok());
     }
     // The active window may be Settings or Appearances; the request is for a
     // main window, so fall back to any.
@@ -52,11 +60,13 @@ fn apply(request: &Request, cx: &mut App) -> Reply {
                 .find_map(|handle| handle.downcast::<PilusView>())
         });
     let Some(handle) = handle else {
-        return Reply::err("no pilus window is open");
+        return Some(Reply::err("no pilus window is open"));
     };
     handle
-        .update(cx, |view, window, cx| view.apply_ctl(request, window, cx))
-        .unwrap_or_else(|error| Reply::err(format!("the window is busy: {error}")))
+        .update(cx, |view, window, cx| {
+            view.apply_ctl(request, replier, window, cx)
+        })
+        .unwrap_or_else(|error| Some(Reply::err(format!("the window is busy: {error}"))))
 }
 
 fn sidebar_tab(tab: Tab) -> SidebarTab {
@@ -74,10 +84,17 @@ impl PilusView {
     fn apply_ctl(
         &mut self,
         request: &Request,
+        replier: &Replier,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Reply {
-        match request {
+    ) -> Option<Reply> {
+        // Whatever opens, reads or drives a page waits for the person's yes.
+        if request.needs_browser_control()
+            && let Some(refusal) = self.browser_ctl_refusal()
+        {
+            return Some(Reply::err(refusal));
+        }
+        Some(match request {
             Request::Ping => Reply::ok(),
             Request::State => {
                 let (tabs, url) = self.browser_summary();
@@ -86,6 +103,7 @@ impl PilusView {
                     &self.right.tab.label().to_ascii_lowercase(),
                     tabs,
                     &url,
+                    self.browser_agent_control(),
                 )
             }
             Request::SidebarOpen { tab } => {
@@ -102,25 +120,55 @@ impl PilusView {
                 self.toggle_right_sidebar(cx);
                 Reply::ok()
             }
-            Request::BrowserOpen { url } => {
+            Request::BrowserOpen { url, wait } => {
                 // Load the address first so a refused one does not leave the
                 // sidebar open on an empty Browser.
-                match self.browser_open_url(url, cx) {
-                    Ok(()) => {
-                        self.ctl_show_sidebar(Some(SidebarTab::Browser), cx);
-                        Reply::ok()
-                    }
-                    Err(message) => Reply::err(message),
+                if let Err(message) = self.browser_open_url(url, false, cx) {
+                    return Some(Reply::err(message));
                 }
+                self.ctl_show_sidebar(Some(SidebarTab::Browser), cx);
+                return self.browser_ctl_loaded(*wait, replier);
             }
             Request::TabFocus { index } => {
                 if !tab_exists(&self.tabs, *index) {
-                    return Reply::err(format!("there is no tab {index}"));
+                    return Some(Reply::err(format!("there is no tab {index}")));
                 }
                 self.focus_tab(*index, cx);
                 Reply::ok()
             }
-        }
+            Request::BrowserControl { reason } => {
+                // Up front, so the banner is where the person is looking.
+                self.ctl_show_sidebar(Some(SidebarTab::Browser), cx);
+                return self.browser_ctl_ask(reason.as_deref(), replier, cx);
+            }
+            Request::BrowserRelease => self.browser_ctl_release(cx),
+            Request::BrowserTabs => self.browser_ctl_tabs(),
+            Request::BrowserNew {
+                url: Some(url),
+                wait,
+            } => {
+                if let Err(message) = self.browser_open_url(url, true, cx) {
+                    return Some(Reply::err(message));
+                }
+                self.ctl_show_sidebar(Some(SidebarTab::Browser), cx);
+                return self.browser_ctl_loaded(*wait, replier);
+            }
+            Request::BrowserNew { url: None, .. } => {
+                self.ctl_show_sidebar(Some(SidebarTab::Browser), cx);
+                self.browser_ctl_blank(cx)
+            }
+            Request::BrowserClose { tab } => self.browser_ctl_close(*tab, cx),
+            Request::BrowserFocus { tab } => {
+                self.ctl_show_sidebar(Some(SidebarTab::Browser), cx);
+                return self.browser_ctl_focus(*tab, replier, cx);
+            }
+            Request::BrowserPage { tab, op } => {
+                return self.browser_ctl_page(*tab, op, replier, cx);
+            }
+            Request::PortsList => return self.ports_ctl_list(replier),
+            Request::PortsForward { port } => return self.ports_ctl_forward(*port, replier),
+            Request::PortsStop { port } => self.ports_ctl_stop(*port),
+        })
     }
 
     /// Open the right sidebar, on `tab` when one is named, as its buttons do.

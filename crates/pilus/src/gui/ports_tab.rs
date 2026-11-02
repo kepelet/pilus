@@ -10,6 +10,11 @@
 //!
 //! This Mac needs no forwarding: its ports are already at `localhost`, so its
 //! rows only open.
+//!
+//! `pilus ctl ports ...` drives the same machinery, so an agent can reach a
+//! dev server the way a person would: list, forward, open `localhost:<port>`.
+//! It forwards only a port the machine is listening on, as the Forward button
+//! does, so a script cannot aim the tunnel at anything else the host can see.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
@@ -19,10 +24,13 @@ use gpui::{Context, Div, FontWeight, SharedString, Stateful, div, prelude::*, px
 use pilus_client::{
     ListeningPort, PortForward, SshTarget, free_local_port, kill_process, list_ports,
 };
+use serde_json::{Value, json};
 
+use super::ctl_tunnel::{self, Spec as TunnelSpec, Status as TunnelStatus};
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
 use super::toast::ToastKind;
 use super::{EndpointId, PilusView, PromptAction, icon};
+use crate::ctl::{Replier, Reply};
 
 /// How often the open tab asks the machine what it is listening on.
 const POLL: Duration = Duration::from_millis(3000);
@@ -38,6 +46,10 @@ pub(super) enum PortsMsg {
         port: u16,
         result: Result<PortForward, String>,
     },
+    /// A forward asked for over `pilus ctl` found nothing to forward; the
+    /// `Starting` row it took is released rather than left as a failure for a
+    /// port that was never listed.
+    Abandoned { machine: String, port: u16 },
     Killed {
         /// The machine the process ran on; `None` for this Mac.
         machine: Option<String>,
@@ -69,6 +81,8 @@ pub(super) struct PortsPanel {
     error: Option<String>,
     polling: bool,
     last_poll: Option<Instant>,
+    /// The `ctl_tunnel` revision last drawn, so a status change repaints.
+    tunnel_revision: u64,
     tx: Sender<PortsMsg>,
     rx: Receiver<PortsMsg>,
 }
@@ -84,6 +98,7 @@ impl PortsPanel {
             error: None,
             polling: false,
             last_poll: None,
+            tunnel_revision: 0,
             tx,
             rx,
         }
@@ -117,6 +132,16 @@ impl PortsPanel {
             }
         }
     }
+}
+
+/// How a forward reads in `pilus ctl`'s answer.
+fn forwarded(port: u16, local: u16, already: bool) -> Value {
+    json!({
+        "port": port,
+        "local_port": local,
+        "url": format!("http://localhost:{local}"),
+        "already_forwarded": already,
+    })
 }
 
 /// One row to draw: a port the machine is listening on, or one it was
@@ -158,6 +183,13 @@ impl PilusView {
                     self.ports_panel.forwards.insert((machine, port), state);
                     changed = true;
                 }
+                PortsMsg::Abandoned { machine, port } => {
+                    let key = (machine, port);
+                    if matches!(self.ports_panel.forwards.get(&key), Some(Forward::Starting)) {
+                        self.ports_panel.forwards.remove(&key);
+                        changed = true;
+                    }
+                }
                 PortsMsg::Killed {
                     machine,
                     port,
@@ -181,6 +213,11 @@ impl PilusView {
                     changed = true;
                 }
             }
+        }
+        let revision = ctl_tunnel::revision();
+        if revision != self.ports_panel.tunnel_revision {
+            self.ports_panel.tunnel_revision = revision;
+            changed = true;
         }
         for state in self.ports_panel.forwards.values_mut() {
             if let Forward::Active(forward) = state
@@ -290,6 +327,193 @@ impl PilusView {
             })
             .ok();
         });
+    }
+
+    /// `pilus ctl ports list`: what the active machine listens on, and where
+    /// each forwarded port can be reached here. The scan runs off the GUI
+    /// thread and answers when it is done.
+    pub(super) fn ports_ctl_list(&mut self, replier: &Replier) -> Option<Reply> {
+        let target = match self.ssh_target_for_active() {
+            Ok(target) => target,
+            Err(error) => return Some(Reply::err(error)),
+        };
+        let name = self.active_machine.as_ref().map_or_else(
+            || "this Mac".to_string(),
+            |machine| machine.display().to_string(),
+        );
+        let forwarded: HashMap<u16, u16> = match &self.active_machine {
+            Some(machine) => self
+                .ports_panel
+                .forwards
+                .iter()
+                .filter(|((id, _), _)| *id == machine.id)
+                .filter_map(|((_, port), state)| match state {
+                    Forward::Active(forward) => Some((*port, forward.local_port())),
+                    _ => None,
+                })
+                .collect(),
+            None => HashMap::new(),
+        };
+        let local = target.is_none();
+        let replier = replier.clone();
+        std::thread::spawn(move || {
+            let reply = match list_ports(target.as_ref()) {
+                Ok(ports) => {
+                    let rows: Vec<Value> = ports
+                        .iter()
+                        .map(|row| {
+                            // This Mac's ports are already at localhost.
+                            let reachable = if local {
+                                Some(row.port)
+                            } else {
+                                forwarded.get(&row.port).copied()
+                            };
+                            json!({
+                                "port": row.port,
+                                "process": row.process,
+                                "pid": row.pid,
+                                "command": row.command,
+                                "url": reachable.map(|port| format!("http://localhost:{port}")),
+                            })
+                        })
+                        .collect();
+                    Reply::data(json!({ "machine": name, "ports": rows }))
+                }
+                Err(error) => Reply::err(error),
+            };
+            replier.send(reply);
+        });
+        None
+    }
+
+    /// `pilus ctl ports forward`: the Forward button for `port`, answering
+    /// with the address to open once the tunnel is up. A port already
+    /// forwarded answers with its address at once.
+    pub(super) fn ports_ctl_forward(&mut self, port: u16, replier: &Replier) -> Option<Reply> {
+        let Some(machine) = self.active_machine.as_ref() else {
+            return Some(Reply::data(json!({
+                "port": port,
+                "local_port": port,
+                "url": format!("http://localhost:{port}"),
+                "note": "this Mac: the port is already on localhost",
+            })));
+        };
+        let Some(target) = machine.ssh_target() else {
+            return Some(Reply::err(
+                "This machine has no SSH profile to forward through",
+            ));
+        };
+        let key = (machine.id.clone(), port);
+        if let Some(state) = self.ports_panel.forwards.get_mut(&key) {
+            match state {
+                Forward::Active(forward) => {
+                    if !forward.has_exited() {
+                        return Some(Reply::data(forwarded(port, forward.local_port(), true)));
+                    }
+                    // The tunnel died: start it again below.
+                }
+                Forward::Starting => {
+                    return Some(Reply::err(format!(
+                        "the forward of port {port} is still starting; try again in a moment"
+                    )));
+                }
+                Forward::Failed(_) => {}
+            }
+        }
+        self.ports_panel
+            .forwards
+            .insert(key.clone(), Forward::Starting);
+        let tx = self.ports_panel.tx.clone();
+        let replier = replier.clone();
+        std::thread::spawn(move || {
+            let (machine, port) = key;
+            // Only a port the host is listening on, at the address it listens
+            // on: the same rows the Ports tab offers.
+            let found = list_ports(Some(&target)).and_then(|ports| {
+                ports
+                    .into_iter()
+                    .find(|row| row.port == port)
+                    .ok_or_else(|| format!("nothing is listening on port {port} on that machine"))
+            });
+            let row = match found {
+                Ok(row) => row,
+                Err(error) => {
+                    tx.send(PortsMsg::Abandoned { machine, port }).ok();
+                    replier.send(Reply::err(error));
+                    return;
+                }
+            };
+            let result = free_local_port(port)
+                .ok_or_else(|| "no free port on this Mac".to_string())
+                .and_then(|local| PortForward::start(&target, local, &row.host, port));
+            let reply = match &result {
+                Ok(forward) => Reply::data(forwarded(port, forward.local_port(), false)),
+                Err(error) => Reply::err(error.clone()),
+            };
+            // The panel takes the tunnel over (and toasts) on its next tick;
+            // it lives in the channel until then.
+            tx.send(PortsMsg::Forwarded {
+                machine,
+                port,
+                result,
+            })
+            .ok();
+            replier.send(reply);
+        });
+        None
+    }
+
+    /// `pilus ctl ports stop`.
+    pub(super) fn ports_ctl_stop(&mut self, port: u16) -> Reply {
+        let Some(machine) = &self.active_machine else {
+            return Reply::err("this Mac has no forwards; its ports are already on localhost");
+        };
+        if self
+            .ports_panel
+            .forwards
+            .remove(&(machine.id.clone(), port))
+            .is_some()
+        {
+            Reply::ok()
+        } else {
+            Reply::err(format!("port {port} is not forwarded"))
+        }
+    }
+
+    /// Hold a `pilus ctl` tunnel to each allowed machine, and none to the
+    /// rest. Cheap and idempotent: it runs when the allowed list or the
+    /// machine catalog changes.
+    pub(super) fn sync_ctl_tunnels(&self) {
+        let wanted: Vec<TunnelSpec> = self
+            .machines
+            .iter()
+            .filter(|machine| machine.enabled && self.settings.ctl_tunnels.contains(&machine.id))
+            .filter_map(|machine| {
+                machine.ssh_target().map(|target| TunnelSpec {
+                    id: machine.id.clone(),
+                    target,
+                })
+            })
+            .collect();
+        ctl_tunnel::ensure(&wanted, &crate::ctl::socket_path());
+    }
+
+    /// Tick the active machine's "let agents drive this window" box.
+    fn ports_toggle_ctl_tunnel(&mut self, cx: &mut Context<Self>) {
+        let Some(machine) = &self.active_machine else {
+            return;
+        };
+        let id = machine.id.clone();
+        let allowed = &mut self.settings.ctl_tunnels;
+        match allowed.iter().position(|allowed| *allowed == id) {
+            Some(at) => {
+                allowed.remove(at);
+            }
+            None => allowed.push(id),
+        }
+        self.save_settings();
+        self.sync_ctl_tunnels();
+        cx.notify();
     }
 
     /// End the forward of `port` on the active machine.
@@ -468,16 +692,11 @@ impl PilusView {
                 this.ports_panel.mark_stale();
                 cx.notify();
             }));
-        div()
+        let row = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .flex_shrink_0()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
             .child(icon(
                 include_bytes!("../../assets/icons/server.svg"),
                 fonts.body,
@@ -492,7 +711,68 @@ impl PilusView {
                     .text_color(theme.muted)
                     .child(format!("Listening on {name}")),
             )
-            .child(refresh)
+            .child(refresh);
+        let mut header = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .flex_shrink_0()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(row);
+        if let Some(machine) = &self.active_machine {
+            header = header.child(self.ports_ctl_tunnel_row(&machine.id, &name, cx));
+        }
+        header
+    }
+
+    /// The opt-in for agents on the active machine: a box, and how the tunnel
+    /// that carries it is doing.
+    fn ports_ctl_tunnel_row(&self, id: &str, name: &str, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let on = self
+            .settings
+            .ctl_tunnels
+            .iter()
+            .any(|allowed| allowed == id);
+        let (note, color) = match (on, ctl_tunnel::status(id)) {
+            (false, _) => (
+                "Off. Agents there cannot reach this window.".to_string(),
+                theme.muted,
+            ),
+            (true, Some(TunnelStatus::Up)) => (
+                "On. Agents there can run `pilus ctl`.".to_string(),
+                theme.muted,
+            ),
+            (true, Some(TunnelStatus::Retrying(why))) => {
+                (format!("Down: {why}. Retrying."), theme.alert)
+            }
+            (true, _) => ("Connecting…".to_string(), theme.muted),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                style::checkbox(
+                    "pilus-ports-ctl-tunnel",
+                    on,
+                    format!("Let agents on {name} drive this window"),
+                    theme,
+                    fonts.secondary,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.ports_toggle_ctl_tunnel(cx))),
+            )
+            .child(
+                div()
+                    .pl_5()
+                    .text_size(px(fonts.label))
+                    .text_color(color)
+                    .child(note),
+            )
     }
 
     fn port_row(&self, row: &Row, cx: &mut Context<Self>) -> Stateful<Div> {

@@ -61,11 +61,73 @@ Files under `~/.pilus` are owner-only.
 - Anything running as the owner can use it, including an agent in a pane. So a
   verb gets no more than the button it stands for. The Browser verb opens
   http and https only, though the address bar accepts more.
-- A request line is capped at 16 KB and a client has two seconds to send it,
-  so a stalled client cannot hold the listener.
+- A request line is capped at 16 KB and a client has two seconds to send it.
+  At most 16 clients are served at once, so a stalled client cannot hold the
+  listener or crowd out the rest.
 - Never add a verb that reads files, runs a command, or returns the contents
-  of a pane. `state` reports only which tab is showing and the Browser's
-  address.
+  of a terminal pane. `state` reports only which tab is showing and the
+  Browser's address.
+
+### The Browser's page verbs
+
+`browser snapshot`, `html`, `text`, `eval`, `click`, `fill`, `press`, `wait`,
+`network` and `console` return a page's contents and run script in it. That is
+more than the address bar offers, and anything running as the owner (an agent
+in a pane, say) can ask. The Browser keeps the owner's sign-ins, so a script in
+a page there runs as them. So:
+
+- Page verbs reach **loopback pages only**: http or https on `localhost`,
+  `*.localhost`, `127.0.0.1` or `::1`. The script that serves them is injected
+  into every page, but on any other page it does nothing and defines nothing, so
+  there is nothing to call. `browser_inspect::is_loopback` and the script test
+  the same thing; the script's test is the one that counts, since a page can
+  navigate between the check and the call. A LAN address is not loopback:
+  forward its port (`ports forward`) and open `localhost`.
+- `back`, `forward` and `reload` are the page's own buttons and work on any
+  page, as do `open`, `new`, `close` and `focus`. `open` still takes http and
+  https only.
+- **The person says yes first.** An agent asks with `browser control`; the
+  banner shows its reason and waits for Allow. Until then every verb that opens,
+  reads or drives a page is refused (`Request::needs_browser_control`; add a new
+  Browser verb to it). A real click or keypress in the page, or the Take over
+  button, ends the grant. The banner is drawn by pilus, not by the page, and
+  never takes its text from the page; the agent's reason is the agent's word and
+  is shown as plain text. Do not add a way to grant control without the person
+  pressing Allow, such as a flag, a setting or an environment variable an agent
+  can set.
+- Page text is untrusted data. An agent that reads it is reading whatever the
+  page says, prompts included. The window parses what a page posts field by
+  field, caps it and stores it; it never acts on it beyond answering the call
+  that waits.
+- `ports forward` forwards only a port the machine is listening on, at the
+  address it listens on, as the Forward button does. A script cannot name a
+  host or a port the Ports tab would not list.
+- Do not add a page verb that returns cookies or storage by name, a verb that
+  reaches a non-loopback page, or a setting that turns the loopback rule off
+  without a decision from the owner. `eval` on a local page can read that
+  page's own cookies, as the page can.
+
+### The tunnel to a host
+
+An agent on an SSH machine can only reach the window if pilus carries the socket
+there (`ssh -R`, see [ctl.md](ctl.md#agents-on-a-host)). That widens who can
+drive the window from the owner's processes on this Mac to every process of the
+owner's account on that host. So:
+
+- It is **off for every machine** and turns on only when the person ticks the
+  box for that machine. The tunnel only lets an agent reach the window; the
+  Browser still waits for Allow. Never enable it from a `pilus ctl` verb, a setting a
+  script can write, or a default: an agent that could switch it on could
+  open its own way in.
+- Everything above still holds across the tunnel, the loopback rule for page
+  verbs included. A host gets no more than a pane on this Mac gets.
+- The socket lives in `~/.pilus` on the host, made `0700` before the socket
+  exists, under the name `pilus-remote.sock`, so it never replaces a window of
+  the host's own. Only the one name is ever removed there.
+- `-R` paths are split on `:` with no quoting, so a path holding one is
+  refused rather than parsed into a different forward.
+- Quitting pilus ends every tunnel. A crash can leave an `ssh` behind that
+  holds an unlinked socket; the next tunnel replaces the file.
 
 ## Logging
 

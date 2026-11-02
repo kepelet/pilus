@@ -102,3 +102,11 @@ out of the machine (a request, or a subprocess that reaches a host) records
 itself with `netlog::record` or `netlog::note`, or it will be missing from the
 page. Local-only subprocesses (`git`, the daemon's socket) are not network
 calls and stay out.
+
+## The `pilus ctl` tunnels
+
+An SSH machine the person allowed for `pilus ctl` has one supervisor thread
+(`gui/ctl_tunnel.rs`). While the tunnel is up the thread is blocked reading
+ssh's stderr; after a failure it sleeps on a condition variable for 2 s to 60 s.
+There is no timer in the window and no poll. A machine not allowed has no
+thread. See [ctl.md](ctl.md).

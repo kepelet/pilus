@@ -28,8 +28,8 @@ use super::style::{self, FillExt, Fonts, RadiusExt};
 use super::theme::Theme;
 use super::toast::ToastKind;
 use super::{
-    EndpointId, HEAD_CONTROLS_GAP, HEAD_CONTROLS_W, HEADER_HEIGHT, PilusView, SESSION_MENU_GAP,
-    SIDEBAR_HEAD_INSET, SIDEBAR_ROW_HEIGHT, SIDEBAR_TOGGLE_W, TAB_HEIGHT, icon, row_tooltip,
+    EndpointId, HEADER_HEIGHT, PilusView, SESSION_MENU_GAP, SIDEBAR_HEAD_INSET, SIDEBAR_ROW_HEIGHT,
+    SIDEBAR_TOGGLE_W, TAB_HEIGHT, icon, row_tooltip,
 };
 
 /// Width of the pinned menu, the session menu's.
@@ -227,8 +227,8 @@ impl PilusView {
         self.pinned_menu_open = false;
     }
 
-    /// The button in the sidebar's head, after the session picker and the
-    /// collapse toggle, that drops the pins down. It is absent until something
+    /// The button in the sidebar's head, before the collapse toggle, that
+    /// drops the pins down. It is absent until something
     /// is pinned, so a window that never pins one has no dead control.
     pub(super) fn pinned_button(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let count = self.session_pins().count();
@@ -294,10 +294,8 @@ impl PilusView {
         let sidebar_left = self
             .sidebar_dock()
             .map_or(0.0, |dock| f32::from(dock.x) * cell_width);
-        let button_left = sidebar_left
-            + Self::head_controls_left(fullscreen)
-            + HEAD_CONTROLS_W
-            + HEAD_CONTROLS_GAP;
+        // The button leads the head, ahead of the collapse toggle.
+        let button_left = sidebar_left + Self::head_controls_left(fullscreen);
         let menu_left = button_left.max(SIDEBAR_HEAD_INSET);
         let menu_top = (HEADER_HEIGHT + TAB_HEIGHT) / 2.0 + SESSION_MENU_GAP;
         let mut rows = div().flex().flex_col().gap_1();

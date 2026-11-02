@@ -289,10 +289,8 @@ const SHEEN_MAX: f32 = 0.055;
 const SHEEN_HEIGHT: f32 = 0.32;
 /// Width of the sidebar collapse/expand button.
 const SIDEBAR_TOGGLE_W: f32 = 28.0;
-/// Gap between the session picker and the sidebar toggle it precedes.
+/// Gap between the pinned button and the sidebar toggle it precedes.
 const HEAD_CONTROLS_GAP: f32 = 4.0;
-/// How far the header's session picker and toggle reach together.
-const HEAD_CONTROLS_W: f32 = SIDEBAR_TOGGLE_W + HEAD_CONTROLS_GAP + SIDEBAR_TOGGLE_W;
 /// Gap between the session picker and the menu it opens below.
 const SESSION_MENU_GAP: f32 = 4.0;
 /// Height of a tab pill in the top chrome.
@@ -450,8 +448,8 @@ gpui::actions!([
     RightSidebarForward,
     /// Open the native Open Workspace picker.
     OpenWorkspacePicker,
-    /// Open the footer session switcher.
-    OpenSessionMenu,
+    /// Open the palette listing the sessions, to switch to one.
+    OpenSessionSwitcher,
     /// Open the command palette.
     OpenCommandPalette,
     /// Open the palette listing the pinned workspaces.
@@ -1109,7 +1107,7 @@ fn app_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
         KeyBinding::new("cmd-o", OpenPinnedWorkspaces, None),
         KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, None),
-        KeyBinding::new("cmd-shift-s", OpenSessionMenu, None),
+        KeyBinding::new("cmd-shift-s", OpenSessionSwitcher, None),
         KeyBinding::new("cmd-shift-.", OpenSettings, None),
         KeyBinding::new("cmd-1", FocusTab1, None),
         KeyBinding::new("cmd-2", FocusTab2, None),
@@ -5424,10 +5422,46 @@ impl PilusView {
         cx.notify();
     }
 
+    /// The sessions as palette rows (⌘⇧S), in the daemon's order. A stopped one
+    /// starts and then attaches, the same as its row in the session menu.
+    fn session_palette_entries(&self) -> Vec<Entry> {
+        let current = self.current_session_name();
+        let mut entries: Vec<Entry> = self
+            .sessions
+            .iter()
+            .map(|session| Entry {
+                command: if session.running {
+                    Command::SwitchSession(session.name.clone())
+                } else {
+                    Command::StartSession(session.name.clone())
+                },
+                title: self.settings.session_label(&session.name).to_string(),
+                group: if session.name == current {
+                    "Current"
+                } else if session.running {
+                    "Running"
+                } else {
+                    "Stopped"
+                },
+                shortcut: None,
+            })
+            .collect();
+        entries.push(Entry {
+            command: Command::NewSession,
+            title: "New session".to_string(),
+            group: "Session",
+            shortcut: None,
+        });
+        entries
+    }
+
     /// The live command list, rebuilt from current view state.
     fn palette_entries(&self) -> Vec<Entry> {
         if self.palette.is_pinned() {
             return self.pinned_palette_entries();
+        }
+        if self.palette.is_sessions() {
+            return self.session_palette_entries();
         }
         let entry = |command: Command, title: &str, group: &'static str, shortcut| Entry {
             command,
@@ -5635,6 +5669,7 @@ impl PilusView {
             }
             Command::FocusTab(index) => self.focus_tab(index, cx),
             Command::SwitchSession(name) => self.switch_session(&name),
+            Command::StartSession(name) => self.start_session(name),
             Command::NewSession => self.start_new_session(),
             Command::RenameSession => {
                 let name = self.current_session_name().to_string();
@@ -12006,7 +12041,7 @@ impl PilusView {
             .overflow_hidden()
             // Fixed clearance for the floating traffic lights; the sections
             // scroll under it instead of disappearing beneath the titlebar.
-            // The session picker and collapse toggle follow the lights, or
+            // The pinned button and collapse toggle follow the lights, or
             // take the left edge where fullscreen hides them.
             .child(
                 div()
@@ -12018,9 +12053,8 @@ impl PilusView {
                     .justify_start()
                     .gap(px(HEAD_CONTROLS_GAP))
                     .pl(px(Self::head_controls_left(fullscreen)))
-                    .child(self.session_picker("pilus-session-button", cx))
-                    .child(self.sidebar_toggle("pilus-sidebar-toggle", cx))
-                    .children(self.pinned_button(cx)),
+                    .children(self.pinned_button(cx))
+                    .child(self.sidebar_toggle("pilus-sidebar-toggle", cx)),
             )
             .child(list);
         // The sidebar parts from the terminal with a hairline. It is an
@@ -12403,16 +12437,18 @@ impl PilusView {
                     .flex_row()
                     .overflow_hidden()
                     .gap(px(HEAD_CONTROLS_GAP))
-                    // The slot is the picker and toggle plus the strip's gap
-                    // after them; the negative margin cancels the gap so a
-                    // closed slot takes no room at all.
-                    .w(px((HEAD_CONTROLS_W + 4.0) * parked))
+                    // The slot is the toggle plus the strip's gap after it;
+                    // the negative margin cancels the gap so a closed slot
+                    // takes no room at all.
+                    .w(px((SIDEBAR_TOGGLE_W + 4.0) * parked))
                     .mr(px(-4.0))
                     .opacity(parked * parked)
-                    .child(self.session_picker("pilus-session-button-parked", cx))
                     .child(self.sidebar_toggle("pilus-sidebar-toggle-parked", cx)),
             );
         }
+        // The session picker sits beside the first tab whether or not the
+        // sidebar is open, so it never moves with the panel.
+        tab_strip = tab_strip.child(self.session_picker("pilus-session-button", cx));
         // The strip stays up under a page; any tab action closes the page.
         // The plus follows the tabs until overflow makes the scroll viewport
         // shrink.
@@ -12814,8 +12850,8 @@ impl PilusView {
         self.sidebar_dock().map_or(0, |dock| dock.width)
     }
 
-    /// The session picker, an icon alone in the header just before the
-    /// sidebar toggle: the current session's mapped icon, opening the session
+    /// The session picker, an icon alone in the tab strip just before the
+    /// first tab: the current session's mapped icon, opening the session
     /// menu below it. The name lives in the tooltip and the menu.
     fn session_picker(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
@@ -13127,8 +13163,7 @@ impl PilusView {
     ///
     /// A transparent catcher covers the content area so a click anywhere
     /// outside dismisses; the panel stops propagation so its own clicks land.
-    /// It opens below the session picker in the header, left-aligned with it,
-    /// wherever the picker sits: the sidebar's head or the tab strip's.
+    /// It opens below the session picker in the tab strip, left-aligned with it.
     fn session_menu(
         &self,
         cx: &mut Context<Self>,
@@ -13139,14 +13174,12 @@ impl PilusView {
             return div().into_any_element();
         }
         let theme = self.theme;
-        let picker_left = if self.sidebar_visible {
-            let sidebar_left = self
-                .sidebar_dock()
-                .map_or(0.0, |dock| f32::from(dock.x) * cell_width);
-            sidebar_left + Self::head_controls_left(fullscreen)
-        } else {
-            self.strip_pad(fullscreen)
-        };
+        // The picker leads the tab strip, after the toggle's slot while the
+        // sidebar is away.
+        let parked = (1.0 - self.sidebar_open).clamp(0.0, 1.0);
+        let picker_left = self.sidebar_px(cell_width)
+            + self.strip_pad(fullscreen)
+            + (SIDEBAR_TOGGLE_W + 4.0) * parked;
         let menu_left = picker_left.max(SIDEBAR_HEAD_INSET);
         let menu_top = (HEADER_HEIGHT + TAB_HEIGHT) / 2.0 + SESSION_MENU_GAP;
         let mut items = div().flex().flex_col().gap_1();
@@ -13620,6 +13653,8 @@ impl PilusView {
                         "Nothing pinned. Right-click a workspace and choose Pin this Workspace."
                     } else if self.palette.is_pinned() {
                         "No matching workspaces"
+                    } else if self.palette.is_sessions() {
+                        "No matching sessions"
                     } else {
                         "No matching commands"
                     }),
@@ -13685,7 +13720,9 @@ impl PilusView {
 
         let palette_input = self.palette_input.clone();
         let hint = if self.palette.is_pinned() {
-            "Open a pinned workspace…"
+            "Open pinned workspaces…"
+        } else if self.palette.is_sessions() {
+            "Switch session…"
         } else {
             "Type a command…"
         };
@@ -16000,9 +16037,17 @@ impl Render for PilusView {
                 .on_action(cx.listener(|this, _: &OpenHome, _window, cx| {
                     this.toggle_home(cx);
                 }))
-                .on_action(cx.listener(|this, _: &OpenSessionMenu, _window, cx| {
-                    this.close_pinned_menu();
-                    this.session_menu_open = true;
+                .on_action(cx.listener(|this, _: &OpenSessionSwitcher, _window, cx| {
+                    // Like ⌘O, the chord toggles, and any other palette turns
+                    // into the session list rather than closing.
+                    if this.palette.is_open() && this.palette.is_sessions() {
+                        this.palette.close();
+                    } else {
+                        this.quick_open.close();
+                        this.close_session_menu();
+                        this.close_pinned_menu();
+                        this.palette.open_sessions();
+                    }
                     cx.notify();
                 }))
                 .on_action(cx.listener(|this, _: &OpenAbout, _window, cx| {

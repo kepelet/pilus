@@ -39,12 +39,18 @@ Home's Pinned and Recent blocks.
 ⌘O (File > Open Pinned Workspace…) opens the command palette in its pinned mode
 (`Palette::open_pinned`): the same overlay, filtered by the same fuzzy match, but
 listing only the attached session's pins in pin order, a remote pin as
-`name · machine`. Enter runs `Command::OpenPinned(index)`, which calls
+`name · machine`. Its field reads "Open pinned workspaces…". Enter runs `Command::OpenPinned(index)`, which calls
 `open_saved_workspace`. The mode lives in the `Palette`, so every way out of the
 overlay clears it, and pressing ⌘⇧P while it is open shows the commands.
 
-The pinned menu is a folder-bookmark button in the sidebar head after the
-session picker and the collapse toggle (`pinned_button`), which drops a list of
+⌘⇧S is the same overlay in its session mode (`Palette::open_sessions`, field
+"Switch session…"): one row per Luvus session, a running one switching to it and
+a stopped one starting it first (`Command::StartSession`), plus New session. The
+session picker button itself sits in the tab strip beside the first tab and still
+opens the session menu.
+
+The pinned menu is a folder-bookmark button in the sidebar head before the
+collapse toggle (`pinned_button`), which drops a list of
 the pins below it (`pinned_menu`), built like the session menu: a transparent
 catcher over the window dismisses it, and Escape closes it. A row shows the name
 and, for a remote pin, the machine; its tooltip shows the folder. The button is

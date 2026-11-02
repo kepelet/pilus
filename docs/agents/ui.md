@@ -62,8 +62,8 @@ is the only implementation of it.
 - **Selection** in the sidebar (workspace, worktree, agent) is a pill in the
   same tint as a selected tab (`Theme::tint_fill`), with the
   same `theme.border` hairline, `panel_fg`/`muted` text and a bold name.
-  Hover takes the same tint without the border, as do the header's toggle
-  and session picker, and so does the active workspace while an agent row
+  Hover takes the same tint without the border, as do the header's toggle,
+  pinned button and session picker, and so does the active workspace while an agent row
   holds the selection.
   A nested workspace row's pill starts past its elbow, so the tree rail stays
   bare.

@@ -1,4 +1,5 @@
-//! The native command palette (⌘⇧P), and its pinned-workspaces mode (⌘O).
+//! The native command palette (⌘⇧P), and its pinned-workspaces (⌘O) and
+//! session-switcher (⌘⇧S) modes.
 //!
 //! The palette is a keyboard-first overlay. The view hands it the live command
 //! list, it filters that list against the typed query, and the view dispatches
@@ -49,6 +50,8 @@ pub enum Command {
     Quit,
     FocusTab(u16),
     SwitchSession(String),
+    /// Start a stopped session's daemon, then attach to it.
+    StartSession(String),
     NewSession,
     RenameSession,
     FocusWorkspace(String),
@@ -68,12 +71,22 @@ pub struct Entry {
     pub shortcut: Option<&'static str>,
 }
 
+/// What the overlay lists. The view fills `palette_entries` to match.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Mode {
+    #[default]
+    Commands,
+    /// Only the attached session's pinned workspaces (⌘O).
+    Pinned,
+    /// The Luvus sessions, to switch to one (⌘⇧S).
+    Sessions,
+}
+
 /// Query and highlight state for the overlay.
 #[derive(Debug, Default)]
 pub struct Palette {
     open: bool,
-    /// Whether it lists only the pinned workspaces (⌘O) instead of commands.
-    pinned: bool,
+    mode: Mode,
     input: TextField,
     selected: usize,
     /// Query text the highlight last reset against, so caret-blink repaints
@@ -110,27 +123,38 @@ impl Palette {
 
     /// Whether it lists pinned workspaces rather than commands.
     pub fn is_pinned(&self) -> bool {
-        self.pinned
+        self.mode == Mode::Pinned
+    }
+
+    /// Whether it lists sessions rather than commands.
+    pub fn is_sessions(&self) -> bool {
+        self.mode == Mode::Sessions
     }
 
     /// Show the palette with an empty query and the first row highlighted.
     pub fn open(&mut self) {
         self.open = true;
-        self.pinned = false;
+        self.mode = Mode::Commands;
         self.clear();
     }
 
     /// Show it as the pinned-workspaces list, which `palette_entries` fills.
     pub fn open_pinned(&mut self) {
         self.open();
-        self.pinned = true;
+        self.mode = Mode::Pinned;
+    }
+
+    /// Show it as the session switcher, which `palette_entries` fills.
+    pub fn open_sessions(&mut self) {
+        self.open();
+        self.mode = Mode::Sessions;
     }
 
     /// Hide the palette and forget the query. Every way out lands here, so the
     /// mode never outlives the overlay.
     pub fn close(&mut self) {
         self.open = false;
-        self.pinned = false;
+        self.mode = Mode::Commands;
         self.clear();
     }
 
@@ -316,6 +340,18 @@ mod tests {
         palette.open_pinned();
         palette.open();
         assert!(!palette.is_pinned(), "opening the commands leaves the mode");
+    }
+
+    #[test]
+    fn the_session_mode_ends_with_the_overlay() {
+        let mut palette = Palette::default();
+        palette.open_sessions();
+        assert!(palette.is_open() && palette.is_sessions() && !palette.is_pinned());
+        palette.close();
+        assert!(!palette.is_open() && !palette.is_sessions());
+        palette.open_sessions();
+        palette.open_pinned();
+        assert!(!palette.is_sessions(), "one mode replaces another");
     }
 
     #[test]

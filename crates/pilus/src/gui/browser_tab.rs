@@ -962,10 +962,15 @@ impl PilusView {
     }
 
     /// What the menu's rows tick: whether the tray is open, how many notes
-    /// the tab holds, and the viewport it is held to.
-    pub(super) fn browser_menu_state(&self) -> (bool, usize, Viewport) {
+    /// the tab holds, the viewport it is held to, and the room it has (whole
+    /// pixels, as the last frame measured it).
+    pub(super) fn browser_menu_state(&self) -> (bool, usize, Viewport, (u32, u32)) {
         let page = self.browser_panel.page();
-        (page.tray, page.notes.len(), page.viewport)
+        let (width, height) = self.browser_panel.room.get();
+        // A measured size is never negative; an unmeasured one is zero.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let room = (width.max(0.0) as u32, height.max(0.0) as u32);
+        (page.tray, page.notes.len(), page.viewport, room)
     }
 
     /// Run the row picked from the three-dot menu. `url` is the address the
@@ -1549,6 +1554,53 @@ impl PilusView {
             return None;
         }
         Some(Reply::data(self.ctl_describe(ix)))
+    }
+
+    /// `browser viewport [SHAPE]`: report the shape the agent's page is shown
+    /// in, or put it in a new one first, as the three-dot menu does.
+    ///
+    /// Setting takes the hold, since it changes what the page lays out against
+    /// while the agent works; reading does not lock the person out. The size is
+    /// the one the room allows (see [`Viewport::fit`]), as the last frame
+    /// measured it, so `requested` and `width`×`height` differ when a narrow
+    /// column shrank the page, and both are absent before the Browser has been
+    /// drawn. Only the selected page is drawn, so for another tab the size is
+    /// what it would get in the same room.
+    pub(super) fn browser_ctl_viewport(
+        &mut self,
+        tab: Option<u16>,
+        shape: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Reply {
+        let viewport = match shape.map(Viewport::parse).transpose() {
+            Ok(viewport) => viewport,
+            Err(message) => return Reply::err(message),
+        };
+        let ix = match viewport {
+            Some(_) => self.ctl_agent_hold(tab, cx),
+            None => self.ctl_agent_index(tab),
+        };
+        let ix = match ix {
+            Ok(ix) => ix,
+            Err(message) => return Reply::err(message),
+        };
+        if let Some(viewport) = viewport {
+            self.browser_panel.pages[ix].viewport = viewport;
+            cx.notify();
+        }
+        let viewport = self.browser_panel.pages[ix].viewport;
+        let mut answer = json!({
+            "tab": ix + 1,
+            "viewport": viewport.name(),
+        });
+        if let Some((width, height)) = viewport.size_in(self.browser_panel.room.get()) {
+            answer["width"] = json!(width);
+            answer["height"] = json!(height);
+        }
+        if let Viewport::Custom(width, height) = viewport {
+            answer["requested"] = json!({ "width": width, "height": height });
+        }
+        Reply::data(answer)
     }
 
     /// `browser snapshot`, `click`, `eval` and the rest.

@@ -170,6 +170,17 @@ pub enum Request {
     BrowserClose { tab: Option<u16> },
     /// Select the agent's page tab at the 1-based index `tab`.
     BrowserFocus { tab: u16 },
+    /// Read or set the shape the agent's page is shown in: a preset
+    /// (`responsive`, `16:10`, `4:3`, `mobile`, `tablet`) or `WIDTHxHEIGHT`.
+    /// With no `shape` it only reports the one in force. The 1-based `tab`,
+    /// else the selected one. The word is parsed in the window, which owns the
+    /// list of shapes.
+    BrowserViewport {
+        #[serde(default)]
+        tab: Option<u16>,
+        #[serde(default)]
+        shape: Option<String>,
+    },
     /// Look at or act on a page of the agent's: the 1-based `tab`, else the
     /// selected one.
     BrowserPage {
@@ -542,6 +553,10 @@ fn parse_browser(words: &[&str]) -> Result<Request> {
                 .transpose()?,
         }),
         "tabs" => Ok(Request::BrowserTabs),
+        "viewport" => Ok(Request::BrowserViewport {
+            tab: flags.tab,
+            shape: flags.maybe_one("viewport")?,
+        }),
         "open" => Ok(Request::BrowserOpen {
             url: flags.one("open", "a URL")?,
             wait: !flags.no_wait,
@@ -1048,6 +1063,34 @@ mod tests {
                     selector: Some("input[name=q]".to_string())
                 }
             }
+        );
+    }
+
+    #[test]
+    fn viewport_reads_or_sets_a_shape() {
+        assert_eq!(
+            page("browser viewport"),
+            Request::BrowserViewport {
+                tab: None,
+                shape: None
+            }
+        );
+        assert_eq!(
+            page("browser viewport mobile --tab 2"),
+            Request::BrowserViewport {
+                tab: Some(2),
+                shape: Some("mobile".to_string())
+            }
+        );
+        assert_eq!(
+            page("browser viewport 1000x800"),
+            Request::BrowserViewport {
+                tab: None,
+                shape: Some("1000x800".to_string())
+            }
+        );
+        assert!(
+            parse_args(&["browser", "viewport", "mobile", "tablet"].map(String::from)).is_err()
         );
     }
 

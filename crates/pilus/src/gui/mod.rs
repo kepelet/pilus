@@ -11100,7 +11100,7 @@ impl PilusView {
             | SidebarMenuTarget::Browser { .. }
             | SidebarMenuTarget::File { .. } => (false, false),
         };
-        let (notes_open, notes, viewport) = self.browser_menu_state();
+        let (notes_open, notes, viewport, room) = self.browser_menu_state();
         MenuLabels {
             status: self.agent_status,
             paths_visible,
@@ -11109,6 +11109,7 @@ impl PilusView {
             notes_open,
             notes,
             viewport,
+            room,
         }
     }
 

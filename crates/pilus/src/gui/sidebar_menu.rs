@@ -346,6 +346,10 @@ pub struct Labels {
     pub notes: usize,
     /// The viewport the Browser's tab is held to, which its submenu ticks.
     pub viewport: Viewport,
+    /// The room the Browser's column leaves its page, in pixels, so each
+    /// viewport row can say what size the page would get. Zero before the
+    /// Browser has been drawn, when the rows show no size.
+    pub room: (u32, u32),
 }
 
 impl MenuTarget {
@@ -435,6 +439,9 @@ fn action(item: Item, labels: Labels) -> Entry {
     }
     if item == Item::BrowserNotes && labels.notes > 0 {
         title.push_str(&format!(" · {}", labels.notes));
+    }
+    if let Item::Viewport(viewport) = item {
+        title = viewport.describe(labels.room);
     }
     // A filter row is ticked when it is the one in force, as is the
     // viewport the tab is held to and the tray while it is open.
@@ -880,6 +887,39 @@ mod tests {
         };
         assert_eq!(title(Some("Arc".into())).as_deref(), Some("Open in Arc"));
         assert_eq!(title(None).as_deref(), Some("Open in Default Browser"));
+    }
+
+    #[test]
+    fn the_viewport_rows_say_what_size_the_page_gets() {
+        // The room is short, so the two devices are shrunk to its height.
+        let labels = Labels {
+            room: (1000, 700),
+            ..Labels::default()
+        };
+        let entries = browser("https://a.test").entries(false, labels);
+        let Some(Entry::Submenu { entries: sub, .. }) = entries
+            .iter()
+            .find(|entry| matches!(entry, Entry::Submenu { .. }))
+        else {
+            panic!("the Viewport row opens a submenu");
+        };
+        let titles: Vec<&str> = sub
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Action { title, .. } => Some(title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "Responsive (1000\u{d7}700)",
+                "16:10 (1000\u{d7}625)",
+                "4:3 (933\u{d7}700)",
+                "Mobile (323\u{d7}700)",
+                "Tablet (525\u{d7}700)",
+            ]
+        );
     }
 
     #[test]

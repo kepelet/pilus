@@ -35,6 +35,8 @@ pilus ctl browser network --filter /api    # method, url, status, ms
 pilus ctl browser console                  # console.* and uncaught errors
 pilus ctl browser eval 'document.title'
 pilus ctl browser tabs                     # also: new [URL], close [N], focus N
+pilus ctl browser viewport mobile          # also: responsive|16:10|4:3|tablet|1000x800
+pilus ctl browser viewport                 # no value: what it is now, and its size
 ```
 
 ```sh
@@ -169,7 +171,7 @@ and the next tunnel removes it. See
 | `browser snapshot`, `click`, `eval`, `wait`, … | the page, over `window.ipc`, tagged with the call's id |
 | `ports list`, `ports forward` | the worker thread that ran `ssh` |
 | `browser request` | the person, from the prompt |
-| `browser network`, `console`, `tabs`, `close`, `release` | the GUI thread, at once |
+| `browser network`, `console`, `tabs`, `close`, `release`, `viewport` | the GUI thread, at once |
 
 A page that never loads or never answers is the server's 30 s timeout. A new
 load (`PageLoadEvent::Started`) fails every call still waiting on the old
@@ -255,6 +257,26 @@ and sends a ring out on a click. It is only for the person watching, so:
   the ring;
 - an action does not depend on it: any failure drawing it is swallowed.
 
+### Viewport
+
+`browser viewport [SHAPE] [--tab N]` reads or sets the shape of an agent's page:
+`responsive`, `16:10`, `4:3`, `mobile`, `tablet`, or an exact `WIDTHxHEIGHT`
+(each side 100 to 4096; `Viewport::parse`). The answer is
+`{tab, viewport, width, height}` with `requested` added for an exact size.
+
+- Setting takes the hold, like any verb that drives the tab; reading does not,
+  so a look never locks the person out. It sets the very field the menu sets,
+  so the menu ticks it, and the person can change it back there.
+- An exact size follows the same rule as the presets: it is kept when the Browser column has
+  the room and shrunk, proportions kept, when it does not. `width` and `height`
+  are what the page got, `requested` what was asked, so an agent that sees them
+  differ knows the page lays out narrower than it wanted and can widen the
+  sidebar or ask for less. They are absent before the Browser has been drawn.
+- The size is from the room the last frame measured, so it is one frame behind
+  a change. For a tab that is not selected it is what that tab would get in the
+  same room. Run `browser eval 'innerWidth'` for the page's own word.
+- Like the menu, it resizes only: no user agent, touch or pixel ratio.
+
 Two things an agent trips on, both seen on a live window:
 
 - `open` returns when the document has loaded, not when the page has drawn what
@@ -289,12 +311,15 @@ on; the three dots (with a note count) open a native menu whose first row, Notes
 toggles the tray. Code: `gui/browser_notes.rs` and `browser_notes.js`, with the
 buttons and tray in `gui/browser_tab.rs`.
 
-The same menu holds the tab's other settings, none of which an agent can read or
-change. **Viewport** (Responsive, 16:10, 4:3, Mobile, Tablet) puts the page in a
-smaller card, centred and fitted to the room the column leaves
-(`gui/browser_viewport.rs`). Mobile and Tablet stop at their real size, 390×844
-and 768×1024. It resizes the page only: no user agent, touch or pixel ratio.
-It is per tab and ends when the tab closes. **Open in Default Browser** passes
+The same menu holds the tab's other settings. **Viewport** (Responsive, 16:10,
+4:3, Mobile, Tablet) puts the page in a smaller card, centred and fitted to the
+room the column leaves (`gui/browser_viewport.rs`). Each row names the size the
+page would get, like `Mobile (390×844)`. A shape narrower than its size shows
+the shrunk size (`16:10 (480×300)`). Every shape stops at its real size, never
+larger: 16:10 is 1280×800, 4:3 is 1024×768, Mobile 390×844, Tablet 768×1024. It resizes the page only: no user agent, touch or pixel
+ratio. It is per tab and ends when the tab closes. An agent drives the same
+setting with `browser viewport` (see below); the other rows in this menu are
+the person's alone. **Open in Default Browser** passes
 the address through `openable_url` first, so a page on any scheme but
 http/https is refused. **Copy URL** copies it. The menu is an `NSMenu` because a
 GPUI dropdown would paint under the webview.

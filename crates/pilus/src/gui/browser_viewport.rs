@@ -8,9 +8,10 @@
 //! leaves, asks [`Viewport::fit`] for the box, and centres it.
 //!
 //! Every shape fits inside the room it is given and keeps its proportions, so
-//! a narrow column shrinks a phone rather than clipping it. A phone or tablet
-//! never grows past its real size, as a larger one would stop being a test of
-//! that device.
+//! a narrow column shrinks a phone rather than clipping it. A shape never grows
+//! past its real size, as a larger one would stop being a test of that screen. An exact size an agent asks for (`browser viewport 1000x800`)
+//! is held to the same rule: it is the size it gets when the room allows it,
+//! and the answer says what it got when it does not.
 
 /// What a page tab shows its page in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -18,14 +19,17 @@ pub enum Viewport {
     /// The whole room the column leaves. The page decides how it lays out.
     #[default]
     Responsive,
-    /// A widescreen laptop panel.
+    /// A widescreen laptop panel, 1280×800.
     Wide,
-    /// An older monitor or a tablet held sideways.
+    /// An older monitor or a tablet held sideways, 1024×768.
     Standard,
     /// A phone held upright.
     Mobile,
     /// A tablet held upright.
     Tablet,
+    /// An exact size in CSS pixels, which only an agent can ask for: the menu
+    /// lists the presets.
+    Custom(u16, u16),
 }
 
 impl Viewport {
@@ -38,7 +42,13 @@ impl Viewport {
         Self::Tablet,
     ];
 
-    /// The menu's wording.
+    /// The smallest and largest side an exact size may have. Below the first
+    /// a page is not a page; above the second no column has the room, so the
+    /// request could only ever be shrunk.
+    pub const MIN_SIDE: u16 = 100;
+    pub const MAX_SIDE: u16 = 4096;
+
+    /// The preset's wording.
     pub fn label(self) -> &'static str {
         match self {
             Self::Responsive => "Responsive",
@@ -46,25 +56,75 @@ impl Viewport {
             Self::Standard => "4:3",
             Self::Mobile => "Mobile",
             Self::Tablet => "Tablet",
+            Self::Custom(..) => "Custom",
         }
     }
 
-    /// Width and height in CSS pixels. A device viewport is its real size; a
-    /// ratio is only a proportion, so it has no size of its own.
+    /// The name a script uses for it, which [`Self::parse`] takes back.
+    pub fn name(self) -> String {
+        match self {
+            Self::Responsive => "responsive".into(),
+            Self::Wide => "16:10".into(),
+            Self::Standard => "4:3".into(),
+            Self::Mobile => "mobile".into(),
+            Self::Tablet => "tablet".into(),
+            Self::Custom(width, height) => format!("{width}x{height}"),
+        }
+    }
+
+    /// A viewport from the word a script or a person types: a preset's name
+    /// (`mobile`, `16:10`), or `WIDTHxHEIGHT` in CSS pixels.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let word = text.trim().to_ascii_lowercase();
+        match word.as_str() {
+            "responsive" | "full" | "reset" | "none" => return Ok(Self::Responsive),
+            "16:10" | "wide" => return Ok(Self::Wide),
+            "4:3" | "standard" => return Ok(Self::Standard),
+            "mobile" | "phone" => return Ok(Self::Mobile),
+            "tablet" => return Ok(Self::Tablet),
+            _ => {}
+        }
+        let bad = || {
+            format!(
+                "unknown viewport {text:?}; use responsive, 16:10, 4:3, mobile, tablet or \
+                 WIDTHxHEIGHT in pixels, like 1000x800"
+            )
+        };
+        let (width, height) = word.split_once(['x', '\u{d7}']).ok_or_else(bad)?;
+        let side = |digits: &str| -> Result<u16, String> {
+            let value: u16 = digits.trim().parse().map_err(|_| bad())?;
+            if (Self::MIN_SIDE..=Self::MAX_SIDE).contains(&value) {
+                Ok(value)
+            } else {
+                Err(format!(
+                    "a viewport side is {} to {} pixels, not {value}",
+                    Self::MIN_SIDE,
+                    Self::MAX_SIDE
+                ))
+            }
+        };
+        Ok(Self::Custom(side(width)?, side(height)?))
+    }
+
+    /// Width and height in CSS pixels. Every shape but Responsive is a real
+    /// size: the two ratios stand for a laptop panel (1280×800) and an older
+    /// monitor (1024×768), so a script that asks for one gets the same layout
+    /// whenever the room allows.
     fn shape(self) -> Option<(f32, f32)> {
         match self {
             Self::Responsive => None,
-            Self::Wide => Some((16.0, 10.0)),
-            Self::Standard => Some((4.0, 3.0)),
+            Self::Wide => Some((1280.0, 800.0)),
+            Self::Standard => Some((1024.0, 768.0)),
             Self::Mobile => Some((390.0, 844.0)),
             Self::Tablet => Some((768.0, 1024.0)),
+            Self::Custom(width, height) => Some((f32::from(width), f32::from(height))),
         }
     }
 
-    /// Whether the shape is a real device, which is never drawn larger than
-    /// it is.
+    /// Whether the shape is a real size, which is never drawn larger than it
+    /// is.
     fn capped(self) -> bool {
-        matches!(self, Self::Mobile | Self::Tablet)
+        self != Self::Responsive
     }
 
     /// Whether the page is held to a box smaller than the room.
@@ -86,6 +146,30 @@ impl Viewport {
         }
         Some(((shape_w * scale).floor(), (shape_h * scale).floor()))
     }
+
+    /// The size in CSS pixels the page gets in `room`: the box when there is
+    /// one, else all of the room. `None` before the Browser has ever been
+    /// drawn, when there is no room to speak of.
+    pub fn size_in(self, room: (f32, f32)) -> Option<(u32, u32)> {
+        let (width, height) = self
+            .fit(room)
+            .or_else(|| (room.0 > 0.0 && room.1 > 0.0).then_some(room))?;
+        // Both are floored and positive, so the casts lose nothing.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Some((width.floor() as u32, height.floor() as u32))
+    }
+
+    /// The menu's row: the name and the size the page gets, like
+    /// `Mobile (390×844)`. A ratio has no size of its own, so it shows what
+    /// the room makes of it.
+    pub fn describe(self, room: (u32, u32)) -> String {
+        #[allow(clippy::cast_precision_loss)]
+        let size = self.size_in((room.0 as f32, room.1 as f32));
+        match size {
+            Some((width, height)) => format!("{} ({width}\u{d7}{height})", self.label()),
+            None => self.label().to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -106,6 +190,19 @@ mod tests {
         assert_eq!(
             Viewport::Standard.fit((1200.0, 600.0)),
             Some((800.0, 600.0))
+        );
+    }
+
+    #[test]
+    fn a_ratio_stops_at_its_real_size() {
+        assert_eq!(Viewport::Wide.fit((2000.0, 1500.0)), Some((1280.0, 800.0)));
+        assert_eq!(
+            Viewport::Standard.fit((2000.0, 1500.0)),
+            Some((1024.0, 768.0))
+        );
+        assert_eq!(
+            Viewport::Wide.describe((2000, 1500)),
+            "16:10 (1280\u{d7}800)"
         );
     }
 
@@ -132,6 +229,59 @@ mod tests {
     fn no_room_means_no_box() {
         assert_eq!(Viewport::Mobile.fit((0.0, 500.0)), None);
         assert_eq!(Viewport::Wide.fit((500.0, -1.0)), None);
+    }
+
+    #[test]
+    fn a_name_parses_back_to_its_viewport() {
+        for viewport in Viewport::ALL {
+            assert_eq!(Viewport::parse(&viewport.name()), Ok(viewport));
+        }
+        assert_eq!(Viewport::parse("Phone"), Ok(Viewport::Mobile));
+        assert_eq!(Viewport::parse("1000x800"), Ok(Viewport::Custom(1000, 800)));
+        assert_eq!(
+            Viewport::parse(" 640\u{d7}480 "),
+            Ok(Viewport::Custom(640, 480))
+        );
+        assert_eq!(Viewport::Custom(1000, 800).name(), "1000x800");
+    }
+
+    #[test]
+    fn a_size_outside_the_limits_or_a_stray_word_is_refused() {
+        for text in [
+            "",
+            "huge",
+            "1000",
+            "1000x",
+            "x800",
+            "50x800",
+            "1000x9000",
+            "ax9",
+        ] {
+            assert!(Viewport::parse(text).is_err(), "{text:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn an_exact_size_is_kept_when_it_fits_and_shrinks_when_it_does_not() {
+        let custom = Viewport::Custom(1000, 500);
+        assert_eq!(custom.fit((1400.0, 900.0)), Some((1000.0, 500.0)));
+        assert_eq!(custom.fit((500.0, 900.0)), Some((500.0, 250.0)));
+    }
+
+    #[test]
+    fn the_size_the_page_gets_is_described() {
+        assert_eq!(
+            Viewport::Mobile.describe((1400, 1400)),
+            "Mobile (390\u{d7}844)"
+        );
+        assert_eq!(Viewport::Wide.describe((480, 900)), "16:10 (480\u{d7}300)");
+        assert_eq!(
+            Viewport::Responsive.describe((480, 700)),
+            "Responsive (480\u{d7}700)"
+        );
+        // Before the Browser has been drawn there is no size to show.
+        assert_eq!(Viewport::Mobile.describe((0, 0)), "Mobile");
+        assert_eq!(Viewport::Responsive.size_in((0.0, 0.0)), None);
     }
 
     #[test]

@@ -164,6 +164,9 @@ impl PilusView {
                 self.ctl_show_sidebar(Some(SidebarTab::Browser), cx);
                 return self.browser_ctl_focus(*tab, replier, cx);
             }
+            Request::BrowserViewport { tab, shape } => {
+                self.browser_ctl_viewport(*tab, shape.as_deref(), cx)
+            }
             Request::BrowserPage { tab, op } => {
                 return self.browser_ctl_page(*tab, op, replier, cx);
             }

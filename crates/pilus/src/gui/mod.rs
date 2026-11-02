@@ -7568,6 +7568,10 @@ impl PilusView {
                     .child(self.menu_bar_section_block(cx))
             }))
             .child(
+                style::section_card_tab(theme, "SIDEBAR", self.section_font())
+                    .child(self.sidebar_section_block(cx)),
+            )
+            .child(
                 style::section_card_tab(theme, "GITHUB", self.section_font())
                     .child(self.github_settings_block(cx)),
             )
@@ -9887,6 +9891,37 @@ impl PilusView {
         )
     }
 
+    /// The SIDEBAR section: whether the Home, Search and Insights quick links
+    /// show above the lists.
+    fn sidebar_section_block(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        div().flex().flex_col().gap_2().child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .pb_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(self.footer_font()))
+                        .text_color(theme.muted)
+                        .child("Show quick links (Home, Search and Insights) at the top of the sidebar."),
+                )
+                .child(
+                    style::toggle("pilus-quick-links-toggle", self.settings.quick_links, theme)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings.quick_links = !this.settings.quick_links;
+                            this.save_settings();
+                            cx.notify();
+                        })),
+                ),
+        )
+    }
+
     /// Mirror the agents into the menu bar and act on its clicks.
     fn sync_menubar(&mut self, cx: &mut Context<Self>) {
         let theme = self.theme;
@@ -11996,16 +12031,24 @@ impl PilusView {
             SIDEBAR_ROW_EDGE,
             self.theme.border,
         ));
-        content = content.child(self.open_workspace_row(cx));
-        content = content.child(self.overview_nav_row(cx));
-        content = content.child(self.search_nav_row(cx));
-        content = content.child(self.stats_nav_row(cx));
+        // The quick links are optional (Settings → Sidebar). Opening a
+        // workspace stays on ⌘⇧O, the File menu and the tab strip's `+`.
+        if self.settings.quick_links {
+            content = content.child(self.overview_nav_row(cx));
+            content = content.child(self.search_nav_row(cx));
+            content = content.child(self.stats_nav_row(cx));
+        }
         // sipil's own section leads the lists: the user's agents, people and
         // channels, with where the connection stands in its header.
-        content = content.children(self.sipil_sections(cx));
+        let sipil = self.sipil_sections(cx);
+        let github = self.github_sidebar(cx);
+        // Workspaces leads the list when the quick links are off and nothing
+        // sits above it, so it needs no gap to separate it from them.
+        let leads = !self.settings.quick_links && sipil.is_empty() && github.is_none();
+        content = content.children(sipil);
 
-        content = content.children(self.github_sidebar(cx));
-        content = content.child(self.workspaces_section(cx));
+        content = content.children(github);
+        content = content.child(self.workspaces_section(leads, cx));
         content = content.child(self.agents_section(cx));
 
         let list = div()
@@ -14079,36 +14122,7 @@ impl PilusView {
         self.active_session()
     }
 
-    /// An "Open Workspace" action above the nav rows.
-    ///
-    /// It opens the same folder picker as the Cmd+Shift+O chord. The picker is
-    /// a modal overlay, so the row never takes the selection pill.
-    fn open_workspace_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        div()
-            .id("pilus-open-workspace")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(SIDEBAR_GLYPH_GAP))
-            .h(px(SIDEBAR_ROW_HEIGHT))
-            .pl(px(SIDEBAR_ROW_PAD))
-            .pr(px(SIDEBAR_ROW_PAD))
-            .rounded(self.sidebar_radius().pixels())
-            .cursor_pointer()
-            .text_size(px(self.chrome_font()))
-            .text_color(theme.panel_fg)
-            .child(style::hover_target(&self.sidebar_hover))
-            .child(icon(
-                include_bytes!("../../assets/icons/plus.svg"),
-                SIDEBAR_GLYPH,
-                theme.muted,
-            ))
-            .child(div().flex_1().child("Open Workspace"))
-            .on_click(cx.listener(|this, _, _, cx| this.open_picker(cx)))
-    }
-
-    /// The Home row below Open Workspace: what is working, waiting and new.
+    /// The Home row, first of the quick links: what is working, waiting and new.
     fn overview_nav_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         div()
@@ -14134,7 +14148,7 @@ impl PilusView {
             .on_click(cx.listener(|this, _, _, cx| this.open_overview(cx)))
     }
 
-    /// The Search row below Open Workspace: it opens the page that finds a
+    /// The Search row below Home: it opens the page that finds a
     /// saved agent session and resumes it.
     fn search_nav_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -14854,13 +14868,13 @@ impl PilusView {
 
     /// WORKSPACES: every connected endpoint as a machine row, with the
     /// workspaces opened on it hanging below.
-    fn workspaces_section(&self, cx: &mut Context<Self>) -> Div {
+    fn workspaces_section(&self, leads: bool, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let section = div()
             .flex()
             .flex_col()
             .gap_1()
-            .pt(px(SIDEBAR_SECTION_GAP))
+            .pt(px(if leads { 0.0 } else { SIDEBAR_SECTION_GAP }))
             .child(self.section_header(
                 SectionHeader {
                     id: "pilus-workspaces-toggle",

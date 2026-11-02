@@ -3,8 +3,10 @@
 Read this before you change the Home page (`gui/overview.rs`), its idle-agent
 panel, or the New Agent composer it embeds.
 
-The sidebar's top rows are Open Workspace, then Home, Search and Insights, in
-that order.
+The sidebar's top rows are the quick links: Home, Search and Insights, in that
+order. `Settings::quick_links` (on by default; Settings → Sidebar) shows or hides
+them. Open Workspace has no sidebar row; it is ⌘⇧O, the File menu and the tab
+strip's `+`.
 
 ## Home owns no data
 

@@ -350,6 +350,9 @@ pub struct Settings {
     /// Whether the terminal cursor fades in and out. Off by default: a steady
     /// cursor needs no repaints while the window is idle.
     pub cursor_blink: bool,
+    /// Show the quick links (Home, Search, Insights) at the top of the
+    /// sidebar. On by default; the commands and palette entries stay.
+    pub quick_links: bool,
     /// Show the GitHub sections in the sidebar. They need the `gh` CLI on
     /// this Mac and stay out of the way when it is missing, so on is the
     /// right default; off also stops every request to GitHub.
@@ -470,6 +473,7 @@ impl Default for Settings {
             pane_gaps: false,
             pane_toolbar: false,
             cursor_blink: false,
+            quick_links: true,
             github: true,
             github_repositories: true,
             github_pinned: Vec::new(),
@@ -1064,6 +1068,7 @@ mod tests {
         assert!(!back.pane_gaps);
         assert!(!back.pane_toolbar);
         assert!(!back.cursor_blink);
+        assert!(back.quick_links);
     }
 
     #[test]
@@ -1280,6 +1285,7 @@ mod tests {
             pane_gaps: true,
             pane_toolbar: false,
             cursor_blink: true,
+            quick_links: false,
             github: false,
             github_repositories: false,
             github_pinned: vec!["o/r".to_string()],

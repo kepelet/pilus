@@ -454,6 +454,8 @@ gpui::actions!([
     OpenSessionMenu,
     /// Open the command palette.
     OpenCommandPalette,
+    /// Open the palette listing the pinned workspaces.
+    OpenPinnedWorkspaces,
     /// Open the Settings page.
     OpenSettings,
     /// Open the Home composer for a new agent.
@@ -1105,6 +1107,7 @@ fn app_key_bindings() -> Vec<KeyBinding> {
             Some("MdEditor"),
         ),
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
+        KeyBinding::new("cmd-o", OpenPinnedWorkspaces, None),
         KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, None),
         KeyBinding::new("cmd-shift-s", OpenSessionMenu, None),
         KeyBinding::new("cmd-shift-.", OpenSettings, None),
@@ -1258,6 +1261,7 @@ fn app_menus(energy: bool) -> Vec<Menu> {
             MenuItem::action("Open Local Terminal", OpenLocalTerminal),
             MenuItem::action("New Agent…", OpenHome),
             MenuItem::action("Open Workspace", OpenWorkspacePicker),
+            MenuItem::action("Open Pinned Workspace…", OpenPinnedWorkspaces),
             MenuItem::action("Go to File…", OpenQuickOpen),
             MenuItem::separator(),
             MenuItem::action("Split Vertical", SplitVertical),
@@ -2043,6 +2047,8 @@ struct PilusView {
     last_session_poll: Instant,
     /// Whether the session menu is open.
     session_menu_open: bool,
+    /// Whether the pinned workspaces menu is open.
+    pinned_menu_open: bool,
     /// The row waiting on a second press before it stops or deletes.
     session_confirm: Option<(String, SessionVerb)>,
     /// The session whose icon choices are unfolded under its menu row.
@@ -2198,8 +2204,6 @@ struct PilusView {
     sidebar_revision: u64,
     /// Whether the native sidebar is expanded.
     sidebar_visible: bool,
-    /// Whether the PINNED WORKSPACES section is collapsed to its header.
-    pinned_collapsed: bool,
     /// Whether the WORKSPACES section is collapsed to its header.
     workspaces_collapsed: bool,
     /// Keys of the machines whose workspaces are folded under their row.
@@ -2811,6 +2815,7 @@ impl PilusView {
             sessions,
             last_session_poll: Instant::now(),
             session_menu_open: false,
+            pinned_menu_open: false,
             session_confirm: None,
             session_icon_editing: None,
             session_working: HashSet::new(),
@@ -2884,7 +2889,6 @@ impl PilusView {
             worktree_probing: HashSet::new(),
             sidebar_revision: 0,
             sidebar_visible: true,
-            pinned_collapsed: false,
             workspaces_collapsed: false,
             machines_collapsed: HashSet::new(),
             machine_toggled: None,
@@ -5363,9 +5367,14 @@ impl PilusView {
         {
             return;
         }
-        // An open session menu owns Escape; the daemon never sees it.
+        // An open session or pinned menu owns Escape; the daemon never sees it.
         if self.session_menu_open && keystroke.key == "escape" {
             self.close_session_menu();
+            cx.notify();
+            return;
+        }
+        if self.pinned_menu_shown() && keystroke.key == "escape" {
+            self.close_pinned_menu();
             cx.notify();
             return;
         }
@@ -5417,6 +5426,9 @@ impl PilusView {
 
     /// The live command list, rebuilt from current view state.
     fn palette_entries(&self) -> Vec<Entry> {
+        if self.palette.is_pinned() {
+            return self.pinned_palette_entries();
+        }
         let entry = |command: Command, title: &str, group: &'static str, shortcut| Entry {
             command,
             title: title.to_string(),
@@ -5627,6 +5639,11 @@ impl PilusView {
             Command::RenameSession => {
                 let name = self.current_session_name().to_string();
                 self.open_session_rename(&name, cx);
+            }
+            Command::OpenPinned(index) => {
+                if let Some(saved) = self.pinned_at(index) {
+                    self.open_saved_workspace(saved, cx);
+                }
             }
             Command::FocusWorkspace(id) => {
                 self.leave_settings_page();
@@ -10016,6 +10033,8 @@ impl PilusView {
     /// tracks the flight with throttled resizes, so it has converged by the
     /// time the panel lands and nothing pops at settle.
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        // The pinned menu hangs from the sidebar's head and goes with it.
+        self.close_pinned_menu();
         // Capture the current openness before flipping the flag: with no
         // tween in flight `sidebar_factor` reads `sidebar_visible`, so
         // sampling after the flip would pin `from` to the new target and
@@ -10196,6 +10215,7 @@ impl PilusView {
     /// the overlay sits above the grid.
     fn overlay_open(&self) -> bool {
         self.session_menu_open
+            || self.pinned_menu_shown()
             || self.palette.is_open()
             || self.quick_open.is_open()
             || self.picker.is_open()
@@ -11939,7 +11959,6 @@ impl PilusView {
         content = content.children(self.sipil_sections(cx));
 
         content = content.children(self.github_sidebar(cx));
-        content = content.children(self.pinned_section(cx));
         content = content.child(self.workspaces_section(cx));
         content = content.child(self.agents_section(cx));
 
@@ -12000,7 +12019,8 @@ impl PilusView {
                     .gap(px(HEAD_CONTROLS_GAP))
                     .pl(px(Self::head_controls_left(fullscreen)))
                     .child(self.session_picker("pilus-session-button", cx))
-                    .child(self.sidebar_toggle("pilus-sidebar-toggle", cx)),
+                    .child(self.sidebar_toggle("pilus-sidebar-toggle", cx))
+                    .children(self.pinned_button(cx)),
             )
             .child(list);
         // The sidebar parts from the terminal with a hairline. It is an
@@ -12837,6 +12857,7 @@ impl PilusView {
                 } else {
                     this.session_menu_open = true;
                 }
+                this.close_pinned_menu();
                 cx.notify();
             }))
     }
@@ -13595,7 +13616,13 @@ impl PilusView {
                     .py_4()
                     .text_size(px(self.chrome_font()))
                     .text_color(theme.muted)
-                    .child("No matching commands"),
+                    .child(if self.palette.is_pinned() && entries.is_empty() {
+                        "Nothing pinned. Right-click a workspace and choose Pin this Workspace."
+                    } else if self.palette.is_pinned() {
+                        "No matching workspaces"
+                    } else {
+                        "No matching commands"
+                    }),
             );
         }
         for (index, entry) in matches.iter().enumerate() {
@@ -13657,7 +13684,13 @@ impl PilusView {
         }
 
         let palette_input = self.palette_input.clone();
+        let hint = if self.palette.is_pinned() {
+            "Open a pinned workspace…"
+        } else {
+            "Type a command…"
+        };
         palette_input.update(cx, |input, _| {
+            input.set_placeholder(hint);
             input.set_style(
                 theme,
                 style::chrome_font(&self.shared_settings),
@@ -15932,6 +15965,17 @@ impl Render for PilusView {
                     }
                     cx.notify();
                 }))
+                .on_action(cx.listener(|this, _: &OpenPinnedWorkspaces, _window, cx| {
+                    // The chord toggles, and a palette open for commands turns
+                    // into the pinned list rather than closing.
+                    if this.palette.is_open() && this.palette.is_pinned() {
+                        this.palette.close();
+                    } else {
+                        this.quick_open.close();
+                        this.palette.open_pinned();
+                    }
+                    cx.notify();
+                }))
                 .on_action(cx.listener(|this, _: &OpenQuickOpen, _window, cx| {
                     // Like the palette, the chord toggles.
                     if this.quick_open.is_open() {
@@ -15957,6 +16001,7 @@ impl Render for PilusView {
                     this.toggle_home(cx);
                 }))
                 .on_action(cx.listener(|this, _: &OpenSessionMenu, _window, cx| {
+                    this.close_pinned_menu();
                     this.session_menu_open = true;
                     cx.notify();
                 }))
@@ -16077,6 +16122,7 @@ impl Render for PilusView {
             )
             .when(!luvus_missing, |root| {
                 root.child(self.session_menu(cx, cell_width, fullscreen))
+                    .child(self.pinned_menu(cx, cell_width, fullscreen))
                     .child(self.palette_overlay(cx))
                     .child(self.quick_open_overlay(cx))
                     .child(self.picker_overlay(window, cx))

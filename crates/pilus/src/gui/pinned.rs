@@ -4,8 +4,8 @@
 //! and lives in `Settings::pinned_workspaces`; the folders opened last are
 //! `Settings::recent_workspaces`. Both are namespaced by Luvus session: a row
 //! is drawn and opened only in the session that saved it, because
-//! `workspace.open` goes to the attached session's daemon. The sidebar's PINNED
-//! WORKSPACES section and Home's Pinned and Recent blocks draw them, and all
+//! `workspace.open` goes to the attached session's daemon. The sidebar head's
+//! pinned menu and Home's Pinned and Recent blocks draw them, and all
 //! three open one the same way: `workspace.open` for the folder on the machine that owns it, then the
 //! window switches to that endpoint, so the terminal that appears is in the
 //! folder.
@@ -15,18 +15,27 @@
 //! connected by the switch afterwards. Nothing here is asked of the daemon
 //! except that one call, which runs on a worker thread.
 
-use gpui::{Context, Div, MouseButton, MouseDownEvent, Render, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, Div, MouseButton, MouseDownEvent, Render, Stateful, Window, div,
+    prelude::*, px,
+};
 
 use super::overview::{card, quiet};
+use super::palette::{Command, Entry};
 use super::picker::PickerEvent;
 use super::sidebar_menu::MenuTarget;
-use super::style::{self, Fonts, RadiusExt};
+use super::style::{self, FillExt, Fonts, RadiusExt};
 use super::theme::Theme;
 use super::toast::ToastKind;
 use super::{
-    EndpointId, PilusView, SIDEBAR_GLYPH, SIDEBAR_GLYPH_GAP, SIDEBAR_ROW_HEIGHT, SIDEBAR_ROW_PAD,
-    SIDEBAR_SECTION_GAP, SectionHeader, icon, row_tooltip,
+    EndpointId, HEAD_CONTROLS_GAP, HEAD_CONTROLS_W, HEADER_HEIGHT, PilusView, SESSION_MENU_GAP,
+    SIDEBAR_HEAD_INSET, SIDEBAR_ROW_HEIGHT, SIDEBAR_TOGGLE_W, TAB_HEIGHT, icon, row_tooltip,
 };
+
+/// Width of the pinned menu, the session menu's.
+const PINNED_MENU_WIDTH: f32 = 264.0;
+/// Tallest the pinned menu grows before its rows scroll.
+const PINNED_MENU_MAX_HEIGHT: f32 = 360.0;
 use crate::settings::SavedWorkspace;
 
 impl PilusView {
@@ -184,70 +193,180 @@ impl PilusView {
         );
     }
 
-    /// PINNED WORKSPACES, between the GitHub block and WORKSPACES. It is not
-    /// drawn until something is pinned, so a window that never pins one has no
-    /// empty heading.
-    pub(super) fn pinned_section(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let pins: Vec<&SavedWorkspace> = self.session_pins().collect();
-        if pins.is_empty() {
-            return None;
-        }
-        let section = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .pt(px(SIDEBAR_SECTION_GAP))
-            .child(self.section_header(
-                SectionHeader {
-                    id: "pilus-pinned-toggle",
-                    label: "PINNED WORKSPACES",
-                    collapsed: self.pinned_collapsed,
-                    toggle: Box::new(|this, cx| {
-                        this.pinned_collapsed = !this.pinned_collapsed;
-                        cx.notify();
-                    }),
-                    menu: false,
-                    button: None,
-                },
-                cx,
-            ));
-        if self.pinned_collapsed {
-            return Some(section);
-        }
-        let mut rows = div().flex().flex_col().gap_1();
-        for (index, saved) in pins.into_iter().enumerate() {
-            rows = rows.child(self.pinned_row(index, saved, cx));
-        }
-        Some(section.child(style::enter("pilus-pinned-rows", rows)))
+    /// Whether the pinned menu is on screen: open, with the sidebar it hangs
+    /// from showing and something left to list. A flag left set by a collapsed
+    /// sidebar or a last unpin must not keep an invisible overlay eating clicks.
+    pub(super) fn pinned_menu_shown(&self) -> bool {
+        self.pinned_menu_open && self.sidebar_visible && self.session_pins().next().is_some()
     }
 
-    /// One pinned folder: its glyph and name, the machine at the right when it
-    /// is not this Mac. A click opens it; a right click offers Unpin.
+    /// The `index`th pin of the attached session, in pin order.
+    pub(super) fn pinned_at(&self, index: usize) -> Option<SavedWorkspace> {
+        self.session_pins().nth(index).cloned()
+    }
+
+    /// The pins as palette rows (⌘O), in pin order. A remote pin names its
+    /// machine in the title, so typing the machine finds it.
+    pub(super) fn pinned_palette_entries(&self) -> Vec<Entry> {
+        self.session_pins()
+            .enumerate()
+            .map(|(index, saved)| Entry {
+                command: Command::OpenPinned(index),
+                title: match self.saved_host(saved) {
+                    Some(host) => format!("{} · {host}", saved.label()),
+                    None => saved.label().to_string(),
+                },
+                group: "Pinned",
+                shortcut: None,
+            })
+            .collect()
+    }
+
+    /// Close the pinned menu.
+    pub(super) fn close_pinned_menu(&mut self) {
+        self.pinned_menu_open = false;
+    }
+
+    /// The button in the sidebar's head, after the session picker and the
+    /// collapse toggle, that drops the pins down. It is absent until something
+    /// is pinned, so a window that never pins one has no dead control.
+    pub(super) fn pinned_button(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let count = self.session_pins().count();
+        if count == 0 {
+            return None;
+        }
+        let theme = self.theme;
+        Some(
+            div()
+                .id("pilus-pinned-button")
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .h(px(TAB_HEIGHT))
+                .w(px(SIDEBAR_TOGGLE_W))
+                .radius_md()
+                .cursor_pointer()
+                .state_fill(
+                    if self.pinned_menu_open {
+                        theme.tint_fill(1.0)
+                    } else {
+                        gpui::Rgba::default()
+                    },
+                    theme.tint_fill(1.0),
+                    style::RADIUS_MD,
+                )
+                .child(icon(
+                    include_bytes!("../../assets/icons/folder-bookmark.svg"),
+                    14.0,
+                    theme.muted,
+                ))
+                .tooltip(row_tooltip(
+                    format!("Pinned workspaces · {count}"),
+                    theme.panel_fg,
+                    Vec::new(),
+                    theme,
+                ))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.pinned_menu_open = !this.pinned_menu_open;
+                    this.close_session_menu();
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// The pinned menu: one row per pin, below its button in the sidebar head.
+    ///
+    /// Like the session menu, a transparent catcher covers the window so a
+    /// click anywhere outside dismisses it, and the panel stops propagation so
+    /// its own clicks land.
+    pub(super) fn pinned_menu(
+        &self,
+        cx: &mut Context<Self>,
+        cell_width: f32,
+        fullscreen: bool,
+    ) -> AnyElement {
+        if !self.pinned_menu_shown() {
+            return div().into_any_element();
+        }
+        let theme = self.theme;
+        let sidebar_left = self
+            .sidebar_dock()
+            .map_or(0.0, |dock| f32::from(dock.x) * cell_width);
+        let button_left = sidebar_left
+            + Self::head_controls_left(fullscreen)
+            + HEAD_CONTROLS_W
+            + HEAD_CONTROLS_GAP;
+        let menu_left = button_left.max(SIDEBAR_HEAD_INSET);
+        let menu_top = (HEADER_HEIGHT + TAB_HEIGHT) / 2.0 + SESSION_MENU_GAP;
+        let mut rows = div().flex().flex_col().gap_1();
+        for (index, saved) in self.session_pins().enumerate() {
+            rows = rows.child(self.pinned_row(index, saved, cx));
+        }
+        style::enter(
+            "pilus-pinned-menu-enter",
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(menu_left))
+                        .top(px(menu_top))
+                        .w(px(PINNED_MENU_WIDTH))
+                        .radius_md()
+                        .bg(theme.sidebar_bg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .p_2()
+                        .child(
+                            div()
+                                .id("pilus-pinned-menu-scroll")
+                                .max_h(px(PINNED_MENU_MAX_HEIGHT))
+                                .overflow_y_scroll()
+                                .child(rows),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        ),
+                )
+                // Stop the press here: it would otherwise reach the button
+                // beneath, whose click handler reopens the menu this just
+                // closed, so a second click on it could never close it.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.close_pinned_menu();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                ),
+        )
+        .into_any_element()
+    }
+
+    /// One pinned folder in the menu: its name, the machine at the right when
+    /// it is not this Mac. A click opens it; a right click offers Unpin, and a
+    /// drag onto another row takes its slot.
     fn pinned_row(
         &self,
         index: usize,
         saved: &SavedWorkspace,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> Stateful<Div> {
         let theme = self.theme;
         let host = self.saved_host(saved);
-        let glyph: &'static [u8] = if host.is_some() {
-            include_bytes!("../../assets/icons/server.svg")
-        } else {
-            include_bytes!("../../assets/icons/folder.svg")
-        };
-        let mut lines = vec![(
-            format!(
-                "Directory: {}",
-                self.shorten_cwd(&saved.endpoint, &saved.path)
-            ),
-            theme.muted,
-        )];
-        if let Some(host) = host.as_ref() {
-            lines.push((format!("Host: {host}"), theme.muted));
-        }
-        let tip = row_tooltip(saved.label().to_string(), theme.panel_fg, lines, theme);
-
+        let tip = row_tooltip(
+            saved.label().to_string(),
+            theme.panel_fg,
+            vec![(self.shorten_cwd(&saved.endpoint, &saved.path), theme.muted)],
+            theme,
+        );
         let open = saved.clone();
         let menu = saved.clone();
         let drag = PinDrag {
@@ -260,23 +379,22 @@ impl PilusView {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(SIDEBAR_GLYPH_GAP))
-            .h(px(SIDEBAR_ROW_HEIGHT))
-            .px(px(SIDEBAR_ROW_PAD))
+            .gap_2()
+            .h(px(28.0))
+            .px_2()
             .radius_md()
             .cursor_pointer()
+            .hover_fill(theme.panel, style::RADIUS_MD)
             .text_size(px(self.chrome_font()))
-            .child(style::hover_target(&self.sidebar_hover))
-            .tooltip(tip)
-            .child(div().w(px(SIDEBAR_GLYPH)).flex_shrink_0().child(icon(
-                glyph,
-                SIDEBAR_GLYPH,
+            .child(icon(
+                include_bytes!("../../assets/icons/folder-bookmark.svg"),
+                14.0,
                 theme.muted,
-            )))
+            ))
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(0.0))
                     .truncate()
                     .text_color(theme.panel_fg)
                     .child(saved.label().to_string()),
@@ -290,8 +408,9 @@ impl PilusView {
                     .text_color(theme.muted)
                     .child(host)
             }))
+            .tooltip(tip)
             .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
-            // The row under a drag shows the pill it would take, unless it is
+            // The row under a drag shows the fill it would take, unless it is
             // the one being dragged.
             .drag_over::<PinDrag>({
                 let saved = saved.clone();
@@ -311,12 +430,16 @@ impl PilusView {
                 move |this, drag: &PinDrag, _, cx| this.reorder_pin(&drag.saved, &saved, cx)
             }))
             // A click, not a mouse down, so starting a drag does not open it.
-            .on_click(
-                cx.listener(move |this, _, _, cx| this.open_saved_workspace(open.clone(), cx)),
-            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.close_pinned_menu();
+                this.open_saved_workspace(open.clone(), cx);
+            }))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, _: &MouseDownEvent, _, cx| this.open_saved_menu(&menu, cx)),
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.close_pinned_menu();
+                    this.open_saved_menu(&menu, cx);
+                }),
             )
     }
 

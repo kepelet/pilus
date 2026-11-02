@@ -26,7 +26,7 @@ use super::diff::{split_path, status_glyph};
 use super::diff_model::{self as model, Src, SrcKind};
 use super::highlight;
 use super::style::{self, ButtonKind, FillExt, RadiusExt};
-use super::{EndpointId, PilusView, icon};
+use super::{EndpointId, PilusView};
 
 /// How often the open tab asks the daemon for a fresh answer.
 const POLL: Duration = Duration::from_millis(2000);
@@ -506,12 +506,9 @@ impl PilusView {
     fn git_header(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let summary = self
-            .git_panel
-            .status
-            .as_ref()
-            .map(summary_line)
-            .unwrap_or_default();
+        let status = self.git_panel.status.as_ref();
+        let branch = status.map(|status| branch_name(status).to_string());
+        let summary = status.map(distance_line).unwrap_or_default();
         let refresh = self
             .diff_icon_button(
                 "pilus-git-refresh",
@@ -531,11 +528,7 @@ impl PilusView {
             .py_2()
             .border_b_1()
             .border_color(theme.border)
-            .child(icon(
-                include_bytes!("../../assets/icons/git-branch.svg"),
-                fonts.body,
-                theme.muted,
-            ))
+            .children(branch.map(|branch| style::branch_chip(theme, branch, fonts.label)))
             .child(
                 div()
                     .flex_1()
@@ -1198,14 +1191,18 @@ impl PilusView {
     }
 }
 
-/// `main · ↑2 ↓1 · 1 stash`: the branch, how far it is from its upstream, and
-/// the stashes it hides.
-fn summary_line(status: &GitStatus) -> String {
-    let mut parts = vec![if status.branch.is_empty() {
-        "detached HEAD".to_string()
+/// The branch the header names, or `detached HEAD` when none is checked out.
+fn branch_name(status: &GitStatus) -> &str {
+    if status.branch.is_empty() {
+        "detached HEAD"
     } else {
-        status.branch.clone()
-    }];
+        &status.branch
+    }
+}
+
+/// `↑2 ↓1`: how far the branch is from its upstream, empty when level. The
+/// branch is the header's chip, and stashes are not listed here.
+fn distance_line(status: &GitStatus) -> String {
     let mut distance = Vec::new();
     if status.ahead > 0 {
         distance.push(format!("↑{}", status.ahead));
@@ -1213,15 +1210,7 @@ fn summary_line(status: &GitStatus) -> String {
     if status.behind > 0 {
         distance.push(format!("↓{}", status.behind));
     }
-    if !distance.is_empty() {
-        parts.push(distance.join(" "));
-    }
-    match status.stashes {
-        0 => {}
-        1 => parts.push("1 stash".to_string()),
-        n => parts.push(format!("{n} stashes")),
-    }
-    parts.join(" · ")
+    distance.join(" ")
 }
 
 /// `author · 4 hours ago`, leaving out whichever the daemon did not send.
@@ -1272,18 +1261,17 @@ mod tests {
     }
 
     #[test]
-    fn summary_names_the_branch_and_only_what_differs() {
-        assert_eq!(summary_line(&status("main", 0, 0, 0)), "main");
-        assert_eq!(summary_line(&status("main", 2, 0, 0)), "main · ↑2");
-        assert_eq!(
-            summary_line(&status("main", 2, 1, 1)),
-            "main · ↑2 ↓1 · 1 stash"
-        );
-        assert_eq!(
-            summary_line(&status("main", 0, 3, 2)),
-            "main · ↓3 · 2 stashes"
-        );
-        assert_eq!(summary_line(&status("", 0, 0, 0)), "detached HEAD");
+    fn distance_shows_only_what_differs() {
+        assert_eq!(distance_line(&status("main", 0, 0, 0)), "");
+        assert_eq!(distance_line(&status("main", 2, 0, 0)), "↑2");
+        assert_eq!(distance_line(&status("main", 2, 1, 1)), "↑2 ↓1");
+        assert_eq!(distance_line(&status("main", 0, 3, 2)), "↓3");
+    }
+
+    #[test]
+    fn a_missing_branch_reads_as_detached_head() {
+        assert_eq!(branch_name(&status("main", 0, 0, 0)), "main");
+        assert_eq!(branch_name(&status("", 0, 0, 0)), "detached HEAD");
     }
 
     #[test]

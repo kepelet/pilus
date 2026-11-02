@@ -1,4 +1,4 @@
-//! The native command palette (⌘⇧P).
+//! The native command palette (⌘⇧P), and its pinned-workspaces mode (⌘O).
 //!
 //! The palette is a keyboard-first overlay. The view hands it the live command
 //! list, it filters that list against the typed query, and the view dispatches
@@ -53,6 +53,8 @@ pub enum Command {
     RenameSession,
     FocusWorkspace(String),
     FocusAgent(String),
+    /// The `n`th pinned workspace of the attached session, in pin order.
+    OpenPinned(usize),
 }
 
 /// One palette row: a command plus the text that is searched and drawn.
@@ -70,6 +72,8 @@ pub struct Entry {
 #[derive(Debug, Default)]
 pub struct Palette {
     open: bool,
+    /// Whether it lists only the pinned workspaces (⌘O) instead of commands.
+    pinned: bool,
     input: TextField,
     selected: usize,
     /// Query text the highlight last reset against, so caret-blink repaints
@@ -104,15 +108,29 @@ impl Palette {
         self.selected
     }
 
+    /// Whether it lists pinned workspaces rather than commands.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
     /// Show the palette with an empty query and the first row highlighted.
     pub fn open(&mut self) {
         self.open = true;
+        self.pinned = false;
         self.clear();
     }
 
-    /// Hide the palette and forget the query.
+    /// Show it as the pinned-workspaces list, which `palette_entries` fills.
+    pub fn open_pinned(&mut self) {
+        self.open();
+        self.pinned = true;
+    }
+
+    /// Hide the palette and forget the query. Every way out lands here, so the
+    /// mode never outlives the overlay.
     pub fn close(&mut self) {
         self.open = false;
+        self.pinned = false;
         self.clear();
     }
 
@@ -286,6 +304,18 @@ mod tests {
             palette.highlighted(&matches).map(|e| e.title.as_str()),
             Some("Quit")
         );
+    }
+
+    #[test]
+    fn the_pinned_mode_ends_with_the_overlay() {
+        let mut palette = Palette::default();
+        palette.open_pinned();
+        assert!(palette.is_open() && palette.is_pinned());
+        palette.close();
+        assert!(!palette.is_open() && !palette.is_pinned());
+        palette.open_pinned();
+        palette.open();
+        assert!(!palette.is_pinned(), "opening the commands leaves the mode");
     }
 
     #[test]

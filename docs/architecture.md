@@ -217,8 +217,9 @@ vertically (its height is kept in `settings.json`): the commit list on top,
 and what the picked commit changed below. What is changed but not yet
 committed is Changes', so the History tab does not repeat it.
 
-The header names the branch with `↑ahead ↓behind` against its upstream and the
-stash count. The list is the newest 50 commits (subject, up to two branch or
+The header names the branch in a bordered chip (`style::branch_chip`, which
+Changes' header uses too) with `↑ahead ↓behind` against its upstream beside
+it. The list is the newest 50 commits (subject, up to two branch or
 tag labels with the checked-out branch emphasised, hash, author, age), with
 *Show more* adding 50 while the last read filled the page. The picked commit
 is the panel pill, and the newest is picked when nothing is. The detail shows

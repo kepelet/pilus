@@ -379,7 +379,7 @@ pub struct Settings {
     pub sipil_order: Vec<String>,
     /// Folders kept to open again in one click, local or on a saved machine, in
     /// the order they were pinned. Each belongs to the session that pinned it
-    /// and shows only there, under PINNED WORKSPACES in the sidebar and on
+    /// and shows only there, in the sidebar head's pinned menu and on
     /// Home. Kept in `pilus.db` (`UiState`).
     pub pinned_workspaces: Vec<SavedWorkspace>,
     /// The folders opened last, newest first, at most `RECENT_WORKSPACES`

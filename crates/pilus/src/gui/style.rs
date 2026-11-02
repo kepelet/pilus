@@ -325,6 +325,33 @@ pub(super) fn chip(theme: Theme, text: impl IntoElement, size: f32) -> Div {
         .child(text)
 }
 
+/// A [`chip`] that names a branch: the branch glyph, then the name. It gives
+/// way before its neighbours and truncates a long name, so a header can hold it
+/// next to its controls. The Changes and History tabs lead their header with it.
+pub(super) fn branch_chip(theme: Theme, name: impl Into<SharedString>, size: f32) -> Div {
+    chip(
+        theme,
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .min_w(px(0.0))
+            .child(
+                svg()
+                    .data(include_bytes!("../../assets/icons/git-branch.svg"))
+                    .w(px(size))
+                    .h(px(size))
+                    .flex_shrink_0()
+                    .text_color(theme.muted),
+            )
+            .child(div().min_w(px(0.0)).truncate().child(name.into())),
+        size,
+    )
+    .flex_shrink_1()
+    .min_w(px(0.0))
+}
+
 /// Height of a [`glyph_tile`], and the box its glyph is sized against.
 pub(super) const GLYPH_TILE: f32 = 20.0;
 /// Room added to each side of a [`glyph_tile`]'s glyph, so the card reads as a

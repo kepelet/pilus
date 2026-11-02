@@ -41,7 +41,7 @@ pub enum MenuTarget {
         /// Whether the folder is already pinned, which turns Pin into Unpin.
         pinned: bool,
     },
-    /// A saved folder in the PINNED WORKSPACES section or on Home's Pinned and
+    /// A saved folder in the sidebar head's pinned menu or on Home's Pinned and
     /// Recent blocks, which is not open as a workspace (yet).
     Saved {
         /// Endpoint key (`local` or a machine id).
@@ -97,9 +97,9 @@ pub enum Item {
     Close,
     /// Rename the workspace's label, or give the agent's pane a live alias.
     Rename,
-    /// Keep the workspace's folder in PINNED WORKSPACES and on Home.
+    /// Keep the workspace's folder in the sidebar head's pinned menu and on Home.
     PinWorkspace,
-    /// Take the folder out of PINNED WORKSPACES again.
+    /// Take the folder out of the pinned menu again.
     UnpinWorkspace,
     /// Toggle the second (path) line of every row in the owning section.
     TogglePaths,

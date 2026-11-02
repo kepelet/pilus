@@ -945,6 +945,11 @@ impl TextInput {
         self.line_height = px(font_size.as_f32() * LINE_LEADING);
     }
 
+    /// Change the hint shown while the field is empty and unfocused.
+    pub(super) fn set_placeholder(&mut self, placeholder: impl Into<SharedString>) {
+        self.placeholder = placeholder.into();
+    }
+
     /// Show or hide the gutter of line numbers. Only a multiline field has one.
     pub(super) fn set_line_numbers(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.line_numbers != on {

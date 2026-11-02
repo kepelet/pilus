@@ -10,7 +10,7 @@
 //! window: a single open window feeds it, so a second window does not stack a
 //! second icon, and with none open [`headless`] feeds it from the app's own
 //! watcher. Pinned workspaces follow the agents, and a click on one opens
-//! that folder like the sidebar's PINNED WORKSPACES row does. Other platforms have no menu bar, so they do nothing.
+//! that folder like the sidebar's pinned menu does. Other platforms have no menu bar, so they do nothing.
 
 /// One agent in the menu.
 #[derive(Clone, Debug, PartialEq)]

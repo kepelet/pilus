@@ -1341,6 +1341,7 @@ impl UiPlaygroundView {
         }
         row.child(style::chip(theme, "after t1", fonts.label))
             .child(style::chip(theme, "src/auth/** +2", fonts.label))
+            .child(style::branch_chip(theme, "main", fonts.label))
     }
 
     /// Board cards joined by connectors: a waiting link, a settled

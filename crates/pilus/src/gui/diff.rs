@@ -2007,20 +2007,16 @@ impl PilusView {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let panel = &self.diff_panel;
-        let summary = match &panel.snapshot {
-            Some(snapshot) => {
-                let open = panel.open_notes_in_review();
-                let mut parts = Vec::new();
-                if !snapshot.branch.is_empty() {
-                    parts.push(snapshot.branch.clone());
-                }
-                parts.push(format!("{} changed", snapshot.files.len()));
-                if open > 0 {
-                    parts.push(format!("{open} open notes"));
-                }
-                parts.join(" · ")
-            }
-            None => String::new(),
+        let branch = panel
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.branch.clone())
+            .filter(|branch| !branch.is_empty());
+        let open = panel.open_notes_in_review();
+        let summary = if panel.snapshot.is_some() && open > 0 {
+            format!("{open} open notes")
+        } else {
+            String::new()
         };
         let refresh = self
             .diff_icon_button(
@@ -2084,6 +2080,7 @@ impl PilusView {
             .py_2()
             .border_b_1()
             .border_color(theme.border)
+            .children(branch.map(|branch| style::branch_chip(theme, branch, fonts.label)))
             .child(
                 div()
                     .flex_1()
@@ -3390,11 +3387,7 @@ impl PilusView {
 
     /// A note's card, running the full width of the row: a narrow sidebar
     /// has no room to spare for a gutter-sized indent.
-    pub(super) fn diff_note_card(
-        &self,
-        note: &DiffNote,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(super) fn diff_note_card(&self, note: &DiffNote, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let id = note.id.clone();

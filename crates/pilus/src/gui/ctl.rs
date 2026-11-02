@@ -88,22 +88,17 @@ impl PilusView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Reply> {
-        // Whatever opens, reads or drives a page waits for the person's yes.
-        if request.needs_browser_control()
-            && let Some(refusal) = self.browser_ctl_refusal()
-        {
-            return Some(Reply::err(refusal));
-        }
         Some(match request {
             Request::Ping => Reply::ok(),
             Request::State => {
-                let (tabs, url) = self.browser_summary();
+                let (tabs, url, agent_tabs, held) = self.browser_summary();
                 ctl::state_reply(
                     self.right.visible,
                     &self.right.tab.label().to_ascii_lowercase(),
                     tabs,
                     &url,
-                    self.browser_agent_control(),
+                    agent_tabs,
+                    held,
                 )
             }
             Request::SidebarOpen { tab } => {
@@ -120,10 +115,10 @@ impl PilusView {
                 self.toggle_right_sidebar(cx);
                 Reply::ok()
             }
-            Request::BrowserOpen { url, wait } => {
+            Request::BrowserOpen { url, wait, tab } => {
                 // Load the address first so a refused one does not leave the
                 // sidebar open on an empty Browser.
-                if let Err(message) = self.browser_open_url(url, false, cx) {
+                if let Err(message) = self.browser_ctl_open(url, *tab, false, cx) {
                     return Some(Reply::err(message));
                 }
                 self.ctl_show_sidebar(Some(SidebarTab::Browser), cx);
@@ -136,18 +131,25 @@ impl PilusView {
                 self.focus_tab(*index, cx);
                 Reply::ok()
             }
-            Request::BrowserControl { reason } => {
-                // Up front, so the banner is where the person is looking.
+            // From before a tab belonged to whoever opened it. Nothing is asked
+            // of the person now, so there is nothing to wait for.
+            Request::BrowserControl { .. } => Reply::data(serde_json::json!({
+                "granted": true,
+                "note": "no permission is needed: open a tab with `browser new URL` and use it; \
+                         tabs the person opened are theirs",
+            })),
+            Request::BrowserBorrow { tab, reason } => {
+                // Up front, so the prompt is where the person is looking.
                 self.ctl_show_sidebar(Some(SidebarTab::Browser), cx);
-                return self.browser_ctl_ask(reason.as_deref(), replier, cx);
+                return self.browser_ctl_request(*tab, reason.as_deref(), replier, cx);
             }
-            Request::BrowserRelease => self.browser_ctl_release(cx),
+            Request::BrowserRelease { tab } => self.browser_ctl_release(*tab, cx),
             Request::BrowserTabs => self.browser_ctl_tabs(),
             Request::BrowserNew {
                 url: Some(url),
                 wait,
             } => {
-                if let Err(message) = self.browser_open_url(url, true, cx) {
+                if let Err(message) = self.browser_ctl_open(url, None, true, cx) {
                     return Some(Reply::err(message));
                 }
                 self.ctl_show_sidebar(Some(SidebarTab::Browser), cx);

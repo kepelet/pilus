@@ -86,15 +86,32 @@ a page there runs as them. So:
 - `back`, `forward` and `reload` are the page's own buttons and work on any
   page, as do `open`, `new`, `close` and `focus`. `open` still takes http and
   https only.
-- **The person says yes first.** An agent asks with `browser control`; the
-  banner shows its reason and waits for Allow. Until then every verb that opens,
-  reads or drives a page is refused (`Request::needs_browser_control`; add a new
-  Browser verb to it). A real click or keypress in the page, or the Take over
-  button, ends the grant. The banner is drawn by pilus, not by the page, and
-  never takes its text from the page; the agent's reason is the agent's word and
-  is shown as plain text. Do not add a way to grant control without the person
-  pressing Allow, such as a flag, a setting or an environment variable an agent
-  can set.
+- **A tab belongs to whoever opened it.** There is no Allow button. An agent
+  opens tabs of its own (`browser new`, `browser open`) and may read, drive,
+  close and select only those; every Browser verb goes through
+  `Access::permits` / `acquire` in `gui/browser_control.rs`, so a new verb that
+  takes a tab must too. A tab the person opened is refused to it, and the
+  person's tabs are the only ones whose sign-ins and open pages an agent has no
+  way to reach. The one way in is `browser request N`: the prompt names the
+  tab and waits for Allow, and a yes lends that one tab until it is released,
+  taken back or closed. Do not add a verb, flag, setting or environment
+  variable that lets an agent use a tab the person opened without that yes. The
+  prompt is drawn by pilus and never takes its text from the page; the agent's
+  reason is its own word and is shown as plain text.
+- **An agent's tab is marked, and locked while it works.** The strip shows a
+  chip on every tab an agent opened, lit while it holds the tab. A held page
+  has a clear native cover (`gui/browser_shield.rs`) that swallows the
+  person's mouse, wheel and keys, and a Take over button in a corner. A tab an
+  agent opened has a dashed border. It is drawn by pilus, never
+  injected into the page, so a page cannot remove or imitate it and it covers
+  pages that run none of our script. Take over ends the hold and turns the agent
+  away from that tab for 15 s.
+- What this gives up, on purpose: an agent no longer needs a yes to open a
+  page, so it can load any http or https address in a tab the person can see,
+  and, on a loopback page it opened, run script as the person's browser
+  profile (cookies are per host, not per port, so `localhost:3000`'s sign-in is
+  visible to a page on `localhost:8787`). It cannot reach a non-loopback page's
+  contents, or any tab the person opened.
 - Page text is untrusted data. An agent that reads it is reading whatever the
   page says, prompts included. The window parses what a page posts field by
   field, caps it and stores it; it never acts on it beyond answering the call

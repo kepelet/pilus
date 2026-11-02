@@ -21,8 +21,7 @@ reach the window: on this Mac, or on the mini through the tunnel below.
 ```sh
 pilus ctl ports list                       # what the active machine listens on
 pilus ctl ports forward 8787               # → {"url": "http://localhost:8787", …}
-pilus ctl browser control checking the todo app   # waits for the person's yes
-pilus ctl browser open localhost:8787      # answers once the page has loaded
+pilus ctl browser open localhost:8787      # a tab of your own; answers once it has loaded
 pilus ctl browser snapshot                 # the page as text, controls as @1, @2…
 pilus ctl browser fill @1 "buy milk"
 pilus ctl browser click @2
@@ -34,45 +33,69 @@ pilus ctl browser tabs                     # also: new [URL], close [N], focus N
 ```
 
 ```sh
-pilus ctl browser release                  # when done
+pilus ctl browser release                  # when done: unlocks your tabs
 ```
 
 `pilus ctl` with no words prints every verb. Page verbs take `--tab N`, else
-they act on the selected tab. Strings print as written; everything else as JSON.
+they act on the selected tab, which must be one the agent opened (see below).
+`browser open URL --tab N` loads into that tab of yours; without `--tab` it
+loads into the selected tab if the agent opened it, else a new one. Strings
+print as written; everything else as JSON.
 
 `ports forward` forwards the port to the same number on this Mac when it is
 free, else another, and says which in `local_port`: open the `url` it returns.
 It forwards only a port the machine is listening on, as the Forward button does.
 On this Mac there is nothing to forward and it says so.
 
-## Asking for the Browser
+## Whose tab is it
 
-The Browser is the person's, so an agent asks for it. `browser control [WHY]`
-puts a banner over the Browser's tab strip (it opens the sidebar on the Browser
-so it is seen) and waits for Allow or Deny. Until the person allows it, every
-verb that opens, reads or drives a page is refused with a message that tells
-the agent how to ask: `open`, `new`, `close`, `focus`, and all of the page verbs
-(`Request::needs_browser_control`). `tabs`, `state`, `ping`, the sidebar and
-`ports …` stay free.
+A tab belongs to whoever opened it. An agent needs no yes for a tab of its own.
 
-- While allowed, the banner reads "An agent is controlling the Browser" with
-  **Take over**, and the Browser's globe in the sidebar goes accent so it shows
-  with the Browser tab closed. `state` reports `agent_control` as `none`,
-  `asking` or `granted`.
-- The person takes over by pressing Take over, or by clicking or typing in the
-  page: its script reports only `isTrusted` input, which the agent's synthetic
-  events never are. Taking over ends the grant, fails whatever the agent had in
-  flight with "the person took over the Browser", and turns the agent away for
-  15 s. Deny turns it away for 60 s. Both are a deadline compared when the next
-  `control` arrives, not a timer.
-- The agent hands the Browser back with `browser release`.
-- The grant belongs to the window's Browser, not to a tab or a client: any agent
-  that reaches the window can use it, so what the banner says is all it says.
-  It lasts until Take over, `release`, or quit.
-- `control`'s reason is the agent's word. It is cut to one line of plain text
-  and shown as text; do not trust it.
-
-State and rules are in `gui/browser_control.rs`, which has no GUI types.
+- An agent opens tabs of its own (`browser new`, `browser open`) and uses only
+  those: every verb that opens, reads, drives, closes or selects a page checks
+  the tab (`Access::permits`, in `gui/browser_control.rs`). A tab the person
+  opened is refused with a message that says how to ask. `tabs`, `state`,
+  `ping`, the sidebar and `ports …` stay free, and `tabs` says who opened each
+  (`opened_by`: `person` or `agent`), which the agent `held`, which were `lent`
+  and which are `asking`.
+- **Asking for the person's tab.** `browser request N [WHY]` puts a prompt over
+  the Browser's tab strip (and opens the sidebar on the Browser) naming the tab
+  and the reason, with Allow and Deny, and waits. Allow *lends* the tab: the
+  agent holds it at once and may use it, but it stays the person's, and goes
+  back to them on `release`, Take over or when the tab is closed. Deny turns the
+  agent away from that tab for 60 s. Asking for a tab it may already use answers
+  at once, and so does asking again within the 60 s or 15 s refusals (deadlines
+  compared when the request arrives, no timer). If the person does not decide
+  within 30 s the agent's call times out but the prompt stays; a late Allow
+  means the agent's next `request` returns at once. The reason is the agent's
+  word: one line of plain text, never trusted. A tab with nothing in it is not
+  lent. The prompt is drawn by pilus, not the page.
+- In the strip, a tab an agent opened has a **dashed border**, and so has its
+  page's frame. A tab an agent may use, lent ones included, wears a chip, lit
+  while the agent works in it or waits on a yes. The Browser's globe in the
+  sidebar goes accent while any is held, so it shows with the Browser tab
+  closed. `state` reports `agent_tabs` and `held`.
+- **Held means locked.** A verb that uses a tab takes the hold (`acquire`).
+  While held, a native cover (`gui/browser_shield.rs`) sits over the page and
+  swallows the person's clicks, scrolls and keys, so they cannot interrupt a
+  form half filled, and the address bar and back/forward/reload wait. The cover
+  is clear: the person sees the page and watches the agent work. Its **Take
+  over** button, in the page's top-right corner, ends the hold, fails whatever the agent had in
+  flight with "the person took over this tab", and turns the agent away from
+  that tab for 15 s. The person can still close the tab.
+- The agent lets go with `browser release [N]` (one tab, else all of its tabs,
+  and a lent one returns to the person).
+  Nothing expires on a timer, so an agent that forgets leaves its tab locked
+  until the person presses Take over or closes it.
+- A tab opened by a link in a page (`window.open`) belongs to the agent if the
+  agent held that page, else to the person.
+- `browser control [WHY]` is kept so older agents keep running. It answers
+  `granted` at once and changes nothing.
+- Where there is no AppKit the cover is not drawn. A real click or keypress in
+  the page, which its script reports (`isTrusted`; the agent's synthetic events
+  never are), then takes the tab back instead.
+- The rules: [the control socket](security.md#the-control-socket). Ownership
+  state has no GUI types, in `gui/browser_control.rs`.
 
 ## Agents on a host
 
@@ -138,12 +161,8 @@ and the next tunnel removes it. See
 | `browser open`, `new`, `reload`, `focus` of an unbuilt tab | the webview's page-load handler, when the load finishes |
 | `browser snapshot`, `click`, `eval`, `wait`, … | the page, over `window.ipc`, tagged with the call's id |
 | `ports list`, `ports forward` | the worker thread that ran `ssh` |
-| `browser control` | the person, from the banner |
+| `browser request` | the person, from the prompt |
 | `browser network`, `console`, `tabs`, `close`, `release` | the GUI thread, at once |
-
-`browser control` is answered by the person pressing Allow or Deny. If they do
-not decide within 30 s the agent's call times out but the banner stays, and a
-late Allow just means the agent's next `control` returns at once.
 
 A page that never loads or never answers is the server's 30 s timeout. A new
 load (`PageLoadEvent::Started`) fails every call still waiting on the old
@@ -205,6 +224,9 @@ Notes for changing it:
    later, return `None` and hand the `Replier` to whoever knows.
 3. A page verb also needs an op in `browser_inspect.js` and a case in
    `browser_inspect::call_script`.
+   A verb that touches a tab gets it from `ctl_agent_hold` (or `ctl_agent_index`
+   when it must not lock the person out, as `close` does), never from
+   `ctl_page_index` alone: that is what keeps an agent out of the person's tabs.
 4. Add it to `ctl::USAGE` and the lists above.
 
 ## Rules

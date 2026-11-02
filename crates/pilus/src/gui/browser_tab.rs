@@ -29,9 +29,10 @@ use gpui_wry::WebView;
 use serde_json::json;
 use wry::{NewWindowResponse, PageLoadEvent, WebViewBuilder};
 
-use super::browser_control::Control;
+use super::browser_control::{Access, Ask, Opener, Pending};
 use super::browser_data;
 use super::browser_inspect::{self, INIT_SCRIPT, Inspect};
+use super::browser_shield::Shield;
 use super::style::{self, FillExt, RadiusExt};
 use super::toast::ToastKind;
 use super::{PilusView, icon};
@@ -80,6 +81,13 @@ struct Page {
     /// What `pilus ctl` has seen of the page, and who waits on it. The
     /// webview's handlers hold the other end.
     inspect: Arc<Inspect>,
+    /// Who opened the tab and who may use it now (see `browser_control`).
+    access: Access,
+    /// The native cover that keeps the person out while an agent holds the
+    /// tab (see `browser_shield`).
+    shield: Shield,
+    /// An agent's request for this tab, waiting on the person.
+    ask: Option<Pending>,
 }
 
 impl Page {
@@ -92,6 +100,9 @@ impl Page {
             title: String::new(),
             corner: None,
             inspect: Arc::default(),
+            access: Access::person(),
+            shield: Shield::default(),
+            ask: None,
         }
     }
 
@@ -100,6 +111,14 @@ impl Page {
         Self {
             pending: Some(url),
             ..Self::new()
+        }
+    }
+
+    /// The same, opened by whoever `access` says.
+    fn loading_as(url: String, access: Access) -> Self {
+        Self {
+            access,
+            ..Self::loading(url)
         }
     }
 
@@ -118,6 +137,11 @@ impl Page {
     /// Drop what the page knew. The queue is cleared so a late event cannot
     /// bring the old address back.
     fn forget(&mut self) {
+        // An emptied tab is the person's again, and nothing covers it.
+        self.access = Access::person();
+        self.shield.remove();
+        // Dropping the request tells the agent that asked.
+        self.ask = None;
         self.view = None;
         self.pending = None;
         self.url.clear();
@@ -148,6 +172,18 @@ fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
+/// What the strip draws for one tab.
+struct TabLook {
+    ix: usize,
+    label: String,
+    /// An agent opened it: dashed border.
+    agent_opened: bool,
+    /// An agent may use it, or is asking: the chip.
+    chip: bool,
+    /// An agent is working in it, or waits on a yes: lit.
+    busy: bool,
+}
+
 pub(super) struct BrowserPanel {
     /// The open page tabs; never empty, and at most [`MAX_PAGES`].
     pages: Vec<Page>,
@@ -155,8 +191,6 @@ pub(super) struct BrowserPanel {
     active: usize,
     /// The address bar holds the keyboard.
     pub(super) editing: bool,
-    /// Whether an agent has been given the Browser (see `browser_control`).
-    control: Control,
 }
 
 impl BrowserPanel {
@@ -165,8 +199,19 @@ impl BrowserPanel {
             pages: vec![Page::new()],
             active: 0,
             editing: false,
-            control: Control::default(),
         }
+    }
+
+    /// How many tabs are an agent's to use (it opened them, or was lent them),
+    /// and how many of those it holds now.
+    fn agent_tabs(&self) -> (usize, usize) {
+        let agent = self.pages.iter().filter(|page| page.access.agent_usable());
+        let (mut total, mut held) = (0, 0);
+        for page in agent {
+            total += 1;
+            held += usize::from(page.access.held());
+        }
+        (total, held)
     }
 
     fn page(&self) -> &Page {
@@ -398,6 +443,23 @@ fn normalize(typed: &str) -> Option<String> {
     ))
 }
 
+/// The address a script may load for `typed`: the address bar's own fix-ups,
+/// but only http and https, since the bar lets a person type `file:` and a
+/// script should not (see security.md).
+fn web_url(typed: &str) -> Result<String, String> {
+    let url = normalize(typed).ok_or("the URL is empty")?;
+    let web = url.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    });
+    if web {
+        Ok(url)
+    } else {
+        Err(format!(
+            "the Browser opens only http and https URLs, not {typed:?}"
+        ))
+    }
+}
+
 fn percent_encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
@@ -476,6 +538,10 @@ impl PilusView {
 
     /// Give the address bar the keyboard.
     pub(super) fn browser_begin_edit(&mut self, cx: &mut Context<Self>) {
+        // The address is part of the tab an agent is working in.
+        if self.browser_panel.page().access.held() {
+            return;
+        }
         self.browser_panel.editing = true;
         self.right.focused = true;
         if let Some(view) = &self.browser_panel.page().view {
@@ -541,65 +607,23 @@ impl PilusView {
         self.browser_begin_edit(cx);
     }
 
-    /// Load a page for `pilus ctl browser open`. It goes in a fresh tab beside
-    /// the others, or in the selected one when that is empty or the strip is
-    /// full; with `fresh` a full strip is an error instead, since `browser
-    /// new` promised a tab of its own. The address is what the sender typed,
-    /// so it gets the address bar's own fix-ups, but only http and https load:
-    /// the bar lets a person type `file:`, and a script should not (see
-    /// security.md).
-    pub(super) fn browser_open_url(
-        &mut self,
-        typed: &str,
-        fresh: bool,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        let url = normalize(typed).ok_or("the URL is empty")?;
-        let web = url.split_once("://").is_some_and(|(scheme, _)| {
-            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-        });
-        if !web {
-            return Err(format!(
-                "the Browser opens only http and https URLs, not {typed:?}"
-            ));
-        }
-        let page = self.browser_panel.page();
-        let empty = page.view.is_none() && page.pending.is_none();
-        if fresh && !empty && self.browser_panel.full() {
-            return Err(format!(
-                "the Browser holds {MAX_PAGES} tabs; close one first"
-            ));
-        }
-        if empty || self.browser_panel.full() {
-            self.browser_panel.page_mut().pending = Some(url.clone());
-        } else {
-            self.browser_panel.pages.push(Page::loading(url.clone()));
-            self.browser_panel.active = self.browser_panel.pages.len() - 1;
-        }
-        self.browser_input
-            .update(cx, |input, cx| input.set_value(url, cx));
-        self.browser_panel.editing = false;
-        self.right.focused = false;
-        cx.notify();
-        Ok(())
-    }
-
     /// Whether the selected tab has a page, or one on its way.
     pub(super) fn browser_has_content(&self) -> bool {
         let page = self.browser_panel.page();
         page.view.is_some() || page.pending.is_some()
     }
 
-    /// How many tabs the Browser has and the selected one's address, for
-    /// `pilus ctl state`.
-    pub(super) fn browser_summary(&self) -> (usize, String) {
+    /// How many tabs the Browser has, the selected one's address, and how
+    /// many tabs agents opened and hold, for `pilus ctl state`.
+    pub(super) fn browser_summary(&self) -> (usize, String, usize, usize) {
         let page = self.browser_panel.page();
         let url = if page.url.is_empty() {
             page.pending.clone().unwrap_or_default()
         } else {
             page.url.clone()
         };
-        (self.browser_panel.pages.len(), url)
+        let (agent, held) = self.browser_panel.agent_tabs();
+        (self.browser_panel.pages.len(), url, agent, held)
     }
 
     /// Show tab `ix`. An empty tab opens with the address bar ready.
@@ -649,15 +673,20 @@ impl PilusView {
     /// Drain what the pages reported; true when anything on screen changed.
     pub(super) fn browser_tick(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
-        // A real click or keypress in a page is the person taking over. The
-        // flag is always cleared, so input from before the grant never counts.
-        let mut touched = false;
-        for page in &self.browser_panel.pages {
-            // Every page's flag is cleared, not just until one is found.
-            touched |= page.inspect.take_user_input();
+        // The person took a held tab back: with Take over on its shield, or,
+        // where the shield is not up, with a real click or keypress in the
+        // page, which its script can tell from the agent's. Every flag is
+        // cleared each tick, so input from before the hold never counts.
+        let mut back = Vec::new();
+        for (ix, page) in self.browser_panel.pages.iter().enumerate() {
+            let pressed = page.shield.taken();
+            let typed = page.inspect.take_user_input();
+            if (pressed || typed) && page.access.held() {
+                back.push(ix);
+            }
         }
-        if touched && self.browser_panel.control.permits() {
-            self.browser_take_over(cx);
+        for ix in back {
+            self.browser_take_over(ix, cx);
             changed = true;
         }
         // A click in the page moves the OS first responder without GPUI
@@ -700,9 +729,13 @@ impl PilusView {
                 self.browser_panel.pages[from].pending = Some(url);
                 continue;
             }
-            // Beside the opener, and in front only when the opener was.
+            // Beside the opener, and in front only when the opener was. It
+            // belongs to whoever was working the opener.
             let at = from + 1;
-            self.browser_panel.pages.insert(at, Page::loading(url));
+            let access = self.browser_panel.pages[from].access.child();
+            self.browser_panel
+                .pages
+                .insert(at, Page::loading_as(url, access));
             if from == self.browser_panel.active {
                 self.browser_panel.active = at;
                 address_changed = true;
@@ -740,6 +773,10 @@ impl PilusView {
                 page.corner = Some(corner);
             }
             let shown = on_screen && ix == active;
+            // The cover goes over a held page while it is on screen, and is
+            // taken away when the page is hidden or let go.
+            page.shield
+                .sync(view.read(cx).raw(), shown && page.access.held());
             view.update(cx, |view, _| {
                 if shown && !view.visible() {
                     view.show();
@@ -799,63 +836,183 @@ impl PilusView {
 // `None` when it kept the `Replier` for something that finishes later: a page
 // loading, or the page answering a script. See `browser_inspect`.
 impl PilusView {
-    /// Why an agent may not drive the Browser right now, or `None` if it may.
-    pub(super) fn browser_ctl_refusal(&self) -> Option<String> {
-        let control = &self.browser_panel.control;
-        (!control.permits()).then(|| control.refusal(Instant::now()))
-    }
-
-    /// `pilus ctl state`'s word for where the agents stand.
-    pub(super) fn browser_agent_control(&self) -> &'static str {
-        self.browser_panel.control.label()
-    }
-
-    /// `browser control`: an agent asks for the Browser. The banner goes up
-    /// and the answer comes when the person decides.
-    pub(super) fn browser_ctl_ask(
+    /// `browser release`: the agent lets go of its tabs, so the person can use
+    /// them. With a `tab` that one, else every tab the agent holds.
+    pub(super) fn browser_ctl_release(
         &mut self,
-        reason: Option<&str>,
-        replier: &Replier,
+        tab: Option<u16>,
         cx: &mut Context<Self>,
-    ) -> Option<Reply> {
-        let reply = self
-            .browser_panel
-            .control
-            .ask(reason, replier, Instant::now());
-        cx.notify();
-        reply
-    }
-
-    /// `browser release`: the agent is done.
-    pub(super) fn browser_ctl_release(&mut self, cx: &mut Context<Self>) -> Reply {
-        let released = self.browser_panel.control.release();
+    ) -> Reply {
+        let tabs: Vec<usize> = match tab {
+            Some(_) => match self.ctl_page_index(tab) {
+                Ok(ix) if self.browser_panel.pages[ix].access.agent_usable() => {
+                    vec![ix]
+                }
+                Ok(ix) => {
+                    return Reply::err(format!(
+                        "Browser tab {} is the person's and was not lent to you",
+                        ix + 1
+                    ));
+                }
+                Err(message) => return Reply::err(message),
+            },
+            None => (0..self.browser_panel.pages.len()).collect(),
+        };
+        let mut released = 0;
+        for ix in tabs {
+            let page = &mut self.browser_panel.pages[ix];
+            if page.access.release() {
+                page.shield.remove();
+                released += 1;
+            }
+        }
         cx.notify();
         Reply::data(json!({ "released": released }))
     }
 
-    fn browser_allow(&mut self, cx: &mut Context<Self>) {
-        if self.browser_panel.control.allow() {
-            cx.notify();
-        }
-    }
-
-    fn browser_deny(&mut self, cx: &mut Context<Self>) {
-        if self.browser_panel.control.deny(Instant::now()) {
-            cx.notify();
-        }
-    }
-
-    /// The person takes the Browser back: the grant ends and whatever the
-    /// agent had in flight is told why.
-    pub(super) fn browser_take_over(&mut self, cx: &mut Context<Self>) {
-        if !self.browser_panel.control.take_over(Instant::now()) {
+    /// The person takes tab `ix` back: the hold ends, the shield comes off and
+    /// whatever the agent had in flight is told why.
+    pub(super) fn browser_take_over(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(page) = self.browser_panel.pages.get_mut(ix) else {
+            return;
+        };
+        if !page.access.take_over(Instant::now()) {
             return;
         }
-        for page in &self.browser_panel.pages {
-            page.inspect.fail_calls("the person took over the Browser");
-        }
-        self.toast(ToastKind::Info, "You have the Browser");
+        page.shield.remove();
+        page.inspect.fail_calls("the person took over this tab");
+        self.toast(ToastKind::Info, "You have the tab");
         cx.notify();
+    }
+
+    /// `browser request`: an agent asks for a tab the person opened. Answers
+    /// now when it may use it already or was turned away, else the prompt goes
+    /// up and the answer comes when the person decides.
+    pub(super) fn browser_ctl_request(
+        &mut self,
+        tab: u16,
+        reason: Option<&str>,
+        replier: &Replier,
+        cx: &mut Context<Self>,
+    ) -> Option<Reply> {
+        let ix = match self.ctl_page_index(Some(tab)) {
+            Ok(ix) => ix,
+            Err(message) => return Some(Reply::err(message)),
+        };
+        let page = &mut self.browser_panel.pages[ix];
+        match page.access.ask(Instant::now()) {
+            Ask::Already => Some(Reply::data(json!({ "granted": true, "tab": ix + 1 }))),
+            Ask::Refused(why) => Some(Reply::err(why)),
+            Ask::Prompt if page.view.is_none() && page.pending.is_none() => {
+                Some(Reply::err(format!(
+                    "Browser tab {} is empty, so there is nothing to lend; open your own with \
+                 `pilus ctl browser new URL`",
+                    ix + 1
+                )))
+            }
+            Ask::Prompt => {
+                match &mut page.ask {
+                    Some(pending) => pending.join(replier),
+                    None => page.ask = Some(Pending::new(reason, replier)),
+                }
+                cx.notify();
+                None
+            }
+        }
+    }
+
+    /// The person answers the request for tab `ix`: a yes lends it and the
+    /// agent holds it from now on, a no turns the agent away for a minute.
+    fn browser_answer_request(&mut self, ix: usize, allow: bool, cx: &mut Context<Self>) {
+        let Some(page) = self.browser_panel.pages.get_mut(ix) else {
+            return;
+        };
+        let Some(pending) = page.ask.take() else {
+            return;
+        };
+        let reply = if allow {
+            page.access.allow();
+            Reply::data(json!({ "granted": true, "tab": ix + 1 }))
+        } else {
+            Reply::err(page.access.deny(Instant::now()))
+        };
+        pending.answer(&reply);
+        cx.notify();
+    }
+
+    /// The index of the tab the agent names, else of the selected one, if an
+    /// agent may use it: one the person opened is theirs. This does not take
+    /// the hold, so it also serves `close` and `release`.
+    fn ctl_agent_index(&self, tab: Option<u16>) -> Result<usize, String> {
+        let ix = self.ctl_page_index(tab)?;
+        self.browser_panel.pages[ix]
+            .access
+            .permits(Instant::now())
+            .map_err(|why| format!("Browser tab {}: {why}", ix + 1))?;
+        Ok(ix)
+    }
+
+    /// The same, and the agent starts working in it: the hold is taken, which
+    /// puts the shield over the page on the next frame.
+    fn ctl_agent_hold(
+        &mut self,
+        tab: Option<u16>,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        let ix = self.ctl_agent_index(tab)?;
+        self.browser_panel.pages[ix]
+            .access
+            .acquire(Instant::now())?;
+        cx.notify();
+        Ok(ix)
+    }
+
+    /// `browser open` and `browser new URL`: load `url` in a tab of the
+    /// agent's, and show it. With `fresh` that is always a new tab. Otherwise
+    /// it is the tab named, else the selected one when the agent opened it,
+    /// else a new one. A tab the person opened is never reused.
+    pub(super) fn browser_ctl_open(
+        &mut self,
+        typed: &str,
+        tab: Option<u16>,
+        fresh: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let url = web_url(typed)?;
+        let now = Instant::now();
+        let reuse = if fresh {
+            None
+        } else if tab.is_some() {
+            Some(self.ctl_agent_index(tab)?)
+        } else {
+            self.ctl_agent_index(None).ok()
+        };
+        match reuse {
+            Some(ix) => {
+                self.browser_panel.pages[ix].access.acquire(now)?;
+                self.browser_select_tab(ix, cx);
+                self.browser_panel.pages[ix].pending = Some(url.clone());
+            }
+            None => {
+                if self.browser_panel.full() {
+                    return Err(format!(
+                        "the Browser holds {MAX_PAGES} tabs; close one first"
+                    ));
+                }
+                let mut access = Access::agent();
+                access.acquire(now)?;
+                self.browser_panel
+                    .pages
+                    .push(Page::loading_as(url.clone(), access));
+                self.browser_panel.active = self.browser_panel.pages.len() - 1;
+            }
+        }
+        self.browser_input
+            .update(cx, |input, cx| input.set_value(url, cx));
+        self.browser_panel.editing = false;
+        self.right.focused = false;
+        cx.notify();
+        Ok(())
     }
 
     /// The index of the 1-based `tab`, else of the selected one.
@@ -909,6 +1066,10 @@ impl PilusView {
             "title": title,
             "state": state,
             "inspectable": browser_inspect::is_loopback(&url),
+            "opened_by": page.access.opener().label(),
+            "held": page.access.held(),
+            "lent": page.access.lent(),
+            "asking": page.ask.is_some(),
         })
     }
 
@@ -937,20 +1098,30 @@ impl PilusView {
         }
     }
 
-    /// `browser new` without an address: an empty tab.
+    /// `browser new` without an address: an empty tab of the agent's.
     pub(super) fn browser_ctl_blank(&mut self, cx: &mut Context<Self>) -> Reply {
-        if self.browser_panel.has_page() && self.browser_panel.full() {
+        if self.browser_panel.full() {
             return Reply::err(format!(
                 "the Browser holds {MAX_PAGES} tabs; close one first"
             ));
         }
-        self.browser_new_tab(cx);
+        let mut page = Page::new();
+        page.access = Access::agent();
+        if let Err(message) = page.access.acquire(Instant::now()) {
+            return Reply::err(message);
+        }
+        self.browser_panel.pages.push(page);
+        self.browser_panel.active = self.browser_panel.pages.len() - 1;
+        self.browser_panel.editing = false;
+        self.right.focused = false;
+        self.browser_input.update(cx, |input, cx| input.clear(cx));
+        cx.notify();
         Reply::data(self.ctl_describe(self.browser_panel.active))
     }
 
     /// `browser close`.
     pub(super) fn browser_ctl_close(&mut self, tab: Option<u16>, cx: &mut Context<Self>) -> Reply {
-        match self.ctl_page_index(tab) {
+        match self.ctl_agent_index(tab) {
             Ok(ix) => {
                 self.browser_close_tab(ix, cx);
                 self.browser_ctl_tabs()
@@ -967,7 +1138,7 @@ impl PilusView {
         replier: &Replier,
         cx: &mut Context<Self>,
     ) -> Option<Reply> {
-        let ix = match self.ctl_page_index(Some(tab)) {
+        let ix = match self.ctl_agent_hold(Some(tab), cx) {
             Ok(ix) => ix,
             Err(message) => return Some(Reply::err(message)),
         };
@@ -988,7 +1159,7 @@ impl PilusView {
         replier: &Replier,
         cx: &mut Context<Self>,
     ) -> Option<Reply> {
-        let ix = match self.ctl_page_index(tab) {
+        let ix = match self.ctl_agent_hold(tab, cx) {
             Ok(ix) => ix,
             Err(message) => return Some(Reply::err(message)),
         };
@@ -1065,7 +1236,7 @@ impl PilusView {
 // Rendering.
 impl PilusView {
     pub(super) fn browser_page(&mut self, cx: &mut Context<Self>) -> Div {
-        let banner = self.browser_control_banner(cx);
+        let banner = self.browser_request_banner(cx);
         let page = div()
             .relative()
             .flex()
@@ -1091,23 +1262,24 @@ impl PilusView {
         }
     }
 
-    /// What an agent has asked for or been given, over the tab strip: who is
-    /// at the controls, and the way to take them back. It is drawn by us, not
-    /// the page, so a page cannot imitate it.
-    fn browser_control_banner(&mut self, cx: &mut Context<Self>) -> Option<Div> {
+    /// What an agent has asked for, over the tab strip: which tab, why, and
+    /// the way to answer. It shows only while a request waits. It is drawn by
+    /// us, not the page, so a page cannot imitate it.
+    fn browser_request_banner(&mut self, cx: &mut Context<Self>) -> Option<Div> {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
-        let control = &self.browser_panel.control;
-        let asking = control.label() == "asking";
-        if !asking && !control.permits() {
-            return None;
-        }
-        let title = if asking {
-            "An agent wants to control the Browser"
-        } else {
-            "An agent is controlling the Browser"
-        };
-        let reason = control.reason().map(str::to_string);
+        let (ix, page) = self
+            .browser_panel
+            .pages
+            .iter()
+            .enumerate()
+            .find(|(_, page)| page.ask.is_some())?;
+        let reason = page
+            .ask
+            .as_ref()
+            .and_then(Pending::reason)
+            .map(str::to_string);
+        let title = format!("An agent wants to use \u{201c}{}\u{201d}", page.label());
         let mut text = div().flex().flex_col().flex_1().min_w(px(0.0)).child(
             div()
                 .truncate()
@@ -1125,46 +1297,36 @@ impl PilusView {
                     .child(reason),
             );
         }
-        let mut buttons = div()
+        let buttons = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_1()
-            .flex_shrink_0();
-        if asking {
-            buttons = buttons
-                .child(
-                    style::small_button(
-                        "pilus-browser-deny",
-                        "Deny",
-                        style::ButtonKind::Ghost,
-                        theme,
-                        fonts.secondary,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.browser_deny(cx))),
-                )
-                .child(
-                    style::small_button(
-                        "pilus-browser-allow",
-                        "Allow",
-                        style::ButtonKind::Primary,
-                        theme,
-                        fonts.secondary,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.browser_allow(cx))),
-                );
-        } else {
-            buttons = buttons.child(
+            .flex_shrink_0()
+            .child(
                 style::small_button(
-                    "pilus-browser-takeover",
-                    "Take over",
-                    style::ButtonKind::Secondary,
+                    "pilus-browser-deny",
+                    "Deny",
+                    style::ButtonKind::Ghost,
                     theme,
                     fonts.secondary,
                 )
-                .on_click(cx.listener(|this, _, _, cx| this.browser_take_over(cx))),
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.browser_answer_request(ix, false, cx);
+                })),
+            )
+            .child(
+                style::small_button(
+                    "pilus-browser-allow",
+                    "Allow",
+                    style::ButtonKind::Primary,
+                    theme,
+                    fonts.secondary,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.browser_answer_request(ix, true, cx);
+                })),
             );
-        }
         Some(
             div()
                 .flex()
@@ -1187,6 +1349,8 @@ impl PilusView {
     /// meet the window's own; the page's layer is clipped to match (see
     /// [`round_page_corner`]).
     fn browser_frame(&self, page: Option<Entity<WebView>>) -> Div {
+        // A page an agent opened is framed with a dashed line, as its tab is.
+        let dashed = self.browser_panel.page().access.opener() == Opener::Agent;
         div()
             .relative()
             .flex_1()
@@ -1197,6 +1361,7 @@ impl PilusView {
                 div()
                     .size_full()
                     .border_1()
+                    .when(dashed, |frame| frame.border_dashed())
                     .border_color(self.theme.border)
                     .rounded_br(style::Radius::Md.pixels())
                     .overflow_hidden()
@@ -1213,14 +1378,27 @@ impl PilusView {
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let full = self.browser_panel.full();
         let active = self.browser_panel.active;
-        let tabs: Vec<(usize, String)> = self
+        let tabs: Vec<TabLook> = self
             .browser_panel
             .pages
             .iter()
             .enumerate()
-            .map(|(ix, page)| (ix, page.label()))
+            .map(|(ix, page)| TabLook {
+                ix,
+                label: page.label(),
+                agent_opened: page.access.opener() == Opener::Agent,
+                chip: page.access.agent_usable() || page.ask.is_some(),
+                busy: page.access.held() || page.ask.is_some(),
+            })
             .collect();
-        let tabs = tabs.into_iter().map(|(ix, label)| {
+        let tabs = tabs.into_iter().map(|look| {
+            let TabLook {
+                ix,
+                label,
+                agent_opened,
+                chip,
+                busy,
+            } = look;
             let group = SharedString::from(format!("pilus-browser-tab-group-{ix}"));
             let selected = ix == active;
             let close = div()
@@ -1246,9 +1424,30 @@ impl PilusView {
                         cx.stop_propagation();
                     }),
                 );
+            let title = div().flex_1().min_w(px(0.0)).truncate().child(label);
+            // A tab an agent may use wears a chip, lit while it works there or
+            // waits on a yes, so the person sees whose each tab is without
+            // opening it.
+            let title = if chip {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(icon(
+                        include_bytes!("../../assets/icons/cpu.svg"),
+                        fonts.label,
+                        if busy { theme.accent } else { theme.muted },
+                    ))
+                    .child(title)
+            } else {
+                title
+            };
             style::tab(
                 ("pilus-browser-tab", ix),
-                div().flex_1().min_w(px(0.0)).truncate().child(label),
+                title,
                 selected,
                 theme,
                 fonts.body,
@@ -1259,6 +1458,15 @@ impl PilusView {
             .flex_1()
             .min_w(px(28.0))
             .max_w(px(160.0))
+            // A tab an agent opened has a dashed border. Every tab keeps a
+            // 1px one, clear when it is not dashed, so none shifts.
+            .border_1()
+            .when(agent_opened, |tab| tab.border_dashed())
+            .border_color(if agent_opened {
+                if busy { theme.accent } else { theme.muted }
+            } else {
+                gpui::transparent_black().into()
+            })
             .child(close)
             .on_click(cx.listener(move |this, _, _, cx| this.browser_select_tab(ix, cx)))
             .on_mouse_up(
@@ -1297,7 +1505,8 @@ impl PilusView {
         let theme = self.theme;
         let fonts = style::Fonts::resolve(&self.shared_settings);
         let height = style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL);
-        let loaded = self.browser_panel.has_page();
+        // The buttons act on the page, so they wait while an agent holds it.
+        let loaded = self.browser_panel.has_page() && !self.browser_panel.page().access.held();
         self.browser_input.update(cx, |input, _| {
             input.set_style(
                 theme,
@@ -1388,8 +1597,8 @@ impl PilusView {
     /// The globe, lit while the Browser is open.
     fn browser_glyph(&self, lit: bool) -> impl IntoElement {
         let theme = self.theme;
-        // Accent while an agent holds the Browser, wherever the sidebar is.
-        let color = if self.browser_panel.control.permits() {
+        // Accent while an agent works in a tab, wherever the sidebar is.
+        let color = if self.browser_panel.agent_tabs().1 > 0 {
             theme.accent
         } else if lit {
             theme.panel_fg

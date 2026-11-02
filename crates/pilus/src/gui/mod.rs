@@ -17,6 +17,7 @@ mod box_drawing;
 mod browser_control;
 mod browser_data;
 mod browser_inspect;
+mod browser_shield;
 mod browser_tab;
 mod connector;
 mod ctl;

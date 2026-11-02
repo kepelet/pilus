@@ -128,34 +128,50 @@ pub enum Request {
     SidebarClose,
     /// Open the right sidebar if it is closed, close it if it is open.
     SidebarToggle,
-    /// Load `url` in the Browser tab, opening the sidebar on it. Answers once
-    /// the page has loaded, unless `wait` is off.
+    /// Load `url` in a Browser tab of the agent's, opening the sidebar on it:
+    /// the 1-based `tab` if one is named, else the selected tab when the agent
+    /// opened it, else a new tab. Answers once the page has loaded, unless
+    /// `wait` is off.
     BrowserOpen {
         url: String,
         #[serde(default = "yes")]
         wait: bool,
+        #[serde(default)]
+        tab: Option<u16>,
     },
     /// Go to the workspace tab at the 1-based `index`.
     TabFocus { index: u16 },
-    /// Ask the person for the Browser. Answers when they decide, and every
-    /// verb that opens, reads or drives a page is refused until they allow it.
-    /// `reason` is shown to them.
+    /// Kept so an agent written against the old Browser grant still runs. No
+    /// one has to say yes any more: an agent uses the tabs it opens and no
+    /// others, so this answers at once and changes nothing. `reason` is
+    /// ignored.
     BrowserControl { reason: Option<String> },
-    /// Hand the Browser back.
-    BrowserRelease,
-    /// List the Browser's page tabs.
+    /// Ask the person to lend the agent the 1-based `tab`, which they opened.
+    /// Answers when they decide; the agent may use the tab until it releases
+    /// it or they take it back. `reason` is shown to them.
+    #[serde(rename = "browser_request")]
+    BrowserBorrow { tab: u16, reason: Option<String> },
+    /// Let go of the agent's tabs, so the person can use them: the 1-based
+    /// `tab`, else every tab the agent holds.
+    BrowserRelease {
+        #[serde(default)]
+        tab: Option<u16>,
+    },
+    /// List the Browser's page tabs, and who opened each.
     BrowserTabs,
-    /// Open a page tab of its own, on `url` when one is given.
+    /// Open a page tab of the agent's own, on `url` when one is given.
     BrowserNew {
         url: Option<String>,
         #[serde(default = "yes")]
         wait: bool,
     },
-    /// Close a page tab: the 1-based `tab`, else the selected one.
+    /// Close one of the agent's page tabs: the 1-based `tab`, else the
+    /// selected one.
     BrowserClose { tab: Option<u16> },
-    /// Select the page tab at the 1-based index `tab`.
+    /// Select the agent's page tab at the 1-based index `tab`.
     BrowserFocus { tab: u16 },
-    /// Look at or act on a page: the 1-based `tab`, else the selected one.
+    /// Look at or act on a page of the agent's: the 1-based `tab`, else the
+    /// selected one.
     BrowserPage {
         tab: Option<u16>,
         #[serde(flatten)]
@@ -167,22 +183,6 @@ pub enum Request {
     PortsForward { port: u16 },
     /// End the forward of a remote port.
     PortsStop { port: u16 },
-}
-
-impl Request {
-    /// Whether the person must have given the Browser away first: every verb
-    /// that changes what is on its pages or reads what they hold. Looking at
-    /// which tabs exist, and everything off the Browser, is free.
-    pub fn needs_browser_control(&self) -> bool {
-        matches!(
-            self,
-            Self::BrowserOpen { .. }
-                | Self::BrowserNew { .. }
-                | Self::BrowserClose { .. }
-                | Self::BrowserFocus { .. }
-                | Self::BrowserPage { .. }
-        )
-    }
 }
 
 fn yes() -> bool {
@@ -456,17 +456,36 @@ fn parse_browser(words: &[&str]) -> Result<Request> {
     let Some((verb, rest)) = words.split_first() else {
         bail!("pilus ctl browser needs a command\n\n{USAGE}");
     };
-    let flags = Flags::take(rest, matches!(*verb, "eval" | "fill" | "control"))?;
+    let flags = Flags::take(
+        rest,
+        matches!(*verb, "eval" | "fill" | "control" | "request"),
+    )?;
     match *verb {
         "control" => Ok(Request::BrowserControl {
             // The rest of the line is the reason, so it needs no quoting.
             reason: Some(flags.positional.join(" ")).filter(|reason| !reason.is_empty()),
         }),
-        "release" => Ok(Request::BrowserRelease),
+        "request" => {
+            let [tab, reason @ ..] = flags.positional.as_slice() else {
+                bail!("browser request needs a tab number and maybe a reason\n\n{USAGE}");
+            };
+            Ok(Request::BrowserBorrow {
+                tab: parse_tab(tab)?,
+                // The rest of the line is the reason, so it needs no quoting.
+                reason: Some(reason.join(" ")).filter(|reason| !reason.is_empty()),
+            })
+        }
+        "release" => Ok(Request::BrowserRelease {
+            tab: flags
+                .maybe_one("release")?
+                .map(|word| parse_tab(&word))
+                .transpose()?,
+        }),
         "tabs" => Ok(Request::BrowserTabs),
         "open" => Ok(Request::BrowserOpen {
             url: flags.one("open", "a URL")?,
             wait: !flags.no_wait,
+            tab: flags.tab,
         }),
         "new" => Ok(Request::BrowserNew {
             url: flags.maybe_one("new")?,
@@ -558,15 +577,18 @@ pub const USAGE: &str = "USAGE:\n\
     \x20   pilus ctl ports list\n\
     \x20   pilus ctl ports forward PORT      # then open localhost:<local_port> it prints\n\
     \x20   pilus ctl ports stop PORT\n\n\
-    BROWSER (ask first: everything below except tabs needs the person's yes):\n\
-    \x20   pilus ctl browser control [WHY]   # waits for them; shown on a banner\n\
-    \x20   pilus ctl browser release         # hand it back when done\n\
-    \x20   pilus ctl browser open URL [--no-wait]\n\
-    \x20   pilus ctl browser tabs\n\
-    \x20   pilus ctl browser new [URL] [--no-wait]\n\
+    BROWSER (no one has to say yes: you open tabs of your own, marked as an agent's,\n\
+    and use only those; the person's tabs are theirs, and your tab is locked to them\n\
+    while you work in it until you release it or they press Take over):\n\
+    \x20   pilus ctl browser new [URL] [--no-wait]   # a tab of your own\n\
+    \x20   pilus ctl browser open URL [--tab N] [--no-wait]  # in your tab N, else a new one\n\
+    \x20   pilus ctl browser tabs                    # who opened each, and which you hold\n\
     \x20   pilus ctl browser close [N]\n\
-    \x20   pilus ctl browser focus N\n\n\
-    PAGE COMMANDS (localhost pages only; --tab N picks a tab, else the selected one):\n\
+    \x20   pilus ctl browser focus N\n\
+    \x20   pilus ctl browser request N [WHY]         # ask to use a tab the person opened;\n\
+    \x20                                              # waits for their yes (allowed, denied)\n\
+    \x20   pilus ctl browser release [N]             # unlock your tabs when done\n\n\
+    PAGE COMMANDS (your tabs; localhost pages only; --tab N picks one, else the selected):\n\
     \x20   pilus ctl browser snapshot        # the page as text, controls numbered @1, @2, ...\n\
     \x20   pilus ctl browser html [SELECTOR]\n\
     \x20   pilus ctl browser text [SELECTOR]\n\
@@ -760,11 +782,17 @@ pub fn state_reply(
     tab: &str,
     browser_tabs: usize,
     browser_url: &str,
-    agent_control: &str,
+    agent_tabs: usize,
+    held: usize,
 ) -> Reply {
     Reply::data(json!({
         "sidebar": { "visible": visible, "tab": tab },
-        "browser": { "tabs": browser_tabs, "url": browser_url, "agent_control": agent_control },
+        "browser": {
+            "tabs": browser_tabs,
+            "url": browser_url,
+            "agent_tabs": agent_tabs,
+            "held": held,
+        },
     }))
 }
 
@@ -794,6 +822,7 @@ mod tests {
             Some(Request::BrowserOpen {
                 url: "localhost:3000".to_string(),
                 wait: true,
+                tab: None,
             })
         );
         assert_eq!(
@@ -813,7 +842,16 @@ mod tests {
             page("browser open localhost:8787 --no-wait"),
             Request::BrowserOpen {
                 url: "localhost:8787".to_string(),
-                wait: false
+                wait: false,
+                tab: None
+            }
+        );
+        assert_eq!(
+            page("browser open localhost:8787 --tab 2"),
+            Request::BrowserOpen {
+                url: "localhost:8787".to_string(),
+                wait: true,
+                tab: Some(2)
             }
         );
         assert_eq!(
@@ -897,7 +935,50 @@ mod tests {
     }
 
     #[test]
-    fn asking_for_the_browser_parses_and_gates_the_right_verbs() {
+    fn release_names_a_tab_or_lets_go_of_all() {
+        assert_eq!(
+            page("browser release"),
+            Request::BrowserRelease { tab: None }
+        );
+        assert_eq!(
+            page("browser release 3"),
+            Request::BrowserRelease { tab: Some(3) }
+        );
+        assert!(parse_args(&words("browser release 0")).is_err());
+        assert!(parse_args(&words("browser release 1 2")).is_err());
+    }
+
+    #[test]
+    fn asking_for_a_tab_names_it_and_takes_the_rest_as_the_reason() {
+        assert_eq!(
+            page("browser request 2 check the todo app"),
+            Request::BrowserBorrow {
+                tab: 2,
+                reason: Some("check the todo app".to_string())
+            }
+        );
+        assert_eq!(
+            page("browser request 1"),
+            Request::BrowserBorrow {
+                tab: 1,
+                reason: None
+            }
+        );
+        for bad in ["browser request", "browser request 0", "browser request x"] {
+            assert!(parse_args(&words(bad)).is_err(), "{bad:?} should fail");
+        }
+    }
+
+    #[test]
+    fn asking_for_a_tab_keeps_the_verb_name_on_the_wire() {
+        let text = serde_json::to_string(&page("browser request 2 why")).expect("encode");
+        assert_eq!(text, r#"{"cmd":"browser_request","tab":2,"reason":"why"}"#);
+    }
+
+    #[test]
+    fn the_old_ask_for_the_browser_still_parses() {
+        // An agent written against the grant keeps working: the window
+        // answers it at once and changes nothing.
         assert_eq!(
             page("browser control to check the todo app"),
             Request::BrowserControl {
@@ -908,31 +989,6 @@ mod tests {
             page("browser control"),
             Request::BrowserControl { reason: None }
         );
-        assert_eq!(page("browser release"), Request::BrowserRelease);
-        for gated in [
-            "browser open localhost:1",
-            "browser new",
-            "browser close",
-            "browser focus 1",
-            "browser snapshot",
-            "browser network",
-            "browser eval 1",
-            "browser reload",
-        ] {
-            assert!(page(gated).needs_browser_control(), "{gated}");
-        }
-        for free in [
-            "ping",
-            "state",
-            "browser tabs",
-            "browser control",
-            "browser release",
-            "ports list",
-            "ports forward 1",
-            "sidebar open",
-        ] {
-            assert!(!page(free).needs_browser_control(), "{free}");
-        }
     }
 
     #[test]
@@ -984,9 +1040,13 @@ mod tests {
             old,
             Request::BrowserOpen {
                 url: "localhost:1".to_string(),
-                wait: true
+                wait: true,
+                tab: None
             }
         );
+        // And so is one written before `release` named a tab.
+        let old: Request = serde_json::from_str(r#"{"cmd":"browser_release"}"#).expect("old");
+        assert_eq!(old, Request::BrowserRelease { tab: None });
     }
 
     #[test]

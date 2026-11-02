@@ -891,7 +891,8 @@ mod tests {
 
     #[test]
     fn the_viewport_rows_say_what_size_the_page_gets() {
-        // The room is short, so the two devices are shrunk to its height.
+        // The room is short, so the pages are drawn smaller, but they lay out
+        // at their own sizes.
         let labels = Labels {
             room: (1000, 700),
             ..Labels::default()
@@ -914,10 +915,10 @@ mod tests {
             titles,
             [
                 "Responsive (1000\u{d7}700)",
-                "16:10 (1000\u{d7}625)",
-                "4:3 (933\u{d7}700)",
-                "Mobile (323\u{d7}700)",
-                "Tablet (525\u{d7}700)",
+                "16:10 (1280\u{d7}800)",
+                "4:3 (1024\u{d7}768)",
+                "Mobile (390\u{d7}844)",
+                "Tablet (768\u{d7}1024)",
             ]
         );
     }

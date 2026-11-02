@@ -94,6 +94,10 @@ struct Page {
     corner: Option<(f32, bool)>,
     /// The shape the page is held to.
     viewport: Viewport,
+    /// The page zoom last pushed to the webview. A viewport wider than the
+    /// column is drawn zoomed out so the page still lays out at the viewport's
+    /// width; an idle frame does not re-send it.
+    zoom: f64,
     /// What `pilus ctl` has seen of the page, and who waits on it. The
     /// webview's handlers hold the other end.
     inspect: Arc<Inspect>,
@@ -127,6 +131,7 @@ impl Page {
             title: String::new(),
             corner: None,
             viewport: Viewport::default(),
+            zoom: 1.0,
             inspect: Arc::default(),
             access: Access::person(),
             shield: Shield::default(),
@@ -1127,6 +1132,7 @@ impl PilusView {
         // The frame's 1px border sits outside the page, so the page's
         // corner is that much tighter than the frame's.
         let corner = (style::Radius::Md.pixels().to_f64() as f32 - 1.0).max(0.0);
+        let room = self.browser_panel.room.get();
         for (ix, page) in self.browser_panel.pages.iter_mut().enumerate() {
             let Some(view) = &page.view else {
                 continue;
@@ -1137,6 +1143,13 @@ impl PilusView {
             if page.corner != rounding {
                 round_page_corner(view.read(cx).raw(), corner, page.viewport.constrained());
                 page.corner = rounding;
+            }
+            // A card smaller than its viewport shows the page zoomed out, so the
+            // page lays out at the viewport's own width instead of the card's.
+            let zoom = page.viewport.scale(room);
+            if (zoom - page.zoom).abs() > 1e-4 {
+                let _ = view.read(cx).raw().zoom(zoom);
+                page.zoom = zoom;
             }
             let shown = on_screen && ix == active;
             // The cover goes over a held page while it is on screen, and is
@@ -1561,11 +1574,10 @@ impl PilusView {
     ///
     /// Setting takes the hold, since it changes what the page lays out against
     /// while the agent works; reading does not lock the person out. The size is
-    /// the one the room allows (see [`Viewport::fit`]), as the last frame
-    /// measured it, so `requested` and `width`×`height` differ when a narrow
-    /// column shrank the page, and both are absent before the Browser has been
-    /// drawn. Only the selected page is drawn, so for another tab the size is
-    /// what it would get in the same room.
+    /// the one the page lays out at, which is the shape's own size however
+    /// narrow the column; `scale` is how far a narrow column draws it smaller
+    /// (see [`Viewport::scale`], from the room the last frame measured). Both
+    /// are absent before the Browser has been drawn.
     pub(super) fn browser_ctl_viewport(
         &mut self,
         tab: Option<u16>,
@@ -1597,9 +1609,9 @@ impl PilusView {
             answer["width"] = json!(width);
             answer["height"] = json!(height);
         }
-        if let Viewport::Custom(width, height) = viewport {
-            answer["requested"] = json!({ "width": width, "height": height });
-        }
+        // The page lays out at `width`×`height` whatever the column, drawn
+        // smaller by `scale` when the column cannot hold it.
+        answer["scale"] = json!(viewport.scale(self.browser_panel.room.get()));
         Reply::data(answer)
     }
 
@@ -1798,7 +1810,8 @@ impl PilusView {
     /// A page held to a viewport is a smaller card in the same area: centred
     /// across, flush with the top, and round on every corner. The area is
     /// measured as it paints, so the card is fitted to the room the previous
-    /// frame had (see [`BrowserPanel::room`]).
+    /// frame had (see [`BrowserPanel::room`]). A card smaller than the
+    /// viewport shows the page zoomed out (see `browser_sync`).
     fn browser_frame(&self, page: Option<Entity<WebView>>) -> Div {
         // A page an agent opened is framed with a dashed line, as its tab is.
         let dashed = self.browser_panel.page().access.opener() == Opener::Agent;

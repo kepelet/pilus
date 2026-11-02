@@ -1,17 +1,21 @@
 //! The shape a Browser tab gives its page: the column's full width, or a
 //! smaller frame with the proportions of a screen the person wants to check.
 //!
-//! The webview is a native view that lays out from GPUI's bounds, so a
-//! viewport is nothing but a smaller box the page is placed in; the page's own
-//! CSS sees a narrower window and answers with its responsive layout. This
-//! module is the arithmetic only: `browser_tab` measures the room the column
-//! leaves, asks [`Viewport::fit`] for the box, and centres it.
+//! The webview is a native view that lays out from GPUI's bounds, and GPUI can
+//! neither clip nor scroll one, so a card wider than the column would paint
+//! over its neighbour. The card is therefore always inside the room, with the
+//! shape's proportions, and the page is zoomed (`WKWebView.pageZoom`) by the
+//! amount the card is smaller than the shape. The page's layout viewport is
+//! `card / zoom`, which is the shape's own size: a 16:10 page lays out at 1280
+//! CSS pixels and its media queries answer for that width, however narrow the
+//! column, and is drawn smaller to fit. This module is the arithmetic only:
+//! `browser_tab` measures the room the column leaves, asks [`Viewport::fit`]
+//! for the card and [`Viewport::scale`] for the zoom, and centres the card.
 //!
-//! Every shape fits inside the room it is given and keeps its proportions, so
-//! a narrow column shrinks a phone rather than clipping it. A shape never grows
-//! past its real size, as a larger one would stop being a test of that screen. An exact size an agent asks for (`browser viewport 1000x800`)
-//! is held to the same rule: it is the size it gets when the room allows it,
-//! and the answer says what it got when it does not.
+//! A shape never grows past its real size, as a larger one would stop being a
+//! test of that screen. An exact size an agent asks for
+//! (`browser viewport 1000x800`) is held to the same rule: the page always
+//! lays out at that size, and the answer says how far it was scaled to fit.
 
 /// What a page tab shows its page in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -132,36 +136,58 @@ impl Viewport {
         self != Self::Responsive
     }
 
-    /// The box for the page inside `room` (width, height), or `None` when it
-    /// takes all of it. Proportions are kept and neither side overruns `room`.
-    pub fn fit(self, room: (f32, f32)) -> Option<(f32, f32)> {
+    /// How much of the shape's size fits in `room`, at most 1: the zoom the
+    /// page is drawn at. `None` for Responsive, which has no shape, and when
+    /// there is no room.
+    fn fit_scale(self, room: (f32, f32)) -> Option<f32> {
         let (shape_w, shape_h) = self.shape()?;
         let (room_w, room_h) = room;
         if room_w <= 0.0 || room_h <= 0.0 {
             return None;
         }
-        let mut scale = (room_w / shape_w).min(room_h / shape_h);
-        if self.capped() {
-            scale = scale.min(1.0);
-        }
+        let scale = (room_w / shape_w).min(room_h / shape_h);
+        Some(if self.capped() { scale.min(1.0) } else { scale })
+    }
+
+    /// The card the page is drawn in inside `room` (width, height), or `None`
+    /// when it takes all of it. Proportions are kept and neither side overruns
+    /// `room`; the page inside lays out at the shape's size (see
+    /// [`Self::scale`]).
+    pub fn fit(self, room: (f32, f32)) -> Option<(f32, f32)> {
+        let (shape_w, shape_h) = self.shape()?;
+        let scale = self.fit_scale(room)?;
         Some(((shape_w * scale).floor(), (shape_h * scale).floor()))
     }
 
-    /// The size in CSS pixels the page gets in `room`: the box when there is
-    /// one, else all of the room. `None` before the Browser has ever been
-    /// drawn, when there is no room to speak of.
+    /// The zoom the page is drawn at in `room`: 1 when the card is the shape's
+    /// own size or the page is Responsive, less when the column is too small
+    /// for it.
+    pub fn scale(self, room: (f32, f32)) -> f64 {
+        let Some((shape_w, _)) = self.shape() else {
+            return 1.0;
+        };
+        // The card is floored to whole pixels, so the zoom is taken from its
+        // width: the layout viewport is then the shape's width to the pixel.
+        self.fit(room)
+            .map_or(1.0, |(width, _)| f64::from(width / shape_w))
+    }
+
+    /// The size in CSS pixels the page lays out at in `room`: the shape's own
+    /// size, however small the card, or all of the room for Responsive. `None`
+    /// before the Browser has ever been drawn, when there is no room to speak
+    /// of.
     pub fn size_in(self, room: (f32, f32)) -> Option<(u32, u32)> {
-        let (width, height) = self
-            .fit(room)
-            .or_else(|| (room.0 > 0.0 && room.1 > 0.0).then_some(room))?;
+        if room.0 <= 0.0 || room.1 <= 0.0 {
+            return None;
+        }
+        let (width, height) = self.shape().unwrap_or(room);
         // Both are floored and positive, so the casts lose nothing.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         Some((width.floor() as u32, height.floor() as u32))
     }
 
-    /// The menu's row: the name and the size the page gets, like
-    /// `Mobile (390×844)`. A ratio has no size of its own, so it shows what
-    /// the room makes of it.
+    /// The menu's row: the name and the size the page lays out at, like
+    /// `Mobile (390×844)`. Responsive shows the room it takes.
     pub fn describe(self, room: (u32, u32)) -> String {
         #[allow(clippy::cast_precision_loss)]
         let size = self.size_in((room.0 as f32, room.1 as f32));
@@ -262,10 +288,30 @@ mod tests {
     }
 
     #[test]
-    fn an_exact_size_is_kept_when_it_fits_and_shrinks_when_it_does_not() {
+    fn an_exact_size_is_drawn_whole_when_it_fits_and_scaled_when_it_does_not() {
         let custom = Viewport::Custom(1000, 500);
         assert_eq!(custom.fit((1400.0, 900.0)), Some((1000.0, 500.0)));
+        assert_eq!(custom.scale((1400.0, 900.0)), 1.0);
         assert_eq!(custom.fit((500.0, 900.0)), Some((500.0, 250.0)));
+        assert_eq!(custom.scale((500.0, 900.0)), 0.5);
+    }
+
+    #[test]
+    fn the_page_always_lays_out_at_the_shapes_width() {
+        // A column of 480 or 700 pixels: the card shrinks, the zoom follows, and
+        // card ÷ zoom is the shape's width either way.
+        for room in [(480.0, 900.0), (700.0, 900.0), (1000.0, 500.0)] {
+            for viewport in [Viewport::Wide, Viewport::Standard, Viewport::Mobile] {
+                let (card_w, _) = viewport.fit(room).expect("fits");
+                let (shape_w, _) = viewport.shape().expect("a shape");
+                let layout = f64::from(card_w) / viewport.scale(room);
+                assert!(
+                    (layout - f64::from(shape_w)).abs() < 1e-3,
+                    "{viewport:?} in {room:?} laid out at {layout}"
+                );
+            }
+        }
+        assert_eq!(Viewport::Responsive.scale((480.0, 900.0)), 1.0);
     }
 
     #[test]
@@ -274,7 +320,11 @@ mod tests {
             Viewport::Mobile.describe((1400, 1400)),
             "Mobile (390\u{d7}844)"
         );
-        assert_eq!(Viewport::Wide.describe((480, 900)), "16:10 (480\u{d7}300)");
+        // A narrow column scales the page; it does not change what it lays out at.
+        assert_eq!(
+            Viewport::Wide.describe((480, 900)),
+            "16:10 (1280\u{d7}800)"
+        );
         assert_eq!(
             Viewport::Responsive.describe((480, 700)),
             "Responsive (480\u{d7}700)"

@@ -262,17 +262,19 @@ and sends a ring out on a click. It is only for the person watching, so:
 `browser viewport [SHAPE] [--tab N]` reads or sets the shape of an agent's page:
 `responsive`, `16:10`, `4:3`, `mobile`, `tablet`, or an exact `WIDTHxHEIGHT`
 (each side 100 to 4096; `Viewport::parse`). The answer is
-`{tab, viewport, width, height}` with `requested` added for an exact size.
+`{tab, viewport, width, height, scale}`.
 
 - Setting takes the hold, like any verb that drives the tab; reading does not,
   so a look never locks the person out. It sets the very field the menu sets,
   so the menu ticks it, and the person can change it back there.
-- An exact size follows the same rule as the presets: it is kept when the Browser column has
-  the room and shrunk, proportions kept, when it does not. `width` and `height`
-  are what the page got, `requested` what was asked, so an agent that sees them
-  differ knows the page lays out narrower than it wanted and can widen the
-  sidebar or ask for less. They are absent before the Browser has been drawn.
-- The size is from the room the last frame measured, so it is one frame behind
+- An exact size follows the same rule as the presets: the page lays out at
+  that size, whatever the column. `width` and `height` are the layout
+  viewport (`innerWidth`×`innerHeight`), and `scale` is how far a narrow column
+  draws it smaller (1 when it fits; page zoom, so the card keeps the shape's
+  proportions and nothing scrolls or clips). Click and `--at` coordinates stay
+  in CSS pixels of the layout viewport. `width` and `height` are absent before
+  the Browser has been drawn.
+- `scale` is from the room the last frame measured, so it is one frame behind
   a change. For a tab that is not selected it is what that tab would get in the
   same room. Run `browser eval 'innerWidth'` for the page's own word.
 - Like the menu, it resizes only: no user agent, touch or pixel ratio.
@@ -314,10 +316,12 @@ buttons and tray in `gui/browser_tab.rs`.
 The same menu holds the tab's other settings. **Viewport** (Responsive, 16:10,
 4:3, Mobile, Tablet) puts the page in a smaller card, centred and fitted to the
 room the column leaves (`gui/browser_viewport.rs`). Each row names the size the
-page would get, like `Mobile (390×844)`. A shape narrower than its size shows
-the shrunk size (`16:10 (480×300)`). Every shape stops at its real size, never
-larger: 16:10 is 1280×800, 4:3 is 1024×768, Mobile 390×844, Tablet 768×1024. It resizes the page only: no user agent, touch or pixel
-ratio. It is per tab and ends when the tab closes. An agent drives the same
+page lays out at, like `Mobile (390×844)`. Every shape is its real size, never
+larger: 16:10 is 1280×800, 4:3 is 1024×768, Mobile 390×844, Tablet 768×1024.
+When the column is narrower than that, the page still lays out at the shape's
+size and is drawn zoomed out to fit the card (`WKWebView.pageZoom`, applied in
+`browser_sync`). It is not clipped or scrolled, because GPUI cannot clip a
+native view. It resizes the page only: no user agent, touch or pixel ratio. It is per tab and ends when the tab closes. An agent drives the same
 setting with `browser viewport` (see below); the other rows in this menu are
 the person's alone. **Open in Default Browser** passes
 the address through `openable_url` first, so a page on any scheme but

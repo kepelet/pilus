@@ -12040,7 +12040,8 @@ impl PilusView {
         }
         // sipil's own section leads the lists: the user's agents, people and
         // channels, with where the connection stands in its header.
-        let sipil = self.sipil_sections(cx);
+        // With the quick links off, SIPIL is the first section and needs no gap.
+        let sipil = self.sipil_sections(!self.settings.quick_links, cx);
         let github = self.github_sidebar(cx);
         // Workspaces leads the list when the quick links are off and nothing
         // sits above it, so it needs no gap to separate it from them.
@@ -14278,14 +14279,14 @@ impl PilusView {
     /// people share. People and
     /// channels are listed whether or not a daemon is connected, since they never
     /// needed one.
-    fn sipil_sections(&self, cx: &mut Context<Self>) -> Vec<Div> {
+    fn sipil_sections(&self, leads: bool, cx: &mut Context<Self>) -> Vec<Div> {
         // Shown only for a pilus that is switched on and has something to list;
         // the Sipil tab, where a first agent or contact is added, opens from
         // the command palette (Show Sipil).
         if !self.sipil_listed() {
             return Vec::new();
         }
-        vec![self.sipil_agents_section(cx)]
+        vec![self.sipil_agents_section(leads, cx)]
     }
 
     /// Whether sipil is set up and switched on: reachable, with something to
@@ -14299,12 +14300,12 @@ impl PilusView {
         me.reachable && listed
     }
 
-    fn sipil_agents_section(&self, cx: &mut Context<Self>) -> Div {
+    fn sipil_agents_section(&self, leads: bool, cx: &mut Context<Self>) -> Div {
         let section = div()
             .flex()
             .flex_col()
             .gap_1()
-            .pt(px(SIDEBAR_SECTION_GAP))
+            .pt(px(if leads { 0.0 } else { SIDEBAR_SECTION_GAP }))
             .child(self.section_header(
                 SectionHeader {
                     id: "pilus-sipil-agents-toggle",

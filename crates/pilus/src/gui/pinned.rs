@@ -318,6 +318,7 @@ impl PilusView {
         for (index, saved) in self.session_pins().enumerate() {
             rows = rows.child(self.pinned_row(index, saved, cx));
         }
+        let count = self.session_pins().count();
         style::enter(
             "pilus-pinned-menu-enter",
             div()
@@ -337,6 +338,7 @@ impl PilusView {
                         .border_1()
                         .border_color(theme.border)
                         .p_2()
+                        .child(self.pinned_menu_head(count, cx))
                         .child(
                             div()
                                 .id("pilus-pinned-menu-scroll")
@@ -364,9 +366,73 @@ impl PilusView {
         .into_any_element()
     }
 
+    /// The menu's title line: how many pins, and a button that sorts them. It
+    /// sits outside the scrolling rows so it stays in reach in a long list.
+    fn pinned_menu_head(&self, count: usize, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(24.0))
+            .pl_2()
+            .pr_1()
+            .mb_1()
+            .child(
+                div()
+                    .text_size(px(self.section_font()))
+                    .text_color(theme.muted)
+                    .child(format!("PINNED · {count}")),
+            )
+            .child(
+                div()
+                    .id("pilus-pinned-sort")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .radius_sm()
+                    .cursor_pointer()
+                    .hover_fill(theme.tint_fill(1.0), style::RADIUS_SM)
+                    .child(icon(
+                        include_bytes!("../../assets/icons/arrow-down-a-z.svg"),
+                        13.0,
+                        theme.muted,
+                    ))
+                    .tooltip(row_tooltip(
+                        "Sort by name".to_string(),
+                        theme.panel_fg,
+                        vec![("Press again to reverse".to_string(), theme.muted)],
+                        theme,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.sort_pins(cx))),
+            )
+    }
+
+    /// Sort the attached session's pins by name, or reverse them when they
+    /// already are. Home and the menu bar list the same order.
+    fn sort_pins(&mut self, cx: &mut Context<Self>) {
+        let session = self.session_name.clone();
+        self.settings.sort_workspace_pins(session.as_deref());
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Take a pin away from the menu's own button. The menu stays open so
+    /// several can go in a row; it closes itself when the last one does
+    /// (`pinned_menu_shown`).
+    fn unpin_saved(&mut self, saved: &SavedWorkspace, cx: &mut Context<Self>) {
+        self.settings.set_workspace_pinned(saved.clone(), false);
+        self.save_settings();
+        cx.notify();
+    }
+
     /// One pinned folder in the menu: its name, the machine at the right when
-    /// it is not this Mac. A click opens it; a right click offers Unpin, and a
-    /// drag onto another row takes its slot.
+    /// it is not this Mac. A click opens it; the x at the end (shown on hover)
+    /// and a right click offer Unpin, and a drag onto another row takes its
+    /// slot.
     fn pinned_row(
         &self,
         index: usize,
@@ -383,6 +449,39 @@ impl PilusView {
         );
         let open = saved.clone();
         let menu = saved.clone();
+        let unpin = saved.clone();
+        let group = format!("pilus-pinned-group-{index}");
+        // Hidden, it keeps its room, so the name truncates at the same place
+        // whether or not the row is hovered.
+        let remove = div()
+            .id(format!("pilus-pinned-unpin-{index}"))
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .w(px(18.0))
+            .h(px(18.0))
+            .radius_sm()
+            .cursor_pointer()
+            .hover_fill(theme.tint_fill(2.0), style::RADIUS_SM)
+            .opacity(0.0)
+            .group_hover(group.clone(), |style| style.opacity(1.0))
+            .child(icon(
+                include_bytes!("../../assets/icons/x.svg"),
+                11.0,
+                theme.muted,
+            ))
+            .tooltip(row_tooltip(
+                "Unpin".to_string(),
+                theme.panel_fg,
+                Vec::new(),
+                theme,
+            ))
+            // Without this the click would also reach the row and open it.
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.unpin_saved(&unpin, cx);
+            }));
         let drag = PinDrag {
             saved: saved.clone(),
             theme,
@@ -390,6 +489,7 @@ impl PilusView {
         };
         div()
             .id(format!("pilus-pinned-{index}"))
+            .group(group)
             .flex()
             .flex_row()
             .items_center()
@@ -422,6 +522,7 @@ impl PilusView {
                     .text_color(theme.muted)
                     .child(host)
             }))
+            .child(remove)
             .tooltip(tip)
             .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
             // The row under a drag shows the fill it would take, unless it is

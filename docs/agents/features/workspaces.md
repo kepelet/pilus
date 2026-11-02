@@ -59,7 +59,10 @@ in the tab strip's head, ahead of the sidebar toggle and the session picker
 (`parked_controls_w` sizes the slot), and the menu hangs from it there. Toggling
 the sidebar closes the menu, as does the last pin going (`pinned_menu_shown`). A row opens the workspace and closes
 the menu; a right click opens its context menu; a drag onto another row
-reorders.
+reorders. An x at the row's end (shown on hover) unpins it and leaves the menu
+open. The menu's head carries the pin count and a sort button
+(`Settings::sort_workspace_pins`): A to Z by name, reversed when already sorted,
+with the other sessions' slots left alone.
 
 1. Call `workspace.open` on a worker thread through the control client. This
    reaches a saved machine over SSH whether or not the window is attached to

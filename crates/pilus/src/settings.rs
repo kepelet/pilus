@@ -753,6 +753,38 @@ impl Settings {
         self.pinned_workspaces.insert(into, pin);
     }
 
+    /// Sort the pins of `session` by label, A to Z, or Z to A when they are
+    /// already in A to Z order, so a second press reverses. The list is shared
+    /// by every session, so the sorted pins are written back into the slots the
+    /// session's pins held and the other sessions' pins do not move.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn sort_workspace_pins(&mut self, session: Option<&str>) {
+        let key = |saved: &SavedWorkspace| saved.label().to_lowercase();
+        let slots: Vec<usize> = self
+            .pinned_workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, saved)| saved.session.as_deref() == session)
+            .map(|(at, _)| at)
+            .collect();
+        let mut sorted: Vec<SavedWorkspace> = slots
+            .iter()
+            .map(|&at| self.pinned_workspaces[at].clone())
+            .collect();
+        // Stable, so equal labels keep the order they were pinned in.
+        sorted.sort_by_key(key);
+        if slots
+            .iter()
+            .zip(&sorted)
+            .all(|(&at, saved)| self.pinned_workspaces[at] == *saved)
+        {
+            sorted.reverse();
+        }
+        for (&at, saved) in slots.iter().zip(sorted) {
+            self.pinned_workspaces[at] = saved;
+        }
+    }
+
     /// The pin for the folder `path` on `endpoint` in `session`; a folder
     /// unpinned since a menu was drawn comes back unnamed, so a stale click
     /// still opens it.
@@ -1466,6 +1498,36 @@ mod tests {
         settings.move_workspace_pin(&saved("local", "/w/gone"), &saved("local", "/w/a"));
         assert_eq!(order(&settings, None), ["/w/a", "/w/b", "/w/c"]);
         assert_eq!(order(&settings, Some("work")), ["/w/x", "/w/y"]);
+    }
+
+    #[test]
+    fn sorting_pins_orders_by_label_then_reverses_and_leaves_other_sessions() {
+        let mut settings = Settings::default();
+        for pin in [
+            saved("local", "/w/Zed"),
+            saved_in("work", "local", "/w/m"),
+            saved("local", "/w/api"),
+            saved("local", "/w/Mid"),
+            saved_in("work", "local", "/w/b"),
+        ] {
+            settings.set_workspace_pinned(pin, true);
+        }
+        let order = |settings: &Settings, session: Option<&str>| -> Vec<String> {
+            settings
+                .pinned_in(session)
+                .map(|saved| saved.path.clone())
+                .collect()
+        };
+
+        settings.sort_workspace_pins(None);
+        assert_eq!(order(&settings, None), ["/w/api", "/w/Mid", "/w/Zed"]);
+        assert_eq!(order(&settings, Some("work")), ["/w/m", "/w/b"]);
+        // The other session's pins keep their places in the shared list.
+        assert_eq!(settings.pinned_workspaces[1].path, "/w/m");
+        assert_eq!(settings.pinned_workspaces[4].path, "/w/b");
+
+        settings.sort_workspace_pins(None);
+        assert_eq!(order(&settings, None), ["/w/Zed", "/w/Mid", "/w/api"]);
     }
 
     #[test]

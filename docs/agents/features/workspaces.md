@@ -54,8 +54,10 @@ collapse toggle (`pinned_button`), which drops a list of
 the pins below it (`pinned_menu`), built like the session menu: a transparent
 catcher over the window dismisses it, and Escape closes it. A row shows the name
 and, for a remote pin, the machine; its tooltip shows the folder. The button is
-absent until something is pinned, and the menu closes when the sidebar collapses
-or the last pin goes (`pinned_menu_shown`). A row opens the workspace and closes
+absent until something is pinned. When the sidebar collapses the button parks
+in the tab strip's head, ahead of the sidebar toggle and the session picker
+(`parked_controls_w` sizes the slot), and the menu hangs from it there. Toggling
+the sidebar closes the menu, as does the last pin going (`pinned_menu_shown`). A row opens the workspace and closes
 the menu; a right click opens its context menu; a drag onto another row
 reorders.
 

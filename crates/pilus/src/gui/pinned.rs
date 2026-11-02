@@ -193,11 +193,18 @@ impl PilusView {
         );
     }
 
-    /// Whether the pinned menu is on screen: open, with the sidebar it hangs
-    /// from showing and something left to list. A flag left set by a collapsed
-    /// sidebar or a last unpin must not keep an invisible overlay eating clicks.
+    /// Whether the attached session has anything pinned.
+    pub(super) fn has_session_pins(&self) -> bool {
+        self.session_pins().next().is_some()
+    }
+
+    /// Whether the pinned menu is on screen: open with something left to list.
+    /// A flag left set by a last unpin must not keep an invisible overlay
+    /// eating clicks. The button hangs in the sidebar head, or in the tab
+    /// strip while the sidebar is collapsed; toggling the sidebar closes the
+    /// menu, so it never outlives the button it hangs from.
     pub(super) fn pinned_menu_shown(&self) -> bool {
-        self.pinned_menu_open && self.sidebar_visible && self.session_pins().next().is_some()
+        self.pinned_menu_open && self.has_session_pins()
     }
 
     /// The `index`th pin of the attached session, in pin order.
@@ -230,7 +237,11 @@ impl PilusView {
     /// The button in the sidebar's head, before the collapse toggle, that
     /// drops the pins down. It is absent until something
     /// is pinned, so a window that never pins one has no dead control.
-    pub(super) fn pinned_button(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(super) fn pinned_button(
+        &self,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
         let count = self.session_pins().count();
         if count == 0 {
             return None;
@@ -238,7 +249,7 @@ impl PilusView {
         let theme = self.theme;
         Some(
             div()
-                .id("pilus-pinned-button")
+                .id(id)
                 .occlude()
                 .flex()
                 .items_center()
@@ -294,8 +305,13 @@ impl PilusView {
         let sidebar_left = self
             .sidebar_dock()
             .map_or(0.0, |dock| f32::from(dock.x) * cell_width);
-        // The button leads the head, ahead of the collapse toggle.
-        let button_left = sidebar_left + Self::head_controls_left(fullscreen);
+        // The button leads the head, ahead of the collapse toggle; with the
+        // sidebar collapsed it leads the tab strip instead.
+        let button_left = if self.sidebar_visible {
+            sidebar_left + Self::head_controls_left(fullscreen)
+        } else {
+            self.strip_pad(fullscreen)
+        };
         let menu_left = button_left.max(SIDEBAR_HEAD_INSET);
         let menu_top = (HEADER_HEIGHT + TAB_HEIGHT) / 2.0 + SESSION_MENU_GAP;
         let mut rows = div().flex().flex_col().gap_1();

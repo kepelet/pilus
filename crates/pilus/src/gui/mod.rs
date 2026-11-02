@@ -10173,6 +10173,17 @@ impl PilusView {
         }
     }
 
+    /// Width of the controls the tab strip parks at its head while the
+    /// sidebar is away: the pinned button (once something is pinned) and the
+    /// toggle, in the order the sidebar head holds them.
+    fn parked_controls_w(&self) -> f32 {
+        if self.has_session_pins() {
+            SIDEBAR_TOGGLE_W * 2.0 + HEAD_CONTROLS_GAP
+        } else {
+            SIDEBAR_TOGGLE_W
+        }
+    }
+
     /// Left inset of the tab strip and its menus: clears the traffic lights
     /// when the sidebar is gone, hugs the edge otherwise, gliding between
     /// the two while the panel tweens.
@@ -12053,7 +12064,7 @@ impl PilusView {
                     .justify_start()
                     .gap(px(HEAD_CONTROLS_GAP))
                     .pl(px(Self::head_controls_left(fullscreen)))
-                    .children(self.pinned_button(cx))
+                    .children(self.pinned_button("pilus-pinned-button", cx))
                     .child(self.sidebar_toggle("pilus-sidebar-toggle", cx)),
             )
             .child(list);
@@ -12437,12 +12448,13 @@ impl PilusView {
                     .flex_row()
                     .overflow_hidden()
                     .gap(px(HEAD_CONTROLS_GAP))
-                    // The slot is the toggle plus the strip's gap after it;
-                    // the negative margin cancels the gap so a closed slot
-                    // takes no room at all.
-                    .w(px((SIDEBAR_TOGGLE_W + 4.0) * parked))
+                    // The slot is the parked controls plus the strip's gap
+                    // after them; the negative margin cancels the gap so a
+                    // closed slot takes no room at all.
+                    .w(px((self.parked_controls_w() + 4.0) * parked))
                     .mr(px(-4.0))
                     .opacity(parked * parked)
+                    .children(self.pinned_button("pilus-pinned-button-parked", cx))
                     .child(self.sidebar_toggle("pilus-sidebar-toggle-parked", cx)),
             );
         }
@@ -13179,7 +13191,7 @@ impl PilusView {
         let parked = (1.0 - self.sidebar_open).clamp(0.0, 1.0);
         let picker_left = self.sidebar_px(cell_width)
             + self.strip_pad(fullscreen)
-            + (SIDEBAR_TOGGLE_W + 4.0) * parked;
+            + (self.parked_controls_w() + 4.0) * parked;
         let menu_left = picker_left.max(SIDEBAR_HEAD_INSET);
         let menu_top = (HEADER_HEIGHT + TAB_HEIGHT) / 2.0 + SESSION_MENU_GAP;
         let mut items = div().flex().flex_col().gap_1();

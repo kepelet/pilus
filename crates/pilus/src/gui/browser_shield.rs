@@ -6,7 +6,9 @@
 //! placed just above the page, with the page's frame, that swallows the mouse,
 //! the wheel and the keyboard, so the person cannot interrupt an agent half
 //! way through a form. It draws nothing over the page, so the person watches
-//! the agent work; its only chrome is a Take over button in a corner. It is
+//! the agent work. It spans the whole page, edge to edge, and paints a faint
+//! accent wash with an accent frame so the person can see at a glance that the
+//! page is held; its one control is a Take over button in a corner. It is
 //! drawn by pilus, not injected into the page, so a page can neither remove
 //! nor imitate it, and it works on pages that run none of our script.
 //!
@@ -51,12 +53,21 @@ mod imp {
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, NSObjectProtocol};
     use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
-    use objc2_app_kit::{NSButton, NSEvent, NSView, NSWindowOrderingMode};
-    use objc2_foundation::{NSPoint, NSRect, NSString};
+    use objc2_app_kit::{
+        NSButton, NSColor, NSCompositingOperation, NSEvent, NSRectFillUsingOperation, NSView,
+        NSWindowOrderingMode,
+    };
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
     use wry::WebViewExtMacOS;
 
     /// Space between the button and the page's corner.
     const CORNER_GAP: f64 = 8.0;
+    /// How strong the wash over the page is: enough to read as "held", not
+    /// enough to hide the page or the agent's cursor in it.
+    const WASH: f64 = 0.06;
+    /// Thickness and strength of the frame around the page's edge.
+    const FRAME: f64 = 3.0;
+    const FRAME_ALPHA: f64 = 0.7;
 
     struct Ivars {
         /// Set by the button, read by [`Shield::taken`].
@@ -74,6 +85,27 @@ mod imp {
         struct Cover;
 
         impl Cover {
+            // The wash and the frame. The view is not opaque, so the page
+            // shows through whatever is not painted.
+            #[unsafe(method(drawRect:))]
+            fn draw_rect(&self, _dirty: NSRect) {
+                let bounds = self.bounds();
+                let accent = NSColor::controlAccentColor();
+                accent.colorWithAlphaComponent(WASH).setFill();
+                NSRectFillUsingOperation(bounds, NSCompositingOperation::SourceOver);
+                accent.colorWithAlphaComponent(FRAME_ALPHA).setFill();
+                let (w, h) = (bounds.size.width, bounds.size.height);
+                let t = FRAME.min(w / 2.0).min(h / 2.0);
+                for edge in [
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, t)),
+                    NSRect::new(NSPoint::new(0.0, h - t), NSSize::new(w, t)),
+                    NSRect::new(NSPoint::new(0.0, t), NSSize::new(t, h - 2.0 * t)),
+                    NSRect::new(NSPoint::new(w - t, t), NSSize::new(t, h - 2.0 * t)),
+                ] {
+                    NSRectFillUsingOperation(edge, NSCompositingOperation::SourceOver);
+                }
+            }
+
             #[unsafe(method(takeOver:))]
             fn take_over(&self, _sender: Option<&AnyObject>) {
                 self.ivars().taken.store(true, Ordering::Relaxed);
@@ -181,6 +213,8 @@ mod imp {
             let frame = page.frame();
             if built.cover.frame() != frame {
                 built.cover.setFrame(frame);
+                // The wash and frame follow the page's size.
+                built.cover.setNeedsDisplay(true);
             }
             let size = built.button.frame().size;
             // The top-right corner, out of the way of the page's content. The

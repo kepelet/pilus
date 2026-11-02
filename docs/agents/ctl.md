@@ -25,6 +25,8 @@ pilus ctl browser open localhost:8787      # a tab of your own; answers once it 
 pilus ctl browser snapshot                 # the page as text, controls as @1, @2…
 pilus ctl browser fill @1 "buy milk"
 pilus ctl browser click @2
+pilus ctl browser scroll down              # also: up|left|right|top|bottom [PX] [--in SEL]
+pilus ctl browser scroll @7                # bring one element into view
 pilus ctl browser wait 'li:nth-child(2)'
 pilus ctl browser network --filter /api    # method, url, status, ms
 pilus ctl browser console                  # console.* and uncaught errors
@@ -79,7 +81,9 @@ A tab belongs to whoever opened it. An agent needs no yes for a tab of its own.
   While held, a native cover (`gui/browser_shield.rs`) sits over the page and
   swallows the person's clicks, scrolls and keys, so they cannot interrupt a
   form half filled, and the address bar and back/forward/reload wait. The cover
-  is clear: the person sees the page and watches the agent work. Its **Take
+  spans the whole page, edge to edge, and paints a faint accent wash with an
+  accent frame (`WASH`, `FRAME` in `browser_shield.rs`) so a held page reads as
+  held; it stays see-through, so the person watches the agent work. Its **Take
   over** button, in the page's top-right corner, ends the hold, fails whatever the agent had in
   flight with "the person took over this tab", and turns the agent away from
   that tab for 15 s. The person can still close the tab.
@@ -203,6 +207,29 @@ cannot change at run time. So `PILUS_HTTP_HOSTS="lab,intranet.corp" just bundle`
 (commas or spaces) writes an `NSExceptionDomains` entry, with subdomains, for
 each name. Empty by default, so a shipped build keeps ATS whole. There is no
 settings list: type the `http://`. Unverified on a live window.
+
+### Scrolling and the agent's cursor
+
+`browser scroll` moves the page, or with `--in` one scrollable element, by a
+step (`PX`, else 80% of the viewport) or to its top or bottom; with only a
+selector it brings that element into view. The answer carries `x`, `y`,
+`max_y`, `max_x`, `viewport`, `at_top` and `at_bottom`, so an agent knows when
+another step would move nothing. Scrolling is `behavior: 'instant'` whatever
+the page's CSS says.
+
+`click`, `fill` and `scroll` drive a **virtual cursor** in the page
+(`cursor` in `browser_inspect.js`): a pointer that glides to the target, dips
+and sends a ring out on a click. It is only for the person watching, so:
+
+- it sits in a closed shadow root, `pointer-events: none`, built from DOM calls
+  and the Web Animations API alone, so a page's CSS and CSP can neither style
+  nor block it, and it never takes part in the page's own events;
+- a click waits for the glide (at most about 0.7 s) before the events fire, so
+  the cursor is where the click lands;
+- it leaves the DOM 3 s after the last action. That is the one timer, cleared by
+  the next action, so an idle page runs nothing. `prefers-reduced-motion` skips
+  the glide and the ring;
+- an action does not depend on it: any failure drawing it is swallowed.
 
 Two things an agent trips on, both seen on a live window:
 

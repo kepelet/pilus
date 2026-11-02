@@ -381,6 +381,12 @@ pub(super) fn call_script(id: u64, op: &PageOp) -> Option<String> {
         PageOp::Html { selector } => run("html", json!([selector])),
         PageOp::Text { selector } => run("text", json!([selector])),
         PageOp::Click { selector } => run("click", json!([selector])),
+        PageOp::Scroll {
+            direction,
+            pixels,
+            selector,
+            within,
+        } => run("scroll", json!([direction, pixels, selector, within])),
         PageOp::Fill { selector, text } => run("fill", json!([selector, text])),
         PageOp::Press { key, selector } => run("press", json!([key, selector])),
         PageOp::Wait {

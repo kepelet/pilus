@@ -263,6 +263,144 @@
       ? text.slice(0, 200000) + `\n… (${text.length - 200000} more characters)`
       : text;
 
+  // ---- the agent's cursor ------------------------------------------------
+  // A pointer that glides to what the agent is about to act on and pulses
+  // where it clicks, so the person watching sees what is being done. It is
+  // cosmetic: it never takes part in the page's events, and it is built with
+  // DOM calls and the Web Animations API only, so a page's CSP (which can
+  // forbid inline styles and `innerHTML`) cannot stop it. It lives in a
+  // closed shadow root so the page's CSS cannot reach it, and it leaves the
+  // DOM a few seconds after the last action, with one timer that is cleared by
+  // the next action, so an idle page runs nothing.
+  const cursor = (() => {
+    const NS = 'http://www.w3.org/2000/svg';
+    const ACCENT = '#3b82f6';
+    const calm = () => {
+      try {
+        return matchMedia('(prefers-reduced-motion: reduce)').matches;
+      } catch (_) {
+        return false;
+      }
+    };
+    let host = null;
+    let pointer = null;
+    let at = null;
+    let gone = 0;
+
+    const build = () => {
+      host = document.createElement('div');
+      Object.assign(host.style, {
+        all: 'initial',
+        position: 'fixed',
+        left: '0',
+        top: '0',
+        width: '0',
+        height: '0',
+        pointerEvents: 'none',
+        zIndex: '2147483647',
+      });
+      const root = host.attachShadow({ mode: 'closed' });
+      pointer = document.createElement('div');
+      Object.assign(pointer.style, { position: 'absolute', left: '0', top: '0', willChange: 'transform' });
+      const svg = document.createElementNS(NS, 'svg');
+      for (const [name, value] of [['width', '16'], ['height', '22'], ['viewBox', '-1 -1 16 22']]) {
+        svg.setAttribute(name, value);
+      }
+      svg.style.overflow = 'visible';
+      svg.style.filter = 'drop-shadow(0 1px 2px rgba(0,0,0,.45))';
+      const arrow = document.createElementNS(NS, 'path');
+      arrow.setAttribute('d', 'M0 0 L0 17 L4.5 13 L7.5 20 L10.5 18.7 L7.6 12 L13.5 12 Z');
+      arrow.setAttribute('fill', '#fff');
+      arrow.setAttribute('stroke', '#111');
+      arrow.setAttribute('stroke-width', '1.3');
+      arrow.setAttribute('stroke-linejoin', 'round');
+      svg.appendChild(arrow);
+      pointer.appendChild(svg);
+      root.appendChild(pointer);
+      (document.documentElement || document.body).appendChild(host);
+    };
+
+    const place = (x, y) => `translate(${x - 1}px, ${y - 1}px)`;
+    const frame = (ms) => new Promise((done) => setTimeout(done, ms));
+
+    // Keep the pointer on screen until the agent has been quiet a while.
+    const linger = () => {
+      clearTimeout(gone);
+      gone = setTimeout(() => {
+        const fade = pointer && !calm() ? pointer.animate([{ opacity: 1 }, { opacity: 0 }], 300) : null;
+        setTimeout(() => {
+          if (host) host.remove();
+          host = pointer = at = null;
+        }, fade ? 300 : 0);
+      }, 3000);
+    };
+
+    // Glide to (x, y) in viewport coordinates and settle there.
+    const to = async (x, y) => {
+      try {
+        if (!host || !host.isConnected) {
+          host = null;
+          build();
+          at = at || { x: Math.max(0, x - 80), y: Math.max(0, y + 60) };
+          pointer.style.transform = place(at.x, at.y);
+        }
+        const from = at;
+        const distance = Math.hypot(x - from.x, y - from.y);
+        const ms = calm() ? 0 : Math.min(650, 160 + distance * 0.45);
+        at = { x, y };
+        pointer.style.transform = place(x, y);
+        if (ms > 0 && distance > 1) {
+          pointer.animate([{ transform: place(from.x, from.y) }, { transform: place(x, y) }], {
+            duration: ms,
+            easing: 'cubic-bezier(.3,.1,.2,1)',
+          });
+          await frame(ms + 30);
+        }
+        linger();
+      } catch (_) {
+        /* the cursor is decoration; an action goes on without it */
+      }
+    };
+
+    // The press: the pointer dips and a ring spreads from its tip.
+    const press = async () => {
+      try {
+        if (!host || !at || calm()) return;
+        pointer.animate(
+          [{ transform: place(at.x, at.y) + ' scale(1)' }, { transform: place(at.x, at.y) + ' scale(.82)' }, { transform: place(at.x, at.y) + ' scale(1)' }],
+          { duration: 220, easing: 'ease-out' }
+        );
+        const ring = document.createElement('div');
+        Object.assign(ring.style, {
+          position: 'absolute',
+          left: `${at.x - 20}px`,
+          top: `${at.y - 20}px`,
+          width: '40px',
+          height: '40px',
+          borderRadius: '50%',
+          boxSizing: 'border-box',
+          border: `2px solid ${ACCENT}`,
+          background: 'rgba(59,130,246,.22)',
+        });
+        pointer.parentNode.appendChild(ring);
+        ring.animate(
+          [{ transform: 'scale(.2)', opacity: 1 }, { transform: 'scale(1.25)', opacity: 0 }],
+          { duration: 520, easing: 'ease-out' }
+        );
+        setTimeout(() => ring.remove(), 540);
+        await frame(110);
+      } catch (_) {
+        /* decoration only */
+      }
+    };
+
+    const toElement = (el) => {
+      const box = el.getBoundingClientRect();
+      return to(box.x + box.width / 2, box.y + box.height / 2);
+    };
+    return { to, press, toElement };
+  })();
+
   // ---- acting on the page ------------------------------------------------
   const mouse = (el, type) => {
     const box = el.getBoundingClientRect();
@@ -281,26 +419,79 @@
     );
   };
 
+  // Where the page (or the element being scrolled) is, so an agent knows
+  // whether another step would move it.
+  const whereIs = (target) => {
+    const page = !target;
+    const el = target || document.scrollingElement || document.documentElement;
+    const viewH = page ? innerHeight : el.clientHeight;
+    const viewW = page ? innerWidth : el.clientWidth;
+    const maxY = Math.max(0, el.scrollHeight - viewH);
+    const maxX = Math.max(0, el.scrollWidth - viewW);
+    const y = Math.round(page ? scrollY : el.scrollTop);
+    const x = Math.round(page ? scrollX : el.scrollLeft);
+    return {
+      x,
+      y,
+      max_y: Math.round(maxY),
+      max_x: Math.round(maxX),
+      viewport: { width: Math.round(viewW), height: Math.round(viewH) },
+      at_top: y <= 0,
+      at_bottom: y >= maxY - 1,
+    };
+  };
+
   const ops = {
     snapshot,
     html: (selector) => cut((selector ? resolve(selector) : document.documentElement).outerHTML),
     text: (selector) => cut((selector ? resolve(selector) : document.body).innerText),
-    click: (selector) => {
+    click: async (selector) => {
       const el = resolve(selector);
       if (!visible(el)) throw new Error('that element is not visible');
       if (el.disabled) throw new Error('that element is disabled');
-      el.scrollIntoView({ block: 'center', inline: 'center' });
+      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      await cursor.toElement(el);
       mouse(el, 'pointerdown');
       mouse(el, 'mousedown');
       if (el.focus) el.focus();
       mouse(el, 'pointerup');
       mouse(el, 'mouseup');
       el.click();
+      await cursor.press();
       return { clicked: describe(el) };
     },
-    fill: (selector, text) => {
+    scroll: async (direction, pixels, selector, within) => {
+      if (selector) {
+        const el = resolve(selector);
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        await cursor.toElement(el);
+        return { into_view: describe(el), ...whereIs(null) };
+      }
+      const target = within ? resolve(within) : null;
+      const now = whereIs(target);
+      const stepY = pixels || Math.max(40, Math.round(now.viewport.height * 0.8));
+      const stepX = pixels || Math.max(40, Math.round(now.viewport.width * 0.8));
+      let top = now.y;
+      let left = now.x;
+      if (direction === 'down') top += stepY;
+      else if (direction === 'up') top -= stepY;
+      else if (direction === 'right') left += stepX;
+      else if (direction === 'left') left -= stepX;
+      else if (direction === 'top') top = 0;
+      else if (direction === 'bottom') top = now.max_y;
+      else throw new Error('scroll needs a direction or an element');
+      // The pointer rests over what is being scrolled, as a hand on a wheel.
+      const area = target ? target.getBoundingClientRect() : { x: 0, y: 0, width: innerWidth, height: innerHeight };
+      await cursor.to(area.x + area.width / 2, area.y + area.height / 2);
+      (target || window).scrollTo({ top: Math.max(0, top), left: Math.max(0, left), behavior: 'instant' });
+      const after = whereIs(target);
+      return { scrolled: { x: after.x - now.x, y: after.y - now.y }, ...after };
+    },
+    fill: async (selector, text) => {
       const el = resolve(selector);
       if (el.disabled || el.readOnly) throw new Error('that field cannot be edited');
+      el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+      await cursor.toElement(el);
       if (el.focus) el.focus();
       if (el.isContentEditable) {
         el.textContent = text;

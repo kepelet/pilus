@@ -189,6 +189,32 @@ fn yes() -> bool {
     true
 }
 
+/// Which way `browser scroll` goes. `Top` and `Bottom` jump to the end.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl ScrollDirection {
+    fn parse(word: &str) -> Option<Self> {
+        Some(match word {
+            "up" => Self::Up,
+            "down" => Self::Down,
+            "left" => Self::Left,
+            "right" => Self::Right,
+            "top" => Self::Top,
+            "bottom" => Self::Bottom,
+            _ => return None,
+        })
+    }
+}
+
 /// What to do to one Browser page. The verb is the `op` field.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -213,6 +239,16 @@ pub enum PageOp {
     },
     Click {
         selector: String,
+    },
+    /// Scroll the page (or one scrollable element, `within`) a step in
+    /// `direction`, by `pixels` else most of a screen, or with no direction
+    /// bring `selector` into view. The answer says where the page now is, so
+    /// an agent knows when it has reached the end.
+    Scroll {
+        direction: Option<ScrollDirection>,
+        pixels: Option<u32>,
+        selector: Option<String>,
+        within: Option<String>,
     },
     /// Replace the value of a field, as typing would.
     Fill {
@@ -386,6 +422,7 @@ struct Flags {
     timeout_ms: Option<u32>,
     filter: Option<String>,
     limit: Option<u32>,
+    within: Option<String>,
     positional: Vec<String>,
 }
 
@@ -416,6 +453,7 @@ impl Flags {
                     })?);
                 }
                 "--filter" => flags.filter = Some(value("--filter")?.to_string()),
+                "--in" => flags.within = Some(value("--in")?.to_string()),
                 "--limit" => {
                     let text = value("--limit")?;
                     flags.limit = Some(
@@ -519,6 +557,7 @@ fn parse_browser(words: &[&str]) -> Result<Request> {
         "click" => Ok(flags.page(PageOp::Click {
             selector: flags.one("click", "a selector or @N")?,
         })),
+        "scroll" => parse_scroll(&flags),
         "fill" => {
             // An empty text is fine (it clears the field), but it must be
             // given, so a forgotten argument is not a silent clear.
@@ -566,6 +605,45 @@ fn parse_browser(words: &[&str]) -> Result<Request> {
     }
 }
 
+/// `scroll down [PIXELS] [--in SELECTOR]`, or `scroll SELECTOR` to bring one
+/// element into view. A direction word wins over a selector of the same name,
+/// and no real selector is spelled `up` or `bottom`.
+fn parse_scroll(flags: &Flags) -> Result<Request> {
+    const HELP: &str = "browser scroll takes up|down|left|right|top|bottom [PIXELS] [--in SELECTOR], \
+                        or a SELECTOR|@N to bring into view";
+    let words: Vec<&str> = flags.positional.iter().map(String::as_str).collect();
+    let op = match words.as_slice() {
+        [word, rest @ ..] if ScrollDirection::parse(word).is_some() => {
+            let pixels = match rest {
+                [] => None,
+                [text] => Some(text.parse::<u32>().map_err(|_| {
+                    anyhow!("browser scroll's distance is a number of pixels, not {text:?}")
+                })?),
+                _ => bail!("{HELP}\n\n{USAGE}"),
+            };
+            PageOp::Scroll {
+                direction: ScrollDirection::parse(word),
+                pixels,
+                selector: None,
+                within: flags.within.clone(),
+            }
+        }
+        [selector] => {
+            if flags.within.is_some() {
+                bail!("browser scroll --in goes with a direction\n\n{USAGE}");
+            }
+            PageOp::Scroll {
+                direction: None,
+                pixels: None,
+                selector: Some((*selector).to_string()),
+                within: None,
+            }
+        }
+        _ => bail!("{HELP}\n\n{USAGE}"),
+    };
+    Ok(flags.page(op))
+}
+
 /// The text `pilus ctl` and `--help` print.
 pub const USAGE: &str = "USAGE:\n\
     \x20   pilus ctl ping\n\
@@ -593,6 +671,8 @@ pub const USAGE: &str = "USAGE:\n\
     \x20   pilus ctl browser html [SELECTOR]\n\
     \x20   pilus ctl browser text [SELECTOR]\n\
     \x20   pilus ctl browser click SELECTOR|@N\n\
+    \x20   pilus ctl browser scroll up|down|left|right|top|bottom [PIXELS] [--in SELECTOR|@N]\n\
+    \x20   pilus ctl browser scroll SELECTOR|@N   # bring it into view\n\
     \x20   pilus ctl browser fill SELECTOR|@N TEXT\n\
     \x20   pilus ctl browser press KEY [SELECTOR|@N]\n\
     \x20   pilus ctl browser wait SELECTOR|@N [--gone] [--timeout MS]\n\
@@ -946,6 +1026,55 @@ mod tests {
         );
         assert!(parse_args(&words("browser release 0")).is_err());
         assert!(parse_args(&words("browser release 1 2")).is_err());
+    }
+
+    #[test]
+    fn scroll_takes_a_direction_or_a_selector() {
+        assert_eq!(
+            page("browser scroll down"),
+            Request::BrowserPage {
+                tab: None,
+                op: PageOp::Scroll {
+                    direction: Some(ScrollDirection::Down),
+                    pixels: None,
+                    selector: None,
+                    within: None,
+                }
+            }
+        );
+        assert_eq!(
+            page("browser scroll up 300 --in .list --tab 2"),
+            Request::BrowserPage {
+                tab: Some(2),
+                op: PageOp::Scroll {
+                    direction: Some(ScrollDirection::Up),
+                    pixels: Some(300),
+                    selector: None,
+                    within: Some(".list".to_string()),
+                }
+            }
+        );
+        assert_eq!(
+            page("browser scroll @4"),
+            Request::BrowserPage {
+                tab: None,
+                op: PageOp::Scroll {
+                    direction: None,
+                    pixels: None,
+                    selector: Some("@4".to_string()),
+                    within: None,
+                }
+            }
+        );
+        for bad in [
+            "browser scroll",
+            "browser scroll down far",
+            "browser scroll down 1 2",
+            "browser scroll #a --in #b",
+            "browser scroll #a #b",
+        ] {
+            assert!(parse_args(&words(bad)).is_err(), "{bad:?} should fail");
+        }
     }
 
     #[test]

@@ -12042,7 +12042,8 @@ impl PilusView {
         // channels, with where the connection stands in its header.
         // With the quick links off, SIPIL is the first section and needs no gap.
         let sipil = self.sipil_sections(!self.settings.quick_links, cx);
-        let github = self.github_sidebar(cx);
+        // GITHUB leads the same way: with nothing above it, it needs no gap.
+        let github = self.github_sidebar(!self.settings.quick_links && sipil.is_empty(), cx);
         // Workspaces leads the list when the quick links are off and nothing
         // sits above it, so it needs no gap to separate it from them.
         let leads = !self.settings.quick_links && sipil.is_empty() && github.is_none();
@@ -14741,10 +14742,12 @@ impl PilusView {
                     lit,
                     on_click,
                 } = button;
-                // Past the hairline, with its glyph over the agent rows'
-                // trailing brand mark: the header breaks out of the row inset,
-                // so the button gives it back less the glyph's own margin.
-                let margin = (HEADER_BUTTON - HEADER_BUTTON * style::ICON_BUTTON_GLYPH) / 2.0;
+                // Past the hairline, centred on the trailing glyph column: the
+                // machine rows' fold chevron and the agent rows' brand mark end
+                // in a `SIDEBAR_GLYPH` box, so the button's centre sits on that
+                // box's. The header breaks out of the row inset, so the button
+                // gives it back less the button's overhang past the box.
+                let margin = (HEADER_BUTTON - SIDEBAR_GLYPH) / 2.0;
                 let kind = if lit {
                     style::ButtonKind::Secondary
                 } else {

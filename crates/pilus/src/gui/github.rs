@@ -29,7 +29,6 @@ use pilus_client::{AccountState, GhAccount, GhState, Listing, RepoSummary, unix_
 
 use super::github_page::View;
 use super::sidebar_menu::Item as SidebarItem;
-use super::style::RadiusExt;
 use super::tasks::{age_label, unix_now};
 use super::toast::ToastKind;
 use super::{
@@ -467,23 +466,23 @@ impl PilusView {
     }
 
     /// The Repositories section, ready to sit above WORKSPACES.
-    pub(super) fn github_sidebar(&self, cx: &mut Context<Self>) -> Option<Div> {
+    pub(super) fn github_sidebar(&self, leads: bool, cx: &mut Context<Self>) -> Option<Div> {
         if !self.settings.github_shows_repositories() {
             return None;
         }
         match self.github.showing() {
             Showing::Nothing => None,
-            Showing::Prompt(advice) => Some(self.github_prompt(advice, cx)),
-            Showing::List => Some(self.github_repositories(cx)),
+            Showing::Prompt(advice) => Some(self.github_prompt(advice, leads, cx)),
+            Showing::List => Some(self.github_repositories(leads, cx)),
         }
     }
 
-    fn github_header(&self, label: &'static str, cx: &mut Context<Self>) -> Div {
+    fn github_header(&self, label: &'static str, leads: bool, cx: &mut Context<Self>) -> Div {
         div()
             .flex()
             .flex_col()
             .gap_1()
-            .pt(px(SIDEBAR_SECTION_GAP))
+            .pt(px(if leads { 0.0 } else { SIDEBAR_SECTION_GAP }))
             .child(self.section_header(
                 SectionHeader {
                     id: "pilus-github-toggle",
@@ -502,9 +501,9 @@ impl PilusView {
 
     /// `gh` is installed but can't be used (not signed in): one section that
     /// says what to do.
-    fn github_prompt(&self, advice: &str, cx: &mut Context<Self>) -> Div {
+    fn github_prompt(&self, advice: &str, leads: bool, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let section = self.github_header("GITHUB", cx);
+        let section = self.github_header("GITHUB", leads, cx);
         if self.github.collapsed {
             return section;
         }
@@ -520,9 +519,9 @@ impl PilusView {
         ))
     }
 
-    fn github_repositories(&self, cx: &mut Context<Self>) -> Div {
+    fn github_repositories(&self, leads: bool, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let section = self.github_header("REPOSITORIES", cx);
+        let section = self.github_header("REPOSITORIES", leads, cx);
         if self.github.collapsed {
             return section;
         }

@@ -17,6 +17,7 @@ mod box_drawing;
 mod browser_control;
 mod browser_data;
 mod browser_inspect;
+mod browser_notes;
 mod browser_shield;
 mod browser_tab;
 mod connector;
@@ -2392,6 +2393,8 @@ struct PilusView {
     browser_panel: BrowserPanel,
     /// The Browser tab's address bar, an IME-capable field of its own.
     browser_input: Entity<TextInput>,
+    /// The field for a note on the element the person just pointed at.
+    browser_note_input: Entity<TextInput>,
     /// The right sidebar (Changes and History tabs).
     right: RightSidebar,
     /// The native Mission Control page: its state and the daemon's last
@@ -2769,6 +2772,18 @@ impl PilusView {
             )
             .submit_on_enter()
         });
+        let browser_note_input = cx.new(|cx| {
+            TextInput::new(
+                String::new(),
+                "What should change here?",
+                style::chrome_font(&shared_settings),
+                px(initial_fonts.body),
+                false,
+                initial_theme,
+                cx,
+            )
+            .submit_on_enter()
+        });
 
         let active_live = connection.is_some();
         let mut view = Self {
@@ -2989,6 +3004,7 @@ impl PilusView {
             ports_panel: PortsPanel::new(),
             browser_panel: BrowserPanel::new(),
             browser_input,
+            browser_note_input,
             right,
             mission: MissionPanel::default(),
             mission_answer,
@@ -7074,6 +7090,9 @@ impl PilusView {
                 Some(self.diff_inputs.search_focus_handle(cx))
             }
             InputLayer::Diff => None,
+            InputLayer::Browser if self.browser_note_focused() => {
+                Some(self.browser_note_input.focus_handle(cx))
+            }
             InputLayer::Browser => Some(self.browser_input.focus_handle(cx)),
             // The reply field holds focus while it is open; otherwise the
             // window root reads the page's shortcuts.

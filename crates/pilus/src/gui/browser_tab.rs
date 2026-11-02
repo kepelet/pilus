@@ -17,6 +17,10 @@
 //!
 //! The address bar is a [`TextInput`]. It follows the selected page's address
 //! while it is not being edited, and what the user typed becomes the next load.
+//!
+//! Two buttons after it annotate the page (see [`super::browser_notes`]): one
+//! points at an element, the other opens the tray of notes, whose *Send* pastes
+//! them to the clipboard.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -32,6 +36,7 @@ use wry::{NewWindowResponse, PageLoadEvent, WebViewBuilder};
 use super::browser_control::{Access, Ask, Opener, Pending};
 use super::browser_data;
 use super::browser_inspect::{self, INIT_SCRIPT, Inspect};
+use super::browser_notes::{self, NoteEvent, Notes, Pick};
 use super::browser_shield::Shield;
 use super::style::{self, FillExt, RadiusExt};
 use super::toast::ToastKind;
@@ -46,6 +51,8 @@ const MAX_PAGES: usize = 8;
 enum Event {
     /// The page at this address started or finished loading.
     Loaded(String),
+    /// The page finished loading, so a script sent now finds its document.
+    Finished,
     /// The page's title changed.
     Titled(String),
     /// The page asked for a new window; the strip opens it as a tab instead.
@@ -88,6 +95,14 @@ struct Page {
     shield: Shield,
     /// An agent's request for this tab, waiting on the person.
     ask: Option<Pending>,
+    /// The person's notes on the page.
+    notes: Notes,
+    /// The picker is on: the next click in the page chooses an element.
+    picking: bool,
+    /// The element just chosen, waiting for its note.
+    draft: Option<Pick>,
+    /// The tray of notes is open.
+    tray: bool,
 }
 
 impl Page {
@@ -103,6 +118,10 @@ impl Page {
             access: Access::person(),
             shield: Shield::default(),
             ask: None,
+            notes: Notes::default(),
+            picking: false,
+            draft: None,
+            tray: false,
         }
     }
 
@@ -142,6 +161,10 @@ impl Page {
         self.shield.remove();
         // Dropping the request tells the agent that asked.
         self.ask = None;
+        self.notes = Notes::default();
+        self.picking = false;
+        self.draft = None;
+        self.tray = false;
         self.view = None;
         self.pending = None;
         self.url.clear();
@@ -480,7 +503,14 @@ impl PilusView {
 
     /// Whether the address bar holds the keyboard.
     pub(super) fn browser_focused(&self) -> bool {
-        self.browser_visible() && self.right.focused && self.browser_panel.editing
+        self.browser_visible()
+            && self.right.focused
+            && (self.browser_panel.editing || self.browser_panel.page().draft.is_some())
+    }
+
+    /// Whether the note field, not the address bar, holds the keyboard.
+    pub(super) fn browser_note_focused(&self) -> bool {
+        self.browser_focused() && !self.browser_panel.editing
     }
 
     /// Whether the page may be drawn: the tab is open and still, and no
@@ -582,6 +612,14 @@ impl PilusView {
     }
 
     pub(super) fn browser_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if self.browser_note_focused() {
+            match event.keystroke.key.as_str() {
+                "escape" => self.browser_note_cancel(cx),
+                "enter" => self.browser_note_save(cx),
+                _ => {}
+            }
+            return;
+        }
         match event.keystroke.key.as_str() {
             "escape" => self.browser_end_edit(cx),
             "enter" => self.browser_submit(cx),
@@ -664,6 +702,206 @@ impl PilusView {
         }
     }
 
+    // ---- notes on the page -------------------------------------------------
+    //
+    // The picker runs in the page; the note is typed in the window's own field
+    // (see `browser_notes`).
+
+    /// Put the picker, and a badge on each note made on this address, into
+    /// page `ix`. A page that has just loaded has lost both.
+    fn browser_notes_sync(&self, ix: usize, cx: &gpui::App) {
+        let Some(page) = self.browser_panel.pages.get(ix) else {
+            return;
+        };
+        let Some(view) = &page.view else {
+            return;
+        };
+        if !page.picking && page.notes.is_empty() {
+            return;
+        }
+        let webview = view.read(cx).raw();
+        let _ = webview.evaluate_script(browser_notes::SCRIPT);
+        let _ = webview.evaluate_script(&page.notes.marks_script(&page.url));
+        if page.picking {
+            let _ = webview.evaluate_script("window.__pilusNotes&&window.__pilusNotes.start()");
+        }
+    }
+
+    /// Switch the picker off in page `ix`.
+    fn browser_pick_stop(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(page) = self.browser_panel.pages.get_mut(ix) else {
+            return;
+        };
+        page.picking = false;
+        if let Some(view) = &page.view {
+            let _ = view
+                .read(cx)
+                .raw()
+                .evaluate_script("window.__pilusNotes&&window.__pilusNotes.stop()");
+        }
+        cx.notify();
+    }
+
+    /// The square beside the address bar: start picking an element, or stop.
+    fn browser_toggle_pick(&mut self, cx: &mut Context<Self>) {
+        let ix = self.browser_panel.active;
+        let page = self.browser_panel.page();
+        if page.picking || page.draft.is_some() {
+            self.browser_pick_stop(ix, cx);
+            self.browser_note_cancel(cx);
+            return;
+        }
+        if page.view.is_none() {
+            self.toast(ToastKind::Info, "Open a page to annotate first");
+            cx.notify();
+            return;
+        }
+        if page.access.held() {
+            self.toast(ToastKind::Info, "An agent is working in this tab");
+            cx.notify();
+            return;
+        }
+        self.browser_panel.page_mut().picking = true;
+        self.browser_notes_sync(ix, cx);
+        cx.notify();
+    }
+
+    /// The bubble beside the square: show or hide the tray of notes.
+    fn browser_toggle_tray(&mut self, cx: &mut Context<Self>) {
+        let page = self.browser_panel.page_mut();
+        page.tray = !page.tray;
+        cx.notify();
+    }
+
+    /// The picker reported something in page `ix`.
+    fn browser_note_event(&mut self, ix: usize, event: NoteEvent, cx: &mut Context<Self>) {
+        let active = ix == self.browser_panel.active;
+        let Some(page) = self.browser_panel.pages.get_mut(ix) else {
+            return;
+        };
+        // Only the picker we switched on may choose; a page that sends a pick
+        // by itself is ignored.
+        if !page.picking {
+            return;
+        }
+        page.picking = false;
+        let NoteEvent::Picked(pick) = event else {
+            return;
+        };
+        page.draft = Some(pick);
+        page.tray = true;
+        if active {
+            self.browser_note_input.update(cx, |input, cx| input.clear(cx));
+            self.browser_focus_note(cx);
+        }
+    }
+
+    /// Give the note field the keyboard.
+    pub(super) fn browser_focus_note(&mut self, cx: &mut Context<Self>) {
+        if self.browser_panel.page().draft.is_none() {
+            return;
+        }
+        self.browser_panel.editing = false;
+        self.right.focused = true;
+        if let Some(view) = &self.browser_panel.page().view {
+            // As for the address bar: the page owns the first responder after a
+            // click in it.
+            let _ = view.read(cx).raw().focus_parent();
+        }
+        cx.notify();
+    }
+
+    /// Save what the note field holds as a note on the chosen element.
+    fn browser_note_save(&mut self, cx: &mut Context<Self>) {
+        let typed = self.browser_note_input.read(cx).value();
+        let ix = self.browser_panel.active;
+        let page = self.browser_panel.page_mut();
+        let Some(pick) = page.draft.take() else {
+            return;
+        };
+        if typed.trim().is_empty() {
+            // Nothing to say yet: keep waiting for it.
+            page.draft = Some(pick);
+            return;
+        }
+        let url = pick.url.clone();
+        if !page.notes.add(pick, &typed) {
+            self.toast(
+                ToastKind::Info,
+                format!(
+                    "A tab keeps at most {} notes. Send or clear some first.",
+                    browser_notes::MAX_NOTES
+                ),
+            );
+        } else if let Some(view) = &self.browser_panel.pages[ix].view {
+            let webview = view.read(cx).raw();
+            let _ = webview.evaluate_script(browser_notes::SCRIPT);
+            let _ = webview
+                .evaluate_script(&self.browser_panel.pages[ix].notes.marks_script(&url));
+        }
+        self.browser_note_input.update(cx, |input, cx| input.clear(cx));
+        self.browser_panel.editing = false;
+        self.right.focused = false;
+        cx.notify();
+    }
+
+    /// Drop the element that was chosen without a note.
+    fn browser_note_cancel(&mut self, cx: &mut Context<Self>) {
+        self.browser_panel.page_mut().draft = None;
+        self.browser_note_input.update(cx, |input, cx| input.clear(cx));
+        if !self.browser_panel.editing {
+            self.right.focused = false;
+        }
+        cx.notify();
+    }
+
+    /// Take note `n` off the page.
+    fn browser_note_remove(&mut self, n: u32, cx: &mut Context<Self>) {
+        let ix = self.browser_panel.active;
+        self.browser_panel.page_mut().notes.remove(n);
+        self.browser_notes_sync_marks(ix, cx);
+        cx.notify();
+    }
+
+    /// Redraw page `ix`'s badges after its notes changed.
+    fn browser_notes_sync_marks(&self, ix: usize, cx: &gpui::App) {
+        let page = &self.browser_panel.pages[ix];
+        if let Some(view) = &page.view {
+            let _ = view
+                .read(cx)
+                .raw()
+                .evaluate_script(&page.notes.marks_script(&page.url));
+        }
+    }
+
+    /// Forget every note on the selected tab.
+    fn browser_notes_clear(&mut self, cx: &mut Context<Self>) {
+        let ix = self.browser_panel.active;
+        self.browser_panel.page_mut().notes.clear();
+        self.browser_notes_sync_marks(ix, cx);
+        cx.notify();
+    }
+
+    /// Copy the selected tab's notes to the clipboard, for the person to paste
+    /// where they choose. The notes stay, so a copy loses nothing; Clear is
+    /// the way to drop them.
+    fn browser_notes_copy(&mut self, cx: &mut Context<Self>) {
+        let page = self.browser_panel.page();
+        if page.notes.is_empty() {
+            return;
+        }
+        let count = page.notes.len();
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(page.notes.message()));
+        self.toast(
+            ToastKind::Info,
+            match count {
+                1 => "Copied 1 note".to_string(),
+                many => format!("Copied {many} notes"),
+            },
+        );
+        cx.notify();
+    }
+
     fn browser_reload(&self, cx: &Context<Self>) {
         if let Some(view) = &self.browser_panel.page().view {
             let _ = view.read(cx).raw().reload();
@@ -691,7 +929,7 @@ impl PilusView {
         }
         // A click in the page moves the OS first responder without GPUI
         // hearing of it, so the address bar learns it lost the keyboard here.
-        if self.browser_panel.editing && self.browser_page_focused(cx) {
+        if self.browser_focused() && self.browser_page_focused(cx) {
             self.browser_end_edit(cx);
             changed = true;
         }
@@ -699,7 +937,14 @@ impl PilusView {
         let mut address_changed = false;
         // New windows the pages asked for, with the tab that asked.
         let mut opened = Vec::new();
+        // Pages that finished loading, which the picker and the badges need to
+        // be put back into, and what the picker reported.
+        let mut finished = Vec::new();
+        let mut picked = Vec::new();
         for (ix, page) in self.browser_panel.pages.iter_mut().enumerate() {
+            for event in page.inspect.take_note_events() {
+                picked.push((ix, event));
+            }
             let events = match page.events.lock() {
                 Ok(mut queue) => std::mem::take(&mut *queue),
                 Err(_) => continue,
@@ -713,12 +958,28 @@ impl PilusView {
                         }
                         page.url = url;
                     }
+                    Event::Finished => finished.push(ix),
                     Event::Titled(title) => {
                         changed |= title != page.title;
                         page.title = title;
                     }
                     Event::Opened(url) => opened.push((ix, url)),
                 }
+            }
+        }
+        for ix in finished {
+            self.browser_notes_sync(ix, cx);
+        }
+        for (ix, event) in picked {
+            changed = true;
+            self.browser_note_event(ix, event, cx);
+        }
+        // An agent that takes a tab ends the person's picking in it: the cover
+        // would swallow the click anyway.
+        for ix in 0..self.browser_panel.pages.len() {
+            if self.browser_panel.pages[ix].access.held() && self.browser_panel.pages[ix].picking {
+                self.browser_pick_stop(ix, cx);
+                changed = true;
             }
         }
         for (from, url) in opened {
@@ -794,17 +1055,30 @@ impl PilusView {
         let opened = loaded.clone();
         let inspect = self.browser_panel.page().inspect.clone();
         let (on_load, on_title, on_message) = (inspect.clone(), inspect.clone(), inspect);
-        let built = WebViewBuilder::new()
-            .with_url(url)
-            // Inert except on a loopback page (see `browser_inspect`).
-            .with_initialization_script(INIT_SCRIPT)
+        let access = self.browser_panel.page().access;
+        let mut builder = WebViewBuilder::new().with_url(url);
+        // The agent's script goes only into a tab an agent may use. A tab the
+        // person keeps runs none of it; lending one injects it then.
+        if access.agent_usable() {
+            builder = builder.with_initialization_script(INIT_SCRIPT);
+        }
+        // A tab an agent opened keeps no one's sign-ins and leaves none behind:
+        // it can load any address and be driven, and must not be a way into the
+        // person's accounts. A tab the person lends keeps its own, since they
+        // said yes to that tab.
+        let built = builder
+            .with_incognito(access.opener() == Opener::Agent)
             .with_ipc_handler(move |request| on_message.on_message(request.body()))
             .with_on_page_load_handler(move |event: PageLoadEvent, url| {
                 match event {
                     PageLoadEvent::Started => on_load.load_started(),
                     PageLoadEvent::Finished => on_load.load_finished(&url),
                 }
+                let done = matches!(event, PageLoadEvent::Finished);
                 push(&loaded, Event::Loaded(url));
+                if done {
+                    push(&loaded, Event::Finished);
+                }
             })
             .with_document_title_changed_handler(move |title| {
                 on_title.set_title(&title);
@@ -932,6 +1206,11 @@ impl PilusView {
         };
         let reply = if allow {
             page.access.allow();
+            // The page was built without the agent's script; give it one now.
+            // It sees only what happens from here on.
+            if let Some(view) = &page.view {
+                let _ = view.read(cx).raw().evaluate_script(INIT_SCRIPT);
+            }
             Reply::data(json!({ "granted": true, "tab": ix + 1 }))
         } else {
             Reply::err(page.access.deny(Instant::now()))
@@ -1065,7 +1344,7 @@ impl PilusView {
             "url": url,
             "title": title,
             "state": state,
-            "inspectable": browser_inspect::is_loopback(&url),
+            "inspectable": page.view.is_some() && page.access.agent_usable(),
             "opened_by": page.access.opener().label(),
             "held": page.access.held(),
             "lent": page.access.lent(),
@@ -1198,13 +1477,6 @@ impl PilusView {
                 None
             }
             _ => {
-                if !browser_inspect::is_loopback(&page.url) {
-                    return Some(Reply::err(format!(
-                        "pilus ctl only looks at or drives localhost pages, and tab {} is on {:?}",
-                        ix + 1,
-                        page.url
-                    )));
-                }
                 let script_id = page.inspect.begin_call(replier.clone());
                 let Some(script) = browser_inspect::call_script(script_id, op) else {
                     page.inspect
@@ -1245,7 +1517,8 @@ impl PilusView {
             .min_h(px(0.0))
             .children(banner)
             .child(self.browser_tab_strip(cx))
-            .child(self.browser_header(cx));
+            .child(self.browser_header(cx))
+            .children(self.browser_notes_tray(cx));
         match self.browser_panel.page().view.clone() {
             // While the column moves the webview is hidden, so the body is
             // left empty rather than showing a stale frame.
@@ -1507,6 +1780,14 @@ impl PilusView {
         let height = style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL);
         // The buttons act on the page, so they wait while an agent holds it.
         let loaded = self.browser_panel.has_page() && !self.browser_panel.page().access.held();
+        let (picking, tray, notes) = {
+            let page = self.browser_panel.page();
+            (
+                page.picking || page.draft.is_some(),
+                page.tray,
+                page.notes.len(),
+            )
+        };
         self.browser_input.update(cx, |input, _| {
             input.set_style(
                 theme,
@@ -1592,6 +1873,233 @@ impl PilusView {
                 .on_click(cx.listener(|this, _, _, cx| this.browser_reload(cx))),
             )
             .child(field)
+            .child(
+                self.diff_icon_button(
+                    "pilus-browser-pick",
+                    include_bytes!("../../assets/icons/square-mouse-pointer.svg"),
+                    if picking {
+                        "Stop picking (Esc)".to_string()
+                    } else {
+                        "Point at an element to leave a note".to_string()
+                    },
+                    picking,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.browser_toggle_pick(cx))),
+            )
+            .child(
+                self.diff_icon_button(
+                    "pilus-browser-notes",
+                    include_bytes!("../../assets/icons/message-square.svg"),
+                    "Notes for the agent".to_string(),
+                    tray || notes > 0,
+                    false,
+                )
+                .when(notes > 0, |button| {
+                    button.child(
+                        div()
+                            .text_size(px(fonts.label))
+                            .text_color(theme.accent)
+                            .child(notes.to_string()),
+                    )
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.browser_toggle_tray(cx))),
+            )
+    }
+
+    /// What the person has pointed at, under the address bar: the hint while
+    /// picking, the field for the note on the chosen element, and the notes
+    /// with the way to send them. It is drawn by us, so the page can neither
+    /// read a note being written nor imitate the field.
+    fn browser_notes_tray(&mut self, cx: &mut Context<Self>) -> Option<Div> {
+        let theme = self.theme;
+        let fonts = style::Fonts::resolve(&self.shared_settings);
+        let height = style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL);
+        let page = self.browser_panel.page();
+        if !(page.tray || page.picking || page.draft.is_some()) {
+            return None;
+        }
+        let picking = page.picking;
+        let draft = page.draft.as_ref().map(|pick| pick.label.clone());
+        let notes: Vec<(u32, String, String)> = page
+            .notes
+            .items()
+            .iter()
+            .map(|note| (note.n, note.pick.label.clone(), note.text.clone()))
+            .collect();
+        let muted = |text: String| {
+            div()
+                .truncate()
+                .text_size(px(fonts.label))
+                .text_color(theme.muted)
+                .child(text)
+        };
+        let mut tray = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .flex_shrink_0()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border);
+
+        if picking {
+            tray = tray.child(muted(
+                "Click an element on the page. \u{2191} picks its container, Esc stops."
+                    .to_string(),
+            ));
+        }
+        if let Some(label) = draft {
+            self.browser_note_input.update(cx, |input, _| {
+                input.set_style(
+                    theme,
+                    style::chrome_font(&self.shared_settings),
+                    px(fonts.body),
+                );
+            });
+            let field = style::bare_field(
+                "pilus-browser-note-field",
+                self.browser_note_focused(),
+                theme,
+                height,
+                self.browser_note_input.clone(),
+            )
+            .flex_1()
+            .min_w(px(0.0))
+            .text_size(px(fonts.body))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.browser_focus_note(cx)),
+            );
+            tray = tray
+                .child(muted(format!("Note on {label}")))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(field)
+                        .child(
+                            style::small_button(
+                                "pilus-browser-note-cancel",
+                                "Cancel",
+                                style::ButtonKind::Ghost,
+                                theme,
+                                fonts.secondary,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.browser_note_cancel(cx))),
+                        )
+                        .child(
+                            style::small_button(
+                                "pilus-browser-note-add",
+                                "Add",
+                                style::ButtonKind::Primary,
+                                theme,
+                                fonts.secondary,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.browser_note_save(cx))),
+                        ),
+                );
+        }
+        if notes.is_empty() {
+            if !picking && self.browser_panel.page().draft.is_none() {
+                tray = tray.child(muted("No notes yet".to_string()));
+            }
+            return Some(tray);
+        }
+        let rows = notes.into_iter().map(|(n, label, text)| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .min_w(px(fonts.body + 4.0))
+                        .text_size(px(fonts.label))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.accent)
+                        .child(format!("{n}")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(fonts.body))
+                                .text_color(theme.fg)
+                                .child(text),
+                        )
+                        .child(muted(label)),
+                )
+                .child(
+                    div()
+                        .id(("pilus-browser-note-remove", n as usize))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .flex_shrink_0()
+                        .size(px(fonts.body + 4.0))
+                        .radius_sm()
+                        .cursor_pointer()
+                        .hover_fill(theme.panel_dim, style::RADIUS_SM)
+                        .child(icon(
+                            include_bytes!("../../assets/icons/x.svg"),
+                            fonts.label,
+                            theme.muted,
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.browser_note_remove(n, cx);
+                        })),
+                )
+        });
+        tray = tray.child(
+            div()
+                .id("pilus-browser-note-list")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .max_h(px(180.0))
+                .overflow_y_scroll()
+                .children(rows),
+        );
+        Some(
+            tray.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        style::small_button(
+                            "pilus-browser-notes-clear",
+                            "Clear",
+                            style::ButtonKind::Ghost,
+                            theme,
+                            fonts.secondary,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.browser_notes_clear(cx))),
+                    )
+                    .child(
+                        style::small_button(
+                            "pilus-browser-notes-copy",
+                            "Copy notes",
+                            style::ButtonKind::Primary,
+                            theme,
+                            fonts.secondary,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.browser_notes_copy(cx))),
+                    ),
+            ),
+        )
     }
 
     /// The globe, lit while the Browser is open.

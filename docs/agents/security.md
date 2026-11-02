@@ -76,13 +76,16 @@ more than the address bar offers, and anything running as the owner (an agent
 in a pane, say) can ask. The Browser keeps the owner's sign-ins, so a script in
 a page there runs as them. So:
 
-- Page verbs reach **loopback pages only**: http or https on `localhost`,
-  `*.localhost`, `127.0.0.1` or `::1`. The script that serves them is injected
-  into every page, but on any other page it does nothing and defines nothing, so
-  there is nothing to call. `browser_inspect::is_loopback` and the script test
-  the same thing; the script's test is the one that counts, since a page can
-  navigate between the check and the call. A LAN address is not loopback:
-  forward its port (`ports forward`) and open `localhost`.
+- Page verbs reach **any address, in a tab an agent may use**, and in no other.
+  The script that serves them is injected only into such a tab, so a tab the
+  person keeps has nothing to call. This used to be limited to loopback pages;
+  the owner lifted that so an agent can drive a staging site or a LAN address.
+  What replaces it is that **a tab an agent opened is incognito**
+  (`with_incognito`, set when its webview is built from `Access::opener`): no
+  cookies, storage or sign-ins of the person's reach it, and none outlive it.
+  So the limit moved from *where* the page is to *whose session* it runs in.
+  Do not build an agent's tab on the shared store, and do not give it a
+  persistent store, without the same decision from the owner.
 - `back`, `forward` and `reload` are the page's own buttons and work on any
   page, as do `open`, `new`, `close` and `focus`. `open` still takes http and
   https only.
@@ -108,10 +111,12 @@ a page there runs as them. So:
   away from that tab for 15 s.
 - What this gives up, on purpose: an agent no longer needs a yes to open a
   page, so it can load any http or https address in a tab the person can see,
-  and, on a loopback page it opened, run script as the person's browser
-  profile (cookies are per host, not per port, so `localhost:3000`'s sign-in is
-  visible to a page on `localhost:8787`). It cannot reach a non-loopback page's
-  contents, or any tab the person opened.
+  read it and drive it, signed out. It can send requests from the person's
+  machine and network to anything they can reach (a LAN admin page, say), and
+  what it types into a page it opened is sent there. It cannot reach any tab the
+  person opened, or their sign-ins, unless they lend that tab. A lent tab runs
+  as them: that is what the yes is for. A page it opens by `window.open` from a
+  lent tab is the agent's, so incognito.
 - Page text is untrusted data. An agent that reads it is reading whatever the
   page says, prompts included. The window parses what a page posts field by
   field, caps it and stores it; it never acts on it beyond answering the call
@@ -120,9 +125,21 @@ a page there runs as them. So:
   address it listens on, as the Forward button does. A script cannot name a
   host or a port the Ports tab would not list.
 - Do not add a page verb that returns cookies or storage by name, a verb that
-  reaches a non-loopback page, or a setting that turns the loopback rule off
-  without a decision from the owner. `eval` on a local page can read that
-  page's own cookies, as the page can.
+  reaches a tab an agent may not use, or a setting that gives an agent's tab
+  the person's profile without a decision from the owner. `eval` can read the
+  cookies of the page it runs in, as the page can; in an agent's tab those are
+  the agent's own.
+- **The person's notes** (the Browser's annotate buttons, `browser_notes`) are
+  the person's act, so they work on any tab, including ones an agent may not
+  use. Nothing about them is readable over the control socket: there is no verb
+  that returns a note or the element behind it, because the element's text is a
+  tab the agent has no right to. *Copy notes* is the person's click, and puts the
+  text on the clipboard. Everything the page supplied in a note
+  (element name, text, markup, selector) is stripped of control characters
+  before it is stored, since it is pasted into a terminal and an escape sequence, or
+  the end of a bracketed paste, must not ride along. The note is typed in a
+  field pilus draws, never in the page. The window ignores a pick the page
+  sends when the picker is not on.
 
 ### The tunnel to a host
 
@@ -136,7 +153,7 @@ owner's account on that host. So:
   Browser still waits for Allow. Never enable it from a `pilus ctl` verb, a setting a
   script can write, or a default: an agent that could switch it on could
   open its own way in.
-- Everything above still holds across the tunnel, the loopback rule for page
+- Everything above still holds across the tunnel, the per-tab rules for page
   verbs included. A host gets no more than a pane on this Mac gets.
 - The socket lives in `~/.pilus` on the host, made `0700` before the socket
   exists, under the name `pilus-remote.sock`, so it never replaces a window of

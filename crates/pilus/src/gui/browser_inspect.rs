@@ -2,9 +2,10 @@
 //! that lets it look and act.
 //!
 //! Each page tab owns an [`Inspect`], shared with the handlers of its webview.
-//! `browser_inspect.js` runs in every page at document start. On a loopback
-//! page it streams console output and requests over `window.ipc` into the
-//! rings here, and answers the calls the window sends it. So a read of the
+//! `browser_inspect.js` runs at document start in every tab an agent may use
+//! (one it opened, or one the person lent it). It streams console output and
+//! requests over `window.ipc` into the rings here, and answers the calls the
+//! window sends it. So a read of the
 //! console or the request log never touches the page, survives a navigation,
 //! and costs nothing while nobody asks. A call that needs the page (a click, a
 //! snapshot, a script) is `evaluate_script` plus an id: the page answers over
@@ -14,8 +15,11 @@
 //!
 //! Page code is not trusted. Whatever arrives is parsed field by field, capped
 //! and stored as data; it never decides what the window does beyond answering
-//! the call that is waiting for it. Only loopback pages get the script at all
+//! the call that is waiting for it. A tab the person keeps gets no script
 //! (see [security](../../../docs/agents/security.md#the-control-socket)).
+//!
+//! The same `window.ipc` carries the annotate picker's messages
+//! (`browser_notes`), which this queues for the window to take.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,9 +27,10 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde_json::{Value, json};
 
+use super::browser_notes::{NoteEvent, Pick};
 use crate::ctl::{PageOp, Replier, Reply};
 
-/// Injected into every page; inert unless the page is on a loopback host.
+/// Injected into a tab only while an agent may use it.
 pub(super) const INIT_SCRIPT: &str = include_str!("browser_inspect.js");
 
 /// Entries kept per ring. The oldest go first.
@@ -38,29 +43,6 @@ const MAX_MESSAGE: usize = 1024 * 1024;
 /// the table without bound; the oldest call is dropped, which tells its
 /// client.
 const MAX_CALLS: usize = 32;
-
-/// Whether `url` is a page `pilus ctl` may look at or drive: http or https on
-/// `localhost`, `*.localhost`, `127.0.0.1` or `::1`. Anything else is a site
-/// the person may be signed in to, and a script in it would be theirs.
-/// `browser_inspect.js` applies the same test in the page, which is the one
-/// that counts; this one gives a clear error without asking the page.
-pub(super) fn is_loopback(url: &str) -> bool {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return false;
-    };
-    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
-        return false;
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    // Whatever precedes the last `@` is credentials, not the host.
-    let host_port = authority.rsplit('@').next().unwrap_or_default();
-    let host = match host_port.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or_default(),
-        None => host_port.split(':').next().unwrap_or_default(),
-    }
-    .to_ascii_lowercase();
-    host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
-}
 
 /// Which of the two rings a read is about.
 #[derive(Clone, Copy)]
@@ -89,6 +71,8 @@ struct State {
     loads: Vec<(Replier, Option<usize>)>,
     loading: bool,
     title: String,
+    /// What the annotate picker reported since the window last looked.
+    notes: Vec<NoteEvent>,
 }
 
 impl Inspect {
@@ -106,6 +90,11 @@ impl Inspect {
     /// The title the page last reported.
     pub(super) fn title(&self) -> String {
         self.state().title.clone()
+    }
+
+    /// What the annotate picker reported, oldest first.
+    pub(super) fn take_note_events(&self) -> Vec<NoteEvent> {
+        std::mem::take(&mut self.state().notes)
     }
 
     pub(super) fn set_title(&self, title: &str) {
@@ -214,6 +203,22 @@ impl Inspect {
         match message.get("t").and_then(Value::as_str) {
             Some("r") => self.answer_call(&message),
             Some("user") => self.user_input.store(true, Ordering::Relaxed),
+            Some("pick") => {
+                if let Some(pick) = Pick::parse(&message) {
+                    let mut state = self.state();
+                    // A person picks one element at a time; a page that floods
+                    // the queue does not grow it.
+                    if state.notes.len() < 8 {
+                        state.notes.push(NoteEvent::Picked(pick));
+                    }
+                }
+            }
+            Some("pick_end") => {
+                let mut state = self.state();
+                if state.notes.len() < 8 {
+                    state.notes.push(NoteEvent::Ended);
+                }
+            }
             Some("log") => {
                 let level = message
                     .get("level")
@@ -404,39 +409,6 @@ pub(super) fn call_script(id: u64, op: &PageOp) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn only_loopback_pages_qualify() {
-        for yes in [
-            "http://localhost:8787/",
-            "https://localhost",
-            "http://127.0.0.1:3000/a?b=c",
-            "http://[::1]:5173/",
-            "http://app.localhost:3000/x",
-            "HTTP://LOCALHOST/",
-            "http://user:pw@localhost:1/",
-        ] {
-            assert!(is_loopback(yes), "{yes}");
-        }
-        for no in [
-            "",
-            "localhost:3000",
-            "file:///etc/hosts",
-            "about:blank",
-            "data:text/html,hi",
-            "http://example.com/",
-            "http://localhost.example.com/",
-            "http://localhost@example.com/",
-            "http://example.com/?u=http://localhost/",
-            "http://example.com#@localhost",
-            "http://127.0.0.2/",
-            "http://192.168.1.5:3000/",
-            "http://evil.localhost.com/",
-            "ftp://localhost/",
-        ] {
-            assert!(!is_loopback(no), "{no}");
-        }
-    }
-
     fn pair() -> (Replier, std::sync::mpsc::Receiver<Reply>) {
         Replier::pair()
     }
@@ -469,6 +441,23 @@ mod tests {
         let reply = answer.try_recv().expect("answered");
         assert!(!reply.ok);
         assert_eq!(reply.error.as_deref(), Some("nothing matches #x"));
+    }
+
+    #[test]
+    fn the_pickers_messages_queue_for_the_window() {
+        let inspect = Inspect::default();
+        inspect.on_message(r##"{"t":"pick","selector":"#go","label":"button#go"}"##);
+        inspect.on_message(r#"{"t":"pick","selector":""}"#);
+        inspect.on_message(r#"{"t":"pick_end"}"#);
+        let events = inspect.take_note_events();
+        assert_eq!(events.len(), 2, "a pick with nothing to name it is dropped");
+        assert!(matches!(&events[0], NoteEvent::Picked(pick) if pick.selector == "#go"));
+        assert_eq!(events[1], NoteEvent::Ended);
+        assert!(inspect.take_note_events().is_empty(), "taken");
+        for _ in 0..50 {
+            inspect.on_message(r#"{"t":"pick_end"}"#);
+        }
+        assert_eq!(inspect.take_note_events().len(), 8, "a flood is capped");
     }
 
     #[test]

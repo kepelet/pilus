@@ -588,7 +588,7 @@ pub const USAGE: &str = "USAGE:\n\
     \x20   pilus ctl browser request N [WHY]         # ask to use a tab the person opened;\n\
     \x20                                              # waits for their yes (allowed, denied)\n\
     \x20   pilus ctl browser release [N]             # unlock your tabs when done\n\n\
-    PAGE COMMANDS (your tabs; localhost pages only; --tab N picks one, else the selected):\n\
+    PAGE COMMANDS (your tabs, any address; --tab N picks one, else the selected):\n\
     \x20   pilus ctl browser snapshot        # the page as text, controls numbered @1, @2, ...\n\
     \x20   pilus ctl browser html [SELECTOR]\n\
     \x20   pilus ctl browser text [SELECTOR]\n\

@@ -172,8 +172,9 @@ document, and closing a tab fails everything waiting on it.
 
 Each page tab owns an `Inspect` (`gui/browser_inspect.rs`), shared with its
 webview's handlers. `browser_inspect.js` is injected into every page at document
-start. **On a loopback page** (`localhost`, `*.localhost`, `127.0.0.1`, `::1`,
-http or https) it:
+start **of every tab an agent may use**: one it opened, with any http or https
+address, or one the person lent it (injected at the moment they allow it, so it
+sees only what happens from then on). It:
 
 - streams console output, uncaught errors and requests (fetch, XHR, and the
   document and subresources from `PerformanceObserver`) over `window.ipc` into
@@ -183,9 +184,14 @@ http or https) it:
 - defines `window.__pilus`, which the window calls through `evaluate_script`
   with an id. The page answers over IPC.
 
-On any other page it does nothing at all: no hooks, no `__pilus`, no IPC. A
-site you are signed in to costs nothing and cannot be driven. `is_loopback` and
-the script apply the same test; the script's is the one that counts.
+A tab the person opened and keeps gets no script: no hooks, no `__pilus`, so a
+site they read costs nothing and cannot be driven. `inspectable` in `tabs` says
+whether a tab has it.
+
+A tab an agent opened is also **incognito** (`with_incognito`): its cookies and
+storage are its own and are dropped with it, so an agent that opens a site sees
+it signed out, and cannot reach the person's sign-ins by loading one. To work on
+a page as the person, ask for their tab with `browser request`.
 
 Two things an agent trips on, both seen on a live window:
 
@@ -213,6 +219,34 @@ Notes for changing it:
 - `snapshot` numbers controls as `@N` and keeps the elements, not a selector, so
   a page that re-renders leaves a stale handle that says so.
 
+## Notes from the person
+
+The other direction: the person points at something on a page and tells the
+agent. Two buttons follow the address bar. The pointer square turns the picker
+on; the bubble (with a count) opens the tray. Code: `gui/browser_notes.rs` and
+`browser_notes.js`, with the buttons and tray in `gui/browser_tab.rs`.
+
+1. The picker is injected on demand, not at document start, so a page the
+   person only reads runs none of it. It outlines what is under the pointer,
+   swallows the click so the page does not act on it, and posts the element's
+   selector, name, text and start of its markup. ↑ picks the container, ↓ goes
+   back, Esc stops. It works on any tab, one an agent may not use included.
+2. The note is typed in a field pilus draws under the address bar, not in the
+   page. Enter or Add saves it and the element gets a numbered dashed badge,
+   redrawn on scroll and resize, and again after each load.
+3. **Copy notes** puts all of the tab's notes on the clipboard, with no
+   trailing newline, and keeps them (Clear drops them). The person pastes them
+   into whichever agent they mean. They are Markdown-ish text: the page, then
+   per note its number, the element, the person's words and a `selector:` the
+   agent can pass to `browser click`. The message says which words are the
+   page's. Pasting straight into the focused pane was tried first; it was
+   dropped because the focused pane is not always the agent the person means.
+   Choosing an agent from the AGENTS list would bring it back.
+
+There is deliberately no verb to read notes; see
+[security](security.md#the-control-socket). Notes live with the tab and go with
+it when it closes.
+
 ## Adding a verb
 
 1. Add a variant to `ctl::Request` (a page verb is a `ctl::PageOp`) and a case
@@ -238,7 +272,8 @@ Notes for changing it:
 - Security: see [the control socket](security.md#the-control-socket). A verb
   gets only what a person at the keyboard could do from that surface, a verb
   that takes a URL must not take more schemes than the surface does, and page
-  verbs reach loopback pages only.
+  verbs drive only tabs an agent opened, or was lent, and an agent's tab never
+  carries the person's sign-ins.
 - A tunnel supervisor blocks while its `ssh` runs and sleeps on a condition
   variable between attempts, so an allowed machine costs one parked thread and
   an unallowed one costs nothing. Do not add a poll to watch it.

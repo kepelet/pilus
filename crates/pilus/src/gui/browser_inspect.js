@@ -1,26 +1,18 @@
-// Injected into every Browser page at document start (browser_inspect.rs).
+// Injected into a Browser page only when an agent may use that tab (it opened
+// the tab, or the person lent it): see browser_tab.rs. A tab the person opened
+// and keeps gets no hooks and no `__pilus`, so an ordinary site pays no cost
+// for the capture below and `pilus ctl browser ...` has nothing to call.
 //
-// It does nothing unless the page is on a loopback host: a page anywhere else
-// gets no hooks and no `__pilus`, so `pilus ctl browser ...` can neither read
-// nor drive it, and an ordinary site pays no cost for the capture below.
-//
-// On a local page it (1) streams console output and requests to the window
-// over `window.ipc`, and (2) defines `__pilus`, which the window calls to look
-// at or act on the page. Every answer goes back the same way, tagged with the
-// id of the call that asked.
+// It (1) streams console output and requests to the window over `window.ipc`,
+// and (2) defines `__pilus`, which the window calls to look at or act on the
+// page. Every answer goes back the same way, tagged with the id of the call
+// that asked. The script is idempotent: lending a tab injects it into a page
+// that is already open, and a second copy does nothing.
 //
 // Everything here is page-visible and the page is not trusted: the window
 // treats whatever arrives as untrusted data.
 (() => {
-  const host = location.hostname;
-  const local =
-    (location.protocol === 'http:' || location.protocol === 'https:') &&
-    (host === 'localhost' ||
-      host === '127.0.0.1' ||
-      host === '[::1]' ||
-      host === '::1' ||
-      host.endsWith('.localhost'));
-  if (!local || window.__pilus || !window.ipc) return;
+  if (window.__pilus || !window.ipc) return;
 
   const post = window.ipc.postMessage.bind(window.ipc);
   const clip = (value, max) => {

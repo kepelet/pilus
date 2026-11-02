@@ -14886,8 +14886,8 @@ impl PilusView {
         }
         let mut children = div().flex().flex_col().gap_1();
         let mut any = false;
-        // Compact pane style also flattens this list: no fold chevron, no
-        // rail, no elbows, so every row sits at one level.
+        // Compact pane style also flattens this list: no rail, no elbows, so
+        // every row sits at one level. The machines still fold.
         let flat = self.sidebar_flat();
         for id in self.connected_endpoints() {
             let host = id.machine_id().map(|_| self.endpoint_label(&id));
@@ -14902,8 +14902,8 @@ impl PilusView {
             let home = workspaces
                 .iter()
                 .position(|workspace| self.is_home_workspace(&id, workspace));
-            let foldable = !flat && workspaces.len() > usize::from(home.is_some());
-            let folded = !flat && self.machine_folded(&id);
+            let foldable = workspaces.len() > usize::from(home.is_some());
+            let folded = self.machine_folded(&id);
             children = match home {
                 Some(index) => children.child(self.workspace_row(
                     &id,
@@ -14912,7 +14912,7 @@ impl PilusView {
                     0,
                     NestRail {
                         foldable,
-                        parent: foldable && !folded,
+                        parent: !flat && foldable && !folded,
                         more: false,
                     },
                     cx,
@@ -14920,7 +14920,7 @@ impl PilusView {
                 None => children.child(self.machine_row(
                     &id,
                     host.as_deref(),
-                    !folded,
+                    !flat && !folded,
                     cx,
                 )),
             };
@@ -14989,7 +14989,7 @@ impl PilusView {
 
     /// Whether the machine's workspaces are folded under its row.
     fn machine_folded(&self, endpoint: &EndpointId) -> bool {
-        !self.sidebar_flat() && self.machines_collapsed.contains(&endpoint.key())
+        self.machines_collapsed.contains(&endpoint.key())
     }
 
     /// Compact pane style flattens the Workspaces list: machines become small
@@ -15153,7 +15153,7 @@ impl PilusView {
                     .text_color(self.machine_color())
                     .child(title),
             )
-            .children((!self.sidebar_flat()).then(|| self.machine_fold_toggle(endpoint, cx)))
+            .child(self.machine_fold_toggle(endpoint, cx))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {

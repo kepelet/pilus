@@ -19,15 +19,19 @@
 //! while it is not being edited, and what the user typed becomes the next load.
 //!
 //! Two buttons after it annotate the page (see [`super::browser_notes`]): one
-//! points at an element, the other opens the tray of notes, whose *Send* pastes
-//! them to the clipboard.
+//! points at an element, the other is a three-dot menu. Its rows toggle the
+//! tray of notes (whose *Copy* puts them on the clipboard), hold the page to a
+//! [`Viewport`], hand it to the default browser, and copy its address. It is a
+//! native `NSMenu`, because anything GPUI draws would land under the webview.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, Context, Div, Entity, FontWeight, MouseButton, SharedString, Stateful, Window, div,
-    prelude::*, px,
+    AnyElement, Context, Div, Entity, FontWeight, MouseButton, SharedString, Stateful, Window,
+    canvas, div, prelude::*, px,
 };
 use gpui_wry::WebView;
 use serde_json::json;
@@ -38,6 +42,8 @@ use super::browser_data;
 use super::browser_inspect::{self, INIT_SCRIPT, Inspect};
 use super::browser_notes::{self, NoteEvent, Notes, Pick};
 use super::browser_shield::Shield;
+use super::browser_viewport::Viewport;
+use super::sidebar_menu::{Item as MenuItem, MenuTarget};
 use super::style::{self, FillExt, RadiusExt};
 use super::toast::ToastKind;
 use super::{PilusView, icon};
@@ -82,9 +88,12 @@ struct Page {
     url: String,
     /// The page's title, as the webview last reported it.
     title: String,
-    /// The corner radius last pushed to the webview's layer, so an idle
-    /// frame does not re-send it and a radius setting change reaches it.
-    corner: Option<f32>,
+    /// The corner radius last pushed to the webview's layer, and whether all
+    /// four corners took it, so an idle frame does not re-send it and a
+    /// radius setting or viewport change reaches it.
+    corner: Option<(f32, bool)>,
+    /// The shape the page is held to.
+    viewport: Viewport,
     /// What `pilus ctl` has seen of the page, and who waits on it. The
     /// webview's handlers hold the other end.
     inspect: Arc<Inspect>,
@@ -114,6 +123,7 @@ impl Page {
             url: String::new(),
             title: String::new(),
             corner: None,
+            viewport: Viewport::default(),
             inspect: Arc::default(),
             access: Access::person(),
             shield: Shield::default(),
@@ -170,6 +180,7 @@ impl Page {
         self.url.clear();
         self.title.clear();
         self.corner = None;
+        self.viewport = Viewport::default();
         if let Ok(mut queue) = self.events.lock() {
             queue.clear();
         }
@@ -214,6 +225,11 @@ pub(super) struct BrowserPanel {
     active: usize,
     /// The address bar holds the keyboard.
     pub(super) editing: bool,
+    /// The room the column leaves the page (width, height), as the last frame
+    /// painted it. A viewport is fitted into it, so it is read one frame late.
+    room: Rc<Cell<(f32, f32)>>,
+    /// The room the last render fitted the page into, to tell when it moved.
+    fitted: Cell<(f32, f32)>,
 }
 
 impl BrowserPanel {
@@ -222,6 +238,8 @@ impl BrowserPanel {
             pages: vec![Page::new()],
             active: 0,
             editing: false,
+            room: Rc::default(),
+            fitted: Cell::default(),
         }
     }
 
@@ -290,11 +308,31 @@ fn selected_after_close(active: usize, closed: usize, left: usize) -> usize {
     }
 }
 
-/// Round the page's bottom-right corner by clipping its backing layer.
-/// GPUI cannot clip a native view, so the layer does it. AppKit layers are
-/// not flipped, so the bottom edge is the layer's min-y.
+/// The name of the app that opens web addresses, as the Finder shows it
+/// ("Safari", "Google Chrome"), asked of LaunchServices, which answers from
+/// its own database without touching the disk or the network.
 #[cfg(target_os = "macos")]
-fn round_page_corner(webview: &wry::WebView, radius: f32) {
+fn default_browser_name() -> Option<String> {
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::{NSString, NSURL};
+
+    let web = NSURL::URLWithString(&NSString::from_str("https://example.com"))?;
+    let app = NSWorkspace::sharedWorkspace().URLForApplicationToOpenURL(&web)?;
+    let name = app.lastPathComponent()?.to_string();
+    let name = name.strip_suffix(".app").unwrap_or(&name);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_browser_name() -> Option<String> {
+    None
+}
+
+/// Round the page's bottom-right corner, or all four when `all`, by clipping
+/// its backing layer. GPUI cannot clip a native view, so the layer does it.
+/// AppKit layers are not flipped, so the bottom edge is the layer's min-y.
+#[cfg(target_os = "macos")]
+fn round_page_corner(webview: &wry::WebView, radius: f32, all: bool) {
     use objc2::msg_send;
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
@@ -302,6 +340,8 @@ fn round_page_corner(webview: &wry::WebView, radius: f32) {
 
     /// `kCALayerMaxXMinYCorner`.
     const BOTTOM_RIGHT: usize = 1 << 1;
+    /// Every corner: min-x/min-y, max-x/min-y, min-x/max-y, max-x/max-y.
+    const ALL: usize = 0b1111;
 
     let page = webview.webview();
     // SAFETY: `layer` is an NSView/CALayer selector sent to a live view on
@@ -313,14 +353,14 @@ fn round_page_corner(webview: &wry::WebView, radius: f32) {
         let layer: Option<Retained<AnyObject>> = msg_send![&*page, layer];
         if let Some(layer) = layer {
             let _: () = msg_send![&*layer, setCornerRadius: f64::from(radius)];
-            let _: () = msg_send![&*layer, setMaskedCorners: BOTTOM_RIGHT];
+            let _: () = msg_send![&*layer, setMaskedCorners: if all { ALL } else { BOTTOM_RIGHT }];
             let _: () = msg_send![&*layer, setMasksToBounds: true];
         }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn round_page_corner(_: &wry::WebView, _: f32) {}
+fn round_page_corner(_: &wry::WebView, _: f32, _: bool) {}
 
 /// Move a hidden page out of the window, keeping its size.
 ///
@@ -431,10 +471,29 @@ fn send_edit(edit: PageEdit) {
 #[cfg(not(target_os = "macos"))]
 fn send_edit(_: PageEdit) {}
 
+/// Whether `name` is on the person's plain-http list. An entry is a hostname,
+/// or `*.suffix` for every name under the suffix (not the suffix itself).
+/// Case does not matter, and neither does a trailing dot.
+fn http_listed(name: &str, hosts: &[String]) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    hosts.iter().any(|entry| {
+        let entry = entry.trim().trim_end_matches('.').to_ascii_lowercase();
+        match entry.strip_prefix("*.") {
+            Some(suffix) => {
+                !suffix.is_empty()
+                    && name.len() > suffix.len() + 1
+                    && name.ends_with(suffix)
+                    && name[..name.len() - suffix.len()].ends_with('.')
+            }
+            None => !entry.is_empty() && entry == name,
+        }
+    })
+}
+
 /// The address `typed` stands for: a full address as written, a host as
-/// `https` (`http` for this machine, where dev servers rarely speak TLS), and
-/// anything else as a search.
-fn normalize(typed: &str) -> Option<String> {
+/// `https` (`http` for this machine and for `http_hosts`, where dev servers
+/// rarely speak TLS), and anything else as a search.
+fn normalize(typed: &str, http_hosts: &[String]) -> Option<String> {
     let typed = typed.trim();
     if typed.is_empty() {
         return None;
@@ -452,7 +511,8 @@ fn normalize(typed: &str) -> Option<String> {
     });
     let local = name == "localhost"
         || name.parse::<std::net::Ipv4Addr>().is_ok()
-        || name.ends_with(".localhost");
+        || name.ends_with(".localhost")
+        || http_listed(name, http_hosts);
     let looks_like_host = !typed.contains(char::is_whitespace) && (local || name.contains('.'));
     if local && looks_like_host {
         return Some(format!("http://{typed}"));
@@ -469,8 +529,8 @@ fn normalize(typed: &str) -> Option<String> {
 /// The address a script may load for `typed`: the address bar's own fix-ups,
 /// but only http and https, since the bar lets a person type `file:` and a
 /// script should not (see security.md).
-fn web_url(typed: &str) -> Result<String, String> {
-    let url = normalize(typed).ok_or("the URL is empty")?;
+fn web_url(typed: &str, http_hosts: &[String]) -> Result<String, String> {
+    let url = normalize(typed, http_hosts).ok_or("the URL is empty")?;
     let web = url.split_once("://").is_some_and(|(scheme, _)| {
         scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
     });
@@ -605,7 +665,7 @@ impl PilusView {
     /// Load what the address bar holds.
     fn browser_submit(&mut self, cx: &mut Context<Self>) {
         let typed = self.browser_input.read(cx).value();
-        let Some(url) = normalize(&typed) else {
+        let Some(url) = normalize(&typed, &self.settings.browser_http_hosts) else {
             self.browser_end_edit(cx);
             return;
         };
@@ -772,7 +832,7 @@ impl PilusView {
         cx.notify();
     }
 
-    /// The bubble beside the square: show or hide the tray of notes.
+    /// The menu's Notes row: show or hide the tray of notes.
     fn browser_toggle_tray(&mut self, cx: &mut Context<Self>) {
         let page = self.browser_panel.page_mut();
         page.tray = !page.tray;
@@ -797,7 +857,8 @@ impl PilusView {
         page.draft = Some(pick);
         page.tray = true;
         if active {
-            self.browser_note_input.update(cx, |input, cx| input.clear(cx));
+            self.browser_note_input
+                .update(cx, |input, cx| input.clear(cx));
             self.browser_focus_note(cx);
         }
     }
@@ -842,10 +903,10 @@ impl PilusView {
         } else if let Some(view) = &self.browser_panel.pages[ix].view {
             let webview = view.read(cx).raw();
             let _ = webview.evaluate_script(browser_notes::SCRIPT);
-            let _ = webview
-                .evaluate_script(&self.browser_panel.pages[ix].notes.marks_script(&url));
+            let _ = webview.evaluate_script(&self.browser_panel.pages[ix].notes.marks_script(&url));
         }
-        self.browser_note_input.update(cx, |input, cx| input.clear(cx));
+        self.browser_note_input
+            .update(cx, |input, cx| input.clear(cx));
         self.browser_panel.editing = false;
         self.right.focused = false;
         cx.notify();
@@ -854,7 +915,8 @@ impl PilusView {
     /// Drop the element that was chosen without a note.
     fn browser_note_cancel(&mut self, cx: &mut Context<Self>) {
         self.browser_panel.page_mut().draft = None;
-        self.browser_note_input.update(cx, |input, cx| input.clear(cx));
+        self.browser_note_input
+            .update(cx, |input, cx| input.clear(cx));
         if !self.browser_panel.editing {
             self.right.focused = false;
         }
@@ -905,6 +967,51 @@ impl PilusView {
                 many => format!("Copied {many} notes"),
             },
         );
+        cx.notify();
+    }
+
+    /// The three dots beside the address bar: open the menu at the pointer.
+    fn browser_open_menu(&mut self, cx: &mut Context<Self>) {
+        let url = self.browser_panel.page().url.clone();
+        let browser = default_browser_name();
+        self.open_context_menu(MenuTarget::Browser { url, browser }, cx);
+    }
+
+    /// What the menu's rows tick: whether the tray is open, how many notes
+    /// the tab holds, and the viewport it is held to.
+    pub(super) fn browser_menu_state(&self) -> (bool, usize, Viewport) {
+        let page = self.browser_panel.page();
+        (page.tray, page.notes.len(), page.viewport)
+    }
+
+    /// Run the row picked from the three-dot menu. `url` is the address the
+    /// menu was opened on, so a page that navigated while the menu was up
+    /// does not retarget the pick.
+    pub(super) fn browser_menu_item(&mut self, url: &str, item: MenuItem, cx: &mut Context<Self>) {
+        match item {
+            MenuItem::BrowserNotes => self.browser_toggle_tray(cx),
+            MenuItem::Viewport(viewport) => {
+                self.browser_panel.page_mut().viewport = viewport;
+                cx.notify();
+            }
+            MenuItem::OpenInBrowser => {
+                // The page's address is the page's to choose, and the system
+                // opener launches any scheme, so only a web address goes out.
+                if pilus_client::openable_url(url) {
+                    cx.open_url(url);
+                } else {
+                    self.toast(
+                        ToastKind::Info,
+                        "Only web pages open in the default browser",
+                    );
+                }
+            }
+            MenuItem::CopyUrl => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.to_string()));
+                self.toast(ToastKind::Info, "Copied the address");
+            }
+            _ => {}
+        }
         cx.notify();
     }
 
@@ -1035,9 +1142,12 @@ impl PilusView {
             let Some(view) = &page.view else {
                 continue;
             };
-            if page.corner != Some(corner) {
-                round_page_corner(view.read(cx).raw(), corner);
-                page.corner = Some(corner);
+            // A boxed page is a card of its own, so it rounds every corner;
+            // a full one only meets the column's.
+            let rounding = Some((corner, page.viewport.constrained()));
+            if page.corner != rounding {
+                round_page_corner(view.read(cx).raw(), corner, page.viewport.constrained());
+                page.corner = rounding;
             }
             let shown = on_screen && ix == active;
             // The cover goes over a held page while it is on screen, and is
@@ -1052,6 +1162,12 @@ impl PilusView {
                     park_page(view.raw());
                 }
             });
+        }
+        // The boxed page was fitted to the room the last frame measured; when
+        // the column has since been resized, fit it again.
+        let panel = &self.browser_panel;
+        if panel.page().viewport.constrained() && panel.room.get() != panel.fitted.get() {
+            cx.notify();
         }
     }
 
@@ -1263,7 +1379,7 @@ impl PilusView {
         fresh: bool,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let url = web_url(typed)?;
+        let url = web_url(typed, &self.settings.browser_http_hosts)?;
         let now = Instant::now();
         let reuse = if fresh {
             None
@@ -1627,9 +1743,34 @@ impl PilusView {
     /// reads as content in a frame. Only the bottom-right corner is round, to
     /// meet the window's own; the page's layer is clipped to match (see
     /// [`round_page_corner`]).
+    ///
+    /// A page held to a viewport is a smaller card in the same area: centred
+    /// across, flush with the top, and round on every corner. The area is
+    /// measured as it paints, so the card is fitted to the room the previous
+    /// frame had (see [`BrowserPanel::room`]).
     fn browser_frame(&self, page: Option<Entity<WebView>>) -> Div {
         // A page an agent opened is framed with a dashed line, as its tab is.
         let dashed = self.browser_panel.page().access.opener() == Opener::Agent;
+        let viewport = self.browser_panel.page().viewport;
+        let room = self.browser_panel.room.get();
+        self.browser_panel.fitted.set(room);
+        let measured = self.browser_panel.room.clone();
+        let boxed = viewport.fit(room);
+        let radius = style::Radius::Md.pixels();
+        let card = div()
+            .border_1()
+            .when(dashed, |frame| frame.border_dashed())
+            .border_color(self.theme.border)
+            .overflow_hidden()
+            .children(page);
+        let card = match boxed {
+            Some((width, height)) => card
+                .flex_shrink_0()
+                .w(px(width))
+                .h(px(height))
+                .rounded(radius),
+            None => card.size_full().rounded_br(radius),
+        };
         div()
             .relative()
             .flex_1()
@@ -1638,13 +1779,26 @@ impl PilusView {
             .py(px(FRAME_GUTTER))
             .child(
                 div()
+                    .relative()
+                    .flex()
+                    .flex_row()
+                    .justify_center()
+                    .items_start()
                     .size_full()
-                    .border_1()
-                    .when(dashed, |frame| frame.border_dashed())
-                    .border_color(self.theme.border)
-                    .rounded_br(style::Radius::Md.pixels())
-                    .overflow_hidden()
-                    .children(page),
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                measured.set((
+                                    f32::from(bounds.size.width),
+                                    f32::from(bounds.size.height),
+                                ));
+                            },
+                            |_, (), _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .child(card),
             )
     }
 
@@ -1786,12 +1940,13 @@ impl PilusView {
         let height = style::scaled(&self.shared_settings, style::CONTROL_HEIGHT_SMALL);
         // The buttons act on the page, so they wait while an agent holds it.
         let loaded = self.browser_panel.has_page() && !self.browser_panel.page().access.held();
-        let (picking, tray, notes) = {
+        let (picking, tray, notes, viewport) = {
             let page = self.browser_panel.page();
             (
                 page.picking || page.draft.is_some(),
                 page.tray,
                 page.notes.len(),
+                page.viewport,
             )
         };
         self.browser_input.update(cx, |input, _| {
@@ -1895,10 +2050,10 @@ impl PilusView {
             )
             .child(
                 self.diff_icon_button(
-                    "pilus-browser-notes",
-                    include_bytes!("../../assets/icons/message-square.svg"),
-                    "Notes for the agent".to_string(),
-                    tray || notes > 0,
+                    "pilus-browser-more",
+                    include_bytes!("../../assets/icons/ellipsis.svg"),
+                    "Notes, viewport and the page's address".to_string(),
+                    tray || notes > 0 || viewport.constrained(),
                     false,
                 )
                 .when(notes > 0, |button| {
@@ -1909,7 +2064,7 @@ impl PilusView {
                             .child(notes.to_string()),
                     )
                 })
-                .on_click(cx.listener(|this, _, _, cx| this.browser_toggle_tray(cx))),
+                .on_click(cx.listener(|this, _, _, cx| this.browser_open_menu(cx))),
             )
     }
 
@@ -1978,36 +2133,34 @@ impl PilusView {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.browser_focus_note(cx)),
             );
-            tray = tray
-                .child(muted(format!("Note on {label}")))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .child(field)
-                        .child(
-                            style::small_button(
-                                "pilus-browser-note-cancel",
-                                "Cancel",
-                                style::ButtonKind::Ghost,
-                                theme,
-                                fonts.secondary,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| this.browser_note_cancel(cx))),
+            tray = tray.child(muted(format!("Note on {label}"))).child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(field)
+                    .child(
+                        style::small_button(
+                            "pilus-browser-note-cancel",
+                            "Cancel",
+                            style::ButtonKind::Ghost,
+                            theme,
+                            fonts.secondary,
                         )
-                        .child(
-                            style::small_button(
-                                "pilus-browser-note-add",
-                                "Add",
-                                style::ButtonKind::Primary,
-                                theme,
-                                fonts.secondary,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| this.browser_note_save(cx))),
-                        ),
-                );
+                        .on_click(cx.listener(|this, _, _, cx| this.browser_note_cancel(cx))),
+                    )
+                    .child(
+                        style::small_button(
+                            "pilus-browser-note-add",
+                            "Add",
+                            style::ButtonKind::Primary,
+                            theme,
+                            fonts.secondary,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.browser_note_save(cx))),
+                    ),
+            );
         }
         if notes.is_empty() {
             if !picking && self.browser_panel.page().draft.is_none() {
@@ -2214,11 +2367,11 @@ mod tests {
     #[test]
     fn full_addresses_pass_through() {
         assert_eq!(
-            normalize(" https://example.com/a "),
+            normalize(" https://example.com/a ", &[]),
             Some("https://example.com/a".to_string())
         );
         assert_eq!(
-            normalize("file:///tmp/x.html"),
+            normalize("file:///tmp/x.html", &[]),
             Some("file:///tmp/x.html".to_string())
         );
     }
@@ -2226,33 +2379,69 @@ mod tests {
     #[test]
     fn hosts_get_a_scheme() {
         assert_eq!(
-            normalize("example.com/docs"),
+            normalize("example.com/docs", &[]),
             Some("https://example.com/docs".to_string())
         );
         assert_eq!(
-            normalize("localhost:5173"),
+            normalize("localhost:5173", &[]),
             Some("http://localhost:5173".to_string())
         );
         assert_eq!(
-            normalize("127.0.0.1:3000/x"),
+            normalize("127.0.0.1:3000/x", &[]),
             Some("http://127.0.0.1:3000/x".to_string())
+        );
+    }
+
+    #[test]
+    fn listed_hosts_get_http() {
+        let hosts = vec!["*.lab".to_string(), "Intranet.Corp".to_string()];
+        let http = |typed| normalize(typed, &hosts);
+        assert_eq!(
+            http("trakteer.lab"),
+            Some("http://trakteer.lab".to_string())
+        );
+        assert_eq!(
+            http("a.b.lab:8080/x"),
+            Some("http://a.b.lab:8080/x".to_string())
+        );
+        assert_eq!(
+            http("intranet.corp"),
+            Some("http://intranet.corp".to_string())
+        );
+        // The suffix alone, a lookalike and an unlisted name stay https.
+        assert_eq!(http("lab.com"), Some("https://lab.com".to_string()));
+        assert_eq!(
+            http("evillab"),
+            Some("https://duckduckgo.com/?q=evillab".to_string())
+        );
+        assert_eq!(
+            http("x.notlab.com"),
+            Some("https://x.notlab.com".to_string())
+        );
+        assert_eq!(
+            http("mylab.lab.evil.com"),
+            Some("https://mylab.lab.evil.com".to_string())
+        );
+        assert_eq!(
+            normalize("trakteer.lab", &[]),
+            Some("https://trakteer.lab".to_string())
         );
     }
 
     #[test]
     fn anything_else_is_a_search() {
         assert_eq!(
-            normalize("rust gpui"),
+            normalize("rust gpui", &[]),
             Some("https://duckduckgo.com/?q=rust%20gpui".to_string())
         );
         assert_eq!(
-            normalize("gpui"),
+            normalize("gpui", &[]),
             Some("https://duckduckgo.com/?q=gpui".to_string())
         );
     }
 
     #[test]
     fn blank_loads_nothing() {
-        assert_eq!(normalize("   "), None);
+        assert_eq!(normalize("   ", &[]), None);
     }
 }

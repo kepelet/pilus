@@ -267,7 +267,10 @@ mod tests {
         assert!(notes.add(pick("#c", "http://x/"), "third"));
         let numbers: Vec<u32> = notes.items().iter().map(|note| note.n).collect();
         assert_eq!(numbers, [2, 3]);
-        assert!(!notes.add(pick("#d", "http://x/"), "   "), "empty is refused");
+        assert!(
+            !notes.add(pick("#d", "http://x/"), "   "),
+            "empty is refused"
+        );
     }
 
     #[test]
@@ -293,7 +296,10 @@ mod tests {
     #[test]
     fn the_message_names_the_page_and_whose_words_are_whose() {
         let mut notes = Notes::default();
-        notes.add(pick("main > button", "http://localhost:8787/"), "make it blue");
+        notes.add(
+            pick("main > button", "http://localhost:8787/"),
+            "make it blue",
+        );
         notes.add(pick("#nav", "http://localhost:8787/"), "too tall");
         notes.add(pick("#f", "http://localhost:8787/about"), "typo");
         let message = notes.message();

@@ -193,6 +193,21 @@ storage are its own and are dropped with it, so an agent that opens a site sees
 it signed out, and cannot reach the person's sign-ins by loading one. To work on
 a page as the person, ask for their tab with `browser request`.
 
+### Plain-http hosts (`*.lab`)
+
+The address bar and `browser open` send a bare dotted name to `https`, and only
+`localhost`, IPs and `*.localhost` to `http`. A dev name like `trakteer.lab` is
+on neither, so two things let it through, and a bare name needs both:
+
+- `browser_http_hosts` in `settings.json` (`["*.lab", "intranet.corp"]`) makes
+  `normalize` pick `http` for those names. `*.lab` is every name under `lab`, not
+  `lab` itself. It changes the scheme only; a full `http://…` is always honoured.
+- The web view must be allowed plain http. In a bundle, App Transport Security
+  refuses it for non-local names, and a signed Info.plist cannot change at run
+  time, so `PILUS_HTTP_HOSTS="lab,intranet.corp" just bundle` (commas or spaces) writes
+  an `NSExceptionDomains` entry (with subdomains) for each name. Empty by default,
+  so a shipped build keeps ATS whole. Unverified on a live window.
+
 Two things an agent trips on, both seen on a live window:
 
 - `open` returns when the document has loaded, not when the page has drawn what
@@ -223,8 +238,19 @@ Notes for changing it:
 
 The other direction: the person points at something on a page and tells the
 agent. Two buttons follow the address bar. The pointer square turns the picker
-on; the bubble (with a count) opens the tray. Code: `gui/browser_notes.rs` and
-`browser_notes.js`, with the buttons and tray in `gui/browser_tab.rs`.
+on; the three dots (with a note count) open a native menu whose first row, Notes,
+toggles the tray. Code: `gui/browser_notes.rs` and `browser_notes.js`, with the
+buttons and tray in `gui/browser_tab.rs`.
+
+The same menu holds the tab's other settings, none of which an agent can read or
+change. **Viewport** (Responsive, 16:10, 4:3, Mobile, Tablet) puts the page in a
+smaller card, centred and fitted to the room the column leaves
+(`gui/browser_viewport.rs`). Mobile and Tablet stop at their real size, 390×844
+and 768×1024. It resizes the page only: no user agent, touch or pixel ratio.
+It is per tab and ends when the tab closes. **Open in Default Browser** passes
+the address through `openable_url` first, so a page on any scheme but
+http/https is refused. **Copy URL** copies it. The menu is an `NSMenu` because a
+GPUI dropdown would paint under the webview.
 
 1. The picker is injected on demand, not at document start, so a page the
    person only reads runs none of it. It outlines what is under the pointer,

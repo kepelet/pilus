@@ -105,7 +105,7 @@ pub use read::{
 };
 pub use relay::RelaySettings;
 pub use stage::{Discard, StageAction, discard, set_staged};
-pub use surface::{Surface, SurfaceChange, link_at, path_at};
+pub use surface::{Surface, SurfaceChange, link_at, openable_url, path_at};
 pub use tasks::{NewTask, Task, TaskStatus, split_list};
 pub use transport::SshTarget;
 pub use tunnel::{CtlKiller, CtlTunnel, REMOTE_SOCKET};

@@ -20,6 +20,7 @@ mod browser_inspect;
 mod browser_notes;
 mod browser_shield;
 mod browser_tab;
+mod browser_viewport;
 mod connector;
 mod ctl;
 mod ctl_tunnel;
@@ -10951,6 +10952,7 @@ impl PilusView {
             | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::AgentFilter
+            | SidebarMenuTarget::Browser { .. }
             | SidebarMenuTarget::File { .. } => None,
         };
         if let Some((endpoint, workspace_id, index, target)) = workspace_probe {
@@ -11035,6 +11037,7 @@ impl PilusView {
             | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::AgentFilter
+            | SidebarMenuTarget::Browser { .. }
             | SidebarMenuTarget::File { .. } => return,
         };
         let workspace_id = workspace_id.to_string();
@@ -11077,6 +11080,7 @@ impl PilusView {
             | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::AgentFilter
+            | SidebarMenuTarget::Browser { .. }
             | SidebarMenuTarget::File { .. } => false,
         }
     }
@@ -11093,13 +11097,18 @@ impl PilusView {
             | SidebarMenuTarget::Tab { .. }
             | SidebarMenuTarget::Github
             | SidebarMenuTarget::AgentFilter
+            | SidebarMenuTarget::Browser { .. }
             | SidebarMenuTarget::File { .. } => (false, false),
         };
+        let (notes_open, notes, viewport) = self.browser_menu_state();
         MenuLabels {
             status: self.agent_status,
             paths_visible,
             scoped,
             repos: self.github.repos.items.len(),
+            notes_open,
+            notes,
+            viewport,
         }
     }
 
@@ -11229,6 +11238,9 @@ impl PilusView {
             }
             (SidebarMenuTarget::Github, item) => {
                 self.github_menu_item(item, cx);
+            }
+            (SidebarMenuTarget::Browser { url, .. }, item) => {
+                self.browser_menu_item(url, item, cx);
             }
             (SidebarMenuTarget::File { path, .. }, SidebarItem::CopyPath) => {
                 self.menu_copy(path, cx);

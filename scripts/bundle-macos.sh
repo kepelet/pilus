@@ -37,6 +37,27 @@ cp target/release/pilus "$app/Contents/MacOS/pilus"
 cp target/release/pilus-agent "$app/Contents/MacOS/pilus-agent"
 cp crates/pilus/assets/pilus.icns "$app/Contents/Resources/pilus.icns"
 
+# Hostnames the Browser may load over plain http, separated by commas or
+# spaces (`lab,intranet.corp`); a name also
+# covers every name under it, so `lab` allows trakteer.lab. Empty keeps App
+# Transport Security whole. WKWebView enforces it, and a signed Info.plist
+# cannot change after the build, so this is a build-time list.
+ats=""
+for host in ${PILUS_HTTP_HOSTS//,/ }; do
+    ats="${ats}
+            <key>${host}</key><dict>
+                <key>NSIncludesSubdomains</key><true/>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+            </dict>"
+done
+ats_block=""
+if [ -n "$ats" ]; then
+    ats_block="    <key>NSAppTransportSecurity</key><dict>
+        <key>NSExceptionDomains</key><dict>${ats}
+        </dict>
+    </dict>"
+fi
+
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -52,6 +73,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>${app_version}</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
+${ats_block}
     <key>NSLocalNetworkUsageDescription</key><string>pilus connects directly to your sipil daemons, contacts and paired devices on this network, so messages and agents do not go through a relay.</string>
 </dict>
 </plist>

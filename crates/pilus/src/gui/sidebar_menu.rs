@@ -20,6 +20,8 @@
 //! [`Entry`] trees. [`super::native_menu`] turns a tree into an `NSMenu` and
 //! the window runs the picked item, so nothing here knows GPUI or AppKit.
 
+use super::browser_viewport::Viewport;
+
 /// The sidebar row an open menu is anchored to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MenuTarget {
@@ -74,6 +76,14 @@ pub enum MenuTarget {
     Tab { tab_id: String },
     /// The GitHub section's header in the sidebar.
     Github,
+    /// The Browser's three-dot button. `url` is the page the tab shows, empty
+    /// for a tab with no page, which has nothing to open or copy.
+    Browser {
+        url: String,
+        /// The default browser's name, for the Open row; `None` when the
+        /// system does not say.
+        browser: Option<String>,
+    },
     /// A row of the Files tab's tree, or its blank area (`root`), which acts
     /// on the tree's own folder.
     File {
@@ -154,6 +164,16 @@ pub enum Item {
     /// Turn the GitHub integration off, which also stops its requests.
     GithubDisable,
     NewTab,
+    /// Show or hide the Browser's tray of notes.
+    BrowserNotes,
+    /// The parent row of the viewport submenu, which is never picked itself.
+    ViewportMenu,
+    /// Hold the Browser's page to this viewport.
+    Viewport(Viewport),
+    /// Hand the Browser's page to the system's default browser.
+    OpenInBrowser,
+    /// Put the Browser's address on the clipboard.
+    CopyUrl,
     /// Rename the right-clicked tab in the strip.
     RenameTab,
     /// Close the active tab, or the right-clicked one in the strip.
@@ -212,6 +232,11 @@ impl Item {
             Self::GithubHideSection => "Hide Section",
             Self::GithubDisable => "Turn Off GitHub",
             Self::NewTab => "New Tab",
+            Self::BrowserNotes => "Notes",
+            Self::ViewportMenu => "Viewport",
+            Self::Viewport(viewport) => viewport.label(),
+            Self::OpenInBrowser => "Open in Default Browser",
+            Self::CopyUrl => "Copy URL",
             Self::RenameTab => "Rename Tab",
             Self::CloseTab => "Close Tab",
             Self::Divider => "",
@@ -254,6 +279,11 @@ impl Item {
             Self::ForkPane => "arrow.branch",
             Self::MoveToTab => "arrow.turn.down.right",
             Self::NewTab => "plus",
+            Self::BrowserNotes => "bubble.left",
+            Self::ViewportMenu => "rectangle.dashed",
+            Self::Viewport(_) => "",
+            Self::OpenInBrowser => "safari",
+            Self::CopyUrl => "link",
             Self::GithubAll => "list.bullet",
             Self::GithubRefresh => "arrow.clockwise",
             Self::GithubHideSection => "eye.slash",
@@ -310,6 +340,12 @@ pub struct Labels {
     /// The one status the AGENTS list is narrowed to, which its filter menu
     /// ticks; `None` when it lists them all.
     pub status: Option<&'static str>,
+    /// The Browser's tray of notes is open, which its Notes row ticks.
+    pub notes_open: bool,
+    /// How many notes the Browser's tab holds, shown on its Notes row.
+    pub notes: usize,
+    /// The viewport the Browser's tab is held to, which its submenu ticks.
+    pub viewport: Viewport,
 }
 
 impl MenuTarget {
@@ -330,6 +366,7 @@ impl MenuTarget {
             Self::Terminal { selection, agent } => terminal_rows(*selection, *agent),
             Self::Tab { .. } => tab_rows(),
             Self::Github => github_rows(),
+            Self::Browser { url, .. } => browser_rows(!url.is_empty()),
             Self::File { root, dir, .. } => file_rows(*root, *dir),
         }
     }
@@ -362,6 +399,28 @@ impl MenuTarget {
                         .map(|item| action(item, labels))
                         .collect(),
                 },
+                Item::ViewportMenu => Entry::Submenu {
+                    title: item.label(labels.paths_visible, labels.scoped).to_string(),
+                    symbol: item.symbol(labels.paths_visible),
+                    entries: Viewport::ALL
+                        .into_iter()
+                        .map(|viewport| action(Item::Viewport(viewport), labels))
+                        .collect(),
+                },
+                Item::OpenInBrowser => {
+                    let mut row = action(item, labels);
+                    if let (
+                        Entry::Action { title, .. },
+                        Self::Browser {
+                            browser: Some(name),
+                            ..
+                        },
+                    ) = (&mut row, self)
+                    {
+                        *title = format!("Open in {name}");
+                    }
+                    row
+                }
                 item => action(item, labels),
             })
             .collect()
@@ -374,15 +433,21 @@ fn action(item: Item, labels: Labels) -> Entry {
     if item == Item::GithubAll {
         title.push_str(&format!(" · {}", labels.repos));
     }
-    // A filter row is ticked when it is the one in force.
-    let ticked = matches!(
-        item,
+    if item == Item::BrowserNotes && labels.notes > 0 {
+        title.push_str(&format!(" · {}", labels.notes));
+    }
+    // A filter row is ticked when it is the one in force, as is the
+    // viewport the tab is held to and the tray while it is open.
+    let ticked = match item {
         Item::FilterAll
-            | Item::FilterBlocked
-            | Item::FilterDone
-            | Item::FilterWorking
-            | Item::FilterIdle
-    ) && item.status() == labels.status;
+        | Item::FilterBlocked
+        | Item::FilterDone
+        | Item::FilterWorking
+        | Item::FilterIdle => item.status() == labels.status,
+        Item::Viewport(viewport) => viewport == labels.viewport,
+        Item::BrowserNotes => labels.notes_open,
+        _ => false,
+    };
     Entry::Action {
         item,
         title,
@@ -441,6 +506,17 @@ fn github_rows() -> Vec<Item> {
         Item::GithubHideSection,
         Item::GithubDisable,
     ]
+}
+
+/// The Browser's three-dot menu: the page's own settings, then what to do
+/// with its address. A tab with no page has no address, so those rows are
+/// left out rather than shown dead.
+fn browser_rows(has_url: bool) -> Vec<Item> {
+    let mut items = vec![Item::BrowserNotes, Item::ViewportMenu];
+    if has_url {
+        items.extend([Item::Divider, Item::OpenInBrowser, Item::CopyUrl]);
+    }
+    items
 }
 
 /// A strip tab's rows: the rename, then the destructive close alone below a
@@ -756,6 +832,92 @@ mod tests {
         assert_eq!(ticked(Some("done")), [Item::FilterDone]);
     }
 
+    fn browser(url: &str) -> MenuTarget {
+        MenuTarget::Browser {
+            url: url.into(),
+            browser: Some("Safari".into()),
+        }
+    }
+
+    #[test]
+    fn the_browser_menu_leaves_out_the_address_rows_without_a_page() {
+        assert_eq!(
+            browser_rows(true),
+            vec![
+                Item::BrowserNotes,
+                Item::ViewportMenu,
+                Item::Divider,
+                Item::OpenInBrowser,
+                Item::CopyUrl,
+            ]
+        );
+        assert_eq!(
+            browser_rows(false),
+            vec![Item::BrowserNotes, Item::ViewportMenu]
+        );
+        assert_eq!(browser("").rows(false), browser_rows(false));
+        assert_eq!(browser("https://a.test").rows(false), browser_rows(true));
+    }
+
+    #[test]
+    fn the_open_row_names_the_default_browser_when_known() {
+        let title = |browser| {
+            let target = MenuTarget::Browser {
+                url: "https://a.test".into(),
+                browser,
+            };
+            target
+                .entries(false, Labels::default())
+                .into_iter()
+                .find_map(|entry| match entry {
+                    Entry::Action {
+                        item: Item::OpenInBrowser,
+                        title,
+                        ..
+                    } => Some(title),
+                    _ => None,
+                })
+        };
+        assert_eq!(title(Some("Arc".into())).as_deref(), Some("Open in Arc"));
+        assert_eq!(title(None).as_deref(), Some("Open in Default Browser"));
+    }
+
+    #[test]
+    fn the_viewport_submenu_ticks_the_one_in_force() {
+        let labels = Labels {
+            viewport: Viewport::Mobile,
+            notes_open: true,
+            notes: 3,
+            ..Labels::default()
+        };
+        let entries = browser("https://a.test").entries(false, labels);
+        let Some(Entry::Submenu { entries: sub, .. }) = entries
+            .iter()
+            .find(|entry| matches!(entry, Entry::Submenu { .. }))
+        else {
+            panic!("the Viewport row opens a submenu");
+        };
+        let rows: Vec<(Item, bool)> = sub
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Action { item, checked, .. } => Some((*item, *checked)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), Viewport::ALL.len());
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, checked)| *checked)
+                .collect::<Vec<_>>(),
+            [&(Item::Viewport(Viewport::Mobile), true)]
+        );
+        // The Notes row shows its count and is ticked while the tray is open.
+        assert!(matches!(
+            &entries[0],
+            Entry::Action { item: Item::BrowserNotes, title, checked: true, .. } if title == "Notes · 3"
+        ));
+    }
+
     #[test]
     fn entries_take_their_wording_from_the_window() {
         let agent = MenuTarget::Agent {
@@ -768,6 +930,7 @@ mod tests {
             scoped: true,
             repos: 0,
             status: None,
+            ..Labels::default()
         };
         let titles: Vec<String> = agent
             .entries(false, labels)

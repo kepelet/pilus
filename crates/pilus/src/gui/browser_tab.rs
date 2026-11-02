@@ -513,11 +513,17 @@ impl PilusView {
         self.browser_focused() && !self.browser_panel.editing
     }
 
-    /// Whether the page may be drawn: the tab is open and still, and no
+    /// Whether the page may be drawn: the tab is open and not sliding, and no
     /// overlay of ours is up, since the webview would paint over it.
+    ///
+    /// A handle drag does not hide it: the page's native frame is re-set from
+    /// GPUI's layout on every paint, so it follows the column's edge, and the
+    /// drag keeps receiving events because AppKit sends them to the view that
+    /// took the mouse-down. Only a tween hides it, as the native view cannot
+    /// follow a slide that is still moving the column out from under it.
     fn browser_on_screen(&self) -> bool {
         self.browser_visible()
-            && !self.right.moving()
+            && !self.right.tweening()
             && self.right.openness() >= 1.0
             && !self.picker.is_open()
             && !self.palette.is_open()
@@ -1520,7 +1526,7 @@ impl PilusView {
             .child(self.browser_header(cx))
             .children(self.browser_notes_tray(cx));
         match self.browser_panel.page().view.clone() {
-            // While the column moves the webview is hidden, so the body is
+            // While the column slides the webview is hidden, so the body is
             // left empty rather than showing a stale frame.
             //
             // The native view paints above GPUI and takes the mouse, so the

@@ -11973,7 +11973,7 @@ impl PilusView {
             "pilus-sidebar-hover",
             &self.sidebar_hover,
             self.theme.tint_fill(1.0),
-            style::RADIUS_MD,
+            self.sidebar_radius(),
             SIDEBAR_ROW_EDGE,
         ));
         // The selected row's raised fill is a second pill under the rows, so
@@ -11985,14 +11985,14 @@ impl PilusView {
             "pilus-sidebar-context",
             &self.sidebar_context,
             self.theme.tint_fill(1.0),
-            style::RADIUS_MD,
+            self.sidebar_radius(),
             SIDEBAR_ROW_EDGE,
         ));
         content = content.child(style::glide_outlined(
             "pilus-sidebar-selection",
             &self.sidebar_selection,
             self.theme.tint_fill(1.0),
-            style::RADIUS_MD,
+            self.sidebar_radius(),
             SIDEBAR_ROW_EDGE,
             self.theme.border,
         ));
@@ -13840,7 +13840,8 @@ impl PilusView {
         let cwd = self.shorten_cwd(&endpoint.key(), &workspace.cwd);
         // The home workspace is named for the machine it lives on, since its
         // own name is just the user's directory.
-        let title = if cwd == "~" && !workspace.nested {
+        let home = cwd == "~" && !workspace.nested;
+        let title = if home {
             self.endpoint_label(endpoint)
         } else {
             workspace.name.clone()
@@ -13893,17 +13894,22 @@ impl PilusView {
                             .rounded_bl(style::Radius::Sm.pixels() * 0.75),
                     )
                     .into_any_element()
-            } else if remote {
+            } else if remote && home {
                 glyph(
                     include_bytes!("../../assets/icons/server.svg"),
-                    SIDEBAR_GLYPH,
+                    self.machine_glyph(),
                     theme.muted,
                 )
                 .into_any_element()
             } else {
+                let size = if home {
+                    self.machine_glyph()
+                } else {
+                    SIDEBAR_GLYPH
+                };
                 glyph(
                     include_bytes!("../../assets/icons/folder.svg"),
-                    SIDEBAR_GLYPH,
+                    size,
                     theme.muted,
                 )
                 .into_any_element()
@@ -13911,11 +13917,16 @@ impl PilusView {
         }
         // The name owns the first line. The machine name stays out of the
         // row (the tooltip names it), so nothing competes with the label.
-        let name = div()
+        let mut name = div()
             .flex_1()
             .min_w_0()
             .truncate()
             .text_color(theme.panel_fg);
+        if home {
+            name = name
+                .text_size(px(self.machine_font()))
+                .text_color(self.machine_color());
+        }
         head = head.child(name.child(title));
         if foldable {
             head = head.child(self.machine_fold_toggle(endpoint, cx));
@@ -13979,7 +13990,7 @@ impl PilusView {
             // The branch and host badges keep the row's content inset.
             .pr(px(SIDEBAR_ROW_PAD))
             .py_1()
-            .radius_md()
+            .rounded(self.sidebar_radius().pixels())
             .cursor_pointer()
             .tooltip(tip)
             .child(pill_frame)
@@ -14083,7 +14094,7 @@ impl PilusView {
             .h(px(SIDEBAR_ROW_HEIGHT))
             .pl(px(SIDEBAR_ROW_PAD))
             .pr(px(SIDEBAR_ROW_PAD))
-            .radius_md()
+            .rounded(self.sidebar_radius().pixels())
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
@@ -14109,7 +14120,7 @@ impl PilusView {
             .h(px(SIDEBAR_ROW_HEIGHT))
             .pl(px(SIDEBAR_ROW_PAD))
             .pr(px(SIDEBAR_ROW_PAD))
-            .radius_md()
+            .rounded(self.sidebar_radius().pixels())
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
@@ -14136,7 +14147,7 @@ impl PilusView {
             .h(px(SIDEBAR_ROW_HEIGHT))
             .pl(px(SIDEBAR_ROW_PAD))
             .pr(px(SIDEBAR_ROW_PAD))
-            .radius_md()
+            .rounded(self.sidebar_radius().pixels())
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
@@ -14163,7 +14174,7 @@ impl PilusView {
             .h(px(SIDEBAR_ROW_HEIGHT))
             .pl(px(SIDEBAR_ROW_PAD))
             .pr(px(SIDEBAR_ROW_PAD))
-            .radius_md()
+            .rounded(self.sidebar_radius().pixels())
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
@@ -14527,7 +14538,7 @@ impl PilusView {
                 SIDEBAR_ROW_PAD + if nested { SIDEBAR_GLYPH } else { 0.0 }
             ))
             .pr(px(SIDEBAR_ROW_PAD))
-            .radius_md()
+            .rounded(self.sidebar_radius().pixels())
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .text_color(theme.panel_fg)
@@ -14875,6 +14886,9 @@ impl PilusView {
         }
         let mut children = div().flex().flex_col().gap_1();
         let mut any = false;
+        // Compact pane style also flattens this list: no fold chevron, no
+        // rail, no elbows, so every row sits at one level.
+        let flat = self.sidebar_flat();
         for id in self.connected_endpoints() {
             let host = id.machine_id().map(|_| self.endpoint_label(&id));
             let workspaces = self.endpoint_workspaces(&id);
@@ -14888,7 +14902,8 @@ impl PilusView {
             let home = workspaces
                 .iter()
                 .position(|workspace| self.is_home_workspace(&id, workspace));
-            let foldable = workspaces.len() > usize::from(home.is_some());
+            let foldable = !flat && workspaces.len() > usize::from(home.is_some());
+            let folded = !flat && self.machine_folded(&id);
             children = match home {
                 Some(index) => children.child(self.workspace_row(
                     &id,
@@ -14897,7 +14912,7 @@ impl PilusView {
                     0,
                     NestRail {
                         foldable,
-                        parent: foldable && !self.machine_folded(&id),
+                        parent: foldable && !folded,
                         more: false,
                     },
                     cx,
@@ -14905,18 +14920,27 @@ impl PilusView {
                 None => children.child(self.machine_row(
                     &id,
                     host.as_deref(),
-                    !self.machine_folded(&id),
+                    !folded,
                     cx,
                 )),
             };
-            if self.machine_folded(&id) {
+            if folded {
                 continue;
             }
             let below: Vec<(usize, &ShellWorkspace)> = workspaces
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| Some(*index) != home)
-                .map(|(_, workspace)| (if workspace.nested { 2 } else { 1 }, workspace))
+                .map(|(_, workspace)| {
+                    let depth = if flat {
+                        0
+                    } else if workspace.nested {
+                        2
+                    } else {
+                        1
+                    };
+                    (depth, workspace)
+                })
                 .collect();
             for (at, (depth, workspace)) in below.iter().enumerate() {
                 let rail = NestRail {
@@ -14965,7 +14989,54 @@ impl PilusView {
 
     /// Whether the machine's workspaces are folded under its row.
     fn machine_folded(&self, endpoint: &EndpointId) -> bool {
-        self.machines_collapsed.contains(&endpoint.key())
+        !self.sidebar_flat() && self.machines_collapsed.contains(&endpoint.key())
+    }
+
+    /// Compact pane style flattens the Workspaces list: machines become small
+    /// headings and every workspace sits at one level, with no tree rail.
+    fn sidebar_flat(&self) -> bool {
+        !self.settings.pane_gaps
+    }
+
+    /// Corner of a sidebar row and of the pills under the rows. Compact squares
+    /// them whatever the corner setting says; tabs and everything outside the
+    /// lists keep following it.
+    fn sidebar_radius(&self) -> style::Radius {
+        if self.sidebar_flat() {
+            style::Radius::None
+        } else {
+            style::RADIUS_MD
+        }
+    }
+
+    /// Glyph size of a machine's icon, shrunk in Compact like its name. The
+    /// glyph keeps its box, so the labels stay on the same column.
+    fn machine_glyph(&self) -> f32 {
+        if self.sidebar_flat() {
+            SIDEBAR_GLYPH - 3.0
+        } else {
+            SIDEBAR_GLYPH
+        }
+    }
+
+    /// Color of a machine's name. Compact dims it so the heading recedes
+    /// behind the workspaces listed under it.
+    fn machine_color(&self) -> gpui::Rgba {
+        if self.sidebar_flat() {
+            self.theme.muted
+        } else {
+            self.theme.panel_fg
+        }
+    }
+
+    /// Text size of a machine's name. Compact shrinks it a step so the
+    /// heading reads as a label over the workspaces, not a row among them.
+    fn machine_font(&self) -> f32 {
+        if self.sidebar_flat() {
+            self.footer_font()
+        } else {
+            self.chrome_font()
+        }
     }
 
     /// The chevron at the end of a machine's row. It folds and unfolds the
@@ -15051,7 +15122,7 @@ impl PilusView {
             .min_w_0()
             .h(px(SIDEBAR_ROW_HEIGHT))
             .px(px(SIDEBAR_ROW_PAD))
-            .radius_md()
+            .rounded(self.sidebar_radius().pixels())
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .relative()
@@ -15070,7 +15141,7 @@ impl PilusView {
             }))
             .child(div().w(px(SIDEBAR_GLYPH)).flex_shrink_0().child(icon(
                 icon_bytes,
-                SIDEBAR_GLYPH,
+                self.machine_glyph(),
                 theme.muted,
             )))
             .child(
@@ -15078,10 +15149,11 @@ impl PilusView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(theme.panel_fg)
+                    .text_size(px(self.machine_font()))
+                    .text_color(self.machine_color())
                     .child(title),
             )
-            .child(self.machine_fold_toggle(endpoint, cx))
+            .children((!self.sidebar_flat()).then(|| self.machine_fold_toggle(endpoint, cx)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -15256,7 +15328,7 @@ impl PilusView {
             // The status dot and branch keep the row's content inset.
             .pr(px(SIDEBAR_ROW_PAD))
             .py_1()
-            .radius_md()
+            .rounded(self.sidebar_radius().pixels())
             .cursor_pointer()
             .children(selected.then(|| style::glide_target(&self.sidebar_selection)))
             .child(style::hover_target(&self.sidebar_hover))

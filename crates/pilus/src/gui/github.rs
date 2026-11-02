@@ -638,7 +638,7 @@ impl PilusView {
             .h(px(SIDEBAR_ROW_HEIGHT))
             .pl(px(SIDEBAR_ROW_PAD))
             .pr(px(SIDEBAR_ROW_PAD))
-            .radius_md()
+            .rounded(self.sidebar_radius().pixels())
             .cursor_pointer()
             .text_size(px(self.chrome_font()))
             .child(style::hover_target(&self.sidebar_hover))

@@ -3068,6 +3068,7 @@ impl Element for HoverGlide {
                     size: pill.size,
                 },
                 self.bleed,
+                self.radius,
             );
             let radius = self.radius.pixels();
             let color = Rgba {
@@ -3297,6 +3298,7 @@ impl Element for Glide {
                 size: pill.size,
             },
             self.bleed,
+            self.radius,
         );
         // The target marker fills its parent's padding box, which sits inside
         // the parent's own 1px border; a bordered pill goes back out onto
@@ -3316,11 +3318,13 @@ impl Element for Glide {
     }
 }
 
-/// A pill widened by `bleed` on both sides while the corner radius is zero,
-/// so a square selection or hover fill runs flush to the edge of the list it
-/// sits in instead of leaving the rounded pill's gap.
-fn bled(pill: Bounds<Pixels>, bleed: f32) -> Bounds<Pixels> {
-    if bleed <= 0.0 || Radius::Md.pixels() > px(0.0) {
+/// A pill widened by `bleed` on both sides while its own corner radius is
+/// zero, so a square selection or hover fill runs flush to the edge of the
+/// list it sits in instead of leaving the rounded pill's gap. It follows the
+/// pill's radius, not the setting, so a list that squares itself (Compact
+/// sidebar) goes flush too.
+fn bled(pill: Bounds<Pixels>, bleed: f32, radius: Radius) -> Bounds<Pixels> {
+    if bleed <= 0.0 || radius.pixels() > px(0.0) {
         return pill;
     }
     Bounds {

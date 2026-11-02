@@ -250,6 +250,14 @@ pub enum PageOp {
         selector: Option<String>,
         within: Option<String>,
     },
+    /// Press on `from`, move to the element `to` or by `by` (`[dx, dy]` pixels
+    /// from `from`'s centre), and let go. Drives what a person would do with a
+    /// slider, a sortable list or a draggable card.
+    Drag {
+        from: String,
+        to: Option<String>,
+        by: Option<[i32; 2]>,
+    },
     /// Replace the value of a field, as typing would.
     Fill {
         selector: String,
@@ -423,6 +431,7 @@ struct Flags {
     filter: Option<String>,
     limit: Option<u32>,
     within: Option<String>,
+    by: Option<[i32; 2]>,
     positional: Vec<String>,
 }
 
@@ -453,6 +462,10 @@ impl Flags {
                     })?);
                 }
                 "--filter" => flags.filter = Some(value("--filter")?.to_string()),
+                "--by" => {
+                    let text = value("--by")?;
+                    flags.by = Some(parse_offset(text)?);
+                }
                 "--in" => flags.within = Some(value("--in")?.to_string()),
                 "--limit" => {
                     let text = value("--limit")?;
@@ -558,6 +571,7 @@ fn parse_browser(words: &[&str]) -> Result<Request> {
             selector: flags.one("click", "a selector or @N")?,
         })),
         "scroll" => parse_scroll(&flags),
+        "drag" => parse_drag(&flags),
         "fill" => {
             // An empty text is fine (it clears the field), but it must be
             // given, so a forgotten argument is not a silent clear.
@@ -603,6 +617,36 @@ fn parse_browser(words: &[&str]) -> Result<Request> {
         "reload" => Ok(flags.page(PageOp::Reload)),
         other => bail!("unknown browser command {other:?}\n\n{USAGE}"),
     }
+}
+
+/// `DX,DY`, each a whole number of pixels, either may be negative.
+fn parse_offset(text: &str) -> Result<[i32; 2]> {
+    let bad = || anyhow!("--by is DX,DY in pixels, like 120,0 or -40,25, not {text:?}");
+    let (dx, dy) = text.split_once(',').ok_or_else(bad)?;
+    Ok([
+        dx.trim().parse().map_err(|_| bad())?,
+        dy.trim().parse().map_err(|_| bad())?,
+    ])
+}
+
+/// `drag FROM TO` or `drag FROM --by DX,DY`.
+fn parse_drag(flags: &Flags) -> Result<Request> {
+    let op = match (flags.positional.as_slice(), flags.by) {
+        ([from, to], None) => PageOp::Drag {
+            from: from.clone(),
+            to: Some(to.clone()),
+            by: None,
+        },
+        ([from], Some(by)) => PageOp::Drag {
+            from: from.clone(),
+            to: None,
+            by: Some(by),
+        },
+        _ => bail!(
+            "browser drag takes FROM TO (selectors or @N), or FROM --by DX,DY\n\n{USAGE}"
+        ),
+    };
+    Ok(flags.page(op))
 }
 
 /// `scroll down [PIXELS] [--in SELECTOR]`, or `scroll SELECTOR` to bring one
@@ -673,6 +717,8 @@ pub const USAGE: &str = "USAGE:\n\
     \x20   pilus ctl browser click SELECTOR|@N\n\
     \x20   pilus ctl browser scroll up|down|left|right|top|bottom [PIXELS] [--in SELECTOR|@N]\n\
     \x20   pilus ctl browser scroll SELECTOR|@N   # bring it into view\n\
+    \x20   pilus ctl browser drag SELECTOR|@N SELECTOR|@N   # press, move to it, let go\n\
+    \x20   pilus ctl browser drag SELECTOR|@N --by DX,DY    # or move by pixels\n\
     \x20   pilus ctl browser fill SELECTOR|@N TEXT\n\
     \x20   pilus ctl browser press KEY [SELECTOR|@N]\n\
     \x20   pilus ctl browser wait SELECTOR|@N [--gone] [--timeout MS]\n\
@@ -1072,6 +1118,42 @@ mod tests {
             "browser scroll down 1 2",
             "browser scroll #a --in #b",
             "browser scroll #a #b",
+        ] {
+            assert!(parse_args(&words(bad)).is_err(), "{bad:?} should fail");
+        }
+    }
+
+    #[test]
+    fn drag_takes_a_target_or_an_offset() {
+        assert_eq!(
+            page("browser drag #card @3"),
+            Request::BrowserPage {
+                tab: None,
+                op: PageOp::Drag {
+                    from: "#card".to_string(),
+                    to: Some("@3".to_string()),
+                    by: None,
+                }
+            }
+        );
+        assert_eq!(
+            page("browser drag .knob --by -40,25 --tab 2"),
+            Request::BrowserPage {
+                tab: Some(2),
+                op: PageOp::Drag {
+                    from: ".knob".to_string(),
+                    to: None,
+                    by: Some([-40, 25]),
+                }
+            }
+        );
+        for bad in [
+            "browser drag",
+            "browser drag #a",
+            "browser drag #a #b --by 1,1",
+            "browser drag #a --by 1",
+            "browser drag #a --by x,y",
+            "browser drag #a #b #c",
         ] {
             assert!(parse_args(&words(bad)).is_err(), "{bad:?} should fail");
         }

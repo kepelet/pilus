@@ -27,6 +27,8 @@ pilus ctl browser fill @1 "buy milk"
 pilus ctl browser click @2
 pilus ctl browser scroll down              # also: up|left|right|top|bottom [PX] [--in SEL]
 pilus ctl browser scroll @7                # bring one element into view
+pilus ctl browser drag @3 @9               # press on @3, move to @9, let go
+pilus ctl browser drag .knob --by 120,0    # or move by pixels from its centre
 pilus ctl browser wait 'li:nth-child(2)'
 pilus ctl browser network --filter /api    # method, url, status, ms
 pilus ctl browser console                  # console.* and uncaught errors
@@ -217,7 +219,19 @@ selector it brings that element into view. The answer carries `x`, `y`,
 another step would move nothing. Scrolling is `behavior: 'instant'` whatever
 the page's CSS says.
 
-`click`, `fill` and `scroll` drive a **virtual cursor** in the page
+`browser drag FROM TO` (or `FROM --by DX,DY`) presses on the centre of `FROM`,
+moves in 8 steps to the centre of `TO` (or the offset point) and lets go. A
+plain element gets `pointerdown`/`mousedown`, the moves, then
+`pointerup`/`mouseup`, which is what sliders and most sortable lists listen
+for. An element with `draggable="true"` gets the HTML5 sequence instead
+(`dragstart`, `drag`, `dragenter`/`dragover`, `drop`, `dragend`), because a
+real browser swaps the mouse events for those once a drag begins; `drop` is sent
+only when the page cancels `dragover`, as a real one is, and the answer says
+`dropped`. The drop point must be on screen (`scroll` first). Synthetic events
+carry no OS drag, so a page that needs a real file or system drag cannot be
+driven this way.
+
+`click`, `fill`, `scroll` and `drag` drive a **virtual cursor** in the page
 (`cursor` in `browser_inspect.js`): a pointer that glides to the target, dips
 and sends a ring out on a click. It is only for the person watching, so:
 

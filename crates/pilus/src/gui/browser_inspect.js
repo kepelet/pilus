@@ -320,7 +320,9 @@
       (document.documentElement || document.body).appendChild(host);
     };
 
-    const place = (x, y) => `translate(${x - 1}px, ${y - 1}px)`;
+    // While the button is held the pointer stays pressed in, the whole drag.
+    let held = false;
+    const place = (x, y) => `translate(${x - 1}px, ${y - 1}px)` + (held ? ' scale(.85)' : '');
     const frame = (ms) => new Promise((done) => setTimeout(done, ms));
 
     // Keep the pointer on screen until the agent has been quiet a while.
@@ -336,7 +338,7 @@
     };
 
     // Glide to (x, y) in viewport coordinates and settle there.
-    const to = async (x, y) => {
+    const to = async (x, y, glideMs) => {
       try {
         if (!host || !host.isConnected) {
           host = null;
@@ -346,7 +348,7 @@
         }
         const from = at;
         const distance = Math.hypot(x - from.x, y - from.y);
-        const ms = calm() ? 0 : Math.min(650, 160 + distance * 0.45);
+        const ms = calm() ? 0 : glideMs !== undefined ? glideMs : Math.min(650, 160 + distance * 0.45);
         at = { x, y };
         pointer.style.transform = place(x, y);
         if (ms > 0 && distance > 1) {
@@ -398,7 +400,12 @@
       const box = el.getBoundingClientRect();
       return to(box.x + box.width / 2, box.y + box.height / 2);
     };
-    return { to, press, toElement };
+    // Press the button in and keep it there until `hold(false)`.
+    const hold = (on) => {
+      held = on;
+      if (host && pointer && at) pointer.style.transform = place(at.x, at.y);
+    };
+    return { to, press, hold, toElement };
   })();
 
   // ---- acting on the page ------------------------------------------------
@@ -486,6 +493,95 @@
       (target || window).scrollTo({ top: Math.max(0, top), left: Math.max(0, left), behavior: 'instant' });
       const after = whereIs(target);
       return { scrolled: { x: after.x - now.x, y: after.y - now.y }, ...after };
+    },
+    drag: async (from, to, by) => {
+      const src = resolve(from);
+      if (!visible(src)) throw new Error('that element is not visible');
+      src.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      const a = src.getBoundingClientRect();
+      const x0 = a.x + a.width / 2;
+      const y0 = a.y + a.height / 2;
+      let dst = null;
+      let x1;
+      let y1;
+      if (to) {
+        dst = resolve(to);
+        if (!visible(dst)) throw new Error('the target is not visible');
+        const b = dst.getBoundingClientRect();
+        x1 = b.x + b.width / 2;
+        y1 = b.y + b.height / 2;
+      } else {
+        x1 = x0 + by[0];
+        y1 = y0 + by[1];
+      }
+      if (x1 < 0 || y1 < 0 || x1 > innerWidth || y1 > innerHeight) {
+        throw new Error('the drop point is off screen; scroll it into view first');
+      }
+      const under = (x, y) => document.elementFromPoint(x, y) || dst || document.body;
+      const fire = (el, type, x, y, extra) => {
+        const init = { bubbles: true, cancelable: true, view: window, button: 0, clientX: x, clientY: y, ...extra };
+        el.dispatchEvent(
+          type.startsWith('pointer')
+            ? new PointerEvent(type, { ...init, pointerId: 1, isPrimary: true })
+            : type.startsWith('drag') || type === 'drop'
+              ? new DragEvent(type, init)
+              : new MouseEvent(type, init)
+        );
+      };
+      const STEPS = 8;
+      const along = (i) => [x0 + ((x1 - x0) * i) / STEPS, y0 + ((y1 - y0) * i) / STEPS];
+
+      await cursor.to(x0, y0);
+      cursor.hold(true);
+      try {
+        // A draggable element starts the browser's own drag, which replaces
+        // the mouse moves: send the events that drag would.
+        if (src.draggable === true) {
+          const data = new DataTransfer();
+          const withData = { dataTransfer: data };
+          fire(src, 'dragstart', x0, y0, withData);
+          let over = src;
+          for (let i = 1; i <= STEPS; i++) {
+            const [x, y] = along(i);
+            await cursor.to(x, y, 45);
+            const next = i === STEPS && dst ? dst : under(x, y);
+            if (next !== over) {
+              fire(next, 'dragenter', x, y, withData);
+              if (over !== src) fire(over, 'dragleave', x, y, withData);
+              over = next;
+            }
+            fire(src, 'drag', x, y, withData);
+            fire(over, 'dragover', x, y, withData);
+          }
+          const probe = new DragEvent('dragover', { bubbles: true, cancelable: true, clientX: x1, clientY: y1, dataTransfer: data });
+          over.dispatchEvent(probe);
+          // The page accepts a drop by cancelling dragover.
+          const accepted = probe.defaultPrevented;
+          if (accepted) fire(over, 'drop', x1, y1, withData);
+          fire(src, 'dragend', x1, y1, withData);
+          cursor.hold(false);
+          await cursor.press();
+          return { dragged: describe(src), onto: describe(over), mode: 'html5', dropped: accepted };
+        }
+        fire(src, 'pointerdown', x0, y0, { buttons: 1 });
+        fire(src, 'mousedown', x0, y0, { buttons: 1 });
+        if (src.focus) src.focus();
+        for (let i = 1; i <= STEPS; i++) {
+          const [x, y] = along(i);
+          await cursor.to(x, y, 45);
+          const el = under(x, y);
+          fire(el, 'pointermove', x, y, { buttons: 1 });
+          fire(el, 'mousemove', x, y, { buttons: 1 });
+        }
+        const end = dst || under(x1, y1);
+        fire(end, 'pointerup', x1, y1, { buttons: 0 });
+        fire(end, 'mouseup', x1, y1, { buttons: 0 });
+        cursor.hold(false);
+        await cursor.press();
+        return { dragged: describe(src), onto: describe(end), mode: 'pointer', moved: [Math.round(x1 - x0), Math.round(y1 - y0)] };
+      } finally {
+        cursor.hold(false);
+      }
     },
     fill: async (selector, text) => {
       const el = resolve(selector);

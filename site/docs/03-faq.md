@@ -129,9 +129,9 @@ Kalau kamu menemukan issue yang tidak tercantum di sini,
 
 ### In-app browser
 
-- **Situs non-HTTPS belum bisa dibuka.** `localhost` dan alamat IP tidak terpengaruh, jadi dev server
-  yang diteruskan lewat [Port forwarder](/features/port-forwarder) tetap bisa dibuka. Untuk yang lain,
-  pakai browser biasa.
+- **Situs http biasa di internet belum bisa dibuka.** `localhost` dan alamat IP tidak terpengaruh, jadi dev server
+  yang diteruskan lewat [Port forwarder](/features/port-forwarder) tetap bisa dibuka. Nama di jaringan privat
+  (misalnya `*.lab`) bisa diizinkan saat build dengan `PILUS_HTTP_HOSTS`. Untuk yang lain, pakai browser biasa.
 - Maksimal delapan tab halaman.
 
 ### Search dan Insights

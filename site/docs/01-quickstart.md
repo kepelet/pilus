@@ -13,7 +13,7 @@ Saat pertama kali dibuka, pilus mencari socket klien Luvus. Kalau Luvus belum te
 
 Tekan `cmd+shift+o` untuk memilih folder. Dropdown host di atas dialog menentukan mesin yang kamu jelajahi: Mac lokal atau mesin SSH. Kalau folder berada di repo Git, **Open with new worktree** akan membuat worktree dengan nama branch otomatis.
 
-Folder yang sering kamu buka bisa di-pin lewat klik kanan. Setelah itu, folder muncul di Pinned Workspaces.
+Folder yang sering kamu buka bisa di-pin lewat klik kanan. Setelah itu, folder muncul di menu pin pada header sidebar, dan `cmd+o` membukanya lewat palette.
 
 ## 3. Jalankan agent
 
@@ -40,6 +40,8 @@ Tekan `cmd+b` untuk membuka panel kanan. Tab **Diff** menampilkan perubahan agen
 | --- | --- |
 | `cmd+shift+p` | Buka command palette |
 | `cmd+shift+o` | Buka workspace |
+| `cmd+o` | Buka workspace yang di-pin |
+| `cmd+shift+s` | Pindah sesi Luvus |
 | `cmd+t` | Buka tab baru |
 | `cmd+d` / `cmd+shift+d` | Split vertikal / horizontal |
 | `cmd+b` | Tampilkan/sembunyikan panel kanan |

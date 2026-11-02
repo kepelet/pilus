@@ -19,7 +19,7 @@ Di sini kamu bisa meninjau perubahan di workspace aktif. Saya masih sering membu
 
 ## Git
 
-Tab ini menampilkan riwayat commit. Pilih commit untuk melihat perubahannya. Riwayat dimuat sedikit demi sedikit saat kamu menggulir, jadi repo dengan ribuan commit tetap ringan. Perubahan yang belum di-commit ada di tab Diff.
+Tab ini menampilkan riwayat commit, dengan branch aktif di chip berbingkai di header (Diff memakai chip yang sama). Pilih commit untuk melihat perubahannya. Riwayat dimuat sedikit demi sedikit saat kamu menggulir, jadi repo dengan ribuan commit tetap ringan. Perubahan yang belum di-commit ada di tab Diff.
 
 ## Worktree
 

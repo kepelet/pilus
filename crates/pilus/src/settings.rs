@@ -381,13 +381,6 @@ pub struct Settings {
     /// ticks the box in the Ports tab; nothing is published for a machine not
     /// named here.
     pub ctl_tunnels: Vec<String>,
-    /// Hostnames the Browser opens over plain `http` when the address is typed
-    /// without a scheme, as `localhost` is: `trakteer.lab`, or `*.lab` for every
-    /// name under a suffix. Edited by hand in `settings.json`; empty by default.
-    /// It only picks the scheme. Whether the web view may then load plain http
-    /// is the bundle's App Transport Security exception (`PILUS_HTTP_HOSTS` in
-    /// `scripts/bundle-macos.sh`).
-    pub browser_http_hosts: Vec<String>,
     /// The SIPIL sidebar rows (`daemon:<id>`, `channel:<id>`, `person:<id>`) in
     /// the order the person dragged them into. A row not named here comes after
     /// the ones that are, in the order the section would list it. Kept in
@@ -494,7 +487,6 @@ impl Default for Settings {
             index_agents: false,
             index_machines: Vec::new(),
             ctl_tunnels: Vec::new(),
-            browser_http_hosts: Vec::new(),
             sipil_order: Vec::new(),
             pinned_workspaces: Vec::new(),
             recent_workspaces: Vec::new(),
@@ -1308,7 +1300,6 @@ mod tests {
             index_agents: true,
             index_machines: vec!["local".to_string(), "build-box".to_string()],
             ctl_tunnels: vec!["build-box".to_string()],
-            browser_http_hosts: vec!["*.lab".to_string()],
             sipil_order: vec!["person:b".to_string(), "daemon:a".to_string()],
             pinned_workspaces: vec![SavedWorkspace {
                 session: Some("kind-voyager".to_string()),

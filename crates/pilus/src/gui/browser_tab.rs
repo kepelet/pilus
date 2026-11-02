@@ -471,29 +471,10 @@ fn send_edit(edit: PageEdit) {
 #[cfg(not(target_os = "macos"))]
 fn send_edit(_: PageEdit) {}
 
-/// Whether `name` is on the person's plain-http list. An entry is a hostname,
-/// or `*.suffix` for every name under the suffix (not the suffix itself).
-/// Case does not matter, and neither does a trailing dot.
-fn http_listed(name: &str, hosts: &[String]) -> bool {
-    let name = name.trim_end_matches('.').to_ascii_lowercase();
-    hosts.iter().any(|entry| {
-        let entry = entry.trim().trim_end_matches('.').to_ascii_lowercase();
-        match entry.strip_prefix("*.") {
-            Some(suffix) => {
-                !suffix.is_empty()
-                    && name.len() > suffix.len() + 1
-                    && name.ends_with(suffix)
-                    && name[..name.len() - suffix.len()].ends_with('.')
-            }
-            None => !entry.is_empty() && entry == name,
-        }
-    })
-}
-
 /// The address `typed` stands for: a full address as written, a host as
-/// `https` (`http` for this machine and for `http_hosts`, where dev servers
+/// `https` (`http` for this machine, where dev servers
 /// rarely speak TLS), and anything else as a search.
-fn normalize(typed: &str, http_hosts: &[String]) -> Option<String> {
+fn normalize(typed: &str) -> Option<String> {
     let typed = typed.trim();
     if typed.is_empty() {
         return None;
@@ -511,8 +492,7 @@ fn normalize(typed: &str, http_hosts: &[String]) -> Option<String> {
     });
     let local = name == "localhost"
         || name.parse::<std::net::Ipv4Addr>().is_ok()
-        || name.ends_with(".localhost")
-        || http_listed(name, http_hosts);
+        || name.ends_with(".localhost");
     let looks_like_host = !typed.contains(char::is_whitespace) && (local || name.contains('.'));
     if local && looks_like_host {
         return Some(format!("http://{typed}"));
@@ -529,8 +509,8 @@ fn normalize(typed: &str, http_hosts: &[String]) -> Option<String> {
 /// The address a script may load for `typed`: the address bar's own fix-ups,
 /// but only http and https, since the bar lets a person type `file:` and a
 /// script should not (see security.md).
-fn web_url(typed: &str, http_hosts: &[String]) -> Result<String, String> {
-    let url = normalize(typed, http_hosts).ok_or("the URL is empty")?;
+fn web_url(typed: &str) -> Result<String, String> {
+    let url = normalize(typed).ok_or("the URL is empty")?;
     let web = url.split_once("://").is_some_and(|(scheme, _)| {
         scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
     });
@@ -665,7 +645,7 @@ impl PilusView {
     /// Load what the address bar holds.
     fn browser_submit(&mut self, cx: &mut Context<Self>) {
         let typed = self.browser_input.read(cx).value();
-        let Some(url) = normalize(&typed, &self.settings.browser_http_hosts) else {
+        let Some(url) = normalize(&typed) else {
             self.browser_end_edit(cx);
             return;
         };
@@ -1379,7 +1359,7 @@ impl PilusView {
         fresh: bool,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let url = web_url(typed, &self.settings.browser_http_hosts)?;
+        let url = web_url(typed)?;
         let now = Instant::now();
         let reuse = if fresh {
             None
@@ -2367,11 +2347,11 @@ mod tests {
     #[test]
     fn full_addresses_pass_through() {
         assert_eq!(
-            normalize(" https://example.com/a ", &[]),
+            normalize(" https://example.com/a "),
             Some("https://example.com/a".to_string())
         );
         assert_eq!(
-            normalize("file:///tmp/x.html", &[]),
+            normalize("file:///tmp/x.html"),
             Some("file:///tmp/x.html".to_string())
         );
     }
@@ -2379,69 +2359,33 @@ mod tests {
     #[test]
     fn hosts_get_a_scheme() {
         assert_eq!(
-            normalize("example.com/docs", &[]),
+            normalize("example.com/docs"),
             Some("https://example.com/docs".to_string())
         );
         assert_eq!(
-            normalize("localhost:5173", &[]),
+            normalize("localhost:5173"),
             Some("http://localhost:5173".to_string())
         );
         assert_eq!(
-            normalize("127.0.0.1:3000/x", &[]),
+            normalize("127.0.0.1:3000/x"),
             Some("http://127.0.0.1:3000/x".to_string())
-        );
-    }
-
-    #[test]
-    fn listed_hosts_get_http() {
-        let hosts = vec!["*.lab".to_string(), "Intranet.Corp".to_string()];
-        let http = |typed| normalize(typed, &hosts);
-        assert_eq!(
-            http("trakteer.lab"),
-            Some("http://trakteer.lab".to_string())
-        );
-        assert_eq!(
-            http("a.b.lab:8080/x"),
-            Some("http://a.b.lab:8080/x".to_string())
-        );
-        assert_eq!(
-            http("intranet.corp"),
-            Some("http://intranet.corp".to_string())
-        );
-        // The suffix alone, a lookalike and an unlisted name stay https.
-        assert_eq!(http("lab.com"), Some("https://lab.com".to_string()));
-        assert_eq!(
-            http("evillab"),
-            Some("https://duckduckgo.com/?q=evillab".to_string())
-        );
-        assert_eq!(
-            http("x.notlab.com"),
-            Some("https://x.notlab.com".to_string())
-        );
-        assert_eq!(
-            http("mylab.lab.evil.com"),
-            Some("https://mylab.lab.evil.com".to_string())
-        );
-        assert_eq!(
-            normalize("trakteer.lab", &[]),
-            Some("https://trakteer.lab".to_string())
         );
     }
 
     #[test]
     fn anything_else_is_a_search() {
         assert_eq!(
-            normalize("rust gpui", &[]),
+            normalize("rust gpui"),
             Some("https://duckduckgo.com/?q=rust%20gpui".to_string())
         );
         assert_eq!(
-            normalize("gpui", &[]),
+            normalize("gpui"),
             Some("https://duckduckgo.com/?q=gpui".to_string())
         );
     }
 
     #[test]
     fn blank_loads_nothing() {
-        assert_eq!(normalize("   ", &[]), None);
+        assert_eq!(normalize("   "), None);
     }
 }

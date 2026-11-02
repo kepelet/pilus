@@ -193,20 +193,16 @@ storage are its own and are dropped with it, so an agent that opens a site sees
 it signed out, and cannot reach the person's sign-ins by loading one. To work on
 a page as the person, ask for their tab with `browser request`.
 
-### Plain-http hosts (`*.lab`)
+### Plain-http hosts (`lab`)
 
 The address bar and `browser open` send a bare dotted name to `https`, and only
-`localhost`, IPs and `*.localhost` to `http`. A dev name like `trakteer.lab` is
-on neither, so two things let it through, and a bare name needs both:
-
-- `browser_http_hosts` in `settings.json` (`["*.lab", "intranet.corp"]`) makes
-  `normalize` pick `http` for those names. `*.lab` is every name under `lab`, not
-  `lab` itself. It changes the scheme only; a full `http://…` is always honoured.
-- The web view must be allowed plain http. In a bundle, App Transport Security
-  refuses it for non-local names, and a signed Info.plist cannot change at run
-  time, so `PILUS_HTTP_HOSTS="lab,intranet.corp" just bundle` (commas or spaces) writes
-  an `NSExceptionDomains` entry (with subdomains) for each name. Empty by default,
-  so a shipped build keeps ATS whole. Unverified on a live window.
+`localhost`, IPs and `*.localhost` to `http`. A full `http://trakteer.lab` is
+always honoured, but the web view must also be allowed plain http: in a bundle,
+App Transport Security refuses it for non-local names, and a signed Info.plist
+cannot change at run time. So `PILUS_HTTP_HOSTS="lab,intranet.corp" just bundle`
+(commas or spaces) writes an `NSExceptionDomains` entry, with subdomains, for
+each name. Empty by default, so a shipped build keeps ATS whole. There is no
+settings list: type the `http://`. Unverified on a live window.
 
 Two things an agent trips on, both seen on a live window:
 

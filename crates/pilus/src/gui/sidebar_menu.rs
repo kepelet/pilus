@@ -53,7 +53,7 @@ pub enum MenuTarget {
         /// Whether it is pinned now, which turns Pin into Unpin.
         pinned: bool,
     },
-    /// The AGENTS header's clock: which statuses the list shows.
+    /// The AGENTS header's filter button: which statuses the list shows.
     AgentFilter,
     /// A live AGENTS row, addressed by its pane id.
     Agent {
@@ -461,7 +461,7 @@ fn agent_rows() -> Vec<Item> {
     ]
 }
 
-/// The AGENTS header's clock: every status, then one row per status in the
+/// The AGENTS header's filter button: every status, then one row per status in the
 /// order the list sorts them.
 fn agent_filter_rows() -> Vec<Item> {
     vec![

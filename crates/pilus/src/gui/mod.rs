@@ -13969,7 +13969,8 @@ impl PilusView {
         if home {
             name = name
                 .text_size(px(self.machine_font()))
-                .text_color(self.machine_color());
+                .text_color(self.machine_color())
+                .font_weight(self.machine_weight());
         }
         head = head.child(name.child(title));
         if foldable {
@@ -15054,6 +15055,16 @@ impl PilusView {
         }
     }
 
+    /// Weight of a machine's name. Compact shrinks and dims the name, so bold
+    /// keeps it readable as the heading over its workspaces.
+    fn machine_weight(&self) -> FontWeight {
+        if self.sidebar_flat() {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        }
+    }
+
     /// The chevron at the end of a machine's row. It folds and unfolds the
     /// workspaces below without selecting the machine, so the row's own click
     /// stays "go there".
@@ -15166,6 +15177,7 @@ impl PilusView {
                     .truncate()
                     .text_size(px(self.machine_font()))
                     .text_color(self.machine_color())
+                    .font_weight(self.machine_weight())
                     .child(title),
             )
             .child(self.machine_fold_toggle(endpoint, cx))
@@ -15247,7 +15259,7 @@ impl PilusView {
                     menu: false,
                     button: Some(HeaderButton {
                         id: "pilus-agents-filter",
-                        glyph: include_bytes!("../../assets/icons/clock.svg"),
+                        glyph: include_bytes!("../../assets/icons/list-filter.svg"),
                         tip: "Filter by status",
                         lit: self.agent_status.is_some(),
                         on_click: Box::new(|this, cx| {

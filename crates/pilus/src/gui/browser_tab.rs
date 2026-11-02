@@ -102,6 +102,9 @@ struct Page {
     /// The native cover that keeps the person out while an agent holds the
     /// tab (see `browser_shield`).
     shield: Shield,
+    /// The page's document has been told to show the agent's cursor (see
+    /// `browser_inspect.js`); reset when a new document starts.
+    cursor_on: bool,
     /// An agent's request for this tab, waiting on the person.
     ask: Option<Pending>,
     /// The person's notes on the page.
@@ -127,6 +130,7 @@ impl Page {
             inspect: Arc::default(),
             access: Access::person(),
             shield: Shield::default(),
+            cursor_on: false,
             ask: None,
             notes: Notes::default(),
             picking: false,
@@ -1132,8 +1136,23 @@ impl PilusView {
             let shown = on_screen && ix == active;
             // The cover goes over a held page while it is on screen, and is
             // taken away when the page is hidden or let go.
-            page.shield
-                .sync(view.read(cx).raw(), shown && page.access.held());
+            let held = shown && page.access.held();
+            page.shield.sync(view.read(cx).raw(), held);
+            // The agent's cursor is on the page for as long as the tab is
+            // held and seen, not only while an action runs. A new document
+            // starts without it, so it is asked for again.
+            if page.inspect.take_fresh() {
+                page.cursor_on = false;
+            }
+            if page.cursor_on != held {
+                let script = if held {
+                    "window.__pilus&&window.__pilus.cursor(true)"
+                } else {
+                    "window.__pilus&&window.__pilus.cursor(false)"
+                };
+                let _ = view.read(cx).raw().evaluate_script(script);
+                page.cursor_on = held;
+            }
             view.update(cx, |view, _| {
                 if shown && !view.visible() {
                     view.show();

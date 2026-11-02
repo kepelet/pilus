@@ -250,11 +250,15 @@ pub enum PageOp {
         selector: Option<String>,
         within: Option<String>,
     },
-    /// Press on `from`, move to the element `to` or by `by` (`[dx, dy]` pixels
-    /// from `from`'s centre), and let go. Drives what a person would do with a
-    /// slider, a sortable list or a draggable card.
+    /// Press on `from` (an element), or at `at` (`[x, y]` in the viewport,
+    /// when there is nothing to name: a canvas, a map), move to the element
+    /// `to` or by `by` (`[dx, dy]` pixels from where it pressed), and let go.
+    /// Drives what a person would do with a slider, a sortable list, a
+    /// draggable card or a drawing surface.
     Drag {
-        from: String,
+        from: Option<String>,
+        #[serde(default)]
+        at: Option<[i32; 2]>,
         to: Option<String>,
         by: Option<[i32; 2]>,
     },
@@ -432,6 +436,7 @@ struct Flags {
     limit: Option<u32>,
     within: Option<String>,
     by: Option<[i32; 2]>,
+    at: Option<[i32; 2]>,
     positional: Vec<String>,
 }
 
@@ -464,7 +469,11 @@ impl Flags {
                 "--filter" => flags.filter = Some(value("--filter")?.to_string()),
                 "--by" => {
                     let text = value("--by")?;
-                    flags.by = Some(parse_offset(text)?);
+                    flags.by = Some(parse_offset("--by", text)?);
+                }
+                "--at" => {
+                    let text = value("--at")?;
+                    flags.at = Some(parse_offset("--at", text)?);
                 }
                 "--in" => flags.within = Some(value("--in")?.to_string()),
                 "--limit" => {
@@ -619,9 +628,9 @@ fn parse_browser(words: &[&str]) -> Result<Request> {
     }
 }
 
-/// `DX,DY`, each a whole number of pixels, either may be negative.
-fn parse_offset(text: &str) -> Result<[i32; 2]> {
-    let bad = || anyhow!("--by is DX,DY in pixels, like 120,0 or -40,25, not {text:?}");
+/// `A,B`, each a whole number of pixels (`--by` may be negative).
+fn parse_offset(flag: &str, text: &str) -> Result<[i32; 2]> {
+    let bad = || anyhow!("{flag} is two numbers of pixels, like 120,0 or -40,25, not {text:?}");
     let (dx, dy) = text.split_once(',').ok_or_else(bad)?;
     Ok([
         dx.trim().parse().map_err(|_| bad())?,
@@ -629,24 +638,29 @@ fn parse_offset(text: &str) -> Result<[i32; 2]> {
     ])
 }
 
-/// `drag FROM TO` or `drag FROM --by DX,DY`.
+/// `drag FROM TO`, `drag FROM --by DX,DY`, or from a point with
+/// `drag --at X,Y TO` / `drag --at X,Y --by DX,DY`.
 fn parse_drag(flags: &Flags) -> Result<Request> {
-    let op = match (flags.positional.as_slice(), flags.by) {
-        ([from, to], None) => PageOp::Drag {
-            from: from.clone(),
-            to: Some(to.clone()),
-            by: None,
-        },
-        ([from], Some(by)) => PageOp::Drag {
-            from: from.clone(),
-            to: None,
-            by: Some(by),
-        },
-        _ => bail!(
-            "browser drag takes FROM TO (selectors or @N), or FROM --by DX,DY\n\n{USAGE}"
-        ),
+    let (from, to) = match (flags.positional.as_slice(), flags.at) {
+        ([from, to], None) => (Some(from.clone()), Some(to.clone())),
+        ([from], None) => (Some(from.clone()), None),
+        ([to], Some(_)) => (None, Some(to.clone())),
+        ([], Some(_)) => (None, None),
+        _ => (None, None),
     };
-    Ok(flags.page(op))
+    // Exactly one way to say where it ends, and one way to say where it starts.
+    let starts = from.is_some() || flags.at.is_some();
+    if !starts || to.is_some() == flags.by.is_some() || (from.is_some() && flags.at.is_some()) {
+        bail!(
+            "browser drag takes FROM TO, FROM --by DX,DY, --at X,Y TO or --at X,Y --by DX,DY\n\n{USAGE}"
+        );
+    }
+    Ok(flags.page(PageOp::Drag {
+        from,
+        at: flags.at,
+        to,
+        by: flags.by,
+    }))
 }
 
 /// `scroll down [PIXELS] [--in SELECTOR]`, or `scroll SELECTOR` to bring one
@@ -719,6 +733,8 @@ pub const USAGE: &str = "USAGE:\n\
     \x20   pilus ctl browser scroll SELECTOR|@N   # bring it into view\n\
     \x20   pilus ctl browser drag SELECTOR|@N SELECTOR|@N   # press, move to it, let go\n\
     \x20   pilus ctl browser drag SELECTOR|@N --by DX,DY    # or move by pixels\n\
+    \x20   pilus ctl browser drag --at X,Y --by DX,DY       # from a point in the viewport\n\
+    \x20   pilus ctl browser drag --at X,Y SELECTOR|@N\n\
     \x20   pilus ctl browser fill SELECTOR|@N TEXT\n\
     \x20   pilus ctl browser press KEY [SELECTOR|@N]\n\
     \x20   pilus ctl browser wait SELECTOR|@N [--gone] [--timeout MS]\n\
@@ -1130,7 +1146,8 @@ mod tests {
             Request::BrowserPage {
                 tab: None,
                 op: PageOp::Drag {
-                    from: "#card".to_string(),
+                    from: Some("#card".to_string()),
+                    at: None,
                     to: Some("@3".to_string()),
                     by: None,
                 }
@@ -1141,9 +1158,34 @@ mod tests {
             Request::BrowserPage {
                 tab: Some(2),
                 op: PageOp::Drag {
-                    from: ".knob".to_string(),
+                    from: Some(".knob".to_string()),
+                    at: None,
                     to: None,
                     by: Some([-40, 25]),
+                }
+            }
+        );
+        assert_eq!(
+            page("browser drag --at 200,150 --by 80,-20"),
+            Request::BrowserPage {
+                tab: None,
+                op: PageOp::Drag {
+                    from: None,
+                    at: Some([200, 150]),
+                    to: None,
+                    by: Some([80, -20]),
+                }
+            }
+        );
+        assert_eq!(
+            page("browser drag --at 10,10 #drop"),
+            Request::BrowserPage {
+                tab: None,
+                op: PageOp::Drag {
+                    from: None,
+                    at: Some([10, 10]),
+                    to: Some("#drop".to_string()),
+                    by: None,
                 }
             }
         );
@@ -1154,6 +1196,10 @@ mod tests {
             "browser drag #a --by 1",
             "browser drag #a --by x,y",
             "browser drag #a #b #c",
+            "browser drag --at 1,1",
+            "browser drag --at 1,1 --by 2",
+            "browser drag --at 1,1 #a --by 2,2",
+            "browser drag #a --at 1,1 --by 2,2",
         ] {
             assert!(parse_args(&words(bad)).is_err(), "{bad:?} should fail");
         }

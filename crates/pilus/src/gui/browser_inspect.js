@@ -270,8 +270,11 @@
   // DOM calls and the Web Animations API only, so a page's CSP (which can
   // forbid inline styles and `innerHTML`) cannot stop it. It lives in a
   // closed shadow root so the page's CSS cannot reach it, and it leaves the
-  // DOM a few seconds after the last action, with one timer that is cleared by
-  // the next action, so an idle page runs nothing.
+  // DOM when the window lets go of the tab (`__pilus.cursor(false)`). The window
+  // asks for it whenever the tab is held and on screen, so it stays up between
+  // actions; a tab that is not shown falls back to leaving a few seconds after
+  // the last action, with one timer the next action clears. Either way an idle
+  // page runs nothing.
   const cursor = (() => {
     const NS = 'http://www.w3.org/2000/svg';
     const ACCENT = '#3b82f6';
@@ -286,6 +289,8 @@
     let pointer = null;
     let at = null;
     let gone = 0;
+    // The window wants the cursor kept up, so no action lets it fade.
+    let wanted = false;
 
     const build = () => {
       host = document.createElement('div');
@@ -325,16 +330,23 @@
     const place = (x, y) => `translate(${x - 1}px, ${y - 1}px)` + (held ? ' scale(.85)' : '');
     const frame = (ms) => new Promise((done) => setTimeout(done, ms));
 
-    // Keep the pointer on screen until the agent has been quiet a while.
-    const linger = () => {
+    // Take the pointer away after `delay` ms, fading it out. Run again, it
+    // starts over, so the next action or `show` cancels a pending exit.
+    const leave = (delay) => {
       clearTimeout(gone);
       gone = setTimeout(() => {
-        const fade = pointer && !calm() ? pointer.animate([{ opacity: 1 }, { opacity: 0 }], 300) : null;
-        setTimeout(() => {
+        const fade = pointer && !calm() ? pointer.animate([{ opacity: 1 }, { opacity: 0 }], 250) : null;
+        gone = setTimeout(() => {
           if (host) host.remove();
           host = pointer = at = null;
-        }, fade ? 300 : 0);
-      }, 3000);
+        }, fade ? 250 : 0);
+      }, delay);
+    };
+    // After an action: stay up if the window wants the cursor, else leave once
+    // the agent has been quiet a while.
+    const linger = () => {
+      clearTimeout(gone);
+      if (!wanted) leave(3000);
     };
 
     // Glide to (x, y) in viewport coordinates and settle there.
@@ -396,6 +408,35 @@
       }
     };
 
+    // Keep the cursor up until `hide`. It appears where it last was, else in
+    // the middle of the viewport.
+    const show = () => {
+      wanted = true;
+      clearTimeout(gone);
+      const draw = () => {
+        if (!wanted) return;
+        try {
+          if (!host || !host.isConnected) {
+            host = null;
+            build();
+            const start = at || { x: innerWidth / 2, y: innerHeight / 2 };
+            at = start;
+            pointer.style.transform = place(start.x, start.y);
+            if (!calm()) pointer.animate([{ opacity: 0 }, { opacity: 1 }], 200);
+          }
+        } catch (_) {
+          /* decoration only */
+        }
+      };
+      // At document start there may be no root element to hang it on yet.
+      if (document.documentElement) draw();
+      else addEventListener('DOMContentLoaded', draw, { once: true });
+    };
+    const hide = () => {
+      wanted = false;
+      leave(0);
+    };
+
     const toElement = (el) => {
       const box = el.getBoundingClientRect();
       return to(box.x + box.width / 2, box.y + box.height / 2);
@@ -405,7 +446,7 @@
       held = on;
       if (host && pointer && at) pointer.style.transform = place(at.x, at.y);
     };
-    return { to, press, hold, toElement };
+    return { to, press, hold, toElement, show, hide };
   })();
 
   // ---- acting on the page ------------------------------------------------
@@ -494,13 +535,26 @@
       const after = whereIs(target);
       return { scrolled: { x: after.x - now.x, y: after.y - now.y }, ...after };
     },
-    drag: async (from, to, by) => {
-      const src = resolve(from);
-      if (!visible(src)) throw new Error('that element is not visible');
-      src.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-      const a = src.getBoundingClientRect();
-      const x0 = a.x + a.width / 2;
-      const y0 = a.y + a.height / 2;
+    drag: async (from, at, to, by) => {
+      let src;
+      let x0;
+      let y0;
+      if (from) {
+        src = resolve(from);
+        if (!visible(src)) throw new Error('that element is not visible');
+        src.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        const a = src.getBoundingClientRect();
+        x0 = a.x + a.width / 2;
+        y0 = a.y + a.height / 2;
+      } else {
+        // A point in the viewport: whatever is there takes the press.
+        [x0, y0] = at;
+        if (x0 < 0 || y0 < 0 || x0 > innerWidth || y0 > innerHeight) {
+          throw new Error(`${x0},${y0} is outside the viewport (${innerWidth}x${innerHeight})`);
+        }
+        src = document.elementFromPoint(x0, y0);
+        if (!src) throw new Error(`nothing is at ${x0},${y0}`);
+      }
       let dst = null;
       let x1;
       let y1;
@@ -689,10 +743,19 @@
   Object.defineProperty(window, '__pilus', {
     value: Object.freeze({
       run: (id, name, args) => answer(id, () => ops[name](...args)),
+      // The window keeps the agent's cursor up while it holds and shows the tab.
+      cursor: (on) => {
+        if (on) cursor.show();
+        else cursor.hide();
+        return 'ok';
+      },
       // `work` is built in the window's script, so it is not subject to the
       // page's CSP the way an `eval` here would be.
       eval: (id, work) => answer(id, work),
     }),
     enumerable: false,
   });
+  // A new document has the script and none of what the window set up in the
+  // last one, the cursor among it.
+  send({ t: 'ready' });
 })();

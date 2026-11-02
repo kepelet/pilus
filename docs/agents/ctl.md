@@ -29,6 +29,7 @@ pilus ctl browser scroll down              # also: up|left|right|top|bottom [PX]
 pilus ctl browser scroll @7                # bring one element into view
 pilus ctl browser drag @3 @9               # press on @3, move to @9, let go
 pilus ctl browser drag .knob --by 120,0    # or move by pixels from its centre
+pilus ctl browser drag --at 200,150 --by 80,0   # from a point in the viewport
 pilus ctl browser wait 'li:nth-child(2)'
 pilus ctl browser network --filter /api    # method, url, status, ms
 pilus ctl browser console                  # console.* and uncaught errors
@@ -220,7 +221,10 @@ another step would move nothing. Scrolling is `behavior: 'instant'` whatever
 the page's CSS says.
 
 `browser drag FROM TO` (or `FROM --by DX,DY`) presses on the centre of `FROM`,
-moves in 8 steps to the centre of `TO` (or the offset point) and lets go. A
+moves in 8 steps to the centre of `TO` (or the offset point) and lets go.
+`--at X,Y` replaces `FROM` with a point in the viewport (CSS pixels, from its
+top-left), for a canvas, a map or a slider with no handle to name: whatever
+`elementFromPoint` finds there takes the press, and the answer names it. A
 plain element gets `pointerdown`/`mousedown`, the moves, then
 `pointerup`/`mouseup`, which is what sliders and most sortable lists listen
 for. An element with `draggable="true"` gets the HTML5 sequence instead
@@ -240,9 +244,15 @@ and sends a ring out on a click. It is only for the person watching, so:
   nor block it, and it never takes part in the page's own events;
 - a click waits for the glide (at most about 0.7 s) before the events fire, so
   the cursor is where the click lands;
-- it leaves the DOM 3 s after the last action. That is the one timer, cleared by
-  the next action, so an idle page runs nothing. `prefers-reduced-motion` skips
-  the glide and the ring;
+- it is up whenever the tab is held and on screen, not only while an action
+  runs. `browser_sync` tells the page (`__pilus.cursor(on)`) when that changes:
+  it appears in the middle of the viewport, stays where the last action left
+  it, and fades out on release, Take over, or when the Browser is hidden. A new
+  document starts without it, so the script reports `ready` and the window asks
+  again (`Inspect::take_fresh`). A tab that is not on screen but is driven
+  (the Browser closed) falls back to leaving 3 s after the last action. Nothing
+  here is a timer on an idle page. `prefers-reduced-motion` skips the glide and
+  the ring;
 - an action does not depend on it: any failure drawing it is swallowed.
 
 Two things an agent trips on, both seen on a live window:

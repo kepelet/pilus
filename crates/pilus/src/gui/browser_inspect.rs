@@ -57,6 +57,9 @@ pub(super) struct Inspect {
     state: Mutex<State>,
     /// A real click or keypress reached the page since this was last taken.
     user_input: AtomicBool,
+    /// A document with the script in it has started since this was last
+    /// taken: whatever the window set up in the old one (the cursor) is gone.
+    fresh: AtomicBool,
 }
 
 #[derive(Default)]
@@ -106,6 +109,11 @@ impl Inspect {
     /// agent's synthetic events.
     pub(super) fn take_user_input(&self) -> bool {
         self.user_input.swap(false, Ordering::Relaxed)
+    }
+
+    /// Whether a new document started its script since the last call.
+    pub(super) fn take_fresh(&self) -> bool {
+        self.fresh.swap(false, Ordering::Relaxed)
     }
 
     /// End every call waiting on the page with `why`.
@@ -203,6 +211,7 @@ impl Inspect {
         match message.get("t").and_then(Value::as_str) {
             Some("r") => self.answer_call(&message),
             Some("user") => self.user_input.store(true, Ordering::Relaxed),
+            Some("ready") => self.fresh.store(true, Ordering::Relaxed),
             Some("pick") => {
                 if let Some(pick) = Pick::parse(&message) {
                     let mut state = self.state();
@@ -387,7 +396,7 @@ pub(super) fn call_script(id: u64, op: &PageOp) -> Option<String> {
             selector,
             within,
         } => run("scroll", json!([direction, pixels, selector, within])),
-        PageOp::Drag { from, to, by } => run("drag", json!([from, to, by])),
+        PageOp::Drag { from, at, to, by } => run("drag", json!([from, at, to, by])),
         PageOp::Fill { selector, text } => run("fill", json!([selector, text])),
         PageOp::Press { key, selector } => run("press", json!([key, selector])),
         PageOp::Wait {
@@ -474,6 +483,15 @@ mod tests {
         inspect.on_message(r#"{"t":"user"}"#);
         assert!(inspect.take_user_input());
         assert!(!inspect.take_user_input(), "taken");
+    }
+
+    #[test]
+    fn a_new_document_is_noted_once() {
+        let inspect = Inspect::default();
+        assert!(!inspect.take_fresh());
+        inspect.on_message(r#"{"t":"ready"}"#);
+        assert!(inspect.take_fresh());
+        assert!(!inspect.take_fresh(), "taken");
     }
 
     #[test]

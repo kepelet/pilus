@@ -527,6 +527,58 @@ impl PilusView {
         self.browser_begin_edit(cx);
     }
 
+    /// Load a page for `pilus ctl browser open`. It goes in a fresh tab beside
+    /// the others, or in the selected one when that is empty or the strip is
+    /// full. The address is what the sender typed, so it gets the address
+    /// bar's own fix-ups, but only http and https load: the bar lets a person
+    /// type `file:`, and a script should not (see security.md).
+    pub(super) fn browser_open_url(
+        &mut self,
+        typed: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let url = normalize(typed).ok_or("the URL is empty")?;
+        let web = url.split_once("://").is_some_and(|(scheme, _)| {
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        });
+        if !web {
+            return Err(format!(
+                "the Browser opens only http and https URLs, not {typed:?}"
+            ));
+        }
+        let page = self.browser_panel.page();
+        if (page.view.is_none() && page.pending.is_none()) || self.browser_panel.full() {
+            self.browser_panel.page_mut().pending = Some(url.clone());
+        } else {
+            self.browser_panel.pages.push(Page::loading(url.clone()));
+            self.browser_panel.active = self.browser_panel.pages.len() - 1;
+        }
+        self.browser_input
+            .update(cx, |input, cx| input.set_value(url, cx));
+        self.browser_panel.editing = false;
+        self.right.focused = false;
+        cx.notify();
+        Ok(())
+    }
+
+    /// Whether the selected tab has a page, or one on its way.
+    pub(super) fn browser_has_content(&self) -> bool {
+        let page = self.browser_panel.page();
+        page.view.is_some() || page.pending.is_some()
+    }
+
+    /// How many tabs the Browser has and the selected one's address, for
+    /// `pilus ctl state`.
+    pub(super) fn browser_summary(&self) -> (usize, String) {
+        let page = self.browser_panel.page();
+        let url = if page.url.is_empty() {
+            page.pending.clone().unwrap_or_default()
+        } else {
+            page.url.clone()
+        };
+        (self.browser_panel.pages.len(), url)
+    }
+
     /// Show tab `ix`. An empty tab opens with the address bar ready.
     fn browser_select_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix >= self.browser_panel.pages.len() || ix == self.browser_panel.active {

@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod cli;
+mod ctl;
 #[cfg(feature = "gui")]
 mod gui;
 #[cfg(feature = "gui")]

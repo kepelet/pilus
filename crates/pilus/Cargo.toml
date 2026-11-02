@@ -49,6 +49,13 @@ gpui_platform = { workspace = true, optional = true }
 gpui-wry = { workspace = true, optional = true }
 wry = { workspace = true, optional = true }
 qrcode = { version = "0.14.1", default-features = false }
+# The channel that carries `pilus ctl` requests to the window: a send from the
+# listener thread wakes the GUI's task, so the listener costs nothing idle.
+# GPUI already builds it.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

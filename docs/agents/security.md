@@ -50,6 +50,23 @@ Files under `~/.pilus` are owner-only.
 - A remote save is staged beside the file and copied over it only once every
   byte has arrived (`write::remote_save_script`).
 
+## The control socket
+
+`pilus ctl` (see [ctl.md](ctl.md)) lets any process that can open
+`~/.pilus/pilus.sock` drive the window.
+
+- The socket lives in the `0700` folder and is set to `0600`, so only the
+  owner's processes reach it. Do not move it to `/tmp`, and do not add a TCP
+  or network listener.
+- Anything running as the owner can use it, including an agent in a pane. So a
+  verb gets no more than the button it stands for. The Browser verb opens
+  http and https only, though the address bar accepts more.
+- A request line is capped at 16 KB and a client has two seconds to send it,
+  so a stalled client cannot hold the listener.
+- Never add a verb that reads files, runs a command, or returns the contents
+  of a pane. `state` reports only which tab is showing and the Browser's
+  address.
+
 ## Logging
 
 Warnings and panics go to `~/.pilus/logs/pilus.log` (`logging.rs`). The log is

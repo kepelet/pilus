@@ -6552,6 +6552,7 @@ dependencies = [
  "bezel-mermaid",
  "block2 0.6.2",
  "crossterm",
+ "futures",
  "gpui-pre",
  "gpui-pre-platform",
  "gpui-updater-core",

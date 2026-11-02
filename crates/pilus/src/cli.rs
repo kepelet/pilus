@@ -48,6 +48,8 @@ pub enum Launch {
         /// Stable machine profile id.
         id: String,
     },
+    /// Send one command to the running window over its control socket.
+    Ctl(Vec<String>),
     /// Play every notification cue once, so the audio path can be heard
     /// without waiting for an agent to block.
     TestSound,
@@ -74,6 +76,7 @@ pub fn run() -> Result<()> {
         Launch::Feed { target } => run_feed(target),
         Launch::CheckUpdates { channel, feed_url } => run_check_updates(channel, feed_url),
         Launch::ProbeMachine { id } => run_probe_machine(id),
+        Launch::Ctl(words) => crate::ctl::run_client(&words),
         Launch::TestSound => run_test_sound(),
         #[cfg(feature = "visual-test")]
         Launch::UiShots { main } => run_ui_shots(main),
@@ -82,6 +85,12 @@ pub fn run() -> Result<()> {
 
 /// Parse `pilus` arguments.
 pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
+    let mut args = args.peekable();
+    // `ctl` is a subcommand with words of its own, so it is taken before the
+    // flag loop, which would reject them.
+    if args.next_if(|word| word == "ctl").is_some() {
+        return Ok(Launch::Ctl(args.collect()));
+    }
     let mut target = ConnectTarget::local();
     let mut probe = false;
     let mut menubar = false;
@@ -96,7 +105,6 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
     let mut pane_id = None;
     let mut channel = None;
     let mut feed_url = None;
-    let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => {
@@ -207,7 +215,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Launch> {
 fn print_help() {
     println!(
         "pilus — native desktop client for a Luvus daemon\n\n\
-         USAGE:\n    pilus [--session NAME | --socket PATH] [--probe]\n\n\
+         USAGE:\n    pilus [--session NAME | --socket PATH] [--probe]\n    pilus ctl COMMAND\n\n\
          OPTIONS:\n\
          \x20   --session NAME   Attach to a named Luvus session\n\
          \x20   --socket PATH    Attach to an explicit client-socket path\n\
@@ -223,7 +231,9 @@ fn print_help() {
          \x20   --feed-url URL   Static release manifest for --check-updates\n\
          \x20   --pane ID        Pane to observe with --probe-uhp\n\
          \x20   --test-sound     Play every notification cue and exit\n\
-         \x20   -h, --help       Print this help"
+         \x20   -h, --help       Print this help\n\n\
+         CTL (drives the running window):\n{}",
+        crate::ctl::USAGE
     );
 }
 
@@ -660,6 +670,14 @@ mod tests {
                 );
             }
             _ => panic!("expected CheckUpdates"),
+        }
+    }
+
+    #[test]
+    fn ctl_keeps_its_words_out_of_the_flag_parser() {
+        match parse_args(&["ctl", "sidebar", "open", "--odd"]).expect("parse") {
+            Launch::Ctl(words) => assert_eq!(words, ["sidebar", "open", "--odd"]),
+            _ => panic!("expected Ctl"),
         }
     }
 

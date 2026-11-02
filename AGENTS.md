@@ -41,6 +41,7 @@ command-line tools can still build the app.
 | `pilus.db`, `index.db`, `settings.json`, anything under `~/.pilus` | [persistence.md](docs/agents/persistence.md) |
 | URLs, SVGs, remote shell commands, private files, logs | [security.md](docs/agents/security.md) |
 | iOS push alerts: `push.rs`, `hub.push.*`, `infra/push`, `Notifier.swift` | [push.md](docs/agents/push.md) |
+| `pilus ctl`, `pilus.sock`, driving the window from a script | [ctl.md](docs/agents/ctl.md) |
 | Timers, polling, animation, energy mode, the Process page | [idle-cost.md](docs/agents/idle-cost.md) |
 | Any drawn element; screenshots before shipping UI | [ui.md](docs/agents/ui.md) |
 | Sipil: iroh wire, identity, allow-lists | [sipil/network.md](docs/agents/sipil/network.md) |

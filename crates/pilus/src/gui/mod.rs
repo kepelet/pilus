@@ -17,6 +17,7 @@ mod box_drawing;
 mod browser_data;
 mod browser_tab;
 mod connector;
+mod ctl;
 mod cursor_blink;
 mod database;
 mod diff;
@@ -576,6 +577,11 @@ pub fn run(target: ConnectTarget, menubar_only: bool) -> anyhow::Result<()> {
         // service is left alone, and one installed from an older build or app
         // location moves onto this binary.
         connector::ensure(settings.borrow().connector);
+        // The menu bar helper has no sidebar to drive, and the full app that
+        // replaces it takes the socket.
+        if !menubar_only {
+            ctl::start(&pilus_root, cx);
+        }
         perf::start();
         process::mark_launch();
         // sipil is a program the user starts, so a daemon that is not up yet is
@@ -14936,12 +14942,9 @@ impl PilusView {
                     },
                     cx,
                 )),
-                None => children.child(self.machine_row(
-                    &id,
-                    host.as_deref(),
-                    !flat && !folded,
-                    cx,
-                )),
+                None => {
+                    children.child(self.machine_row(&id, host.as_deref(), !flat && !folded, cx))
+                }
             };
             if folded {
                 continue;
